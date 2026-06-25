@@ -77,6 +77,8 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
 
   duckdb_native_ingestible_table_info() = default;
 
+  [[nodiscard]] std::span<std::string const> column_names() const override { return names; }
+
   /// db_path-as-span (contract-keeping for the base interface). duckdb-native
   /// cache matching keys on the catalog/schema/table name in @c cache_entry_info,
   /// not on these paths.

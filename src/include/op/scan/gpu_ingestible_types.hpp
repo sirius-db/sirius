@@ -45,6 +45,8 @@ class ingestible_table_info {
   ingestible_table_info(ingestible_table_info const&)            = delete;
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;
 
+  [[nodiscard]] virtual std::span<std::string const> column_names() const = 0;
+
   /**
    * @brief Resolved file paths captured at bind time.
    *

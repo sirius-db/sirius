@@ -760,7 +760,7 @@ TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns"
   // Each pinned column MUST have exactly chunk_memory_spaces.size() chunks.
   // With the bug, w would have just 1 chunk while k and v had N chunks,
   // which silently fell back to uncached scans.
-  for (auto const& col_name : entry.table_info->column_names()) {
+  for (auto const& col_name : entry.cache_info.column_names()) {
     auto col_it = entry.data_batches_by_column.find(col_name);
     REQUIRE(col_it != entry.data_batches_by_column.end());
     INFO("col_name=" << col_name << " chunks=" << col_it->second.size());
@@ -768,7 +768,7 @@ TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns"
   }
 
   // The merged entry must list all unique columns: k, v, w.
-  REQUIRE(entry.table_info->column_names().size() == 3u);
+  REQUIRE(entry.cache_info.column_names().size() == 3u);
 
   auto unpin = con.Query("CALL unpin_table('merge_pin');");
   REQUIRE(unpin);
