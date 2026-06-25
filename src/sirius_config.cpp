@@ -108,6 +108,10 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.optional("max_read_split", opt.max_read_split);
   r.optional("bounce_block_size", yaml::bytes(opt.bounce_block_size));
+  r.optional("upkeep_interval_ms", opt.upkeep_interval);
+  r.optional("conn_max_age_s", opt.conn_max_age);
+  r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
+  r.optional("retry_jitter_ms", opt.retry_jitter);
   r.optional("max_retry_attempts", opt.max_retry_attempts);
   r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
   r.optional("honor_retry_after", opt.honor_retry_after);
