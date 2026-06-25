@@ -31,6 +31,3 @@ sirius:
       num_threads: 1
       thread_name_prefix: "sirius_downgrade_executor"
       monitor_period_ms: 10
-    duckdb_scan:
-      num_threads: 4
-      thread_name_prefix: "sirius_scan_executor"

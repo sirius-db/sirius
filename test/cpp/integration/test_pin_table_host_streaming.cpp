@@ -97,8 +97,6 @@ void write_config(fs::path const& yaml_path)
        "  executor:\n"
        "    pipeline:\n"
        "      num_threads: 4\n"
-       "    duckdb_scan:\n"
-       "      num_threads: 2\n"
        "    task_creator:\n"
        "      num_threads: 2\n"
        "    downgrade:\n"
