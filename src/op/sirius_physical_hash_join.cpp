@@ -1315,7 +1315,8 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
     // key here just leaves that column unpruned (the join stays authoritative).
     if (cond_idx < key_casts.size() && key_casts[cond_idx].cast_right) {
       SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic filter key {}: skipped (cast on build key cond_idx={}).",
+        "[sirius_physical_hash_join] dynamic filter key {}: skipped (cast on build key "
+        "cond_idx={}).",
         k,
         cond_idx);
       continue;
@@ -1347,9 +1348,9 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
       }
     }
 
-    // (2) Membership filter — post-decode. Choose the structure that fits the device L2 cache.
-    // Prefer the exact IN-list if it fits; else the Bloom if it fits; else none — a structure that
-    // spills L2 makes the post-decode probe cost more than the pruning saves.
+    // (2) Membership filter — post-decode. Prefer the exact IN-list when its set fits the device L2
+    // cache; otherwise fall back to the Bloom whenever the key type supports it; `none` only when
+    // the key type has no Bloom support (non-INT64).
     auto const n  = static_cast<std::size_t>(build_view.num_rows());
     auto const l2 = device_l2_cache_bytes();
     auto const set_bytes =
@@ -1361,8 +1362,7 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);
       choice = "in_list";
-    } else if (l2 > 0 && sirius::op::sirius_dynamic_bloom_filter::supports(col.type()) &&
-               bloom_bytes <= l2) {
+    } else if (sirius::op::sirius_dynamic_bloom_filter::supports(col.type())) {
       nvtx3::scoped_range vr{"dynfilter::build_bloom"};
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
