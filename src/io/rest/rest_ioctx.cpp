@@ -33,17 +33,17 @@ namespace {
 /// authorizer, the staging resource) live on the reactor_context, not here; the
 /// staging resource's block size is cached as a primitive so the static
 /// prep_device_rx_request can size bounce windows without the live resource.
-rest_reactor::config build_config(long request_timeout_s,
-                                  std::string ca_bundle_path,
-                                  bool tls_verify,
-                                  std::size_t max_connections,
-                                  cucascade::memory::fixed_size_host_memory_resource* host_mr,
-                                  std::optional<std::size_t> max_retry_attempts,
-                                  std::optional<std::chrono::milliseconds> retry_backoff_base,
-                                  std::optional<std::chrono::milliseconds> retry_jitter,
-                                  std::optional<bool> honor_retry_after)
+config build_config(long request_timeout_s,
+                    std::string ca_bundle_path,
+                    bool tls_verify,
+                    std::size_t max_connections,
+                    cucascade::memory::fixed_size_host_memory_resource* host_mr,
+                    std::optional<std::size_t> max_retry_attempts,
+                    std::optional<std::chrono::milliseconds> retry_backoff_base,
+                    std::optional<std::chrono::milliseconds> retry_jitter,
+                    std::optional<bool> honor_retry_after)
 {
-  rest_reactor::config cfg;
+  config cfg;
   cfg.request_timeout_s = request_timeout_s;
   cfg.ca_bundle_path    = std::move(ca_bundle_path);
   cfg.tls_verify        = tls_verify;

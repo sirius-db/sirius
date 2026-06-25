@@ -161,14 +161,14 @@ bool is_retriable_curl(CURLcode rc) noexcept
 /// Presigned-URL TTL for a request: the whole-request timeout plus clock-skew
 /// headroom, with a sane floor so very short timeouts still leave a usable
 /// window.
-std::chrono::seconds presign_ttl(const rest_reactor::config& cfg) noexcept
+std::chrono::seconds presign_ttl(const config& cfg) noexcept
 {
   long const base = cfg.request_timeout_s > 0 ? cfg.request_timeout_s + 60 : 300;
   return std::chrono::seconds{base};
 }
 
 /// Apply per-request TLS + timeout options on top of configure_easy_handle.
-void apply_request_opts(CURL* h, const rest_reactor::config& cfg)
+void apply_request_opts(CURL* h, const config& cfg)
 {
   if (!cfg.ca_bundle_path.empty()) {
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_CAINFO, cfg.ca_bundle_path.c_str()));
@@ -235,7 +235,7 @@ std::optional<size_t> content_range_start(std::string const& cr)
 /// plus uniform jitter.
 std::chrono::milliseconds compute_backoff(std::size_t attempt,
                                           std::string const& retry_after,
-                                          const rest_reactor::config& cfg)
+                                          const config& cfg)
 {
   if (cfg.honor_retry_after && !retry_after.empty()) {
     try {

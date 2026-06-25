@@ -18,6 +18,10 @@
 #pragma once
 
 #include "exec/config.hpp"
+#include "io/cache/config.hpp"
+#include "io/object_store_config.hpp"
+#include "io/rest/config.hpp"
+#include "io/uring/config.hpp"
 
 namespace sirius::scan_manager {
 
@@ -28,33 +32,44 @@ namespace sirius::scan_manager {
  * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
  * Set to @c false to fall back to @c cudf::io::datasource::create() at
  * every read site (e.g. when the sirius IO path is misbehaving).
+ *
+ * Sub-configs:
+ *  - @c local   — uring reactor tunables (local-disk IO path).
+ *  - @c rest    — REST reactor tunables (S3/object-store IO path).
+ *  - @c cache   — prefetching cache tunables.
+ *  - @c object_store — object-store credentials and endpoint.
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
   bool use_sirius_datasource{false};
-  /// Reserved (not currently consumed). Intended size of the @c uring_reactor
-  /// pool, but the production @c uring_ioctx is built by @c SiriusContext, which
-  /// scales the reactor count with the number of GPUs the NUMA node serves
-  /// (@c clamp(4 * devices, 4, 16)) rather than reading this field. Parsed from
-  /// YAML and kept for forward compatibility / tests; setting it has no effect
-  /// on the engine today.
-  bool use_odirect{true};
-  std::size_t uring_n_reactors{4};
-  /// io_uring submission/completion queue depth per reactor.  Ignored when
-  /// @c use_sirius_datasource is false.
-  unsigned uring_ring_entries{64};
-  /// Enable the prefetching cache.  Requires @c use_sirius_datasource=true;
-  /// when true, SiriusContext (S6) allocates a pinned-host buffer_pool and
-  /// initializes the cache on the IO backends it owns (the per-NUMA urings and
-  /// the s3_ioctx).  Off by default.
+
+  /// Number of uring reactor worker threads for the local-disk IO path.
+  std::size_t uring_n_reactors{1};
+
+  /// Enable the prefetching cache on the ioctx.  When false the cache is
+  /// constructed but unarmed (no background IO threads).
   bool enable_prefetch_cache{false};
-  /// Total pinned-host bytes reserved for the prefetch cache.  Rounded
-  /// up to the nearest 500 MiB slab.  Ignored when
-  /// @c enable_prefetch_cache is false.
-  std::size_t prefetch_buffer_pool_bytes{20ULL << 30};
-  /// Maximum chunks the cache may have in flight at once (admission
-  /// control).  Ignored when @c enable_prefetch_cache is false.
-  std::size_t prefetch_inflight_budget_chunks{2048};
+
+  /// Total pinned-memory budget for the prefetch buffer pool (bytes).
+  /// Divided by the slab size to derive @c max_slabs passed to
+  /// @c initialize_cache.
+  std::size_t prefetch_buffer_pool_bytes{256UL << 20};
+
+  /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
+  /// ring depth, etc.
+  io::uring::config local{};
+
+  /// REST (S3/object-store) reactor configuration — timeouts, TLS, chunking,
+  /// retry policy, etc.
+  io::rest::config rest{};
+
+  /// Prefetching cache configuration — in-flight budget, pool sizing,
+  /// dispose-after-use policy.
+  io::cache::config cache{};
+
+  /// Object-store credentials and endpoint consumed by the REST reactor.
+  /// Empty fields disable the S3/REST backend.
+  io::object_store_config object_store{};
 };
 
 }  // namespace sirius::scan_manager

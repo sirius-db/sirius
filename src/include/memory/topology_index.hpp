@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "cucascade/memory/memory_reservation_manager.hpp"
+
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <span>
@@ -46,16 +48,14 @@ namespace sirius::memory {
 /// used when a requested device id is absent from the topology).
 class topology_index {
  public:
-  /// @brief Build the index for @p device_ids against a discovered topology.
-  /// @param topology    the system topology to resolve NUMA nodes from (copied
-  ///                    and retained).
-  /// @param device_ids  the GPU device ids to scope the index to, in the order
-  ///                    callers should iterate them (e.g. the reserved GPU
-  ///                    memory spaces).  Retained verbatim as @c gpu_ids().
+  /// @brief Build the index from explicit device ids.
+  /// @param topology    the system topology to resolve NUMA nodes from.
+  /// @param device_ids  GPU device ids to scope the index to.  NUMA nodes are
+  ///                    taken directly from the topology; ids absent from the
+  ///                    topology resolve to -1.
   topology_index(cucascade::memory::system_topology_info topology, std::vector<int> device_ids)
     : _topology(std::move(topology)), _gpu_ids(std::move(device_ids))
   {
-    // Resolve each device id's NUMA node from the topology once.
     std::unordered_map<int, int> topology_numa;
     for (auto const& gpu : _topology.gpus) {
       topology_numa[static_cast<int>(gpu.id)] = gpu.numa_node;
@@ -63,6 +63,52 @@ class topology_index {
     for (int const gpu_id : _gpu_ids) {
       auto it              = topology_numa.find(gpu_id);
       int const numa_node  = it == topology_numa.end() ? -1 : it->second;
+      _gpu_to_numa[gpu_id] = numa_node;
+      _numa_to_gpus[numa_node].push_back(gpu_id);
+    }
+  }
+
+  /// @brief Build the index by extracting device ids from a reservation manager.
+  ///
+  /// GPU ids come from GPU-tier memory spaces; host NUMA nodes (HOST-tier) are
+  /// cross-checked so a GPU's topology NUMA node is only used when a matching
+  /// HOST space exists — otherwise the GPU falls back to NUMA -1.
+  ///
+  /// @param topology  the system topology to resolve NUMA nodes from.
+  /// @param manager   reservation manager whose GPU/HOST spaces define the scope.
+  topology_index(cucascade::memory::system_topology_info topology,
+                 const cucascade::memory::memory_reservation_manager& manager)
+    : _topology(std::move(topology))
+  {
+    auto extract_ids = [](cucascade::memory::Tier tier) {
+      return [tier](const cucascade::memory::memory_reservation_manager& manager) {
+        auto spaces = manager.get_memory_spaces_for_tier(tier);
+        std::vector<int> ids;
+        ids.reserve(spaces.size());
+        std::transform(spaces.begin(), spaces.end(), std::back_inserter(ids), [](auto* space) {
+          return space->get_device_id();
+        });
+        return ids;
+      };
+    };
+
+    _gpu_ids                         = extract_ids(cucascade::memory::Tier::GPU)(manager);
+    std::vector<int> host_numa_nodes = extract_ids(cucascade::memory::Tier::HOST)(manager);
+
+    // Resolve each device id's NUMA node from the topology once.
+    std::unordered_map<int, int> topology_numa;
+    for (auto const& gpu : _topology.gpus) {
+      topology_numa[static_cast<int>(gpu.id)] = gpu.numa_node;
+    }
+    auto default_numa = -1;
+    for (int const gpu_id : _gpu_ids) {
+      auto it = topology_numa.find(gpu_id);
+      int const numa_node =
+        it == topology_numa.end() ? default_numa
+        : std::find(host_numa_nodes.begin(), host_numa_nodes.end(), it->second) !=
+            host_numa_nodes.end()
+          ? it->second
+          : default_numa;
       _gpu_to_numa[gpu_id] = numa_node;
       _numa_to_gpus[numa_node].push_back(gpu_id);
     }

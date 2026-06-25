@@ -19,7 +19,6 @@
 #include "config.hpp"
 #include "exec/config.hpp"
 #include "exec/inspectable_mpsc.hpp"
-#include "io/object_store_config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -122,9 +121,9 @@ struct sirius_config {
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
-  /// Overwrite the stored scan_manager_config. SiriusContext::initialize() uses
-  /// this to persist the S3 backend it materialized from object_store_config,
-  /// so a later get_config() reflects the actual scan_manager wiring.
+  /// Overwrite the stored scan_manager_config. Allows callers (e.g.
+  /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
+  /// get_scan_manager_config() reflects the actual scan_manager state.
   void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
@@ -150,14 +149,6 @@ struct sirius_config {
   {
     return _telemetry_config;
   }
-
-  /// Object-store backend credentials + endpoint. Empty fields disable the
-  /// S3 backend; SiriusContext::initialize() reads this to populate
-  /// scan_manager_config::s3_config before constructing the scan_manager.
-  /// Direct member access (no getter/setter) to keep the test fixture and
-  /// future SET-handler wiring simple — both sides write into this struct
-  /// and SiriusContext consumes it at initialize() time.
-  sirius::io::object_store_config object_store_config{};
 
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,

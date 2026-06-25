@@ -191,7 +191,7 @@ sirius_scan_manager::sirius_scan_manager(
   // is identical from the caller's point of view.
   if (_config.use_sirius_datasource) {
     _io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(
-      _config.uring_n_reactors, *host_mrs.front(), _config.use_odirect);
+      _config.uring_n_reactors, *host_mrs.front(), _config.local.use_odirect);
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
                      _config.uring_n_reactors);
   } else {
@@ -225,12 +225,12 @@ sirius_scan_manager::sirius_scan_manager(
     auto const max_slabs =
       static_cast<uint32_t>((_config.prefetch_buffer_pool_bytes + slab_bytes - 1) / slab_bytes);
     _io_ctx->initialize_cache(
-      reservation_manager, _config.prefetch_inflight_budget_chunks, max_slabs, _topology_index);
+      reservation_manager, _config.cache.inflight_budget_chunks, max_slabs, _topology_index);
   }
 
   if (_io_ctx->cache() && _io_ctx->cache()->is_armed()) {
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache armed (inflight_chunks={})",
-                     _config.prefetch_inflight_budget_chunks);
+                     _config.cache.inflight_budget_chunks);
   } else {
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] prefetch cache unarmed");
   }
