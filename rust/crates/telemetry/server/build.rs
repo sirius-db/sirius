@@ -5,15 +5,16 @@ use quent_ui::timeline::{
 };
 use quent_query_engine_ui::{OperatorFilter, QueryFilter};
 use quent_simulator_ui::EntityRef;
-use ts_rs::TS;
+use ts_rs::{Config, TS};
 
 const TS_OUT_DIR: &str = "./ts-bindings/";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    <QueryBundle<EntityRef> as TS>::export_all_to(TS_OUT_DIR)?;
-    <SingleTimelineRequest<QueryFilter, OperatorFilter> as TS>::export_all_to(TS_OUT_DIR)?;
-    <SingleTimelineResponse as TS>::export_all_to(TS_OUT_DIR)?;
-    <BulkTimelineRequest<QueryFilter, OperatorFilter> as TS>::export_all_to(TS_OUT_DIR)?;
-    <BulkTimelinesResponse as TS>::export_all_to(TS_OUT_DIR)?;
+    let cfg = Config::new().with_out_dir(TS_OUT_DIR);
+    <QueryBundle<EntityRef> as TS>::export_all(&cfg)?;
+    <SingleTimelineRequest<QueryFilter, OperatorFilter> as TS>::export_all(&cfg)?;
+    <SingleTimelineResponse as TS>::export_all(&cfg)?;
+    <BulkTimelineRequest<QueryFilter, OperatorFilter> as TS>::export_all(&cfg)?;
+    <BulkTimelinesResponse as TS>::export_all(&cfg)?;
     Ok(())
 }
