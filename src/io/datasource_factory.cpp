@@ -17,10 +17,23 @@
 #include "io/datasource_factory.hpp"
 
 #include "io/io_context.hpp"
+#include "io/kvikio/kvikio_context.hpp"
+#include "io/object_store_config.hpp"
+#include "io/rest/rest_ioctx.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
+#include "io/s3/static_credentials.hpp"
+#include "io/uring/uring_ioctx.hpp"
+#include "log/logging.hpp"
+#include "scan_manager/config.hpp"
 
 #include <cudf/io/datasource.hpp>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
 #include <cctype>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -45,27 +58,107 @@ std::string to_lower_scheme(std::string_view s)
   return out;
 }
 
+/// First HOST-tier pinned staging resource, or nullptr when none exists.  The
+/// uring / rest reactors stage device reads through it and size their bounce
+/// slots from its block size.
+cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
+  cucascade::memory::memory_reservation_manager& rm)
+{
+  auto host_spaces = rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (host_spaces.empty()) { return nullptr; }
+  return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+}
+
+/// Build a SigV4 authorizer from the object-store credentials, or nullptr when
+/// the store is not configured (empty endpoint / credentials / region — which
+/// disables the REST backend).  The signing form follows @c s3_signing_mode.
+std::shared_ptr<s3::s3_request_authorizer> make_s3_authorizer(const object_store_config& os)
+{
+  if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
+    return nullptr;
+  }
+  auto creds = s3::static_credentials_from(os);
+  switch (os.s3_signing_mode) {
+    case object_store_config::signing_mode::header:
+      return std::make_shared<s3::sirius_sigv4_header_authorizer>(
+        std::move(creds), os.region, os.endpoint);
+    case object_store_config::signing_mode::presigned:
+      return std::make_shared<s3::sirius_sigv4_presigned_authorizer>(
+        std::move(creds), os.region, os.endpoint);
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 using scheme_checker_type = io_context_registry::scheme_checker_type;
 using factory_type        = io_context_registry::factory_type;
 
-std::shared_ptr<io::sirius_ioctx> make_uring_ioctx(
-  const sirius::scan_manager::scan_manager_config& config)
+factory_type make_kvikio_ioctx_factory(
+  [[maybe_unused]] cucascade::memory::memory_reservation_manager& reservation_manager)
 {
-  return nullptr;
+  return [](const scan_manager::scan_manager_config&) -> std::shared_ptr<sirius_ioctx> {
+    try {
+      return std::make_shared<kvikio_context>();
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
 }
 
-std::shared_ptr<io::sirius_ioctx> make_rest_ioctx(
-  const sirius::scan_manager::scan_manager_config& config)
+factory_type make_uring_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager)
 {
-  return nullptr;
+  return [&reservation_manager](
+           const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+    try {
+      auto* host_mr = first_host_resource(reservation_manager);
+      if (host_mr == nullptr) {
+        SIRIUS_LOG_ERROR(
+          "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
+        return nullptr;
+      }
+      // One reactor_context shared by the whole pool: it carries the per-reactor
+      // config (bounce-slot size taken from the staging resource's block size)
+      // and the pinned bounce-staging resource itself.
+      auto uring_cfg        = config.local;
+      uring_cfg.bounce_size = host_mr->get_block_size();
+      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(uring_cfg, host_mr);
+      return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
 }
 
-std::shared_ptr<io::sirius_ioctx> make_kvikio_ioctx(
-  [[maybe_unused]] const sirius::scan_manager::scan_manager_config& config)
+factory_type make_rest_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager)
 {
-  return nullptr;
+  return [&reservation_manager](
+           const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+    try {
+      auto authorizer = make_s3_authorizer(config.object_store);
+      if (!authorizer) {
+        SIRIUS_LOG_WARN(
+          "make_rest_ioctx_factory: object store not configured (endpoint / credentials / "
+          "region missing); REST backend disabled");
+        return nullptr;
+      }
+      // Host staging is optional for REST — when absent, reactor-staged device
+      // reads are disabled (bounce_block_size 0), host reads still work.
+      auto* host_mr              = first_host_resource(reservation_manager);
+      auto rest_cfg              = config.rest;
+      rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
+      auto ctx                   = std::make_shared<rest::rest_reactor::reactor_context>(
+        std::move(rest_cfg), std::move(authorizer), host_mr);
+      return std::make_shared<rest::rest_ioctx>(config.uring_n_reactors, std::move(ctx));
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -78,15 +171,18 @@ io_context_registry::io_context_registry(
     _reservation_manager(reservation_manager),
     _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
 {
-  _entries.emplace(
-    io_context_type::kvikio,
-    entry{io_context_type::kvikio, [](std::string_view url) { return true; }, make_kvikio_ioctx});
-  _entries.emplace(
-    io_context_type::uring,
-    entry{io_context_type::uring, [](std::string_view url) { return true; }, make_uring_ioctx});
-  _entries.emplace(
-    io_context_type::restful,
-    entry{io_context_type::restful, [](std::string_view url) { return true; }, make_rest_ioctx});
+  _entries.emplace(io_context_type::kvikio,
+                   entry{io_context_type::kvikio,
+                         [](std::string_view url) { return true; },
+                         make_kvikio_ioctx_factory(_reservation_manager)});
+  _entries.emplace(io_context_type::uring,
+                   entry{io_context_type::uring,
+                         [](std::string_view url) { return true; },
+                         make_uring_ioctx_factory(_reservation_manager)});
+  _entries.emplace(io_context_type::restful,
+                   entry{io_context_type::restful,
+                         [](std::string_view url) { return true; },
+                         make_rest_ioctx_factory(_reservation_manager)});
 }
 
 void io_context_registry::register_ioctx(io_context_type type,

@@ -112,4 +112,35 @@ class io_context_registry {
   std::unordered_map<io_context_type, entry> _entries;
 };
 
+// ---------------------------------------------------------------------------
+// Per-backend factory builders
+// ---------------------------------------------------------------------------
+//
+// Each returns a @c factory_type closure that builds one backend ioctx from a
+// @c scan_manager_config.  The closure captures @p reservation_manager by
+// reference (it sources the HOST-tier staging resource the reactors need), so
+// @p reservation_manager must outlive every ioctx the returned factory creates.
+// The closures are @c noexcept-safe: a construction failure (missing resource,
+// unconfigured credentials, …) is logged and reported as a null ioctx rather
+// than thrown, matching @c io_context_registry::make_ioctx.
+
+/// kvikio fallback backend (cudf default datasource).  Ignores the reservation
+/// manager — kvikio owns no reactor staging — but takes it for a uniform
+/// factory-builder signature.
+io_context_registry::factory_type make_kvikio_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager);
+
+/// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
+/// @c config.local (bounce-slot size taken from the HOST-tier resource's block
+/// size) and @c config.uring_n_reactors.
+io_context_registry::factory_type make_uring_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager);
+
+/// RESTful object-store (s3://) backend.  Builds a SigV4 authorizer from
+/// @c config.object_store and a @c rest_reactor::reactor_context from
+/// @c config.rest.  Returns a null ioctx when the object store is not
+/// configured (empty endpoint / credentials / region).
+io_context_registry::factory_type make_rest_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager);
+
 }  // namespace sirius::io
