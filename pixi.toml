@@ -1,8 +1,13 @@
 [workspace]
 channels = ["rapidsai", "conda-forge" ]
 name = "sirius"
-platforms = ["linux-64", "linux-aarch64"]
-requires-pixi = ">=0.68"
+platforms = [
+  { name = "linux-64-cuda13", platform = "linux-64", cuda = "13" },
+  { name = "linux-aarch64-cuda13", platform = "linux-aarch64", cuda = "13" },
+  { name = "linux-64-cuda12", platform = "linux-64", cuda = "12" },
+  { name = "linux-aarch64-cuda12", platform = "linux-aarch64", cuda = "12" },
+]
+requires-pixi = ">=0.71"
 
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
@@ -57,9 +62,9 @@ description = "Run the Quent telemetry UI server."
 cmd = "echo 'Quent UI will be served at: http://localhost:8080' && cargo run --manifest-path rust/Cargo.toml -p sirius-telemetry-server --features ui -- --output-dir {{ output_dir }}"
 args = [{ arg = "output_dir", default = "telemetry_data" }]
 
-# CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
-[feature.cuda13.system-requirements]
-cuda = "13"
+# CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems.
+[feature.cuda13]
+platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.cuda13.dependencies]
 cuda-version = "13.2.*"
@@ -70,8 +75,8 @@ libcudf = "26.06.*"
 CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100f-real;120a-real;120"
 VCPKG_CUDA_VERSION = "13"
 
-[feature.cuda12.system-requirements]
-cuda = "12"
+[feature.cuda12]
+platforms = ["linux-64-cuda12", "linux-aarch64-cuda12"]
 
 [feature.cuda12.dependencies]
 cuda-version = "12.*"
@@ -96,6 +101,9 @@ zip = "*"
 [feature.vcpkg.activation]
 scripts = ["scripts/vcpkg.sh"]
 
+[feature.duckdb-python]
+platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
+
 [feature.duckdb-python.dependencies]
 pip = "*"
 python = "3.*"
@@ -106,8 +114,11 @@ setuptools-scm = "*"
 [feature.duckdb-python.tasks]
 build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"
 
+[feature.nightly-runner]
+platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
+
 [feature.nightly-runner.dependencies]
-pixi = "0.70.*"
+pixi = "0.71.*"
 
 [feature.nightly-runner.tasks]
 nightly-shell = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi shell --manifest-path envs/nightly/pixi.toml"

@@ -28,6 +28,11 @@ jobs:
   starrocks:
     name: starrocks
     runs-on: ubuntu-24.04
+    env:
+      # CPU runner: no GPU/driver. The workspace platforms are CUDA-pinned (the
+      # `engine` feature targets CUDA 13), so assert `__cuda` for the `cn` env to
+      # resolve even though `cn` itself is CUDA-agnostic.
+      CONDA_OVERRIDE_CUDA: "13"
     defaults:
       run:
         working-directory: experimental/starrocks
@@ -43,7 +48,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
           cache: false
-          pixi-version: v0.70.2
+          pixi-version: v0.71.1
           manifest-path: experimental/starrocks/pixi.toml
           environments: cn
 
