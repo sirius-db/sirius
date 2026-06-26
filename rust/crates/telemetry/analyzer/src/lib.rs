@@ -1,7 +1,7 @@
-use instrumentation_model::SiriusEvent;
+use instrumentation_model::{Sirius, SiriusEvent};
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
-use quent_query_engine_analyzer::ui::UiAnalyzer;
+use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
 use quent_query_engine_ui::{OperatorFilter, QueryBundle, QueryEntities, QueryFilter};
 use quent_ui::{
     FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
@@ -50,6 +50,22 @@ pub mod task;
 pub mod view;
 
 const TASK_TYPE_NAME: &str = "task";
+
+/// `quent-open` viewer entry for the Sirius model: the conventional `Viewer`
+/// path quent-open names (`sirius_telemetry_analyzer::Viewer`) to build a viewer
+/// that renders [`SiriusEvent`] streams with [`SiriusUiAnalyzer`].
+pub struct Viewer;
+
+impl QuentViewer for Viewer {
+    type Analyzer = SiriusUiAnalyzer;
+
+    fn import_events(
+        dir: &std::path::Path,
+        format: quent_model::exporter::FileSystemFormat,
+    ) -> quent_model::exporter::ImporterResult<ViewerEventStream<Self::Analyzer>> {
+        Sirius::import_events(dir, format)
+    }
+}
 
 pub struct SiriusUiAnalyzer {
     pub model: SiriusModel,

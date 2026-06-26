@@ -7,14 +7,15 @@ edition.workspace = true
 collector = ["quent-model/collector"]
 
 [dependencies]
-# Tracks a pinned commit from quent's main branch.
-quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "7f391d7065bf404cf9a1394d5227acd9ed69bf0b" }
-quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "7f391d7065bf404cf9a1394d5227acd9ed69bf0b" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "7f391d7065bf404cf9a1394d5227acd9ed69bf0b" }
-quent-stdlib = { git = "https://github.com/rapidsai/quent.git", rev = "7f391d7065bf404cf9a1394d5227acd9ed69bf0b" }
+# TEMP pin: the quent-open feature stack, hosted on the mbrobbel/quent fork
+# until it lands on quent main (revert to a rapidsai/quent main rev then).
+quent-attributes = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
+quent-model = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
+quent-query-engine-model = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
+quent-stdlib = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
 uuid = "1"
 
 [build-dependencies]
 # Captures this crate's git provenance into QUENT_SOURCE_* so the model! macro's
 # generated ModelSource records Sirius (not quent) as the model's source.
-quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "7f391d7065bf404cf9a1394d5227acd9ed69bf0b" }
+quent-build-info = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
