@@ -12,8 +12,6 @@ use crate::type_mapper;
 pub struct SlotInfo {
     /// StarRocks slot identifier from `TSlotDescriptor.id`.
     pub slot_id: i32,
-    /// Tuple that owns this slot.
-    pub parent_tuple_id: i32,
     /// Descriptor-table column position, used to preserve StarRocks output order.
     pub column_pos: i32,
     /// Stable output name for the slot, falling back to `col_<slot_id>`.
@@ -141,7 +139,6 @@ impl TryFrom<&TDescriptorTable> for DescriptorTable {
                 (parent_tuple_id, slot_id),
                 SlotInfo {
                     slot_id,
-                    parent_tuple_id,
                     column_pos: slot.column_pos.unwrap_or(slot_id),
                     col_name: slot
                         .col_name
