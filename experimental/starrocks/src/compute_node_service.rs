@@ -47,15 +47,14 @@ impl PInternalService for SiriusComputeNodeService {
         &self,
         request: PExecPlanFragmentRequest,
         attachment: Vec<u8>,
-    ) -> Result<PExecPlanFragmentResult, crate::prpc::Error> {
-        Ok(
-            match self
-                .translate_single_attachment(request.attachment_protocol.as_deref(), &attachment)
-            {
-                Ok(()) => Self::exec_plan_result(Self::ok_status()),
-                Err(err) => Self::exec_plan_result(Self::internal_error(err)),
-            },
-        )
+    ) -> Result<crate::prpc::Reply<PExecPlanFragmentResult>, crate::prpc::Error> {
+        let result = match self
+            .translate_single_attachment(request.attachment_protocol.as_deref(), &attachment)
+        {
+            Ok(()) => Self::exec_plan_result(Self::ok_status()),
+            Err(err) => Self::exec_plan_result(Self::internal_error(err)),
+        };
+        Ok(result.into())
     }
 
     /// Handles FE batch fragment dispatch by translating every per-instance fragment.
@@ -64,19 +63,18 @@ impl PInternalService for SiriusComputeNodeService {
         &self,
         request: PExecBatchPlanFragmentsRequest,
         attachment: Vec<u8>,
-    ) -> Result<PExecBatchPlanFragmentsResult, crate::prpc::Error> {
-        Ok(
-            match self
-                .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
-            {
-                Ok(()) => PExecBatchPlanFragmentsResult {
-                    status: Some(Self::ok_status()),
-                },
-                Err(err) => PExecBatchPlanFragmentsResult {
-                    status: Some(Self::internal_error(err)),
-                },
+    ) -> Result<crate::prpc::Reply<PExecBatchPlanFragmentsResult>, crate::prpc::Error> {
+        let result = match self
+            .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
+        {
+            Ok(()) => PExecBatchPlanFragmentsResult {
+                status: Some(Self::ok_status()),
             },
-        )
+            Err(err) => PExecBatchPlanFragmentsResult {
+                status: Some(Self::internal_error(err)),
+            },
+        };
+        Ok(result.into())
     }
 
     /// Infers the schema of the FILES() target so the FE can resolve the table function.
@@ -85,8 +83,8 @@ impl PInternalService for SiriusComputeNodeService {
         &self,
         _request: PGetFileSchemaRequest,
         attachment: Vec<u8>,
-    ) -> Result<PGetFileSchemaResult, crate::prpc::Error> {
-        Ok(match Self::file_schema_from_attachment(&attachment).await {
+    ) -> Result<crate::prpc::Reply<PGetFileSchemaResult>, crate::prpc::Error> {
+        let result = match Self::file_schema_from_attachment(&attachment).await {
             Ok(schema) => PGetFileSchemaResult {
                 status: Self::ok_status(),
                 schema,
@@ -95,7 +93,8 @@ impl PInternalService for SiriusComputeNodeService {
                 status: Self::internal_error(err),
                 schema: Vec::new(),
             },
-        })
+        };
+        Ok(result.into())
     }
 }
 

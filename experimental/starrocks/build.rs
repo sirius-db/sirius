@@ -113,13 +113,14 @@ impl ServiceGenerator for BrpcServiceGenerator {
             let output_type: syn::Type =
                 syn::parse_str(&method.output_type).expect("method output type should parse");
             // `+ Send` keeps the dispatch future Send so connections can be spawned; an `async fn`
-            // impl satisfies this return-position-impl-trait signature.
+            // impl satisfies this return-position-impl-trait signature. The reply is wrapped in
+            // `prpc::Reply` so a handler may attach bytes (e.g. `fetch_data`'s `TResultBatch`).
             quote! {
                 fn #method_ident(
                     &self,
                     _request: #input_type,
                     _attachment: Vec<u8>,
-                ) -> impl Future<Output = Result<#output_type, crate::prpc::Error>> + Send {
+                ) -> impl Future<Output = Result<crate::prpc::Reply<#output_type>, crate::prpc::Error>> + Send {
                     async move {
                         Err(crate::prpc::Error::method_not_implemented(methods::#const_ident))
                     }
@@ -149,8 +150,11 @@ impl ServiceGenerator for BrpcServiceGenerator {
                 ) -> Result<crate::prpc::Response, crate::prpc::Error> {
                     let request = #input_type::decode(request_bytes.as_slice())
                         .map_err(|err| crate::prpc::Error::invalid_request(methods::#const_ident, err))?;
-                    let response = inner.#method_ident(request, attachment).await?;
-                    Ok(crate::prpc::Response::new(response.encode_to_vec()))
+                    let reply = inner.#method_ident(request, attachment).await?;
+                    Ok(crate::prpc::Response::with_attachment(
+                        reply.message.encode_to_vec(),
+                        reply.attachment,
+                    ))
                 }
             }
         });

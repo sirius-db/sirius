@@ -303,7 +303,7 @@ mod tests {
         }
 
         fn call(&mut self, _request: prpc::Request) -> Self::Future {
-            ready(Ok(prpc::Response::new(Vec::new())))
+            ready(Ok(prpc::Response::with_attachment(Vec::new(), Vec::new())))
         }
     }
 
