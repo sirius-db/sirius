@@ -51,9 +51,7 @@ pub mod view;
 
 const TASK_TYPE_NAME: &str = "task";
 
-/// `quent-open` viewer entry for the Sirius model: the conventional `Viewer`
-/// path quent-open names (`sirius_telemetry_analyzer::Viewer`) to build a viewer
-/// that renders [`SiriusEvent`] streams with [`SiriusUiAnalyzer`].
+/// `quent-open` viewer entry: renders Sirius events with [`SiriusUiAnalyzer`].
 pub struct Viewer;
 
 impl QuentViewer for Viewer {

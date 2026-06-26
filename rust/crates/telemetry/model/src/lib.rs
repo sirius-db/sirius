@@ -15,7 +15,6 @@ model! {
         task::TaskQueue,
         task::TaskManagerLoopThread,
         task::ExecutorThread,
-        // Cargo package providing the `Viewer`/`QuentViewer` entry quent-open builds.
         analyzer_package: "sirius-telemetry-analyzer",
     }
 }

@@ -14,6 +14,4 @@ instrumentation-model = { path = "../model" }
 [build-dependencies]
 cxx-build = "1"
 instrumentation-model = { path = "../model" }
-# TEMP pin: the quent-open feature stack, hosted on the mbrobbel/quent fork
-# until it lands on quent main (revert to a rapidsai/quent main rev then).
-quent-codegen = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
+quent-codegen = { workspace = true }

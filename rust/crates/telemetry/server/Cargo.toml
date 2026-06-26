@@ -12,17 +12,15 @@ axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 instrumentation-model = { path = "../model", features = ["collector"] }
 sirius-telemetry-analyzer = { path = "../analyzer" }
-quent-collector = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
-quent-exporter = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
-quent-query-engine-server = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
+quent-collector = { workspace = true }
+quent-exporter = { workspace = true }
+quent-query-engine-server = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 uuid = "1"
 
 [build-dependencies]
-# TEMP pin: the quent-open feature stack, hosted on the mbrobbel/quent fork
-# until it lands on quent main (revert to a rapidsai/quent main rev then).
-quent-simulator-ui = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
-quent-query-engine-ui = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
-quent-ui = { git = "https://github.com/mbrobbel/quent.git", rev = "27052c857918885b1b79fa07df59928a0290d87f" }
+quent-simulator-ui = { workspace = true }
+quent-query-engine-ui = { workspace = true }
+quent-ui = { workspace = true }
 ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }
