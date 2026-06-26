@@ -80,9 +80,9 @@ struct operator_params {
 
   /// Wire dynamic table-filter pushdown: a hash-join build publishes a runtime membership filter
   /// (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan, which applies it
-  /// post-decode to drop non-matching rows before the join. Off by default; the master switch for
+  /// post-decode to drop non-matching rows before the join. On by default; the master switch for
   /// the feature.
-  bool enable_dynamic_filter_pushdown = false;
+  bool enable_dynamic_filter_pushdown = true;
 
   /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
   /// for READ-time row-group pruning at the probe scan. Off by default and requires

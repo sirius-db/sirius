@@ -1683,7 +1683,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "enable_dynamic_filter_pushdown",
     "Wire dynamic table-filter pushdown: a hash-join build publishes a runtime membership filter "
     "(IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan to drop non-matching rows "
-    "before the join (off by default)",
+    "before the join (on by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
     SetEnableDynamicFilterPushdown);
