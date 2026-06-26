@@ -220,11 +220,11 @@ class sirius_mask_applicable {
  * predicate, so it rides the @ref sirius_mask_applicable path: a row-level persistent-set probe
  * applied post-decode. Intended for small-to-moderate key sets; larger builds use a bloom filter.
  *
- * @note Probe keys equal to @c std::numeric_limits<std::int64_t>::min() (INT64_MIN) are treated as
- *       empty-slot sentinels by the underlying @c cuco::static_set and will not match, even if
- *       INT64_MIN was inserted into the build set. This is safe — the join remains authoritative, so
- *       a missed singleton only costs a pruning opportunity, never a false negative — but it requires
- *       that build keys never legitimately use INT64_MIN (a precondition satisfied by TPC-H-style
+ * @note A probe key equal to the key type's minimum (INT32_MIN / INT64_MIN) is treated as an
+ *       empty-slot sentinel by the underlying @c cuco::static_set and will not match, even if that
+ *       value was inserted into the build set. This is safe — the join remains authoritative, so a
+ *       missed singleton only costs a pruning opportunity, never a false negative — but it requires
+ *       that build keys never legitimately use that minimum (a precondition satisfied by TPC-H-style
  *       surrogate-key domains).
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
@@ -237,7 +237,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   ///               a partially built set).
   /// @param mr     Device memory resource backing the structure.
   ///
-  /// For supported keys (currently INT64 with no nulls, the join-key common case) the constructor
+  /// For supported keys (INT32 or INT64 with no nulls, the join-key common case) the constructor
   /// builds a persistent @c cuco::static_set ONCE; every @ref compute_mask is then a single
   /// read-only probe kernel.
   sirius_dynamic_in_list_filter(cudf::column_view const& keys,
@@ -259,7 +259,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   /// Number of build keys backing the set.
   [[nodiscard]] std::size_t size() const noexcept;
 
-  /// True when the persistent probe structure was built (INT64 fast path) — exposed for tests.
+  /// True when the persistent probe structure was built — exposed for tests.
   [[nodiscard]] bool has_persistent_set() const noexcept;
 
   /// Whether @p keys can back the persistent exact membership set.
@@ -320,7 +320,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
 
-  /// Whether a key/probe column of type @p t can back a Bloom filter (currently INT64 only).
+  /// Whether a key/probe column of type @p t can back a Bloom filter (INT32 or INT64).
   [[nodiscard]] static bool supports(cudf::data_type t) noexcept;
 
   /// Estimated device footprint (bytes) of the Bloom bit array for @p num_keys keys at this

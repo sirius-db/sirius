@@ -38,6 +38,7 @@
 #include <optional>
 #include <queue>
 #include <set>
+#include <unordered_set>
 
 namespace sirius::op::scan {
 class duckdb_scan_executor;
@@ -226,13 +227,11 @@ class task_scheduler {
   std::mutex _priority_scans_mutex;
   std::queue<op::sirius_physical_operator*> _priority_scans;
 
-  /// Leaf scans that feed a dynamic-filter-producing hash join's build port through a pure
-  /// single-edge chain (scan → partition → concat → build). Seeded at start_query alongside the
-  /// generic initial scans so the join's build-port publish hook delivers its filter BEFORE the
-  /// probe-side scan reads — without this, demand-driven task creation only reaches such chains
-  /// after the probe pipeline produces output, which is after the probe scan has fully run.
-  /// Computed per query in prepare_for_query; guarded by _priority_scans_mutex.
-  std::vector<op::sirius_physical_operator*> _eager_filter_build_scans;
+  /// Pipelines that transitively feed a dynamic-filter-producing join's build input. The
+  /// management loop dispatches their tasks ahead of others so the filter publishes before the
+  /// consuming scans drain. Set once in prepare_for_query, before the management loop runs;
+  /// read-only thereafter.
+  std::unordered_set<const sirius_pipeline*> _filter_build_pipelines;
 
   exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;

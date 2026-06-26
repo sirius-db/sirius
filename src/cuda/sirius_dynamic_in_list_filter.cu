@@ -35,45 +35,53 @@
 namespace sirius::op {
 
 namespace {
-// Sentinel marking empty slots; may never legitimately be inserted. TPC-H-style surrogate keys do
-// not use INT64_MIN; supporting arbitrary INT64 domains would require an alternate sentinel path.
-constexpr std::int64_t kEmptySentinel = std::numeric_limits<std::int64_t>::min();
-
 // Match estimated_set_bytes' 0.5 load factor: capacity = 2 × keys.
 constexpr std::size_t kCapacityFactor = 2;
 constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 
-// The number of threads to use per key probe.
+// Threads per key probe.
 constexpr std::size_t kCgSize = 1;
 
-// Minimum capacity for the set.
+// Minimum set capacity.
 constexpr std::size_t kMinCapacity = 8;
 
-// TODO: template on the key type to support other types.
-using set_alloc = sirius::rmm_cuco_allocator<std::int64_t>;
-using set_type =
-  cuco::static_set<std::int64_t,
-                   cuco::extent<std::size_t>,
-                   cuda::thread_scope_device,
-                   cuda::std::equal_to<std::int64_t>,
-                   cuco::double_hashing<kCgSize, cuco::default_hash_function<std::int64_t>>,
-                   set_alloc>;
+template <class KeyT>
+using set_alloc = sirius::rmm_cuco_allocator<KeyT>;
+
+template <class KeyT>
+using set_type = cuco::static_set<KeyT,
+                                  cuco::extent<std::size_t>,
+                                  cuda::thread_scope_device,
+                                  cuda::std::equal_to<KeyT>,
+                                  cuco::double_hashing<kCgSize, cuco::default_hash_function<KeyT>>,
+                                  set_alloc<KeyT>>;
+
+template <class KeyT>
+std::unique_ptr<set_type<KeyT>> build_set(cudf::column_view const& keys,
+                                          std::size_t capacity,
+                                          rmm::device_async_resource_ref mr,
+                                          cuda::stream_ref stream)
+{
+  std::unique_ptr<set_type<KeyT>> set(
+    new set_type<KeyT>{cuco::extent<std::size_t>{capacity},
+                       cuco::empty_key<KeyT>{std::numeric_limits<KeyT>::min()},
+                       {},
+                       {},
+                       {},
+                       {},
+                       set_alloc<KeyT>{mr},
+                       stream});
+  if (keys.size() > 0) {
+    auto const* d = keys.data<KeyT>();
+    set->insert_async(d, d + keys.size(), stream);
+  }
+  return set;
+}
 }  // namespace
 
 struct sirius_dynamic_in_list_filter::set_impl {
-  set_type set;
-
-  set_impl(std::size_t capacity, rmm::device_async_resource_ref mr, cuda::stream_ref stream)
-    : set{cuco::extent<std::size_t>{capacity},
-          cuco::empty_key<std::int64_t>{kEmptySentinel},
-          {},
-          {},
-          {},
-          {},
-          set_alloc{mr},
-          stream}
-  {
-  }
+  std::unique_ptr<set_type<std::int32_t>> s32;
+  std::unique_ptr<set_type<std::int64_t>> s64;
 };
 
 sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view const& keys,
@@ -83,25 +91,31 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
 {
   if (!supports(keys)) {
     throw std::invalid_argument(
-      "[sirius_dynamic_in_list_filter] unsupported key column (INT64 with no nulls required).");
+      "[sirius_dynamic_in_list_filter] unsupported key column (INT32/INT64, no nulls required).");
   }
 
   cuda::stream_ref const s{stream.value()};
-  _set = std::make_unique<set_impl>(
-    std::max<std::size_t>(kCapacityFactor * _num_keys, kMinCapacity), mr, s);
-  if (_num_keys > 0) {
-    auto const* d = keys.data<std::int64_t>();
-    _set->set.insert_async(d, d + _num_keys, s);
+  auto const capacity = std::max<std::size_t>(kCapacityFactor * _num_keys, kMinCapacity);
+  _set                = std::make_unique<set_impl>();
+  switch (_key_type.id()) {
+    case cudf::type_id::INT32: _set->s32 = build_set<std::int32_t>(keys, capacity, mr, s); break;
+    case cudf::type_id::INT64: _set->s64 = build_set<std::int64_t>(keys, capacity, mr, s); break;
+    default: break;  // unreachable: supports() gates the type
   }
 }
 
 bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noexcept
-{ return keys.type().id() == cudf::type_id::INT64 && keys.null_count() == 0; }
+{
+  auto const id = keys.type().id();
+  return (id == cudf::type_id::INT32 || id == cudf::type_id::INT64) && keys.null_count() == 0;
+}
 
 sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter() = default;
 
 bool sirius_dynamic_in_list_filter::has_persistent_set() const noexcept
-{ return static_cast<bool>(_set); }
+{
+  return _set && (_set->s32 || _set->s64);
+}
 
 std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   cudf::column_view const& probe,
@@ -114,8 +128,16 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
   cuda::stream_ref const s{stream.value()};
-  auto const* d = probe.data<std::int64_t>();
-  _set->set.contains_async(d, d + n, out->mutable_view().data<bool>(), s);
+  auto* const outp = out->mutable_view().data<bool>();
+
+  // probe.type() == _key_type, so the populated set matches the probe width.
+  if (_set->s32) {
+    auto const* d = probe.data<std::int32_t>();
+    _set->s32->contains_async(d, d + n, outp, s);
+  } else {
+    auto const* d = probe.data<std::int64_t>();
+    _set->s64->contains_async(d, d + n, outp, s);
+  }
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
   }

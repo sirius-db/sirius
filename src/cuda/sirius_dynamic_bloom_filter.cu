@@ -38,11 +38,7 @@
 namespace sirius::op {
 
 namespace {
-// ~16 bits/key → num_blocks ≈ keys/16, a few MB even for tens of millions of keys, with a
-// sub-percent false-positive rate. Both policies below use 256-bit blocks, so the block count is
-// the same for either. False positives are safe (they only let through a few extra probe rows,
-// which the exact join then discards); false negatives never happen, so the filter never drops a
-// true match.
+// ~16 bits/key → num_blocks ≈ keys/16
 constexpr std::size_t kBitsPerBlock     = 256;
 constexpr std::size_t kTargetBitsPerKey = 16;
 
@@ -55,41 +51,28 @@ std::size_t blocks_for(std::size_t num_keys)
 
 using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
 
-// Apache Arrow / Parquet split-block bloom filter (SBBF): 8 bits set per 256-bit block, xxhash_64 —
-// the scheme Parquet persists. It caps at max_filter_blocks (128 MiB); a filter that needs more
-// blocks uses the default cuco policy instead, which has no such cap.
-using arrow_policy   = cuco::arrow_filter_policy<std::int64_t>;
-using default_policy = cuco::default_filter_policy<cuco::xxhash_64<std::int64_t>, std::uint32_t, 8>;
+template <class KeyT>
+using arrow_policy = cuco::arrow_filter_policy<KeyT>;
+template <class KeyT>
+using default_policy = cuco::default_filter_policy<cuco::xxhash_64<KeyT>, std::uint32_t, 8>;
 
-template <class Policy>
-using bloom_filter_for = cuco::bloom_filter<std::int64_t,
-                                            cuco::extent<std::size_t>,
-                                            cuda::thread_scope_device,
-                                            Policy,
-                                            bloom_alloc>;
-using arrow_bloom   = bloom_filter_for<arrow_policy>;
-using default_bloom = bloom_filter_for<default_policy>;
+template <class KeyT, class Policy>
+using bloom_filter_for = cuco::
+  bloom_filter<KeyT, cuco::extent<std::size_t>, cuda::thread_scope_device, Policy, bloom_alloc>;
 
-// Largest block count the Arrow policy can address; above it, the default policy is used.
-constexpr std::size_t kArrowMaxBlocks = arrow_policy::max_filter_blocks;
-}  // namespace
+template <class KeyT>
+struct typed_bloom {
+  std::unique_ptr<bloom_filter_for<KeyT, arrow_policy<KeyT>>> arrow;
+  std::unique_ptr<bloom_filter_for<KeyT, default_policy<KeyT>>> standard;
 
-// Exactly one of these is populated, chosen by size. They are constructed in place (the cuco
-// bloom_filter owns device storage and is never moved through here). Arrow policy when the filter
-// fits its block cap (Parquet-compatible fingerprints); the default cuco policy otherwise, so a
-// build too large for Arrow still gets the full target bits/key.
-struct sirius_dynamic_bloom_filter::impl {
-  std::unique_ptr<arrow_bloom> arrow;
-  std::unique_ptr<default_bloom> standard;
-
-  impl(std::size_t num_blocks, rmm::device_async_resource_ref mr, cuda::stream_ref stream)
+  typed_bloom(std::size_t num_blocks, rmm::device_async_resource_ref mr, cuda::stream_ref stream)
   {
-    if (num_blocks <= kArrowMaxBlocks) {
-      arrow = std::unique_ptr<arrow_bloom>(
-        new arrow_bloom{cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
+    if (num_blocks <= arrow_policy<KeyT>::max_filter_blocks) {
+      arrow.reset(new bloom_filter_for<KeyT, arrow_policy<KeyT>>{
+        cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
     } else {
-      standard = std::unique_ptr<default_bloom>(
-        new default_bloom{cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
+      standard.reset(new bloom_filter_for<KeyT, default_policy<KeyT>>{
+        cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
     }
   }
 
@@ -103,10 +86,17 @@ struct sirius_dynamic_bloom_filter::impl {
     }
   }
 };
+}  // namespace
+
+// Exactly one typed Bloom is populated, chosen by the key width.
+struct sirius_dynamic_bloom_filter::impl {
+  std::unique_ptr<typed_bloom<std::int32_t>> b32;
+  std::unique_ptr<typed_bloom<std::int64_t>> b64;
+};
 
 bool sirius_dynamic_bloom_filter::supports(cudf::data_type t) noexcept
 {
-  return t.id() == cudf::type_id::INT64;
+  return t.id() == cudf::type_id::INT32 || t.id() == cudf::type_id::INT64;
 }
 
 std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) noexcept
@@ -121,16 +111,30 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
 {
   if (!supports(keys.type())) {
     throw std::invalid_argument(
-      "[sirius_dynamic_bloom_filter] unsupported key type (INT64 only for now).");
+      "[sirius_dynamic_bloom_filter] unsupported key type (INT32 or INT64).");
   }
   auto const n = static_cast<std::size_t>(keys.size());
   cuda::stream_ref const s{stream.value()};
-  _impl = std::make_unique<impl>(blocks_for(n), mr, s);
+  auto const num_blocks = blocks_for(n);
+  _impl                 = std::make_unique<impl>();
 
-  // Insert every build key. The build join keys are non-null (FK/PK); a null position would only
-  // add a stray fingerprint, which costs a negligible false-positive bump, never correctness.
-  auto const* d = keys.data<std::int64_t>();
-  _impl->with([&](auto& f) { f.add(d, d + n, s); });
+  // Insert every build key. Build keys are non-null (FK/PK); a null slot would only add a stray
+  // fingerprint — a negligible false-positive bump, never a dropped match.
+  switch (keys.type().id()) {
+    case cudf::type_id::INT32: {
+      _impl->b32    = std::make_unique<typed_bloom<std::int32_t>>(num_blocks, mr, s);
+      auto const* d = keys.data<std::int32_t>();
+      _impl->b32->with([&](auto& f) { f.add(d, d + n, s); });
+      break;
+    }
+    case cudf::type_id::INT64: {
+      _impl->b64    = std::make_unique<typed_bloom<std::int64_t>>(num_blocks, mr, s);
+      auto const* d = keys.data<std::int64_t>();
+      _impl->b64->with([&](auto& f) { f.add(d, d + n, s); });
+      break;
+    }
+    default: break;  // unreachable: supports() gates the type
+  }
 }
 
 sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter() = default;
@@ -144,13 +148,24 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   auto const n = probe.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-
   cuda::stream_ref const s{stream.value()};
-  auto const* d = probe.data<std::int64_t>();
-  // true where the probe key's fingerprint is present — a superset of the true matches (false
-  // positives allowed). Querying garbage at null positions is harmless; their rows are dropped via
-  // the carried-over null mask below.
-  _impl->with([&](auto& f) { f.contains(d, d + n, out->mutable_view().data<bool>(), s); });
+  auto* const outp = out->mutable_view().data<bool>();
+
+  switch (probe.type().id()) {
+    case cudf::type_id::INT32: {
+      if (!_impl->b32) { return nullptr; }
+      auto const* d = probe.data<std::int32_t>();
+      _impl->b32->with([&](auto& f) { f.contains(d, d + n, outp, s); });
+      break;
+    }
+    case cudf::type_id::INT64: {
+      if (!_impl->b64) { return nullptr; }
+      auto const* d = probe.data<std::int64_t>();
+      _impl->b64->with([&](auto& f) { f.contains(d, d + n, outp, s); });
+      break;
+    }
+    default: return nullptr;
+  }
 
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());

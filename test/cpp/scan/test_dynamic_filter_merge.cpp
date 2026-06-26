@@ -522,6 +522,55 @@ TEST_CASE("sirius_dynamic_bloom_filter never drops a true match (no false negati
   REQUIRE(table->num_rows() == 10);
 }
 
+TEST_CASE("sirius_dynamic_in_list_filter supports INT32 keys exactly",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  // INT32 build key set {0,1,2,3,4}; INT32 probe [0..9]. Exact membership keeps exactly {0,1,2,3,4}.
+  auto keys   = cudf::sequence(5,
+                             cudf::numeric_scalar<int32_t>(0, true, stream),
+                             cudf::numeric_scalar<int32_t>(1, true, stream),
+                             stream);
+  auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+    keys->view(), stream, cudf::get_current_device_resource_ref());
+  REQUIRE(filter->has_persistent_set());  // INT32, non-null keys → persistent-set fast path
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, filter);
+
+  auto table = make_sequence_table(10, stream);  // INT32 [0..9]
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(to_host_int32(out->view().column(0), stream) == std::vector<int32_t>{0, 1, 2, 3, 4});
+}
+
+TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negatives",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  auto keys   = cudf::sequence(5,
+                             cudf::numeric_scalar<int32_t>(0, true, stream),
+                             cudf::numeric_scalar<int32_t>(1, true, stream),
+                             stream);
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0,
+                      std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+                        keys->view(), stream, cudf::get_current_device_resource_ref()));
+
+  auto table = make_sequence_table(10, stream);  // INT32 [0..9]
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  // Build keys {0..4} all precede any false positive (which can only come from {5..9}), so the
+  // first five survivors must be exactly the keys — proving no false negative.
+  auto const survivors = to_host_int32(out->view().column(0), stream);
+  REQUIRE(survivors.size() >= 5);
+  REQUIRE(survivors.size() <= 10);
+  REQUIRE(std::vector<int32_t>(survivors.begin(), survivors.begin() + 5) ==
+          std::vector<int32_t>{0, 1, 2, 3, 4});
+}
+
 //===----------------------------------------------------------------------===//
 // apply_dynamic_filters_to_view — view-based core (pinned cached path)
 //===----------------------------------------------------------------------===//

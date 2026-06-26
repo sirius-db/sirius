@@ -1307,12 +1307,36 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
   std::vector<std::shared_ptr<sirius_dynamic_filter const>> per_key_membership(
     filter_pushdown->join_condition.size());
 
+  // Read a numeric scalar to host as a double for the zone-map range-coverage gate. Returns nullopt
+  // for non-numeric keys (the gate is then skipped and the zone-map is published).
+  auto scalar_to_double = [stream](cudf::scalar const& s) -> std::optional<double> {
+    switch (s.type().id()) {
+      case cudf::type_id::INT8:
+        return static_cast<double>(static_cast<cudf::numeric_scalar<std::int8_t> const&>(s).value(stream));
+      case cudf::type_id::INT16:
+        return static_cast<double>(static_cast<cudf::numeric_scalar<std::int16_t> const&>(s).value(stream));
+      case cudf::type_id::INT32:
+        return static_cast<double>(static_cast<cudf::numeric_scalar<std::int32_t> const&>(s).value(stream));
+      case cudf::type_id::INT64:
+        return static_cast<double>(static_cast<cudf::numeric_scalar<std::int64_t> const&>(s).value(stream));
+      case cudf::type_id::UINT8:
+        return static_cast<double>(static_cast<cudf::numeric_scalar<std::uint8_t> const&>(s).value(stream));
+      case cudf::type_id::UINT16:
+        return static_cast<double>(static_cast<cudf::numeric_scalar<std::uint16_t> const&>(s).value(stream));
+      case cudf::type_id::UINT32:
+        return static_cast<double>(static_cast<cudf::numeric_scalar<std::uint32_t> const&>(s).value(stream));
+      case cudf::type_id::UINT64:
+        return static_cast<double>(static_cast<cudf::numeric_scalar<std::uint64_t> const&>(s).value(stream));
+      default:
+        return std::nullopt;
+    }
+  };
+
   for (std::size_t k = 0; k < filter_pushdown->join_condition.size(); ++k) {
     auto const cond_idx = filter_pushdown->join_condition[k];
     // Skip cast keys: the build-side scalar / membership set is built in the build column's type
     // (col.type() below), but the consumer lowers it against the probe column's storage type;
-    // casting it across would need a separate code path. Pushdown is opportunistic — skipping a
-    // key here just leaves that column unpruned (the join stays authoritative).
+    // casting it across would need a separate code path.
     if (cond_idx < key_casts.size() && key_casts[cond_idx].cast_right) {
       SIRIUS_LOG_DEBUG(
         "[sirius_physical_hash_join] dynamic filter key {}: skipped (cast on build key "
@@ -1341,10 +1365,34 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
                                 stream,
                                 allocator_ref);
       if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
-        std::vector<sirius::op::zone_map_entry> zones;
-        zones.push_back({std::move(min_s), std::move(max_s)});
-        per_key_zone_map[k] =
-          std::make_shared<sirius::op::sirius_dynamic_zone_map_filter>(std::move(zones));
+        // Range-coverage publication gate (the zone-map analogue of the cardinality gate above):
+        // a [min,max] spanning most of the build key's domain prunes nothing, so skip it.
+        bool publish_zone_map = true;
+        if (build_key_domain_cardinality > 0) {
+          auto const lo = scalar_to_double(*min_s);
+          auto const hi = scalar_to_double(*max_s);
+          if (lo && hi) {
+            auto const coverage =
+              (*hi - *lo + 1.0) / static_cast<double>(build_key_domain_cardinality);
+            if (coverage >= k_publish_domain_coverage_threshold) {
+              SIRIUS_LOG_DEBUG(
+                "[sirius_physical_hash_join] zone-map key {}: skipped (range [{},{}] covers {:.2f} "
+                "of key domain ~{}).",
+                k,
+                *lo,
+                *hi,
+                coverage,
+                build_key_domain_cardinality);
+              publish_zone_map = false;
+            }
+          }
+        }
+        if (publish_zone_map) {
+          std::vector<sirius::op::zone_map_entry> zones;
+          zones.push_back({std::move(min_s), std::move(max_s)});
+          per_key_zone_map[k] =
+            std::make_shared<sirius::op::sirius_dynamic_zone_map_filter>(std::move(zones));
+        }
       }
     }
 
@@ -1381,9 +1429,7 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
   }
 
   // Publish is cross-stream: consumers probe these structures from their own task streams the
-  // moment push_filter lands, with no event ordering back to `stream`. Drain the build kernels
-  // first so a consumer can never read a partially built key set / bit array — or zone-map
-  // min/max device scalars whose reduce() has not yet completed on `stream`.
+  // moment push_filter lands, with no event ordering back to `stream`.
   auto const built = [](auto const& f) { return static_cast<bool>(f); };
   if (std::any_of(per_key_membership.begin(), per_key_membership.end(), built) ||
       std::any_of(per_key_zone_map.begin(), per_key_zone_map.end(), built)) {
@@ -1397,13 +1443,6 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
     if (!target_accepts_filters(tgt)) { continue; }
     ++active_targets;
 
-    // probe_col_idx and per_key_* are both indexed in filter_pushdown->join_condition order:
-    // DuckDB builds JoinFilterPushdownInfo::join_condition and each target's `columns` in lockstep
-    // (join_filter_pushdown_optimizer.cpp:249-250) and GetPushdownFilterTargets propagates
-    // `columns` all-or-nothing — never dropping/reordering an entry — so pi.columns[k] is the
-    // consumer column for join_condition[k]. If a DuckDB bump ever breaks that, a misaligned push
-    // would route a filter to the wrong column and drop true-matching rows; degrade to no pruning
-    // rather than that.
     if (tgt.probe_col_idx.size() != per_key_membership.size()) {
       SIRIUS_LOG_WARN(
         "[sirius_physical_hash_join] dynamic-filter column mismatch (probe_col_idx={} keys={}); "

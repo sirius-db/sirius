@@ -173,60 +173,60 @@ void task_scheduler::set_scan_caching_config(sirius::op::scan::cache_level level
 
 namespace {
 
-/// Collect leaf scans that feed a dynamic-filter-producing hash join's BUILD port through a
-/// pure chain: every hop is a pipeline with a single input whose sink has a single output edge
-/// (scan → PARTITION → CONCAT → join.build). Such a chain has no probe-side dependence, so
-/// running it first does no work that would not run anyway — it only moves the work earlier,
-/// which lets the join's build-port publish hook (push_data_batch_partitioned) deliver its
-/// membership filter before the probe-side scan claims its splits. Without this, demand-driven
-/// task creation reaches the chain only after the probe pipeline emits output — after the probe
-/// scan has fully run — making the filter a deterministic no-op (the Q8 part→lineitem case; see
-/// docs/super-sirius/dynamic-filters.md "Q8 deep-dive findings").
-std::vector<op::sirius_physical_operator*> collect_eager_filter_build_scans(
+/// Collect the pipelines that transitively feed a dynamic-filter-producing join's build input.
+/// The management loop dispatches their tasks ahead of others so the filter publishes before the
+/// consuming scans drain. The walk follows build-input edges backward from each producing join,
+/// passing through any intervening joins.
+std::unordered_set<const sirius_pipeline*> collect_filter_build_pipelines(
   planner::query const& query)
 {
   auto const& pipelines = query.get_pipelines();
 
-  // Pipeline lookup by the operator that receives a sink's output (the downstream pipeline's
-  // first executable operator). Register every operator: fused chains keep intermediate
-  // operators inside one pipeline, and next_port_info points at the receiving operator.
-  std::unordered_map<op::sirius_physical_operator const*, sirius_pipeline*> pipeline_of;
+  // Reverse edges: a receiving (operator, port) maps to the pipelines whose sink feeds it.
+  struct in_edge {
+    std::string_view port;
+    sirius_pipeline* from;
+  };
+  std::unordered_map<op::sirius_physical_operator const*, std::vector<in_edge>> incoming;
+  for (auto const& p : pipelines) {
+    auto sink = p->get_sink();
+    if (!sink) { continue; }
+    for (auto const& next : sink->get_next_ports_after_sink()) {
+      if (next.next_operator) {
+        incoming[next.next_operator].push_back({next.next_operator_port_name, p.get()});
+      }
+    }
+  }
+
+  // Seed the walk with the build port of every filter-producing join.
+  std::vector<std::pair<op::sirius_physical_operator const*, std::string_view>> work;
   for (auto const& p : pipelines) {
     for (auto const& op_ref : p->get_operators()) {
-      pipeline_of.emplace(&op_ref.get(), p.get());
-    }
-    if (auto sink = p->get_sink()) { pipeline_of.emplace(sink.get(), p.get()); }
-  }
-
-  std::vector<op::sirius_physical_operator*> eager;
-  for (auto* scan : query.get_scan_operators()) {
-    auto it = pipeline_of.find(scan);
-    if (it == pipeline_of.end()) { continue; }
-    auto* pipeline = it->second;
-
-    // Walk single-edge hops; depth-bounded for safety (chains are scan/partition/concat-sized).
-    constexpr int k_max_chain_hops = 8;
-    for (int hop = 0; pipeline && hop < k_max_chain_hops; ++hop) {
-      auto sink = pipeline->get_sink();
-      if (!sink) { break; }
-      auto const& nexts = sink->get_next_ports_after_sink();
-      if (nexts.size() != 1 || !nexts[0].next_operator) { break; }
-      auto* next_op = nexts[0].next_operator;
-
-      if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(next_op)) {
-        if (nexts[0].next_operator_port_name == "build" && !join->probe_targets.empty()) {
-          eager.push_back(scan);
-        }
-        break;  // any join port ends the chain — probe-side edges are not eligible
+      auto* join = dynamic_cast<op::sirius_physical_hash_join*>(&op_ref.get());
+      if (join && !join->probe_targets.empty()) {
+        work.emplace_back(&op_ref.get(), std::string_view{"build"});
       }
-
-      // A multi-input receiver means the chain merges with another dependence — stop.
-      if (next_op->get_port_ids().size() != 1) { break; }
-      auto next_it = pipeline_of.find(next_op);
-      pipeline     = next_it != pipeline_of.end() ? next_it->second : nullptr;
     }
   }
-  return eager;
+
+  // Add each feeding pipeline, then recurse into its source operator's input ports.
+  std::unordered_set<const sirius_pipeline*> result;
+  while (!work.empty()) {
+    auto [node, port] = work.back();
+    work.pop_back();
+    auto it = incoming.find(node);
+    if (it == incoming.end()) { continue; }
+    for (auto const& edge : it->second) {
+      if (edge.port != port) { continue; }
+      if (!result.insert(edge.from).second) { continue; }
+      auto source = edge.from->get_source();
+      if (!source) { continue; }
+      for (auto const& source_port : source->get_port_ids()) {
+        work.emplace_back(source.get(), source_port);
+      }
+    }
+  }
+  return result;
 }
 
 }  // namespace
@@ -254,7 +254,7 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   for (auto* scan : scans) {
     _priority_scans.push(scan);
   }
-  _eager_filter_build_scans = collect_eager_filter_build_scans(*query);
+  _filter_build_pipelines = collect_filter_build_pipelines(*query);
 }
 
 std::future<void> task_scheduler::start_query()
@@ -270,32 +270,12 @@ std::future<void> task_scheduler::start_query()
   }
 
   constexpr int k_initial_scans = 2;
-  // Cap on eager filter-build seeds: these chains run regardless (seeding only moves them
-  // earlier), but each adds a concurrent scan working set, and k_initial_scans exists to bound
-  // exactly that. Wired build chains are dimension-sized in practice; four covers every TPC-H
-  // shape while keeping the bound meaningful.
-  constexpr int k_eager_filter_build_scans = 4;
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
 
-  // Seed filter-producing build chains FIRST: their publish unblocks probe-side pruning, and
-  // they are the cheapest pipelines in the query.
-  std::unordered_set<op::sirius_physical_operator*> seeded;
-  int eager_count = 0;
-  for (auto* scan_op : _eager_filter_build_scans) {
-    if (eager_count >= k_eager_filter_build_scans) { break; }
-    if (!seeded.insert(scan_op).second) { continue; }
-    SIRIUS_LOG_INFO("[task_scheduler] eager-seeding dynamic-filter build-chain scan (op_id={}).",
-                    scan_op->get_operator_id());
-    _task_creator->schedule(scan_op);
-    ++eager_count;
-  }
-
-  for (int i = 0; i < k_initial_scans && !_priority_scans.empty();) {
+  for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
     auto* scan_op = _priority_scans.front();
     _priority_scans.pop();
-    if (!seeded.insert(scan_op).second) { continue; }  // already eager-seeded — try the next scan
     _task_creator->schedule(scan_op);
-    ++i;
   }
 
   return future;
@@ -445,15 +425,36 @@ void task_scheduler::management_eventloop()
     // binding to guarantee correctness.
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
-      // First try exact preference match.
-      auto task = _task_queue.pop_if(
-        [device_id](const sirius::parallel::itask& t) -> bool {
-          const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
-          if (!gpu_task) { return false; }
-          auto pref = gpu_task->get_preferred_device_id();
-          return pref.has_value() && pref.value() == device_id;
-        },
-        /*front_to_back=*/true);
+      std::unique_ptr<sirius::parallel::itask> task;
+
+      // Prefer tasks from pipelines feeding a dynamic-filter-producing join's build input, so the
+      // filter publishes before the consuming scans drain. Falls through to normal dispatch when
+      // none are queued, so it never starves other work.
+      if (!_filter_build_pipelines.empty()) {
+        task = _task_queue.pop_if(
+          [this, device_id](const sirius::parallel::itask& t) -> bool {
+            const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
+            if (!gpu_task || _filter_build_pipelines.count(gpu_task->get_pipeline()) == 0) {
+              return false;
+            }
+            auto pref = gpu_task->get_preferred_device_id();
+            return !pref.has_value() || pref.value() == device_id ||
+                   _gpu_executors.count(pref.value()) == 0;
+          },
+          /*front_to_back=*/true);
+      }
+
+      // Exact preference match.
+      if (!task) {
+        task = _task_queue.pop_if(
+          [device_id](const sirius::parallel::itask& t) -> bool {
+            const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
+            if (!gpu_task) { return false; }
+            auto pref = gpu_task->get_preferred_device_id();
+            return pref.has_value() && pref.value() == device_id;
+          },
+          /*front_to_back=*/true);
+      }
       if (!task) {
         // Fallback: take the first task with NO preference, or whose preferred
         // device does not exist in _gpu_executors (a stale preference from a

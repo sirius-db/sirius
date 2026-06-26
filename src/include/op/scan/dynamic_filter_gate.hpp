@@ -55,14 +55,13 @@ class dynamic_filter_gate {
                          std::size_t observed_filter_count);
 
   //===--------------------------------------------------------------------===//
-  // Per-filter marginal usefulness (Vertica-style adaptive evaluation)
+  // Per-filter marginal usefulness
   //===--------------------------------------------------------------------===//
-  // The scan-level gate above answers "is applying ANYTHING here worth it"; these answer "is
-  // THIS filter still earning its mask". The apply cascades filters most-selective-first and
-  // records each filter's marginal keep ratio (its drop on the rows that survived the filters
-  // before it) the first time it participates. A filter whose marginal keep exceeds the skip
-  // threshold is dropped from later splits — it cannot prune enough to repay its per-split mask
-  // kernel. Skipping is always safe: the join remains authoritative.
+  // The scan-level gate above decides whether applying anything is worth it; these decide whether
+  // one filter still earns its mask. The apply cascades filters most-selective-first and records
+  // each filter's marginal keep ratio (its drop on the rows surviving the filters before it). A
+  // filter whose marginal keep exceeds the skip threshold is dropped from later splits. Skipping is
+  // safe: the join is authoritative.
 
   /// Marginal keep ratio recorded for @p filter, or nullopt while unmeasured.
   [[nodiscard]] std::optional<double> filter_keep_ratio(
@@ -80,9 +79,9 @@ class dynamic_filter_gate {
  private:
   enum class state { unknown, active, disabled };
 
-  /// Per-filter skip threshold (Vertica uses ~0.9): a filter keeping more than this fraction of
-  /// the rows it sees prunes too little to repay computing its mask on every split.
-  static constexpr double k_filter_skip_keep_threshold = 0.9;
+  /// A filter that keeps more than this fraction of the rows it sees prunes too little to repay
+  /// its per-split mask kernel, so it is dropped from later splits.
+  static constexpr double k_filter_skip_keep_threshold = 0.5;
 
   std::atomic<state> _state{state::unknown};
 
