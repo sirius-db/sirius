@@ -142,7 +142,7 @@ fn translate_slot_ref(
     })?;
     let field = ctx
         .desc
-        .slot_global_index(slot_ref.slot_id, ctx.row_tuples)? as i32;
+        .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)? as i32;
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(
