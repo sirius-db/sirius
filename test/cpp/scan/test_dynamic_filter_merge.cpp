@@ -46,8 +46,8 @@ using sirius::op::sirius_dynamic_filter_kind;
 using sirius::op::sirius_dynamic_filter_set;
 using sirius::op::sirius_dynamic_zone_map_filter;
 using sirius::op::zone_map_entry;
-using sirius::op::scan::merge_dynamic_filters_into_ast;
 using sirius::op::scan::dynamic_filter_apply_mode;
+using sirius::op::scan::merge_dynamic_filters_into_ast;
 using sirius::op::scan::scan_plan;
 
 namespace {
@@ -66,9 +66,12 @@ std::shared_ptr<sirius_dynamic_zone_map_filter> make_zone_map(int32_t lo, int32_
 }
 
 /// Zone-map with explicit boundary inclusivity, so the exclusive GREATER / LESS lowering branches
-/// (sirius_dynamic_filter.cpp) get exercised — the default helper above only builds inclusive bounds.
-std::shared_ptr<sirius_dynamic_zone_map_filter>
-make_zone_map(int32_t lo, int32_t hi, bool inclusive_min, bool inclusive_max)
+/// (sirius_dynamic_filter.cpp) get exercised — the default helper above only builds inclusive
+/// bounds.
+std::shared_ptr<sirius_dynamic_zone_map_filter> make_zone_map(int32_t lo,
+                                                              int32_t hi,
+                                                              bool inclusive_min,
+                                                              bool inclusive_max)
 {
   std::vector<zone_map_entry> zones;
   zones.push_back({make_int32_scalar(lo), make_int32_scalar(hi)});
@@ -284,11 +287,12 @@ std::vector<int32_t> to_host_int32(cudf::column_view const& col, rmm::cuda_strea
 
 /// Build a zone-map-*only* filter (no membership) the way the hash-join producer does: reduce the
 /// build column's min/max into device scalars on `stream`. A large build whose membership structure
-/// doesn't fit L2 emits exactly this — the path whose missing build-stream sync produced cross-stream
-/// false negatives (Q8/Q9/Q17 with enable_dynamic_zone_map_filter). The producer's drain-before-publish
-/// is the structural guard; this exercises the zone-map-only correctness (bounds, column, superset).
-std::shared_ptr<sirius_dynamic_zone_map_filter>
-make_zone_map_from_reduce(cudf::column_view const& build_col, rmm::cuda_stream_view stream)
+/// doesn't fit L2 emits exactly this — the path whose missing build-stream sync produced
+/// cross-stream false negatives (Q8/Q9/Q17 with enable_dynamic_zone_map_filter). The producer's
+/// drain-before-publish is the structural guard; this exercises the zone-map-only correctness
+/// (bounds, column, superset).
+std::shared_ptr<sirius_dynamic_zone_map_filter> make_zone_map_from_reduce(
+  cudf::column_view const& build_col, rmm::cuda_stream_view stream)
 {
   auto mr    = cudf::get_current_device_resource_ref();
   auto min_s = cudf::reduce(build_col,
@@ -526,7 +530,8 @@ TEST_CASE("sirius_dynamic_in_list_filter supports INT32 keys exactly",
           "[dynamic_filter][scan_merge]")
 {
   auto stream = cudf::get_default_stream();
-  // INT32 build key set {0,1,2,3,4}; INT32 probe [0..9]. Exact membership keeps exactly {0,1,2,3,4}.
+  // INT32 build key set {0,1,2,3,4}; INT32 probe [0..9]. Exact membership keeps exactly
+  // {0,1,2,3,4}.
   auto keys   = cudf::sequence(5,
                              cudf::numeric_scalar<int32_t>(0, true, stream),
                              cudf::numeric_scalar<int32_t>(1, true, stream),
@@ -717,7 +722,7 @@ TEST_CASE("cascaded membership filters produce the conjunction of all filters",
   filters.push_filter(0, make_in_list_prefix(4, stream));  // keeps 0..3
 
   auto table = make_int64_sequence_table(10, stream);
-  auto out = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
   stream.synchronize();
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 4);  // 0..3 — intersection regardless of cascade order

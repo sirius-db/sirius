@@ -171,6 +171,9 @@ void task_scheduler::set_scan_caching_config(sirius::op::scan::cache_level level
   _scan_executor->set_scan_caching_enabled(level);
 }
 
+//===----------------------------------------------------------------------===//
+// Dynamic table filters
+//===----------------------------------------------------------------------===//
 namespace {
 
 /// Collect the pipelines that transitively feed a dynamic-filter-producing join's build input.
@@ -230,6 +233,7 @@ std::unordered_set<const sirius_pipeline*> collect_filter_build_pipelines(
 }
 
 }  // namespace
+//===----------------------------------------------------------------------===//
 
 void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {

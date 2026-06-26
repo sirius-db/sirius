@@ -50,7 +50,7 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
       auto const& col_ref  = tree.emplace<cudf::ast::column_name_reference>(parquet_col_name);
       auto const& fragment = lowerable->to_ast(tree, col_ref);
       root                 = root ? &tree.emplace<cudf::ast::operation>(
-                                      cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
+                      cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
                                   : &fragment;
     }
   }
@@ -101,7 +101,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
         }
         auto const& fragment = lowerable->to_ast(tree, *col_ref);
         root                 = root ? &tree.emplace<cudf::ast::operation>(
-                                        cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
+                        cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
                                     : &fragment;
       }
     }

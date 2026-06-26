@@ -130,9 +130,10 @@ TEST_CASE_METHOD(router_fixture,
   REQUIRE(channel->empty());
 }
 
-TEST_CASE_METHOD(router_fixture,
-                 "get_or_create_dynamic_filter_channel hands out no channel when pushdown is disabled",
-                 "[dynamic_filter][router]")
+TEST_CASE_METHOD(
+  router_fixture,
+  "get_or_create_dynamic_filter_channel hands out no channel when pushdown is disabled",
+  "[dynamic_filter][router]")
 {
   set_pushdown_enabled(false);
   sirius_physical_plan_generator gen(*con.context);

@@ -52,7 +52,9 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
   /// Filtering only shrinks or passes through its input, never expands it — reserve at most the
   /// input footprint rather than the base 2× expansion default.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override
-  { return stats.bytes; }
+  {
+    return stats.bytes;
+  }
 
  private:
   /// The producer/consumer rendezvous channel; co-owned with the producing hash-join build.

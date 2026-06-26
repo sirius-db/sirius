@@ -36,9 +36,9 @@ namespace sirius::op::scan {
 /// @brief Per-scan selectivity gate for post-decode dynamic filters.
 ///
 /// Used by @ref apply_dynamic_filters_gated_view. The first applied non-empty batch decides:
-/// filters that keep more than 25% of rows are disabled for the scan; selective filters stay active.
-/// If more filters publish after a disable decision, the gate re-arms and measures once more.
-/// Concurrent batches may both measure during re-arm; that only costs redundant work.
+/// filters that keep more than 25% of rows are disabled for the scan; selective filters stay
+/// active. If more filters publish after a disable decision, the gate re-arms and measures once
+/// more. Concurrent batches may both measure during re-arm; that only costs redundant work.
 class dynamic_filter_gate {
  public:
   /// True when a gated apply would do work now: at least one filter has published, and the gate is
@@ -74,7 +74,9 @@ class dynamic_filter_gate {
 
   /// True when @p kept marks a filter as not worth its per-split mask kernel.
   [[nodiscard]] static constexpr bool filter_skippable(double kept) noexcept
-  { return kept > k_filter_skip_keep_threshold; }
+  {
+    return kept > k_filter_skip_keep_threshold;
+  }
 
  private:
   enum class state { unknown, active, disabled };

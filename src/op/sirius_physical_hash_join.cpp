@@ -1312,23 +1312,30 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
   auto scalar_to_double = [stream](cudf::scalar const& s) -> std::optional<double> {
     switch (s.type().id()) {
       case cudf::type_id::INT8:
-        return static_cast<double>(static_cast<cudf::numeric_scalar<std::int8_t> const&>(s).value(stream));
+        return static_cast<double>(
+          static_cast<cudf::numeric_scalar<std::int8_t> const&>(s).value(stream));
       case cudf::type_id::INT16:
-        return static_cast<double>(static_cast<cudf::numeric_scalar<std::int16_t> const&>(s).value(stream));
+        return static_cast<double>(
+          static_cast<cudf::numeric_scalar<std::int16_t> const&>(s).value(stream));
       case cudf::type_id::INT32:
-        return static_cast<double>(static_cast<cudf::numeric_scalar<std::int32_t> const&>(s).value(stream));
+        return static_cast<double>(
+          static_cast<cudf::numeric_scalar<std::int32_t> const&>(s).value(stream));
       case cudf::type_id::INT64:
-        return static_cast<double>(static_cast<cudf::numeric_scalar<std::int64_t> const&>(s).value(stream));
+        return static_cast<double>(
+          static_cast<cudf::numeric_scalar<std::int64_t> const&>(s).value(stream));
       case cudf::type_id::UINT8:
-        return static_cast<double>(static_cast<cudf::numeric_scalar<std::uint8_t> const&>(s).value(stream));
+        return static_cast<double>(
+          static_cast<cudf::numeric_scalar<std::uint8_t> const&>(s).value(stream));
       case cudf::type_id::UINT16:
-        return static_cast<double>(static_cast<cudf::numeric_scalar<std::uint16_t> const&>(s).value(stream));
+        return static_cast<double>(
+          static_cast<cudf::numeric_scalar<std::uint16_t> const&>(s).value(stream));
       case cudf::type_id::UINT32:
-        return static_cast<double>(static_cast<cudf::numeric_scalar<std::uint32_t> const&>(s).value(stream));
+        return static_cast<double>(
+          static_cast<cudf::numeric_scalar<std::uint32_t> const&>(s).value(stream));
       case cudf::type_id::UINT64:
-        return static_cast<double>(static_cast<cudf::numeric_scalar<std::uint64_t> const&>(s).value(stream));
-      default:
-        return std::nullopt;
+        return static_cast<double>(
+          static_cast<cudf::numeric_scalar<std::uint64_t> const&>(s).value(stream));
+      default: return std::nullopt;
     }
   };
 

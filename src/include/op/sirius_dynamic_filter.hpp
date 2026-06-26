@@ -224,8 +224,8 @@ class sirius_mask_applicable {
  *       empty-slot sentinel by the underlying @c cuco::static_set and will not match, even if that
  *       value was inserted into the build set. This is safe — the join remains authoritative, so a
  *       missed singleton only costs a pruning opportunity, never a false negative — but it requires
- *       that build keys never legitimately use that minimum (a precondition satisfied by TPC-H-style
- *       surrogate-key domains).
+ *       that build keys never legitimately use that minimum (a precondition satisfied by
+ * TPC-H-style surrogate-key domains).
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable {

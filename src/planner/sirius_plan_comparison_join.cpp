@@ -297,7 +297,7 @@ build_side_filter_evidence inspect_build_side_for_dynamic_filters(duckdb::Logica
       if (stats && stats->has_estimated_cardinality) { card = stats->estimated_cardinality; }
     }
     if (card == 0) {
-      // May inlcude optimizer filter selectivity
+      // May include optimizer filter selectivity
       card = get.estimated_cardinality;
     }
     ev.domain_cardinality = std::max(ev.domain_cardinality, card);
@@ -373,7 +373,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     const auto& op_params = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                               ->get_config()
                               .get_operator_params();
-    auto join             = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+    auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,
       std::move(left),
       std::move(right),

@@ -172,7 +172,9 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 // split-provider interface
 //===----------------------------------------------------------------------===//
 bool parquet_gpu_ingestible::has_more_splits() const
-{ return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size(); }
+{
+  return _next_batch_idx.load(std::memory_order_relaxed) < _batches.size();
+}
 
 std::function<std::vector<std::unique_ptr<op::operator_data>>()>
 parquet_gpu_ingestible::next_split_provider()
