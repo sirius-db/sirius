@@ -27,9 +27,9 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -84,7 +84,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    */
   ~convertible_gpu_pipeline_task() override
   {
-    if (_task) { _queue.push(std::move(_task)); }
+    if (_task) { (void)_queue.push(std::move(_task)); }
   }
 
   /**

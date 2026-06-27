@@ -97,14 +97,26 @@ std::vector<std::string> decode_one_dict(std::vector<uint8_t> const& bytes,
 std::vector<std::string> decode_one_segment(std::vector<uint8_t> const& bytes,
                                             duckdb::CompressionType codec,
                                             uint32_t row_count,
-                                            uint32_t max_string_length)
+                                            uint32_t max_string_length,
+                                            uint32_t lead_pad = 0)
 {
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  // Optionally stage the segment behind `lead_pad` padding bytes so its base lands at a
+  // non-naturally-aligned device address, exercising the codec's alignment-agnostic reads.
+  std::vector<uint8_t> staged;
+  uint8_t const* host_src = bytes.data();
+  size_t host_size        = bytes.size();
+  if (lead_pad) {
+    staged.assign(lead_pad, uint8_t{0});
+    staged.insert(staged.end(), bytes.begin(), bytes.end());
+    host_src  = staged.data();
+    host_size = staged.size();
+  }
+  rmm::device_buffer d_seg(host_src, host_size, stream.view());
 
-  gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
-                              static_cast<uint32_t>(d_seg.size()),
+  gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()) + lead_pad,
+                              static_cast<uint32_t>(bytes.size()),
                               0,
                               row_count,
                               0,
@@ -222,6 +234,27 @@ TEST_CASE("gpu_decode_strings UNCOMPRESSED - many rows across multiple CTAs",
   REQUIRE(out.size() == rows.size());
   for (size_t i = 0; i < rows.size(); ++i) {
     REQUIRE(out[i] == rows[i]);
+  }
+}
+
+TEST_CASE("gpu_decode_strings UNCOMPRESSED - tolerates unaligned segment base",
+          "[scan][decode][strings][uncompressed]")
+{
+  // RMM device buffers are 256B-aligned; staging the segment behind 1-3 pad bytes forces a
+  // non-int32-aligned base, exercising the alignment-agnostic offset reads (load_unaligned).
+  std::vector<std::string> rows = {"", "x", "abcd", "longer-string-here", "", "zz", "q"};
+  auto bytes                    = make_uncompressed_segment(rows);
+  for (uint32_t pad : {1u, 2u, 3u}) {
+    auto out = decode_one_segment(bytes,
+                                  CompressionType::COMPRESSION_UNCOMPRESSED,
+                                  static_cast<uint32_t>(rows.size()),
+                                  /*max_len=*/32u,
+                                  /*lead_pad=*/pad);
+    REQUIRE(out.size() == rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+      INFO("pad=" << pad << " row=" << i);
+      REQUIRE(out[i] == rows[i]);
+    }
   }
 }
 

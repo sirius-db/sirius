@@ -19,8 +19,8 @@
 // cucascade
 #include "host_parquet_representation.hpp"
 
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/common.hpp>
-#include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library

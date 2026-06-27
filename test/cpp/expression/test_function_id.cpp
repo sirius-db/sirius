@@ -41,8 +41,8 @@ using sirius::to_duckdb_function_name;
 static_assert(std::is_enum_v<function_id>, "sirius::function_id must be an enum class.");
 static_assert(sizeof(function_id) == 2,
               "sirius::function_id is uint16_t-backed (D-01 — locked ABI).");
-static_assert(static_cast<uint16_t>(function_id::error) + 1 == 27,
-              "sirius::function_id has exactly 27 entries (D-01 — locked ABI).");
+static_assert(static_cast<uint16_t>(function_id::error) + 1 == 28,
+              "sirius::function_id has exactly 28 entries (D-01 — locked ABI).");
 
 // ============================================================================
 // Round-trip every function_id entry through the name mappers
@@ -181,6 +181,26 @@ TEST_CASE("ast_function_id - regexp_replace round-trips through name mappers", "
   auto const id = from_duckdb_function_name(name);
   REQUIRE(id.has_value());
   REQUIRE(*id == function_id::regexp_replace);
+}
+
+TEST_CASE("ast_function_id - concat round-trips through name mappers", "[ast_function_id]")
+{
+  auto const name = to_duckdb_function_name(function_id::concat);
+  REQUIRE(name == "concat");
+  auto const id = from_duckdb_function_name(name);
+  REQUIRE(id.has_value());
+  REQUIRE(*id == function_id::concat);
+}
+
+TEST_CASE("ast_function_id - concat and || both resolve to function_id::concat",
+          "[ast_function_id]")
+{
+  auto const id_fn = from_duckdb_function_name("concat");
+  auto const id_op = from_duckdb_function_name("||");
+  REQUIRE(id_fn.has_value());
+  REQUIRE(id_op.has_value());
+  REQUIRE(*id_fn == function_id::concat);
+  REQUIRE(*id_op == function_id::concat);
 }
 
 TEST_CASE("ast_function_id - year round-trips through name mappers", "[ast_function_id]")

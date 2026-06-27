@@ -1,10 +1,14 @@
 use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
-    PExecPlanFragmentResult, StatusPb, p_internal_service_brpc::PInternalService,
+    PExecPlanFragmentResult, PGetFileSchemaRequest, PGetFileSchemaResult, PSlotDescriptor,
+    StatusPb, p_internal_service_brpc::PInternalService,
 };
 use starrocks_plan_translator::PlanTranslator;
 use starrocks_thrift::{
-    internal_service::{TExecBatchPlanFragmentsParams, TExecPlanFragmentParams},
+    internal_service::{
+        TExecBatchPlanFragmentsParams, TExecPlanFragmentParams, TGetFileSchemaRequest,
+    },
+    plan_nodes::TFileFormatType,
     status_code::TStatusCode,
 };
 use thrift::{
@@ -43,15 +47,14 @@ impl PInternalService for SiriusComputeNodeService {
         &self,
         request: PExecPlanFragmentRequest,
         attachment: Vec<u8>,
-    ) -> Result<PExecPlanFragmentResult, crate::prpc::Error> {
-        Ok(
-            match self
-                .translate_single_attachment(request.attachment_protocol.as_deref(), &attachment)
-            {
-                Ok(()) => Self::exec_plan_result(Self::ok_status()),
-                Err(err) => Self::exec_plan_result(Self::internal_error(err)),
-            },
-        )
+    ) -> Result<crate::prpc::Reply<PExecPlanFragmentResult>, crate::prpc::Error> {
+        let result = match self
+            .translate_single_attachment(request.attachment_protocol.as_deref(), &attachment)
+        {
+            Ok(()) => Self::exec_plan_result(Self::ok_status()),
+            Err(err) => Self::exec_plan_result(Self::internal_error(err)),
+        };
+        Ok(result.into())
     }
 
     /// Handles FE batch fragment dispatch by translating every per-instance fragment.
@@ -60,19 +63,38 @@ impl PInternalService for SiriusComputeNodeService {
         &self,
         request: PExecBatchPlanFragmentsRequest,
         attachment: Vec<u8>,
-    ) -> Result<PExecBatchPlanFragmentsResult, crate::prpc::Error> {
-        Ok(
-            match self
-                .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
-            {
-                Ok(()) => PExecBatchPlanFragmentsResult {
-                    status: Some(Self::ok_status()),
-                },
-                Err(err) => PExecBatchPlanFragmentsResult {
-                    status: Some(Self::internal_error(err)),
-                },
+    ) -> Result<crate::prpc::Reply<PExecBatchPlanFragmentsResult>, crate::prpc::Error> {
+        let result = match self
+            .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
+        {
+            Ok(()) => PExecBatchPlanFragmentsResult {
+                status: Some(Self::ok_status()),
             },
-        )
+            Err(err) => PExecBatchPlanFragmentsResult {
+                status: Some(Self::internal_error(err)),
+            },
+        };
+        Ok(result.into())
+    }
+
+    /// Infers the schema of the FILES() target so the FE can resolve the table function.
+    #[instrument(skip_all)]
+    async fn get_file_schema(
+        &self,
+        _request: PGetFileSchemaRequest,
+        attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PGetFileSchemaResult>, crate::prpc::Error> {
+        let result = match Self::file_schema_from_attachment(&attachment).await {
+            Ok(schema) => PGetFileSchemaResult {
+                status: Self::ok_status(),
+                schema,
+            },
+            Err(err) => PGetFileSchemaResult {
+                status: Self::internal_error(err),
+                schema: Vec::new(),
+            },
+        };
+        Ok(result.into())
     }
 }
 
@@ -150,6 +172,37 @@ impl SiriusComputeNodeService {
             "translated StarRocks plan fragment"
         );
         Ok(())
+    }
+
+    /// Extracts the parquet path from the binary-thrift attachment and infers its schema.
+    async fn file_schema_from_attachment(
+        attachment: &[u8],
+    ) -> std::result::Result<Vec<PSlotDescriptor>, String> {
+        let request = Self::deserialize_binary::<TGetFileSchemaRequest>(attachment)
+            .map_err(|err| format!("failed to deserialize TGetFileSchemaRequest: {err}"))?;
+        let broker = request.scan_range.broker_scan_range.ok_or_else(|| {
+            "TGetFileSchemaRequest scan_range carries no broker_scan_range".to_string()
+        })?;
+        // Cross-file sampling and type promotion (what the native scanner does for multi-file
+        // FILES()) is a follow-up; reject multiple ranges rather than resolve a partial schema.
+        let ranges = broker.ranges;
+        if ranges.len() > 1 {
+            return Err(format!(
+                "multi-file FILES() schema inference is not supported yet ({} files); use a single file path",
+                ranges.len()
+            ));
+        }
+        let range = ranges
+            .into_iter()
+            .next()
+            .ok_or_else(|| "broker_scan_range carries no file ranges".to_string())?;
+        if range.format_type != TFileFormatType::FORMAT_PARQUET {
+            return Err(format!(
+                "unsupported file format {:?}; only parquet schema inference is implemented",
+                range.format_type
+            ));
+        }
+        crate::file_schema::parquet_file_schema(&range.path).await
     }
 
     /// Deserializes a thrift struct using the StarRocks binary attachment protocol.

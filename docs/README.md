@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="sirius-full-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="sirius-full.png">
-    <img src="sirius-full.png" alt="Sirius" width="500"/>
+    <source media="(prefers-color-scheme: dark)" srcset="logo/sirius_dark_full.svg">
+    <source media="(prefers-color-scheme: light)" srcset="logo/sirius_light_full.svg">
+    <img src="logo/sirius_light_full.svg" alt="Sirius" width="500"/>
   </picture>
   <br/>
   <a href="https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg">
@@ -39,10 +39,27 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 
 ## Building and Running Sirius
 
-After loading the extension, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
+For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
+
+Quick start:
+
+```bash
+git clone --recurse-submodules https://github.com/sirius-db/sirius.git
+cd sirius
+pixi run make
+./build/release/duckdb
+```
+
+Alternatively, load the extension into an existing DuckDB shell:
 
 ```sql
--- Plain SQL runs on GPU once the extension is loaded
+LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+```
+
+Either way, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
+
+```sql
+-- Plain SQL runs on GPU automatically
 SELECT l_returnflag, sum(l_quantity)
 FROM lineitem
 GROUP BY l_returnflag
@@ -56,6 +73,16 @@ Two execution paths are available. See each page for build, configuration, and t
 
 - **[`gpu_execution`](gpu_execution.md) (Recommended)** — Out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. Works with **Parquet** data format.
 - **[`gpu_processing`](gpu_processing.md)** — In-memory execution where the dataset must fit in GPU memory. Works with DuckDB's native storage format.
+
+## Configuration
+
+Sirius loads its settings from a YAML config file, searched in this order:
+
+1. Path in the `SIRIUS_CONFIG_FILE` environment variable
+2. `./sirius.yaml` (current working directory)
+3. `~/.sirius/sirius.yaml`
+
+If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
@@ -73,6 +100,29 @@ SET sirius_log_level = 'trace';
 SET sirius_log_flush_seconds = 1;
 ```
 
+## Tracing
+> **Note:** Tracing is experimental and the telemetry schema may change.
+
+Sirius instruments query execution with [Quent](https://github.com/rapidsai/quent), emitting
+per-query traces of operator and pipeline activity that Quent can render
+as an interactive browser timeline. Enable it in your YAML config file,
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+```
+
+run queries, then visualize:
+
+```bash
+pixi run quent   # serves Quent UI at http://localhost:8080
+```
+
+See the [Quent Telemetry guide](super-sirius/quent-telemetry.md) for the full setup details: enabling the
+exporter, per-query labeling, generating telemetry (using a TPC-H helper), and visualization.
+
 ## Limitations
 
 Sirius is under active development. Notable current limitations include:
@@ -85,7 +135,7 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 ## Contributors and Partners
 
 <p align="center">
-  <img src="contributors.png" alt="Contributors and partners: NVIDIA, University of Wisconsin-Madison, DuckDB, and VAST Data" width="700"/>
+  <img src="logo/combined-logos.png" alt="Contributors and partners: NVIDIA, University of Wisconsin-Madison, DuckDB, and VAST Data" width="700"/>
 </p>
 
 ## Future Roadmap

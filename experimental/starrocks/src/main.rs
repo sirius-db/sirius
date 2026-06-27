@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use anyhow::{Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
@@ -34,6 +34,10 @@ struct Args {
     /// FE registration retry settings.
     #[command(flatten, next_help_heading = "Registration")]
     registration: RegistrationConfig,
+
+    /// Sirius engine bring-up settings.
+    #[command(flatten, next_help_heading = "Engine")]
+    engine: EngineConfig,
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -43,10 +47,26 @@ struct RegistrationConfig {
     registration_max_attempts: NonZeroU32,
 }
 
+#[derive(Clone, Debug, clap::Args)]
+/// Sirius engine bring-up settings.
+struct EngineConfig {
+    /// Path to a Sirius YAML config file. When unset, built-in engine defaults are used.
+    #[arg(long)]
+    sirius_config: Option<PathBuf>,
+}
+
 impl Args {
     /// Starts the CN listeners, registers with FE, and waits for shutdown.
     #[instrument(name = "compute_node", skip_all)]
     async fn run(self) -> Result<()> {
+        // Bring the Sirius engine up before serving any RPC so a bad config or a GPU bring-up
+        // failure exits before FE can route work here (fail-fast). The handle is held for the
+        // process lifetime and torn down (RAII) only after the servers stop, below.
+        #[cfg(feature = "sirius-engine")]
+        let sirius_context = bring_up_engine(&self.engine)?;
+        #[cfg(not(feature = "sirius-engine"))]
+        warn_engine_disabled(&self.engine);
+
         let state = SharedHeartbeatState::new();
 
         // HeartbeatService tells FE this process is alive and captures FE identity. The configured
@@ -73,7 +93,7 @@ impl Args {
             tokio::spawn(RegistrationMonitor::new(self.fe, self.compute_node, state).run());
 
         info!("compute node registered; waiting for FE heartbeats");
-        RunningComputeNode {
+        let result = RunningComputeNode {
             heartbeat_server,
             backend_server,
             brpc_runtime,
@@ -81,7 +101,38 @@ impl Args {
             report_task,
         }
         .wait_until_shutdown()
-        .await
+        .await;
+
+        // The servers have stopped by the time `wait_until_shutdown` returns, so no in-flight RPC
+        // can touch the engine. Tear it down explicitly here for an ordered, logged teardown.
+        #[cfg(feature = "sirius-engine")]
+        {
+            info!("tearing down Sirius engine context");
+            drop(sirius_context);
+        }
+        result
+    }
+}
+
+/// Brings up the embedded Sirius engine context from `--sirius-config` (or built-in defaults when
+/// unset). Returns an error on a bad config file or GPU bring-up failure so startup can fail fast.
+#[cfg(feature = "sirius-engine")]
+fn bring_up_engine(engine: &EngineConfig) -> Result<sirius::SiriusContext> {
+    let context = match &engine.sirius_config {
+        Some(path) => sirius::SiriusContext::from_config_file(path),
+        None => sirius::SiriusContext::new(),
+    }
+    .map_err(|err| anyhow!("failed to bring up Sirius engine: {err}"))?;
+    info!(config = ?engine.sirius_config, "Sirius engine context created");
+    Ok(context)
+}
+
+/// Warns when an engine config is supplied but the engine was compiled out, so the flag is
+/// silently ignored rather than honored.
+#[cfg(not(feature = "sirius-engine"))]
+fn warn_engine_disabled(engine: &EngineConfig) {
+    if engine.sirius_config.is_some() {
+        warn!("--sirius-config ignored: built without the `sirius-engine` feature");
     }
 }
 

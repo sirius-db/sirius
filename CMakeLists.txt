@@ -108,6 +108,11 @@ set(CUCASCADE_BUILD_SHARED_LIBS
 set(CUCASCADE_BUILD_STATIC_LIBS
     ON
     CACHE BOOL "" FORCE)
+# Sirius consumes cucascade's cudf-coupled representations and converters (PR
+# #150 split these into the optional cucascade_cudf target), so build it.
+set(CUCASCADE_BUILD_CUDF
+    ON
+    CACHE BOOL "" FORCE)
 set(CUCASCADE_WARNINGS_AS_ERRORS
     OFF
     CACHE BOOL "" FORCE)
@@ -137,7 +142,9 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
                                                       Static)
   endfunction()
 
-  foreach(_target cucascade_objects cucascade_static cucascade_shared)
+  foreach(_target
+          cucascade_objects cucascade_static cucascade_shared
+          cucascade_cudf_objects cucascade_cudf_static cucascade_cudf_shared)
     if(TARGET "${_target}")
       sirius_prefer_static_cudart("${_target}")
     endif()
@@ -313,9 +320,16 @@ set(EXTENSION_SOURCES
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
-    src/op/scan/equality_delete_mask.cu src/cuda/scan/gpu_decode_alp.cu
-    src/cuda/scan/gpu_decode_bitpacking.cu src/cuda/scan/gpu_decode_rle.cu
-    src/cuda/scan/gpu_decode_strings.cu src/cuda/scan/gpu_native_decode.cu)
+    src/op/scan/equality_delete_mask.cu
+    src/cuda/scan/gpu_decode_alp.cu
+    src/cuda/scan/gpu_decode_bitpacking.cu
+    src/cuda/scan/gpu_decode_rle.cu
+    src/cuda/scan/gpu_decode_strings.cu
+    src/cuda/scan/gpu_native_decode.cu
+    src/cuda/scan/strings/dict_fsst.cu
+    src/cuda/scan/strings/dictionary.cu
+    src/cuda/scan/strings/fsst.cu
+    src/cuda/scan/strings/uncompressed.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -362,12 +376,16 @@ foreach(_target sirius_extension sirius_loadable_extension)
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
+  # cuCascade::cucascade_cudf holds the cudf-coupled representations and
+  # converters Sirius uses; it transitively links the cudf-free core
+  # (cuCascade::cucascade) and cudf::cudf.
   target_link_libraries(
     ${_target}
     cudf::cudf
     rmm::rmm
     spdlog::spdlog
     cuCascade::cucascade
+    cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
     telemetry_bridge)
 
@@ -429,11 +447,12 @@ endif()
 
 # Required by DuckDB's export set (duckdb_static -> sirius_extension ->
 # cucascade_static / telemetry_bridge). cucascade upstream PR #126 split
-# topology_discovery into its own static target — list it here so the export set
-# covers the dependency chain.
+# topology_discovery into its own static target, and PR #150 split the
+# cudf-coupled code into cucascade_cudf_static — list both here so the export
+# set covers the full dependency chain.
 install(
-  TARGETS sirius_extension cucascade_static cucascade_topology_discovery_static
-          telemetry_bridge
+  TARGETS sirius_extension cucascade_static cucascade_cudf_static
+          cucascade_topology_discovery_static telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -501,6 +520,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
     test/cpp/operator/test_mgpu_stress.cpp
+    test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
@@ -663,6 +683,7 @@ target_link_libraries(
   rmm::rmm
   spdlog::spdlog
   cuCascade::cucascade
+  cuCascade::cucascade_cudf
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 link_extension_libraries(parquet_benchmark "")
