@@ -16,10 +16,21 @@
 
 // Phase 22 D-12 PIN-MGPU-01 verification gates ([pin_mgpu]).
 //
-// NOTE: every TEST_CASE in this file is currently DISABLED via the Catch2 [.]
-// hidden tag, so default test runs skip them. They are parked pending a
-// follow-up PR that fixes a multi-GPU pin bug. Remove the leading "[.]" from a
-// test's tag string to re-enable it.
+// NOTE: multi-GPU chunk distribution is a function of total_data_size /
+// scan_task_batch_size. The pin path round-robins each *coalesced batch* across
+// GPUs, so a pin spreads across GPUs only once it produces >= 2 batches. This is
+// intentional — a small pin that fits comfortably on one GPU stays there, and
+// production runs the 512 MB default batch size. To exercise the distribution
+// path on a small, fast fixture, the multi-GPU gates below set a 1 MB
+// scan_task_batch_size so the 4-file surface yields one batch per file and the
+// round-robin lands chunks on both GPUs.
+//
+// Host-tier cached-serve is covered by a single-GPU gate (num_gpus=1, runs on
+// any host) and multi-GPU gates (num_gpus=2 + 1 MB batch so host chunks
+// distribute across both GPUs). Each pins to host, overwrites the on-disk
+// parquet, then reads a real column and asserts the ORIGINAL value comes back —
+// proving the data is served from the host pin, not re-read from the mutated
+// files.
 //
 // Two TEST_CASEs validate that `CALL pin_table(...)` distributes parquet
 // chunks across all GPU memory spaces on num_gpus=2 hosts:
@@ -28,9 +39,9 @@
 //      Pin a 4-file parquet surface, then walk
 //      sirius_scan_manager::get_pinned_entries() (Phase 22 Plan 01 accessor)
 //      and assert pinned_entry.chunk_memory_spaces (Phase 22 Plan 01 vector)
-//      reports at least 2 distinct GPU device_ids. Per Phase 22 Plan 02, the
-//      round-robin counter on PinTableFunction is per-FILE — single-file
-//      pins land all chunks on GPU 0 — so a multi-file fixture is required
+//      reports at least 2 distinct GPU device_ids. The pin path round-robins
+//      each coalesced batch across GPUs, so a multi-file fixture *plus* a batch
+//      size small enough to emit >= 2 batches (set per-test below) is required
 //      to exercise distribution.
 //
 //   2. Routing gate ([pin_mgpu][scan_manager][mgpu-audit])
@@ -110,7 +121,7 @@ void generate_4file_surface(fs::path const& dir)
 // Distribution gate: assert pinned_entry.chunk_memory_spaces lands chunks
 // on at least 2 distinct GPU device_ids.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[.][pin_mgpu][scan_manager]")
+TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[pin_mgpu][scan_manager]")
 {
   if (!require_two_gpus()) return;
 
@@ -121,8 +132,15 @@ TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[.][pin_mgpu]
 
   generate_4file_surface(tmp);
 
-  auto yaml_path = tmp / "pin_mgpu.yaml";
-  write_mgpu_yaml(yaml_path, mgpu_env_params{});  // num_gpus=2 default
+  // Multi-GPU distribution is total_data_size / scan_task_batch_size: the pin path
+  // round-robins each coalesced batch across GPUs. Under the 512 MB production default
+  // this ~6 MB fixture coalesces into one batch on a single GPU (correct — small pins
+  // don't need every GPU). Shrink the batch size so each ~1.6 MB file becomes its own
+  // batch and the round-robin lands chunks on both GPUs.
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;  // 1 MB
+  auto yaml_path              = tmp / "pin_mgpu.yaml";
+  write_mgpu_yaml(yaml_path, params);
 
   scoped_mgpu_env env(yaml_path);
   auto con = env.make_connection();
@@ -181,7 +199,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 multi-GPU chunk distribution", "[.][pin_mgpu]
 // and GPU 1.
 //===----------------------------------------------------------------------===//
 TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
-          "[.][pin_mgpu][scan_manager][mgpu-audit]")
+          "[pin_mgpu][scan_manager][mgpu-audit]")
 {
   if (!require_two_gpus()) return;
 
@@ -192,8 +210,12 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
 
   generate_4file_surface(tmp);
 
-  auto yaml_path = tmp / "pin_mgpu_route.yaml";
-  write_mgpu_yaml(yaml_path, mgpu_env_params{});  // num_gpus=2 default
+  // 1 MB batch size so the 4-file surface emits one batch per file and the per-batch
+  // round-robin distributes chunks across both GPUs (see distribution-gate comment).
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;  // 1 MB
+  auto yaml_path              = tmp / "pin_mgpu_route.yaml";
+  write_mgpu_yaml(yaml_path, params);
 
   // Construct scoped_log_dir BEFORE scoped_mgpu_env so SIRIUS_LOG_DIR /
   // SIRIUS_LOG_LEVEL are in place when the extension callback creates the
@@ -336,8 +358,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
 // On single-NUMA hosts, the host space is shared but the test passes
 // trivially via the >=1 chunk assertion.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
-          "[.][pin_mgpu][scan_manager][host_tier]")
+TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin", "[pin_mgpu][scan_manager][host_tier]")
 {
   if (!require_two_gpus()) return;
 
@@ -348,8 +369,13 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
 
   generate_4file_surface(tmp);
 
-  auto yaml_path = tmp / "pin_mgpu_host.yaml";
-  write_mgpu_yaml(yaml_path, mgpu_env_params{});
+  // 1 MB batch size so each ~1.6 MB file becomes its own host chunk (>= 4 chunks for
+  // the 4-file surface), distributed round-robin across both GPUs (see distribution
+  // gate). Production uses the larger default batch size.
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;  // 1 MB
+  auto yaml_path              = tmp / "pin_mgpu_host.yaml";
+  write_mgpu_yaml(yaml_path, params);
 
   scoped_mgpu_env env(yaml_path);
   auto con = env.make_connection();
@@ -415,43 +441,79 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin",
 }
 
 //===----------------------------------------------------------------------===//
-// Host-tier cache-path-actually-used gate (KNOWN ISSUE — hidden by default
-// via Catch2 [.] tag; pending follow-up fix).
+// Host-tier cached serve — SINGLE GPU.
 //
-// Bobbi flagged that for `pin_table(tier='host')`, `chunk_memory_spaces` is
-// always empty. The user-visible symptom (uncovered during this investigation):
-//
-//   1. `pin_table(tier='host')` stores the entry with `host_chunks` populated
-//      and `chunk_memory_spaces` intentionally empty (per design — host-tier
-//      entries carry their memory_space inside each host_data_representation).
-//   2. At scan time, sirius_scan_manager::create_provider_for() validates
-//      chunk_memory_spaces unconditionally and throws on empty for host
-//      entries (incorrect). The broad `catch(...)` swallows it and falls
-//      through to the parquet path.
-//   3. Lifting the validation throw exposes a deeper bug:
-//      sirius_gpu_parquet_scan_operator::execute() hard-casts cached batches
-//      to `gpu_table_representation` (sirius_gpu_parquet_scan_operator.cpp:265),
-//      so host_data_representation chunks can't be served. The proper fix
-//      requires either (a) eager HOST→GPU conversion in cached_split_provider's
-//      produce_split(), or (b) detect HOST and convert in the scan operator
-//      using `converter_registry.convert<gpu_table_representation>(...)`.
-//
-// These tests verify the desired end-state behavior: cached host data serves
-// queries even when the underlying parquet files are mutated. The tests are
-// tagged [.] (hidden by default) and will start passing once the deeper fix
-// lands. Run via `--invisibles` or by filter `[host_tier_pending]`.
-//
-// The row-count discriminator is precise: the cached path retains the
-// original 400000 rows even after the on-disk files are overwritten with a
-// 200000-row surface. The current silent-fall-through-to-parquet behavior
-// would report 200000.
+// Pin a 4-file surface to host on a single-GPU topology (num_gpus=1), overwrite
+// the on-disk parquet with a higher k ceiling, then read MAX(k). The host pin
+// must return the ORIGINAL 99999; a silent fall-through to the mutated parquet
+// would return 199999. Does not require 2 GPUs — runs on any host and isolates
+// the basic host->GPU serve path from multi-GPU distribution.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files overwritten",
-          "[.][pin_mgpu][scan_manager][host_tier][regression]")
+TEST_CASE("pin_table - host-tier cached path serves column read after overwrite (single GPU)",
+          "[scan_manager][host_tier][host_serve]")
+{
+  auto tmp = make_tmp("host-serve-1gpu");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  generate_4file_surface(tmp);  // 4 files x 100k rows; num_gpus=1 -> all on GPU 0
+
+  mgpu_env_params params;
+  params.num_gpus = 1;  // single-GPU topology
+  auto yaml_path  = tmp / "host_serve_1gpu.yaml";
+  write_mgpu_yaml(yaml_path, params);
+
+  scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = parquet_glob(tmp);
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='host_serve_1gpu');");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  // Before overwrite: MAX(k) over range(100000) across 4 files is 99999.
+  auto pre = con.Query("CALL gpu_execution(\"SELECT MAX(k) FROM read_parquet('" + glob + "')\");");
+  REQUIRE(pre);
+  REQUIRE_FALSE(pre->HasError());
+  REQUIRE(pre->GetValue(0, 0).GetValue<int64_t>() == 99999);
+
+  // Overwrite with a higher k ceiling: cached host pin -> 99999, fall-through -> 199999.
+  generate_parquet_surface(
+    tmp, "SELECT range AS k, range * 2 AS v FROM range(200000)", /*num_files=*/4);
+
+  auto cached =
+    con.Query("CALL gpu_execution(\"SELECT MAX(k) FROM read_parquet('" + glob + "')\");");
+  REQUIRE(cached);
+  if (cached->HasError()) { UNSCOPED_INFO("gpu_execution error: " << cached->GetError()); }
+  REQUIRE_FALSE(cached->HasError());
+  INFO("expected cached MAX(k)=99999 (fall-through to overwritten parquet would be 199999)");
+  REQUIRE(cached->GetValue(0, 0).GetValue<int64_t>() == 99999);
+
+  auto unpin = con.Query("CALL unpin_table('host_serve_1gpu');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Host-tier cached serve — MULTI-GPU (distributed chunks), MAX(k).
+//
+// Pin a 4-file surface to host with a 1 MB scan_task_batch_size so it splits
+// into multiple host chunks (asserted below), which the scan distributes across
+// both GPUs at serve time. Overwrite the on-disk parquet, then read MAX(k): the
+// host pin must return the ORIGINAL 99999 (every chunk served from memory); a
+// fall-through to the mutated parquet would return 199999.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (multi-GPU)",
+          "[pin_mgpu][scan_manager][host_tier]")
 {
   if (!require_two_gpus()) return;
 
-  auto tmp = make_tmp("host-cached");
+  auto tmp = make_tmp("host-cached-mgpu");
   std::error_code ec;
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp);
@@ -459,8 +521,11 @@ TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files o
   // Original surface: 4 files × 100k rows = 400000 rows total.
   generate_4file_surface(tmp);
 
-  auto yaml_path = tmp / "pin_mgpu_host_cached.yaml";
-  write_mgpu_yaml(yaml_path, mgpu_env_params{});
+  // 1 MB batch so the host pin distributes chunks round-robin across both GPUs.
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;
+  auto yaml_path              = tmp / "pin_mgpu_host_cached.yaml";
+  write_mgpu_yaml(yaml_path, params);
 
   scoped_mgpu_env env(yaml_path);
   auto con = env.make_connection();
@@ -486,6 +551,31 @@ TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files o
   REQUIRE(pin);
   if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
   REQUIRE_FALSE(pin->HasError());
+
+  // The 1 MB batch splits the surface into multiple host chunks; the scan
+  // distributes these across both GPUs at serve time (the per-GPU dispatch is
+  // covered by the [mgpu-audit] routing gate). Host chunks live in NUMA-local
+  // host memory — on a single-NUMA host they share one host space — so we assert
+  // the multi-chunk shape here rather than per-chunk GPU device_ids.
+  {
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+    const sirius::scan_manager::pinned_entry* entry_ptr = nullptr;
+    sirius_ctx->get_scan_manager().visit_pinned_entries(
+      [&entry_ptr](std::string_view name, const auto& e) {
+        if (name == "host_cache_test") {
+          entry_ptr = &e;
+          return true;
+        }
+        return false;
+      });
+    REQUIRE(entry_ptr != nullptr);
+    INFO("host_chunks=" << entry_ptr->host_chunks.size());
+    REQUIRE(entry_ptr->host_chunks.size() >= 2u);
+    for (auto const& chunk : entry_ptr->host_chunks) {
+      REQUIRE(chunk != nullptr);
+    }
+  }
 
   // Sanity check: query BEFORE overwriting to confirm pin → cached SELECT works
   // in this scenario. Use MAX(k) instead of count(*) — count(*) has a separate
@@ -526,24 +616,107 @@ TEST_CASE("pin_table - host-tier cached path serves SELECT after parquet files o
 }
 
 //===----------------------------------------------------------------------===//
-// Host-tier cached path serves non-trivial aggregate (KNOWN ISSUE — hidden
-// via Catch2 [.]).
+// Host-tier cached serve — MULTI-GPU DISPATCH ([mgpu-audit]).
 //
-// Companion to the row-count test above. count(*) can sometimes be served
-// from row-count metadata alone. This test runs a SUM that requires reading
-// every pinned value to prove the cached host_data_representations actually
-// feed the GPU expression executor end-to-end. Overwrite the on-disk parquet
-// with a DIFFERENT multiplier so the SUM from the new files differs from the
-// pinned SUM; only the cached path can return the original SUM.
-//
-// Hidden by [.] tag until the host_chunks scan-operator path is wired up.
+// Verifies the multi-GPU aspect topology-independently: pin a 4-file surface to
+// host with a 1 MB batch (multiple chunks), run a cached column read, capture
+// the [mgpu-audit] log lines, and assert pipeline tasks were dispatched on BOTH
+// GPU 0 and GPU 1. Host chunks live in NUMA-local host memory (a single shared
+// space on single-NUMA hosts), so the per-chunk device_id is not a reliable
+// distribution signal — scan-time dispatch is. Mirrors the GPU-tier routing
+// gate but with tier='host'.
 //===----------------------------------------------------------------------===//
-TEST_CASE("pin_table - host-tier cached path serves aggregate after parquet files overwritten",
-          "[.][pin_mgpu][scan_manager][host_tier][regression]")
+TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)",
+          "[pin_mgpu][scan_manager][host_tier][mgpu-audit]")
 {
   if (!require_two_gpus()) return;
 
-  auto tmp = make_tmp("host-cached-agg");
+  auto tmp = make_tmp("host-dispatch");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  generate_4file_surface(tmp);
+
+  // 1 MB batch so the host pin splits into multiple chunks for the scan to spread.
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;
+  auto yaml_path              = tmp / "pin_mgpu_host_dispatch.yaml";
+  write_mgpu_yaml(yaml_path, params);
+
+  // Construct scoped_log_dir BEFORE the env so SIRIUS_LOG_DIR is in place when
+  // the SiriusContext initializes. env is held in a unique_ptr so we can reset()
+  // it (flushing spdlog's file sink) before parse_audit_log reads the file.
+  scoped_log_dir logs(tmp / "log");
+  auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
+
+  auto glob = parquet_glob(tmp);
+  {
+    auto con = env->make_connection();
+
+    auto fb = con.Query("SET enable_duckdb_fallback = false;");
+    REQUIRE(fb);
+    REQUIRE_FALSE(fb->HasError());
+
+    auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='host_dispatch');");
+    REQUIRE(pin);
+    if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
+    REQUIRE_FALSE(pin->HasError());
+
+    // MAX(k) reads the k column from every pinned chunk, so the cached host scan
+    // drives one pipeline task per chunk — spread across both GPUs.
+    auto sel =
+      con.Query("CALL gpu_execution(\"SELECT MAX(k) FROM read_parquet('" + glob + "')\");");
+    REQUIRE(sel);
+    if (sel->HasError()) { UNSCOPED_INFO("gpu_execution error: " << sel->GetError()); }
+    REQUIRE_FALSE(sel->HasError());
+    REQUIRE(sel->GetValue(0, 0).GetValue<int64_t>() == 99999);
+
+    auto unpin = con.Query("CALL unpin_table('host_dispatch');");
+    REQUIRE(unpin);
+    REQUIRE_FALSE(unpin->HasError());
+  }
+
+  // Flush spdlog and tear down the env so the audit file is complete on disk
+  // before parse_audit_log reads it.
+  if (auto logger = spdlog::default_logger()) { logger->flush(); }
+  env.reset();
+
+  auto counts      = parse_audit_log(logs.path());
+  std::string diag = "per-GPU audit counts from " + logs.path().string() + ": ";
+  for (auto const& [gpu, c] : counts) {
+    diag +=
+      "GPU" + std::to_string(gpu) + "{pipeline=" + std::to_string(c.pipeline_ids.size()) + "} ";
+  }
+  INFO(diag);
+
+  // Load-bearing assertion: the cached host scan dispatched pipeline tasks on
+  // BOTH GPUs. This is the topology-independent proof that host serving uses
+  // both GPUs (true on single- and multi-NUMA hosts alike).
+  REQUIRE(counts.count(0) == 1);
+  REQUIRE(counts.count(1) == 1);
+  REQUIRE(counts.at(0).pipeline_ids.size() >= 1u);
+  REQUIRE(counts.at(1).pipeline_ids.size() >= 1u);
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Host-tier cached serve — MULTI-GPU (distributed chunks), SUM(v).
+//
+// Companion to the MAX(k) gate above, with a non-trivial aggregate: SUM(v)
+// reads every pinned value, proving the distributed host chunks feed the GPU
+// expression executor end-to-end. Pin with a 1 MB batch (chunks across both
+// GPUs), overwrite the on-disk parquet with a different multiplier, then read
+// SUM(v): the host pin returns the ORIGINAL total; a fall-through would return
+// the new files' total.
+//===----------------------------------------------------------------------===//
+TEST_CASE("pin_table - host-tier cached path serves SUM(v) after overwrite (multi-GPU)",
+          "[pin_mgpu][scan_manager][host_tier]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("host-cached-agg-mgpu");
   std::error_code ec;
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp);
@@ -553,8 +726,11 @@ TEST_CASE("pin_table - host-tier cached path serves aggregate after parquet file
   // 4 files: 4 * 9999900000 = 39999600000.
   generate_4file_surface(tmp);
 
-  auto yaml_path = tmp / "pin_mgpu_host_cached_agg.yaml";
-  write_mgpu_yaml(yaml_path, mgpu_env_params{});
+  // 1 MB batch so the host pin distributes chunks round-robin across both GPUs.
+  mgpu_env_params params;
+  params.scan_task_batch_size = 1'000'000;
+  auto yaml_path              = tmp / "pin_mgpu_host_cached_agg.yaml";
+  write_mgpu_yaml(yaml_path, params);
 
   scoped_mgpu_env env(yaml_path);
   auto con = env.make_connection();
@@ -617,14 +793,8 @@ TEST_CASE("pin_table - host-tier cached path serves aggregate after parquet file
 // sequence, and asserts every column in the merged entry has the SAME
 // number of chunks as `chunk_memory_spaces`.
 //===----------------------------------------------------------------------===//
-// TEMPORARILY DISABLED via the Catch2 [.] hidden tag: a multi-GPU-specific bug in
-// this path is being fixed in a follow-up PR. The cache_info column-union behavior
-// asserted here is still exercised on a single GPU by
-// test/cpp/integration/test_pin_table_merge_columns.cpp, so coverage of that
-// behavior is not lost. Remove the leading "[.]" tag to re-enable once the
-// follow-up lands.
 TEST_CASE("pin_table - same-row-count merge appends every chunk for new columns",
-          "[.][pin_mgpu][scan_manager][merge]")
+          "[pin_mgpu][scan_manager][merge]")
 {
   if (!require_two_gpus()) return;
 

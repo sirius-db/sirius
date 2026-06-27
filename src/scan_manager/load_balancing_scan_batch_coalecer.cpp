@@ -87,43 +87,69 @@ void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_proces
     state.queue.enqueue(exec::make_empty_try<std::unique_ptr<op::scan::scan_info>>());
   });
   auto& batch_queue = state.queue;
-  bool is_closed    = false;
-  while (!is_closed && !stop.stop_requested()) {
+
+  // Balance one coalesced batch onto a GPU and hand it to the connector.
+  auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
+    auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
+    auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
+    if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
+
+    auto fadvise_hints = op_data->get_fadvise_hints();
+    if (!fadvise_hints.empty()) {
+      for (auto& hint : fadvise_hints) {
+        if (hint.datasource && !hint.ranges.empty()) {
+          hint.datasource->fadvise(hint.ranges, dev_id);
+        }
+      }
+    }
+    op_data->prefetch(io::cache::prefetching_stage::opportunistic);
+    state.connector->push_split(std::move(op_data));
+  };
+
+  while (!stop.stop_requested()) {
     metadata_processing_state::provider_value_t entry;
     batch_queue.wait_dequeue(entry);
     if (entry.has_exception()) {
       state.connector->close(entry.exception());
-      break;
+      return;
     }
-    is_closed    = entry.is_empty();
-    auto batches = [&]() {
-      if (is_closed) {
-        return state.coalecer->flush();
-      } else {
-        return state.coalecer->push(std::move(entry).value());
+    if (!entry.is_empty()) {
+      auto batches = state.coalecer->push(std::move(entry).value());
+      for (auto& batch : batches) {
+        emit(std::move(batch));
       }
-    }();
-    for (auto& batch : batches) {
-      auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
-      auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
-      if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
+      continue;
+    }
 
-      auto fadvise_hints = op_data->get_fadvise_hints();
-      if (!fadvise_hints.empty()) {
-        for (auto& hint : fadvise_hints) {
-          if (hint.datasource && !hint.ranges.empty()) {
-            hint.datasource->fadvise(hint.ranges, dev_id);
-          };
-        }
+    // End-of-input sentinel. The producer-side completion_controller emits it
+    // only after every metadata task has finished enqueuing, so no further
+    // entries will be produced. But state.queue is a multi-producer queue with
+    // only per-producer (per-thread) FIFO: real entries enqueued before this
+    // sentinel on other threads may still be sitting in the queue and get
+    // delivered out of order. Drain them before closing so their splits are not
+    // silently dropped (which would scan fewer files than requested).
+    metadata_processing_state::provider_value_t leftover;
+    while (batch_queue.try_dequeue(leftover)) {
+      if (leftover.has_exception()) {
+        state.connector->close(leftover.exception());
+        return;
       }
-      op_data->prefetch(io::cache::prefetching_stage::opportunistic);
-      state.connector->push_split(std::move(op_data));
+      if (leftover.is_empty()) { continue; }  // extra (e.g. stop) sentinel — ignore
+      auto batches = state.coalecer->push(std::move(leftover).value());
+      for (auto& batch : batches) {
+        emit(std::move(batch));
+      }
     }
-    if (is_closed) {
-      state.connector->close();
-      break;
+    auto final_batches = state.coalecer->flush();
+    for (auto& batch : final_batches) {
+      emit(std::move(batch));
     }
+    state.connector->close();
+    return;
   }
+
+  // Stop requested between iterations — close so downstream consumers unblock.
+  state.connector->close();
 }
 
 void load_balancing_scan_batch_coalecer::process_cached_entries(
