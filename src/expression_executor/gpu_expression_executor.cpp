@@ -48,8 +48,6 @@
 #include <numeric>
 #include <variant>
 
-/// TODO: expose bitmap-returning API
-
 namespace {
 /// Returns true if cudf::cast supports this type (fixed-width only; no STRING/LIST/STRUCT/etc.).
 bool IsFixedWidth(cudf::data_type const& type)
