@@ -135,7 +135,11 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 ## Contributors and Partners
 
 <p align="center">
-  <img src="logo/combined-logos.png" alt="Contributors and partners: NVIDIA, University of Wisconsin-Madison, DuckDB, and VAST Data" width="700"/>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="logo/combined-logos.png">
+    <source media="(prefers-color-scheme: light)" srcset="logo/combined-logos-light.png">
+    <img src="logo/combined-logos-light.png" alt="Contributors and partners: NVIDIA, University of Wisconsin-Madison, DuckDB, and VAST Data" width="700"/>
+  </picture>
 </p>
 
 ## Future Roadmap
