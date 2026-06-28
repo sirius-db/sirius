@@ -4667,6 +4667,27 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - pin_table gpu tier filter drops pure-filter column",
+                 "[integration][gpu_execution][parquet][pin_table][filter]")
+{
+  auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+  auto pin_query =
+    "CALL pin_table('" + parquet_dir.string() + "/lineitem.parquet', tier='gpu', name='lineitem');";
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  // l_linenumber is referenced only by the predicate, so the cached-scan post-filter fold must
+  // gather just l_orderkey and never materialize l_linenumber (#987).
+  compare_gpu_vs_cpu("select l_orderkey from lineitem where l_linenumber = 1 and l_orderkey < 1000;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - pin_table host tier scan and aggregate",
                  "[integration][gpu_execution][parquet][pin_table_host]")
 {
@@ -4681,6 +4702,27 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
     "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - pin_table host tier filter drops pure-filter column",
+                 "[integration][gpu_execution][parquet][pin_table_host][filter]")
+{
+  auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+  auto pin_query   = "CALL pin_table('" + parquet_dir.string() +
+                   "/lineitem.parquet', tier='host', name='lineitem');";
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  // l_linenumber is referenced only by the predicate, so the cached-scan post-filter fold must
+  // gather just l_orderkey and never materialize l_linenumber (#987).
+  compare_gpu_vs_cpu("select l_orderkey from lineitem where l_linenumber = 1 and l_orderkey < 1000;");
 
   auto unpin_result = con->Query("CALL unpin_table('lineitem');");
   REQUIRE(unpin_result);
