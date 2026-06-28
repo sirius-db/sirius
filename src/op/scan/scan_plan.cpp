@@ -103,6 +103,18 @@ bool needs_output_assembly(scan_plan const& plan)
   return false;
 }
 
+std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)
+{
+  std::vector<cudf::size_type> positions;
+  positions.reserve(plan.output_layout.size());
+  for (auto const& entry : plan.output_layout) {
+    if (entry.source == scan_plan::output_entry::DATA) {
+      positions.push_back(static_cast<cudf::size_type>(entry.idx));
+    }
+  }
+  return positions;
+}
+
 std::unique_ptr<cudf::table> assemble_scan_output(scan_plan const& plan,
                                                   std::unique_ptr<cudf::table> reader_output,
                                                   std::vector<std::string> const& partition_values,
@@ -121,18 +133,9 @@ std::unique_ptr<cudf::table> assemble_scan_output(scan_plan const& plan,
       out_cols.push_back(std::move(data_cols.at(entry.idx)));
     } else {
       auto const& pcol = plan.partition_columns.at(entry.idx);
-      // partition_values is in partition_columns order, so entry.idx indexes it directly.
-      if (entry.idx >= partition_values.size()) {
-        throw sirius::internal_exception(
-          "[assemble_scan_output] partition_values too short ({}) for partition column '{}' at "
-          "index {}.",
-          partition_values.size(),
-          pcol.name,
-          entry.idx);
-      }
-      auto duckdb_val =
-        duckdb::Value(partition_values[entry.idx]).DefaultCastAs(sirius::to_duckdb(pcol.type));
-      auto scalar = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
+      auto const& pval = partition_values.at(entry.idx);
+      auto duckdb_val  = duckdb::Value(pval).DefaultCastAs(sirius::to_duckdb(pcol.type));
+      auto scalar      = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
       out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
     }
   }

@@ -31,6 +31,7 @@
 
 // cudf
 #include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
@@ -41,6 +42,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -306,14 +308,30 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
+  // The decoded table lays out the output columns first (indices [0, output_arity)) followed by
+  // any pure-filter columns. Dropping the trailing pure-filter columns is the projection; when a
+  // filter is applied we fold that projection into the gather so they are never materialized.
+  bool const needs_projection =
+    pf.output_arity > 0 && static_cast<std::size_t>(input->num_columns()) > pf.output_arity;
+
   if (pf.apply_filter && _filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
     sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
     auto src = std::move(input);
-    input    = exec.select(src->view());
-  }
-
-  if (pf.output_arity > 0 && static_cast<std::size_t>(input->num_columns()) > pf.output_arity) {
+    if (needs_projection) {
+      // Filter and project in a single gather so the pure-filter columns are never
+      // materialized.
+      std::vector<cudf::size_type> output_indices(pf.output_arity);
+      std::iota(output_indices.begin(), output_indices.end(), cudf::size_type{0});
+      input = exec.select(src->view(), output_indices);
+    } else {
+      // Nothing to project away, or output_arity == 0 (count(*)) — keep all columns so the
+      // surviving row count is preserved.
+      input = exec.select(src->view());
+    }
+  } else if (needs_projection) {
+    // No filter applied, but pure-filter columns were decoded — drop the trailing columns
+    // (zero-copy: they simply fall out of scope).
     auto cols = input->release();
     std::vector<std::unique_ptr<cudf::column>> selected;
     selected.reserve(pf.output_arity);
