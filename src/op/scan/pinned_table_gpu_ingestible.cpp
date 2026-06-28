@@ -204,7 +204,11 @@ std::unique_ptr<cudf::table> pinned_table_gpu_ingestible::post_filter_and_projec
     sirius::gpu_expression_executor exec(
       sirius_filter_ast.get(), cudf::get_current_device_resource_ref(), stream);
     auto src = std::move(input);
-    input    = exec.select(src->view());
+    // Fold the output projection into the filter gather so pure-filter columns are never
+    // materialized.
+    auto const data_positions = output_data_positions(*_plan);
+    input =
+      data_positions.empty() ? exec.select(src->view()) : exec.select(src->view(), data_positions);
     SIRIUS_LOG_DEBUG(
       "[pinned_table_gpu_ingestible::post_filter_and_project] Applied duckdb filter "
       "expression on cached batch.");
