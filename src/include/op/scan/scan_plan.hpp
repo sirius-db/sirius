@@ -57,16 +57,8 @@ namespace sirius::op::scan {
  *
  * Hive-partition columns live in P-space but are not in the parquet file, so
  * they never appear in D-space. They are injected post-read into the final
- * output in the order column_ids expects.
- *
- * A fourth space — the operator's OUTPUT position — is @c output_layout's own index, and is
- * distinct from D. The two differ in two ways: pure-filter columns occupy a D position but no
- * output position, while hive-partition columns occupy an output position but no D position.
- * @c data_columns is laid out output-first: the output DATA columns come first, in output order
- * (D positions 0..K-1), followed by the trailing pure-filter columns (D >= K). So an output DATA
- * column's D index equals its rank among the output's DATA columns, and D and output positions
- * coincide exactly when the output has neither partitions nor pure-filter columns (the
- * @c needs_output_assembly == false identity case).
+ * output in the order column_ids expects. Also, pure filter columns live in D-space
+ * but are not in the final output layout, so they are dropped after filter evaluation.
  */
 struct scan_plan {
   /// A column produced by the parquet reader, in batch order.
@@ -180,13 +172,10 @@ struct scan_plan {
   std::vector<std::string> const& partition_values,
   rmm::cuda_stream_view stream);
 
-/// Batch (D-space) positions of the output DATA columns, in @c output_layout order. Because
-/// @c data_columns is laid out output-first, these are the contiguous prefix [0, K) of the
-/// decoded columns. Pass them to the post-filter gather (@ref gpu_expression_executor::select) to
-/// materialize only the output columns, dropping the trailing pure-filter columns; the kept
-/// columns keep their D positions, so @ref assemble_scan_output still applies unchanged. Empty
-/// when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in
+/// Batch (D-space) positions of the output DATA columns, in @c output_layout order.
+/// Empty when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in
 /// which case the caller gathers all columns instead.
+/// @param plan  The scan plan describing the layout.
 [[nodiscard]] std::vector<cudf::size_type> output_data_positions(scan_plan const& plan);
 
 /// Build a scan_plan from DuckDB planner inputs. See @c scan_plan for semantics.

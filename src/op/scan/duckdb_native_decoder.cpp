@@ -829,7 +829,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
 
   auto mr_ref = mem_space.get_default_allocator();
 
-  std::size_t const num_cols = scan_info.projected_cols.size();
+  auto const num_cols = scan_info.projected_cols.size();
 
   std::size_t total_rows = 0;
   for (auto const& rg : split.row_groups) {

@@ -311,8 +311,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   // The decoded table lays out the output columns first (indices [0, output_arity)) followed by
   // any pure-filter columns. Dropping the trailing pure-filter columns is the projection; when a
   // filter is applied we fold that projection into the gather so they are never materialized.
-  bool const needs_projection =
-    pf.output_arity > 0 && static_cast<std::size_t>(input->num_columns()) > pf.output_arity;
+  bool const needs_projection = pf.output_arity > 0 && input->num_columns() > pf.output_arity;
 
   if (pf.apply_filter && _filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);

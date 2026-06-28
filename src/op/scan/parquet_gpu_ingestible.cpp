@@ -596,10 +596,7 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
         sirius_filter_ast.get(), cudf::get_current_device_resource_ref(), stream);
       auto input = std::move(table);
       // Fold the output projection into the filter gather so pure-filter columns are never
-      // materialized (#987). output_data_positions is the output-first prefix [0, K) of the
-      // decoded columns, so gathering it drops the trailing pure-filter columns while leaving the
-      // kept columns at their original D positions — post_filter_and_project's assemble_scan_output
-      // still indexes them by D. Empty for a count(*) / partition-only output: gather everything.
+      // materialized.
       auto const data_positions = output_data_positions(*_plan);
       table                     = data_positions.empty() ? exec.select(input->view())
                                                          : exec.select(input->view(), data_positions);
@@ -634,10 +631,6 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   rmm::cuda_stream_view stream)
 {
   auto const& pf = static_cast<parquet_post_filter_and_projection_info const&>(info);
-  // Reached only on the post-decode filter path (reader-side pushdown assembles inline). The
-  // ingestible only emits a non-null post_filter_and_projection_info when
-  // needs_output_assembly(*_plan) is true, so this is unconditionally meaningful.
-  //
   // @p input may have had its trailing pure-filter columns dropped by materialize_table's
   // projection fold; the remaining DATA columns keep their D positions (the fold gathers the
   // output-first prefix), so assemble_scan_output's indexing by output_entry::idx stays correct.
