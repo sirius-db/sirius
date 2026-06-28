@@ -4680,7 +4680,8 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
   // l_linenumber is referenced only by the predicate, so the cached-scan post-filter fold must
   // gather just l_orderkey and never materialize l_linenumber (#987).
-  compare_gpu_vs_cpu("select l_orderkey from lineitem where l_linenumber = 1 and l_orderkey < 1000;");
+  compare_gpu_vs_cpu(
+    "select l_orderkey from lineitem where l_linenumber = 1 and l_orderkey < 1000;");
 
   auto unpin_result = con->Query("CALL unpin_table('lineitem');");
   REQUIRE(unpin_result);
@@ -4722,7 +4723,8 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
   // l_linenumber is referenced only by the predicate, so the cached-scan post-filter fold must
   // gather just l_orderkey and never materialize l_linenumber (#987).
-  compare_gpu_vs_cpu("select l_orderkey from lineitem where l_linenumber = 1 and l_orderkey < 1000;");
+  compare_gpu_vs_cpu(
+    "select l_orderkey from lineitem where l_linenumber = 1 and l_orderkey < 1000;");
 
   auto unpin_result = con->Query("CALL unpin_table('lineitem');");
   REQUIRE(unpin_result);
