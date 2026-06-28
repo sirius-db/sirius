@@ -159,6 +159,9 @@ class parquet_batch_coalecer : public batch_coalecer {
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
+    SIRIUS_LOG_INFO(
+      "[coalesce-debug] parquet_batch_coalecer emit #{}: {} slice(s), acc_bytes={}, cap={}",
+      ++_emit_count, split->rg_slices.size(), _acc_bytes, _cap);
     _slices.clear();
     _acc_bytes = 0;
     return split;
@@ -170,7 +173,8 @@ class parquet_batch_coalecer : public batch_coalecer {
   const bool _needs_assembly;
 
   std::vector<row_group_slice> _slices;
-  std::size_t _acc_bytes = 0;
+  std::size_t _acc_bytes  = 0;
+  std::size_t _emit_count = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
 };

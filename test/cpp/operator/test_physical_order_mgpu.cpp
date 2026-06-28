@@ -53,6 +53,9 @@ mgpu_env_params make_params()
   mgpu_env_params p;
   p.cache                    = "none";
   p.hash_partition_bytes     = 1'000'000;  // 1 MiB → force many partitions
+  p.scan_task_batch_size     = 16'000'000;  // 16 MB → force >=2 scan batches so the
+                                            // coalescer doesn't merge the whole surface
+                                            // into one batch (else all work lands on GPU 0)
   p.pipeline_num_threads     = 4;
   p.task_creator_num_threads = 4;
   return p;
