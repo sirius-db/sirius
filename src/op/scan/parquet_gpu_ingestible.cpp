@@ -108,6 +108,7 @@ class parquet_batch_coalecer : public batch_coalecer {
     std::vector<cudf::size_type> cur_rgs;
     std::size_t cur_unc  = 0;
     std::size_t cur_comp = 0;
+    int64_t cur_rows     = 0;
     auto seal_file       = [&]() {
       if (cur_rgs.empty()) { return; }
       // A file's row groups can span multiple splits, each sealed into its own
@@ -124,20 +125,29 @@ class parquet_batch_coalecer : public batch_coalecer {
                            cur_comp,
                            std::move(slice_ds));
       _acc_bytes += cur_unc;
+      _acc_rows += cur_rows;
       cur_rgs.clear();
       cur_unc  = 0;
       cur_comp = 0;
+      cur_rows = 0;
     };
 
+    // cuDF tables are limited to cudf::size_type (int32_t) rows per call.
+    static constexpr int64_t cudf_max_rows = std::numeric_limits<cudf::size_type>::max();
+
     for (auto const& rg : file->row_groups) {
-      if ((!_slices.empty() || !cur_rgs.empty()) && _cap > 0 &&
-          _acc_bytes + cur_unc + rg.uncompressed_bytes > _cap) {
+      bool const byte_cap_hit = (!_slices.empty() || !cur_rgs.empty()) && _cap > 0 &&
+                                _acc_bytes + cur_unc + rg.uncompressed_bytes > _cap;
+      bool const row_cap_hit = (!_slices.empty() || !cur_rgs.empty()) &&
+                               _acc_rows + cur_rows + rg.num_rows > cudf_max_rows;
+      if (byte_cap_hit || row_cap_hit) {
         seal_file();
         emitted.push_back(emit_current());
       }
       cur_unc += rg.uncompressed_bytes;
       cur_comp += rg.compressed_bytes;
       cur_rgs.push_back(rg.index);
+      cur_rows += rg.num_rows;
     }
     seal_file();
     return emitted;
@@ -168,6 +178,7 @@ class parquet_batch_coalecer : public batch_coalecer {
       _cap);
     _slices.clear();
     _acc_bytes = 0;
+    _acc_rows  = 0;
     return split;
   }
 
@@ -178,6 +189,7 @@ class parquet_batch_coalecer : public batch_coalecer {
 
   std::vector<row_group_slice> _slices;
   std::size_t _acc_bytes  = 0;
+  int64_t _acc_rows       = 0;
   std::size_t _emit_count = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
@@ -548,7 +560,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
     auto const [rg_unc, rg_comp] = rg_contribution(metadata.row_groups[rg_idx]);
-    out->row_groups.push_back({rg_idx, rg_unc, rg_comp});
+    out->row_groups.push_back({rg_idx, rg_unc, rg_comp, metadata.row_groups[rg_idx].num_rows});
   }
 
   // Hive partition values for this file, in scan_plan::partition_columns order.

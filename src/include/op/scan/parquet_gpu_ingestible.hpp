@@ -162,6 +162,7 @@ class parquet_file_scan_info : public scan_info {
     cudf::size_type index;
     std::size_t uncompressed_bytes;
     std::size_t compressed_bytes;
+    int64_t num_rows;
   };
 
   /// Parsed footer metadata for this file.
