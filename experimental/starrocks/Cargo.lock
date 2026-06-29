@@ -1878,6 +1878,8 @@ name = "sirius-starrocks-cn"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "backon",
  "clap",
  "heck",
