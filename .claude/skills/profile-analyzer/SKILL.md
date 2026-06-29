@@ -87,15 +87,7 @@ reports/<label>_<YYYYMMDD_HHMMSS>/
     sirius/q<N>/{nsys.nsys-rep, nsys.sqlite, nsys.sql, timings.csv, log_dir/}
 ```
 
-**Output from non-profiled run** (`performance_test.py` benchmark layout):
-```
-<benchmark_dir>/                      # default: test/tpch_performance/output/tpch_<ts>_<mode>_<engine>_iter<N>/
-  metadata.json                       # commit, branch, date, mode, iterations, engine, queries, pin
-  csv/runtimes.csv                    # long-format: engine,query,iteration,runtime_s
-  log_dir/sirius_<YYYY-MM-DD>.log     # combined Sirius spdlog daily sink
-  <engine>/q<N>/result.txt            # fetched rows, one repr(row) per line (last iter wins)
-  sirius/q<N>/sirius.log              # per-query Sirius log split (Sirius engine only)
-```
+**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
 
 ### Workflow B: Generate Report from Existing Profiles
 

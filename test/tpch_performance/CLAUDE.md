@@ -137,7 +137,7 @@ Key flags:
 - `--iterations N` — per-query iteration count.
 - `--mode grouped|sequential|isolated|nsys-profile` — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (fresh connection + drop_os_cache per run; requires passwordless sudo), `nsys-profile` (see below).
 - `--queries 1,3,6-10` — subset selection.
-- `--pin gpu|host|none` — Sirius cache pre-load tier. `gpu` is the only tier implemented today; `host` is allowed at the flag level but `CALL pin_table` throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:681-683`) — queries then fall through to disk reads.
+- `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
 - `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
 - `--mode nsys-profile` — wrap each query in `nsys profile` (one DuckDB CLI subprocess per query; the cudaProfilerApi capture range covers the cold + hot iterations). Requires `--engine gpu`; incompatible with `--validation` and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout in nsys-profile mode (default 90s).
@@ -197,7 +197,7 @@ When passed `--pinning-mode pinned-hot`, the Sirius engine emits one union `CALL
 
 To verify a query actually hit the cache, grep `runs/.../sirius/q<N>/sirius.log` for `using cached_split_provider`; the matching-fallback log line is `not all the columns are pinned for this query`.
 
-Tier override: the helper defaults to `tier='gpu'` — the only tier currently implemented in `src/sirius_extension.cpp`. **`tier='host'` is not supported right now and will be added later**: setting `SIRIUS_PIN_TIER=host` today makes the emitted `CALL pin_table` throw `NotImplementedException` at bind time (`src/sirius_extension.cpp:681-683`), and queries fall through to disk reads. Once host-tier support lands, flip via `SIRIUS_PIN_TIER=host`.
+Tier override: the helper defaults to `tier='gpu'`. Both `gpu` and `host` are supported in `src/sirius_extension.cpp`; set `SIRIUS_PIN_TIER=host` to pin into NUMA-local pinned host memory instead. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
 
 ### Unified query runner
 
