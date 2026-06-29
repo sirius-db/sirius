@@ -152,8 +152,11 @@ class parquet_split_info : public scan_info {
 class parquet_file_scan_info : public scan_info {
  public:
   /// A single pruned row group with the byte accounting the coalescer chunks on.
-  /// @c uncompressed_bytes excludes pure-filter columns (read for filtering but
-  /// not emitted), matching the legacy @c rg_contribution accounting.
+  /// @c uncompressed_bytes is the estimated DECODED (GPU-resident) size of the row
+  /// group's emitted columns — fixed-width columns contribute
+  /// row_count x cuDF decoded width, VARCHAR / nested fall back to the parquet
+  /// encoded-uncompressed size, and pure-filter columns (read for filtering but
+  /// not emitted) are excluded. See @c rg_contribution in parquet_gpu_ingestible.cpp.
   struct row_group_entry {
     cudf::size_type index;
     std::size_t uncompressed_bytes;
