@@ -207,10 +207,9 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
   auto yaml_path = tmp / "comp.yaml";
   write_compression_yaml(yaml_path);
 
-  // Write a plan file for the 't_comp' table (identity plan — universally available)
-  auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir, "t_comp", "identity\n---\nidentity");
-
+  // SELECT range AS k, range * 3 AS v FROM range(10000):
+  //   SUM(k) = 9999*10000/2 = 49995000
+  //   SUM(v) = 3 * SUM(k)   = 149985000
   sirius::test::mgpu::generate_parquet_surface(
     tmp, "SELECT range AS k, range * 3 AS v FROM range(10000)", /*num_files=*/1);
 
@@ -219,14 +218,13 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  // Pin without compression as reference
-  auto pin_raw = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_raw');");
-  REQUIRE(pin_raw);
-  if (pin_raw->HasError()) { UNSCOPED_INFO("pin_raw error: " << pin_raw->GetError()); }
-  REQUIRE_FALSE(pin_raw->HasError());
-
   REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
   REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 0;")->HasError());
+
+  // Write a plan file for the table that matches the parquet glob name
+  auto plan_dir = tmp / "plans";
+  write_plan_file(
+    plan_dir, "t_comp", "input -> delta -> differences\n---\ninput -> delta -> differences\n");
   REQUIRE_FALSE(
     con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
       ->HasError());
@@ -236,21 +234,16 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
   if (pin_comp->HasError()) { UNSCOPED_INFO("pin_comp error: " << pin_comp->GetError()); }
   REQUIRE_FALSE(pin_comp->HasError());
 
-  // Both cached scans must return the same aggregate
-  auto sum_raw  = con.Query("SELECT SUM(k), SUM(v) FROM t_raw;");
-  auto sum_comp = con.Query("SELECT SUM(k), SUM(v) FROM t_comp;");
-
-  REQUIRE(sum_raw);
+  // Query via gpu_execution so Sirius serves the result from the compressed cache.
+  const std::string select_sql = "SELECT SUM(k), SUM(v) FROM read_parquet('" + glob + "')";
+  auto sum_comp                = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   REQUIRE(sum_comp);
-  REQUIRE_FALSE(sum_raw->HasError());
+  if (sum_comp->HasError()) { UNSCOPED_INFO("sum_comp error: " << sum_comp->GetError()); }
   REQUIRE_FALSE(sum_comp->HasError());
+  REQUIRE(sum_comp->RowCount() == 1);
+  REQUIRE(sum_comp->GetValue(0, 0) == duckdb::Value::BIGINT(49995000LL));
+  REQUIRE(sum_comp->GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
 
-  REQUIRE(sum_raw->RowCount() == sum_comp->RowCount());
-  for (duckdb::idx_t col = 0; col < 2; ++col) {
-    REQUIRE(sum_raw->GetValue(col, 0) == sum_comp->GetValue(col, 0));
-  }
-
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_raw');")->HasError());
   REQUIRE_FALSE(con.Query("CALL unpin_table('t_comp');")->HasError());
 
   fs::remove_all(tmp);
@@ -270,9 +263,8 @@ TEST_CASE("pin_table compression - column-subset projection correctness",
   auto yaml_path = tmp / "comp.yaml";
   write_compression_yaml(yaml_path);
 
-  auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir, "t_proj", "identity\n---\nidentity\n---\nidentity");
-
+  // SELECT range AS a, range * 2 AS b, range * 3 AS c FROM range(5000):
+  //   SUM(b) = 2 * (0+1+...+4999) = 2 * 4999*5000/2 = 24995000
   sirius::test::mgpu::generate_parquet_surface(
     tmp, "SELECT range AS a, range * 2 AS b, range * 3 AS c FROM range(5000)", 1);
 
@@ -283,6 +275,12 @@ TEST_CASE("pin_table compression - column-subset projection correctness",
 
   REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
   REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 0;")->HasError());
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir,
+                  "t_proj",
+                  "input -> delta -> differences\n---\ninput -> delta -> differences\n---\ninput "
+                  "-> delta -> differences\n");
   REQUIRE_FALSE(
     con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
       ->HasError());
@@ -292,14 +290,15 @@ TEST_CASE("pin_table compression - column-subset projection correctness",
   if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
   REQUIRE_FALSE(pin->HasError());
 
-  // Project only column b; result should equal range(5000)*2 sum
-  auto res = con.Query("SELECT SUM(b) FROM t_proj;");
+  // Project only column b; Sirius must decompress only that column.
+  // SUM(b) = 2*(0+1+...+4999) = 2*4999*5000/2 = 24995000
+  const std::string select_sql = "SELECT SUM(b) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
   REQUIRE_FALSE(res->HasError());
   REQUIRE(res->RowCount() == 1);
-
-  // SUM of 0..4999 * 2 = 2 * 4999*5000/2 = 24990000
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24990000LL));
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
 
   REQUIRE_FALSE(con.Query("CALL unpin_table('t_proj');")->HasError());
 
@@ -320,7 +319,8 @@ TEST_CASE("pin_table compression - fallback when no plan file for table",
   auto yaml_path = tmp / "comp.yaml";
   write_compression_yaml(yaml_path);
 
-  // Plan dir exists but has no file matching 't_noplan'
+  // Plan dir exists but has no file matching 't_noplan' — must pin uncompressed.
+  // SUM(k) = 0+1+...+999 = 999*1000/2 = 499500
   auto plan_dir = tmp / "plans";
   fs::create_directories(plan_dir);
 
@@ -342,10 +342,12 @@ TEST_CASE("pin_table compression - fallback when no plan file for table",
   REQUIRE_FALSE(pin->HasError());
 
   // Must still scan correctly via fallback raw host rep
-  auto res = con.Query("SELECT COUNT(*) FROM t_noplan;");
+  const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
   REQUIRE_FALSE(res->HasError());
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000));
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(499500LL));
 
   REQUIRE_FALSE(con.Query("CALL unpin_table('t_noplan');")->HasError());
 
@@ -366,11 +368,14 @@ TEST_CASE("pin_table compression - fallback when chunk is below min_chunk_bytes 
   auto yaml_path = tmp / "comp.yaml";
   write_compression_yaml(yaml_path);
 
+  // Plan file exists but threshold is far above the tiny chunk size — forces
+  // fallback to uncompressed host rep.
+  // SUM(k) = 0+1+...+99 = 99*100/2 = 4950
   auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir, "t_threshold", "identity");
+  write_plan_file(plan_dir, "t_threshold", "input -> delta -> differences\n");
 
   sirius::test::mgpu::generate_parquet_surface(
-    tmp, "SELECT range AS k FROM range(100)", 1);  // tiny chunk
+    tmp, "SELECT range AS k FROM range(100)", 1);  // tiny chunk (~800 B uncompressed)
 
   sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
   auto con = env.make_connection();
@@ -381,7 +386,7 @@ TEST_CASE("pin_table compression - fallback when chunk is below min_chunk_bytes 
   REQUIRE_FALSE(
     con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
       ->HasError());
-  // Threshold far above the tiny chunk — forces fallback
+  // Threshold (1 GiB) far above the tiny chunk (~800 B) — forces fallback
   REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 1000000000;")->HasError());
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_threshold');");
@@ -389,10 +394,12 @@ TEST_CASE("pin_table compression - fallback when chunk is below min_chunk_bytes 
   if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
   REQUIRE_FALSE(pin->HasError());
 
-  auto res = con.Query("SELECT COUNT(*) FROM t_threshold;");
+  const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
   REQUIRE_FALSE(res->HasError());
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(100));
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(4950LL));
 
   REQUIRE_FALSE(con.Query("CALL unpin_table('t_threshold');")->HasError());
 

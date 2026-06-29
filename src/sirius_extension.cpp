@@ -1070,18 +1070,16 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         if (compression_enabled && chunk.tbl->num_columns() > 0) {
           auto plan_dsl =
             sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
-          const std::size_t uncompressed_bytes = [&] {
-            std::size_t sz = 0;
+          try {
+            std::size_t uncompressed_bytes = 0;
             for (int ci = 0; ci < chunk.tbl->num_columns(); ++ci) {
               auto const& col = chunk.tbl->view().column(ci);
               if (cudf::is_fixed_width(col.type())) {
-                sz += static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
+                uncompressed_bytes +=
+                  static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
               }
             }
-            return sz;
-          }();
-          if (plan_dsl.has_value() && uncompressed_bytes >= comp_cfg.min_chunk_bytes) {
-            try {
+            if (plan_dsl.has_value() && uncompressed_bytes >= comp_cfg.min_chunk_bytes) {
               auto ct = simpatico::compress_with_plan(chunk.tbl->view(),
                                                       *plan_dsl,
                                                       target_stream,
@@ -1110,13 +1108,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                compressed_bytes,
                                100.0 * static_cast<double>(compressed_bytes) /
                                  static_cast<double>(uncompressed_bytes));
-            } catch (const std::exception& e) {
-              SIRIUS_LOG_WARN(
-                "[pin_table] compression failed for '{}': {}; "
-                "falling back to uncompressed for this chunk",
-                data.args.name,
-                e.what());
             }
+          } catch (const std::exception& e) {
+            SIRIUS_LOG_WARN(
+              "[pin_table] compression failed for '{}': {}; "
+              "falling back to uncompressed for this chunk",
+              data.args.name,
+              e.what());
           }
         }
         if (!compressed_this_chunk) {
