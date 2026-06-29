@@ -118,15 +118,18 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
     }
   }
 
-  return std::unique_ptr<compressed_host_representation>(
-    new compressed_host_representation(get_memory_space(),
-                                       _path,
-                                       _owns_file,
-                                       _column_names,
-                                       _compressed_bytes,
-                                       _uncompressed_bytes,
-                                       _num_rows,
-                                       std::move(absolute)));
+  // const_cast is safe: select_columns is logically const (it creates a
+  // projection sharing the same file) but the base-class constructor requires
+  // a non-const memory_space& — the underlying object is non-const.
+  return std::unique_ptr<compressed_host_representation>(new compressed_host_representation(
+    const_cast<cucascade::memory::memory_space&>(get_memory_space()),
+    _path,
+    _owns_file,
+    _column_names,
+    _compressed_bytes,
+    _uncompressed_bytes,
+    _num_rows,
+    std::move(absolute)));
 }
 
 }  // namespace sirius

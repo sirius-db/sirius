@@ -42,7 +42,9 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
     auto const device_mr = space->get_default_allocator();
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
     // Capture the old resource by value (not by ref) — see comment in header for why.
-    prev_device_mrs_.push_back(cudf::set_current_device_resource_ref(device_mr));
+    // Wrap device_async_resource_ref in any_resource to satisfy the non-deprecated API.
+    prev_device_mrs_.push_back(cudf::set_current_device_resource(
+      ::cuda::mr::any_resource<::cuda::mr::device_accessible>{device_mr}));
   }
 }
 

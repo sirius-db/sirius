@@ -16,6 +16,9 @@
 
 #include "plan_register.hpp"
 
+#include <mutex>
+#include <shared_mutex>
+
 namespace sirius::compression {
 
 plan_register& plan_register::global()
