@@ -312,6 +312,22 @@ class gpu_expression_executor {
     std::size_t min_ast_size                    = 2);
 
   /**
+   * @brief Non-owning ctor for a pre-filtered list of expressions (e.g. the projection operator's
+   * subset of select_list entries that actually need evaluation, after pulling out pure
+   * BOUND_REF passthroughs).
+   *
+   * The caller retains ownership of the nodes; the executor only reads from them. The output
+   * table produced by execute() contains one column per entry in @p expressions, in the same
+   * order.
+   */
+  gpu_expression_executor(
+    std::vector<sirius::ast::node const*> expressions,
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
+    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    expression_executor_strategy strategy       = strategy_from_config(),
+    std::size_t min_ast_size                    = 2);
+
+  /**
    * @brief Executes the current set of expressions against the given input batch and emits a new
    * output batch with the results.
    *

@@ -495,6 +495,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/expression_executor/test_nonduckdb_frontend_proof.cpp
+    test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
