@@ -161,7 +161,10 @@ class parquet_batch_coalecer : public batch_coalecer {
     split->partition_values        = _partition_values;
     SIRIUS_LOG_INFO(
       "[coalesce-debug] parquet_batch_coalecer emit #{}: {} slice(s), acc_bytes={}, cap={}",
-      ++_emit_count, split->rg_slices.size(), _acc_bytes, _cap);
+      ++_emit_count,
+      split->rg_slices.size(),
+      _acc_bytes,
+      _cap);
     _slices.clear();
     _acc_bytes = 0;
     return split;
