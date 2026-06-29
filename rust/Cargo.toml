@@ -20,21 +20,3 @@ edition = "2024"
 cxx = "1"
 cxx-build = "1"
 sirius-sys = { path = "crates/sirius-sys" }
-
-# TODO: repin to a rapidsai/quent main rev once the quent-open stack lands.
-quent-analyzer = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-attributes = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-build-info = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-codegen = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-collector = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-events = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-exporter = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-model = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-query-engine-analyzer = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-query-engine-model = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-query-engine-server = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-query-engine-ui = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-simulator-ui = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-stdlib = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-time = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
-quent-ui = { git = "https://github.com/mbrobbel/quent.git", rev = "bf638347a78607647eac9295976233144bcd14a5" }
