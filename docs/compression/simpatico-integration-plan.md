@@ -1,9 +1,10 @@
 # Simpatico Compression Integration Plan
 
 Status: **Draft for review** — §5.3 DISK serialization resolved (shipped in `simpatico_codegen`)
-Scope: Integrate `simpatico_codegen` (GPU plan-based columnar compression) into Sirius to
-compress data on spill, with later extensions for plan discovery (`explore`) and
-distributed (multi-GPU / multi-node) transfer.
+Scope: Integrate `simpatico_codegen` (GPU plan-based columnar compression) into Sirius. The
+priority deliverable is compressing **pinned/cached input tables** in host memory (Phase 2);
+compressing data **on spill** follows (Phase 3), with later extensions for plan discovery
+(`explore`) and distributed (multi-GPU / multi-node) transfer.
 
 ---
 
@@ -213,7 +214,7 @@ fully-wired `compressed_table` ready to `decompress()`.
 **Sirius DISK tier work reduces to**: call `write_compressed_table` in the HOST→DISK spill
 converter, call `read_compressed_table` in the DISK→GPU prepare converter, and wrap the result
 in a `compressed_disk_representation`. The custom serialization logic that was previously the
-largest net-new piece of Phase 2 is already implemented and tested.
+largest net-new piece of the spill phase (Phase 3) is already implemented and tested.
 
 One thing to consider here is the alternative of keeping the metadata classes live in memory
 while the actual buffers are just dumped directly into a file.
@@ -307,7 +308,12 @@ thin bridge `device_memory_resource` subclass that forwards to a
 `rmm::device_async_resource_ref` on a known stream would suffice. Defer until measured to be
 necessary.
 
-### 5.5 Per-node plan register
+### 5.5 Plan register
+
+Two key spaces share one resolver. The **cached input-table** path (Phase 2) keys plans by
+`(pinned table, column name)` — a stable identity already known at pin time from parquet metadata.
+The **spill** path (Phase 3) keys plans by graph-node-output identity (below). Both resolve to a
+per-column Simpatico DSL string, falling back to a single global default plan when no entry exists.
 
 Node outputs flow through `repository_wiring → port → shared_data_repository`, identified by a stable
 `port_id` (`src/include/pipeline/repository_wiring.hpp`, `src/include/op/sirius_physical_operator.hpp`).
@@ -321,8 +327,8 @@ plan_register : node_output_id  ->  per-column Simpatico DSL string
   converter can look it up — mirroring how `host_parquet_representation` carries `_data_file_path`.
   Natural stamping point: where the sink publishes output (`push_data_batch(port_id, batch)`).
 - Thread-safe (spill runs on downgrade threads). Start with a simple `shared_mutex`-guarded map.
-- Population: Phase 2 = hand-authored / static config (like Simpatico's `config/*.txt`).
-  Phase 3 = `explore` writes entries.
+- Population: Phases 2-3 = hand-authored / static config (like Simpatico's `config/*.txt`).
+  Phase 4 = `explore` writes entries.
 
 ---
 
@@ -385,9 +391,71 @@ then pass `-DSIMPATICO_BUILD_BENCH=OFF` from Sirius's cmake configure step when 
 - Smoke test inside Sirius: build a cudf table → `compress_with_plan` → `decompress` → assert
   roundtrip equality. Confirms toolchain, NVRTC JIT, and linkage.
 
-### Phase 2 — Spill compression (core deliverable)
-- `simpatico_bridge`, the three compressed representations.
-- `register_compression_converters` + wire into `converter_registry::initialize`.
+### Phase 2 — Cached input-table compression (pinned host, the priority deliverable)
+
+Goal: store `pin_table(..., tier => 'host')` chunks **simpatico-compressed** in pinned host
+memory instead of raw `host_data_representation`, decompressing transparently when a cached scan
+pulls a chunk to the GPU. This shrinks the host-resident footprint of pinned base tables (e.g.
+`lineitem`) so more data fits in host memory, at the cost of a bounded decompress on scan. It is
+sequenced **before** spill because pinned input tables are the common, proactive case; spill is the
+reactive safety net.
+
+This phase builds the **shared** compression machinery — `simpatico_bridge`,
+`compressed_host_representation`, the GPU↔HOST converters, and plan resolution — that the spill
+phase later reuses. Phase 3 then only adds the DISK tier and the downgrade dispatch wiring.
+
+Current path (no compression yet):
+- Pin: `SiriusExtension::PinTableFunction` (`src/sirius_extension.cpp:844`, `tier == "host"`) reads
+  each parquet chunk to a `gpu_table_representation`, converts GPU→HOST into a
+  `cucascade::host_data_representation` via the converter registry, and stores it in
+  `pinned_entry::host_chunks` (`src/include/scan_manager/sirius_scan_manager.hpp:168`).
+- Scan: `gpu_ingestible_factory::try_cached` builds a `pinned_table_gpu_ingestible` (HOST ctor);
+  `produce_batch` slices the host rep by the query's column indices
+  (`src/op/scan/pinned_table_gpu_ingestible.cpp:173`) and emits a host-resident `data_batch`;
+  `scan_operator_with_pinned_table_input::prepare_for_processing`
+  (`src/op/scan/sirius_gpu_scan_operator.cpp:46`) converts it to `gpu_table_representation` via
+  `mut.convert_to<gpu_table_representation>(registry, ...)`.
+
+Work:
+- `simpatico_bridge` (`ensure_cuda_context` + stream/mr helpers) and `compressed_host_representation`
+  (Tier::HOST `idata_representation` wrapping a `simpatico::compressed_table` plus
+  schema / row count / plan DSL / column names; `get_size_in_bytes` = compressed footprint,
+  `get_uncompressed_data_size_in_bytes` = logical). Shared with Phase 3.
+- `register_compression_converters(registry)` (wired into `converter_registry::initialize` next to
+  `register_parquet_converters`) registers:
+  - `gpu_table_representation → compressed_host_representation` — resolve plan, `compress_with_plan`,
+    stage compressed device buffers to pinned host. Pass the cuCascade allocator directly: the
+    vendored API takes `rmm::device_async_resource_ref` (= `memory_space::get_default_allocator()`),
+    so §5.4's `nullptr` workaround is unnecessary.
+  - `compressed_host_representation → gpu_table_representation` — `decompress` to a cudf table on the
+    target GPU. Once registered, the scan-time `convert_to<gpu_table_representation>` in
+    `prepare_for_processing` decompresses automatically — **no scan-operator edit**.
+- Column projection on the compressed rep: a `compressed_host_representation::select_columns(indices)`
+  that picks the subset of `compressed_column`s (cheap — `compressed_table` is per-column), replacing
+  the `host_chunk->slice(column_indices)` call in `produce_batch`.
+- `pinned_entry`: add a compressed host slot (e.g.
+  `std::vector<std::shared_ptr<compressed_host_representation>> compressed_host_chunks;`) + a flag, or
+  generalize `host_chunks` to `shared_ptr<idata_representation>`. `PinTableFunction` (host tier)
+  compresses each chunk (GPU → compressed_host) when compression is enabled and a plan resolves; else
+  falls back to the existing raw `host_data_representation`.
+- `pinned_table_gpu_ingestible` HOST ctor + `produce_batch` host branch accept compressed chunks and
+  emit a batch wrapping the `compressed_host_representation`.
+- Plan resolution keyed by **pinned table + column name** (parquet metadata names are already captured
+  at pin time as `read_column_names` / `pinned_entry::column_names`). First cut: a single global default
+  plan plus an optional per-table/column override map (in-memory). Simpler than Phase 3's graph-node
+  identity because the cache key is a real table/column.
+- Config: enable/disable flag, min-chunk-size-to-compress threshold, default plan.
+- Robustness: compression is best-effort — on `compress_with_plan` failure or no plan, store the raw
+  host rep (query still succeeds). Decompression is NOT optional and runs on the reservation-backed
+  prepare stream.
+- Tests: pin tier=host compressed → cached scan → result equality vs uncompressed pin; column-subset
+  projection correctness; memory accounting (compressed < uncompressed); fallback when no plan / tiny
+  chunk; multi-GPU pin (NUMA-local host space) decompresses onto the right GPU.
+
+### Phase 3 — Spill compression
+- Reuse Phase 2's `simpatico_bridge`, `compressed_host_representation`, and
+  `register_compression_converters`; add `compressed_disk_representation` (Tier::DISK) and the
+  remaining converters (§5.2).
 - Edit `convertible_data_batch::convert` (HOST/DISK) to target compressed reps behind a config flag.
 - DISK tier: call `write_compressed_table` / `read_compressed_table` directly — no custom
   serialization to write (§5.3 resolved upstream).
@@ -395,12 +463,12 @@ then pass `-DSIMPATICO_BUILD_BENCH=OFF` from Sirius's cmake configure step when 
 - Tests: spill→reload roundtrip; downgrade under memory pressure; fallback when no plan registered;
   memory accounting (compressed vs uncompressed sizes correct).
 
-### Phase 3 — Plan discovery (`explore`)
+### Phase 4 — Plan discovery (`explore`)
 - `explore` is **not** part of `simpatico_codegen`; it lives in the main Simpatico repo
   (`bindings/cudf-sys/compression_explorer`). Decide: vendor that component too, or run it offline
   and import results. Run periodically per node output; write winning plans into the register.
 
-### Phase 4 — Distributed transfer
+### Phase 5 — Distributed transfer
 - Add `compressed_gpu_representation` to the cross-GPU `representation_converter` paths.
 - Policy by link type: **intra-node** (NVLink/peer DMA) — high bandwidth, prefer existing
   `cudaMemcpyPeerAsync`; compress only if it pays off (light/skip). **Inter-node** — lower bandwidth,
@@ -431,14 +499,18 @@ Consumed headers from the engine:
 - `src/compression/simpatico_codegen/include/api/simpatico_codegen.hpp`
 - `src/compression/simpatico_codegen/include/api/compressed_table_io.hpp`
 
-Edited (Sirius):
-- `CMakeLists.txt` (add_subdirectory + link nvrtc/nvcomp + new src/compression sources)
+Edited (Sirius) — Phase 2 (cached input tables):
+- `CMakeLists.txt` (link `simpatico` into the extension targets; link nvrtc/nvcomp; new src/compression sources)
 - `src/include/data/sirius_converter_registry.hpp` (call `register_compression_converters`)
+- extension init `src/sirius_extension.cpp` (`ensure_cuda_context()` near `converter_registry::initialize()`)
+- `src/sirius_extension.cpp` `PinTableFunction` (host tier: compress chunk → `compressed_host_representation`)
+- `src/include/scan_manager/sirius_scan_manager.hpp` (`pinned_entry`: compressed host-chunk slot)
+- `src/op/scan/pinned_table_gpu_ingestible.{hpp,cpp}` (HOST ctor + `produce_batch` accept compressed chunks; column `select_columns`)
+
+Edited (Sirius) — Phase 3 (spill), additional:
 - `src/include/data/convertible_data_batch.hpp` (HOST/DISK → compressed targets)
-- extension init (`ensure_cuda_context()`)
 - sink publish path (stamp node-output id onto batches)
 
 Unchanged:
 - cuCascade (entire submodule)
-- GPU pipeline task / `lock_or_prepare_batch` logic (decompression is automatic via registered converter)
-```
+- GPU pipeline task / `lock_or_prepare_batch` / `prepare_for_processing` logic (decompression is automatic via registered converter)

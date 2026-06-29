@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <compression/compressed_representation.hpp>
 #include <io/gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 
@@ -50,9 +51,10 @@ class pinned_table_post_filter_and_projection_info : public io::post_filter_and_
 
 class pinned_table_gpu_ingestible : public io::gpu_ingestible {
  public:
-  using gpu_chunk     = std::vector<std::shared_ptr<cudf::column>>;
-  using host_chunk    = std::shared_ptr<::cucascade::host_data_representation>;
-  using chunk_variant = std::variant<gpu_chunk, host_chunk>;
+  using gpu_chunk             = std::vector<std::shared_ptr<cudf::column>>;
+  using host_chunk            = std::shared_ptr<::cucascade::host_data_representation>;
+  using compressed_host_chunk = std::shared_ptr<sirius::compressed_host_representation>;
+  using chunk_variant         = std::variant<gpu_chunk, host_chunk, compressed_host_chunk>;
 
   /// GPU-tier constructor.
   pinned_table_gpu_ingestible(
@@ -62,10 +64,20 @@ class pinned_table_gpu_ingestible : public io::gpu_ingestible {
     std::shared_ptr<duckdb::Expression> filter_expression,
     std::shared_ptr<scan_plan const> plan);
 
-  /// HOST-tier constructor.
+  /// HOST-tier constructor (uncompressed).
   pinned_table_gpu_ingestible(
     std::unique_ptr<io::ingestible_table_info> table_info,
     std::vector<std::shared_ptr<::cucascade::host_data_representation>> host_chunks,
+    std::vector<std::size_t> column_indices,
+    ::cucascade::memory::memory_space& memory_space,
+    std::unordered_map<int, ::cucascade::memory::memory_space*> gpu_memory_spaces,
+    std::shared_ptr<duckdb::Expression> filter_expression,
+    std::shared_ptr<scan_plan const> plan);
+
+  /// HOST-tier constructor (Simpatico-compressed chunks).
+  pinned_table_gpu_ingestible(
+    std::unique_ptr<io::ingestible_table_info> table_info,
+    std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
     std::vector<std::size_t> column_indices,
     ::cucascade::memory::memory_space& memory_space,
     std::unordered_map<int, ::cucascade::memory::memory_space*> gpu_memory_spaces,
