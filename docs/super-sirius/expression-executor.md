@@ -17,6 +17,8 @@ This document covers the GPU expression execution subsystem used by FILTER and P
 
 Both methods accept a `data_batch` and return a new `data_batch` with the result. The `rmm::cuda_stream_view` and memory resource are passed to the constructor and stored as members — they are not per-call arguments.
 
+The executor can be constructed from the full operator expression list or from a pre-filtered `std::vector<sirius::ast::node const*>` (non-owning). The PROJECTION operator uses the latter to pass only the entries that actually need evaluation, after pulling out pure BOUND_REF passthroughs that it exposes as zero-copy views (see [operators](operators.md)). `execute()` returns one output column per supplied expression, in order.
+
 ## Sirius AST Type Hierarchy
 
 **Files:** `src/include/expression/ast/node.hpp`, `src/include/expression/ast/*.hpp`

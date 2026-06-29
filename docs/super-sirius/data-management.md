@@ -19,6 +19,15 @@ A data batch flows through the system in these stages:
 8. Cleanup:        batch destroyed when shared_ptr ref count reaches zero
 ```
 
+### Owned vs. view-backed GPU batches
+
+A `gpu_table_representation` holds its data in one of two forms:
+
+- **Owned** — a `std::unique_ptr<cudf::table>`. Built via `sirius::make_data_batch(table, space, stream)`. This is the common case (operators that allocate new output columns).
+- **View-backed (`owning_table_view`)** — a non-owning `cudf::table_view` plus a type-erased (`std::any`) *owner* that keeps the viewed device memory alive. Built via `sirius::make_data_batch_from_view(view, owner, alloc_size, space, stream)`. Used to expose existing columns without copying.
+
+The owner can be any copy-constructible object that keeps the memory alive — e.g. a `read_only_data_batch` lock on a source batch (so the source stays alive and read-only-pinned for the view's lifetime), a `shared_ptr<cudf::table>`, or a composite of both. Producers of view-backed batches include the pinned-table scan path and the PROJECTION operator's zero-copy passthrough paths (see [operators](operators.md)). Downstream code is agnostic: `get_table_view()` works for both forms, and `release_table()` materializes a view-backed batch into an owned table on demand.
+
 ### Batch State Machine
 
 Each `data_batch` (from cuCascade) uses a 3-class reader-writer locking model. Data is only

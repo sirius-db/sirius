@@ -19,6 +19,8 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
+#include <duckdb/common/types/value.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/node.hpp>
@@ -207,4 +209,101 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   REQUIRE(host_key0 == key_vals);
   REQUIRE(host_key1 == key_vals);
   REQUIRE(host_data == data_vals);
+}
+
+// Path 3: a mix of evaluated columns (here a constant) and zero-copy passthroughs. Exercises the
+// composite owning_table_view owner (freshly-evaluated table + input read-only lock).
+TEST_CASE("sirius_physical_projection mixes evaluated and passthrough columns (path 3)",
+          "[physical_projection][mixed]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  std::vector<int64_t> key_vals{7, 8, 9};
+  std::vector<int64_t> data_vals{70, 80, 90};
+  auto input_batch = make_two_column_batch<int64_t, int64_t>(
+    *space, key_vals, data_vals, cudf::type_id::INT64, std::nullopt);
+
+  // SELECT data (passthrough col1), 42 (constant -> evaluated), key (passthrough col0)
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
+  exprs.push_back(duckdb::make_uniq<BoundReferenceExpression>(
+    duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), 1));
+  exprs.push_back(duckdb::make_uniq<BoundConstantExpression>(duckdb::Value::BIGINT(42)));
+  exprs.push_back(duckdb::make_uniq<BoundReferenceExpression>(
+    duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), 0));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  sirius_physical_projection projection(
+    sirius::from_duckdb_vec(types), translate_expressions(std::move(exprs)), key_vals.size());
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
+  auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+  auto out_batch =
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().at(0);
+
+  // Drop every external handle to the input batch and sync the stream before validating. The
+  // output's composite owner (input read-only lock) must keep the passthrough columns' data
+  // alive even after the input variable disappears.
+  inputs.clear();
+  input_batch.reset();
+  REQUIRE(cudaStreamSynchronize(cudf::get_default_stream().value()) == cudaSuccess);
+
+  auto out_view = sirius::get_cudf_table_view(*out_batch);
+  REQUIRE(out_view.num_columns() == 3);
+  REQUIRE(copy_column_to_host<int64_t>(out_view.column(0)) == data_vals);
+  REQUIRE(copy_column_to_host<int64_t>(out_view.column(1)) ==
+          std::vector<int64_t>(key_vals.size(), 42));
+  REQUIRE(copy_column_to_host<int64_t>(out_view.column(2)) == key_vals);
+}
+
+// Lifetime: a passthrough-only (path 2) output references input memory via the owning_table_view.
+// Dropping every external handle to the input batch must NOT free the data — the output batch's
+// owner (the input read-only lock) keeps it alive and pinned.
+TEST_CASE("sirius_physical_projection passthrough output outlives input batch handle",
+          "[physical_projection][lifetime]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  std::vector<int64_t> key_vals{1, 2, 3, 4};
+  std::vector<int64_t> data_vals{11, 22, 33, 44};
+  auto input_batch = make_two_column_batch<int64_t, int64_t>(
+    *space, key_vals, data_vals, cudf::type_id::INT64, std::nullopt);
+
+  // Pure passthrough: SELECT key, data
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
+  exprs.push_back(duckdb::make_uniq<BoundReferenceExpression>(
+    duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), 0));
+  exprs.push_back(duckdb::make_uniq<BoundReferenceExpression>(
+    duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), 1));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  sirius_physical_projection projection(
+    sirius::from_duckdb_vec(types), translate_expressions(std::move(exprs)), key_vals.size());
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
+  auto outputs = projection.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto out_batch =
+    dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().at(0);
+
+  // Drop every external handle to the input batch and sync the stream before validating; only the
+  // output owner's read-only lock keeps the data alive.
+  inputs.clear();
+  input_batch.reset();
+  REQUIRE(cudaStreamSynchronize(cudf::get_default_stream().value()) == cudaSuccess);
+
+  auto out_view = sirius::get_cudf_table_view(*out_batch);
+  REQUIRE(out_view.num_columns() == 2);
+  REQUIRE(copy_column_to_host<int64_t>(out_view.column(0)) == key_vals);
+  REQUIRE(copy_column_to_host<int64_t>(out_view.column(1)) == data_vals);
 }

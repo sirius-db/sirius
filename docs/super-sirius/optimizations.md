@@ -94,6 +94,19 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
+### Zero-Copy Projection Passthrough (PR #991)
+
+**Motivation:** A projection that simply re-references input columns (`SELECT a, c, a`) previously deep-copied every output column on device via the expression executor's BOUND_REF path, even though the data already lived on the GPU.
+
+**Mechanism:** `sirius_physical_projection::execute()` classifies each `select_list` entry as a pure passthrough (`sirius::ast::reference`) or an expression to evaluate, then takes one of three paths per batch:
+1. **All evaluated:** owned `cudf::table` (unchanged).
+2. **All passthrough:** output is a `cudf::table_view` over the input columns, wrapped as a view-backed batch whose owner is the input's `read_only_data_batch` lock — **zero device copies**.
+3. **Mixed:** only the non-passthrough entries are evaluated; the output view mixes evaluated columns with input columns, jointly owned by the evaluated table (`shared_ptr<cudf::table>`) and the input lock.
+
+Only the entries needing evaluation are handed to the executor (its `std::vector<sirius::ast::node const*>` constructor), so passthrough columns are never materialized.
+
+**Code path:** `src/op/sirius_physical_projection.cpp` — `execute()`; `src/include/data/data_batch_utils.hpp` — `make_data_batch_from_view()`; `src/include/expression_executor/gpu_expression_executor.hpp` — subset constructor.
+
 ## Memory Optimizations
 
 ### Memory-Pressure-Driven Downgrade (PR #368)
