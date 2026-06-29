@@ -182,6 +182,7 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
+    src/helper/list_offset_fixup.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
@@ -549,6 +550,7 @@ set(TEST_SOURCES
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
+    test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp

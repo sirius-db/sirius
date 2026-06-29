@@ -184,6 +184,7 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
     case type_id::TIMESTAMP_NS: return cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS);
     case type_id::VARCHAR: return cudf::data_type(cudf::type_id::STRING);
     case type_id::STRUCT: return cudf::data_type(cudf::type_id::STRUCT);
+    case type_id::ARRAY: return cudf::data_type(cudf::type_id::LIST);
     case type_id::LIST:
     case type_id::SQLNULL:
     case type_id::INVALID:
@@ -321,6 +322,7 @@ inline cudf::data_type GetCudfType(const LogicalType& logical_type)
     case LogicalTypeId::TIMESTAMP_NS: return cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS);
     case LogicalTypeId::VARCHAR: return cudf::data_type(cudf::type_id::STRING);
     case LogicalTypeId::STRUCT: return cudf::data_type(cudf::type_id::STRUCT);
+    case LogicalTypeId::ARRAY: return cudf::data_type(cudf::type_id::LIST);
     case LogicalTypeId::DECIMAL: {
       switch (logical_type.InternalType()) {
         case PhysicalType::INT32:
