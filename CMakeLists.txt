@@ -113,8 +113,8 @@ set(CUCASCADE_WARNINGS_AS_ERRORS
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
-# Simpatico GPU compression engine (Phase 1 integration) Tests disabled here —
-# run them via the standalone simpatico_codegen build. Benchmark harness
+# Simpatico GPU compression engine Tests disabled here — run them via the
+# standalone simpatico_codegen build. Benchmark harness
 # (compress_with_plan_benchmark) is built by default.
 add_subdirectory(src/compression/simpatico_codegen
                  "${CMAKE_BINARY_DIR}/simpatico_codegen" EXCLUDE_FROM_ALL)
@@ -164,6 +164,10 @@ endif()
 
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/compression/compressed_representation.cpp
+    src/compression/compression_converters.cpp
+    src/compression/plan_register.cpp
+    src/compression/simpatico_bridge.cpp
     src/config.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
@@ -359,6 +363,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
@@ -374,7 +380,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     spdlog::spdlog
     cuCascade::cucascade
     yaml-cpp::yaml-cpp
-    telemetry_bridge)
+    telemetry_bridge
+    simpatico)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -456,6 +463,7 @@ endif()
 
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
@@ -603,6 +611,7 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
