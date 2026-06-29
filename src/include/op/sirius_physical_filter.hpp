@@ -19,7 +19,10 @@
 #include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cudf/types.hpp>
+
 #include <memory>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -34,25 +37,20 @@ class sirius_physical_filter : public sirius_physical_operator {
  public:
   sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
                          std::unique_ptr<sirius::ast::node> expression,
-                         std::size_t estimated_cardinality);
+                         std::size_t estimated_cardinality,
+                         std::vector<cudf::size_type> output_indices = {});
 
   //! The filter expression
   std::unique_ptr<sirius::ast::node> expression;
 
+  //! Output column positions to gather from the filtered input, in output order.
+  //! Empty ⇒ keep every input column. When set, columns referenced only by the
+  //! predicate are evaluated but never materialized — folds what would otherwise
+  //! be a trailing projection into the filter's gather.
+  std::vector<cudf::size_type> output_indices;
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
-
-  // sirius_expression_executor* sirius_expression_executor;
-
-  // public:
-  // 	std::unique_ptr<duckdb::OperatorState> get_operator_state(duckdb::ExecutionContext &context)
-  // const override;
-
-  // 	bool parallel_operator() const override {
-  // 		return true;
-  // 	}
-
-  // 	std::string params_to_string() const override;
 };
 
 }  // namespace op

@@ -4801,3 +4801,23 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   REQUIRE(unpin_result);
   REQUIRE_FALSE(unpin_result->HasError());
 }
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - standalone filter drops pure-filter column via projection map",
+                 "[integration][gpu_execution][parquet][filter][projection_map]")
+{
+  // A HAVING predicate over an aggregate cannot be pushed below the aggregate, so it materializes
+  // as a standalone LogicalFilter above it. The aggregate it filters on is dropped from the output,
+  // so DuckDB attaches a projection_map to that filter. The filter must gather only the projected
+  // columns and never materialize the aggregate(s) referenced only by the predicate (#987) — the
+  // trailing projection is folded into the filter's select() rather than emitted as its own op.
+
+  // Drops one pure-filter aggregate (sum(l_quantity)); keeps only the group key l_orderkey.
+  compare_gpu_vs_cpu(
+    "select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 100;");
+
+  // Drops two pure-filter aggregates; keeps a two-column group-key prefix.
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus from lineitem group by l_returnflag, l_linestatus "
+    "having sum(l_quantity) > 100 and count(*) > 5;");
+}

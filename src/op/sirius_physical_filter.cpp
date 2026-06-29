@@ -31,10 +31,12 @@ namespace op {
 
 sirius_physical_filter::sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
                                                std::unique_ptr<sirius::ast::node> expression_p,
-                                               std::size_t estimated_cardinality)
+                                               std::size_t estimated_cardinality,
+                                               std::vector<cudf::size_type> output_indices_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality),
-    expression(std::move(expression_p))
+    expression(std::move(expression_p)),
+    output_indices(std::move(output_indices_p))
 {
   D_ASSERT(expression != nullptr);
 }
@@ -43,7 +45,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
                                                                rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_filter::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input         = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
   sirius::gpu_expression_executor gpu_expression_executor(
@@ -53,8 +55,12 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    auto filtered_table = gpu_expression_executor.select(
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    // Empty output_indices ⇒ keep every input column; otherwise gather only the requested
+    // output columns, so pure-filter columns are evaluated but never materialized.
+    auto filtered_table = output_indices.empty()
+                            ? gpu_expression_executor.select(view)
+                            : gpu_expression_executor.select(view, output_indices);
     output_batches.push_back(
       sirius::make_data_batch(std::move(filtered_table), *batch.get_memory_space(), stream));
   }
