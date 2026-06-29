@@ -101,19 +101,13 @@ impl PInternalService for SiriusComputeNodeService {
         request: PFetchDataRequest,
         _attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PFetchDataResult>, crate::prpc::Error> {
-        let id = FragmentInstanceId {
-            hi: request.finst_id.hi,
-            lo: request.finst_id.lo,
-        };
+        let id = FragmentInstanceId::from(&request.finst_id);
         // An unknown id is an error, not EOS: it means this CN never buffered a result for the
         // fragment the FE is polling (wrong id, or a dispatch/result-sink path that did not run),
         // and StarRocks treats a missing result buffer as a failure rather than an empty result.
         let Some(outcome) = self.results.take_next(id) else {
             return Ok(Self::fetch_data_result(
-                Self::internal_error(format!(
-                    "no buffered result for fragment instance {}-{}",
-                    id.hi, id.lo
-                )),
+                Self::internal_error(format!("no buffered result for fragment instance {id}")),
                 0,
                 true,
             )
@@ -298,10 +292,10 @@ impl SiriusComputeNodeService {
 
     /// Extracts the fragment instance id the FE later passes to `fetch_data`.
     fn fragment_instance_id(params: &TExecPlanFragmentParams) -> Option<FragmentInstanceId> {
-        params.params.as_ref().map(|exec| FragmentInstanceId {
-            hi: exec.fragment_instance_id.hi,
-            lo: exec.fragment_instance_id.lo,
-        })
+        params
+            .params
+            .as_ref()
+            .map(|exec| FragmentInstanceId::from(&exec.fragment_instance_id))
     }
 
     /// Extracts the parquet path from the binary-thrift attachment and infers its schema.
