@@ -103,6 +103,33 @@ struct telemetry_config {
   std::string engine_name{"siriusDB"};
 };
 
+/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
+/// These settings apply exclusively to cached input-table pinning and have no
+/// effect on spill-path compression (Phase 3).
+struct compression_config {
+  /// When true, pin_table(tier=>'host') attempts to compress each chunk with
+  /// Simpatico before storing it in host memory. Falls back to uncompressed
+  /// host storage when no plan file is found for a table or compression fails.
+  bool enable_pin_table_compression{false};
+
+  /// Minimum chunk size (uncompressed bytes) below which compression is
+  /// skipped and the chunk is stored uncompressed.  0 = no threshold.
+  std::size_t min_chunk_bytes{1ULL * 1024 * 1024};  // 1 MiB
+
+  /// Directory containing per-table Simpatico plan files for input-table
+  /// compression.  Each file is named "<table_name>.<ext>" (any extension);
+  /// its contents are the multi-column plan DSL (columns separated by "---"
+  /// lines) passed verbatim to simpatico::compress_with_plan.  If no file
+  /// exists for a table, that table is pinned uncompressed regardless of the
+  /// enable flag.  Empty string = feature disabled.
+  std::string input_plan_dir{};
+
+  /// Directory used for temporary .hpln files. On Linux, /dev/shm is a
+  /// RAM-backed tmpfs; falls back to std::filesystem::temp_directory_path()
+  /// when not available.
+  std::string temp_dir{"/dev/shm"};
+};
+
 struct sirius_config {
   sirius_config();
   ~sirius_config() = default;
@@ -161,6 +188,16 @@ struct sirius_config {
     return _telemetry_config;
   }
 
+  [[nodiscard]] const compression_config& get_compression_config() const noexcept
+  {
+    return _compression_config;
+  }
+
+  [[nodiscard]] compression_config& get_compression_config() noexcept
+  {
+    return _compression_config;
+  }
+
   /// Object-store backend credentials + endpoint. Empty fields disable the
   /// S3 backend; SiriusContext::initialize() reads this to populate
   /// scan_manager_config::s3_config before constructing the scan_manager.
@@ -187,6 +224,7 @@ struct sirius_config {
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
+  compression_config _compression_config;
 };
 
 }  // namespace sirius
