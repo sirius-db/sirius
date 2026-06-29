@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <compression/compression_converters.hpp>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
@@ -54,6 +55,7 @@ class converter_registry {
     instance_ = std::make_unique<registry_type>();
     cucascade::register_builtin_converters(*instance_);
     sirius::register_parquet_converters(*instance_);
+    sirius::register_compression_converters(*instance_);
   }
 
   /**
