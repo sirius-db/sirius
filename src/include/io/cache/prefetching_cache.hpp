@@ -21,6 +21,7 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
+#include "io/cache/config.hpp"
 #include "io/cache/types.hpp"
 #include "planner/query.hpp"
 
@@ -140,10 +141,8 @@ class prefetching_cache {
 
   prefetching_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
                     sirius_ioctx* io_ctx,
-                    size_t inflight_budget_chunks,
-                    uint32_t buffer_pool_slabs,
-                    std::shared_ptr<const sirius::memory::topology_index> topology_index,
-                    bool dispose_after_use = false);
+                    const config& cfg,
+                    std::shared_ptr<const sirius::memory::topology_index> topology_index);
   ~prefetching_cache();
 
   prefetching_cache(prefetching_cache const&)            = delete;
@@ -238,6 +237,8 @@ class prefetching_cache {
     uint64_t misses{0};
     uint64_t evictions{0};
   };
+
+  const config _cfg;
 
   counters _counters;
   counters_snapshot _last_reported;

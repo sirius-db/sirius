@@ -21,7 +21,7 @@
 namespace sirius::io::cache {
 
 struct config {
-  size_t inflight_budget_chunks   = 2048;
+  size_t inflight_io_chunk_budget = 2048;
   size_t initial_pool_reservation = 10;
   bool dispose_after_use          = false;
 

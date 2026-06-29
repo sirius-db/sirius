@@ -50,12 +50,8 @@ void sirius_ioctx::initialize_cache(
     return;
   }
   try {
-    _cache = std::make_unique<cache::prefetching_cache>(reservation_manager,
-                                                        this,
-                                                        cache_config.inflight_budget_chunks,
-                                                        cache_config.initial_pool_reservation,
-                                                        std::move(topology_index),
-                                                        cache_config.dispose_after_use);
+    _cache = std::make_unique<cache::prefetching_cache>(
+      reservation_manager, this, cache_config, std::move(topology_index));
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("prefetching_cache construction failed: {}", e.what());
     _cache.reset();

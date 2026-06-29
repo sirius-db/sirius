@@ -27,6 +27,9 @@ struct config {
   /// handle instead of the O_DIRECT one.  Defaults to O_DIRECT.
   bool use_odirect{true};
 
+  // max number of contiguous segments to fuse into one readv SQE.  The
+  // prep_host_rxv_request and prep_host_to_device_rx_request paths fuse
+  // contiguous segments into one readv SQE, capped at this value.  The
   std::size_t max_n_chunks{16};
 };
 

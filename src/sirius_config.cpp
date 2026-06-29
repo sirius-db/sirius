@@ -121,7 +121,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
   yaml::reader r(node, "local");
-  r.optional("bounce_size", yaml::bytes(opt.bounce_size));
   r.optional("use_odirect", opt.use_odirect);
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.reject_unknown();
@@ -131,7 +130,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
   r.optional(
-    "inflight_budget_chunks", opt.inflight_budget_chunks, yaml::greater_than<std::size_t>{0});
+    "inflight_io_chunk_budget", opt.inflight_io_chunk_budget, yaml::greater_than<std::size_t>{0});
   r.optional("initial_pool_reservation", opt.initial_pool_reservation);
   r.optional("dispose_after_use", opt.dispose_after_use);
   r.optional("buffer_pool_bytes", yaml::bytes(opt.buffer_pool_bytes));

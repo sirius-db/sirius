@@ -264,16 +264,14 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size
 prefetching_cache::prefetching_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
   sirius_ioctx* io_ctx,
-  size_t inflight_budget_chunks,
-  uint32_t buffer_pool_slabs,
-  std::shared_ptr<const sirius::memory::topology_index> topology_index,
-  bool dispose_after_use)
-  : _pool(std::make_unique<buffer_pool>(reservation_manager, buffer_pool_slabs)),
+  const config& cfg,
+  std::shared_ptr<const sirius::memory::topology_index> topology_index)
+  : _cfg(cfg),
+    _pool(std::make_unique<buffer_pool>(reservation_manager, cfg.initial_pool_reservation)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
     _armed(true),
-    _rate_limiter(inflight_budget_chunks),
-    _dispose_after_use(dispose_after_use)
+    _rate_limiter(_cfg.inflight_io_chunk_budget)
 {
   _preparation_thread = std::jthread([this](const std::stop_token& st) { prepare_loop(st); },
                                      _preparation_stop_source.get_token());
@@ -795,7 +793,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // under memory pressure and stop once enough chunks are free again.  Memory
     // pressure is scored as outstanding (handed-out) chunks against the pool's
     // aggregate reserved capacity.
-    bool const dispose       = _dispose_after_use;
+    bool const dispose       = _cfg.dispose_after_use;
     size_t const capacity    = _pool->capacity_chunks();
     size_t const outstanding = _pool->total_chunks();
     bool const should_evict =
