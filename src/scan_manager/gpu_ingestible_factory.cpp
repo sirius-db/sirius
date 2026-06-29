@@ -136,19 +136,31 @@ std::shared_ptr<io::gpu_ingestible> gpu_ingestible_factory::try_cached(
       }
 
       if (entry.tier == cucascade::memory::Tier::HOST) {
-        // HOST-tier entries store one host_data_representation per chunk in
-        // entry.host_chunks; chunk_memory_spaces is intentionally empty (see
-        // pinned_entry doc comment + insert_pinned_entry_host). Validate the
-        // host_chunks vector instead.
-        if (entry.host_chunks.empty()) {
+        // HOST-tier entries store either compressed_host_chunks (compressed) or
+        // host_chunks (uncompressed); at most one is populated. Compressed takes
+        // priority when non-empty.
+        const bool has_compressed   = !entry.compressed_host_chunks.empty();
+        const bool has_uncompressed = !entry.host_chunks.empty();
+        if (!has_compressed && !has_uncompressed) {
           throw std::runtime_error("[gpu_ingestible_factory::try_cached] pinned host entry '" +
-                                   pinned_name + "' has no host_chunks");
+                                   pinned_name +
+                                   "' has no host_chunks and no compressed_host_chunks");
         }
-        for (std::size_t i = 0; i < entry.host_chunks.size(); ++i) {
-          if (!entry.host_chunks[i]) {
-            throw std::runtime_error("[gpu_ingestible_factory::try_cached] pinned host entry '" +
-                                     pinned_name + "' host_chunks[" + std::to_string(i) +
-                                     "] is null");
+        if (has_compressed) {
+          for (std::size_t i = 0; i < entry.compressed_host_chunks.size(); ++i) {
+            if (!entry.compressed_host_chunks[i]) {
+              throw std::runtime_error("[gpu_ingestible_factory::try_cached] pinned host entry '" +
+                                       pinned_name + "' compressed_host_chunks[" +
+                                       std::to_string(i) + "] is null");
+            }
+          }
+        } else {
+          for (std::size_t i = 0; i < entry.host_chunks.size(); ++i) {
+            if (!entry.host_chunks[i]) {
+              throw std::runtime_error("[gpu_ingestible_factory::try_cached] pinned host entry '" +
+                                       pinned_name + "' host_chunks[" + std::to_string(i) +
+                                       "] is null");
+            }
           }
         }
         // The HOST cached path materializes host chunks onto the executing
@@ -181,6 +193,27 @@ std::shared_ptr<io::gpu_ingestible> gpu_ingestible_factory::try_cached(
           }
           column_indices.push_back(
             static_cast<std::size_t>(std::distance(entry.column_names.begin(), it)));
+        }
+
+        if (has_compressed) {
+          SIRIUS_LOG_DEBUG(
+            "[gpu_ingestible_factory::try_cached] using compressed-host "
+            "pinned_table_gpu_ingestible for op_id={} (pinned='{}' data_cols={} "
+            "chunks={} needs_assembly={})",
+            op_id,
+            pinned_name,
+            column_indices.size(),
+            entry.compressed_host_chunks.size(),
+            op::scan::needs_output_assembly(plan));
+
+          return std::make_shared<op::scan::pinned_table_gpu_ingestible>(
+            std::move(table_info),
+            entry.compressed_host_chunks,
+            std::move(column_indices),
+            *entry.memory_space,
+            gpu_memory_spaces,
+            std::move(filter_expression),
+            std::move(plan_shared));
         }
 
         SIRIUS_LOG_DEBUG(

@@ -31,6 +31,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
+#include <compression/compressed_representation.hpp>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types.hpp>
@@ -166,6 +167,11 @@ struct pinned_entry {
   /// pinned columns. The cached_split_provider slices these by column index when
   /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  /// HOST-tier compressed storage: one compressed_host_representation per chunk,
+  /// each holding all pinned columns in Simpatico-compressed form. Populated by
+  /// @ref insert_pinned_entry_host_compressed. Takes priority over host_chunks
+  /// when non-empty (the ingestible factory checks this first).
+  std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_host_chunks;
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which cached_split_provider variant @ref create_provider_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
@@ -319,6 +325,26 @@ class sirius_scan_manager {
     std::vector<std::string> column_names,
     std::vector<std::string> file_paths,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+    cucascade::memory::memory_space& memory_space,
+    bool is_partial = false);
+
+  /// \brief Pin the entry for a table on the host tier using Simpatico-compressed chunks.
+  ///
+  /// Each entry in @p compressed_chunks holds all pinned columns in compressed form.
+  /// The ingestible factory will prefer this over the uncompressed host_chunks when
+  /// it finds a non-empty compressed_host_chunks slot.
+  ///
+  /// \param name                Table name key.
+  /// \param column_names        Column names in capture order.
+  /// \param file_paths          Resolved file paths captured at pin time.
+  /// \param compressed_chunks   One compressed_host_representation per batch.
+  /// \param memory_space        Representative host memory space (metadata only).
+  /// \param is_partial          True when the caller capped row capture below full file content.
+  void insert_pinned_entry_host_compressed(
+    const std::string& name,
+    const std::vector<std::string>& column_names,
+    const std::vector<std::string>& file_paths,
+    std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
     cucascade::memory::memory_space& memory_space,
     bool is_partial = false);
 

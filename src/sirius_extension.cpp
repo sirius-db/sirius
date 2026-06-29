@@ -38,6 +38,10 @@
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
+#include "compression/compressed_representation.hpp"
+#include "compression/compression_converters.hpp"
+#include "compression/plan_register.hpp"
+#include "compression/simpatico_bridge.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
@@ -56,6 +60,17 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+
+#include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <rmm/mr/per_device_resource.hpp>
+
+#include <api/compressed_table_io.hpp>
+#include <api/simpatico_codegen.hpp>
+
+#include <filesystem>
+#include <fstream>
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_buffer_manager.hpp"
@@ -939,6 +954,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   // HOST-tier storage: one host_data_representation per chunk.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  // HOST-tier compressed storage (populated when compression is enabled).
+  std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_host_chunks;
   std::vector<std::string> read_column_names;  // captured from parquet metadata
   int64_t remaining_rows = data.args.n_rows.value_or(-1);
   // Per-call local counter (NOT std::atomic, NOT global). PinTableFunction is
@@ -957,6 +974,42 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   cucascade::representation_converter_registry* registry_ptr = nullptr;
   std::unordered_map<int, rmm::cuda_stream> pin_streams_by_gpu;
   if (data.args.tier == "host") { registry_ptr = &sirius::converter_registry::get(); }
+
+  // Compression: load the per-table plan DSL from the plan directory (if configured).
+  // The file <input_plan_dir>/<table_name>.* is read once before the per-file loop and
+  // cached in the plan_register for this table. If no file exists the table is pinned
+  // uncompressed regardless of the enable flag.
+  const auto& comp_cfg    = sirius_ctx->get_config().get_compression_config();
+  const bool tier_is_host = (data.args.tier == "host");
+  const bool comp_globally_enabled =
+    tier_is_host && comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
+  if (comp_globally_enabled) {
+    namespace fs     = std::filesystem;
+    const auto& name = data.args.name;
+    // Check register cache first so repeated pins don't re-scan the directory.
+    if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
+      std::error_code ec;
+      for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
+        if (!entry.is_regular_file()) { continue; }
+        if (entry.path().stem() == name) {
+          std::ifstream f(entry.path());
+          std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+          if (!dsl.empty()) {
+            sirius::compression::plan_register::global().set_table_plan(name, std::move(dsl));
+          }
+          break;
+        }
+      }
+      if (ec) {
+        SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
+                        comp_cfg.input_plan_dir,
+                        ec.message());
+      }
+    }
+  }
+  const bool compression_enabled =
+    comp_globally_enabled &&
+    sirius::compression::plan_register::global().resolve_table_plan(data.args.name).has_value();
 
   for (auto const& path : file_paths) {
     if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
@@ -1013,14 +1066,69 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         (void)inserted;
         rmm::cuda_stream_view target_stream = stream_it->second.view();
         auto* target_host_space             = host_space_by_gpu.at(target_gpu_id);
-        cucascade::gpu_table_representation gpu_repr(
-          std::move(chunk.tbl), *target_space, target_stream);
-        auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
-          gpu_repr, target_host_space, target_stream);
-        // Sync before gpu_repr leaves scope so the async D2H copies finish before its
-        // device buffers are freed.
-        target_stream.synchronize();
-        host_chunks.emplace_back(std::move(host_repr));
+        bool compressed_this_chunk          = false;
+        if (compression_enabled && chunk.tbl->num_columns() > 0) {
+          auto plan_dsl =
+            sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
+          const std::size_t uncompressed_bytes = [&] {
+            std::size_t sz = 0;
+            for (int ci = 0; ci < chunk.tbl->num_columns(); ++ci) {
+              auto const& col = chunk.tbl->view().column(ci);
+              if (cudf::is_fixed_width(col.type())) {
+                sz += static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
+              }
+            }
+            return sz;
+          }();
+          if (plan_dsl.has_value() && uncompressed_bytes >= comp_cfg.min_chunk_bytes) {
+            try {
+              auto ct = simpatico::compress_with_plan(chunk.tbl->view(),
+                                                      *plan_dsl,
+                                                      target_stream,
+                                                      rmm::mr::get_current_device_resource_ref(),
+                                                      read_column_names);
+              // Ensure GPU compression kernels complete before the D2H write.
+              target_stream.synchronize();
+              const std::string temp_path =
+                sirius::compression::make_compressed_temp_path(comp_cfg.temp_dir);
+              const std::string write_err = simpatico::write_compressed_table(ct, temp_path);
+              if (!write_err.empty()) {
+                throw std::runtime_error("write_compressed_table: " + write_err);
+              }
+              const std::size_t compressed_bytes =
+                static_cast<std::size_t>(std::filesystem::file_size(temp_path));
+              compressed_host_chunks.emplace_back(
+                std::make_shared<sirius::compressed_host_representation>(*target_host_space,
+                                                                         temp_path,
+                                                                         read_column_names,
+                                                                         compressed_bytes,
+                                                                         uncompressed_bytes,
+                                                                         chunk_rows));
+              compressed_this_chunk = true;
+              SIRIUS_LOG_DEBUG("[pin_table] chunk compressed: {} bytes → {} bytes ({:.1f}%)",
+                               uncompressed_bytes,
+                               compressed_bytes,
+                               100.0 * static_cast<double>(compressed_bytes) /
+                                 static_cast<double>(uncompressed_bytes));
+            } catch (const std::exception& e) {
+              SIRIUS_LOG_WARN(
+                "[pin_table] compression failed for '{}': {}; "
+                "falling back to uncompressed for this chunk",
+                data.args.name,
+                e.what());
+            }
+          }
+        }
+        if (!compressed_this_chunk) {
+          cucascade::gpu_table_representation gpu_repr(
+            std::move(chunk.tbl), *target_space, target_stream);
+          auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
+            gpu_repr, target_host_space, target_stream);
+          // Sync before gpu_repr leaves scope so the async D2H copies finish before its
+          // device buffers are freed.
+          target_stream.synchronize();
+          host_chunks.emplace_back(std::move(host_repr));
+        }
       } else {
         tables.emplace_back(std::move(chunk.tbl));
         chunk_memory_spaces.push_back(target_space);  // parallel to tables
@@ -1038,18 +1146,31 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // pinned_entry::is_partial.
   bool const is_partial_pin = data.args.n_rows.has_value();
   if (data.args.tier == "host") {
-    // entry.memory_space is metadata only; each host_chunk carries its own
-    // per-GPU NUMA-local memory_space inside its host_data_representation.
-    // Pass a representative (the first round-robin GPU's host space) so the
-    // entry still has a non-null memory_space for diagnostics.
     int const first_gpu_id          = gpu_spaces[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
-    sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
-                                                            std::move(read_column_names),
-                                                            std::move(file_paths),
-                                                            std::move(host_chunks),
-                                                            *representative_host_space,
-                                                            is_partial_pin);
+    if (!compressed_host_chunks.empty() && host_chunks.empty()) {
+      // All chunks were compressed successfully.
+      sirius_ctx->get_scan_manager().insert_pinned_entry_host_compressed(
+        data.args.name,
+        read_column_names,
+        file_paths,
+        std::move(compressed_host_chunks),
+        *representative_host_space,
+        is_partial_pin);
+    } else {
+      // Some or all chunks are uncompressed (compression not enabled, no plan, or partial failure).
+      // compressed_host_chunks destructs here, unlinking any already-written temp files.
+      // entry.memory_space is metadata only; each host_chunk carries its own
+      // per-GPU NUMA-local memory_space inside its host_data_representation.
+      // Pass a representative (the first round-robin GPU's host space) so the
+      // entry still has a non-null memory_space for diagnostics.
+      sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
+                                                              std::move(read_column_names),
+                                                              std::move(file_paths),
+                                                              std::move(host_chunks),
+                                                              *representative_host_space,
+                                                              is_partial_pin);
+    }
   } else {
     sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
                                                        std::move(read_column_names),
@@ -1480,6 +1601,36 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
+static void SetEnablePinTableCompression(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  sirius_ctx->get_config().get_compression_config().enable_pin_table_compression =
+    BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression to {}", BooleanValue::Get(parameter));
+}
+
+static void SetPinTableInputCompressionPlanDir(ClientContext& context,
+                                               SetScope scope,
+                                               Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  sirius_ctx->get_config().get_compression_config().input_plan_dir = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_input_compression_plan_dir");
+}
+
+static void SetPinTableCompressionMinChunkBytes(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  sirius_ctx->get_config().get_compression_config().min_chunk_bytes =
+    static_cast<std::size_t>(UBigIntValue::Get(parameter));
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_chunk_bytes");
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1663,6 +1814,28 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
+
+  config.AddExtensionOption("pin_table_compression",
+                            "Enable Simpatico compression for pin_table(tier=>'host') chunks",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(false),
+                            SetEnablePinTableCompression);
+
+  config.AddExtensionOption(
+    "pin_table_input_compression_plan_dir",
+    "Directory containing per-table Simpatico plan files for pin_table(tier=>'host') compression. "
+    "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
+    "Tables with no matching file are pinned uncompressed. No effect on spill compression.",
+    LogicalType::VARCHAR,
+    Value(std::string{}),
+    SetPinTableInputCompressionPlanDir);
+
+  config.AddExtensionOption(
+    "pin_table_compression_min_chunk_bytes",
+    "Minimum uncompressed chunk size in bytes below which pin_table compression is skipped",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(1ULL * 1024 * 1024),
+    SetPinTableCompressionMinChunkBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -1675,6 +1848,12 @@ static void LoadInternal(ExtensionLoader& loader)
   auto* callback_ptr = callback.get();
   config.GetCallbackManager().Register(std::move(callback));
   sirius::converter_registry::initialize();
+  try {
+    sirius::compression::initialize_simpatico_jit();
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN("Simpatico JIT context initialization failed (compression disabled): {}",
+                    e.what());
+  }
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
 

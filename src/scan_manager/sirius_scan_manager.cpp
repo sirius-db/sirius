@@ -487,6 +487,37 @@ void sirius_scan_manager::insert_pinned_entry_host(
   _pinned_entries[name] = std::move(entry);
 }
 
+void sirius_scan_manager::insert_pinned_entry_host_compressed(
+  const std::string& name,
+  const std::vector<std::string>& column_names,
+  const std::vector<std::string>& file_paths,
+  std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
+  cucascade::memory::memory_space& memory_space,
+  bool is_partial)
+{
+  std::size_t new_num_rows = 0;
+  for (auto const& chunk : compressed_chunks) {
+    if (chunk) { new_num_rows += static_cast<std::size_t>(chunk->num_rows()); }
+  }
+
+  pinned_entry entry;
+  entry.column_names           = column_names;
+  entry.file_paths             = file_paths;
+  entry.tier                   = cucascade::memory::Tier::HOST;
+  entry.memory_space           = &memory_space;
+  entry.num_rows               = new_num_rows;
+  entry.compressed_host_chunks = std::move(compressed_chunks);
+  entry.is_partial             = is_partial;
+
+  SIRIUS_LOG_DEBUG(
+    "[sirius_scan_manager::insert_pinned_entry_host_compressed] '{}' chunks={} rows={}",
+    name,
+    entry.compressed_host_chunks.size(),
+    new_num_rows);
+
+  _pinned_entries[name] = std::move(entry);
+}
+
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
   std::string_view path) const noexcept
 {

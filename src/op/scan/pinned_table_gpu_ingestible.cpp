@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <compression/compressed_representation.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <expression/ast/from_duckdb.hpp>
@@ -109,6 +110,36 @@ pinned_table_gpu_ingestible::pinned_table_gpu_ingestible(
   }
 }
 
+pinned_table_gpu_ingestible::pinned_table_gpu_ingestible(
+  std::unique_ptr<io::ingestible_table_info> table_info,
+  std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
+  std::vector<std::size_t> column_indices,
+  ::cucascade::memory::memory_space& memory_space,
+  std::unordered_map<int, ::cucascade::memory::memory_space*> gpu_memory_spaces,
+  std::shared_ptr<duckdb::Expression> filter_expression,
+  std::shared_ptr<scan_plan const> plan)
+  : io::gpu_ingestible(std::move(table_info)),
+    _column_indices(std::move(column_indices)),
+    _memory_space(&memory_space),
+    _gpu_memory_spaces(std::move(gpu_memory_spaces)),
+    _filter_expression(std::move(filter_expression)),
+    _plan(std::move(plan))
+{
+  if (_gpu_memory_spaces.empty()) {
+    throw std::runtime_error(
+      "[pinned_table_gpu_ingestible] compressed HOST-tier constructor requires non-empty "
+      "gpu_memory_spaces so produce_batch can decompress chunks to the executing GPU's space");
+  }
+  _batches.reserve(compressed_chunks.size());
+  for (auto& chunk : compressed_chunks) {
+    if (!chunk) {
+      throw std::runtime_error(
+        "[pinned_table_gpu_ingestible] null compressed_host_representation in pinned chunks");
+    }
+    _batches.emplace_back(std::move(chunk));
+  }
+}
+
 pinned_table_gpu_ingestible::~pinned_table_gpu_ingestible() = default;
 
 bool pinned_table_gpu_ingestible::has_more_splits() const
@@ -173,6 +204,14 @@ std::shared_ptr<::cucascade::data_batch> pinned_table_gpu_ingestible::produce_ba
         auto sliced = chunk->slice(std::span<const std::size_t>(_column_indices));
         return std::make_shared<::cucascade::data_batch>(::sirius::get_next_batch_id(),
                                                          std::move(sliced));
+      } else if constexpr (std::is_same_v<T, compressed_host_chunk>) {
+        // Emit a compressed-host batch projected to the requested columns.
+        // Decompression is deferred to prepare_for_processing which calls
+        // convert_to<gpu_table_representation> via the registered
+        // compressed_host_representation → gpu_table_representation converter.
+        auto projected = chunk->select_columns(std::span<const std::size_t>(_column_indices));
+        return std::make_shared<::cucascade::data_batch>(::sirius::get_next_batch_id(),
+                                                         std::move(projected));
       }
     },
     _batches[batch_idx]);
