@@ -384,6 +384,7 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
     std::shared_lock lk(_map_mtx);
     auto it = _file_cache.find(obj.raw_file_cache_id());
     if (it != _file_cache.end()) {
+      lk.unlock();
       chunks = it->second->fetch_chunks(offset, size, coverage_policy::full, _chunk_size);
     }
   }
@@ -468,6 +469,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
     std::shared_lock lk(_map_mtx);
     auto it = _file_cache.find(obj.raw_file_cache_id());
     if (it != _file_cache.end()) {
+      lk.unlock();
       chunks = it->second->fetch_chunks(offset, size, policy, _chunk_size);
     }
   }

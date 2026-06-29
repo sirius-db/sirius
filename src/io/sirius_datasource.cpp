@@ -190,15 +190,8 @@ std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
 void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
                                 std::optional<int> dev_id)
 {
-  // Speculative / immediate: only honored when the backend asked for this
-  // particular call site.  none falls through to no-op (the caller blindly
-  // calls fadvise at every tier and the backend's preference is what
-  // decides where the work actually lands).
-  auto const preferred = _io_ctx->preferred_prefetching_stage();
-  if (preferred == cache::prefetching_stage::none) { return; }
-
   auto* cache = _io_ctx->cache();
-  if (cache == nullptr) { return; }
+  if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
 
   // The contract is "one scan, one datasource": a second
   // speculative/immediate fadvise on a datasource that already carries a
@@ -239,8 +232,7 @@ void sirius_datasource::prefetch(cache::prefetching_stage site)
 bool sirius_datasource::uses_prefetching_cache()
 {
   auto* cache = _io_ctx->cache();
-  return cache != nullptr &&
-         _io_ctx->preferred_prefetching_stage() != cache::prefetching_stage::none;
+  return cache != nullptr && _io_ctx->can_use_prefetching_cache();
 }
 
 }  // namespace sirius::io

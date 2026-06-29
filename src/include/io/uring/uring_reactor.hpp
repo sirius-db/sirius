@@ -255,7 +255,7 @@ class uring_reactor {
 
   static constexpr cache::prefetching_stage preferred_prefetching_stage() noexcept
   {
-    return cache::prefetching_stage::immediate;
+    return cache::prefetching_stage::none;
   }
 
  private:

@@ -111,11 +111,10 @@ def setup_benchmark_dir(
     If `name` is provided, the benchmark dir is `<output_root>/<name>` (no
     timestamp); otherwise the default `tpch_<ts>_<mode>_<engine>_iter<N>` is used.
     """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}"
     if name:
-        benchmark_name = name
-    else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        benchmark_name = f"tpch_{ts}_{mode}_{engine}_iter{iterations}"
+        benchmark_name = f"{benchmark_name}_{name}"
     benchmark_dir = os.path.join(output_root, benchmark_name)
     csv_dir = os.path.join(benchmark_dir, "csv")
     log_dir = os.path.join(benchmark_dir, "log_dir")
