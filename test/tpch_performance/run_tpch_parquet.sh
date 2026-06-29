@@ -72,22 +72,24 @@ while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
 done
 
 case "$PINNING_MODE" in
-    none|per-query) ;;
+    none|per-query|pinned-hot) ;;
     *)
-        echo "ERROR: --pinning-mode must be 'none' or 'per-query' (got: $PINNING_MODE)"
+        echo "ERROR: --pinning-mode must be 'none', 'per-query', or 'pinned-hot' (got: $PINNING_MODE)"
         exit 1
         ;;
 esac
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 100 \`seq 1 22\`"
     echo "  --iterations N      Number of iterations per query (default: 2, 1 cold + N-1 warm)"
     echo "  --timeout N         Kill the DuckDB session after N seconds (default: 1200, 0 = no timeout)"
     echo "  --multi-session     Run each query in its own DuckDB process (fresh state per query)"
     echo "  --drop-os-cache     Drop OS filesystem cache before each query (requires --multi-session and sudo)"
     echo "  --pinning-mode MODE 'per-query' calls pin_table for each query's columns before its iterations,"
-    echo "                      then unpin_table afterward. Sirius engine only. Default: 'none'."
+    echo "                      then unpin_table afterward. 'pinned-hot' pins the union of"
+    echo "                      referenced columns once for the whole single-session run."
+    echo "                      Sirius engine only. Default: 'none'."
     exit 1
 fi
 
@@ -119,6 +121,12 @@ if [ "$ENGINE" != "sirius" ] && [ "$ENGINE" != "duckdb" ]; then
     echo "Unknown engine, please use sirius or duckdb"
     exit 1
 fi
+
+if [ "$PINNING_MODE" = "pinned-hot" ] && [ "$MULTI_SESSION" = true ] && [ "$ENGINE" = "sirius" ]; then
+    echo "ERROR: --pinning-mode pinned-hot requires single-session mode; remove --multi-session."
+    exit 1
+fi
+
 DUCKDB="$SIRIUS_DUCKDB"
 # Both engines use the same plain SQL queries — transparent execution
 # routes queries through GPU when SiriusContext is initialized.
@@ -228,7 +236,11 @@ fi
 echo "Iterations: $NUM_ITERATIONS (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 if [ "$PINNING_MODE" != "none" ]; then
     if [ "$ENGINE" = "sirius" ]; then
-        echo "Pinning mode: $PINNING_MODE (pin_table per query, tier=${SIRIUS_PIN_TIER:-gpu})"
+        if [ "$PINNING_MODE" = "per-query" ]; then
+            echo "Pinning mode: $PINNING_MODE (pin_table per query, tier=${SIRIUS_PIN_TIER:-gpu})"
+        else
+            echo "Pinning mode: $PINNING_MODE (pin_table once before timed queries, tier=${SIRIUS_PIN_TIER:-gpu})"
+        fi
     else
         echo "Pinning mode: $PINNING_MODE (ignored — Sirius-only feature)"
     fi
@@ -251,9 +263,12 @@ run_single_session() {
     local MARKER_PREFIX="__TPCH_MARKER__"
     local END_MARKER="__TPCH_END__"
 
-    local PIN_ENABLED=false
+    local PIN_PER_QUERY=false
+    local PINNED_HOT=false
     if [ "$PINNING_MODE" = "per-query" ] && [ "$ENGINE" = "sirius" ]; then
-        PIN_ENABLED=true
+        PIN_PER_QUERY=true
+    elif [ "$PINNING_MODE" = "pinned-hot" ] && [ "$ENGINE" = "sirius" ]; then
+        PINNED_HOT=true
     fi
 
     local TEMP_SQL
@@ -261,11 +276,17 @@ run_single_session() {
     printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
     echo ".timer on" >> "$TEMP_SQL"
 
+    if [ "$PINNED_HOT" = true ]; then
+        echo ".print __TPCH_PIN_BEGIN__ all" >> "$TEMP_SQL"
+        python3 "$SCRIPT_DIR/tpch_pin_columns.py" pin-all "$PARQUET_DIR" >> "$TEMP_SQL"
+        echo ".print __TPCH_PIN_END__ all" >> "$TEMP_SQL"
+    fi
+
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
         # Pin/unpin live OUTSIDE the __TPCH_MARKER__ section so pin/unpin
         # Run Time lines never get counted as query iterations.
-        if [ "$PIN_ENABLED" = true ]; then
+        if [ "$PIN_PER_QUERY" = true ]; then
             echo ".print __TPCH_PIN_BEGIN__ ${q}" >> "$TEMP_SQL"
             python3 "$SCRIPT_DIR/tpch_pin_columns.py" pin "$q" "$PARQUET_DIR" >> "$TEMP_SQL"
             echo ".print __TPCH_PIN_END__ ${q}" >> "$TEMP_SQL"
@@ -276,12 +297,19 @@ run_single_session() {
             cat "$QUERY_FILE" >> "$TEMP_SQL"
             printf '\n' >> "$TEMP_SQL"
         done
-        if [ "$PIN_ENABLED" = true ]; then
+        if [ "$PIN_PER_QUERY" = true ]; then
             echo ".print __TPCH_UNPIN_BEGIN__ ${q}" >> "$TEMP_SQL"
             python3 "$SCRIPT_DIR/tpch_pin_columns.py" unpin "$q" >> "$TEMP_SQL"
             echo ".print __TPCH_UNPIN_END__ ${q}" >> "$TEMP_SQL"
         fi
     done
+
+    if [ "$PINNED_HOT" = true ]; then
+        echo ".print __TPCH_UNPIN_BEGIN__ all" >> "$TEMP_SQL"
+        python3 "$SCRIPT_DIR/tpch_pin_columns.py" unpin-all >> "$TEMP_SQL"
+        echo ".print __TPCH_UNPIN_END__ all" >> "$TEMP_SQL"
+    fi
+
     echo ".print ${END_MARKER}" >> "$TEMP_SQL"
 
     if [ -n "${OUTPUT_DIR:-}" ]; then
@@ -313,12 +341,31 @@ run_single_session() {
     TOTAL_ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
     echo "Total wall-clock time: ${TOTAL_ELAPSED}s"
 
+    local SESSION_OUTPUT_FILE
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        SESSION_OUTPUT_FILE="$OUTPUT_DIR/session_output.txt"
+    else
+        SESSION_OUTPUT_FILE="$PROJECT_DIR/session_output_${ENGINE}_sf${SF}.txt"
+    fi
+    printf '%s\n' "$FULL_OUTPUT" > "$SESSION_OUTPUT_FILE"
+
     local RUN_STATUS=0
     if [ "$SESSION_EXIT" -eq 124 ]; then
         echo "SESSION TIMEOUT: DuckDB was killed after ${SESSION_TIMEOUT}s"
         RUN_STATUS=124
     elif [ "$SESSION_EXIT" -ne 0 ]; then
         echo "SESSION FAILED: DuckDB exited with code $SESSION_EXIT"
+        echo "DuckDB output saved to $SESSION_OUTPUT_FILE"
+        echo "DuckDB error excerpt:"
+        local ERROR_EXCERPT
+        ERROR_EXCERPT=$(printf '%s\n' "$FULL_OUTPUT" \
+            | grep -iE '(^Error:|Invalid Error|IO Error|Catalog Error|Parser Error|Binder Error|Out of Memory|std::bad_alloc|CUDA|RMM|Exception)' \
+            | head -20)
+        if [ -n "$ERROR_EXCERPT" ]; then
+            printf '%s\n' "$ERROR_EXCERPT"
+        else
+            printf '%s\n' "$FULL_OUTPUT" | tail -40
+        fi
         RUN_STATUS=$SESSION_EXIT
     fi
 
@@ -347,7 +394,7 @@ run_single_session() {
 
         # Extract the section between this query's marker and the next __TPCH_* marker.
         # Stopping at any __TPCH_ prefix keeps pin/unpin Run Time lines (which sit in
-        # __TPCH_PIN_*/__TPCH_UNPIN_* sections when --pinning-mode per-query is on)
+        # __TPCH_PIN_*/__TPCH_UNPIN_* sections when a pinning mode is on)
         # out of the query iteration window.
         local SECTION
         SECTION=$(awk -v start="${MARKER_PREFIX} ${q}" '
@@ -358,7 +405,10 @@ run_single_session() {
 
         if [ -z "$SECTION" ]; then
             echo "  NO OUTPUT (session may have timed out or crashed before this query)"
-            echo "error: no output (session may have timed out or crashed before this query)" > "$RESULT_FILE"
+            {
+                echo "error: no output (session may have timed out or crashed before this query)"
+                echo "session_output: $SESSION_OUTPUT_FILE"
+            } > "$RESULT_FILE"
             {
                 echo "step,runtime_s"
                 for ((i = 0; i < NUM_ITERATIONS; i++)); do
@@ -581,7 +631,7 @@ fi
 # Split the Sirius log into per-query segments.
 #
 # Under Super Sirius transparent execution, each query iteration is logged as
-# "QueryBegin: <raw SQL>" — there is no `call gpu_execution(...)` wrapper.
+# "QueryBegin: SQL: <raw SQL>" — there is no `call gpu_execution(...)` wrapper.
 # Skip the session prologue (CREATE VIEW for view setup) and any pinning-mode
 # CALLs (pin_table / unpin_table) so the remaining QueryBegin lines correspond
 # 1:1 to user query iterations. We group every NUM_ITERATIONS consecutive
@@ -599,7 +649,7 @@ if [ "$ENGINE" = "sirius" ] && [ "$MULTI_SESSION" = false ] && [ -n "${OUTPUT_DI
         echo "Splitting Sirius log per query (${NUM_ITERATIONS} iterations per query)..."
         readarray -t QB_LINES < <(
             grep -nE 'QueryBegin:' "$LOG_FILE" \
-                | grep -ivE 'QueryBegin: (CREATE VIEW|CALL (pin_table|unpin_table))' \
+                | grep -ivE 'QueryBegin:[[:space:]]*(SQL:[[:space:]]*)?(CREATE VIEW|CALL[[:space:]]+(pin_table|unpin_table))' \
                 | cut -d: -f1
         )
         TOTAL_LOG_LINES=$(wc -l < "$LOG_FILE")

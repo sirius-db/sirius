@@ -67,9 +67,16 @@ struct mgpu_env_params {
   uint64_t concat_batch_bytes         = 100'000'000;
   uint64_t max_build_hash_table_bytes = 90'000'000;
   double usage_limit_fraction         = 0.4;
-  int pipeline_num_threads            = 4;
-  int task_creator_num_threads        = 4;
-  int duckdb_scan_num_threads         = 2;
+  // Absolute per-GPU usage cap in bytes. When non-zero this is emitted as
+  // `usage_limit_bytes` (mutually exclusive with usage_limit_fraction per
+  // sirius_config.cpp:201) so a test can impose a small fixed budget that
+  // forces OOM/reschedule regardless of the host GPU's physical capacity —
+  // essential on big-memory parts (e.g. GB200 ~186 GB) where a fraction
+  // would never trigger pressure at unit-test data scales.
+  uint64_t usage_limit_bytes   = 0;
+  int pipeline_num_threads     = 4;
+  int task_creator_num_threads = 4;
+  int duckdb_scan_num_threads  = 2;
 };
 
 /**
@@ -85,11 +92,13 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << params.num_gpus
     << "\n"
        "  memory:\n"
-       "    gpu:\n"
-       "      usage_limit_fraction: "
-    << params.usage_limit_fraction
-    << "\n"
-       "      reservation_limit_fraction: 1.0\n"
+       "    gpu:\n";
+  if (params.usage_limit_bytes != 0) {
+    f << "      usage_limit_bytes: " << params.usage_limit_bytes << "\n";
+  } else {
+    f << "      usage_limit_fraction: " << params.usage_limit_fraction << "\n";
+  }
+  f << "      reservation_limit_fraction: 1.0\n"
        "    host:\n"
        "      capacity_bytes: 32000000000\n"
        "      initial_number_pools: 10\n"
@@ -354,7 +363,9 @@ class scoped_log_dir {
  * need: same row count, same string-ToString on every value after a
  * normalized ORDER BY.
  */
-inline void require_gpu_matches_cpu(duckdb::Connection& con, std::string const& inner_query)
+inline void require_gpu_matches_cpu(duckdb::Connection& con,
+                                    std::string const& inner_query,
+                                    bool force_cpu_reference = false)
 {
   auto fb = con.Query("SET enable_duckdb_fallback = false;");
   REQUIRE(fb);
@@ -370,7 +381,23 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con, std::string const& 
   if (gpu_result->HasError()) { UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError()); }
   REQUIRE_FALSE(gpu_result->HasError());
 
+  // The reference run. By default the plain SELECT is transparently intercepted
+  // and run on the GPU again (a GPU-vs-GPU consistency check). When
+  // force_cpu_reference is set, disable interception around it so it executes on
+  // DuckDB CPU — a true correctness oracle, and immune to GPU memory pressure
+  // (so a tight usage_limit_bytes can't turn the reference into a false
+  // failure). Mirrors compare_gpu_vs_cpu's SET gpu_execution=false pattern.
+  if (force_cpu_reference) {
+    auto off = con.Query("SET gpu_execution=false;");
+    REQUIRE(off);
+    REQUIRE_FALSE(off->HasError());
+  }
   auto cpu_result = con.Query(clean_query + ";");
+  if (force_cpu_reference) {
+    auto on = con.Query("SET gpu_execution=true;");
+    REQUIRE(on);
+    REQUIRE_FALSE(on->HasError());
+  }
   REQUIRE(cpu_result);
   REQUIRE_FALSE(cpu_result->HasError());
 

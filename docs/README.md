@@ -1,6 +1,6 @@
 <!-- ![Sirius](sirius-full.png) -->
 <p align="center">
-  <img src="sirius-full.png" alt="Diagram" width="500"/>
+  <img src="logo/sirius_light_full.svg" alt="Diagram" width="500"/>
   <br/>
   <a href="https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg">
     <img src="https://img.shields.io/badge/Slack-Join%20Us-blue?logo=slack" alt="Slack"/>
@@ -19,23 +19,41 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 
 ![Performance](super-sirius-perf.png)
 
-## Supported OS/GPU/CUDA
-- Ubuntu >= 22.04
-- NVIDIA Volta™ or higher with compute capability 7.0+
-- CUDA >= 13.0 (requires NVIDIA driver >= 570)
-- We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
+## Requirements
+- Linux on amd64/x86_64 or arm64/aarch64 with `glibc >= 2.28`.
+- NVIDIA Turing or newer, with compute capability 7.5+.
+- CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver 525.60.13 or newer).
+- `io_uring` enabled at runtime (`CONFIG_IO_URING`, `kernel.io_uring_disabled=0` recommended). Containers must allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
+- Local Parquet files should be on a filesystem/block device that supports direct I/O (`O_DIRECT`).
 
-### Installing Dependencies
+### Build Requirements
 
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))
 
 ## Building and Running Sirius
 
-After loading the extension, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
+For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
+
+Quick start:
+
+```bash
+git clone --recurse-submodules https://github.com/sirius-db/sirius.git
+cd sirius
+pixi run make
+./build/release/duckdb
+```
+
+Alternatively, load the extension into an existing DuckDB shell:
 
 ```sql
--- Plain SQL runs on GPU once the extension is loaded
+LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+```
+
+Either way, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
+
+```sql
+-- Plain SQL runs on GPU automatically
 SELECT l_returnflag, sum(l_quantity)
 FROM lineitem
 GROUP BY l_returnflag
@@ -49,6 +67,16 @@ Two execution paths are available. See each page for build, configuration, and t
 
 - **[`gpu_execution`](gpu_execution.md) (Recommended)** — Out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. Works with **Parquet** data format.
 - **[`gpu_processing`](gpu_processing.md)** — In-memory execution where the dataset must fit in GPU memory. Works with DuckDB's native storage format.
+
+## Configuration
+
+Sirius loads its settings from a YAML config file, searched in this order:
+
+1. Path in the `SIRIUS_CONFIG_FILE` environment variable
+2. `./sirius.yaml` (current working directory)
+3. `~/.sirius/sirius.yaml`
+
+If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
@@ -66,6 +94,29 @@ SET sirius_log_level = 'trace';
 SET sirius_log_flush_seconds = 1;
 ```
 
+## Tracing
+> **Note:** Tracing is experimental and the telemetry schema may change.
+
+Sirius instruments query execution with [Quent](https://github.com/rapidsai/quent), emitting
+per-query traces of operator and pipeline activity that Quent can render
+as an interactive browser timeline. Enable it in your YAML config file,
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+```
+
+run queries, then visualize:
+
+```bash
+pixi run quent   # serves Quent UI at http://localhost:8080
+```
+
+See the [Quent Telemetry guide](super-sirius/quent-telemetry.md) for the full setup details: enabling the
+exporter, per-query labeling, generating telemetry (using a TPC-H helper), and visualization.
+
 ## Limitations
 
 Sirius is under active development. Notable current limitations include:
@@ -78,9 +129,9 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 ## Contributors and Partners
 
 <p align="center">
-  <a href="https://www.nvidia.com/"><img src="https://www.nvidia.com/content/nvidiaGDC/us/en_US/about-nvidia/legal-info/logo-brand-usage/_jcr_content/root/responsivegrid/nv_container_392921705/nv_container_412055486/nv_image.coreimg.100.1290.png/1703060329095/nvidia-logo-horz.png" alt="NVIDIA" width="250" align="middle"/></a>
+  <a href="https://www.nvidia.com/"><img src="logo/nvidia-logo-horiz-blk-16x9 1.png" alt="NVIDIA" width="250" align="middle"/></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.wisc.edu/"><img src="uw-madison-logo.png" alt="UW-Madison" width="250" align="middle"/></a>
+  <a href="https://www.wisc.edu/"><img src="logo/uw-madison-logo.png" alt="UW-Madison" width="250" align="middle"/></a>
 </p>
 <p align="center">
   <a href="https://duckdblabs.com/"><img src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB Labs" width="200" align="middle"/></a>

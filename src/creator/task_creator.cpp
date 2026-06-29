@@ -25,6 +25,7 @@
 #include "planner/query.hpp"
 #include "sirius_context.hpp"
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
@@ -60,6 +61,16 @@ task_creator::task_creator(exec::thread_pool_config config,
       _numa_to_gpu[normalized_numa].push_back(static_cast<int>(_sys_topology->gpus[i].id));
     }
   }
+
+  // Device ids that actually have a GPU executor (memory-manager GPU spaces);
+  // partition affinity indexes this, not the physical topology, so the pin
+  // resolves to a real executor when num_gpus < physical GPU count.
+  for (auto const* space : _mem_res_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (space) { _active_gpu_ids.push_back(space->get_device_id()); }
+  }
+  std::sort(_active_gpu_ids.begin(), _active_gpu_ids.end());
+  _active_gpu_ids.erase(std::unique(_active_gpu_ids.begin(), _active_gpu_ids.end()),
+                        _active_gpu_ids.end());
 }
 
 task_creator::~task_creator() { stop(); }
@@ -86,6 +97,12 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   _gpu_operator_global_state_map.clear();
 
   const auto& pipelines = query.get_pipelines();
+
+  auto* sirius_ctx =
+    _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
+    sirius_ctx->get_telemetry_context();
+
   for (const auto& pipeline : pipelines) {
     pipeline->set_task_creator(this);
     auto source_operator = pipeline->get_source();
@@ -94,7 +111,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       continue;
     }
     size_t operator_id = source_operator->get_operator_id();
-    auto gs            = std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
+    auto gs =
+      std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
     _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
   }
 }
@@ -272,11 +290,12 @@ void task_creator::manager_loop()
             // partitions across GPUs.
             if (auto* partitioned =
                   dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
-                !preferred_device_id.has_value() && partitioned && _sys_topology &&
-                !_sys_topology->gpus.empty()) {
-              auto n_gpus         = _sys_topology->gpus.size();
-              auto idx            = partitioned->get_partition_idx() % n_gpus;
-              preferred_device_id = static_cast<int>(_sys_topology->gpus[idx].id);
+                !preferred_device_id.has_value() && partitioned && !_active_gpu_ids.empty()) {
+              // Index the active executor set so every task of a partition lands
+              // on the same real GPU (required for cuco tables); the physical
+              // topology would yield phantom pins when num_gpus < physical count.
+              auto idx            = partitioned->get_partition_idx() % _active_gpu_ids.size();
+              preferred_device_id = _active_gpu_ids[idx];
             }
             if (!preferred_device_id.has_value() && pipelineable_input &&
                 !pipelineable_input->get_data_batches().empty()) {

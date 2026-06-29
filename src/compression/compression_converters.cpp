@@ -22,7 +22,7 @@
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>

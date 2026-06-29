@@ -284,7 +284,6 @@ impl ExtensionRegistry {
                         extension_urn_reference: urn_anchor,
                         function_anchor,
                         name: name.to_string(),
-                        ..Default::default()
                     },
                 ),
             ),
@@ -323,8 +322,10 @@ pub fn translate_fragment(params: &TExecPlanFragmentParams) -> Result<Translated
 fn output_name_for_expr(expr: &TExpr, desc: &DescriptorTable) -> Option<String> {
     match expr.nodes.as_slice() {
         [node] if node.node_type == TExprNodeType::SLOT_REF => {
-            let slot_id = node.slot_ref.as_ref()?.slot_id;
-            desc.slot(slot_id).ok().map(SlotInfo::output_name)
+            let slot_ref = node.slot_ref.as_ref()?;
+            desc.slot(slot_ref.tuple_id, slot_ref.slot_id)
+                .ok()
+                .map(SlotInfo::output_name)
         }
         _ => None,
     }

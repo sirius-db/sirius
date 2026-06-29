@@ -14,4 +14,5 @@ instrumentation-model = { path = "../model" }
 [build-dependencies]
 cxx-build = "1"
 instrumentation-model = { path = "../model" }
-quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "871f8f45fd35288945a13636df8cadf50f7dbcc2" }
+# Tracks a pinned commit from quent's main branch.
+quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "7f391d7065bf404cf9a1394d5227acd9ed69bf0b" }

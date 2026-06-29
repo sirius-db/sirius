@@ -27,16 +27,23 @@
 
 #include <unistd.h>
 
+#include <memory>
 #include <ranges>
 #include <string>
 
 namespace sirius::telemetry {
 
+std::shared_ptr<const telemetry_context> telemetry_context::create(
+  const sirius::telemetry_config& config)
+{
+  return std::shared_ptr<telemetry_context>(new telemetry_context(config));
+}
+
 telemetry_context::telemetry_context(const sirius::telemetry_config& config)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
-    context_(quent::create_context(
-      uuid::now_v7(), config.enable_quent ? "ndjson" : "noop", config.output_directory)),
+    context_(
+      quent::create_context(config.enable_quent ? "ndjson" : "noop", config.output_directory)),
     engine_observer_(quent::engine::create_observer(*context_)),
     worker_observer_(quent::worker::create_observer(*context_))
 {

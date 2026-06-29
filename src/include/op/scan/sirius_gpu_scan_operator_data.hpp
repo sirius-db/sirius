@@ -21,6 +21,7 @@
 #include <op/sirius_physical_operator.hpp>
 
 // cucascade
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 

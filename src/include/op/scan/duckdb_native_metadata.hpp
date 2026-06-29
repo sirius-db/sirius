@@ -126,9 +126,6 @@ struct duckdb_native_walk_plan {
 
   const std::vector<projected_column>* projected_cols      = nullptr;
   const std::vector<sirius::logical_type>* projected_types = nullptr;
-  std::unordered_map<duckdb::idx_t, std::size_t>
-    projected_lookup;  /// Map storage primary index -> projected column index (rowid cols
-                       /// excluded).
 
   //===----------RowGroupCollection data----------===//
   std::size_t n_row_groups = 0;

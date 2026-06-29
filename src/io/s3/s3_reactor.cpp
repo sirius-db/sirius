@@ -17,6 +17,7 @@
 #include "io/s3/s3_reactor.hpp"
 
 #include "io/sirius_datasource.hpp"
+#include "log/logging.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <curl/curl.h>
@@ -36,6 +37,22 @@ namespace sirius::io::s3 {
 namespace {
 
 using namespace std::chrono_literals;
+
+// Perf-instrumentation helpers. The max/set-once updates are written only by the
+// reactor worker thread today, but use real atomic RMWs (relaxed) so they are
+// correct regardless of writer count and match the `atomic_*` naming. `fetch_max`
+// is C++26; this project is C++20, so a compare_exchange loop implements the max.
+inline std::uint64_t ns_between(std::chrono::steady_clock::time_point a,
+                                std::chrono::steady_clock::time_point b) noexcept
+{
+  auto const d = std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+  return d > 0 ? static_cast<std::uint64_t>(d) : 0;
+}
+inline void atomic_max_relaxed(std::atomic<std::uint64_t>& a, std::uint64_t v) noexcept
+{
+  auto cur = a.load(std::memory_order_relaxed);
+  while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
 
 struct curl_global_init_once {
   curl_global_init_once()
@@ -231,6 +248,12 @@ struct s3_reactor::transfer {
   std::atomic<bool> cuda_done{false};
   cudaError_t cuda_status{cudaSuccess};
   s3_reactor* owner{nullptr};  // for the stream callback (wake + counter)
+
+  // Perf instrumentation start points (only stamped when
+  // config.s3_perf_instrumentation is set). Worker-thread only.
+  std::chrono::steady_clock::time_point t_enqueue{};    // device transfer built
+  std::chrono::steady_clock::time_point t_submit{};     // GET submitted (build_and_add)
+  std::chrono::steady_clock::time_point t_h2d_start{};  // memcpy issued
 };
 
 // ---------------------------------------------------------------------------
@@ -380,11 +403,27 @@ std::size_t s3_reactor::blocking_request(std::string_view bucket,
     }
 
     if (!retriable || attempt >= max_attempts) break;
+    // Off-happy-path: count + WARN once per retried sync request.
+    _retries_total.fetch_add(1, std::memory_order_relaxed);
+    SIRIUS_LOG_WARN("s3_reactor: retrying {} {}/{} attempt {}/{}: {}",
+                    (method == s3_request_method::HEAD ? "HEAD" : "GET"),
+                    bucket,
+                    key,
+                    attempt,
+                    max_attempts,
+                    last_why);
     std::optional<std::chrono::milliseconds> ra;
     if (_cfg.honor_retry_after) ra = parse_retry_after_seconds(hc.retry_after);
     std::this_thread::sleep_for(backoff_delay(attempt, ra));
   }
 
+  _terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+  SIRIUS_LOG_ERROR("s3_reactor: {} {}/{} failed after {} attempt(s); last: {}",
+                   (method == s3_request_method::HEAD ? "HEAD" : "GET"),
+                   bucket,
+                   key,
+                   max_attempts,
+                   last_why);
   std::ostringstream os;
   os << "s3_reactor: " << (method == s3_request_method::HEAD ? "HEAD " : "GET ") << bucket << "/"
      << key << " failed after " << max_attempts << " attempt(s); last: " << last_why;
@@ -491,6 +530,7 @@ void s3_reactor::drain_incoming_device()
     t->stream     = dr.stream;
     t->device_id  = dr.device_id;
     t->owner      = this;
+    if (_cfg.s3_perf_instrumentation) t->t_enqueue = std::chrono::steady_clock::now();
     _pending.push_back(t);
   }
 }
@@ -603,10 +643,25 @@ void s3_reactor::submit_pending()
     try {
       build_and_add(t);  // may throw (authorize / init / add_handle) — never escapes the worker
       if (t->is_device) {
-        // single-writer (worker thread): track the high-water mark of held blocks
-        auto n = static_cast<std::uint64_t>(device_blocks_in_flight());
-        if (n > _device_peak_inflight.load(std::memory_order_relaxed))
-          _device_peak_inflight.store(n, std::memory_order_relaxed);
+        // Track the high-water mark of held blocks (atomic max, same helper as the
+        // perf counters).
+        atomic_max_relaxed(_device_peak_inflight,
+                           static_cast<std::uint64_t>(device_blocks_in_flight()));
+        if (_cfg.s3_perf_instrumentation) {
+          auto const now = std::chrono::steady_clock::now();
+          t->t_submit    = now;  // GET submit; chunk_get is measured to completion
+          // queue-wait only on the first submit (attempt 1) to avoid counting
+          // retry backoff as queue time.
+          if (t->attempt == 1) {
+            _queue_wait_ns_total.fetch_add(ns_between(t->t_enqueue, now),
+                                           std::memory_order_relaxed);
+            _queue_wait_ns_count.fetch_add(1, std::memory_order_relaxed);
+          }
+          if (!_ttfb_first_submit_set) {
+            _ttfb_first_submit     = now;  // TTFB start = first GET submit
+            _ttfb_first_submit_set = true;
+          }
+        }
       }
     } catch (...) {
       auto ep = std::current_exception();
@@ -680,6 +735,22 @@ void s3_reactor::cleanup_easy(transfer* t)
 
 void s3_reactor::start_device_copy(transfer* t)
 {
+  // GET just completed: record per-chunk GET latency + TTFB before the H2D copy.
+  if (_cfg.s3_perf_instrumentation) {
+    auto const now    = std::chrono::steady_clock::now();
+    auto const get_ns = ns_between(t->t_submit, now);
+    _chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
+    _chunk_get_ns_count.fetch_add(1, std::memory_order_relaxed);
+    atomic_max_relaxed(_chunk_get_ns_max, get_ns);
+    // Atomic set-once: the relaxed load is a fast-path guard so only the first
+    // chunk runs the CAS; the compare_exchange_strong from 0 is the atomic gate.
+    if (_ttfb_first_submit_set && _ttfb_ns.load(std::memory_order_relaxed) == 0) {
+      auto expected = std::uint64_t{0};
+      _ttfb_ns.compare_exchange_strong(
+        expected, ns_between(_ttfb_first_submit, now), std::memory_order_relaxed);
+    }
+    t->t_h2d_start = now;  // H2D issue point (memcpy below)
+  }
   // A sibling chunk already failed: don't bother copying, just decrement.
   if (t->req.ctx && t->req.ctx->failed.load(std::memory_order_relaxed)) {
     t->req.ctx->chunk_done();
@@ -735,6 +806,14 @@ void s3_reactor::poll_device_copies()
       ++it;
       continue;
     }
+    if (_cfg.s3_perf_instrumentation) {
+      // memcpy issue -> worker-observed completion (includes callback + poll
+      // latency; not a pure GPU copy time).
+      auto const h2d_ns = ns_between(t->t_h2d_start, std::chrono::steady_clock::now());
+      _h2d_observed_ns_total.fetch_add(h2d_ns, std::memory_order_relaxed);
+      _h2d_observed_ns_count.fetch_add(1, std::memory_order_relaxed);
+      atomic_max_relaxed(_h2d_observed_ns_max, h2d_ns);
+    }
     if (t->cuda_status != cudaSuccess) {
       if (t->req.ctx)
         t->req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
@@ -750,13 +829,23 @@ void s3_reactor::poll_device_copies()
 
 void CUDART_CB s3_reactor::cuda_copy_done(cudaStream_t, cudaError_t status, void* userdata)
 {
-  auto* t        = static_cast<transfer*>(userdata);
+  auto* t = static_cast<transfer*>(userdata);
+  // Lifetime contract: the release-store of cuda_done is the LAST access this
+  // callback makes — to the transfer AND to the reactor. Before the store, t
+  // is still listed in _copying, which pins both lifetimes: poll_device_copies
+  // only deletes t after seeing cuda_done, and cancel_all_on_shutdown stream-
+  // synchronizes every _copying stream (waiting this callback out) before the
+  // reactor tears down _multi. Touching either after the store races with
+  // that delete / teardown (seen as a SIGSEGV on the CUDA callback thread
+  // under SF10 load). The wakeup therefore fires BEFORE the store: it is
+  // sticky (socketpair write), so the worker either wakes into the published
+  // flag or catches it on the next poll tick.
   t->cuda_status = status;  // write before the release-store
-  t->cuda_done.store(true, std::memory_order_release);
   if (t->owner != nullptr) {
     t->owner->_device_copies_total.fetch_add(1, std::memory_order_relaxed);
     curl_multi_wakeup(static_cast<CURLM*>(t->owner->_multi));  // unified wake point
   }
+  t->cuda_done.store(true, std::memory_order_release);
 }
 
 void s3_reactor::cancel_all_on_shutdown()
@@ -876,13 +965,33 @@ void s3_reactor::worker_loop()
       }
 
       if (retriable && t->attempt < _cfg.max_retry_attempts) {
+        // Off-happy-path: count + WARN once per retried request (not per chunk on
+        // success). Always-on, independent of s3_perf_instrumentation.
+        _retries_total.fetch_add(1, std::memory_order_relaxed);
+        SIRIUS_LOG_WARN("s3_reactor: retrying GET {}/{} range [{},{}) attempt {}/{}: {}",
+                        t->req.handle->bucket,
+                        t->req.handle->key,
+                        t->req.offset,
+                        t->req.offset + t->req.size,
+                        t->attempt,
+                        _cfg.max_retry_attempts,
+                        last_why);
         schedule_retry(t, backoff_delay(t->attempt, retry_after));
       } else if (retriable) {
+        _terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+        SIRIUS_LOG_ERROR("s3_reactor: GET {}/{} failed after {} attempt(s); last: {}",
+                         t->req.handle->bucket,
+                         t->req.handle->key,
+                         _cfg.max_retry_attempts,
+                         last_why);
         std::ostringstream os;
         os << "s3_reactor: GET " << t->req.handle->bucket << "/" << t->req.handle->key
            << " failed after " << _cfg.max_retry_attempts << " attempt(s); last: " << last_why;
         finish(t, std::make_exception_ptr(std::runtime_error(os.str())));
       } else if (ep) {
+        _terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+        SIRIUS_LOG_ERROR(
+          "s3_reactor: GET {}/{} non-retriable failure", t->req.handle->bucket, t->req.handle->key);
         finish(t, ep);  // failure (host or device GET) -> chunk_failed (releases staging)
       } else if (t->is_device) {
         cleanup_easy(t);

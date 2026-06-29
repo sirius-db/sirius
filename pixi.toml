@@ -39,7 +39,7 @@ librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
-duckdb = "=1.5.3"
+duckdb = "=1.5.4"
 spdlog = "1.8.*"
 sqlite = "3.*"
 rust-src = "*"
@@ -52,6 +52,11 @@ libcurl = "*"
 go-cgo = ">=1.25"
 
 [tasks]
+
+[tasks.quent]
+description = "Run the Quent telemetry UI server."
+cmd = "echo 'Quent UI will be served at: http://localhost:8080' && cargo run --manifest-path rust/Cargo.toml -p sirius-telemetry-server --features ui -- --output-dir {{ output_dir }}"
+args = [{ arg = "output_dir", default = "telemetry_data" }]
 
 # CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
 [feature.cuda13.system-requirements]

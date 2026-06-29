@@ -75,6 +75,26 @@ struct rg_accumulator {
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
+// Case-insensitively strip a leading "file://" so explicit local URIs behave
+// exactly like bare paths (mirrors the scan_manager's normalize_path): the
+// scheme check must not classify file:// as object-store, and cudf's bundled
+// datasource wants a plain filesystem path.
+std::string strip_file_uri(std::string const& p)
+{
+  static constexpr std::string_view kFile = "file://";
+  if (p.size() > kFile.size()) {
+    bool is_file_uri = true;
+    for (std::size_t i = 0; i < kFile.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {
+        is_file_uri = false;
+        break;
+      }
+    }
+    if (is_file_uri) { return p.substr(kFile.size()); }
+  }
+  return p;
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -195,17 +215,30 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
         auto const& probe_path = batch.file_paths.front();
         try {
           // Resolve the probe file to a datasource (carries its own io backend,
-          // cache and metadata) instead of reaching into io_context.
+          // cache and metadata) instead of reaching into io_context. Local
+          // paths left unclaimed (use_sirius_datasource=false) probe through a
+          // plain cudf datasource so filter pushdown is not lost.
           auto probe_ds = _scan_manager->create_datasource(probe_path);
-          if (!probe_ds) { throw std::runtime_error("no backend supports path: " + probe_path); }
+          std::unique_ptr<cudf::io::datasource> probe_fallback;
+          cudf::io::datasource* probe_src = probe_ds.get();
+          if (probe_src == nullptr) {
+            auto const probe_local = strip_file_uri(probe_path);
+            if (has_uri_scheme(probe_local)) {
+              throw std::runtime_error("no backend supports path: " + probe_path);
+            }
+            probe_fallback = cudf::io::datasource::create(probe_local);
+            probe_src      = probe_fallback.get();
+          }
           std::shared_ptr<cudf::io::parquet::FileMetaData const> probe_meta;
-          if (auto cached = probe_ds->metadata()) {
-            if (auto pm = std::dynamic_pointer_cast<scan_manager::parquet_metadata>(cached)) {
-              probe_meta = pm->file_metadata();
+          if (probe_ds) {
+            if (auto cached = probe_ds->metadata()) {
+              if (auto pm = std::dynamic_pointer_cast<scan_manager::parquet_metadata>(cached)) {
+                probe_meta = pm->file_metadata();
+              }
             }
           }
           if (!probe_meta) {
-            auto footer = cudf::io::parquet::fetch_footer_to_host(*probe_ds);
+            auto footer = cudf::io::parquet::fetch_footer_to_host(*probe_src);
             hybrid_scan_reader probe_reader(
               cudf::host_span<uint8_t const>(footer->data(), footer->size()), *reader_options);
             probe_meta = std::make_shared<cudf::io::parquet::FileMetaData const>(
@@ -294,7 +327,10 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
     // into io_context. Fall back to a plain cudf datasource only for local
     // paths no sirius backend claims.
     auto sirius_ds = _scan_manager->create_datasource(file_path);
-    if (!sirius_ds && has_uri_scheme(file_path)) {
+    // file:// counts as local: create_datasource strips it before deciding the
+    // local fallback, so the scheme check here must strip it too.
+    auto const local_file_path = strip_file_uri(file_path);
+    if (!sirius_ds && has_uri_scheme(local_file_path)) {
       throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
     }
 
@@ -315,7 +351,16 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
       footer_byte_len = cached_parquet_metadata->footer_byte_len();
       reader_ptr      = std::make_unique<hybrid_scan_reader>(*file_metadata, *reader_options);
     } else {
-      auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+      // Local paths left unclaimed (use_sirius_datasource=false) read the
+      // footer through a plain cudf datasource; the slice itself stays
+      // datasource-less so materialize falls back to cudf/KvikIO.
+      std::unique_ptr<cudf::io::datasource> footer_fallback;
+      cudf::io::datasource* footer_src = sirius_ds.get();
+      if (footer_src == nullptr) {
+        footer_fallback = cudf::io::datasource::create(local_file_path);
+        footer_src      = footer_fallback.get();
+      }
+      auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*footer_src);
       footer_byte_len    = footer_buffer->size();
       reader_ptr         = std::make_unique<hybrid_scan_reader>(
         cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
@@ -359,6 +404,63 @@ void parquet_gpu_ingestible::run_batch(file_batch const& batch,
       SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible]                     after: {} (pruned {})",
                        row_group_indices.size(),
                        rgs_before - row_group_indices.size());
+    }
+
+    // Scan-side chunk prewarm: projection and row-group pruning are final for
+    // this file, so hand the prefetch cache the merged column-chunk byte
+    // ranges (plus parquet magic + footer) to stage while slices are built.
+    // describe_parquet()'s insert stays metadata-only — this is the only
+    // place ranges enter the cache, and only when the knob is on.
+    if (sirius_ds && _scan_manager->chunk_prewarm_enabled() && !row_group_indices.empty()) {
+      if (auto* cache = sirius_ds->io_ctx() ? sirius_ds->io_ctx()->cache() : nullptr) {
+        using range_t = cudf::io::text::byte_range_info;
+
+        auto chunk_ranges =
+          reader.all_column_chunks_byte_ranges(row_group_indices, *reader_options);
+        std::sort(chunk_ranges.begin(), chunk_ranges.end(), [](auto const& a, auto const& b) {
+          return a.offset() < b.offset();
+        });
+        std::vector<range_t> merged;
+        merged.reserve(chunk_ranges.size());
+        if (!chunk_ranges.empty()) {
+          auto cur_start = chunk_ranges[0].offset();
+          auto cur_end   = cur_start + chunk_ranges[0].size();
+          for (auto const& r : chunk_ranges) {
+            auto const rs = r.offset();
+            auto const re = rs + r.size();
+            if (rs <= cur_end) {
+              cur_end = std::max(cur_end, re);
+            } else {
+              merged.emplace_back(cur_start, cur_end - cur_start);
+              cur_start = rs;
+              cur_end   = re;
+            }
+          }
+          merged.emplace_back(cur_start, cur_end - cur_start);
+        }
+
+        constexpr std::size_t FOOTER_TAIL_SIZE = 8;
+        auto const file_size                   = sirius_ds->io_object()->size();
+        auto const footer_off =
+          static_cast<int64_t>(file_size - FOOTER_TAIL_SIZE - footer_byte_len);
+        auto const footer_size = static_cast<int64_t>(FOOTER_TAIL_SIZE + footer_byte_len);
+
+        std::vector<range_t> ranges;
+        ranges.reserve(merged.size() + 2);
+        ranges.emplace_back(0, 4);
+        ranges.insert(ranges.end(), merged.begin(), merged.end());
+        ranges.emplace_back(footer_off, footer_size);
+        std::sort(ranges.begin(), ranges.end(), [](auto const& a, auto const& b) {
+          return a.offset() < b.offset();
+        });
+
+        std::shared_ptr<sirius::io::sirius_io_object_metadata> metadata_to_store =
+          cached_parquet_metadata
+            ? nullptr
+            : std::static_pointer_cast<sirius::io::sirius_io_object_metadata>(
+                std::make_shared<scan_manager::parquet_metadata>(file_metadata, footer_byte_len));
+        cache->insert(*sirius_ds->io_object(), std::move(metadata_to_store), ranges);
+      }
     }
 
     std::vector<cudf::size_type> cur_rgs;
@@ -443,7 +545,9 @@ io::filtered_table parquet_gpu_ingestible::materialize_table(
     if (slice.datasource) {
       sources.push_back(cudf::io::datasource::create(slice.datasource.get()));
     } else {
-      sources.push_back(cudf::io::datasource::create(slice.file_path));
+      // Unclaimed local slice (use_sirius_datasource=false): cudf's bundled
+      // datasource wants a plain path, so strip an explicit file:// scheme.
+      sources.push_back(cudf::io::datasource::create(strip_file_uri(slice.file_path)));
     }
     metadatas.push_back(*slice.file_metadata);
     rg_per_src.push_back(slice.row_group_indices);
