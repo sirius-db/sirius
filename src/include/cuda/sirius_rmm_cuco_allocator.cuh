@@ -25,12 +25,7 @@
 
 namespace sirius {
 
-/// cuCollections allocator backed by RMM's stream-ordered pool — the same compute-stream memory
-/// resource the rest of the query uses — instead of cuco's default synchronizing
-/// cudaMalloc/cudaFree. cuco's allocator interface is stream-aware (allocate(n, stream)), matching
-/// RMM's stream-ordered resource. This keeps cuco device structures (Bloom bit arrays, static_set
-/// storage) inside the RMM pool and avoids the implicit device sync of a raw cudaMalloc on the
-/// hot path. Shared by the dynamic-filter device structures (.cu translation units only).
+/// @brief cuCollections allocator backed by RMM's stream-ordered pool allocator.
 template <class T>
 class rmm_cuco_allocator {
  public:
@@ -41,12 +36,12 @@ class rmm_cuco_allocator {
   {
   }
 
-  value_type* allocate(std::size_t n, ::cuda::stream_ref stream)
+  value_type* allocate(std::size_t n, cuda::stream_ref stream)
   {
     return static_cast<value_type*>(
       _mr.allocate(rmm::cuda_stream_view{stream.get()}, n * sizeof(value_type)));
   }
-  void deallocate(value_type* p, std::size_t n, ::cuda::stream_ref stream) noexcept
+  void deallocate(value_type* p, std::size_t n, cuda::stream_ref stream) noexcept
   {
     _mr.deallocate(rmm::cuda_stream_view{stream.get()}, p, n * sizeof(value_type));
   }

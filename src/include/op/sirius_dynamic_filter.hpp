@@ -181,12 +181,10 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
 /**
  * @brief Capability mixin: filter can compute a per-row BOOL keep-mask over a probe column.
  *
- * For filter kinds whose predicate cannot be (cheaply) expressed as a cuDF AST — notably set
- * membership (IN-list, bloom) — the consumer applies them at runtime: it calls @ref compute_mask
- * with the materialized probe column and drops rows where the result is false via
- * @c cudf::apply_boolean_mask. This is distinct from @ref sirius_ast_lowerable (which feeds the
- * parquet reader's @c set_filter and row-group stats pruning); a filter may implement either, both,
- * or — for membership — only this one.
+ * For filter kinds that call @ref compute_mask with the materialized probe column and drops rows
+ * where the result is false via @c cudf::apply_boolean_mask. This is distinct from @ref
+ * sirius_ast_lowerable (which feeds the parquet reader's @c set_filter and row-group stats
+ * pruning); a filter may implement either, both, or — for membership — only this one.
  */
 class sirius_mask_applicable {
  public:
@@ -212,20 +210,6 @@ class sirius_mask_applicable {
 //===----------------------------------------------------------------------===//
 /**
  * @brief Exact set-membership filter: keeps rows whose key appears on the build side.
- *
- * Built from a hash-join build-key column. Where the
- * zone-map only captures the build keys' @c [min,max] range — useless when the keys are scattered
- * across the domain (e.g. a selective dimension subset) — this tests exact membership, so it prunes
- * exactly the rows the join would discard. It cannot be expressed as a cheap AST or row-group stats
- * predicate, so it rides the @ref sirius_mask_applicable path: a row-level persistent-set probe
- * applied post-decode. Intended for small-to-moderate key sets; larger builds use a bloom filter.
- *
- * @note A probe key equal to the key type's minimum (INT32_MIN / INT64_MIN) is treated as an
- *       empty-slot sentinel by the underlying @c cuco::static_set and will not match, even if that
- *       value was inserted into the build set. This is safe — the join remains authoritative, so a
- *       missed singleton only costs a pruning opportunity, never a false negative — but it requires
- *       that build keys never legitimately use that minimum (a precondition satisfied by
- * TPC-H-style surrogate-key domains).
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable {
@@ -288,11 +272,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 /**
  * @brief Probabilistic set-membership filter backed by a GPU blocked Bloom filter (cuCollections).
  *
- * The scale-up of @ref sirius_dynamic_in_list_filter for *large* selective builds (e.g. a
- * date-filtered @c orders, millions of keys) whose exact key set is too big to store and probe
- * cheaply. A Bloom filter is a few bits per key and answers membership with no false negatives —
- * false *positives* only let through a few extra rows, which is harmless because the join is
- * authoritative. Applied row-level (post-decode) via the @ref sirius_mask_applicable path.
+ * The scale-up of @ref sirius_dynamic_in_list_filter for *large* selective builds.
  *
  * Implementation (the @c cuco::bloom_filter and its kernels) is hidden behind a PIMPL so this
  * header stays compilable by the host toolchain; the definitions live in a @c .cu translation unit.
@@ -354,7 +334,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
  * a scan task may run before, during, or after the producing build finalizes. Consumption is
  * opportunistic: a consumer cheaply tests whether any filter has arrived yet (@ref has_filters) and
  * applies whatever is present when each split runs. A filter that publishes after a split was read
- * simply does not prune it — correctness is unaffected because the join remains authoritative.
+ * simply does not prune it.
  */
 class sirius_dynamic_filter_set {
  public:

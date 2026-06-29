@@ -388,13 +388,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto& hj      = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats = std::move(op.join_stats);
 
-    // --- Wire dynamic-filter producer targets ---
+    //===----------Wire dynamic-filter producer targets----------===//
     // For each downstream scan DuckDB has paired with this join, look up the shared channel by
     // the DynamicTableFilterSet pointer (the route key) and stash it along with the per-key
     // consumer column indices on the join.
     //
     // Plan-time selectivity gate: an UNFILTERED build subtree is — for FK-shaped joins — the
     // whole key domain, so its membership filter keeps every probe row by construction.
+    //
+    // DuckDB is the source of truth for whether dynamic filter pushdown is valid for this join
+    // type, gated here on the existence of a dynamic filter channel. See GenerateJoinFilters at
+    // join_filter_pushdown_optimizer.cpp.
     if (hj.filter_pushdown) {
       if (!build_filter_evidence.subtree_filtered) {
         SIRIUS_LOG_INFO(
