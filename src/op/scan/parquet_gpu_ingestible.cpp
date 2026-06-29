@@ -490,10 +490,19 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
           // Fixed-width column: row_count x decoded width, plus a validity mask.
           rg_decoded += row_count * decoded_width + row_count / 8;
         } else {
-          // VARCHAR / nested / unknown: encoded-uncompressed size is the best
-          // pre-decode proxy for the char data; add offset + validity bytes.
-          rg_decoded += static_cast<std::size_t>(column_metadata.total_uncompressed_size) +
-                        row_count * sizeof(std::uint32_t) + row_count / 8;
+          // VARCHAR / nested / unknown. Dictionary/RLE encoding can make the
+          // encoded chunk many times smaller than its decoded char buffer, so
+          // prefer SizeStatistics::unencoded_byte_array_data_bytes (the exact
+          // decoded BYTE_ARRAY size) when the writer recorded it, else fall back
+          // to the encoded-uncompressed size (under-counts dictionary data).
+          std::size_t const char_bytes =
+            (column_metadata.size_statistics &&
+             column_metadata.size_statistics->unencoded_byte_array_data_bytes)
+                         ? static_cast<std::size_t>(
+                  *column_metadata.size_statistics->unencoded_byte_array_data_bytes)
+                         : static_cast<std::size_t>(column_metadata.total_uncompressed_size);
+          // Plus the cuDF string column's offsets (one int32 per row) and validity.
+          rg_decoded += char_bytes + row_count * sizeof(std::uint32_t) + row_count / 8;
         }
       }
       rg_compressed += static_cast<std::size_t>(column_metadata.total_compressed_size);
