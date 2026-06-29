@@ -30,7 +30,7 @@ struct config {
   // max number of contiguous segments to fuse into one readv SQE.  The
   // prep_host_rxv_request and prep_host_to_device_rx_request paths fuse
   // contiguous segments into one readv SQE, capped at this value.  The
-  std::size_t max_n_chunks{16};
+  std::size_t max_n_chunks{1};
 };
 
 }  // namespace sirius::io::uring

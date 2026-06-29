@@ -267,10 +267,11 @@ prefetching_cache::prefetching_cache(
   const config& cfg,
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _cfg(cfg),
-    _pool(std::make_unique<buffer_pool>(reservation_manager, cfg.initial_pool_reservation)),
+    _pool(std::make_unique<buffer_pool>(
+      reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
-    _armed(true),
+    _armed(_io_ctx->can_use_prefetching_cache()),
     _rate_limiter(_cfg.inflight_io_chunk_budget)
 {
   _preparation_thread = std::jthread([this](const std::stop_token& st) { prepare_loop(st); },
@@ -279,6 +280,7 @@ prefetching_cache::prefetching_cache(
                                   _prefetch_stop_source.get_token());
   _evictor_thread     = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
                                  _evictor_stop_source.get_token());
+  _chunk_size         = _pool->chunk_size();
 }
 
 prefetching_cache::~prefetching_cache()
@@ -312,7 +314,7 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
     if (inserted) {
       it->second->file_size = obj.size();
       it->second->io_obj    = obj.shared_from_this();
-      it->second->chunks.reserve((obj.size() + _pool->chunk_bytes() - 1) / _pool->chunk_bytes());
+      it->second->chunks.reserve((obj.size() + _chunk_size - 1) / _chunk_size);
     }
   }
   return *it->second;
@@ -327,7 +329,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
   const auto& key = obj.raw_file_cache_id();
   auto& file      = get_or_create_file_entry(obj);
 
-  const size_t chunk_bytes = _pool->chunk_bytes();
+  const size_t chunk_bytes = _chunk_size;
   auto coalesced_ranges    = _io_ctx->align_and_coalesce(ranges, chunk_bytes);
 
   // Enumerate the chunk-aligned offsets covered by the coalesced ranges.  The
@@ -375,14 +377,14 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
   std::vector<cached_chunk*> chunks;
   if (out_handle && *out_handle) {
     if (auto ctx = out_handle->get_context()) {
-      chunks = find_entry(ctx->chunks, offset, size, coverage_policy::full, _pool->chunk_bytes());
+      chunks = find_entry(ctx->chunks, offset, size, coverage_policy::full, _chunk_size);
     }
   }
   if (chunks.empty()) {
     std::shared_lock lk(_map_mtx);
     auto it = _file_cache.find(obj.raw_file_cache_id());
     if (it != _file_cache.end()) {
-      chunks = it->second->fetch_chunks(offset, size, coverage_policy::full, _pool->chunk_bytes());
+      chunks = it->second->fetch_chunks(offset, size, coverage_policy::full, _chunk_size);
     }
   }
 
@@ -396,7 +398,7 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
     }
 
     auto const end_offset = offset + size;
-    auto const chunk_size = _pool->chunk_bytes();
+    auto const chunk_size = _chunk_size;
 
     for (auto* chunk : chunks) {
       auto const chunk_begin = std::max(offset, chunk->offset);
@@ -422,7 +424,7 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_i
 {
   bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
   if (status) { return exec::make_semi_future<std::size_t>(size); }
-  size_t n_chunks = (size + _pool->chunk_bytes() - 1) / _pool->chunk_bytes();
+  size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
   _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
   return _io_ctx->host_read_async_io(obj, offset, size, dst);
 }
@@ -435,7 +437,7 @@ std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
 {
   bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
   if (status) { return size; }
-  size_t n_chunks = (size + _pool->chunk_bytes() - 1) / _pool->chunk_bytes();
+  size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
   _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
   return _io_ctx->host_read_io(obj, offset, size, dst);
 }
@@ -454,24 +456,24 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
   coverage_policy policy =
     _io_ctx->supports_host_to_device_read() ? coverage_policy::partial : coverage_policy::full;
 
-  size_t n_chunks = (size + _pool->chunk_bytes() - 1) / _pool->chunk_bytes();
+  size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
   std::vector<cached_chunk*> chunks;
   chunks.reserve(n_chunks);
   if (out_handle && *out_handle) {
     if (auto ctx = out_handle->get_context()) {
-      chunks = find_entry(ctx->chunks, offset, size, policy, _pool->chunk_bytes());
+      chunks = find_entry(ctx->chunks, offset, size, policy, _chunk_size);
     }
   }
   if (chunks.empty()) {
     std::shared_lock lk(_map_mtx);
     auto it = _file_cache.find(obj.raw_file_cache_id());
     if (it != _file_cache.end()) {
-      chunks = it->second->fetch_chunks(offset, size, policy, _pool->chunk_bytes());
+      chunks = it->second->fetch_chunks(offset, size, policy, _chunk_size);
     }
   }
 
   while (!chunks.empty()) {
-    size_t const chunk_bytes     = _pool->chunk_bytes();
+    size_t const chunk_bytes     = _chunk_size;
     size_t const first_chunk_off = (offset / chunk_bytes) * chunk_bytes;
     size_t const last_chunk_off  = ((offset + size - 1) / chunk_bytes) * chunk_bytes;
 
@@ -666,9 +668,8 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     if (buffers.size() != n_chunks_needed) {
       // No single arena could satisfy the request.  Return whatever we got and
       // re-enqueue the work for a retry after the evictor frees some.
-      // todo(amin): needs eviction and then backoff
       if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
-      _preparation_queue.enqueue(std::move(req));
+      _eviction_queue.enqueue(nullptr);  // request the evictor to free some buffers
       continue;
     }
 
@@ -694,7 +695,8 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     std::ignore = req->state->mark_allocated();
 
     if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_stage() == prefetching_stage::just_in_time) {
+        _io_ctx->preferred_prefetching_stage() == prefetching_stage::just_in_time ||
+        _io_ctx->preferred_prefetching_stage() == prefetching_stage::none) {
       // either the backend doesn't support scatter-gather reads or it prefers not to reuse
       // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
       // read() path handle the IO directly into the caller's buffer.
@@ -726,7 +728,7 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
                                           [&](cached_chunk* c) {
                                             if (c->state.mark_loading()) {
                                               segments.emplace_back(
-                                                c->offset, _pool->chunk_bytes(), c->data);
+                                                c->offset, _chunk_size, c->data);
                                               return false;
                                             }
                                             return true;
@@ -775,9 +777,15 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
   // returned to the arena it came from.
   std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
   while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req = nullptr;
+    prefetch_request req    = nullptr;
+    bool eviction_requested = false;
     _eviction_queue.wait_dequeue(req);
-    if (req == nullptr) { continue; }
+    if (req == nullptr) {
+      if (!_shutting_down && !st.stop_requested()) {  // spurious wakeup
+        eviction_requested = true;
+      }
+      continue;
+    }
 
     // Accumulate newly-queued requests into the persistent batch.  The batch is
     // NOT cleared each round: a request is dropped only once all of its chunks
@@ -793,19 +801,12 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // under memory pressure and stop once enough chunks are free again.  Memory
     // pressure is scored as outstanding (handed-out) chunks against the pool's
     // aggregate reserved capacity.
-    bool const dispose       = _cfg.dispose_after_use;
-    size_t const capacity    = _pool->capacity_chunks();
-    size_t const outstanding = _pool->total_chunks();
     bool const should_evict =
-      dispose || (capacity > 0 && outstanding > (capacity * 3) / 4);  // <25% free
+      _cfg.dispose_after_use || eviction_requested || _pool->should_start_evicting();
     if (!should_evict) { continue; }
 
-    // Number of chunks we want to evict before stopping (unbounded when
-    // disposing).  Aim to bring outstanding back down to ~25% of capacity.
-    size_t const target_outstanding = capacity / 4;
-    size_t const need =
-      dispose ? std::numeric_limits<size_t>::max()
-              : (outstanding > target_outstanding ? outstanding - target_outstanding : 0);
+    size_t const need = _cfg.dispose_after_use ? std::numeric_limits<size_t>::max()
+                                               : _pool->total_allocated_chunks() * 0.25;
 
     auto const query_tick = static_cast<uint32_t>(_ticker.load(std::memory_order_relaxed));
 

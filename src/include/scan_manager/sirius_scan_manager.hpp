@@ -295,7 +295,7 @@ class sirius_scan_manager {
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path) const noexcept;
+    std::string_view path) const;
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.

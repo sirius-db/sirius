@@ -21,6 +21,8 @@
 #include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/memory_space.hpp"
 
+#include <rmm/aligned.hpp>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -32,30 +34,38 @@ using multiple_blocks_allocation =
   typename cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
 buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservation_manager,
-                         uint32_t initial_slabs)
+                         double reservation_fraction_for_prefetching,
+                         double max_prefetching_budget_fraction)
 {
   auto host_mrs = reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
   if (host_mrs.empty()) {
     throw std::invalid_argument("buffer_pool: no host memory resources provided");
   }
 
+  reservation_fraction_for_prefetching = std::clamp(reservation_fraction_for_prefetching, 0.0, 1.0);
+  max_prefetching_budget_fraction      = std::clamp(max_prefetching_budget_fraction, 0.0, 1.0);
+
   // Chunk size is the host MR's block size; resolve it before sizing the
   // per-arena reservations below (which are expressed in chunks).
   _chunk_bytes =
     host_mrs.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>()->get_block_size();
 
-  auto const n_arenas         = static_cast<uint32_t>(host_mrs.size());
-  auto const slabs_per_arena  = std::max(n_arenas, initial_slabs) / n_arenas;
-  auto const chunks_per_arena = static_cast<size_t>(slabs_per_arena) * CHUNKS_PER_SLAB;
   std::for_each(host_mrs.begin(), host_mrs.end(), [&](auto* mr) {
-    auto* mmr        = const_cast<cucascade::memory::memory_space*>(mr);
-    auto reservation = mmr->make_reservation_upto(chunks_per_arena * _chunk_bytes);
+    auto* mmr = const_cast<cucascade::memory::memory_space*>(mr);
+    auto max_reservation =
+      rmm::align_up(std::size_t(mmr->get_max_memory() * reservation_fraction_for_prefetching),
+                    std::size_t(_chunk_bytes));
+    auto reservation                          = mmr->make_reservation_upto(max_reservation);
+    max_reservation                           = reservation->size();  // may be less than requested
     _numa_to_arena_index[mr->get_device_id()] = _host_arenas.size();
     _host_arenas.push_back(
       host_arena{mr->get_device_id(),
                  std::move(reservation),
                  mmr->get_memory_resource_of<cucascade::memory::Tier::HOST>()});
-    _capacity_chunks += chunks_per_arena;
+    _reserved_size += max_reservation;
+    _max_allowed_budget_for_prefetching +=
+      rmm::align_down(std::size_t(mmr->get_max_memory() * max_prefetching_budget_fraction),
+                      std::size_t(_chunk_bytes));
   });
 }
 
@@ -122,6 +132,28 @@ void buffer_pool::deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexc
   auto b = multiple_blocks_allocation::create(std::move(out), *arena.mr, arena.reservation.get());
   b.reset(nullptr);
   _n_allocated_chunks.fetch_sub(count, std::memory_order_relaxed);
+}
+
+size_t buffer_pool::reservation_size_for_prefetching() const noexcept { return _reserved_size; }
+
+size_t buffer_pool::max_allowed_budget_for_prefetching() const noexcept
+{
+  return _max_allowed_budget_for_prefetching;
+}
+
+size_t buffer_pool::max_system_wide_usage() const noexcept
+{
+  size_t total = 0;
+  for (auto const& arena : _host_arenas) {
+    total += arena.mr->get_total_allocated_bytes();
+  }
+  return total;
+}
+
+bool buffer_pool::should_start_evicting() const noexcept
+{
+  if (_n_allocated_chunks * _chunk_bytes <= reservation_size_for_prefetching()) { return false; }
+  return max_system_wide_usage() > max_allowed_budget_for_prefetching();
 }
 
 }  // namespace sirius::io::cache

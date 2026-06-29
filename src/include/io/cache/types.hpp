@@ -75,13 +75,12 @@ enum class prefetching_stage { none, opportunistic, immediate, just_in_time, dis
 
 class buffer_pool {
  public:
-  static constexpr uint32_t CHUNKS_PER_SLAB = 500;  // 500 chunks per slab
-
   /// @p initial_slabs slabs are allocated up-front from @p mr (clamped to
   /// @p max_slabs).  Default preserves the historical behaviour of warming
   /// the pool with up to 10 slabs at construction.
   buffer_pool(cucascade::memory::memory_reservation_manager& reservation_manager,
-              uint32_t initial_slabs = 10);
+              double reservation_fraction_for_prefetching = 0.0,
+              double max_prefetching_budget_fraction      = 0.0);
 
   ~buffer_pool();
 
@@ -97,14 +96,22 @@ class buffer_pool {
 
   void deallocate_bulk(std::vector<std::byte*>&& out, int numa) noexcept;
 
-  [[nodiscard]] size_t chunk_bytes() const noexcept { return _chunk_bytes; }
+  [[nodiscard]] size_t chunk_size() const noexcept { return _chunk_bytes; }
 
-  /// Number of chunks currently handed out (outstanding) across all arenas.
-  [[nodiscard]] size_t total_chunks() const noexcept { return _n_allocated_chunks; }
+  [[nodiscard]] size_t total_allocated_bytes() const noexcept
+  {
+    return _n_allocated_chunks * _chunk_bytes;
+  }
 
-  /// Aggregate chunk capacity reserved across all arenas.  Stable for the
-  /// pool's lifetime; used to score memory pressure for eviction.
-  [[nodiscard]] size_t capacity_chunks() const noexcept { return _capacity_chunks; }
+  [[nodiscard]] size_t total_allocated_chunks() const noexcept { return _n_allocated_chunks; }
+
+  [[nodiscard]] size_t reservation_size_for_prefetching() const noexcept;
+
+  [[nodiscard]] size_t max_allowed_budget_for_prefetching() const noexcept;
+
+  [[nodiscard]] size_t max_system_wide_usage() const noexcept;
+
+  [[nodiscard]] bool should_start_evicting() const noexcept;
 
  private:
   struct host_arena {
@@ -113,8 +120,9 @@ class buffer_pool {
     cucascade::memory::fixed_size_host_memory_resource* mr;
   };
 
-  size_t _chunk_bytes;
-  size_t _capacity_chunks{0};
+  size_t _chunk_bytes{1};
+  size_t _reserved_size{0};
+  size_t _max_allowed_budget_for_prefetching{0};
   std::unordered_map<int, size_t> _numa_to_arena_index;
   std::vector<host_arena> _host_arenas;
   std::atomic<size_t> _n_allocated_chunks{0};

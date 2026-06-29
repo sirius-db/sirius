@@ -214,7 +214,7 @@ sirius_scan_manager::sirius_scan_manager(
   // user has disabled prefetching so the construction is always
   // unconditional and there's no "is the cache present" branch to
   // worry about in callers.
-  if (_config.enable_prefetch_cache) {
+  if (_config.enable_prefetch_cache && _io_ctx->can_use_prefetching_cache()) {
     _io_ctx->initialize_cache(reservation_manager, _config.cache, _topology_index);
   }
 
@@ -331,7 +331,7 @@ void sirius_scan_manager::start_metadata_processing()
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path) const noexcept
+  std::string_view path) const
 {
   auto file_path = normalize_path(std::string(path));
   if (!_io_ctx) { return nullptr; }

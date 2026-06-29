@@ -261,13 +261,20 @@ struct io_slot {
   return req;
 }
 
-/// Build one device-read chunk for a merged group of contiguous caller-owned
-/// host buffers (@p seg, whose buffer lengths are already O_DIRECT-clamped to
-/// the file end).  The whole group is read in a single readv (or a plain read
-/// when it carries one buffer), then each buffer's overlap with the request
+/// Build one device-read chunk for a merged group of contiguous host buffers
+/// (@p seg, whose buffer lengths are already O_DIRECT-clamped to the file end).
+/// The whole group is read in a single readv (or a plain read when it carries
+/// one buffer), then each buffer's overlap with the request
 /// [@p req_offset, @p req_offset + @p req_size) is H2D-copied into @p dst at its
-/// position within that request — a batch of copies issued together.  Buffers
-/// are separate host allocations, so each copy carries an absolute src pointer.
+/// position within that request — a batch of copies issued together.
+///
+/// A multi-buffer group always carries real (caller-owned) host buffers — the
+/// merge step never fuses a null-buffer segment into a readv — so those copies
+/// hold absolute src pointers into separate host allocations.  A single-buffer
+/// group may instead be a null-buffer (internal bounce slot) segment whose host
+/// buffer is assigned late once a slot is acquired; for it the copy's src is
+/// left null and the within-window offset goes in src_off, so copy_async
+/// resolves it against the bounce buffer (mirrors make_device_chunk).
 [[nodiscard]] chunk_io_request_type_ptr make_device_chunk_vectored(
   int fd,
   io_object_segment seg,
@@ -296,10 +303,14 @@ struct io_slot {
     assert(data_lo < data_hi &&
            "make_device_chunk_vectored: buffer does not overlap the request — caller must filter "
            "non-overlapping segments before building a device copy");
+    // A real host buffer carries an absolute src into that allocation; a null
+    // (bounce-slot) buffer leaves src null and puts the within-window offset in
+    // src_off so copy_async resolves it against the late-assigned bounce buffer.
+    auto* const base = static_cast<uint8_t*>(b.iov_base);
     cpy->copies.push_back(device_cpy_request::copy{
       /*dst=*/dst + (data_lo - req_offset),  // where this buffer lands in dst
-      /*src=*/static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),  // wanted data in buffer
-      /*src_off=*/0,
+      /*src=*/base != nullptr ? base + (data_lo - file_lo) : nullptr,  // wanted data in buffer
+      /*src_off=*/base != nullptr ? 0 : (data_lo - file_lo),
       /*size=*/data_hi - data_lo});
     file_lo = file_hi;
   }
@@ -347,9 +358,13 @@ template <typename FdFor>
     // a readv, so only grow the group when this segment carries a real buffer
     // and the next one does too.
     if (seg.is_buffer_allocated()) {
+      // Test contiguity against the running group (@c seg) rather than
+      // segments[j - 1]: each append keeps seg.offset + seg.size equal to the
+      // end of the last fused segment, so this stays correct without relying on
+      // segments[i] retaining its scalar fields after being moved-from.
       while (j < segments.size() && segments[j].is_buffer_allocated() &&
              seg.n_chunks() + segments[j].n_chunks() <= max_n_chunks &&
-             contiguous(segments[j - 1], segments[j]) && fd_for(segments[j]) == group_fd) {
+             contiguous(seg, segments[j]) && fd_for(segments[j]) == group_fd) {
         for (auto const& b : segments[j].buffers) {
           seg.append(b);
         }

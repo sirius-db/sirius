@@ -131,9 +131,12 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
   yaml::reader r(node, "cache");
   r.optional(
     "inflight_io_chunk_budget", opt.inflight_io_chunk_budget, yaml::greater_than<std::size_t>{0});
-  r.optional("initial_pool_reservation", opt.initial_pool_reservation);
   r.optional("dispose_after_use", opt.dispose_after_use);
-  r.optional("buffer_pool_bytes", yaml::bytes(opt.buffer_pool_bytes));
+  r.optional("min_prefetching_budget_fraction",
+             opt.min_prefetching_budget_fraction,
+             yaml::fraction<double>{});
+  r.optional(
+    "eviction_threshold_fraction", opt.eviction_threshold_fraction, yaml::fraction<double>{});
   r.reject_unknown();
 }
 

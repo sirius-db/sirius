@@ -22,13 +22,9 @@ namespace sirius::io::cache {
 
 struct config {
   size_t inflight_io_chunk_budget = 2048;
-  size_t initial_pool_reservation = 10;
-  bool dispose_after_use          = false;
-
-  /// Total pinned-memory budget for the prefetch buffer pool (bytes).  Divided
-  /// by the slab size to derive the max-slabs count passed to
-  /// @c sirius_ioctx::initialize_cache.
-  size_t buffer_pool_bytes = 256UL << 20;
+  double min_prefetching_budget_fraction{0.05};
+  double eviction_threshold_fraction{0.6};
+  bool dispose_after_use = false;
 };
 
 }  // namespace sirius::io::cache

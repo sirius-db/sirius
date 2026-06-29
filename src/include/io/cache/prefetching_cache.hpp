@@ -206,7 +206,9 @@ class prefetching_cache {
 
   file_entry& get_or_create_file_entry(const sirius_io_object& obj);
 
+  const config _cfg;
   std::unique_ptr<buffer_pool> _pool;
+  size_t _chunk_size = 1;
 
   sirius_ioctx* const _io_ctx;
 
@@ -237,8 +239,6 @@ class prefetching_cache {
     uint64_t misses{0};
     uint64_t evictions{0};
   };
-
-  const config _cfg;
 
   counters _counters;
   counters_snapshot _last_reported;
