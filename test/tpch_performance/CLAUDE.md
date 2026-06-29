@@ -129,17 +129,17 @@ pixi run python test/tpch_performance/performance_test.py \
 # nsys-profile mode (one .nsys-rep + .sqlite per query under <bench>/sirius/q<N>/)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
-    --engine gpu --iterations 2 --nsys-profile --queries 1,3,6
+    --engine gpu --iterations 2 --mode nsys-profile --queries 1,3,6
 ```
 
 Key flags:
 - `--engine gpu|cpu|both` — which engine to benchmark.
 - `--iterations N` — per-query iteration count.
-- `--mode grouped|sequential|isolated` — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (fresh connection + drop_os_cache per run; requires passwordless sudo).
+- `--mode grouped|sequential|isolated|nsys-profile` — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (fresh connection + drop_os_cache per run; requires passwordless sudo), `nsys-profile` (see below).
 - `--queries 1,3,6-10` — subset selection.
 - `--pin gpu|host|none` — Sirius cache pre-load tier. `gpu` is the only tier implemented today; `host` is allowed at the flag level but `CALL pin_table` throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:681-683`) — queries then fall through to disk reads.
 - `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
-- `--nsys-profile` — wrap each query in `nsys profile` (subprocess-per-query under DuckDB CLI). Requires `--engine gpu`; incompatible with `--validation`, `--duckdb-profiling`, `--mode != grouped`.
+- `--mode nsys-profile` — wrap each query in `nsys profile` (one DuckDB CLI subprocess per query; the cudaProfilerApi capture range covers the cold + hot iterations). Requires `--engine gpu`; incompatible with `--validation` and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout in nsys-profile mode (default 90s).
 - `--name <NAME>` — override the auto-timestamped benchmark subdirectory name.
 - `--config <yaml>` — override `$SIRIUS_CONFIG_FILE` for this run.
@@ -247,17 +247,17 @@ A suite of scripts for GPU performance profiling and analysis using NVIDIA Nsigh
 
 ### Profiling queries
 
-The primary entry point is `performance_test.py --nsys-profile` (subprocess-per-query, one `.nsys-rep` + `.sqlite` per query under the standard `<bench>/sirius/q<N>/` layout):
+The primary entry point is `performance_test.py --mode nsys-profile` (subprocess-per-query, one `.nsys-rep` + `.sqlite` per query under the standard `<bench>/sirius/q<N>/` layout):
 
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
-    --engine gpu --iterations 2 --nsys-profile --queries 1,3,6
+    --engine gpu --iterations 2 --mode nsys-profile --queries 1,3,6
 ```
 
-For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrator below) — it delegates to `performance_test.py --nsys-profile` under the hood and flattens the per-query outputs into the report's `profiles/` directory for the analyze/compare tools.
+For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrator below) — it delegates to `performance_test.py --mode nsys-profile` under the hood and flattens the per-query outputs into the report's `profiles/` directory for the analyze/compare tools.
 
 ### Analyzing profiles
 

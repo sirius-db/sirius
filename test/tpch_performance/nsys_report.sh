@@ -167,7 +167,7 @@ else
 
     PY_CMD=(
         pixi run python "$PROJECT_DIR/test/tpch_performance/performance_test.py"
-        --nsys-profile
+        --mode nsys-profile
         --input "$PARQUET_DIR"
         --engine gpu
         --iterations "$ITERATIONS"
