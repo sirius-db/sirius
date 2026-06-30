@@ -24,6 +24,7 @@
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 
+#include <array>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -169,7 +170,11 @@ class curl_share {
   static void lock_cb(CURL* handle, curl_lock_data data, curl_lock_access access, void* userp);
   static void unlock_cb(CURL* handle, curl_lock_data data, void* userp);
 
-  std::mutex _mtx;
+  // One mutex per curl_lock_data class.  libcurl nests share-lock acquisitions
+  // across classes (e.g. Curl_cpool_do_locked locks CONNECT, then internally
+  // Curl_dnscache_prune locks DNS), so a single mutex for all classes
+  // self-deadlocks on that re-entrant nesting; the data argument selects the lock.
+  std::array<std::mutex, CURL_LOCK_DATA_LAST> _mtx;
   curl_share_ptr _share;
 };
 
