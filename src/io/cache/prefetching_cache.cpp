@@ -16,12 +16,14 @@
 
 #include "io/cache/prefetching_cache.hpp"
 
+#include "cucascade/cuda/event.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/types.hpp"
 #include "io/io_context.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
+#include "util/error_utils.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -563,30 +565,37 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
                                       : _io_ctx->host_to_device_read_async_io(
                                           obj, io_segments, offset, size, dst, stream);
     return std::move(io_fut)
-      .via(&_io_cb_dispatcher)
-      .then_try([stream,
+      .via(exec::inline_executor::instance())
+      .then_try([this,
+                 stream,
                  size,
                  read_pinned = std::move(cached_chunks),
-                 loading     = std::move(io_chunks)](exec::try_t<size_t>&& res) mutable -> size_t {
+                 loading     = std::move(io_chunks)](exec::try_t<size_t>&& res) -> size_t {
         bool ok = !res.has_exception();
 
-        std::exception_ptr cuda_exception = nullptr;
-        try {
-          stream.synchronize();
-        } catch (...) {
-          cuda_exception = std::current_exception();
-          ok             = false;
+        std::unique_ptr<cucascade::cuda::cuda_event> event;
+        if (ok) {
+          event = std::make_unique<cucascade::cuda::cuda_event>();
+          event->record(stream);
         }
 
-        // (1) drop the read pins; (2) publish loading -> cached on success, or
-        // revert loading -> allocated on failure so a later read can retry.
-        std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
-        auto transition = ok ? &entry_state::mark_cached : &entry_state::mark_load_failed;
-        std::ranges::for_each(loading, [transition](cached_chunk* c) { (c->state.*transition)(); });
+        _io_cb_dispatcher.enqueue([read_pinned = std::move(read_pinned),
+                                   loading     = std::move(loading),
+                                   event       = std::move(event),
+                                   ok          = ok]() mutable {
+          if (event) {
+            SIRIUS_TRY_AND_LOG_EXCEPTION(
+              event->synchronize(),
+              "prefetching_cache: failed to synchronize CUDA stream after host-to-device copies");
+          }
 
-        if (res.has_exception() || cuda_exception) {
-          std::rethrow_exception(res.has_exception() ? std::move(res).exception() : cuda_exception);
-        }
+          std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
+          auto transition = ok ? &entry_state::mark_cached : &entry_state::mark_load_failed;
+          std::ranges::for_each(loading,
+                                [transition](cached_chunk* c) { (c->state.*transition)(); });
+        });
+
+        if (res.has_exception()) { std::rethrow_exception(std::move(res).exception()); }
         return size;
       })
       .semi();
