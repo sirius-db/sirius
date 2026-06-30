@@ -25,6 +25,7 @@
 #include "memory/topology_index.hpp"
 #include "util/error_utils.hpp"
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
@@ -570,6 +571,8 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
                       stream);
     }
 
+    auto device_id = rmm::get_current_cuda_device();
+
     // (2)+(3): file -> (own bounce | internal bounce) -> device through the IO
     // context.  The future resolves once the H2D copies are *enqueued*; we then
     // synchronize the stream (covering both these copies and the case-(1) copies
@@ -587,11 +590,13 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
       .via(exec::inline_executor::instance())
       .then_try([this,
                  stream,
+                 device_id,
                  size,
                  read_pinned = std::move(cached_chunks),
                  loading     = std::move(io_chunks)](exec::try_t<size_t>&& res) -> size_t {
         bool ok = !res.has_exception();
 
+        rmm::cuda_set_device_raii guard(device_id);
         std::unique_ptr<cucascade::cuda::cuda_event> event;
         if (ok) {
           event = std::make_unique<cucascade::cuda::cuda_event>();
