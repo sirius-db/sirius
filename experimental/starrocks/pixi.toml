@@ -1,7 +1,14 @@
 [workspace]
 channels = ["rapidsai","conda-forge"]
 name = "sirius-starrocks"
-platforms = ["linux-64","linux-aarch64"]
+# CUDA-pinned platforms (pixi >=0.71): the `engine` feature links the CUDA 13
+# Sirius build, so pin `__cuda` on the platforms (mirrors the repo-root
+# pixi.toml). CPU-only hosts assert `CONDA_OVERRIDE_CUDA` to resolve.
+platforms = [
+  { name = "linux-64-cuda13", platform = "linux-64", cuda = "13" },
+  { name = "linux-aarch64-cuda13", platform = "linux-aarch64", cuda = "13" },
+]
+requires-pixi = ">=0.71"
 
 [environments]
 default = ["fe","cn","client","engine"]
@@ -62,8 +69,8 @@ cn-test-no-engine = {cmd = "cargo test -p sirius-starrocks-cn --no-default-featu
 
 # Toolchain + libs to compile and link the engine-linked CN, copied from the
 # repo-root pixi.toml so this env can build/run it. Kept in sync with that file.
-[feature.engine.system-requirements]
-cuda = "13"
+[feature.engine]
+platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.engine.dependencies]
 cxx-compiler = "*"
