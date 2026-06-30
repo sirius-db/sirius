@@ -343,8 +343,7 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - **GPU memory**: `usage_limit_fraction`, `reservation_limit_fraction`
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
-- **Thread pools**: `pipeline`, `duckdb_scan`, `task_creator`, `downgrade` thread counts
-- **Scan cache**: `duckdb_scan.cache` controls cache level (default: `none`, valid: `none`, `parquet`, `table_host`, `table_gpu`). Set it once in the YAML config that `performance_test.py` loads via `SIRIUS_CONFIG_FILE`.
+- **Thread pools**: `pipeline`, `task_creator`, `downgrade` thread counts
 - **Cold-run benchmarking**: pass `--mode isolated` to `performance_test.py` to renew the DuckDB connection and drop OS filesystem cache before every run. Requires one-time passwordless sudo setup:
   ```bash
   echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches

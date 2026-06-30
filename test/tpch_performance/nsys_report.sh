@@ -61,9 +61,6 @@ usage() {
     echo "  -h, --help           Show this help"
     echo ""
     echo "Either --sf or --profile-dir is required."
-    echo ""
-    echo "To set scan_cache_level, configure it in your Sirius YAML config"
-    echo "(pointed at by \$SIRIUS_CONFIG_FILE)."
     exit 1
 }
 

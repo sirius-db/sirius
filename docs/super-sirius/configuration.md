@@ -95,10 +95,6 @@ sirius:
       num_threads: 1
       thread_name_prefix: "sirius_downgrade_executor"
       monitor_period_ms: 10
-    duckdb_scan:
-      num_threads: 4
-      thread_name_prefix: "sirius_scan_executor"
-      cache: "parquet"
     task_creator:
       num_threads: 2
   operator_params:
@@ -288,7 +284,6 @@ Then open `http://localhost:8080` and select the captured Sirius engine/query.
 | `task_creator` | 2 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | 4 | `downgrade` | Data tier migration (GPU→Host) |
-| `duckdb_scan_executor` | 4 | `scan_executor` | Scan task execution (DuckDB/Parquet) |
 
 Each pool supports optional CPU affinity lists for core pinning.
 
@@ -325,7 +320,6 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | `use_opt_table_scan` | - | Enable optimized table scan |
 | `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
 | `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
-| `scan_cache_level` | `NONE` | Scan caching level: `NONE`, `PARQUET`, `TABLE_HOST`, `TABLE_GPU` |
 | `scan_task_batch_size` | 512 MB | Target scan batch size |
 | `default_scan_task_varchar_size` | 256 | VARCHAR size estimate |
 

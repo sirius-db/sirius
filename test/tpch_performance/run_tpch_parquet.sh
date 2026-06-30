@@ -196,20 +196,6 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-# Load per-query scan cache level overrides from YAML config.
-# Used in multi-session mode only — in single-session, the Sirius config YAML controls cache level.
-# Format: <query_number>: <cache_level> (one per line, # comments ignored).
-CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.yaml"
-declare -A QUERY_CACHE_LEVEL
-if [ -f "$CACHE_CONFIG" ]; then
-    while IFS=': ' read -r key value; do
-        [[ -z "$key" || "$key" == \#* ]] && continue
-        value="${value## }"
-        [[ -z "$value" ]] && continue
-        QUERY_CACHE_LEVEL[$key]="$value"
-    done < "$CACHE_CONFIG"
-fi
-
 # Build list of valid queries (those with existing SQL files).
 VALID_QUERIES=()
 for q in "${QUERIES[@]}"; do
@@ -493,7 +479,7 @@ run_multi_session() {
             fi
         fi
 
-        # Build per-query SQL: views + scan cache level (sirius) + timer + N iterations.
+        # Build per-query SQL: views + timer + N iterations.
         # In --pinning-mode per-query, pin before iterations and unpin after — the unpin
         # is mandatory even though the process is about to exit, to release host-pinned
         # memory cleanly back to the allocator before the next process starts.
@@ -505,9 +491,6 @@ run_multi_session() {
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
             printf '%s\n' "$VIEW_SQL"
-            if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
-                printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
-            fi
             printf ".timer on\n"
             if [ "$PIN_ENABLED" = true ]; then
                 printf ".print __TPCH_PIN_BEGIN__ %s\n" "$q"

@@ -7,7 +7,6 @@ into existing groups, creating intermediate groups as needed.
 Usage:
     python patch_config.py sirius.yaml \\
         --opt sirius.executor.pipeline.num_threads=4 \\
-        --opt sirius.executor.duckdb_scan.cache=parquet \\
         --opt sirius.operator_params.scan_task_batch_size=536870912
 """
 
