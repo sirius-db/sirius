@@ -60,12 +60,13 @@ TPCH_TABLES = (
     "supplier",
 )
 
+BUILD_PATH = os.environ.get("SIRIUS_BUILD_PATH", "build/release")
+
 EXTENSION_PATH = os.path.join(
-    REPO_ROOT,
-    "build/release/extension/sirius/sirius.duckdb_extension",
+    REPO_ROOT, BUILD_PATH, "extension/sirius/sirius.duckdb_extension"
 )
 
-DUCKDB_BIN = os.path.join(REPO_ROOT, "build/release/duckdb")
+DUCKDB_BIN = os.path.join(REPO_ROOT, BUILD_PATH, "duckdb")
 
 
 def _git_capture(args):
