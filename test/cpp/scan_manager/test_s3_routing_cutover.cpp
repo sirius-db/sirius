@@ -15,15 +15,18 @@
  */
 
 #include "catch.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/datasource_factory.hpp"
 #include "io/io_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "planner/query.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -238,6 +241,16 @@ sirius::op::scan::ioctx_resolver make_datasource_resolver(sirius_scan_manager& m
     if (!ds) { return nullptr; }
     return ds->io_ctx();
   };
+}
+
+sirius::planner::query make_empty_query()
+{
+  auto tctx = sirius::test::make_test_telemetry_context();
+  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id()};
+  return sirius::planner::query(
+    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+    tctx->context(),
+    tinfo);
 }
 
 class range_s3_server {
@@ -493,6 +506,56 @@ TEST_CASE("scan_manager preserves S3 routing when local Sirius datasource fallba
   REQUIRE(datasource->io_ctx() != nullptr);
   CHECK(datasource->io_ctx()->type() == io_context_type::restful);
   CHECK(datasource->io_ctx()->type() != io_context_type::kvikio);
+}
+
+TEST_CASE("scan_manager re-primes routed S3 cache on every query",
+          "[s3][routing][scan_manager][cache]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), /*use_sirius_datasource=*/true);
+  cfg.enable_prefetch_cache = true;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  auto* routed_cache = datasource->io_ctx()->cache();
+  REQUIRE(routed_cache != nullptr);
+  REQUIRE(routed_cache->query_epoch() == 0);
+
+  auto* default_cache = manager.io_ctx()->cache();
+  REQUIRE(default_cache != nullptr);
+  REQUIRE(default_cache->query_epoch() == 0);
+
+  auto q = make_empty_query();
+  // The query intentionally has no scan operators: routed caches must still
+  // advance once per query, matching the default ioctx's query-wide refresh.
+  manager.prepare_for_query(q);
+  REQUIRE(routed_cache->query_epoch() == 1);
+  REQUIRE(default_cache->query_epoch() == 1);
+
+  manager.prepare_for_query(q);
+  REQUIRE(routed_cache->query_epoch() == 2);
+  REQUIRE(default_cache->query_epoch() == 2);
+}
+
+TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
+          "[s3][routing][scan_manager][cache]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), /*use_sirius_datasource=*/true);
+  REQUIRE_FALSE(cfg.enable_prefetch_cache);
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  REQUIRE(datasource->io_ctx()->cache() == nullptr);
+
+  auto q = make_empty_query();
+  REQUIRE_NOTHROW(manager.prepare_for_query(q));
 }
 
 TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independently",

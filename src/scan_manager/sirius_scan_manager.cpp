@@ -296,6 +296,17 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     _io_ctx->cache()->prepare_for_query(query);
   }
 
+  // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
+  // reused across queries; advance their caches to this query too, or a routed
+  // cache's epoch freezes at build time and a later query serves the prior
+  // query's cached chunks as current.
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    for (auto& [type, io_ctx] : _routed_io_ctxs) {
+      if (io_ctx && io_ctx->cache()) { io_ctx->cache()->prepare_for_query(query); }
+    }
+  }
+
   auto const gpu_ids = _topology_index->gpu_ids();
   auto round_robin =
     std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
