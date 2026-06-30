@@ -132,19 +132,6 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-# Load per-query scan cache level overrides from YAML config.
-# Used in multi-session mode only — in single-session, the Sirius config YAML controls cache level.
-CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.yaml"
-declare -A QUERY_CACHE_LEVEL
-if [ -f "$CACHE_CONFIG" ]; then
-    while IFS=': ' read -r key value; do
-        [[ -z "$key" || "$key" == \#* ]] && continue
-        value="${value## }"
-        [[ -z "$value" ]] && continue
-        QUERY_CACHE_LEVEL[$key]="$value"
-    done < "$CACHE_CONFIG"
-fi
-
 VALID_QUERIES=()
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
@@ -349,9 +336,6 @@ run_multi_session() {
         local TEMP_SQL
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
-            if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
-                printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
-            fi
             if [ "$ENGINE" = "sirius" ] && [ "${SIRIUS_NATIVE_SCAN_VERIFY:-0}" = 1 ]; then
                 printf "SET sirius_log_level = 'debug';\n"
             fi

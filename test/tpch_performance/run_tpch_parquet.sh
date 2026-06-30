@@ -196,20 +196,6 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-# Load per-query scan cache level overrides from YAML config.
-# Used in multi-session mode only — in single-session, the Sirius config YAML controls cache level.
-# Format: <query_number>: <cache_level> (one per line, # comments ignored).
-CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.yaml"
-declare -A QUERY_CACHE_LEVEL
-if [ -f "$CACHE_CONFIG" ]; then
-    while IFS=': ' read -r key value; do
-        [[ -z "$key" || "$key" == \#* ]] && continue
-        value="${value## }"
-        [[ -z "$value" ]] && continue
-        QUERY_CACHE_LEVEL[$key]="$value"
-    done < "$CACHE_CONFIG"
-fi
-
 # Build list of valid queries (those with existing SQL files).
 VALID_QUERIES=()
 for q in "${QUERIES[@]}"; do
