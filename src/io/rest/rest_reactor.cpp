@@ -23,7 +23,6 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <spdlog/fmt/bundled/core.h>
 #include <spdlog/spdlog.h>
 #include <sys/epoll.h>
 #include <unistd.h>
