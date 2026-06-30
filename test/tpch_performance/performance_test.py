@@ -60,9 +60,9 @@ TPCH_TABLES = (
     "supplier",
 )
 
-EXTENSION_PATH = os.path.join(
-    REPO_ROOT,
-    "build/release/extension/sirius/sirius.duckdb_extension",
+EXTENSION_PATH = os.environ.get(
+    "SIRIUS_EXTENSION_PATH",
+    os.path.join(REPO_ROOT, "build/release/extension/sirius/sirius.duckdb_extension"),
 )
 
 
@@ -677,6 +677,17 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--extension-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to the sirius.duckdb_extension to load. "
+            "Overrides the SIRIUS_EXTENSION_PATH env var and the default "
+            "build/release path. Example: "
+            "build/clang-relwithdebinfo/extension/sirius/sirius.duckdb_extension"
+        ),
+    )
+    p.add_argument(
         "--duckdb-profiling",
         action="store_true",
         help=(
@@ -692,7 +703,10 @@ def parse_args():
 
 
 def main():
+    global EXTENSION_PATH
     args = parse_args()
+    if args.extension_path:
+        EXTENSION_PATH = args.extension_path
     source = args.input
     if not os.path.isdir(source):
         raise SystemExit(
