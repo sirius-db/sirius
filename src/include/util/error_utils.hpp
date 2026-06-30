@@ -20,7 +20,6 @@
 #include <source_location>
 #include <string>
 #include <string_view>
-#include <utility>
 
 inline void log_exception_helper(const std::source_location& loc)
 {
@@ -40,7 +39,7 @@ void log_exception_helper(const std::source_location& loc, std::string_view fmt_
   spdlog::source_loc spd_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
 
   // Formats your string cleanly using v1.8.5 syntax
-  std::string user_msg = fmt::format(fmt_str, std::forward<Args>(args)...);
+  std::string user_msg = fmt::vformat(fmt_str, fmt::make_format_args(args...));
 
   try {
     throw;
