@@ -58,9 +58,7 @@
 namespace sirius::pipeline {
 
 duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
-  op::sirius_physical_operator& physical_op,
-  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-    iceberg_cache)
+  op::sirius_physical_operator& physical_op)
 {
   if (physical_op.type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     auto& group_by_physical_op = physical_op.Cast<op::sirius_physical_grouped_aggregate>();
@@ -82,16 +80,10 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
   }
 }
 
-sirius_pipeline_converter::sirius_pipeline_converter(
-  const pipeline_build_context& ctx,
-  const sirius::operator_params& op_params,
-  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-    iceberg_cache,
-  duckdb::ClientContext* client_context)
-  : build_ctx_(ctx),
-    op_params_(op_params),
-    iceberg_cache_(iceberg_cache),
-    client_context_(client_context)
+sirius_pipeline_converter::sirius_pipeline_converter(const pipeline_build_context& ctx,
+                                                     const sirius::operator_params& op_params,
+                                                     duckdb::ClientContext* client_context)
+  : build_ctx_(ctx), op_params_(op_params), client_context_(client_context)
 {
 }
 
@@ -367,8 +359,6 @@ void sirius_pipeline_converter::split_table_scan_source(
 void sirius_pipeline_converter::split_cpu_source(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
-  // cpu_source operator removed; COLUMN_DATA_SCAN, EMPTY_RESULT, and DUMMY_SCAN
-  // remain as direct pipeline sources without a CPU_SOURCE wrapper pipeline.
   (void)current_pipeline;
 }
 
@@ -596,7 +586,7 @@ void sirius_pipeline_converter::split_group_aggregate_sink(
     scheduled_.push_back(partition_pipeline);
 
     // Create merge pipeline: PARTITION (source) -> MERGE_OP (sink)
-    auto merge_op          = construct_sirius_specific_operator(*group_agg_op, iceberg_cache_);
+    auto merge_op          = construct_sirius_specific_operator(*group_agg_op);
     auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
     merge_pipeline->source = partition_ptr;
     merge_pipeline->sink   = merge_op.get();
@@ -613,7 +603,7 @@ void sirius_pipeline_converter::split_group_aggregate_sink(
     // UNGROUPED_AGGREGATE — no PARTITION needed
     scheduled_.push_back(current_pipeline);
 
-    auto merge_op        = construct_sirius_specific_operator(*group_agg_op, iceberg_cache_);
+    auto merge_op        = construct_sirius_specific_operator(*group_agg_op);
     auto new_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
     new_pipeline->source = group_agg_op;
     new_pipeline->sink   = merge_op.get();
@@ -849,7 +839,7 @@ void sirius_pipeline_converter::split_delim_join_sink(
   scheduled_.push_back(partition_distinct_pipeline);
 
   // Merge distinct pipeline: PARTITION_DISTINCT (source) -> merge_distinct (sink)
-  auto merge_distinct_op = construct_sirius_specific_operator(*distinct_op, iceberg_cache_);
+  auto merge_distinct_op = construct_sirius_specific_operator(*distinct_op);
   auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
   merge_pipeline->source = partition_distinct_ptr;
   merge_pipeline->sink   = merge_distinct_op.get();
@@ -875,8 +865,6 @@ void sirius_pipeline_converter::split_pipelines(
     // Preprocessing: replace TABLE_SCAN source with concrete scan operator
     split_table_scan_source(current_pipeline);
 
-    // Preprocessing: split COLUMN_DATA_SCAN/EMPTY_RESULT/DUMMY_SCAN sources
-    // into a CPU_SOURCE scan pipeline (analogous to TABLE_SCAN → PARQUET_SCAN).
     split_cpu_source(current_pipeline);
 
     // Preprocessing: split intermediate joins (modifies current_pipeline in place)
@@ -1028,10 +1016,6 @@ void sirius_pipeline_converter::compute_repository_wiring()
       // (sort_sample overrides get_next_task_hint to wait for N batches)
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
         emit("default", op::MemoryBarrierType::PIPELINE, sink_op, pipeline, dependent_pipeline);
-      }
-    } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
-      for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
-        emit("scan", op::MemoryBarrierType::PIPELINE, sink_op, pipeline, dependent_pipeline);
       }
     } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       // No wiring needed for RESULT_COLLECTOR sinks
@@ -1205,7 +1189,6 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-                 first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
                  first_op.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
                  first_op.type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
@@ -1247,7 +1230,6 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-                 sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
                  sink->type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::EMPTY_RESULT ||
                  sink->type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {

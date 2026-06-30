@@ -44,8 +44,7 @@ void query::build_indices()
       _operator_to_pipeline[source.get()] = pipeline;
 
       // If it's a scan-like source, add to scan operators vector
-      if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+      if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN) {
         _scan_operators.push_back(source.get());
       }
     }

@@ -17,7 +17,6 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
-#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -42,7 +41,7 @@ struct pipeline_conversion_result {
   //! The execution-ready pipelines in dependency order
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_pipelines;
   //! Ownership container for operators inserted during splitting (PARTITION, CONCAT, MERGE,
-  //! and source-side operators such as DUCKDB_SCAN, GPU_PARQUET_SCAN, CPU_SOURCE).
+  //! and source-side operators such as GPU_SCAN).
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators;
   //! Plan-time wiring descriptors. Materialized into runtime repositories and ports by
   //! `materialize_repository_wiring()` after the converter returns.
@@ -61,21 +60,16 @@ struct pipeline_conversion_result {
 //! 5. Finalize pipeline structure (merge sink into operators vector)
 //! 6. Link hash join sibling partition operators
 
-//! Construct a Sirius-specific operator (scan, merge) from a generic physical operator.
+//! Construct a Sirius-specific operator (merge) from a generic physical operator.
 //! This is a pure factory function with no engine/context dependency.
 duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
-  op::sirius_physical_operator& physical_op,
-  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-    iceberg_cache);
+  op::sirius_physical_operator& physical_op);
 
 class sirius_pipeline_converter {
  public:
-  sirius_pipeline_converter(
-    const pipeline_build_context& ctx,
-    const sirius::operator_params& op_params,
-    const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-      iceberg_cache                       = nullptr,
-    duckdb::ClientContext* client_context = nullptr);
+  sirius_pipeline_converter(const pipeline_build_context& ctx,
+                            const sirius::operator_params& op_params,
+                            duckdb::ClientContext* client_context = nullptr);
 
   //! Convert meta-pipelines into execution-ready pipelines.
   //! No runtime state required: wiring is emitted as descriptors in the result;
@@ -131,8 +125,6 @@ class sirius_pipeline_converter {
 
   const pipeline_build_context build_ctx_;
   const sirius::operator_params& op_params_;
-  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-    iceberg_cache_;
   duckdb::ClientContext* client_context_ = nullptr;
 
   // Internal state built during convert(), moved into result

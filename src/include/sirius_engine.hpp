@@ -21,7 +21,6 @@
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/execution/task_error_manager.hpp"
-#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "pipeline/pipeline_build_context.hpp"
@@ -90,10 +89,6 @@ class sirius_engine {
   void reset();
   //! Cancel the tasks
   void cancel_tasks();
-  //! Pre-fetch iceberg table metadata (delete files) for all iceberg scans in the plan.
-  //! Must be called from initialize() BEFORE initialize_internal() assigns operator IDs
-  //! to pipeline-breaker operators (PARTITION, CONCAT, etc.).
-  void prefetch_iceberg_delete_data(op::sirius_physical_operator& plan);
   //! Create a child pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
@@ -106,15 +101,6 @@ class sirius_engine {
   std::condition_variable query_finish_cv;
   //! Whether the query has finished
   bool query_finished;
-
-  // ---------------------------------------------------------------------------
-  // Iceberg metadata cache
-  //
-  // Populated by prefetch_iceberg_delete_data() in initialize(), BEFORE
-  // initialize_internal() runs.  Keyed by iceberg table path string.
-  // ---------------------------------------------------------------------------
-  std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
-    iceberg_delete_data_cache_;
 
  private:
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
