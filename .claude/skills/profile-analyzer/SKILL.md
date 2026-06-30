@@ -146,6 +146,7 @@ All analysis is **scoped to the query execution window** — the time span from 
 | **Memory Transfer Breakdown** | H2D/D2H/D2D with Pageable vs Pinned src/dst, bandwidth in GB/s |
 | **CUDA Runtime API Hotspots** | Slowest CUDA API calls *during query execution only* |
 | **Host Memory Allocation During Query** | Only alloc calls during runtime (init allocs excluded) |
+| **Device Memory Allocation — cudaMalloc Counts** | Total `cudaMalloc` calls split init / during-query / cleanup — during-query calls bypass the RMM pool |
 | **Init/Cleanup Overhead** | What was excluded — cudaHostAlloc, cudaFreeHost, context creation, etc. |
 | **GPU Kernel Attribution** | Maps GPU kernel time back to Sirius operators via correlation chain |
 | **Top Kernels per Operator** | Which specific kernels each operator launches |
@@ -224,6 +225,12 @@ Domain numbers are not registered by Sirius — they're discovered from each nsy
 - If `cudaHostAlloc` appears in the "During Query Execution" section, that's a performance issue — synchronous allocation during active queries stalls the pipeline.
 - `cudaStreamSynchronize` is typically the dominant cost during query execution — it represents time the CPU waits for GPU work to complete.
 
+### Device Allocation (cudaMalloc)
+- The **Device Memory Allocation — cudaMalloc Counts** section reports the total number of `cudaMalloc` calls in the trace, split into `init` / `during_query` / `cleanup` (`cudaMallocHost` is excluded — it's a host pinned alloc, covered by the host section).
+- **`during_query > 0` is the red flag.** Sirius allocates GPU memory through the RMM pool; a raw `cudaMalloc` on the hot path means something bypassed the pool, and each one forces a device-wide sync that stalls the pipeline. This is a frequent source of unintended performance degradation when a new code path allocates outside the pool.
+- On a warm run, expect `during_query = 0`. A nonzero count points at the operator that introduced it — cross-reference the **GPU Kernel Attribution** section to find whose operator window the call falls in. `nsys_compare.sh` flags any per-query increase (0 → N included), so it catches an allocation newly introduced between two runs.
+- `init` allocations (one-time pool priming at startup) are normal and excluded from the query window.
+
 ### Register Spill
 - `local_bytes_per_thread > 0` means the kernel exceeded the register file and is spilling to local memory (which actually resides in global/L2 memory — much slower).
 - This is a red flag for performance-critical kernels. Solutions: reduce register usage, simplify kernel logic, or use `__launch_bounds__` to guide the compiler.
@@ -241,6 +248,7 @@ Domain numbers are not registered by Sirius — they're discovered from each nsy
 9. **Operator attribution**: Which operators consume the most GPU time? Focus optimization here.
 10. **OOM failures**: Queries failing with `std::bad_alloc` need memory optimization.
 11. **Profiling vs actual performance**: Always validate profiled timing changes with non-profiled runs. nsys overhead can mask or exaggerate real performance differences.
+12. **cudaMalloc during query**: the cudaMalloc count's `during_query` value should be 0 on warm runs. Any raw `cudaMalloc` inside the query window bypasses the RMM pool and forces a device-wide sync — a common source of unintended degradation. Use `nsys_compare.sh` to catch a count that newly appears (0 → N) between runs.
 
 ## Output Format
 

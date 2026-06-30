@@ -332,12 +332,19 @@ SELECT
     COALESCE((SELECT ROUND(SUM(end-start)/1e9, 4) FROM NVTX_EVENTS WHERE domainId=0 AND eventType=59 AND end>start), 0),
     COALESCE((SELECT ROUND(SUM(end-start)/1e9, 4) FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION), 0),
     COALESCE((SELECT ROUND(SUM(bytes)/1048576.0, 2) FROM CUPTI_ACTIVITY_KIND_MEMSET), 0),
-    COALESCE((SELECT COUNT(DISTINCT deviceId) FROM CUPTI_ACTIVITY_KIND_KERNEL), 0)
+    COALESCE((SELECT COUNT(DISTINCT deviceId) FROM CUPTI_ACTIVITY_KIND_KERNEL), 0),
+    COALESCE((SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId = s.id
+              WHERE s.value LIKE 'cudaMalloc%' AND s.value NOT LIKE 'cudaMallocHost%'), 0),
+    COALESCE((SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId = s.id
+              WHERE s.value LIKE 'cudaMalloc%' AND s.value NOT LIKE 'cudaMallocHost%'
+                AND r.start >= (SELECT MIN(start) FROM NVTX_EVENTS WHERE domainId = 0 AND eventType = 59 AND end > start)
+                AND r.start <  (SELECT MAX(end)   FROM NVTX_EVENTS WHERE domainId = 0 AND eventType = 59 AND end > start)), 0)
 FROM ANALYSIS_DETAILS d;
 " 2>/dev/null)
 
     IFS='|' read -r trace_s kernels gpu_s streams h2d_gb d2h_gb d2d_gb \
-                    memcpy_s ops ops_s sync_s memset_mb gpus_used <<< "$metrics"
+                    memcpy_s ops ops_s sync_s memset_mb gpus_used \
+                    cuda_malloc_total cuda_malloc_during_query <<< "$metrics"
 
     # Parse timing CSV for cold/hot
     local timing_file="${db%.sqlite}_timings.csv"
@@ -376,6 +383,8 @@ FROM ANALYSIS_DETAILS d;
         --argjson ops "${ops:-0}" \
         --argjson ops_time "${ops_s:-0}" \
         --argjson sync_time "${sync_s:-0}" \
+        --argjson cuda_malloc_total "${cuda_malloc_total:-0}" \
+        --argjson cuda_malloc_during_query "${cuda_malloc_during_query:-0}" \
         --argjson cold "$cold_s" \
         --argjson hot "$hot_s" \
         --argjson all_hot "$all_hot_json" \
@@ -383,7 +392,7 @@ FROM ANALYSIS_DETAILS d;
             query: $q, status: "OK",
             timing: { cold_s: $cold, hot_s: $hot, all_hot_s: $all_hot, trace_duration_s: $trace },
             gpu: { total_kernels: $kernels, gpu_time_s: $gpu, streams_used: $streams, gpus_used: $gpus },
-            memory: { h2d_gb: $h2d, d2h_gb: $d2h, d2d_gb: $d2d, memcpy_time_s: $memcpy_time, memset_mb: $memset_mb },
+            memory: { h2d_gb: $h2d, d2h_gb: $d2h, d2d_gb: $d2d, memcpy_time_s: $memcpy_time, memset_mb: $memset_mb, cuda_malloc_total: $cuda_malloc_total, cuda_malloc_during_query: $cuda_malloc_during_query },
             operators: { count: $ops, total_time_s: $ops_time },
             sync_time_s: $sync_time
         }'
@@ -417,6 +426,7 @@ jq --slurpfile meta "$REPORT_DIR/metadata.json" \
            total_d2d_gb: ([.[] | select(.status == "OK") | .memory.d2d_gb] | add // 0),
            total_memcpy_time_s: ([.[] | select(.status == "OK") | .memory.memcpy_time_s] | add // 0),
            total_sync_time_s: ([.[] | select(.status == "OK") | .sync_time_s] | add // 0),
+           total_cuda_malloc_during_query: ([.[] | select(.status == "OK") | .memory.cuda_malloc_during_query] | add // 0),
            avg_hot_s: ([.[] | select(.status == "OK" and .timing.hot_s != null) | .timing.hot_s] | if length > 0 then add/length else null end),
            total_hot_s: ([.[] | select(.status == "OK" and .timing.hot_s != null) | .timing.hot_s] | add),
            total_cold_s: ([.[] | select(.status == "OK" and .timing.cold_s != null) | .timing.cold_s] | add)
