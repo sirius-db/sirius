@@ -33,16 +33,28 @@ struct plan_compound {
 /// `leaves` maps each fused op's PlanTree NodeId to its produced rep (which the
 /// compress driver moves onto `tree.nodes[nodeid].rep`).
 ///
-/// `raw_passthrough_leaves` holds (parent_rle NodeId, RawFused rep) pairs for
-/// the synthesised Raw passthrough leaves that have no PlanTree op of their own;
-/// the compress driver parks each on `tree.nodes[parent_rle].channels` under the
-/// "values" output path.
-struct plan_compound_builder {
-  std::unordered_map<NodeId, std::unique_ptr<compressed_representation>> leaves;
-  std::vector<std::pair<NodeId, std::unique_ptr<compressed_representation>>> raw_passthrough_leaves;
+/// `raw_passthrough_leaves` holds entries for synthesised Raw passthrough leaves
+/// that have no PlanTree op of their own.  Each entry carries:
+///   - `parent_id`   : the parent node's PlanTree NodeId (was "parent_rle")
+///   - `channel_name`: the output channel name under which the rep is stored
+///                     ("values" for RLE parents, "deltas" for FOR parents)
+///   - `rep`         : the codegen_fused_representation holding the raw buffers
+///
+/// The compress driver parks each rep on
+/// `tree.nodes[parent_id].channels[channel_output_path]`.
+struct RawPassthroughLeaf {
+  NodeId parent_id;
+  std::string channel_name;
+  std::unique_ptr<compressed_representation> rep;
 };
 
-/// True if `op` is a codegen-fusable operator name (delta / rle / bitpack).
+struct plan_compound_builder {
+  std::unordered_map<NodeId, std::unique_ptr<compressed_representation>> leaves;
+  std::vector<RawPassthroughLeaf> raw_passthrough_leaves;
+};
+
+/// True if `op` is a codegen-fusable operator name
+/// (delta / rle / bitpack / for / zigzag).
 bool is_codegen_compressor(std::string const& op);
 
 /// True if `nid` is a fusable node whose producer is itself a fusable op —

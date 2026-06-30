@@ -18,6 +18,7 @@ std::string op_kind_name(OpKind op)
     case OpKind::Delta: return "DELTA";
     case OpKind::Rle: return "RLE";
     case OpKind::Raw: return "RAW";
+    case OpKind::Zigzag: return "ZIGZAG";
     case OpKind::None: return "NONE";
   }
   return "UNKNOWN";

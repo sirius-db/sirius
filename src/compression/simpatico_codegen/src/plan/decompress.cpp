@@ -65,6 +65,8 @@ std::string codegen_kind_for_compressor(std::string const& c)
   if (c == "bitpack") return "bitpack";
   if (c == "delta") return "delta";
   if (c == "rle") return "rle";
+  if (c == "for") return "for";
+  if (c == "zigzag") return "zigzag";
   return {};
 }
 
@@ -79,6 +81,8 @@ std::vector<std::string> consumed_slots(std::string const& kind)
   if (kind == "bitpack") return {"chunk_min", "chunk_count", "chunk_bits", "packed"};
   if (kind == "delta") return {"delta_first"};
   if (kind == "rle") return {"rle_runs_offsets"};
+  if (kind == "for") return {"references"};
+  if (kind == "zigzag") return {"zigzag"};
   if (kind == "RawFused") return {"data", "offsets"};
   return {};
 }
@@ -161,22 +165,27 @@ std::unique_ptr<cudf::column> resolve_channel_bytes_node(NodeId nid,
                                                          rmm::device_async_resource_ref mr);
 
 // Bind the ``data``/``offsets`` slots of a synthesized Raw passthrough leaf
-// (an RLE ``values`` channel whose bytes live in a RawFused rep parked on the
-// parent rle node's ``channels``) at preorder *node_id*.
+// at preorder *node_id*. The Raw leaf has no PlanTree op of its own; its
+// bytes live in a RawFused rep parked on the parent node's ``channels``.
+//
+// The channel name is derived from origin.parent_op:
+//   "rle" -> "values" (run values), "for" -> "deltas" (residuals).
 bool bind_raw_passthrough_buffers(std::int32_t node_id,
-                                  NodeId parent_rle,
+                                  NodeId parent_id,
+                                  std::string const& parent_op,
                                   PlanTree const& tree,
                                   std::size_t element_size,
                                   codegen::jit::LabeledBuffers& labeled,
                                   std::string* error_out)
 {
+  std::string const channel_name       = (parent_op == "for") ? "deltas" : "values";
   compressed_representation const* rep = nullptr;
-  if (parent_rle < tree.nodes.size()) {
-    auto const& rle_node = tree.nodes[parent_rle];
-    for (auto const& [path, crep] : rle_node.channels) {
+  if (parent_id < tree.nodes.size()) {
+    auto const& parent_node = tree.nodes[parent_id];
+    for (auto const& [path, crep] : parent_node.channels) {
       if (!crep) continue;
-      std::string port = port_for_output_path(rle_node, path);
-      if (port == "values") {
+      std::string port = port_for_output_path(parent_node, path);
+      if (port == channel_name) {
         rep = crep.get();
         break;
       }
@@ -184,8 +193,8 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
   }
   if (rep == nullptr) {
     if (error_out)
-      *error_out = "codegen decode: RawFused passthrough rep missing at rle node " +
-                   std::to_string(parent_rle);
+      *error_out = "codegen decode: RawFused passthrough rep missing at " + parent_op + " node " +
+                   std::to_string(parent_id) + " (channel '" + channel_name + "')";
     return false;
   }
   std::vector<compressible_output> nb = rep->named_channels();
@@ -326,7 +335,7 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
     auto const& origin = built->preorder[node_id];
     if (origin.is_raw_passthrough) {
       if (!bind_raw_passthrough_buffers(
-            node_id, origin.parent_rle, tree, element_size, labeled, error_out)) {
+            node_id, origin.parent_rle, origin.parent_op, tree, element_size, labeled, error_out)) {
         return nullptr;
       }
     } else {
@@ -567,13 +576,6 @@ bool decode_node(NodeId nid, TreeDecodeCtx& ctx, std::string* error_out)
 
   if (is_codegen_compressor(node.op)) {
     if (is_fusion_interior(nid, tree)) {
-      ctx.skipped.insert(nid);
-      return true;
-    }
-    auto const* repr = node_rep(nid, tree);
-    if (!repr) return true;
-    if (dynamic_cast<codegen_fused_representation const*>(repr) != nullptr &&
-        node.output_paths.empty()) {
       ctx.skipped.insert(nid);
       return true;
     }

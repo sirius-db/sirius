@@ -97,6 +97,8 @@ void append_op_segment(std::ostringstream& oss, const ::codegen::jit::FusedTree&
     case ::codegen::OpKind::Bitpack: oss << "bp"; break;
     case ::codegen::OpKind::Delta: oss << "dl"; break;
     case ::codegen::OpKind::Rle: oss << "rl"; break;
+    case ::codegen::OpKind::For: oss << "fr"; break;
+    case ::codegen::OpKind::Zigzag: oss << "zz"; break;
     default: oss << "un"; break;
   }
   for (const auto& [k, child] : node.children) {
@@ -230,10 +232,24 @@ class Walker {
                          const std::string& dst,
                          const std::string& len,
                          const std::string& elem_type);
+  void emit_for_producer(const ::codegen::jit::FusedTree& node,
+                         const std::string& dst,
+                         const std::string& len,
+                         const std::string& elem_type);
   void emit_raw_producer(const ::codegen::jit::FusedTree& node,
                          const std::string& dst,
                          const std::string& len,
                          const std::string& elem_type);
+  void emit_zigzag_producer(const ::codegen::jit::FusedTree& node,
+                            const std::string& dst,
+                            const std::string& len,
+                            const std::string& elem_type);
+
+  // Emit ZigZag scalar-load prelude + return its closed-form (inverse) read
+  // expr — reads the stored `zigzag` channel and applies the inverse map
+  // inline, so a ZigZag child of Delta/FOR/RLE needs no shared-mem slab.
+  ValueSource zigzag_value_source_inline(const ::codegen::jit::FusedTree& node,
+                                         const std::string& elem_type);
 
   // Emit Bitpack scalar-load prelude + return its closed-form read expr.
   ValueSource bitpack_value_source(const ::codegen::jit::FusedTree& node,
@@ -340,11 +356,9 @@ void Walker::emit_producer(const ::codegen::jit::FusedTree& node,
     case ::codegen::OpKind::Bitpack: emit_bitpack_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::Delta: emit_delta_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::Rle: emit_rle_producer(node, dst, len, elem_type); return;
-    case ::codegen::OpKind::For:
-      throw RenderError(
-        "decode render: FOR is handled by the legacy operator, not the "
-        "JIT renderer");
+    case ::codegen::OpKind::For: emit_for_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::Raw: emit_raw_producer(node, dst, len, elem_type); return;
+    case ::codegen::OpKind::Zigzag: emit_zigzag_producer(node, dst, len, elem_type); return;
     default:
       throw RenderError(std::string("decode render: invalid op '") +
                         ::codegen::jit::op_kind_name(node.op) + "'");
@@ -726,6 +740,90 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
 }
 
 // =====================================================================
+// FOR — semi-inline reverse transformer.
+//
+// Decode inverts the encode FOR step: given the compressed residuals
+// (the `deltas` child) and the per-chunk reference stored in
+// `references[chunk_id]`, reconstruct `original[i] = residual[i] + ref`.
+//
+// Two paths mirror the Delta producer's child handling:
+//   * Closed-form child (Bitpack/Raw leaf): get a `value_source` expr
+//     (no slab needed) and emit a strided loop that adds the reference.
+//   * Producer child (Delta/Rle): materialise the child into a shared
+//     slab first, then add the reference in a second strided loop.
+// =====================================================================
+void Walker::emit_for_producer(const ::codegen::jit::FusedTree& node,
+                               const std::string& dst,
+                               const std::string& len,
+                               const std::string& elem_type)
+{
+  if (node.children.size() != 1) {
+    throw RenderError(
+      "decode render: FOR must have exactly one child named 'deltas' "
+      "(got " +
+      std::to_string(node.children.size()) + " children)");
+  }
+  auto dit = node.children.find("deltas");
+  if (dit == node.children.end()) {
+    throw RenderError("decode render: FOR missing 'deltas' child (got '" +
+                      node.children.begin()->first + "' instead)");
+  }
+  const std::size_t esize = dtype_elem_size(elem_type);
+  if (esize == 0) {
+    throw RenderError("decode render: FOR op-local dtype '" + elem_type + "' not supported");
+  }
+
+  const std::int32_t id   = id_of(node);
+  const std::string idstr = std::to_string(id);
+
+  // Kernel parameter: references buffer (one entry per chunk).
+  const std::string p_refs = "references_" + idstr;
+  add_param("const " + elem_type + "* __restrict__", p_refs);
+  add_buffer(id, "references", esize);
+
+  const std::string v_ref = "for_ref_" + idstr;
+
+  body_ << "    // --- node " << id << ": FOR (reverse, " << elem_type << ") ---\n"
+        << "    const " << elem_type << " " << v_ref << " = " << p_refs << "[chunk_id];\n";
+
+  const bool child_is_leaf =
+    (dit->second->op == ::codegen::OpKind::Bitpack && dit->second->children.empty()) ||
+    (dit->second->op == ::codegen::OpKind::Raw && dit->second->children.empty());
+
+  if (child_is_leaf) {
+    // Closed-form path: get an inline read expression for the residuals,
+    // then add the per-chunk reference in a single strided loop.
+    const auto mark      = sm_.mark();
+    ValueSource child_vs = value_source(*dit->second, elem_type, len);
+    body_ << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
+          << ") {\n"
+          << "        (" << dst << ")[i] = static_cast<" << elem_type << ">(\n"
+          << "            " << at_pos(child_vs.read_expr, "i") << " + " << v_ref << ");\n"
+          << "    }\n"
+          << "    __syncthreads();\n";
+    sm_.release_to(mark);
+  } else {
+    // Producer child (Delta/Rle): materialise residuals into a shared slab
+    // first, then add the per-chunk reference in a second strided loop.
+    const auto mark        = sm_.mark();
+    const std::string slab = "for_slab_" + idstr;
+    const std::size_t off  = sm_.alloc(esize, ::codegen::kChunkSize);
+
+    body_ << "    " << elem_type << "* " << slab << " = reinterpret_cast<" << elem_type
+          << "*>(workspace + " << off << ");\n";
+    emit_producer(*dit->second, slab, len, elem_type);
+    body_ << "    __syncthreads();\n"
+          << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
+          << ") {\n"
+          << "        (" << dst << ")[i] = static_cast<" << elem_type << ">(\n"
+          << "            " << slab << "[i] + " << v_ref << ");\n"
+          << "    }\n"
+          << "    __syncthreads();\n";
+    sm_.release_to(mark);
+  }
+}
+
+// =====================================================================
 // raw_value_source_inline — closed-form expr for Raw leaf (no smem).
 // =====================================================================
 ValueSource Walker::raw_value_source_inline(const ::codegen::jit::FusedTree& node,
@@ -758,8 +856,62 @@ ValueSource Walker::raw_value_source_inline(const ::codegen::jit::FusedTree& nod
 }
 
 // =====================================================================
-// value_source — closed-form expr (Bitpack / Raw leaf) or materialised-slab
-// read (Delta / Rle / non-leaf).
+// zigzag_value_source_inline — closed-form inverse ZigZag for the leaf.
+//
+// Reads the stored `zigzag` channel at fixed stride (base chunk_start) and
+// applies the inverse map inline:  n = (z >> 1) ^ -(z & 1)  computed in the
+// unsigned domain to avoid signed-shift UB.  No shared memory — callers
+// splice the expression directly (Bitpack-like).
+// =====================================================================
+ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& node,
+                                               const std::string& elem_type)
+{
+  if (!node.children.empty()) { throw RenderError("decode render: Zigzag must be a leaf"); }
+  const std::size_t esize = dtype_elem_size(elem_type);
+  if (esize == 0) {
+    throw RenderError("decode render: zigzag_value_source_inline: unsupported dtype '" + elem_type +
+                      "'");
+  }
+  const std::string utype  = (esize == 8) ? "uint64_t" : "uint32_t";
+  const std::int32_t id    = id_of(node);
+  const std::string idstr  = std::to_string(id);
+  const std::string p_data = "zigzag_" + idstr;
+
+  add_param("const " + elem_type + "* __restrict__", p_data);
+  add_buffer(id, "zigzag", esize);
+
+  // Stored element at this position (read once textually; compiler CSEs the
+  // duplicate load).  base == chunk_start (chunk_id*CHUNK), known at entry.
+  const std::string load = "static_cast<" + utype + ">(" + p_data + "[chunk_start + (__POS__)])";
+
+  ValueSource vs;
+  vs.elem_type = elem_type;
+  vs.read_expr = "static_cast<" + elem_type + ">((" + load +
+                 " >> 1) ^ "
+                 "(static_cast<" +
+                 utype + ">(0) - (" + load + " & static_cast<" + utype + ">(1))))";
+  return vs;
+}
+
+// =====================================================================
+// ZigZag — producer leaf.  Reads the stored `zigzag` channel, applies the
+// inverse map, writes `len` reconstructed elements into `dst`.
+// =====================================================================
+void Walker::emit_zigzag_producer(const ::codegen::jit::FusedTree& node,
+                                  const std::string& dst,
+                                  const std::string& len,
+                                  const std::string& elem_type)
+{
+  ValueSource vs = zigzag_value_source_inline(node, elem_type);
+  body_ << "    // --- node " << id_of(node) << ": Zigzag producer (" << elem_type << ") ---\n"
+        << "    for (int32_t i = tid; i < (" << len << "); i += " << tbs_ << ") {\n"
+        << "        (" << dst << ")[i] = " << at_pos(vs.read_expr, "i") << ";\n"
+        << "    }\n";
+}
+
+// =====================================================================
+// value_source — closed-form expr (Bitpack / Raw / Zigzag leaf) or
+// materialised-slab read (Delta / Rle / non-leaf).
 // =====================================================================
 ValueSource Walker::value_source(const ::codegen::jit::FusedTree& node,
                                  const std::string& elem_type,
@@ -771,6 +923,9 @@ ValueSource Walker::value_source(const ::codegen::jit::FusedTree& node,
   }
   if (node.op == ::codegen::OpKind::Raw && node.children.empty()) {
     return raw_value_source_inline(node, elem_type);
+  }
+  if (node.op == ::codegen::OpKind::Zigzag && node.children.empty()) {
+    return zigzag_value_source_inline(node, elem_type);
   }
 
   // Delta / Rle / non-leaf: materialise the subtree into a fresh shared slab,

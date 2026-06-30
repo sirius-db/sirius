@@ -27,6 +27,7 @@ enum class PlanLeafKind : std::uint8_t {
   NvcompCascaded = 12,
   Alp            = 13,
   AlpRd          = 14,
+  Zigzag         = 15,
   Unknown        = 255,
 };
 

@@ -90,7 +90,8 @@ struct RenderError : std::runtime_error {
 // source alone.
 //
 // Supported ops: Bitpack (leaf), Delta (inline-fused), Rle (stage
-// boundary), composed arbitrarily.  FOR / Raw throw RenderError.
+// boundary), For (semi-inline transformer), composed arbitrarily.  Raw
+// throws RenderError (only valid as an Rle child).
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks);

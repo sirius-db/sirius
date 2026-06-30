@@ -5,7 +5,7 @@ namespace simpatico {
 
 bool is_codegen_compressor(std::string const& op)
 {
-  return op == "delta" || op == "rle" || op == "bitpack";
+  return op == "delta" || op == "rle" || op == "bitpack" || op == "for" || op == "zigzag";
 }
 
 bool is_fusion_interior(NodeId nid, PlanTree const& tree)

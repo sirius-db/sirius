@@ -36,6 +36,15 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
     return t;
   }
 
+  if (node.op == "zigzag") {
+    // Leaf: ZigZag stores its transformed stream to the `zigzag` channel
+    // (its outgoing edge, if any, is an entropy tail on that channel —
+    // ignored here, exactly like Bitpack's packed tail).
+    auto t = jit::FusedTree::make(OpKind::Zigzag);
+    out.preorder.push_back({t.get(), nid, false, 0});
+    return t;
+  }
+
   if (node.op == "delta") {
     PlanEdge const* diff = find_edge(node, "differences");
     if (diff == nullptr) return nullptr;  // value child required (no raw form)
@@ -44,8 +53,8 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
     auto child = build_rec(tree, diff->child, fixed_stride, out);
     if (!child) return nullptr;
     // Delta's single child is keyed "differences" everywhere — the DSL port,
-    // the rep channel (delta_compressed_representation), and the renderer all
-    // agree, so there is no name translation.
+    // the fused rep channel, and the renderer all agree, so there is no name
+    // translation.
     t->children.emplace("differences", std::move(child));
     return t;
   }
@@ -69,9 +78,27 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
       // Raw passthrough: the rle "values" channel has no tree node (the DSL
       // drained it through a synthetic identity leaf). Synthesize the Raw leaf.
       values_child = jit::FusedTree::make(OpKind::Raw);
-      out.preorder.push_back({values_child.get(), 0, true, nid});
+      out.preorder.push_back({values_child.get(), 0, true, nid, "rle"});
     }
     t->children.emplace("values", std::move(values_child));
+    return t;
+  }
+
+  if (node.op == "for") {
+    PlanEdge const* deltas = find_edge(node, "deltas");
+    auto t                 = jit::FusedTree::make(OpKind::For);
+    out.preorder.push_back({t.get(), nid, false, 0});
+    std::shared_ptr<jit::FusedTree> deltas_child;
+    if (deltas != nullptr) {
+      deltas_child = build_rec(tree, deltas->child, fixed_stride, out);
+      if (!deltas_child) return nullptr;
+    } else {
+      // No downstream deltas consumer: Raw passthrough (fixed-stride storage).
+      // Mirrors RLE's values Raw passthrough but uses "deltas" port.
+      deltas_child = jit::FusedTree::make(OpKind::Raw);
+      out.preorder.push_back({deltas_child.get(), 0, true, nid, "for"});
+    }
+    t->children.emplace("deltas", std::move(deltas_child));
     return t;
   }
 

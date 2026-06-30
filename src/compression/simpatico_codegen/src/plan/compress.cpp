@@ -177,7 +177,7 @@ void CompressWalk::emit_path(std::string const& path)
   }
 
   auto col_it = columns.find(node.input_paths[0]);
-  if (node.op == "delta" || node.op == "rle" || node.op == "bitpack") {
+  if (is_codegen_compressor(node.op)) {
     if (emit_fused_node(n, col_it->second)) return;
   }
   emit_generic_node(n, col_it->second);
@@ -257,13 +257,13 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
     nd.rep_path = nd.input_path;
     nd.meta     = nd.rep->describe_meta();
   }
-  // Raw passthrough reps land in the parent RLE node's channels map under the
-  // "values" output path — exactly where bind_raw_passthrough_buffers reads.
-  for (auto& [parent_rle, rep] : builder.raw_passthrough_leaves) {
-    auto& rle_nd = tree.nodes[parent_rle];
-    for (std::size_t i = 0; i < rle_nd.output_names.size(); ++i) {
-      if (rle_nd.output_names[i] == "values") {
-        rle_nd.channels.emplace(rle_nd.output_paths[i], std::move(rep));
+  // Raw passthrough reps land in the parent node's channels map under the
+  // channel_name output path: "values" for Rle parents, "deltas" for For parents.
+  for (auto& leaf : builder.raw_passthrough_leaves) {
+    auto& parent_nd = tree.nodes[leaf.parent_id];
+    for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
+      if (parent_nd.output_names[i] == leaf.channel_name) {
+        parent_nd.channels.emplace(parent_nd.output_paths[i], std::move(leaf.rep));
         break;
       }
     }
@@ -483,12 +483,13 @@ std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
         nd.rep_path = nd.input_path;
         nd.meta     = nd.rep->describe_meta();
       }
-      // Raw passthrough reps land in the parent RLE node's channels map.
-      for (auto& [parent_rle, rep] : builder.raw_passthrough_leaves) {
-        auto& rle_nd = tree.nodes[parent_rle];
-        for (std::size_t i = 0; i < rle_nd.output_names.size(); ++i) {
-          if (rle_nd.output_names[i] == "values") {
-            rle_nd.channels.emplace(rle_nd.output_paths[i], std::move(rep));
+      // Raw passthrough reps land in the parent node's channels map under the
+      // channel_name output path ("values" for RLE, "deltas" for FOR).
+      for (auto& leaf : builder.raw_passthrough_leaves) {
+        auto& parent_nd = tree.nodes[leaf.parent_id];
+        for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
+          if (parent_nd.output_names[i] == leaf.channel_name) {
+            parent_nd.channels.emplace(parent_nd.output_paths[i], std::move(leaf.rep));
             break;
           }
         }

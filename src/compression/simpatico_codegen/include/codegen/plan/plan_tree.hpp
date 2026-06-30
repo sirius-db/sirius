@@ -68,13 +68,12 @@ struct PlanNode {
   // Node-owned compressed representations. Two storage slots cover every shape:
   //
   //   * `rep` — this op's own single representation, keyed by its INPUT path
-  //     (`rep_path`). Set for the fused ops (Delta/Rle/Bitpack) and terminal
-  //     ops consumed by nothing downstream (e.g. `input -> for`).
+  //     (`rep_path`). Set for all JIT-fused ops (Delta/Rle/Bitpack/For).
   //
   //   * `channels` — terminal OUTPUT representations (identity / RawFused),
   //     keyed by their DSL output PATH. Set for a producing node's non-consumed
-  //     outputs — e.g. `for`'s {references, reference_offsets} channels or the
-  //     RawFused `values` passthrough of an Rle.
+  //     outputs — e.g. `for`'s `references` channel or the RawFused `values`
+  //     passthrough of an Rle or the `deltas` passthrough of a For.
   std::unique_ptr<compressed_representation> rep;
   std::string rep_path;
   std::unordered_map<std::string, std::unique_ptr<compressed_representation>> channels;

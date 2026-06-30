@@ -145,8 +145,7 @@ struct RenderError : std::runtime_error {
 //
 // Throws `RenderError` if `tree` contains an op the renderer can't emit.
 // Supported ops: `Bitpack` (leaf, `fixed_stride=true` / OverAllocate), `Raw`
-// (leaf passthrough), `Delta`, `Rle` — composed arbitrarily. `For` goes through
-// the legacy operator instead.
+// (leaf passthrough), `Delta`, `Rle`, `For` — composed arbitrarily.
 //
 // Throws `std::invalid_argument` for malformed inputs (empty dtype,
 // num_chunks < 1).

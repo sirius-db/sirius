@@ -60,6 +60,27 @@ inline std::unique_ptr<cudf::table> make_int32_table(int num_cols, int num_rows,
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+inline std::unique_ptr<cudf::table> make_int64_table(int num_cols, int num_rows, int seed)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(static_cast<std::size_t>(num_cols));
+  for (int c = 0; c < num_cols; ++c) {
+    std::vector<std::int64_t> host(static_cast<std::size_t>(num_rows));
+    for (int r = 0; r < num_rows; ++r)
+      host[static_cast<std::size_t>(r)] =
+        static_cast<std::int64_t>((r * 17 + c * 1013 + seed) % 1000);
+    auto col = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT64}, num_rows, cudf::mask_state::UNALLOCATED);
+    if (cudaMemcpy(col->mutable_view().head<std::int64_t>(),
+                   host.data(),
+                   host.size() * sizeof(std::int64_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      throw std::runtime_error("make_int64_table: cudaMemcpy failed");
+    cols.push_back(std::move(col));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 inline std::unique_ptr<cudf::table> make_f32_table(int num_cols, int num_rows, int seed)
 {
   std::vector<std::unique_ptr<cudf::column>> cols;

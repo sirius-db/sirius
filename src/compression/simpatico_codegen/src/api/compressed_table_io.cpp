@@ -285,6 +285,7 @@ static const char* leaf_kind_to_compressor(PlanLeafKind k)
     case PlanLeafKind::Dictionary: return "dictionary";
     case PlanLeafKind::Bitpack: return "bitpack";
     case PlanLeafKind::For: return "for";
+    case PlanLeafKind::Zigzag: return "zigzag";
     case PlanLeafKind::Alp: return "alp";
     case PlanLeafKind::AlpRd: return "alp_rd";
     case PlanLeafKind::Ans: return "ans";
@@ -327,11 +328,10 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     return col;
   };
 
-  // Delta and Rle can be either a non-fused C++ rep or a JIT codegen_fused_representation.
-  // Detect fused reps by their channel names:
-  //   - Non-fused delta has a single "differences" channel.
-  //   - Non-fused rle has "values" + "runs" channels.
-  //   - Fused reps carry all the manifest buffers for the entire fused region.
+  // Delta, Rle, For and Zigzag are codegen-only operators: encode always
+  // produces a JIT codegen_fused_representation carrying the fused region's
+  // manifest buffers, so their leaves are reconstructed unconditionally as a
+  // fused rep.
   auto make_fused_rep = [&](const char* kind_tag) {
     auto rep = std::make_unique<codegen_fused_representation>(
       kind_tag, tag_to_dtype(ld.type_tag), col_num_rows);
@@ -341,20 +341,16 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     return std::unique_ptr<compressed_representation>(std::move(rep));
   };
 
-  if (ld.kind == PlanLeafKind::Delta) {
-    bool is_fused = !(bufs.size() == 1 && bufs[0].name == "differences");
-    if (is_fused) return make_fused_rep("delta");
-  }
-  if (ld.kind == PlanLeafKind::Rle) {
-    bool is_fused = !(bufs.size() == 2 && bufs[0].name == "values" && bufs[1].name == "runs");
-    if (is_fused) return make_fused_rep("rle");
-  }
+  if (ld.kind == PlanLeafKind::Delta) { return make_fused_rep("delta"); }
+  if (ld.kind == PlanLeafKind::Rle) { return make_fused_rep("rle"); }
+  if (ld.kind == PlanLeafKind::For) { return make_fused_rep("for"); }
+  if (ld.kind == PlanLeafKind::Zigzag) { return make_fused_rep("zigzag"); }
   if (ld.kind == PlanLeafKind::Identity) {
     bool is_fused = !(bufs.size() == 1 && bufs[0].name == "data");
     if (is_fused) return make_fused_rep("RawFused");
   }
 
-  // All other kinds (and non-fused delta/rle/identity): route through reconstruct_representation.
+  // All other kinds (and non-fused identity): route through reconstruct_representation.
   const char* cname = leaf_kind_to_compressor(ld.kind);
   if (!cname) {
     if (err)

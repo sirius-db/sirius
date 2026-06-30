@@ -271,18 +271,28 @@ loaded_table load_binary(std::string const& path, cudf::data_type dtype)
 
 // ── Memory / sync helpers ───────────────────────────────────────────────────────
 
+// Owns a cuda_async_memory_resource and installs it as the current device
+// resource. RMM 26.x resource refs are non-owning, so the resource object
+// (`mr`) must outlive the period it is the current resource — the destructor
+// restores `previous` before `mr` is torn down. `previous` is captured at
+// construction (install() runs immediately after), so install() does not need
+// the set_current_device_resource_ref return value — which is `device_async_resource_ref`
+// on some RMM versions and a deprecated `any_resource` on newer ones.
 struct pool_mr_guard {
-  cuda::mr::any_resource<cuda::mr::device_accessible> mr;
-  cuda::mr::any_resource<cuda::mr::device_accessible> previous;
+  rmm::mr::cuda_async_memory_resource mr{};
+  rmm::device_async_resource_ref previous{rmm::mr::get_current_device_resource_ref()};
+  bool installed = false;
 
   void install()
   {
-    mr = cuda::mr::any_resource<cuda::mr::device_accessible>(rmm::mr::cuda_async_memory_resource{});
-    previous =
-      rmm::mr::set_current_device_resource(cuda::mr::any_resource<cuda::mr::device_accessible>(mr));
+    rmm::mr::set_current_device_resource_ref(mr);
+    installed = true;
   }
 
-  ~pool_mr_guard() { rmm::mr::set_current_device_resource(std::move(previous)); }
+  ~pool_mr_guard()
+  {
+    if (installed) rmm::mr::set_current_device_resource_ref(previous);
+  }
 };
 
 void cuda_sync()

@@ -87,6 +87,7 @@ compressed_table roundtrip_once(cudf::table_view input,
                                 int threads,
                                 char const* label)
 {
+  std::fprintf(stderr, "[roundtrip_once] label='%s'\n", label);
   compressed_table ct =
     (threads <= 1)
       ? compress_with_plan(
@@ -126,7 +127,7 @@ int main()
         "delta.differences.values -> bitpack\n"
         "delta.differences.runs -> bitpack\n"
         "---\n"
-        "input -> for -> deltas, references, reference_offsets\n"
+        "input -> for -> deltas, references\n"
         "for.deltas -> bitpack\n";
       auto ct = compress_with_plan(t->view(),
                                    dsl,
@@ -181,40 +182,36 @@ int main()
     }
 
     {
+      // FOR without a downstream bitpack — deltas stored as raw fixed-stride.
       auto t = make_int32_table(2, 2048, 11);
       std::string dsl =
-        "input -> for\n"
+        "input -> for -> deltas, references\n"
         "---\n"
-        "input -> for\n";
+        "input -> for -> deltas, references\n";
       roundtrip_once(t->view(), dsl, 1, "for_only");
       roundtrip_once(t->view(), dsl, 2, "for_only_mt");
     }
 
     {
-      // Hybrid FOR head + fused bitpack subtree: legacy FOR head produces the
-      // `deltas` channel, which a fused bitpack subtree compresses; decode
-      // dispatches the fused subtree, then inverts FOR. Full roundtrip.
+      // FOR + fused bitpack on deltas: JIT fused region covers both ops.
       auto t = make_int32_table(2, 4096, 5);
       std::string dsl =
-        "input -> for -> deltas, references, reference_offsets\n"
+        "input -> for -> deltas, references\n"
         "for.deltas -> bitpack\n"
         "---\n"
-        "input -> for -> deltas, references, reference_offsets\n"
+        "input -> for -> deltas, references\n"
         "for.deltas -> bitpack\n";
-      auto ct = roundtrip_once(t->view(), dsl, 1, "for_bitpack_subtree");
-      expect(ct.columns.size() == 2, "for_bitpack_subtree: column count");
+      auto ct = roundtrip_once(t->view(), dsl, 1, "for_bitpack");
+      expect(ct.columns.size() == 2, "for_bitpack: column count");
       for (auto const& col : ct.columns) {
-        expect(col.compound != nullptr, "for_bitpack_subtree: compound");
+        expect(col.compound != nullptr, "for_bitpack: compound");
       }
-      roundtrip_once(t->view(), dsl, 2, "for_bitpack_subtree_mt");
+      roundtrip_once(t->view(), dsl, 2, "for_bitpack_mt");
     }
 
-    // NOTE: a FOR head + fused bitpack subtree + nvcomp tail on the fused
-    // bitpack's `packed` channel (e.g. `for.deltas.packed -> ans`) is NOT
-    // supported: the fused subtree leaf does not expose chunk_min/chunk_count/
-    // chunk_bits/packed as resolvable downstream paths the way a legacy bitpack
-    // head does, so the plan fails to resolve. See decode-roundtrip-matrix in
-    // docs/compress_with_plan_plan.md.
+    // NOTE: `for.deltas.packed -> ans` IS supported: the JIT region root is FOR,
+    // bitpack is interior, and its boundary channels (packed, chunk_min, etc.)
+    // are exposed and can be further entropy-coded like any other bitpack output.
 
     {
       // bitextract: split a FLOAT32 column into sign/exponent/mantissa planes;
@@ -310,7 +307,7 @@ int main()
         "delta.differences.values -> bitpack\n"
         "delta.differences.runs -> bitpack\n"
         "---\n"
-        "input -> for -> deltas, references, reference_offsets\n"
+        "input -> for -> deltas, references\n"
         "for.deltas -> bitpack\n"
         "---\n"
         "input -> bitcomp\n"
@@ -330,6 +327,134 @@ int main()
         }
         verify_plan_tree(ct, "stream_pool");
       }
+    }
+
+    // --- Additional FOR roundtrip tests (int32/int64/references entropy tail) ---
+
+    {
+      // FOR + bitpack on deltas, int32, larger data set.
+      auto t = make_int32_table(2, 4096, 53);
+      std::string dsl =
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n"
+        "---\n"
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_for_bp_int32");
+      roundtrip_once(t->view(), dsl, 2, "jit_for_bp_int32_mt");
+    }
+
+    {
+      // FOR + bitpack on deltas, int64.
+      auto t = make_int64_table(2, 4096, 59);
+      std::string dsl =
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n"
+        "---\n"
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_for_bp_int64");
+      roundtrip_once(t->view(), dsl, 2, "jit_for_bp_int64_mt");
+    }
+
+    {
+      // FOR without a downstream bitpack — deltas stored as Raw fixed-stride leaf.
+      auto t = make_int32_table(2, 2048, 61);
+      std::string dsl =
+        "input -> for -> deltas, references\n"
+        "---\n"
+        "input -> for -> deltas, references\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_for_terminal_int32");
+      roundtrip_once(t->view(), dsl, 2, "jit_for_terminal_int32_mt");
+    }
+
+    {
+      // FOR + bitpack on deltas + entropy tail on references channel.
+      auto t = make_int32_table(2, 4096, 67);
+      std::string dsl =
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n"
+        "for.references -> identity\n"
+        "---\n"
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n"
+        "for.references -> identity\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_for_ref_identity_int32");
+      roundtrip_once(t->view(), dsl, 2, "jit_for_ref_identity_int32_mt");
+    }
+
+    {
+      // ZigZag leaf at the region root — stored as its own fixed-stride
+      // `zigzag` channel.  int32 and int64.
+      auto t32 = make_int32_table(2, 4096, 71);
+      std::string dsl32 =
+        "input -> zigzag -> zigzag\n"
+        "---\n"
+        "input -> zigzag -> zigzag\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_zigzag_root_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_zigzag_root_int32_mt");
+
+      auto t64 = make_int64_table(2, 4096, 73);
+      std::string dsl64 =
+        "input -> zigzag -> zigzag\n"
+        "---\n"
+        "input -> zigzag -> zigzag\n";
+      roundtrip_once(t64->view(), dsl64, 1, "jit_zigzag_root_int64");
+      roundtrip_once(t64->view(), dsl64, 2, "jit_zigzag_root_int64_mt");
+    }
+
+    {
+      // Delta -> ZigZag: delta is the region root (inline scan), ZigZag is the
+      // covered leaf that stores the ZigZagged differences.  This is the
+      // canonical signed-residual pipeline.
+      auto t = make_int32_table(2, 4096, 77);
+      std::string dsl =
+        "input -> delta -> differences\n"
+        "delta.differences -> zigzag -> zigzag\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> zigzag -> zigzag\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_delta_zigzag_int32");
+      roundtrip_once(t->view(), dsl, 2, "jit_delta_zigzag_int32_mt");
+    }
+
+    {
+      // Delta -> ZigZag -> ANS: the headline use case.  ZigZag's stored
+      // channel is entropy-tail-routed to ANS (small signed deltas become
+      // small unsigned codes that the entropy coder compresses well).
+      auto t = make_int32_table(2, 4096, 83);
+      std::string dsl =
+        "input -> delta -> differences\n"
+        "delta.differences -> zigzag -> zigzag\n"
+        "delta.differences.zigzag -> ans\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> zigzag -> zigzag\n"
+        "delta.differences.zigzag -> ans\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_delta_zigzag_ans_int32");
+      roundtrip_once(t->view(), dsl, 2, "jit_delta_zigzag_ans_int32_mt");
+    }
+
+    {
+      // FOR + bitpack on deltas + ans entropy tail on packed: mirrors the
+      // delta->rle->bitpack->ans pattern in fused_ans_tail.
+      auto t = make_int32_table(2, 4096, 71);
+      std::string dsl =
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+        "for.deltas.packed -> ans\n"
+        "for.deltas.chunk_min -> identity\n"
+        "for.deltas.chunk_count -> identity\n"
+        "for.deltas.chunk_bits -> identity\n"
+        "---\n"
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+        "for.deltas.packed -> ans\n"
+        "for.deltas.chunk_min -> identity\n"
+        "for.deltas.chunk_count -> identity\n"
+        "for.deltas.chunk_bits -> identity\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_for_bp_ans_int32");
+      roundtrip_once(t->view(), dsl, 2, "jit_for_bp_ans_int32_mt");
     }
 
     std::printf("test_compress_with_plan_roundtrip: PASS\n");

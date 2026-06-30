@@ -81,9 +81,6 @@ int main()
     auto meta = rep->describe_meta();
     expect(std::holds_alternative<simpatico::leaf_meta::none>(meta), "no leaf meta");
 
-    auto const* for_rep = dynamic_cast<simpatico::for_compressed_representation const*>(rep);
-    expect(for_rep == nullptr, "leaf is not FOR");
-
     std::printf("test_leaf_describe: PASS\n");
     return 0;
   } catch (std::exception const& e) {

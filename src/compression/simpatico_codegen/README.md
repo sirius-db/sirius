@@ -78,20 +78,55 @@ delta.differences.runs -> bitpack
 
 Operators come in two classes:
 
-**Fusable** — `delta`, `rle`, `bitpack` (plus `raw` as an RLE `runs` leaf). A
-contiguous chain of these is discovered as one region and compiled into a single
-fused JIT kernel for encode and decode, with no materialized buffers between
-stages.
+**Fusable** — `delta`, `rle`, `bitpack`, `for` (plus `raw` as an RLE `runs`
+leaf). A contiguous chain of these is discovered as one region and compiled into
+a single fused JIT kernel for encode and decode, with no materialized buffers
+between stages.
 
-**Non-fusable** (each runs as its own operator/kernel) — `for`, `alp` /
-`alp_rd` (FLOAT32/FLOAT64), `ans`, `bitcomp` (and the `bitcomp_default` /
+**Non-fusable** (each runs as its own operator/kernel) — `alp` / `alp_rd`
+(FLOAT32/FLOAT64), `ans`, `bitcomp` (and the `bitcomp_default` /
 `bitcomp_sparse` variants), `nvcomp_cascaded` (and the `nvcomp_cascaded_<N>D<M>R<K>B`
 parameterised form, e.g. `nvcomp_cascaded_1D0R1B`), `dictionary` (STRING),
-`bitextract_*` / `bitjoin_*`, and `identity`. Their outputs can still feed a
-fusable subtree — e.g. `for.deltas -> bitpack` runs the FOR operator, then a
-fused bitpack kernel on its `deltas` channel.
+`bitextract_*` / `bitjoin_*`, and `identity`.
 
 The fusable set can grow over time: teaching the encode and decode JIT renderers
 to emit a new operator and adding it to `is_codegen_compressor`
 (`codegen/plan/fusion.hpp`) brings that operator into the fused path, so chains
 that include it compile into one kernel instead of running standalone.
+
+### Multi-output operators and channel routing
+
+Some operators produce more than one named output channel.  How those channels
+are handled depends on whether they are *fused inline* or *boundary*:
+
+**Fused (inline) channels** are written as a closed-form expression inside the
+kernel — no intermediary buffer is ever stored.  Examples:
+- `delta.differences` — the diff expression is spliced directly into the child's
+  scan input.
+- `for.deltas` — the residual `(value - chunk_min)` expression feeds the `deltas`
+  child (e.g. a bitpack) inside the same kernel.
+
+**Boundary channels** are materialized into a buffer by the kernel and stored (or
+further compressed) outside the fused region.  They are exposed via
+`named_channels()` on the representation and routed by two existing mechanisms:
+
+1. **Encode boundary loop** (`emit_fused_node` in `compress.cpp`): if a fused
+   node's boundary channel has a downstream DSL consumer, the bytes are forwarded
+   to that consumer's op after the kernel completes; otherwise the channel is kept
+   in the rep and serialized directly.
+
+2. **Decode per-slot binder** (`bind_real_node_buffers` in `decompress.cpp`): for
+   each consumed slot declared by `consumed_slots()`, the binder resolves the bytes
+   either from the rep's named channel (terminal case) or from a downstream
+   entropy-tail rep that stored those bytes (e.g. `references -> snappy`).
+
+Examples of boundary channels: `bitpack.chunk_min`, `bitpack.packed`,
+`for.references`.  All of these can be stored terminal (no further compression) or
+entropy-tailed (`-> identity/snappy/lz4/ans`), exactly as bitpack's channels can.
+
+**Current limitation:** a boundary channel cannot feed *another fused (codegen)
+region* — e.g. `for.references -> bitpack` or `bitpack.packed -> bitpack` are not
+supported.  This is a pre-existing global gap (not FOR-specific); the same
+restriction applies to all multi-output fusable operators.  Such channels can still
+be compressed by a non-fused op (e.g. `-> snappy`).  Lifting this restriction is
+tracked as a separate future work item (Phase 2).

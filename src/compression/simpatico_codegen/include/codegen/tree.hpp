@@ -41,6 +41,13 @@ enum class OpKind : int {
   Delta,
   Rle,
   Raw,
+  // ZigZag — element-wise signed↔unsigned interleave leaf.  Like Raw it
+  // is a sink that materialises one stored channel ("zigzag"), but it
+  // applies the closed-form ZigZag map on store and its inverse on load.
+  // Maps small-magnitude signed values to small unsigned codes so a
+  // downstream byte/entropy coder (ans/snappy) compresses them far better
+  // than two's-complement (e.g. -1 → 1 instead of 0xFFFFFFFF).
+  Zigzag,
   // The "leaf" sentinel used by the templates below to terminate
   // recursion when a node has no children of a given role.  Mirrors
   // the absence of a key in `FusedTree.children` on the Python side.

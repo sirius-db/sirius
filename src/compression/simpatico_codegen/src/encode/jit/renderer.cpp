@@ -145,6 +145,7 @@ void append_op_segment(std::ostringstream& oss, const ::codegen::jit::FusedTree&
     case ::codegen::OpKind::Rle: oss << "rl"; break;
     case ::codegen::OpKind::Raw: oss << "rw"; break;
     case ::codegen::OpKind::For: oss << "fr"; break;
+    case ::codegen::OpKind::Zigzag: oss << "zz"; break;
     default: oss << "un"; break;
   }
   for (const auto& [k, child] : node.children) {
@@ -369,6 +370,7 @@ class Walker {
   // ----------------- Per-op emitters -----------------
   void emit_node(const ::codegen::jit::FusedTree& node, LaneInput in);
   void emit_delta(const ::codegen::jit::FusedTree& node, LaneInput in);
+  void emit_for(const ::codegen::jit::FusedTree& node, LaneInput in);
   // use_smem: accumulate into a per-block __shared__ slab, then store to global.
   //   Eliminates the cudaMemsetAsync pre-zero requirement for the packed buffer.
   //   Valid only for leaf Bitpacks where bits * kChunkSize / 32 + 2 fits in the
@@ -377,7 +379,7 @@ class Walker {
   void emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, bool use_smem = false);
   void emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in);
   void emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in);
-  // FOR is handled by the legacy operator, not the JIT renderer.
+  void emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in);
 
   // ----------------- Source prelude (constant per kernel) -----------------
   static constexpr const char* kPrelude = R"src(
@@ -426,10 +428,8 @@ void Walker::emit_node(const ::codegen::jit::FusedTree& node, LaneInput in)
     case ::codegen::OpKind::Delta: emit_delta(node, std::move(in)); return;
     case ::codegen::OpKind::Rle: emit_rle(node, std::move(in)); return;
     case ::codegen::OpKind::Raw: emit_raw(node, std::move(in)); return;
-    case ::codegen::OpKind::For:
-      throw RenderError(
-        "render: FOR is handled by the legacy operator, not the JIT "
-        "renderer");
+    case ::codegen::OpKind::For: emit_for(node, std::move(in)); return;
+    case ::codegen::OpKind::Zigzag: emit_zigzag(node, std::move(in)); return;
     case ::codegen::OpKind::None:
     default:
       throw RenderError(std::string("render: invalid op kind '") +
@@ -518,6 +518,94 @@ void Walker::emit_delta(const ::codegen::jit::FusedTree& node, LaneInput in)
   out.length_expr = "((" + in.length_expr + ") > 0 ? " + "((" + in.length_expr + ") - 1) : 0)";
 
   emit_node(*vit->second, std::move(out));
+}
+
+// =====================================================================
+// emit_for — semi-inline transformer.
+//
+// FOR computes a per-chunk minimum (via CUB BlockReduce), stores it in
+// `references[chunk_id]`, then rewrites the LaneInput so downstream ops
+// see `value - chunk_min` (the residual).  Unlike Delta it needs a
+// block-wide reduction and a __syncthreads() before the child can read
+// the rewritten expression, but it does NOT change the element count or
+// need a shared-mem slab for the residuals themselves — those are
+// expressed as a closed-form C++ expression that the child splices in.
+//
+// `references` is a kernel output buffer (num_chunks × elem_size).  It
+// is exposed by the encode bridge as `named_channels()["references"]` so
+// the compress boundary loop can store it or route it to a downstream op
+// (e.g. `for.references -> identity/snappy`), exactly like bitpack's
+// `chunk_min`/`packed` channels.
+//
+// CUB BlockReduce TempStorage uses a static __shared__ declaration
+// inside the body (matching emit_bitpack style) — not tracked by
+// SharedMemAllocator since it is a fixed-size CUB scratch, not a
+// logical data slab.  The broadcast cell `sh_for_min_N` is also static.
+// =====================================================================
+void Walker::emit_for(const ::codegen::jit::FusedTree& node, LaneInput in)
+{
+  if (node.children.size() != 1) {
+    throw RenderError(
+      "render: FOR must have exactly one child named 'deltas' "
+      "(got " +
+      std::to_string(node.children.size()) + " children)");
+  }
+  auto dit = node.children.find("deltas");
+  if (dit == node.children.end()) {
+    throw RenderError("render: FOR missing 'deltas' child (got '" + node.children.begin()->first +
+                      "' instead)");
+  }
+
+  const DtypeInfo* op_dt = lookup_dtype(in.elem_type);
+  if (op_dt == nullptr) {
+    throw RenderError("render: FOR op-local dtype '" + in.elem_type + "' not in dtype table");
+  }
+
+  const std::int32_t id   = take_id();
+  const std::string idstr = std::to_string(id);
+
+  // Output buffer: references[num_chunks] — one per-chunk minimum.
+  const std::string p_refs = "references_" + idstr;
+  add_param(in.elem_type + "*", p_refs);
+  add_buffer(id, "references", op_dt->elem_size, static_cast<std::size_t>(num_chunks_));
+
+  // Local names for the CUB reduce and broadcast cell.
+  const std::string sh_min = "sh_for_min_" + idstr;
+  const std::string v_min  = "for_min_" + idstr;
+  const std::string v_lmin = "for_lmin_" + idstr;
+
+  // Body: per-lane local min → CUB BlockReduce → broadcast → store.
+  body_ << "    // --- node " << id << ": FOR (semi-inline, " << in.elem_type << ") ---\n"
+        << "    const int32_t for_len_" << idstr << " = static_cast<int32_t>(" << in.length_expr
+        << ");\n"
+        << "    " << in.elem_type << " " << v_lmin << " = static_cast<" << in.elem_type << ">("
+        << op_dt->max_literal << ");\n"
+        << "    for (int32_t i = tid; i < for_len_" << idstr << "; i += 128) {\n"
+        << "        " << in.elem_type << " _fv = (" << at_lane(in.read_expr, "i") << ");\n"
+        << "        if (_fv < " << v_lmin << ") " << v_lmin << " = _fv;\n"
+        << "    }\n"
+        << "    typedef cub::BlockReduce<" << in.elem_type << ", 128> ForBR_" << idstr << ";\n"
+        << "    __shared__ typename ForBR_" << idstr << "::TempStorage for_br_ts_" << idstr << ";\n"
+        << "    __shared__ " << in.elem_type << " " << sh_min << ";\n"
+        << "    {\n"
+        << "        " << in.elem_type << " _m = ForBR_" << idstr << "(for_br_ts_" << idstr
+        << ").Reduce(" << v_lmin << ", SimpaticoMin());\n"
+        << "        if (tid == 0) " << sh_min << " = _m;\n"
+        << "    }\n"
+        << "    __syncthreads();\n"
+        << "    const " << in.elem_type << " " << v_min << " = " << sh_min << ";\n"
+        << "    if (tid == 0) " << p_refs << "[chunk_id] = " << v_min << ";\n";
+
+  // Rewrite LaneInput for the child: residual = parent_value - chunk_min.
+  // Length is unchanged — FOR preserves the element count.
+  LaneInput out;
+  out.kind      = LaneInput::Expr;
+  out.elem_type = in.elem_type;
+  out.read_expr = "(static_cast<" + in.elem_type + ">(" + "(" +
+                  at_lane(in.read_expr, "(__LANE__)") + ")" + " - " + "(" + v_min + ")))";
+  out.length_expr = in.length_expr;
+
+  emit_node(*dit->second, std::move(out));
 }
 
 // =====================================================================
@@ -804,6 +892,77 @@ void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
         << "        for (int32_t i = tid; i < " << rlen << "; i += 128) {\n"
         << "            " << p_data << "[" << dbase << " + i] = (" << at_lane(in.read_expr, "i")
         << ");\n"
+        << "        }\n"
+        << "    }\n";
+}
+
+// =====================================================================
+// emit_zigzag — LEAF (storing transform).
+//
+// ZigZag is a sink, like Raw: it consumes the incoming LaneInput
+// (whatever transformer chain preceded it has rewritten read_expr into a
+// closed-form per-lane value) and stores the ZigZag-mapped stream into a
+// single output channel "zigzag".  Unlike Raw it applies the closed-form
+// ZigZag map on store:  z = (uv << 1) ^ (uv >> (W-1))  (arithmetic shift
+// supplies the sign mask).  The decode-side producer applies the inverse.
+//
+// Layout — fixed-stride OverAllocate, identical to FOR's Raw passthrough.
+// Element i of chunk c lands at zigzag[c*CHUNK + i]; decode reads
+// zigzag[chunk_id*CHUNK + i] with the chunk_id known at kernel entry, so
+// no per-chunk offsets buffer is needed (the stride is the constant
+// CHUNK).  The buffer is num_chunks*CHUNK elements; trailing slots of the
+// final short chunk are pre-zeroed (default) and never read — keeping the
+// entropy tail deterministic.
+//
+// ZigZag preserves element count and order (a pure per-lane bijection), so
+// it carries no per-chunk metadata.  Storing the transformed stream as a
+// real rep channel (rather than rewriting read_expr inline) is what lets a
+// downstream NON-fused op entropy-code it:  the channel is exposed via the
+// rep's named_channels() and routed by the compress boundary loop exactly
+// like FOR's `references` or Bitpack's `packed`.
+// =====================================================================
+void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
+{
+  if (!node.children.empty()) {
+    throw RenderError(
+      "render: Zigzag must be a leaf (no children) — it stores its "
+      "transformed stream to the `zigzag` channel; a downstream codec "
+      "attaches to that channel, not as a fused child");
+  }
+  const DtypeInfo* op_dt = lookup_dtype(in.elem_type);
+  if (op_dt == nullptr) {
+    throw RenderError("render: Zigzag op-local dtype '" + in.elem_type +
+                      "' not in dtype table (ZigZag is defined for signed integers)");
+  }
+
+  // Unsigned counterpart + sign-bit shift width, derived from element size.
+  const std::string utype = (op_dt->elem_size == 8) ? "uint64_t" : "uint32_t";
+  const int shift         = static_cast<int>(op_dt->elem_size) * 8 - 1;
+
+  const std::int32_t id    = take_id();
+  const std::string idstr  = std::to_string(id);
+  const std::string p_data = "zigzag_" + idstr;
+  const std::string zbase  = "zz_base_" + idstr;
+  const std::string zlen   = "zz_len_" + idstr;
+
+  add_param(in.elem_type + "*", p_data);
+  const std::size_t nc = static_cast<std::size_t>(num_chunks_);
+  add_buffer(id, "zigzag", op_dt->elem_size, nc * static_cast<std::size_t>(::codegen::kChunkSize));
+
+  body_ << "    // --- node " << id << ": Zigzag (leaf store, " << in.elem_type << ") ---\n"
+        << "    {\n"
+        << "        const int64_t " << zbase << " = static_cast<int64_t>(chunk_id) *\n"
+        << "                             static_cast<int64_t>(CHUNK);\n"
+        << "        const int32_t " << zlen << " = static_cast<int32_t>(" << in.length_expr
+        << ");\n"
+        << "        for (int32_t i = tid; i < " << zlen << "; i += 128) {\n"
+        << "            const " << in.elem_type << " _zv = (" << at_lane(in.read_expr, "i")
+        << ");\n"
+        << "            const " << utype << " _zu =\n"
+        << "                (static_cast<" << utype << ">(_zv) << 1) ^\n"
+        << "                static_cast<" << utype << ">(_zv >> " << shift << ");\n"
+        << "            " << p_data << "[" << zbase << " + i] = static_cast<" << in.elem_type
+        << ">(_zu);\n"
         << "        }\n"
         << "    }\n";
 }

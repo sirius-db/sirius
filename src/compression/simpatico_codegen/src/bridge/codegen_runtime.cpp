@@ -927,30 +927,124 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           break;
         }
 
+        case cc::OpKind::For: {
+          // `references` holds num_chunks per-chunk minimums (same dtype as
+          // the column).  The buffer layout is flat: references[chunk_id].
+          const auto i_refs = find_buffer_idx(spec.buffers, node_id, "references");
+          auto refs_col     = std::make_unique<cudf::column>(original_type,
+                                                         static_cast<cudf::size_type>(num_chunks),
+                                                         std::move(bufs[i_refs]),
+                                                         rmm::device_buffer(0, stream),
+                                                         0);
+          auto rep          = std::make_unique<simpatico::codegen_fused_representation>(
+            "for", original_type, static_cast<cudf::size_type>(num_rows));
+          rep->buffers.emplace_back("references", std::move(refs_col));
+          builder->leaves.emplace(origin.plan_node, std::move(rep));
+          break;
+        }
+
+        case cc::OpKind::Zigzag: {
+          // `zigzag` holds the transformed stream in fixed-stride OverAllocate
+          // layout: num_chunks * kChunkSize elements, element i of chunk c at
+          // [c*kChunkSize + i].  Decode is layout-aware (reads chunk_id*CHUNK +
+          // i), so no compaction is needed — the channel is published as-is and
+          // routed to a downstream codec (or stored) like any other rep channel.
+          const auto i_zz = find_buffer_idx(spec.buffers, node_id, "zigzag");
+          const std::size_t zz_rows =
+            static_cast<std::size_t>(num_chunks) * static_cast<std::size_t>(kChunkSize);
+          auto zz_col = std::make_unique<cudf::column>(original_type,
+                                                       static_cast<cudf::size_type>(zz_rows),
+                                                       std::move(bufs[i_zz]),
+                                                       rmm::device_buffer(0, stream),
+                                                       0);
+          auto rep    = std::make_unique<simpatico::codegen_fused_representation>(
+            "zigzag", original_type, static_cast<cudf::size_type>(num_rows));
+          rep->buffers.emplace_back("zigzag", std::move(zz_col));
+          builder->leaves.emplace(origin.plan_node, std::move(rep));
+          break;
+        }
+
         case cc::OpKind::Raw: {
           // The kernel wrote values in fixed-stride (OverAllocate) layout:
-          //   padded_data[c * kChunkSize + r]  for run r of chunk c.
-          //
-          // That padded buffer is encode-internal scratch only: we always
-          // scatter it down to the tight Compact layout (compact data + compact
-          // rle_runs_offsets) so the RawFused rep is born dense — mirroring the
-          // Bitpack eager-compact path.  Decode reads ``data[offsets[c]+r]``
-          // identically for either layout, so the only observable difference is
-          // the smaller, dense buffer.  Costs one DtoH for total_runs to size
-          // the output buffer.
+          //   padded_data[c * kChunkSize + r]  for run/element r of chunk c.
           //
           // This is a synthesised Raw passthrough leaf (is_raw_passthrough==true):
           // it has no PlanTree op node of its own. The rep is keyed by
           // origin.parent_rle in builder->raw_passthrough_leaves; the compress
-          // driver parks it in tree.nodes[parent_rle].channels under the "values"
-          // output path so decode's bind_raw_passthrough_buffers finds it there.
-          const auto i_data    = find_buffer_idx(spec.buffers, node_id, "data");
-          const auto i_rle_off = find_buffer_idx(spec.buffers, 0, "rle_runs_offsets");
+          // driver parks it in tree.nodes[parent_rle].channels under the channel
+          // path for origin.parent_op ("values" for RLE, "deltas" for FOR).
+          //
+          // RLE parent: scatter padded → compact using rle_runs_offsets so the
+          // rep is born dense. FOR parent: the kernel wrote fixed-stride data
+          // (all CHUNK slots per chunk, no variable counts) — no compaction
+          // needed; data and offsets are consumed as-is.
+          const auto i_data = find_buffer_idx(spec.buffers, node_id, "data");
           const std::int32_t elem_size =
             static_cast<std::int32_t>((original_type.id() == cudf::type_id::INT64) ? 8 : 4);
 
+          if (origin.parent_op == "for") {
+            // ─── FOR Raw: fixed-stride, no compaction ──────────────────────
+            // The kernel wrote data[c*CHUNK + t] and offsets[c] = c*CHUNK.
+            // Read the Raw node's own offsets buffer.
+            const auto i_offs = find_buffer_idx(spec.buffers, node_id, "offsets");
+
+            const std::size_t data_bytes = static_cast<std::size_t>(num_chunks) *
+                                           static_cast<std::size_t>(kChunkSize) *
+                                           static_cast<std::size_t>(elem_size);
+            const std::size_t offs_bytes =
+              static_cast<std::size_t>(num_chunks + 1) * sizeof(std::int32_t);
+
+            rmm::device_buffer data_buf(data_bytes, stream, mr);
+            if (cudaError_t e = cudaMemcpyAsync(data_buf.data(),
+                                                reinterpret_cast<const void*>(dev_ptrs[i_data]),
+                                                data_bytes,
+                                                cudaMemcpyDeviceToDevice,
+                                                stream.value());
+                e != cudaSuccess) {
+              std::fprintf(stderr,
+                           "simpatico::codegen: FOR Raw: data DtoD failed: %s\n",
+                           cudaGetErrorString(e));
+              return -1;
+            }
+            rmm::device_buffer offs_buf(offs_bytes, stream, mr);
+            if (cudaError_t e = cudaMemcpyAsync(offs_buf.data(),
+                                                reinterpret_cast<const void*>(dev_ptrs[i_offs]),
+                                                offs_bytes,
+                                                cudaMemcpyDeviceToDevice,
+                                                stream.value());
+                e != cudaSuccess) {
+              std::fprintf(stderr,
+                           "simpatico::codegen: FOR Raw: offsets DtoD failed: %s\n",
+                           cudaGetErrorString(e));
+              return -1;
+            }
+            cudaStreamSynchronize(stream.value());
+
+            auto data_col =
+              std::make_unique<cudf::column>(original_type,
+                                             static_cast<cudf::size_type>(num_chunks * kChunkSize),
+                                             std::move(data_buf),
+                                             rmm::device_buffer(0, stream),
+                                             0);
+            auto offs_col =
+              std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
+                                             static_cast<cudf::size_type>(num_chunks + 1),
+                                             std::move(offs_buf),
+                                             rmm::device_buffer(0, stream),
+                                             0);
+
+            auto rep = std::make_unique<simpatico::codegen_fused_representation>(
+              "RawFused", original_type, static_cast<cudf::size_type>(num_rows));
+            rep->buffers.emplace_back("data", std::move(data_col));
+            rep->buffers.emplace_back("offsets", std::move(offs_col));
+            builder->raw_passthrough_leaves.push_back(
+              {origin.parent_rle, "deltas", std::move(rep)});
+            break;
+          }
+
           {
-            // ─── scatter padded → compact ─────────────────────────────────────
+            // ─── RLE Raw: scatter padded → compact ────────────────────────
+            const auto i_rle_off    = find_buffer_idx(spec.buffers, 0, "rle_runs_offsets");
             std::int32_t total_runs = 0;
             {
               const CUdeviceptr d_tail =
@@ -1022,12 +1116,12 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
               "RawFused", original_type, static_cast<cudf::size_type>(num_rows));
             rep->buffers.emplace_back("data", std::move(data_col));
             rep->buffers.emplace_back("offsets", std::move(offs_col));
-            builder->raw_passthrough_leaves.emplace_back(origin.parent_rle, std::move(rep));
+            builder->raw_passthrough_leaves.push_back(
+              {origin.parent_rle, "values", std::move(rep)});
           }
           break;
         }
 
-        case cc::OpKind::For:
         case cc::OpKind::None:
         default:
           std::fprintf(stderr,

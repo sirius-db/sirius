@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace simpatico {
@@ -38,14 +39,16 @@ namespace simpatico {
 
 // One built FusedTree node mapped back to its PlanTree origin, in DFS-preorder
 // (index == jit node_id). For a real op node `plan_node` is the PlanTree node
-// id. For a synthesized Raw passthrough leaf, `is_raw_passthrough` is true and
-// `parent_rle` is the owning rle node (whose dropped "values" channel holds the
-// bytes: a RawFused rep on decode, the rle.values DSL path on encode).
+// id. For a synthesized Raw passthrough leaf, `is_raw_passthrough` is true,
+// `parent_rle` is the owning parent node (rle or for), and `parent_op` is the
+// parent's op name ("rle" or "for") so the encode/decode bridges know which
+// channel to bind: "values" for RLE, "deltas" for FOR.
 struct FusedNodeOrigin {
   codegen::jit::FusedTree* node = nullptr;
   NodeId plan_node              = 0;
   bool is_raw_passthrough       = false;
-  NodeId parent_rle             = 0;
+  NodeId parent_rle             = 0;  // owning parent's PlanTree NodeId
+  std::string parent_op;              // owning parent's op name ("rle" or "for")
 };
 
 struct BuiltFusedTree {

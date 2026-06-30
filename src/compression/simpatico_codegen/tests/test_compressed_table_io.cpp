@@ -142,22 +142,38 @@ void test_fused_delta_rle_bitpack()
                "delta.differences.runs -> bitpack\n");
 }
 
-// 2. Hybrid FOR head + fused bitpack subtree: exercises for_compressed_representation
-//    (legacy C++) alongside a fused JIT leaf in the same column.
-void test_hybrid_for_bitpack()
+// 2. FOR + fused bitpack on deltas: JIT fused region covers both ops.
+void test_for_bitpack()
 {
   auto t = make_int32_table(1, 4096, 11);
-  io_roundtrip("hybrid_for_bitpack",
+  io_roundtrip("for_bitpack",
                t->view(),
-               "input -> for -> deltas, references, reference_offsets\n"
+               "input -> for -> deltas, references\n"
                "for.deltas -> bitpack\n");
 }
 
-// 3. FOR only: exercises for_compressed_representation without a fused tail.
+// 3. FOR only: deltas stored as Raw fixed-stride leaf (no downstream bitpack).
 void test_for_only()
 {
   auto t = make_int32_table(1, 4096, 13);
-  io_roundtrip("for_only", t->view(), "input -> for\n");
+  io_roundtrip("for_only", t->view(), "input -> for -> deltas, references\n");
+}
+
+// 3b. ZigZag leaf: exercises the codegen_fused_representation("zigzag") channel
+//     write/read (PlanLeafKind::Zigzag -> make_fused_rep), terminal and with an
+//     entropy tail on the stored channel.
+void test_zigzag()
+{
+  auto t = make_int32_table(1, 4096, 113);
+  io_roundtrip("zigzag_terminal",
+               t->view(),
+               "input -> delta -> differences\n"
+               "delta.differences -> zigzag -> zigzag\n");
+  io_roundtrip("zigzag_ans",
+               t->view(),
+               "input -> delta -> differences\n"
+               "delta.differences -> zigzag -> zigzag\n"
+               "delta.differences.zigzag -> ans\n");
 }
 
 // 4. ALP (floating-point): exercises alp_compressed_representation with its
@@ -180,10 +196,10 @@ void test_multi_column()
                "delta.differences.values -> bitpack\n"
                "delta.differences.runs -> bitpack\n"
                "---\n"
-               "input -> for -> deltas, references, reference_offsets\n"
+               "input -> for -> deltas, references\n"
                "for.deltas -> bitpack\n"
                "---\n"
-               "input -> for\n");
+               "input -> for -> deltas, references\n");
 }
 
 // 6. Column names survive write→read.
@@ -192,9 +208,9 @@ void test_column_names_survive()
   auto t = make_int32_table(2, 1024, 3);
   io_roundtrip("column_names_survive",
                t->view(),
-               "input -> for\n"
+               "input -> for -> deltas, references\n"
                "---\n"
-               "input -> for\n",
+               "input -> for -> deltas, references\n",
                {"price", "volume"});
 }
 
@@ -290,8 +306,9 @@ int main()
   };
   Case cases[] = {
     {"fused_delta_rle_bitpack", test_fused_delta_rle_bitpack},
-    {"hybrid_for_bitpack", test_hybrid_for_bitpack},
+    {"for_bitpack", test_for_bitpack},
     {"for_only", test_for_only},
+    {"zigzag", test_zigzag},
     {"alp_f32", test_alp_f32},
     {"multi_column", test_multi_column},
     {"column_names_survive", test_column_names_survive},

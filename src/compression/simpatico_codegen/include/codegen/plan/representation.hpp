@@ -98,9 +98,8 @@ struct compressed_representation {
   ///
   /// SAFETY: This method should only be called for data that the representation OWNS, not for
   /// views of user-provided data. All compressors create new data during compression:
-  /// - delta_compressor creates new deltas buffer
-  /// - rle_compressor creates new values and runs buffers
-  /// - bitpack_compressor creates new chunk_min, chunk_count, chunk_bits, packed buffers
+  /// - the fused codegen backend creates new buffers (e.g. bitpack chunk_min,
+  ///   chunk_count, chunk_bits, packed) for delta / rle / bitpack / for regions
   /// - identity_compressor makes a COPY of the input (so safe to release the copy)
   ///
   /// The original user input (column_view) is never stored in representations.
@@ -158,53 +157,6 @@ struct identity_compressed_representation : compressed_representation {
   PlanLeafKind kind() const override { return PlanLeafKind::Identity; }
 };
 
-/// RLE format: one value per run and one run length per run.
-/// values[i] repeated runs[i] times.
-struct rle_compressed_representation : compressed_representation {
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out);
-
-  std::unique_ptr<cudf::column> values;
-  std::unique_ptr<cudf::column> runs;  // INT32 run lengths
-
-  rle_compressed_representation(std::unique_ptr<cudf::column> values_in,
-                                std::unique_ptr<cudf::column> runs_in)
-    : compressed_representation(
-        values_in ? values_in->type() : cudf::data_type{cudf::type_id::EMPTY}, 0),
-      values(std::move(values_in)),
-      runs(std::move(runs_in))
-  {
-  }
-
-  // RLE is a codegen-only operator: encode/decode go through the fused
-  // codegen backend (RleFused), so there is no C++ kernel decode path.
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view,
-                                           rmm::device_async_resource_ref) const override
-  {
-    throw std::runtime_error(
-      "rle_compressed_representation: reconstruct via the codegen decode "
-      "path, not C++ decompress()");
-  }
-  std::vector<compressible_output> named_channels() const override
-  {
-    return {
-      {"values", values->view()},
-      {"runs", runs->view()},
-    };
-  }
-  std::unique_ptr<cudf::column> release_output(std::string const& name) override
-  {
-    if (name == "values" && values) { return std::move(values); }
-    if (name == "runs" && runs) { return std::move(runs); }
-    return nullptr;
-  }
-  PlanLeafKind kind() const override { return PlanLeafKind::Rle; }
-};
-
 /// Base compressor: compress(column, stream, mr) -> compressed_representation, decompress(stream,
 /// mr) -> column.
 struct compressor {
@@ -234,46 +186,6 @@ struct identity_compressor : compressor {
   {
     return data_to_decompress.decompress(stream, mr);
   }
-};
-
-/// Delta format: one column of same type — deltas[0] = first value, deltas[i] = data[i] -
-/// data[i-1].
-struct delta_compressed_representation : compressed_representation {
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out);
-
-  std::unique_ptr<cudf::column> deltas;
-
-  explicit delta_compressed_representation(std::unique_ptr<cudf::column> deltas_in)
-    : compressed_representation(
-        deltas_in ? deltas_in->type() : cudf::data_type{cudf::type_id::EMPTY}, 0),
-      deltas(std::move(deltas_in))
-  {
-  }
-
-  // Delta is a codegen-only operator: encode/decode go through the fused
-  // codegen backend (DeltaFused), so there is no C++ kernel decode path.
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view,
-                                           rmm::device_async_resource_ref) const override
-  {
-    throw std::runtime_error(
-      "delta_compressed_representation: reconstruct via the codegen decode "
-      "path, not C++ decompress()");
-  }
-  std::vector<compressible_output> named_channels() const override
-  {
-    return {{"differences", deltas->view()}};
-  }
-  std::unique_ptr<cudf::column> release_output(std::string const& name) override
-  {
-    if (name == "differences" && deltas) { return std::move(deltas); }
-    return nullptr;
-  }
-  PlanLeafKind kind() const override { return PlanLeafKind::Delta; }
 };
 
 /// Dictionary format: stores the encoded dictionary column and a copy of keys chars.
@@ -391,64 +303,6 @@ struct dictionary_compressed_representation : compressed_representation {
 /// Dictionary compressor: STRING column only. Encodes via cudf dictionary encode; stores keys
 /// buffer + offsets + indices.
 struct dictionary_compressor : compressor {
-  std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
-};
-
-// -----------------------------------------------------------------------------
-// Frame-of-Reference (FOR) compressor: chunked with min reference per chunk
-// -----------------------------------------------------------------------------
-
-/// FOR format: chunks determined by variance heuristic (similar to bitpack).
-/// Each chunk stores: reference (min value), offsets (value - reference).
-/// The offsets are suitable for cascading with bitpack for further compression.
-struct for_compressed_representation : compressed_representation {
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out);
-
-  std::unique_ptr<cudf::column> references;         // reference (min) per chunk (original_type)
-  std::unique_ptr<cudf::column> reference_offsets;  // INT32, start index for each chunk
-  std::unique_ptr<cudf::column> deltas;             // same type as original: (value - reference)
-
-  for_compressed_representation(cudf::data_type type,
-                                cudf::size_type n_rows,
-                                std::unique_ptr<cudf::column> refs,
-                                std::unique_ptr<cudf::column> ref_offsets,
-                                std::unique_ptr<cudf::column> dealt);
-
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) const override;
-  std::vector<compressible_output> named_channels() const override
-  {
-    // Deltas are the main compressible output - suitable for bitpacking
-    return {
-      {"deltas", deltas->view()},
-      {"references", references->view()},
-      {"reference_offsets", reference_offsets->view()},
-    };
-  }
-  std::unique_ptr<cudf::column> release_output(std::string const& name) override
-  {
-    if (name == "deltas" && deltas) return std::move(deltas);
-    if (name == "references" && references) return std::move(references);
-    if (name == "reference_offsets" && reference_offsets) return std::move(reference_offsets);
-    return nullptr;
-  }
-  PlanLeafKind kind() const override { return PlanLeafKind::For; }
-};
-
-/// FOR compressor: fixed-width numeric types. Uses variance-based chunking,
-/// stores min (reference) per chunk, then (value - reference) as deltas.
-/// Deltas can be further compressed with bitpack for optimal compression.
-struct for_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
@@ -1481,6 +1335,8 @@ struct codegen_fused_representation : compressed_representation {
     if (kind_tag == "delta") return PlanLeafKind::Delta;
     if (kind_tag == "rle") return PlanLeafKind::Rle;
     if (kind_tag == "bitpack") return PlanLeafKind::Bitpack;
+    if (kind_tag == "for") return PlanLeafKind::For;
+    if (kind_tag == "zigzag") return PlanLeafKind::Zigzag;
     if (kind_tag == "RawFused") return PlanLeafKind::Identity;
     return PlanLeafKind::Unknown;
   }

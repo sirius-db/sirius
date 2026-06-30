@@ -82,29 +82,6 @@ bool check_outputs(const char* op,
 
 }  // namespace
 
-std::unique_ptr<compressed_representation> delta_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view,
-  rmm::device_async_resource_ref,
-  std::string* error_out)
-{
-  if (!check_outputs("delta", output_names, outputs, {"differences"}, error_out)) return nullptr;
-  return std::make_unique<delta_compressed_representation>(std::move(outputs[0]));
-}
-
-std::unique_ptr<compressed_representation> rle_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view,
-  rmm::device_async_resource_ref,
-  std::string* error_out)
-{
-  if (!check_outputs("rle", output_names, outputs, {"values", "runs"}, error_out)) return nullptr;
-  return std::make_unique<rle_compressed_representation>(std::move(outputs[0]),
-                                                         std::move(outputs[1]));
-}
-
 std::unique_ptr<compressed_representation> identity_compressed_representation::from_outputs(
   std::vector<std::string> const& /*output_names*/,
   std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -252,30 +229,6 @@ std::unique_ptr<compressed_representation> bitpack_compressed_representation::fr
                                                              std::move(chunk_count),
                                                              std::move(chunk_bits),
                                                              std::move(packed));
-}
-
-std::unique_ptr<compressed_representation> for_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view,
-  rmm::device_async_resource_ref,
-  std::string* error_out)
-{
-  if (!check_outputs(
-        "for", output_names, outputs, {"deltas", "references", "reference_offsets"}, error_out))
-    return nullptr;
-  auto deltas            = std::move(outputs[0]);
-  auto references        = std::move(outputs[1]);
-  auto reference_offsets = std::move(outputs[2]);
-
-  cudf::size_type num_rows      = deltas->size();
-  cudf::data_type original_type = deltas->type();
-
-  return std::make_unique<for_compressed_representation>(original_type,
-                                                         num_rows,
-                                                         std::move(references),
-                                                         std::move(reference_offsets),
-                                                         std::move(deltas));
 }
 
 // The four buffers are independent leaves that may each be further compressed
@@ -656,12 +609,6 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string* error_out,
   leaf_meta_v const& meta)
 {
-  if (compressor_name == "delta")
-    return delta_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out);
-  if (compressor_name == "rle")
-    return rle_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out);
   if (compressor_name == "identity")
     return identity_compressed_representation::from_outputs(
       output_names, std::move(outputs), stream, mr, error_out);
@@ -670,9 +617,6 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
       output_names, std::move(outputs), stream, mr, error_out);
   if (compressor_name == "bitpack")
     return bitpack_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out);
-  if (compressor_name == "for")
-    return for_compressed_representation::from_outputs(
       output_names, std::move(outputs), stream, mr, error_out);
   if (compressor_name == "alp")
     return alp_compressed_representation::from_outputs(

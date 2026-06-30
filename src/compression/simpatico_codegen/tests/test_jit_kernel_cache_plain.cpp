@@ -18,6 +18,7 @@
 // end-to-end cpp bridge tests on the simulator side.  This file's job
 // is to prove cache plumbing.
 
+#include "codegen/decode/jit/renderer.hpp"
 #include "codegen/encode/jit/plain_compile.hpp"  // for cje::CompileError alias
 #include "codegen/encode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
@@ -30,6 +31,7 @@
 #include <string>
 
 namespace cje = codegen::encode::jit;
+namespace cjd = codegen::decode::jit;
 namespace cjj = codegen::jit;
 using codegen::OpKind;
 
@@ -183,12 +185,99 @@ int main()
   if (cache.size() != 2)
     return report_fail("cache size grew on a should-be-warm num_chunks variant");
 
+  // --- FOR render smoke tests ----------------------------------------
+  // Shape C: [For{Bitpack<int32>}] — the primary JIT FOR shape.
+  // Must render a distinct source from Bitpack alone and from Bitpack<int64>.
+  auto tree_for_bp = cjj::FusedTree::make(OpKind::For);
+  {
+    auto child          = cjj::FusedTree::make(OpKind::Bitpack);
+    child->fixed_stride = true;
+    tree_for_bp->children.emplace("deltas", std::move(child));
+  }
+
+  cje::EncodeKernelSpec spec_for_bp_i32;
+  try {
+    spec_for_bp_i32 = cje::render(*tree_for_bp, "int32_t", /*num_chunks=*/8);
+  } catch (const std::exception& e) {
+    return report_fail("render For{Bitpack}<int32_t> failed", e.what());
+  }
+  if (spec_for_bp_i32.source.empty()) {
+    return report_fail("For{Bitpack}<int32_t> rendered empty source");
+  }
+  if (spec_for_bp_i32.source == spec_a.source) {
+    return report_fail("For{Bitpack} source collided with Bitpack source");
+  }
+
+  cje::EncodeKernelSpec spec_for_bp_i64;
+  try {
+    spec_for_bp_i64 = cje::render(*tree_for_bp, "int64_t", /*num_chunks=*/8);
+  } catch (const std::exception& e) {
+    return report_fail("render For{Bitpack}<int64_t> failed", e.what());
+  }
+  if (spec_for_bp_i64.source == spec_for_bp_i32.source) {
+    return report_fail(
+      "For{Bitpack}<int64_t> source identical to int32_t "
+      "(dtype not substituted in FOR path)");
+  }
+
+  // Compile the FOR encode kernels and verify distinct cache slots.
+  const cjj::CompiledKernel* k_for_i32 = nullptr;
+  try {
+    k_for_i32 =
+      cache.get_or_compile_plain(spec_for_bp_i32.source, spec_for_bp_i32.entry_symbol, opts);
+  } catch (const cje::CompileError& e) {
+    return report_fail(e.what(), "log:\n" + e.log + "\n--- source ---\n" + e.source);
+  } catch (const std::exception& e) {
+    return report_fail(e.what());
+  }
+  if (!k_for_i32 || !k_for_i32->func) {
+    return report_fail("For{Bitpack}<int32_t> compile returned null");
+  }
+
+  const cjj::CompiledKernel* k_for_i64 = nullptr;
+  try {
+    k_for_i64 =
+      cache.get_or_compile_plain(spec_for_bp_i64.source, spec_for_bp_i64.entry_symbol, opts);
+  } catch (const cje::CompileError& e) {
+    return report_fail(e.what(), "log:\n" + e.log + "\n--- source ---\n" + e.source);
+  } catch (const std::exception& e) {
+    return report_fail(e.what());
+  }
+  if (!k_for_i64 || !k_for_i64->func) {
+    return report_fail("For{Bitpack}<int64_t> compile returned null");
+  }
+  if (k_for_i64 == k_for_i32) { return report_fail("int64 For slot collided with int32 For slot"); }
+
+  // Decode-side render: verify FOR decode source renders and compiles.
+  {
+    cjd::DecodeKernelSpec dspec_i32;
+    try {
+      dspec_i32 = cjd::render(*tree_for_bp, "int32_t", /*num_chunks=*/8);
+    } catch (const std::exception& e) {
+      return report_fail("decode render For{Bitpack}<int32_t> failed", e.what());
+    }
+    if (dspec_i32.source.empty()) {
+      return report_fail("decode For{Bitpack}<int32_t> rendered empty source");
+    }
+
+    cjd::DecodeKernelSpec dspec_i64;
+    try {
+      dspec_i64 = cjd::render(*tree_for_bp, "int64_t", /*num_chunks=*/8);
+    } catch (const std::exception& e) {
+      return report_fail("decode render For{Bitpack}<int64_t> failed", e.what());
+    }
+    if (dspec_i64.source == dspec_i32.source) {
+      return report_fail("decode For{Bitpack}<int64_t> source identical to int32_t");
+    }
+  }
+
+  const std::size_t final_size = cache.size();
   std::printf(
     "test_jit_kernel_cache_plain: OK "
     "(cold=%.1f ms, warm=%.3f ms, speedup=%.0fx, size=%zu)\n",
     cold_ms,
     warm_ms,
     warm_ms > 0 ? cold_ms / warm_ms : 0.0,
-    cache.size());
+    final_size);
   return 0;
 }

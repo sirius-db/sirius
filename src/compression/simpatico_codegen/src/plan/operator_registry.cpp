@@ -9,7 +9,6 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
 {
   if (name == "identity") { return std::make_unique<identity_compressor>(); }
   if (name == "dictionary") { return std::make_unique<dictionary_compressor>(); }
-  if (name == "for") { return std::make_unique<for_compressor>(); }
   if (name == "alp") { return std::make_unique<alp_compressor>(); }
   if (name == "alp_rd") { return std::make_unique<alp_rd_compressor>(); }
   if (auto suffix = strip_bitextract_prefix(name)) {
