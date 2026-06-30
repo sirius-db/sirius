@@ -6,14 +6,14 @@ edition.workspace = true
 [dependencies]
 instrumentation-model = { path = "../model" }
 # Tracks a pinned commit from quent's main branch.
-quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
 rustc-hash = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }

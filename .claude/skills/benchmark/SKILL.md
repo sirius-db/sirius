@@ -111,24 +111,15 @@ pixi run python test/tpch_performance/performance_test.py \
 **Required:**
 - `--input <path>` — Parquet directory containing TPC-H tables (one `.parquet` file or sub-directory per table).
 
-**Common options:**
-- `--engine {gpu, cpu, both}` — default `both`. `gpu`/`both` loads the Sirius extension; `cpu` does not.
-- `--iterations <N>` — default `1`.
-- `--queries <spec>` — comma list with ranges, e.g. `1,3,6-10` (default: all 22).
-- `--config <yaml>` — overrides `$SIRIUS_CONFIG_FILE` for the run; copied into `<benchmark_dir>/config.yml`.
-- `--output <dir>` — root directory for benchmark output (default: `test/tpch_performance/output/`). A timestamped subdir is always created underneath.
-- `--name <NAME>` — override the auto-generated benchmark subdirectory name. When set, output goes to `<output>/<NAME>/` instead of `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/`. Useful for labeling runs (e.g. `--name baseline`, `--name with-fix`). Omit for the default timestamped name.
-- `--validation` — after timing, compare the saved `<engine>/q<N>/result.txt` files for CPU and GPU. Byte-exact match first, then `abs_tol=1e-10` on float columns (strict equality on Decimal/int/string/date). Requires `--engine both`; rejected otherwise. No query re-execution (so no second Sirius extension load and no risk of GPU pool re-init OOM).
+**Most-used flags** — the complete reference lives in `test/tpch_performance/CLAUDE.md` and `performance_test.py --help`; consult it rather than re-deriving flags here:
+- `--engine {gpu,cpu,both}` (default `both`) — `gpu`/`both` load the Sirius extension; `cpu` does not.
+- `--iterations <N>` (default `1`) and `--queries 1,3,6-10` (default: all 22).
+- `--mode {grouped,sequential,isolated,nsys-profile}` (default `grouped`) — `grouped` is hot-cache; `isolated` is true cold-start (needs the sudo setup below); `nsys-profile` is GPU-only and owned by the `profile-analyzer` skill.
+- `--pin {none,gpu,host}` (default `none`) — Sirius cache pre-load tier; rejected with `--engine cpu`.
+- `--validation` — byte-compare GPU vs CPU results after timing (`abs_tol=1e-10` on floats); requires `--engine both`.
+- `--name <NAME>` — label the output subdir instead of the default `tpch_<ts>_<mode>_<engine>_iter<N>`.
 
-**Iteration ordering (`--mode`):**
-- `grouped` (default) — per query: run all N iterations back-to-back; one connection per engine. Best for hot-cache measurement.
-- `sequential` — round-robin: iter 0 runs q1, q2, …; iter 1 runs q1, q2, … Single connection per engine.
-- `isolated` — renew the DuckDB connection per (query, iteration) and `drop_os_cache` before every run. True cold-start every execution. Requires the passwordless sudo setup below.
-
-**Pin-table (Sirius cache pre-load):**
-- `--pin {none, gpu, host}` — default `none`. `gpu` or `host` selects the Sirius cache tier; `none` disables pinning. Pin is per-query in `grouped`/`isolated` mode (pinned/unpinned around each query's iteration block) and a single union-pin (all referenced columns per table) at session start in `sequential` mode.
-- `--pin gpu`/`--pin host` is rejected when combined with `--engine cpu` (pin is Sirius-only).
-- Column lists per query live in `test/tpch_performance/tpch_pin_columns.py` (`QUERY_COLUMNS`). The runner imports `emit_pin` / `emit_unpin` / `emit_pin_all` / `emit_unpin_all` from that module.
+The CLAUDE.md is the source of truth for the rest of the surface (`--config`, `--output`, `--duckdb-profiling`, `--query-timeout`), the per-query pin column lists in `tpch_pin_columns.py`, and the shell-runner-only `--data-source` / `--pinning-mode` paths.
 
 **Examples:**
 ```bash
@@ -137,27 +128,10 @@ pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --iterations 2 --mode grouped --engine both
 
-# Per-query GPU-tier pinning, 3 iterations, queries 1/3/6 only
-pixi run python test/tpch_performance/performance_test.py \
-    --input ~/sirius/test_datasets/tpch_parquet_sf100 \
-    --queries 1,3,6 --iterations 3 --mode grouped --engine gpu \
-    --pin gpu
-
-# Sequential round-robin with a single host-tier union-pin
-pixi run python test/tpch_performance/performance_test.py \
-    --input ~/sirius/test_datasets/tpch_parquet_sf10 \
-    --iterations 2 --mode sequential --engine gpu \
-    --pin host
-
-# Cold-start measurement (renew connection + drop OS cache per run)
-pixi run python test/tpch_performance/performance_test.py \
-    --input ~/sirius/test_datasets/tpch_parquet_sf10 \
-    --iterations 2 --mode isolated --engine gpu
-
-# Validate GPU vs CPU after timing
+# Validate GPU vs CPU after timing (queries 1/3/6)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
-    --iterations 1 --engine both --validation
+    --engine both --iterations 1 --validation --queries 1,3,6
 ```
 
 ### Cold-Run Benchmarking (`--mode isolated`)
@@ -170,14 +144,7 @@ echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | su
 
 ### Output Layout
 
-`<output_dir>/tpch_<YYYYMMDD_HHMMSS>_<mode>_<engine>_iter<N>/`
-
-- `config.yml` — copy of the Sirius config used (only when `--config` is provided).
-- `metadata.json` — fields: `commit`, `branch_name`, `date`, `mode`, `iterations`, `engine`, `queries`, `pin`, `runtime_file`.
-- `csv/runtimes.csv` — long-format header `engine, query, iteration, runtime_s`.
-- `log_dir/sirius_YYYY-MM-DD.log` — combined Sirius spdlog daily-sink output (`SIRIUS_LOG_DIR` target).
-- `<engine>/q<N>/result.txt` — fetched rows for that query, one `repr(row)` per line. Overwritten on each iteration (last iter wins).
-- `sirius/q<N>/sirius.log` — per-query Sirius log split, post-processed from the combined log after the run completes (Sirius engine runs only).
+A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<output>/<NAME>/`) containing `metadata.json`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
 
 ---
 

@@ -7,11 +7,10 @@ expansion must match the file list in the corresponding CREATE VIEW
 read_parquet([...]) call — otherwise the scan_manager path-equality check
 in src/scan_manager/sirius_scan_manager.cpp will fall through to disk.
 
-Pin tier: defaults to 'gpu' (the only tier currently implemented).
-tier='host' is not supported right now and will be added later — emitting
-CALL pin_table(..., tier='host', ...) today raises NotImplementedException
-in src/sirius_extension.cpp. Override the default via SIRIUS_PIN_TIER once
-host support lands.
+Pin tier: defaults to 'gpu'; both 'gpu' and 'host' are supported. Set
+SIRIUS_PIN_TIER=host to select the host tier, which converts the pinned
+table into NUMA-local pinned host memory. Any other tier raises
+NotImplementedException at bind time (src/sirius_extension.cpp).
 """
 from __future__ import annotations
 
@@ -230,12 +229,9 @@ def detect_pin_glob(parquet_dir: str, table: str) -> str:
 
 
 def emit_pin(query_num: int, parquet_dir: str) -> str:
-    # Tier defaults to 'gpu' — the only tier currently implemented in
-    # src/sirius_extension.cpp. tier='host' is NOT supported right now and
-    # will be added later; setting SIRIUS_PIN_TIER=host today will make the
-    # CALL pin_table statement throw NotImplementedException at bind time
-    # (src/sirius_extension.cpp:681-683). Once host-tier support lands,
-    # flip via SIRIUS_PIN_TIER=host.
+    # Tier defaults to 'gpu'; SIRIUS_PIN_TIER=host selects the host tier
+    # (both are supported — see src/sirius_extension.cpp). Any other tier
+    # throws NotImplementedException at bind time.
     tier = os.environ.get("SIRIUS_PIN_TIER", "gpu")
     cols_by_table = QUERY_COLUMNS[query_num]
     lines = []
@@ -296,9 +292,8 @@ def main(argv: list[str]) -> int:
             "       tpch_pin_columns.py pin-all <parquet_dir>\n"
             "       tpch_pin_columns.py unpin-all\n"
             "\n"
-            "Tier: defaults to 'gpu'; SIRIUS_PIN_TIER=host overrides once host-tier\n"
-            "support lands. tier='host' is NOT supported right now — use it today and\n"
-            "the CALL pin_table will throw NotImplementedException.",
+            "Tier: defaults to 'gpu'; set SIRIUS_PIN_TIER=host for the host tier\n"
+            "(both 'gpu' and 'host' are supported).",
             file=sys.stderr,
         )
         return 1

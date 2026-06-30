@@ -70,6 +70,22 @@ if(VCPKG_BUILD)
   endforeach()
 endif()
 
+# DuckDB's unity build emits strong symbols for static constexpr members (e.g.
+# duckdb::TableCatalogEntry::Name) that also appear as inline definitions in
+# headers pulled in by the vendored substrait reader
+# (substrait/src/from_substrait.cpp). Tolerate the benign duplicate on every
+# binary that links both libsirius_extension and libduckdb_static — the duckdb
+# shell, the loadable extension, and the C++ test/bench exes — mirroring the
+# per-target flag already on sirius_unittest / parquet_benchmark (and the Rust
+# bindings).
+foreach(_sirius_link_flags CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
+                           CMAKE_MODULE_LINKER_FLAGS)
+  string(APPEND ${_sirius_link_flags} " -Wl,--allow-multiple-definition")
+  set(${_sirius_link_flags}
+      "${${_sirius_link_flags}}"
+      CACHE STRING "" FORCE)
+endforeach()
+
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
@@ -327,6 +343,32 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
 endif()
 
+# Compile the DuckDB substrait extension's Substrait->DuckDB reader directly
+# into the sirius target so the FFI (src/sirius_ffi.cpp) can call
+# `duckdb::SubstraitToDuckDB`. Only the from-substrait direction plus its
+# bundled protobuf (renamespaced to `duckdb::google::protobuf`, no abseil) are
+# compiled in — NOT the substrait SQL functions, to_substrait, or a second
+# loadable extension — so there is no symbol collision with conda/system
+# protobuf or a duplicate extension.
+set(SIRIUS_SUBSTRAIT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/substrait")
+file(GLOB_RECURSE SIRIUS_SUBSTRAIT_PROTOBUF_SOURCES
+     "${SIRIUS_SUBSTRAIT_DIR}/third_party/google/protobuf/*.cc")
+set(SIRIUS_SUBSTRAIT_SOURCES
+    ${SIRIUS_SUBSTRAIT_DIR}/src/from_substrait.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions_generated.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/algebra.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/extended_expression.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/plan.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/type.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/extensions/extensions.pb.cc
+    ${SIRIUS_SUBSTRAIT_PROTOBUF_SOURCES})
+# The vendored/generated protobuf + substrait TUs are not warning-clean; never
+# fail the build on them.
+set_source_files_properties(${SIRIUS_SUBSTRAIT_SOURCES}
+                            PROPERTIES COMPILE_OPTIONS "-w")
+list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
+
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
@@ -360,6 +402,14 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
+
+  # Substrait->DuckDB reader headers (from_substrait.hpp) and its bundled
+  # protobuf.
+  target_include_directories(
+    ${_target}
+    PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
+            ${SIRIUS_SUBSTRAIT_DIR}/third_party
+            ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
   if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
     target_compile_definitions(${_target}
@@ -484,6 +534,7 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/expression_executor/test_nonduckdb_frontend_proof.cpp
+    test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -507,6 +558,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
     test/cpp/operator/test_mgpu_stress.cpp
+    test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp

@@ -1,10 +1,16 @@
+use std::sync::Arc;
+
+use crate::fragment_executor::{FragmentExecutor, StubExecutor};
 use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
-    PExecPlanFragmentResult, PGetFileSchemaRequest, PGetFileSchemaResult, PSlotDescriptor,
-    StatusPb, p_internal_service_brpc::PInternalService,
+    PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
+    PGetFileSchemaResult, PSlotDescriptor, StatusPb, p_internal_service_brpc::PInternalService,
 };
-use starrocks_plan_translator::PlanTranslator;
+use crate::result_encoder::{self, ThriftBinary};
+use crate::result_store::{FragmentInstanceId, ResultStore};
+use starrocks_plan_translator::{PlanTranslator, TranslatedPlan};
 use starrocks_thrift::{
+    data_sinks::{TDataSinkType, TResultSinkType},
     internal_service::{
         TExecBatchPlanFragmentsParams, TExecPlanFragmentParams, TGetFileSchemaRequest,
     },
@@ -25,6 +31,14 @@ use tracing::{info, instrument};
 pub(crate) struct SiriusComputeNodeService {
     /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
+    /// Executes a translated fragment into Arrow result batches.
+    ///
+    /// TODO(starrocks-execute): this is a [`StubExecutor`] until the GPU-backed executor lands.
+    /// The real executor will hold the `Arc<sirius::SiriusContext>` brought up in `main`.
+    executor: Arc<dyn FragmentExecutor>,
+    /// Buffers executed-fragment results for FE `fetch_data` collection. Shared across BRPC
+    /// connections so a `fetch_data` poll sees what an `exec_plan_fragment` buffered.
+    results: Arc<ResultStore>,
 }
 
 impl SiriusComputeNodeService {
@@ -32,30 +46,29 @@ impl SiriusComputeNodeService {
     pub(crate) fn new() -> Self {
         Self {
             translator: PlanTranslator::new(),
+            executor: Arc::new(StubExecutor),
+            results: Arc::new(ResultStore::default()),
         }
     }
 }
 
 impl PInternalService for SiriusComputeNodeService {
-    /// Handles a single FE-dispatched plan fragment thrift attachment.
-    ///
-    /// An OK status here means the fragment was accepted and translated, which is the correct
-    /// dispatch-RPC response; actually executing the fragment and streaming results back is a
-    /// separate, not-yet-implemented RPC surface.
+    /// Handles a single FE-dispatched plan fragment thrift attachment: translate it, and for a
+    /// root RESULT_SINK fragment execute it and buffer the rows for `fetch_data`. An OK status
+    /// means the fragment was accepted (and, for a result fragment, executed and buffered).
     #[instrument(skip_all)]
     async fn exec_plan_fragment(
         &self,
         request: PExecPlanFragmentRequest,
         attachment: Vec<u8>,
-    ) -> Result<PExecPlanFragmentResult, crate::prpc::Error> {
-        Ok(
-            match self
-                .translate_single_attachment(request.attachment_protocol.as_deref(), &attachment)
-            {
-                Ok(()) => Self::exec_plan_result(Self::ok_status()),
-                Err(err) => Self::exec_plan_result(Self::internal_error(err)),
-            },
-        )
+    ) -> Result<crate::prpc::Reply<PExecPlanFragmentResult>, crate::prpc::Error> {
+        let status = match self
+            .exec_single_attachment(request.attachment_protocol.as_deref(), &attachment)
+        {
+            Ok(()) => Self::ok_status(),
+            Err(err) => Self::internal_error(err),
+        };
+        Ok(Self::exec_plan_result(status).into())
     }
 
     /// Handles FE batch fragment dispatch by translating every per-instance fragment.
@@ -64,19 +77,59 @@ impl PInternalService for SiriusComputeNodeService {
         &self,
         request: PExecBatchPlanFragmentsRequest,
         attachment: Vec<u8>,
-    ) -> Result<PExecBatchPlanFragmentsResult, crate::prpc::Error> {
-        Ok(
-            match self
-                .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
-            {
-                Ok(()) => PExecBatchPlanFragmentsResult {
-                    status: Some(Self::ok_status()),
-                },
-                Err(err) => PExecBatchPlanFragmentsResult {
-                    status: Some(Self::internal_error(err)),
-                },
+    ) -> Result<crate::prpc::Reply<PExecBatchPlanFragmentsResult>, crate::prpc::Error> {
+        // TODO(starrocks-execute): execute + buffer results for batch dispatch too. For the
+        // single-fragment milestone only `exec_plan_fragment` runs the RESULT_SINK fragment.
+        let result = match self
+            .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
+        {
+            Ok(()) => PExecBatchPlanFragmentsResult {
+                status: Some(Self::ok_status()),
             },
-        )
+            Err(err) => PExecBatchPlanFragmentsResult {
+                status: Some(Self::internal_error(err)),
+            },
+        };
+        Ok(result.into())
+    }
+
+    /// Returns buffered fragment results to the FE, which polls this until end-of-stream. The
+    /// serialized `TResultBatch` rows ride in the BRPC response attachment.
+    #[instrument(skip_all)]
+    async fn fetch_data(
+        &self,
+        request: PFetchDataRequest,
+        _attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PFetchDataResult>, crate::prpc::Error> {
+        let id = FragmentInstanceId::from(&request.finst_id);
+        // An unknown id is an error, not EOS: it means this CN never buffered a result for the
+        // fragment the FE is polling (wrong id, or a dispatch/result-sink path that did not run),
+        // and StarRocks treats a missing result buffer as a failure rather than an empty result.
+        let Some(outcome) = self.results.take_next(id) else {
+            return Ok(Self::fetch_data_result(
+                Self::internal_error(format!("no buffered result for fragment instance {id}")),
+                0,
+                true,
+            )
+            .into());
+        };
+        match outcome.batch {
+            Some(batch) => match batch.to_binary() {
+                Ok(bytes) => Ok(crate::prpc::Reply::with_attachment(
+                    Self::fetch_data_result(Self::ok_status(), outcome.packet_seq, outcome.eos),
+                    bytes,
+                )),
+                Err(err) => Ok(Self::fetch_data_result(
+                    Self::internal_error(err),
+                    outcome.packet_seq,
+                    true,
+                )
+                .into()),
+            },
+            None => Ok(
+                Self::fetch_data_result(Self::ok_status(), outcome.packet_seq, outcome.eos).into(),
+            ),
+        }
     }
 
     /// Infers the schema of the FILES() target so the FE can resolve the table function.
@@ -85,8 +138,8 @@ impl PInternalService for SiriusComputeNodeService {
         &self,
         _request: PGetFileSchemaRequest,
         attachment: Vec<u8>,
-    ) -> Result<PGetFileSchemaResult, crate::prpc::Error> {
-        Ok(match Self::file_schema_from_attachment(&attachment).await {
+    ) -> Result<crate::prpc::Reply<PGetFileSchemaResult>, crate::prpc::Error> {
+        let result = match Self::file_schema_from_attachment(&attachment).await {
             Ok(schema) => PGetFileSchemaResult {
                 status: Self::ok_status(),
                 schema,
@@ -95,13 +148,14 @@ impl PInternalService for SiriusComputeNodeService {
                 status: Self::internal_error(err),
                 schema: Vec::new(),
             },
-        })
+        };
+        Ok(result.into())
     }
 }
 
 impl SiriusComputeNodeService {
-    /// Deserializes and translates one binary-thrift TExecPlanFragmentParams attachment.
-    fn translate_single_attachment(
+    /// Deserializes one binary-thrift TExecPlanFragmentParams attachment and processes it.
+    fn exec_single_attachment(
         &self,
         protocol: Option<&str>,
         attachment: &[u8],
@@ -109,7 +163,38 @@ impl SiriusComputeNodeService {
         Self::ensure_binary_protocol(protocol)?;
         let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
-        self.translate_and_log_fragment(&params)
+        self.process_fragment(&params)
+    }
+
+    /// Translates one fragment and, when it is a supported RESULT_SINK root, executes it and
+    /// buffers the rows for later `fetch_data`. Shared by single and batch dispatch so both paths
+    /// produce fetchable results for a RESULT_SINK instance.
+    fn process_fragment(
+        &self,
+        params: &TExecPlanFragmentParams,
+    ) -> std::result::Result<(), String> {
+        let translated = self.translate_fragment_logged(params)?;
+        self.execute_and_buffer(params, &translated)
+    }
+
+    /// Executes a RESULT_SINK fragment and buffers its rows. Non-result-sink fragments (e.g. a
+    /// DATA_STREAM_SINK feeding another fragment) are translate-only. An unsupported result-sink
+    /// format or a missing fragment instance id fails loudly so integration gaps surface as an
+    /// error rather than as a silent empty result at `fetch_data`.
+    fn execute_and_buffer(
+        &self,
+        params: &TExecPlanFragmentParams,
+        translated: &TranslatedPlan,
+    ) -> std::result::Result<(), String> {
+        if !Self::is_mysql_result_sink(params)? {
+            return Ok(());
+        }
+        let id = Self::fragment_instance_id(params)
+            .ok_or_else(|| "RESULT_SINK fragment is missing a fragment_instance_id".to_string())?;
+        let result = self.executor.execute(translated)?;
+        let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
+        self.results.insert(id, batch);
+        Ok(())
     }
 
     /// Deserializes a FE batch attachment and merges common params into each instance.
@@ -150,19 +235,20 @@ impl SiriusComputeNodeService {
                 params.resource_info = common.resource_info.clone();
             }
 
-            self.translate_and_log_fragment(&params)
+            self.process_fragment(&params)
                 .map_err(|err| format!("fragment {idx}: {err}"))?;
         }
 
         Ok(())
     }
 
-    /// Converts a StarRocks thrift plan fragment to Substrait and logs substrait-explain output.
+    /// Converts a StarRocks thrift plan fragment to Substrait, logs substrait-explain output, and
+    /// returns the translated plan for execution.
     #[instrument(skip_all)]
-    fn translate_and_log_fragment(
+    fn translate_fragment_logged(
         &self,
         params: &TExecPlanFragmentParams,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<TranslatedPlan, String> {
         let translated = self
             .translator
             .translate_fragment(params)
@@ -172,7 +258,44 @@ impl SiriusComputeNodeService {
             plan = %translated.explain(),
             "translated StarRocks plan fragment"
         );
-        Ok(())
+        Ok(translated)
+    }
+
+    /// Classifies the fragment output sink: `Ok(true)` for a MySQL text-protocol RESULT_SINK this
+    /// CN can encode, `Ok(false)` for a non-result sink (translate-only), and `Err` for a
+    /// RESULT_SINK whose format is not supported yet (binary rows, HTTP/FILE/Arrow Flight, etc.).
+    /// The encoder only emits MySQL text rows, so other result-sink formats must be rejected
+    /// rather than returned in the wrong wire format.
+    fn is_mysql_result_sink(params: &TExecPlanFragmentParams) -> std::result::Result<bool, String> {
+        let Some(sink) = params
+            .fragment
+            .as_ref()
+            .and_then(|fragment| fragment.output_sink.as_ref())
+        else {
+            return Ok(false);
+        };
+        if sink.type_ != TDataSinkType::RESULT_SINK {
+            return Ok(false);
+        }
+        // A RESULT_SINK with no nested detail defaults to MySQL text rows.
+        let Some(result_sink) = sink.result_sink.as_ref() else {
+            return Ok(true);
+        };
+        if matches!(result_sink.is_binary_row, Some(true)) {
+            return Err("binary-row result sinks are not supported yet".to_string());
+        }
+        match result_sink.type_ {
+            None | Some(TResultSinkType::MYSQL_PROTOCAL) => Ok(true),
+            Some(other) => Err(format!("result sink type {other:?} is not supported yet")),
+        }
+    }
+
+    /// Extracts the fragment instance id the FE later passes to `fetch_data`.
+    fn fragment_instance_id(params: &TExecPlanFragmentParams) -> Option<FragmentInstanceId> {
+        params
+            .params
+            .as_ref()
+            .map(|exec| FragmentInstanceId::from(&exec.fragment_instance_id))
     }
 
     /// Extracts the parquet path from the binary-thrift attachment and infers its schema.
@@ -241,6 +364,16 @@ impl SiriusComputeNodeService {
         }
     }
 
+    /// Builds a `fetch_data` response carrying the FE's packet-sequence and end-of-stream markers.
+    fn fetch_data_result(status: StatusPb, packet_seq: i64, eos: bool) -> PFetchDataResult {
+        PFetchDataResult {
+            status,
+            packet_seq: Some(packet_seq),
+            eos: Some(eos),
+            query_statistics: None,
+        }
+    }
+
     /// StarRocks OK status. For these RPCs OK means "fragment accepted and translated", not
     /// "fragment executed" — execution and result delivery are not implemented yet.
     fn ok_status() -> StatusPb {
@@ -261,22 +394,29 @@ impl SiriusComputeNodeService {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use prost::Message;
     use starrocks_thrift::{
+        data::TResultBatch,
+        data_sinks::{TDataSink, TResultSink},
         descriptors::{TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor},
-        internal_service::InternalServiceVersion,
+        internal_service::{InternalServiceVersion, TPlanFragmentExecParams},
         partitions::{TDataPartition, TPartitionType},
         plan_nodes::{TFileScanNode, TPlan, TPlanNode, TPlanNodeType},
         planner::TPlanFragment,
-        types::{TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode, TTypeNodeType},
+        types::{
+            TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode, TTypeNodeType, TUniqueId,
+        },
     };
     use thrift::{protocol::TBinaryOutputProtocol, transport::TIoChannel};
     use tower::{Service, ServiceExt};
 
     use super::*;
     use crate::{
-        proto::starrocks::p_internal_service_brpc::{
-            PInternalServiceRouter, SERVICE_NAME, methods,
+        proto::starrocks::{
+            PFetchDataRequest, PUniqueId,
+            p_internal_service_brpc::{PInternalServiceRouter, SERVICE_NAME, methods},
         },
         prpc,
     };
@@ -369,6 +509,248 @@ mod tests {
         let err = call_router(request).unwrap_err();
 
         assert!(err.to_string().contains("service name"));
+    }
+
+    #[test]
+    fn exec_plan_fragment_executes_result_sink_and_fetch_data_drains_it() {
+        // A root RESULT_SINK fragment is executed (stub) and buffered; fetch_data returns the
+        // rows once, then reports end-of-stream. exec and fetch share one service so they share
+        // the result store.
+        let service = SiriusComputeNodeService::new();
+
+        let mut params = supported_fragment();
+        params.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        params.params = Some(exec_params(TUniqueId::new(0, 1), TUniqueId::new(0, 7)));
+
+        let exec = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&params),
+        );
+        let exec = PExecPlanFragmentResult::decode(exec.body.as_slice()).unwrap();
+        assert_eq!(exec.status.status_code, TStatusCode::OK.0);
+
+        // First fetch returns the buffered rows in the attachment, eos = false.
+        let first = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(0, 7),
+            Vec::new(),
+        );
+        let first_result = PFetchDataResult::decode(first.body.as_slice()).unwrap();
+        assert_eq!(first_result.status.status_code, TStatusCode::OK.0);
+        assert_eq!(first_result.eos, Some(false));
+        let batch = SiriusComputeNodeService::deserialize_binary::<TResultBatch>(&first.attachment)
+            .unwrap();
+        // The stub emits one row of "stub" per output column ("id", "name"); each is a MySQL
+        // length-encoded string (len 4, then the bytes).
+        assert_eq!(batch.rows.len(), 1);
+        assert_eq!(
+            batch.rows[0],
+            vec![0x04, b's', b't', b'u', b'b', 0x04, b's', b't', b'u', b'b']
+        );
+
+        // Second fetch reports end-of-stream with no attachment.
+        let second = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(0, 7),
+            Vec::new(),
+        );
+        let second_result = PFetchDataResult::decode(second.body.as_slice()).unwrap();
+        assert_eq!(second_result.eos, Some(true));
+        assert!(second.attachment.is_empty());
+    }
+
+    #[test]
+    fn fetch_data_for_unknown_fragment_is_an_error() {
+        // A poll for an id this CN never buffered must fail loudly, not look like an empty result.
+        let service = SiriusComputeNodeService::new();
+        let response = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(0, 123),
+            Vec::new(),
+        );
+        let result = PFetchDataResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("no buffered result"),
+            "{:?}",
+            result.status.error_msgs
+        );
+        assert!(response.attachment.is_empty());
+    }
+
+    #[test]
+    fn exec_batch_plan_fragments_buffers_result_sink_instance() {
+        // The FE may dispatch the root via batch dispatch; it must also execute + buffer the
+        // RESULT_SINK instance so fetch_data returns rows instead of a silent empty result.
+        let service = SiriusComputeNodeService::new();
+        let mut root = fragment_params(Some(scan_plan(0, 0)), None);
+        root.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        root.params = Some(exec_params(TUniqueId::new(0, 1), TUniqueId::new(0, 55)));
+        let batch = TExecBatchPlanFragmentsParams::new(
+            Some(fragment_params(None, Some(desc_table()))),
+            Some(vec![root]),
+        );
+
+        let exec = route(
+            &service,
+            methods::EXEC_BATCH_PLAN_FRAGMENTS,
+            PExecBatchPlanFragmentsRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&batch),
+        );
+        let exec = PExecBatchPlanFragmentsResult::decode(exec.body.as_slice()).unwrap();
+        assert_eq!(exec.status.unwrap().status_code, TStatusCode::OK.0);
+
+        let fetched = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(0, 55),
+            Vec::new(),
+        );
+        let fetched_result = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert_eq!(fetched_result.status.status_code, TStatusCode::OK.0);
+        assert_eq!(fetched_result.eos, Some(false));
+        let result_batch =
+            SiriusComputeNodeService::deserialize_binary::<TResultBatch>(&fetched.attachment)
+                .unwrap();
+        assert_eq!(result_batch.rows.len(), 1);
+    }
+
+    #[test]
+    fn exec_plan_fragment_rejects_unsupported_result_sink_format() {
+        // The encoder only emits MySQL text rows; a non-MySQL result sink must be rejected rather
+        // than returned in the wrong wire format.
+        let service = SiriusComputeNodeService::new();
+        let mut params = supported_fragment();
+        params.fragment.as_mut().unwrap().output_sink =
+            Some(result_sink_typed(TResultSinkType::STATISTIC));
+        params.params = Some(exec_params(TUniqueId::new(0, 1), TUniqueId::new(0, 9)));
+
+        let response = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&params),
+        );
+        let result = PExecPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("not supported"),
+            "{:?}",
+            result.status.error_msgs
+        );
+    }
+
+    fn fetch_request(hi: i64, lo: i64) -> Vec<u8> {
+        PFetchDataRequest {
+            finst_id: PUniqueId { hi, lo },
+        }
+        .encode_to_vec()
+    }
+
+    fn result_sink_typed(kind: TResultSinkType) -> TDataSink {
+        TDataSink::new(
+            TDataSinkType::RESULT_SINK,
+            None,
+            Some(TResultSink::new(Some(kind), None, None, None, None)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn route(
+        service: &SiriusComputeNodeService,
+        method: &str,
+        body: Vec<u8>,
+        attachment: Vec<u8>,
+    ) -> prpc::Response {
+        // Route through a router built from a clone of `service`; the result store is shared via
+        // `Arc`, so buffered results survive across the per-call router clones.
+        let mut router = PInternalServiceRouter::new(service.clone());
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                router
+                    .ready()
+                    .await
+                    .unwrap()
+                    .call(prpc::Request::new(SERVICE_NAME, method, body, attachment))
+                    .await
+            })
+            .unwrap()
+    }
+
+    fn result_sink() -> TDataSink {
+        // Only the sink type is read today (is_result_sink); the per-sink payloads stay None.
+        TDataSink::new(
+            TDataSinkType::RESULT_SINK,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn exec_params(
+        query_id: TUniqueId,
+        fragment_instance_id: TUniqueId,
+    ) -> TPlanFragmentExecParams {
+        // Only the ids are needed to key the result store; scan ranges/senders stay empty.
+        TPlanFragmentExecParams::new(
+            query_id,
+            fragment_instance_id,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     fn call_exec_plan_fragment(

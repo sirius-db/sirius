@@ -207,6 +207,10 @@ class task_creator {
   std::unordered_map<int, std::vector<int>> _numa_to_gpu;
   /// Round-robin counter for NUMA-affinity routing when multiple GPUs share a NUMA node.
   std::atomic<uint64_t> _numa_to_gpu_rr{0};
+  /// Sorted device ids that actually have a GPU executor (memory-manager GPU
+  /// spaces). Partition affinity indexes this, not the physical topology, so the
+  /// pin resolves to a real executor when num_gpus < physical GPU count.
+  std::vector<int> _active_gpu_ids;
 };
 
 }  // namespace sirius::creator

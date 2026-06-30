@@ -10,18 +10,18 @@ swagger = ["quent-query-engine-server/swagger"]
 [dependencies]
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
-instrumentation-model = { path = "../model" }
+instrumentation-model = { path = "../model", features = ["collector"] }
 sirius-telemetry-analyzer = { path = "../analyzer" }
-quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-exporter = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
+quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-exporter = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 uuid = "1"
 
 [build-dependencies]
 # Tracks a pinned commit from quent's main branch.
-quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "76e99cf7ca9d531d4e56e94021b1f80d97b23c90" }
-ts-rs = { version = "11", features = ["uuid-impl", "serde-json-impl"] }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2704d96f262fc19f781cc2ca8840a9450f5ad0d9" }
+ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }

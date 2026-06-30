@@ -63,10 +63,41 @@ pub(crate) struct Response {
 }
 
 impl Response {
-    /// Builds a protobuf-body-only response.
-    pub(crate) fn new(body: Vec<u8>) -> Self {
+    /// Builds a response whose protobuf body is accompanied by an optional BRPC attachment.
+    /// Result-bearing RPCs such as `fetch_data` ship the serialized `TResultBatch` here; other
+    /// RPCs pass an empty attachment.
+    pub(crate) fn with_attachment(body: Vec<u8>, attachment: Vec<u8>) -> Self {
+        Self { body, attachment }
+    }
+}
+
+/// A typed RPC handler result: the protobuf response message plus an optional BRPC attachment.
+///
+/// Every StarRocks BRPC reply may carry an attachment, so the generated service trait returns
+/// this wrapper. Handlers that have no attachment return the bare message via `.into()`.
+#[derive(Clone, Debug)]
+pub(crate) struct Reply<M> {
+    /// Protobuf response message.
+    pub(crate) message: M,
+    /// Optional response attachment bytes.
+    pub(crate) attachment: Vec<u8>,
+}
+
+impl<M> Reply<M> {
+    /// Builds a reply whose message is accompanied by an attachment.
+    pub(crate) fn with_attachment(message: M, attachment: Vec<u8>) -> Self {
         Self {
-            body,
+            message,
+            attachment,
+        }
+    }
+}
+
+impl<M> From<M> for Reply<M> {
+    /// Wraps a bare protobuf message as an attachment-less reply.
+    fn from(message: M) -> Self {
+        Self {
+            message,
             attachment: Vec::new(),
         }
     }
