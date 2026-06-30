@@ -31,15 +31,16 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
-#include <cstddef>
-#include <cstdint>
-#include <vector>
 #include <duckdb/common/optional_idx.hpp>
 #include <duckdb/common/types.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+using sirius::estimate_referenced_column_bytes;
 using sirius::logical_type;
 using sirius::type_id;
-using sirius::estimate_referenced_column_bytes;
 
 namespace {
 
