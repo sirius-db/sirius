@@ -211,6 +211,7 @@ set(EXTENSION_SOURCES
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/memory/defragmenter_oom_policy.cpp
+    src/memory/libcudf_current_resource_bridge.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
