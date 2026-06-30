@@ -509,20 +509,37 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
       cached_chunk* c = (ci < chunks.size() && chunks[ci]->offset == off) ? chunks[ci] : nullptr;
 
       if (c != nullptr && c->state.acquire_read()) {
-        cached_chunks.push_back(c);  // (1) hit
+        cached_chunks.push_back(c);  // (1) hit -- a cached chunk is always fully valid
         hits++;
       } else {
         if (!cache_while_reading_enabled) {
           every_chunk_is_cached = false;
           break;  // (3) miss, but we can't do H2D IO, so fall back to direct device read
         }
-        if (c != nullptr && c->state.mark_loading()) {
+        // Only stage a read through the chunk's cache buffer when this read covers
+        // the WHOLE chunk -- a cached chunk must be fully valid.  For the head and
+        // tail chunks of a read (partial overlap), caching the full chunk would
+        // force reading the non-overlapping remainder from disk: that boundary
+        // over-read is the dominant cold-pass cost.  Instead read only the needed,
+        // block-aligned span through an internal bounce slot (null host buffer) and
+        // leave the chunk uncached -- zero over-read.  (Short-term: a partial
+        // boundary chunk is re-read on every pass rather than cached; full partial
+        // caching is a larger redesign.)
+        size_t const need_lo    = std::max(off, offset);
+        size_t const need_hi    = std::min(off + chunk_bytes, offset + size);
+        bool const covers_chunk = (need_lo == off && need_hi == off + chunk_bytes);
+        if (covers_chunk && c != nullptr && c->state.mark_loading()) {
           assert(c->data != nullptr);
-          io_chunks.push_back(c);  // (2) host-to-device load
+          io_chunks.push_back(c);  // (2) host-to-device load into the cache buffer
           io_segments.emplace_back(off, chunk_bytes, c->data);
           h2d++;
         } else {
-          io_segments.emplace_back(off, chunk_bytes, nullptr);  // (3) miss
+          // (3) partial head/tail (or busy / missing chunk): read just the needed,
+          // block-aligned span via an internal bounce slot; do not touch the cache.
+          size_t const seg_lo = need_lo & ~(io::IO_BLOCK_SIZE - 1);
+          size_t const seg_hi = std::min(
+            off + chunk_bytes, (need_hi + io::IO_BLOCK_SIZE - 1) & ~(io::IO_BLOCK_SIZE - 1));
+          io_segments.emplace_back(seg_lo, seg_hi - seg_lo, nullptr);  // (3) miss
           misses++;
         }
       }
