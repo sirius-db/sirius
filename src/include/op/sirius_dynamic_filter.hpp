@@ -249,6 +249,13 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   /// Whether @p keys can back the persistent exact membership set.
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
 
+  /// True iff some key equals the cuco empty-slot sentinel (numeric_limits<KeyT>::min()), which
+  /// static_set silently refuses to insert. Caller must ensure @ref supports (INT32/INT64,
+  /// null_count()==0). Inspects the raw keys.data<KeyT>() buffer synchronizes @p stream to deliver
+  /// the host-side bool used to choose in-list vs bloom.
+  [[nodiscard]] static bool keys_contain_sentinel(cudf::column_view const& keys,
+                                                  rmm::cuda_stream_view stream);
+
   /// Estimated device footprint (bytes) of the @c cuco::static_set built over an IN-list of
   /// @p num_keys keys of @p key_type — the structure that must stay L2-resident for the per-row
   /// membership probe to run at cache bandwidth (capacity ≈ num_keys / load_factor slots, each

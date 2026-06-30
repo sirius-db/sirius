@@ -33,8 +33,6 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/joinside.hpp"
-#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
@@ -53,7 +51,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <limits>
 #include <optional>
 #include <string_view>
 #include <unordered_set>
@@ -1257,42 +1254,6 @@ std::size_t device_l2_cache_bytes() noexcept
   return cached;
 }
 
-/// @brief Proves, from DuckDB's build-side (RHS) join-key statistics, that no build key can equal
-/// the cuco::static_set empty-slot sentinel (= std::numeric_limits<KeyT>::min()) that backs the
-/// in-list filter. When true, the exact in-list filter is sentinel-safe; when false the caller must
-/// route the key to the bloom filter, which reserves no sentinel.
-bool stats_exclude_inlist_sentinel(
-  duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> const& join_stats,
-  std::size_t condition_idx,
-  cudf::data_type key_type)
-{
-  // BUILD (right) side stats are at odd indices of join condition pairs
-  auto const stat_idx = condition_idx * 2 + 1;
-  if (stat_idx >= join_stats.size() || !join_stats[stat_idx]) { return false; }
-  auto const& stats = *join_stats[stat_idx];
-
-  // Require that the stats physical width matches the build-key width
-  auto const phys = stats.GetType().InternalType();
-  bool const is_int32 =
-    key_type.id() == cudf::type_id::INT32 && phys == duckdb::PhysicalType::INT32;
-  bool const is_int64 =
-    key_type.id() == cudf::type_id::INT64 && phys == duckdb::PhysicalType::INT64;
-  if (!is_int32 && !is_int64) { return false; }
-
-  // Sentinels are primitive type minimums, so we require the min to validate non-existence of a
-  // sentinel value.
-  if (!duckdb::NumericStats::HasMin(stats)) { return false; }
-
-  if (is_int32) {
-    auto const stat_min = duckdb::NumericStats::Min(stats).GetValue<std::int32_t>();
-    return stat_min > std::numeric_limits<std::int32_t>::min();
-  } else {
-    // is_int64
-    auto const stat_min = duckdb::NumericStats::Min(stats).GetValue<std::int64_t>();
-    return stat_min > std::numeric_limits<std::int64_t>::min();
-  }
-}
-
 }  // namespace
 
 void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view const& build_view,
@@ -1450,11 +1411,14 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
     auto const l2 = device_l2_cache_bytes();
     auto const set_bytes =
       sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(n, col.type());
-    auto const bloom_bytes   = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(n);
-    char const* choice       = "none";
-    bool const sentinel_safe = stats_exclude_inlist_sentinel(join_stats, cond_idx, col.type());
-    if (l2 > 0 && sirius::op::sirius_dynamic_in_list_filter::supports(col) && set_bytes <= l2 &&
-        sentinel_safe) {
+    auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(n);
+    char const* choice     = "none";
+    bool const in_list_fits =
+      l2 > 0 && sirius::op::sirius_dynamic_in_list_filter::supports(col) && set_bytes <= l2;
+    bool const sentinel_safe =
+      in_list_fits &&
+      !sirius::op::sirius_dynamic_in_list_filter::keys_contain_sentinel(col, stream);
+    if (in_list_fits && sentinel_safe) {
       nvtx3::scoped_range vr{"dynfilter::build_in_list"};
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);

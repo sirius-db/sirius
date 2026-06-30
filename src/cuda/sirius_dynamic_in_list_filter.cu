@@ -23,7 +23,9 @@
 #include <cuco/static_set.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
+#include <cuda/std/limits>
 #include <cuda/stream_ref>
+#include <thrust/logical.h>
 
 #include <op/sirius_dynamic_filter.hpp>
 
@@ -77,6 +79,14 @@ std::unique_ptr<set_type<KeyT>> build_set(cudf::column_view const& keys,
   }
   return set;
 }
+
+template <class KeyT>
+struct equals_sentinel {
+  __device__ __forceinline__ bool operator()(KeyT const& k) const noexcept
+  {
+    return k == std::numeric_limits<KeyT>::min();
+  }
+};
 }  // namespace
 
 struct sirius_dynamic_in_list_filter::set_impl {
@@ -108,6 +118,24 @@ bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noex
 {
   auto const id = keys.type().id();
   return (id == cudf::type_id::INT32 || id == cudf::type_id::INT64) && keys.null_count() == 0;
+}
+
+bool sirius_dynamic_in_list_filter::keys_contain_sentinel(cudf::column_view const& keys,
+                                                          rmm::cuda_stream_view stream)
+{
+  auto const n = keys.size();
+  /// @note Implicit stream synchronization in thrust::any_of() for return of host-side bool
+  switch (keys.type().id()) {
+    case cudf::type_id::INT32: {
+      auto const* d = keys.data<std::int32_t>();
+      return thrust::any_of(rmm::exec_policy(stream), d, d + n, equals_sentinel<std::int32_t>{});
+    }
+    case cudf::type_id::INT64: {
+      auto const* d = keys.data<std::int64_t>();
+      return thrust::any_of(rmm::exec_policy(stream), d, d + n, equals_sentinel<std::int64_t>{});
+    }
+    default: return true;  // unreachable: supports() gates the type (fallthrough to Bloom)
+  }
 }
 
 sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter() = default;

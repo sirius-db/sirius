@@ -385,8 +385,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
       op_params.max_build_hash_table_bytes);
-    auto& hj      = join->Cast<sirius::op::sirius_physical_hash_join>();
-    hj.join_stats = std::move(op.join_stats);
+    auto& hj = join->Cast<sirius::op::sirius_physical_hash_join>();
 
     //===----------Wire dynamic-filter producer targets----------===//
     // For each downstream scan DuckDB has paired with this join, look up the shared channel by
