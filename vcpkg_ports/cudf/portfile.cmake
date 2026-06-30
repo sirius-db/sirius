@@ -112,12 +112,6 @@ vcpkg_replace_string(
   "set(CPM_DOWNLOAD_zstd ON)"
   "# CPM_DOWNLOAD_zstd removed - using CPM_zstd_SOURCE instead")
 
-# Patch dlpack - vcpkg's 0.8 port incorrectly reports version 0.6, so use 0.6
-vcpkg_replace_string(
-  "${SOURCE_PATH}/cpp/cmake/thirdparty/get_dlpack.cmake"
-  "find_and_configure_dlpack(\${CUDF_MIN_VERSION_dlpack})"
-  "find_and_configure_dlpack(\"0.6\")")
-
 # Patch rapids_logger to use vcpkg's spdlog::spdlog target instead of spdlog
 vcpkg_replace_string(
   "${RAPIDS_LOGGER_PATH}/CMakeLists.txt"
