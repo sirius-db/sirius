@@ -25,8 +25,10 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -196,6 +198,37 @@ inline bool futex_wait_until(std::atomic<std::uint32_t>& atom,
 }
 
 // ---------------------------------------------------------------------------
+// Wake threads parked in futex_wait_until() on @p atom.
+//
+// std::atomic::notify_*() routes through libstdc++'s internal waiter pool, which
+// does NOT wake a raw SYS_futex waiter on the atom's own address — and the timed
+// pull-wait (wait_until) uses exactly such a raw wait.  So every notify_all() on
+// the state word must be paired with this matching FUTEX_WAKE_BITSET, otherwise
+// a timed waiter sleeps until its deadline even though the result is already
+// published (the untimed wait(), which uses atomic::wait(), is unaffected).
+
+inline void futex_wake(std::atomic<std::uint32_t>& atom) noexcept
+{
+#ifdef __linux__
+  static_assert(sizeof(std::atomic<std::uint32_t>) == sizeof(std::uint32_t),
+                "futex requires atomic<uint32_t> to have no overhead storage");
+  // Mirror of futex_wait_until's FUTEX_WAIT_BITSET (stable ABI constants).
+  constexpr unsigned futex_wake_bitset      = 10U;
+  constexpr unsigned futex_private_flag     = 128U;
+  constexpr unsigned futex_bitset_match_any = 0xFFFFFFFFU;
+  syscall(SYS_futex,
+          reinterpret_cast<std::uint32_t*>(&atom),
+          static_cast<int>(futex_wake_bitset | futex_private_flag),
+          std::numeric_limits<int>::max(),  // wake every parked waiter
+          nullptr,
+          nullptr,
+          futex_bitset_match_any);
+#else
+  atom.notify_all();
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // core: the shared slot between promise and semi_future/future.
 //
 // Lock-free FSM with four states, one-shot:
@@ -238,6 +271,7 @@ class core {
       // Pull-mode consumer (if any) is woken; push-mode set_callback (if it
       // arrives later) will fire inline.
       _state.notify_all();
+      detail::futex_wake(_state);
       return;
     }
     // The only other valid prior state is has_callback: a callback was
@@ -309,6 +343,7 @@ class core {
     std::move(cb)(std::move(_try));
     _state.store(done, std::memory_order_release);
     _state.notify_all();
+    detail::futex_wake(_state);
   }
 
   std::atomic<std::uint32_t> _state{empty};
