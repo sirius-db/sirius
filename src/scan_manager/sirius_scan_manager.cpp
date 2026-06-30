@@ -358,6 +358,27 @@ void sirius_scan_manager::stop()
 
 namespace {
 
+// Gather positions into @p cached_ids for each requested primary (storage) index, in the
+// given order. Empty when any requested column is absent — i.e. the cache is not a superset.
+std::vector<std::size_t> gather_by_primary_index(
+  duckdb::vector<duckdb::ColumnIndex> const& cached_ids,
+  std::vector<std::size_t> const& requested_primary_indices)
+{
+  std::unordered_map<duckdb::idx_t, std::size_t> pos;
+  pos.reserve(cached_ids.size());
+  for (std::size_t i = 0; i < cached_ids.size(); ++i) {
+    pos.emplace(cached_ids[i].GetPrimaryIndex(), i);
+  }
+  std::vector<std::size_t> projection;
+  projection.reserve(requested_primary_indices.size());
+  for (auto const primary_idx : requested_primary_indices) {
+    auto it = pos.find(primary_idx);
+    if (it == pos.end()) { return {}; }  // cache lacks a requested column
+    projection.push_back(it->second);
+  }
+  return projection;
+}
+
 // Gather projection that lets a cache holding @p cached_ids (by primary/storage
 // index) serve a scan requesting @p requested_ids: for each requested column,
 // its position within @p cached_ids, in the requested order. Empty when any
@@ -366,19 +387,12 @@ std::vector<std::size_t> column_superset_projection(
   duckdb::vector<duckdb::ColumnIndex> const& cached_ids,
   duckdb::vector<duckdb::ColumnIndex> const& requested_ids)
 {
-  std::unordered_map<duckdb::idx_t, std::size_t> pos;
-  pos.reserve(cached_ids.size());
-  for (std::size_t i = 0; i < cached_ids.size(); ++i) {
-    pos.emplace(cached_ids[i].GetPrimaryIndex(), i);
-  }
-  std::vector<std::size_t> projection;
-  projection.reserve(requested_ids.size());
+  std::vector<std::size_t> requested_primary_indices;
+  requested_primary_indices.reserve(requested_ids.size());
   for (auto const& c : requested_ids) {
-    auto it = pos.find(c.GetPrimaryIndex());
-    if (it == pos.end()) { return {}; }  // cache lacks a requested column
-    projection.push_back(it->second);
+    requested_primary_indices.push_back(c.GetPrimaryIndex());
   }
-  return projection;
+  return gather_by_primary_index(cached_ids, requested_primary_indices);
 }
 
 // column_ids-aligned names: for each column_ids[i], the full-schema name at its
@@ -635,8 +649,15 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
 
   try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
-      auto cols = entry.cache_info.can_serve_with_columns(table_info);
-      if (cols.empty()) { continue; }  // serve only on a real (non-empty) match
+      // Identity + serviceability gate: empty when this cache cannot serve the scan
+      // (wrong format / file-set / table, or missing a requested column).
+      if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
+      // Serve cached columns in the ingestible's materialized (disk-decode) order rather
+      // than raw column_ids order, so post_filter_and_project's index-based filter and
+      // projection bind to the same columns they would on the disk read path.
+      auto cols = gather_by_primary_index(entry.cache_info.column_ids,
+                                          op->get_ingestible().materialized_column_order());
+      if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
       auto provider = make_provider_for_pinned_entry(entry, cols);
       _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
       spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",

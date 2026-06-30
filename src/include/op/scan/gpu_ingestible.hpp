@@ -138,6 +138,16 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
   [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
 
+  /// Column primary (storage) indices in the exact order @ref materialize_table emits
+  /// them — output columns first (in output order), then pure-filter columns; partition
+  /// and virtual columns excluded. This is the layout @ref post_filter_and_project assumes
+  /// (its index-based filter refs and projection are expressed in this order).
+  ///
+  /// The pinned-cache scan path serves cached columns in this order — instead of raw
+  /// column_ids order — so a cached batch is laid out identically to a fresh disk read and
+  /// @ref post_filter_and_project resolves the same columns on both paths.
+  [[nodiscard]] virtual std::vector<std::size_t> materialized_column_order() const = 0;
+
  protected:
   gpu_ingestible() noexcept = default;
 };

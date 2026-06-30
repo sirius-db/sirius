@@ -691,4 +691,21 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   return assembled.release(stream, mr_ref);
 }
 
+//===----------------------------------------------------------------------===//
+// materialized_column_order
+//===----------------------------------------------------------------------===//
+std::vector<std::size_t> parquet_gpu_ingestible::materialized_column_order() const
+{
+  // The reader materializes columns in _plan->data_columns order (output columns first,
+  // pure-filter columns trailing; partition/virtual excluded) — exactly the layout
+  // post_filter_and_project's filter refs (batch_position_by_column_id) and output_layout
+  // assume. Expose it as primary/storage indices for the pinned-cache path.
+  std::vector<std::size_t> order;
+  order.reserve(_plan->data_columns.size());
+  for (auto const& dc : _plan->data_columns) {
+    order.push_back(dc.primary_idx);
+  }
+  return order;
+}
+
 }  // namespace sirius::op::scan

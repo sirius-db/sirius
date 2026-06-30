@@ -346,6 +346,33 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   return final_table.release(stream, mr_ref);
 }
 
+//===----------------------------------------------------------------------===//
+// materialized_column_order
+//===----------------------------------------------------------------------===//
+std::vector<std::size_t> duckdb_native_gpu_ingestible::materialized_column_order() const
+{
+  // The decoder emits columns in source_ids order (projection_ids, or column_ids order when
+  // projection is empty) — output columns first, pure-filter columns trailing — which is the
+  // layout post_filter_and_project's emission_order_map filter and [0..output_arity)
+  // projection assume. Return the corresponding column primary (storage) indices, matching
+  // how the pin cache keys columns (ColumnIndex::GetPrimaryIndex).
+  auto const& column_ids     = _info->column_ids;
+  auto const& projection_ids = _info->projection_ids;
+  std::vector<std::size_t> order;
+  if (projection_ids.empty()) {
+    order.reserve(column_ids.size());
+    for (auto const& c : column_ids) {
+      order.push_back(c.GetPrimaryIndex());
+    }
+  } else {
+    order.reserve(projection_ids.size());
+    for (auto const pid : projection_ids) {
+      order.push_back(column_ids[pid].GetPrimaryIndex());
+    }
+  }
+  return order;
+}
+
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(
   std::unique_ptr<duckdb_native_ingestible_table_info> info)
 {

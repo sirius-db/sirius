@@ -157,6 +157,8 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
+  [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
+
  private:
   std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> _info;
   duckdb_native_walk_plan _plan;
