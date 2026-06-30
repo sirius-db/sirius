@@ -4,17 +4,47 @@
 //! fragment instance id until end-of-stream. This store bridges those two RPCs: the exec handler
 //! buffers a fragment's rows here, and each `fetch_data` poll drains them.
 
+use std::fmt;
 use std::{collections::HashMap, sync::Mutex};
 
 use starrocks_thrift::data::TResultBatch;
+use starrocks_thrift::types::TUniqueId;
+use uuid::Uuid;
 
-/// StarRocks `fragment_instance_id` (a `TUniqueId`), the key the FE passes to `fetch_data`.
+use crate::proto::starrocks::PUniqueId;
+
+/// StarRocks `fragment_instance_id`, the key the FE passes to `fetch_data`.
+///
+/// StarRocks identifies a fragment instance by a 128-bit id split into `hi`/`lo`
+/// 64-bit halves (thrift `TUniqueId` on dispatch, proto `PUniqueId` on
+/// `fetch_data`). It is held here as a [`Uuid`] so the two wire forms compare
+/// equal and logs render the canonical hyphenated form instead of `hi-lo`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct FragmentInstanceId {
-    /// High 64 bits of the instance id.
-    pub(crate) hi: i64,
-    /// Low 64 bits of the instance id.
-    pub(crate) lo: i64,
+pub(crate) struct FragmentInstanceId(Uuid);
+
+impl FragmentInstanceId {
+    /// Packs the `hi`/`lo` 64-bit halves of a StarRocks unique id into a [`Uuid`].
+    pub(crate) fn from_halves(hi: i64, lo: i64) -> Self {
+        Self(Uuid::from_u64_pair(hi as u64, lo as u64))
+    }
+}
+
+impl From<&TUniqueId> for FragmentInstanceId {
+    fn from(id: &TUniqueId) -> Self {
+        Self::from_halves(id.hi, id.lo)
+    }
+}
+
+impl From<&PUniqueId> for FragmentInstanceId {
+    fn from(id: &PUniqueId) -> Self {
+        Self::from_halves(id.hi, id.lo)
+    }
+}
+
+impl fmt::Display for FragmentInstanceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 /// One buffered fragment result and where the FE `fetch_data` poll is in draining it.
@@ -111,7 +141,7 @@ mod tests {
     #[test]
     fn delivers_rows_once_then_reports_eos_on_repeat_polls() {
         let store = ResultStore::default();
-        let id = FragmentInstanceId { hi: 1, lo: 2 };
+        let id = FragmentInstanceId::from_halves(1, 2);
         store.insert(id, batch(&["a", "b"]));
 
         let first = store.take_next(id).expect("known fragment");
@@ -132,7 +162,7 @@ mod tests {
         let store = ResultStore::default();
         assert!(
             store
-                .take_next(FragmentInstanceId { hi: 9, lo: 9 })
+                .take_next(FragmentInstanceId::from_halves(9, 9))
                 .is_none()
         );
     }
