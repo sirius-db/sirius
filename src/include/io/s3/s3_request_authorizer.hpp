@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/s3/s3_object_ref.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -31,18 +33,6 @@ namespace sirius::io::s3 {
 /// Sirius needs only read-only S3 operations; PUT / DELETE etc. are
 /// intentionally absent.
 enum class s3_request_method : std::uint8_t { GET, HEAD };
-
-/**
- * @brief Object reference passed to @c s3_request_authorizer::authorize.
- *
- * @c bucket carries the object-store bucket name (no scheme, no trailing
- * slashes). @c key carries the object key, RFC3986-decoded — the authorizer
- * re-encodes for canonical URI construction.
- */
-struct s3_object_ref {
-  std::string bucket;
-  std::string key;
-};
 
 /// Result of authorizing one S3 request: the URL to fetch plus headers to
 /// attach verbatim. Presigned authorizers put auth in the URL query and

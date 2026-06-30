@@ -4686,3 +4686,74 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   REQUIRE(unpin_result);
   REQUIRE_FALSE(unpin_result->HasError());
 }
+
+// duckdb-native pin: pin a table in the attached tpch .db (format='duckdb',
+// table='lineitem'), then a SELECT over the same table must be served from the
+// pinned cache (matched by DataTable* identity), bypassing the native scan.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - pin_table duckdb-native gpu tier scan and aggregate",
+                 "[integration][gpu_execution][duckdb_native][pin_table_duckdb]")
+{
+  auto pin_query  = std::string("CALL pin_table(format='duckdb', name='lineitem', tier='gpu');");
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+    "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+// duckdb-native host-tier pin: same as above but the pinned columns live in
+// pinned host memory; the cached host batches are sliced + served on hit.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - pin_table duckdb-native host tier scan and aggregate",
+                 "[integration][gpu_execution][duckdb_native][pin_table_duckdb_host]")
+{
+  auto pin_query  = std::string("CALL pin_table(format='duckdb', name='lineitem', tier='host');");
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+    "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+// Pin a column subset (cols=[...]) and then run a query that requests a strict
+// subset of those pinned columns — it must be served from the cache. A miss would
+// fall through to the separate (non-cached) scan path, so a passing run also
+// confirms the cache hit; compare_gpu_vs_cpu validates the served data.
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - pin_table column subset serves a subset query",
+                 "[integration][gpu_execution][parquet][pin_table_cols_subset]")
+{
+  auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+  auto pin_query   = "CALL pin_table('" + parquet_dir.string() +
+                   "/lineitem.parquet', tier='gpu', name='lineitem_subset', "
+                   "cols=['l_orderkey', 'l_returnflag', 'l_linestatus', 'l_quantity']);";
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  // Requests only l_returnflag, l_linestatus, l_quantity — a strict subset of the
+  // pinned columns (l_orderkey is pinned but unused here).
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+    "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem_subset');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}

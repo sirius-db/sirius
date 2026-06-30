@@ -111,13 +111,6 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
        "      num_threads: "
     << params.pipeline_num_threads
     << "\n"
-       "    duckdb_scan:\n"
-       "      num_threads: "
-    << params.duckdb_scan_num_threads
-    << "\n"
-       "      cache: "
-    << params.cache
-    << "\n"
        "    task_creator:\n"
        "      num_threads: "
     << params.task_creator_num_threads

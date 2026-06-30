@@ -16,29 +16,56 @@
 
 #include "scan_manager/split_provider.hpp"
 
-#include "op/sirius_physical_operator.hpp"
-#include "scan_manager/balancing_strategy.hpp"
-#include "scan_manager/split_connector.hpp"
+#include "exec/completion_controller.hpp"
+#include "exec/scoped_dispatcher.hpp"
+#include "exec/try.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 
+#include <cassert>
+#include <exception>
 #include <utility>
 
 namespace sirius::scan_manager {
 
-void split_provider::push_to_connector(split_connector& connector,
-                                       std::unique_ptr<op::operator_data> split)
+split_provider::split_provider(op::scan::gpu_ingestible& ingestible, io::sirius_ioctx& io_ctx)
+  : _ingestible(&ingestible), _io_ctx(io_ctx.shared_from_this())
 {
-  connector.push_split(std::move(split));
 }
 
-void split_provider::apply_balancing(op::operator_data& split)
+bool split_provider::has_more_splits() const { return !_ingestible->has_processed_all_metadata(); }
+
+std::function<std::unique_ptr<op::scan::scan_info>()> split_provider::next_split_provider()
 {
-  if (!_balancing_strategy) { return; }
-  // Resident splits already live on a specific GPU; let downstream data
-  // locality decide their placement instead of overriding it here. Also
-  // respect a preference an upstream producer already set.
-  if (split.is_resident() || split.get_preferred_device_id().has_value()) { return; }
-  auto const device_id = _balancing_strategy->get_next_gpu(_pipeline_id, &split);
-  if (device_id >= 0) { split.set_preferred_device_id(device_id); }
+  return _ingestible->next_split_provider(_io_ctx);
 }
+
+template <typename Scheduler>
+void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
+{
+  using split_type = typename value_type::value_type;
+  assert(on_split);
+  exec::completion_controller ctrl;
+  _completion_token =
+    ctrl.on_completion([on_split] { on_split(exec::make_empty_try<split_type>()); });
+  while (has_more_splits()) {
+    auto work = next_split_provider();
+    if (!work) { continue; }
+    scheduler.enqueue([this, on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
+      try {
+        auto split = work();
+        on_split(std::move(split));
+      } catch (...) {
+        on_split(std::current_exception());
+      }
+    });
+  }
+}
+
+// run() is a template parameterised on the scheduler, so its definition lives
+// here rather than in the header. Explicitly instantiate it for the only
+// scheduler the codebase drives it with (sirius_scan_manager's
+// scoped_dispatcher); add a line here if a new scheduler type ever calls run().
+template void split_provider::run<exec::scoped_dispatcher>(exec::scoped_dispatcher&,
+                                                           const push_callback_t&);
 
 }  // namespace sirius::scan_manager

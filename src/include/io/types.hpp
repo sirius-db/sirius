@@ -21,33 +21,47 @@
 
 #include <cuda_runtime.h>
 
-#include <atomic>
+#include <sys/uio.h>
+
+#include <cassert>
 #include <cstddef>
-#include <exception>
-#include <functional>
+#include <cstdint>
 #include <memory>
-#include <stdexcept>
 #include <string>
-#include <utility>
+#include <vector>
 
 namespace sirius::io {
 
-// ---------------------------------------------------------------------------
-// Completion handler
-// ---------------------------------------------------------------------------
+static constexpr size_t IO_BLOCK_SIZE = 4096;  // O_DIRECT page size
 
-/// Boost.Asio-style completion handler for async I/O.
-/// @param bytes_transferred  Total bytes read on success.
-/// @param ep                 Non-null on failure.
-using io_completion_handler = std::function<void(size_t bytes_transferred, std::exception_ptr ep)>;
-
-// ---------------------------------------------------------------------------
-// IO constants
-// ---------------------------------------------------------------------------
-
-static constexpr size_t CHUNK_SIZE    = 1UL << 20;  ///< Bounce-buffer chunk size (1 MiB).
-static constexpr size_t NUM_CHUNKS    = 128;        ///< Number of bounce slots per reactor.
-static constexpr size_t IO_BLOCK_SIZE = 4096;       ///< O_DIRECT alignment requirement (bytes).
+/**
+ * @brief RAII wrapper for a POSIX file descriptor.
+ *
+ * Non-copyable, movable. Closes the underlying fd on destruction.
+ */
+struct file_descriptor {
+  int fd{-1};
+  file_descriptor() = default;
+  explicit file_descriptor(int f) noexcept : fd(f) {}
+  ~file_descriptor() noexcept
+  {
+    if (fd >= 0) ::close(fd);
+  }
+  file_descriptor(file_descriptor const&)            = delete;
+  file_descriptor& operator=(file_descriptor const&) = delete;
+  file_descriptor(file_descriptor&& o) noexcept : fd(std::exchange(o.fd, -1)) {}
+  file_descriptor& operator=(file_descriptor&& o) noexcept
+  {
+    if (this != &o) {
+      if (fd >= 0) ::close(fd);
+      fd = std::exchange(o.fd, -1);
+    }
+    return *this;
+  }
+  [[nodiscard]] int get() const noexcept { return fd; }
+  [[nodiscard]] int native_handle() const noexcept { return fd; }
+  explicit operator bool() const noexcept { return fd >= 0; }
+};
 
 // ---------------------------------------------------------------------------
 // sirius_io_object
@@ -85,165 +99,105 @@ class sirius_io_object_metadata {
   virtual ~sirius_io_object_metadata() = default;
 };
 
-// ---------------------------------------------------------------------------
-// request_context
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Shared completion state for one logical read call (host or device).
- *
- * A single read may be split into multiple sub-requests. All sub-requests
- * decrement @c pending; the last one resolves the handler.
- *
- * Construction is gated by @c create() so callers can't forget to set
- * @c pending or @c handler (a missed setup would silently deadlock the
- * caller).  The destructor is a safety net: if @c handler hasn't been
- * fired by the time the last @c shared_ptr drops (e.g., a sub-request
- * was silently dropped somewhere in the dispatch chain), it fires with
- * an explicit error so the caller sees a failure instead of hanging.
- */
-struct request_context {
- private:
-  // Private tag so only create() can construct.  Public ctor signature so
-  // std::make_shared still works (preserves the single-allocation control
-  // block + object layout).
-  struct create_passkey {};
-
+/// A read of @c size bytes starting at file @c offset, scattered into one or
+/// more destination buffers (@c buffers, in file order).  A single-buffer
+/// segment is a plain read; a multi-buffer segment is a vectored (readv) read
+/// whose iovecs cover @c [offset, offset + size) contiguously in the file but
+/// may land in discontiguous host allocations.
+///
+/// Invariant: @c size == Σ buffers[i].iov_len.  The merge step that fuses
+/// neighboring segments during request preparation maintains this by routing
+/// every growth through @c append.
+class io_object_segment {
  public:
-  explicit request_context(create_passkey) noexcept {}
+  io_object_segment() = default;
 
-  request_context(request_context const&)            = delete;
-  request_context& operator=(request_context const&) = delete;
-
-  /// Construct a request_context expecting @p n_chunks chunk_done /
-  /// chunk_failed calls.
-  ///
-  /// - If @p n_chunks == 0: invokes @p handler with (0, nullptr) immediately
-  ///   and returns nullptr.  Caller checks `if (!ctx) return;`.
-  /// - If @p handler is null and @p n_chunks > 0: throws
-  ///   @c std::invalid_argument.  A pending count with no handler would
-  ///   silently deadlock the caller.
-  /// - Otherwise: returns a fully-populated shared_ptr.
-  [[nodiscard]] static std::shared_ptr<request_context> create(size_t n_chunks,
-                                                               size_t total_bytes,
-                                                               io_completion_handler handler)
+  io_object_segment(size_t offset, size_t size)
+    : offset(offset), size(size), buffers{iovec{nullptr, size}}
   {
-    if (n_chunks == 0) {
-      if (handler) {
-        try {
-          handler(0, nullptr);
-        } catch (...) {
-          // Caller's handler threw on the zero-work path; nothing useful
-          // to do here.
-        }
-      }
-      return nullptr;
-    }
-    if (!handler) {
-      throw std::invalid_argument("request_context::create: handler is null but n_chunks > 0");
-    }
-    auto ctx         = std::make_shared<request_context>(create_passkey{});
-    ctx->handler     = std::move(handler);
-    ctx->total_bytes = total_bytes;
-    ctx->pending.store(n_chunks, std::memory_order_relaxed);
-    return ctx;
   }
 
-  ~request_context() noexcept
+  io_object_segment(size_t offset, size_t size, uint8_t* buffer)
+    : offset(offset), size(size), buffers{iovec{static_cast<void*>(buffer), size}}
   {
-    // Safety net: if the handler hasn't been fired by the normal path
-    // (e.g., a sub-request was silently dropped between enqueue and
-    // completion), fire it now with an explicit error so the caller
-    // doesn't hang forever waiting on a handler that will never come.
-    bool expected = false;
-    if (handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel) &&
-        handler) {
-      try {
-        handler(0,
-                std::make_exception_ptr(
-                  std::runtime_error("request_context destructed before all chunks completed — "
-                                     "handler resolved by safety net")));
-      } catch (...) {
-        // A throwing handler at destruction time can't propagate anywhere
-        // useful — swallow to keep the destructor noexcept.
+  }
+
+  /// Set the destination of a single-buffer segment (the bounce-slot path
+  /// assigns the reactor's internal buffer late, once a slot is acquired).
+  void set_data(uint8_t* buffer)
+  {
+    assert(buffers.size() == 1 && "set_data is only valid for a single-buffer segment");
+    buffers.front().iov_base = static_cast<void*>(buffer);
+  }
+
+  [[nodiscard]] uint8_t* data() const noexcept
+  {
+    return buffers.empty() ? nullptr : static_cast<uint8_t*>(buffers.front().iov_base);
+  }
+
+  [[nodiscard]] bool is_buffer_allocated() const noexcept { return data() != nullptr; }
+
+  /// Number of destination buffers (== number of iovecs in a readv).
+  [[nodiscard]] size_t n_chunks() const noexcept { return buffers.size(); }
+
+  /// True iff this segment must be submitted via io_uring_prep_readv (rather
+  /// than a single io_uring_prep_read).
+  [[nodiscard]] bool is_vectored() const noexcept { return buffers.size() > 1; }
+
+  /// O_DIRECT requires the file offset, the total length, and every iovec base
+  /// and length to be block-aligned.
+  [[nodiscard]] bool is_odirect_compatible() const noexcept
+  {
+    if (offset % IO_BLOCK_SIZE != 0 || size % IO_BLOCK_SIZE != 0) { return false; }
+    for (auto const& b : buffers) {
+      if (b.iov_len % IO_BLOCK_SIZE != 0) { return false; }
+      if (b.iov_base != nullptr && reinterpret_cast<uintptr_t>(b.iov_base) % IO_BLOCK_SIZE != 0) {
+        return false;
       }
     }
+    return true;
   }
 
-  void chunk_done()
+  /// Append a destination buffer, fusing a contiguous neighbor into this
+  /// segment.  Grows @c size by the buffer length to preserve the invariant.
+  void append(iovec iov) noexcept
   {
-    if (pending.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    buffers.push_back(iov);
+    size += iov.iov_len;
+  }
 
-    // Last chunk — fire the handler exactly once.  The CAS guard makes
-    // this idempotent against the destructor safety net and against any
-    // future imbalance where chunk_done could be called extra times.
-    bool expected = false;
-    if (!handler_fired.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
-
-    if (failed.load(std::memory_order_relaxed)) {
-      handler(0, exc);
-    } else {
-      handler(total_bytes, nullptr);
+  /// Rebuild the iovec list for resuming a short read after @p skip bytes were
+  /// already read: drops fully-consumed buffers and advances into the
+  /// straddling one.  Fills @p out in place (reusing its capacity across
+  /// resubmissions); @c buffers is untouched.
+  void fill_remaining_buffers(size_t skip, std::vector<iovec>& out) const
+  {
+    out.clear();
+    out.reserve(buffers.size());
+    for (auto const& iov : buffers) {
+      if (skip >= iov.iov_len) {
+        skip -= iov.iov_len;
+        continue;
+      }
+      out.push_back(iovec{static_cast<uint8_t*>(iov.iov_base) + skip, iov.iov_len - skip});
+      skip = 0;
     }
   }
 
-  void chunk_failed(std::exception_ptr e)
-  {
-    bool expected = false;
-    if (failed.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
-      exc = std::move(e);
-    }
-    chunk_done();
-  }
-
-  io_completion_handler handler;
-  std::atomic<size_t> pending{0};
-  size_t total_bytes{0};
-  std::atomic<bool> failed{false};
-  std::exception_ptr exc;
-  /// Set (via CAS) by whichever path resolves the handler — normal
-  /// completion in chunk_done() or the destructor safety net.
-  /// Guarantees the handler fires at most once.
-  std::atomic<bool> handler_fired{false};
-};
-
-// ---------------------------------------------------------------------------
-// device_read_req / host_read_req
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Descriptor for one aligned 1 MiB I/O chunk pushed to a reactor for
- *        a device (GPU) read.  Templated on the backend's native handle type
- *        (e.g. @c int for a POSIX file descriptor).
- */
-template <typename Handle>
-struct device_read_req {
-  Handle handle{};
-  size_t file_off{0};
-  size_t io_size{0};
-  size_t data_off{0};
-  size_t data_size{0};
-  uint8_t* dst{nullptr};
-  cudaStream_t stream{nullptr};
-  /// CUDA device index that owns @c dst and @c stream.  The reactor thread
-  /// may be running with a different current device, so it must
-  /// cudaSetDevice(device_id) before issuing the H2D copy in multi-GPU
-  /// deployments.  -1 means "don't switch" (single-GPU fast path).
-  int device_id{-1};
-  std::shared_ptr<request_context> ctx;
-};
-
-/**
- * @brief Descriptor for one buffered host read pushed to a reactor.
- *        Templated on the backend's native handle type.
- */
-template <typename Handle>
-struct host_read_req {
-  Handle handle{};
   size_t offset{0};
   size_t size{0};
-  uint8_t* dst{nullptr};
-  std::shared_ptr<request_context> ctx;
+  // Destination buffers in file order.  Owned here so the iovec array stays
+  // alive until the SQE referencing it is reaped.
+  std::vector<iovec> buffers;
 };
+
+/// True iff @p a immediately precedes @p b in the file (no gap, no overlap):
+/// a.offset + a.size == b.offset.  Used to decide whether two segments can be
+/// fused into a single vectored (readv) submission over one contiguous range.
+[[nodiscard]] inline bool contiguous(const io_object_segment& a,
+                                     const io_object_segment& b) noexcept
+{
+  return a.offset + a.size == b.offset;
+}
 
 }  // namespace sirius::io

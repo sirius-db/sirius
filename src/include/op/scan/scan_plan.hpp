@@ -19,6 +19,7 @@
 // sirius
 #include <helper/logical_type.hpp>
 #include <op/scan/hive_partition.hpp>
+#include <op/scan/owning_table_view.hpp>
 
 // duckdb
 #include <duckdb/common/column_index.hpp>
@@ -144,27 +145,30 @@ struct scan_plan {
 ///      covers @c data_columns 1:1 in order.
 [[nodiscard]] bool needs_output_assembly(scan_plan const& plan);
 
-/// Reshape the reader's D-order batch to the plan's output layout: walk
-/// @c output_layout, moving DATA columns out of the batch and synthesizing
-/// PARTITION columns from @p partition_values. Pure-filter data columns
-/// (present in @c data_columns but not referenced by @c output_layout) are
-/// implicitly freed when the released batch goes out of scope.
+/// Reshape the reader's D-order batch to the plan's output layout.
 ///
-/// Callers should gate the call on @ref needs_output_assembly to avoid the
-/// release/rebuild round-trip when assembly is a no-op. When called regardless,
-/// the function still produces a correct output but performs unnecessary work
-/// in the identity case.
+/// When the plan has no partition columns the output is a pure projection /
+/// reordering of the reader's data columns: it is expressed as a non-owning
+/// @ref owning_table_view selection (@c select_columns), so no device buffers
+/// are copied — pure-filter data columns are dropped from the view and freed
+/// when the result is later materialized. When the plan has partition columns
+/// the reader batch is materialized and rebuilt, moving DATA columns out and
+/// synthesizing constant PARTITION columns from @p partition_values.
 ///
+/// Returns @p table unchanged when @c output_layout is empty (SELECT count(*) —
+/// emitting a 0-column table would erase the row count downstream aggregations
+/// consume).
+///
+/// @param table             The reader's D-order batch to reshape (consumed).
 /// @param plan              The scan plan describing the layout.
-/// @param reader_output     The reader's D-order batch to reshape.
 /// @param partition_values  Partition values for this split, in
 ///                          @c partition_columns order. Empty when the plan has
 ///                          no partition columns.
 /// @param stream            CUDA stream for any GPU work (scalar-backed column
-///                          construction).
-[[nodiscard]] std::unique_ptr<cudf::table> assemble_scan_output(
+///                          construction on the partition path).
+[[nodiscard]] owning_table_view assemble_scan_output(
   scan_plan const& plan,
-  std::unique_ptr<cudf::table> reader_output,
+  owning_table_view&& table,
   std::vector<std::string> const& partition_values,
   rmm::cuda_stream_view stream);
 

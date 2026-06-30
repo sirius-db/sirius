@@ -103,13 +103,36 @@ bool needs_output_assembly(scan_plan const& plan)
   return false;
 }
 
-std::unique_ptr<cudf::table> assemble_scan_output(scan_plan const& plan,
-                                                  std::unique_ptr<cudf::table> reader_output,
-                                                  std::vector<std::string> const& partition_values,
-                                                  rmm::cuda_stream_view stream)
+owning_table_view assemble_scan_output(scan_plan const& plan,
+                                       owning_table_view&& table,
+                                       std::vector<std::string> const& partition_values,
+                                       rmm::cuda_stream_view stream)
 {
-  if (!reader_output) return reader_output;
+  if (!table) { return std::move(table); }
 
+  // Nothing to reshape (SELECT count(*) — empty output layout). Emitting a
+  // 0-column table would erase the row count downstream aggregations consume.
+  if (plan.output_layout.empty()) { return std::move(table); }
+
+  // No partition columns: the output is a pure projection / reordering of the
+  // reader's data columns. Express it as a non-owning view selection — no GPU
+  // copy. Every output_entry is DATA here (PARTITION entries only exist when the
+  // plan has partition columns), and entry.idx is the column's position in the
+  // current (D-order) view. Pure-filter data columns are dropped by the
+  // selection and freed when the view is later materialized.
+  if (!plan.has_partitions()) {
+    std::vector<std::size_t> positions;
+    positions.reserve(plan.output_layout.size());
+    for (auto const& entry : plan.output_layout) {
+      positions.push_back(entry.idx);
+    }
+    table.select_columns(positions);
+    return std::move(table);
+  }
+
+  // Partition columns present: materialize the reader batch and rebuild, moving
+  // DATA columns out and synthesizing constant PARTITION columns from the path.
+  auto reader_output  = table.release(stream);
   auto const num_rows = reader_output->num_rows();
   auto data_cols      = reader_output->release();  // move columns out, no GPU copy
 
@@ -139,7 +162,7 @@ std::unique_ptr<cudf::table> assemble_scan_output(scan_plan const& plan,
 
   // Unused data columns (pure-filter columns not in output_layout) fall out
   // of scope with data_cols and are freed.
-  return std::make_unique<cudf::table>(std::move(out_cols));
+  return owning_table_view{std::make_unique<cudf::table>(std::move(out_cols))};
 }
 
 //===----------------------------------------------------------------------===//

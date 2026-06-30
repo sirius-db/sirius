@@ -16,7 +16,9 @@
 
 #include "pipeline/sirius_pipeline_converter.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/shared_ptr_ipp.hpp"
 #include "duckdb/function/table/table_scan.hpp"
@@ -24,6 +26,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -269,8 +272,9 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   table_info->scan_output_arity      = scan_op.types.size();
   table_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
-  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
-    scan_op.types, scan_op.estimated_cardinality, std::move(table_info));
+  auto parquet_ingestible = op::scan::make_ingestible(std::move(table_info));
+  auto gpu_scan_op        = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(parquet_ingestible));
 
   auto* gpu_scan_ptr = gpu_scan_op.get();
 
@@ -308,6 +312,11 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   table_info->storage = &table.GetStorage();
   table_info->context = client_context_;
   table_info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  // Qualified-name identity for the pin cache — derived from the resolved
+  // DuckTableEntry so it matches the pin-side derivation (build_duckdb_pin_info) exactly.
+  table_info->catalog_name           = table.ParentCatalog().GetName();
+  table_info->schema_name            = table.ParentSchema().name;
+  table_info->table_name             = table.name;
   table_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
   std::vector<std::size_t> source_ids_fallback;
@@ -349,8 +358,9 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   table_info->returned_types = scan_op.returned_types;
   table_info->output_types   = scan_op.types;
 
-  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
-    scan_op.types, scan_op.estimated_cardinality, std::move(table_info));
+  auto duckdb_native_ingestible = op::scan::make_ingestible(std::move(table_info));
+  auto gpu_scan_op              = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(duckdb_native_ingestible));
 
   auto* gpu_scan_ptr = gpu_scan_op.get();
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);

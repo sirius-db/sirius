@@ -17,9 +17,8 @@
 #pragma once
 
 // sirius
-#include <io/gpu_ingestible.hpp>
+#include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
-
 // cucascade
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -31,6 +30,7 @@
 // standard library
 #include <cstddef>
 #include <memory>
+#include <variant>
 
 namespace sirius::op::scan {
 
@@ -52,8 +52,13 @@ namespace sirius::op::scan {
  */
 class scan_operator_input : public op::operator_data {
  public:
-  explicit scan_operator_input(std::unique_ptr<io::scan_and_filter_metadata> m)
-    : metadata(std::move(m))
+  explicit scan_operator_input(std::unique_ptr<scan_info> metadata)
+    : materialization_info(std::move(metadata))
+  {
+  }
+
+  explicit scan_operator_input(std::shared_ptr<cucascade::data_batch> cached_batch)
+    : materialization_info(std::move(cached_batch))
   {
   }
 
@@ -62,70 +67,60 @@ class scan_operator_input : public op::operator_data {
     return op::operator_data_type::GPU_SCAN;
   }
 
+  [[nodiscard]] bool is_resident() const noexcept override
+  {
+    return std::holds_alternative<std::shared_ptr<::cucascade::data_batch>>(materialization_info);
+  }
+
+  [[nodiscard]] bool has_scan_metadata() const noexcept
+  {
+    return std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info) &&
+           std::get<std::unique_ptr<scan_info>>(materialization_info) != nullptr;
+  }
+
+  [[nodiscard]] std::vector<op::scan::scan_info::fadvise_entry> get_fadvise_hints() const
+  {
+    if (!has_scan_metadata()) { return {}; }
+    return std::get<std::unique_ptr<scan_info>>(materialization_info)->fadvise_entries();
+  }
+
+  void prefetch(io::cache::prefetching_stage site) const
+  {
+    if (!has_scan_metadata()) { return; }
+    auto hints = get_fadvise_hints();
+    for (auto& hint : hints) {
+      hint.datasource->prefetch(site);
+    }
+  }
+
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view /*stream*/) override
-  {
-    gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
-  }
-
-  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
-  {
-    return metadata ? metadata->scan().estimated_bytes() : 0;
-  }
-
-  std::unique_ptr<io::scan_and_filter_metadata> metadata;
-  ::cucascade::memory::memory_space* gpu_memory_space = nullptr;
-};
-
-//===----------------------------------------------------------------------===//
-// scan_operator_with_pinned_table_input
-//===----------------------------------------------------------------------===//
-/**
- * @brief Operator input for a pinned (cached) scan task.
- *
- * Carries a zero-copy data_batch view over the pinned columns and
- * (optionally) a post-decode filter/projection description. When
- * @ref filter_info is null, @c sirius_gpu_scan_operator::execute forwards
- * the batch unchanged. Otherwise it dispatches into the installed
- * @c io::gpu_ingestible::post_filter_and_project (the cached ingestible
- * applies the filter via @c gpu_expression_executor).
- *
- * @ref prepare_for_processing matches the legacy
- * @c scan_cached_operator_data: host-tier batches are converted to
- * gpu_table_representation on the requested memory space; GPU-tier batches
- * are left in place.
- */
-class scan_operator_with_pinned_table_input : public op::operator_data {
- public:
-  scan_operator_with_pinned_table_input(std::shared_ptr<::cucascade::data_batch> b,
-                                        std::unique_ptr<io::post_filter_and_projection_info> f)
-    : batch(std::move(b)), filter_info(std::move(f))
-  {
-  }
-
-  [[nodiscard]] op::operator_data_type get_type() const override
-  {
-    return op::operator_data_type::GPU_SCAN;
-  }
-
-  [[nodiscard]] bool is_resident() const noexcept override { return true; }
-
-  /**
-   * @brief Move host-tier cached batches onto the requested GPU memory space.
-   *
-   * Mirrors @c scan_cached_operator_data::prepare_for_processing: skip when
-   * the batch is already on GPU or when no target space was requested;
-   * otherwise convert via the converter registry. After any conversion the
-   * batch's resident memory space is captured for @c execute to consume.
-   */
-  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view stream) override;
+                              rmm::cuda_stream_view /*stream*/) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
-  std::shared_ptr<::cucascade::data_batch> batch;
-  std::unique_ptr<io::post_filter_and_projection_info> filter_info;
-  ::cucascade::memory::memory_space* gpu_memory_space = nullptr;
+  [[nodiscard]] const scan_info& get_scan_info() const
+  {
+    if (!has_scan_metadata()) {
+      throw std::runtime_error(
+        "[scan_operator_input::get_scan_info] no scan metadata present; check has_scan_metadata() "
+        "first.");
+    }
+    return *std::get<std::unique_ptr<scan_info>>(materialization_info);
+  }
+
+  [[nodiscard]] std::shared_ptr<::cucascade::data_batch> get_cached_batch() const
+  {
+    if (!is_resident()) {
+      throw std::runtime_error(
+        "[scan_operator_input::get_cached_batch] no cached batch present; check is_resident() "
+        "first.");
+    }
+    return std::get<std::shared_ptr<::cucascade::data_batch>>(materialization_info);
+  }
+
+  cucascade::memory::memory_space* gpu_memory_space = nullptr;
+  std::variant<std::monostate, std::unique_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
+    materialization_info;
 };
 
 }  // namespace sirius::op::scan
