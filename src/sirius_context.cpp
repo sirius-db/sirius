@@ -348,16 +348,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
-  // Route cuDF's current-device-resource through the cucascade adaptor for every GPU, ONCE here at
-  // engine init. cuDF-internal allocations that don't take an explicit mr — notably the cuco hash
-  // tables in hash group-by / hash join / distinct — pull from
-  // rmm::mr::get_current_device_resource_ref(). The Sirius extension and libcudf each carry a
-  // PRIVATE copy of RMM's per-device-resource registry (the extension's function-local statics are
-  // hidden-visibility; libcudf's are GNU_UNIQUE), so the manager's own
-  // cudf::set_current_device_resource_ref only updates the extension's copy — cuDF reads libcudf's,
-  // which otherwise defaults to raw cudaMalloc and bypasses the reservation system. This installs
-  // the adaptor into libcudf's copy so those allocations are reservation-tracked. See
-  // rapidsai/rmm#826 and src/include/memory/libcudf_current_resource_bridge.hpp.
+  // OPT-IN (default OFF; SIRIUS_ENABLE_LIBCUDF_RESOURCE_BRIDGE=1). Attempt to route cuDF's
+  // current-device-resource through the cucascade adaptor so cuDF-internal allocations that don't
+  // take an explicit mr (notably the cuco hash tables in hash group-by / hash join / distinct,
+  // which pull from rmm::mr::get_current_device_resource_ref()) are reservation-tracked instead of
+  // hitting raw cudaMalloc via a duplicate RMM registry. KNOWN TO CORRUPT results at scale, so it is
+  // a no-op unless explicitly enabled — see libcudf_current_resource_bridge.hpp and rapidsai/rmm#826.
   for (auto const* gpu_space :
        memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
     sirius::memory::ensure_libcudf_current_device_resource(gpu_space->get_device_id(),
