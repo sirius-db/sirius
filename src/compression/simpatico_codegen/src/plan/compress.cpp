@@ -257,17 +257,67 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
     nd.rep_path = nd.input_path;
     nd.meta     = nd.rep->describe_meta();
   }
-  // Raw passthrough reps land in the parent node's channels map under the
-  // channel_name output path: "values" for Rle parents, "deltas" for For parents.
+
+  // Build covered set early so the raw-passthrough loop can use it.
+  std::unordered_set<NodeId> const covered(head.covered_nodes.begin(), head.covered_nodes.end());
+  std::vector<std::string> to_recurse;
+
+  // Route each raw-passthrough leaf.
+  //
+  // When a downstream non-fused op consumes the channel path (entropy-tail):
+  //   1. Strip the `data` column from the RawFused rep (keep only `offsets` for
+  //      the decode binder, which resolves data via the downstream rep's bytes).
+  //   2. Keep the data column alive via reprs_by_input until the downstream op
+  //      fires and calls release_column.
+  //   3. Seed columns[channel_path] with a view of the raw data so emit_path can
+  //      route it to the downstream op (e.g. ans, bitcomp).
+  //   4. Add channel_path to to_recurse.
+  //
+  // When no downstream consumer exists (terminal): park the whole RawFused.
   for (auto& leaf : builder.raw_passthrough_leaves) {
     auto& parent_nd = tree.nodes[leaf.parent_id];
+    std::string channel_output_path;
     for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
       if (parent_nd.output_names[i] == leaf.channel_name) {
-        parent_nd.channels.emplace(parent_nd.output_paths[i], std::move(leaf.rep));
+        channel_output_path = parent_nd.output_paths[i];
         break;
       }
     }
+    if (channel_output_path.empty()) continue;  // shouldn't happen
+
+    auto cit                  = consumer_by_input.find(channel_output_path);
+    bool const has_downstream = (cit != consumer_by_input.end() && !covered.count(cit->second));
+
+    if (has_downstream) {
+      auto* raw_rep = static_cast<codegen_fused_representation*>(leaf.rep.get());
+      std::unique_ptr<cudf::column> data_col;
+      for (auto& [bname, bcol] : raw_rep->buffers) {
+        if (bname == "data") {
+          data_col = std::move(bcol);
+          break;
+        }
+      }
+      // Erase the now-null entry so named_channels() returns only offsets.
+      raw_rep->buffers.erase(std::remove_if(raw_rep->buffers.begin(),
+                                            raw_rep->buffers.end(),
+                                            [](auto const& p) { return p.second == nullptr; }),
+                             raw_rep->buffers.end());
+      if (data_col) {
+        cudf::column_view data_view = data_col->view();
+        std::string repr_key        = channel_output_path + ":raw_passthrough";
+        reprs_by_input.emplace(
+          repr_key, std::make_unique<identity_compressed_representation>(std::move(data_col)));
+        col_to_repr_key[channel_output_path] = repr_key;
+        repr_pending[repr_key]               = 1;
+        columns.emplace(channel_output_path, data_view);
+        to_recurse.push_back(channel_output_path);
+      }
+    }
+    // Park the (possibly data-stripped) RawFused rep in the parent's channels
+    // so the decode binder can find its offsets buffer.
+    parent_nd.channels.emplace(channel_output_path, std::move(leaf.rep));
   }
+
   // The region's head input has now been fully consumed by the JIT kernel; free
   // it (boundary outputs below are backed by node-owned reps, not by head_path).
   release_column(head_path);
@@ -275,11 +325,10 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
   // The fused region covers several PlanTree nodes; mark them done and recurse
   // into each region output that feeds a real downstream op (e.g. a bitpack
   // `.packed` channel consumed by `deflate`). Interior region edges (whose
-  // consumer is itself covered) and terminal channels (drained synthetically /
-  // owned by the rep) are skipped.
+  // consumer is itself covered), terminal channels (drained synthetically /
+  // owned by the rep), and channels already routed by the raw-passthrough loop
+  // above are skipped.
   if (head.covered_nodes.empty()) return true;
-  std::unordered_set<NodeId> const covered(head.covered_nodes.begin(), head.covered_nodes.end());
-  std::vector<std::string> to_recurse;
   for (NodeId cn : head.covered_nodes) {
     visited[cn]                    = true;
     PlanNode const& cnode          = tree.nodes[cn];
@@ -289,6 +338,9 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
       auto cit                       = consumer_by_input.find(output_path);
       if (cit == consumer_by_input.end()) continue;  // terminal (owned by rep)
       if (covered.count(cit->second)) continue;      // interior region edge
+      // Already routed by the raw-passthrough loop above (data_col was seeded
+      // into columns and path is in to_recurse).
+      if (columns.count(output_path)) continue;
 
       if (!rep) {
         set_error("fused boundary: missing rep at node " + std::to_string(cn));
@@ -468,36 +520,88 @@ std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
     }
   }
 
-  // Fast path: the whole plan fuses from "input" into one JIT kernel. The head
-  // op is the consumer of "input"; if jit_encode_subtree succeeds it has placed
-  // every region rep, so the compound is complete.
+  // Fast path: the whole plan fuses from "input" into one JIT kernel.  The
+  // head op is the consumer of "input"; if jit_encode_subtree succeeds AND
+  // every raw-passthrough channel is terminal (no downstream non-fused op), the
+  // compound is complete and we return early.  If any raw-passthrough channel
+  // has a downstream consumer (entropy-tail routing needed), the fast path is
+  // skipped so the general CompressWalk can handle it via emit_fused_node.
   auto head_it = consumer_by_input.find("input");
   if (head_it != consumer_by_input.end()) {
-    plan_compound_builder builder;
-    std::string jit_err;
-    if (jit_encode_subtree(tree, head_it->second, input, stream, mr, builder, &jit_err)) {
-      // Place NodeId-keyed reps directly onto their owning nodes.
-      for (auto& [nodeid, rep] : builder.leaves) {
-        auto& nd    = tree.nodes[nodeid];
-        nd.rep      = std::move(rep);
-        nd.rep_path = nd.input_path;
-        nd.meta     = nd.rep->describe_meta();
-      }
-      // Raw passthrough reps land in the parent node's channels map under the
-      // channel_name output path ("values" for RLE, "deltas" for FOR).
-      for (auto& leaf : builder.raw_passthrough_leaves) {
-        auto& parent_nd = tree.nodes[leaf.parent_id];
-        for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
-          if (parent_nd.output_names[i] == leaf.channel_name) {
-            parent_nd.channels.emplace(parent_nd.output_paths[i], std::move(leaf.rep));
-            break;
+    // Pre-check: inspect the fused region structure without running the GPU
+    // kernel.  If any Raw leaf has a downstream consumer, skip the fast path.
+    bool fast_path_ok = true;
+    {
+      auto maybe_built = build_fused_tree(tree,
+                                          head_it->second,
+                                          /*fixed_stride=*/true);
+      if (maybe_built) {
+        // Bail if any Raw passthrough leaf has a downstream consumer
+        // (entropy-tail routing needed — general walk handles it).
+        for (auto const& origin : maybe_built->preorder) {
+          if (!origin.is_raw_passthrough || origin.parent_channel.empty()) continue;
+          auto const& parent_nd = tree.nodes[origin.parent_rle];
+          for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
+            if (parent_nd.output_names[i] == origin.parent_channel) {
+              if (consumer_by_input.count(parent_nd.output_paths[i])) { fast_path_ok = false; }
+              break;
+            }
+          }
+          if (!fast_path_ok) break;
+        }
+
+        // Also bail if any covered node has a boundary output feeding a
+        // second codegen (JIT-fused) region.  The fast path's single
+        // jit_encode_subtree call covers only the primary region; the
+        // secondary region must be handled by the general CompressWalk.
+        if (fast_path_ok) {
+          std::unordered_set<NodeId> covered_set;
+          for (auto const& origin : maybe_built->preorder) {
+            if (!origin.is_raw_passthrough && origin.plan_node < tree.nodes.size()) {
+              covered_set.insert(origin.plan_node);
+            }
+          }
+          for (auto const& origin : maybe_built->preorder) {
+            if (origin.is_raw_passthrough || !fast_path_ok) continue;
+            if (origin.plan_node >= tree.nodes.size()) continue;
+            for (auto const& e : tree.nodes[origin.plan_node].children) {
+              if (!covered_set.count(e.child) && e.child < tree.nodes.size() &&
+                  is_codegen_compressor(tree.nodes[e.child].op)) {
+                fast_path_ok = false;
+                break;
+              }
+            }
           }
         }
       }
-      if (error_out) error_out->clear();
-      return compound;
     }
-    if (!jit_err.empty() && error_out) *error_out = jit_err;
+
+    if (fast_path_ok) {
+      plan_compound_builder builder;
+      std::string jit_err;
+      if (jit_encode_subtree(tree, head_it->second, input, stream, mr, builder, &jit_err)) {
+        // Place NodeId-keyed reps directly onto their owning nodes.
+        for (auto& [nodeid, rep] : builder.leaves) {
+          auto& nd    = tree.nodes[nodeid];
+          nd.rep      = std::move(rep);
+          nd.rep_path = nd.input_path;
+          nd.meta     = nd.rep->describe_meta();
+        }
+        // All raw-passthrough reps are terminal: park in parent channels.
+        for (auto& leaf : builder.raw_passthrough_leaves) {
+          auto& parent_nd = tree.nodes[leaf.parent_id];
+          for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
+            if (parent_nd.output_names[i] == leaf.channel_name) {
+              parent_nd.channels.emplace(parent_nd.output_paths[i], std::move(leaf.rep));
+              break;
+            }
+          }
+        }
+        if (error_out) error_out->clear();
+        return compound;
+      }
+      if (!jit_err.empty() && error_out) *error_out = jit_err;
+    }
   }
 
   // General path: single recursive walk from "input", placing reps as it goes.

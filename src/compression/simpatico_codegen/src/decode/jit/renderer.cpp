@@ -894,14 +894,83 @@ ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& 
 }
 
 // =====================================================================
-// ZigZag — producer leaf.  Reads the stored `zigzag` channel, applies the
-// inverse map, writes `len` reconstructed elements into `dst`.
+// ZigZag — DUAL-MODE producer.
+//
+// Transformer mode (a fused op produced the ZigZag codes, e.g.
+// `zigzag.zigzag -> bitpack`): reconstruct the child's values, then apply the
+// inverse map  n = (z >> 1) ^ -(z & 1)  per element.  Two paths mirror FOR:
+//   * Closed-form child (Bitpack/Raw leaf): splice its value_source expr.
+//   * Producer child (Delta/Rle): materialise into a shared slab first.
+// The code value is loaded into a local once so a non-trivial child read
+// (e.g. simpatico_bp_at) is evaluated a single time per element.
+//
+// Leaf mode: reads the stored `zigzag` channel, applies the inverse map,
+// writes `len` reconstructed elements into `dst`.
 // =====================================================================
 void Walker::emit_zigzag_producer(const ::codegen::jit::FusedTree& node,
                                   const std::string& dst,
                                   const std::string& len,
                                   const std::string& elem_type)
 {
+  if (!node.children.empty()) {
+    if (node.children.size() != 1) {
+      throw RenderError(
+        "decode render: Zigzag transformer must have exactly one child "
+        "named 'zigzag' (got " +
+        std::to_string(node.children.size()) + " children)");
+    }
+    auto zit = node.children.find("zigzag");
+    if (zit == node.children.end()) {
+      throw RenderError("decode render: Zigzag missing 'zigzag' child (got '" +
+                        node.children.begin()->first + "' instead)");
+    }
+    const std::size_t esize = dtype_elem_size(elem_type);
+    if (esize == 0) {
+      throw RenderError("decode render: Zigzag op-local dtype '" + elem_type + "' not supported");
+    }
+    const std::string utype = (esize == 8) ? "uint64_t" : "uint32_t";
+    const std::int32_t id   = id_of(node);
+    const std::string idstr = std::to_string(id);
+
+    const bool child_is_leaf =
+      (zit->second->op == ::codegen::OpKind::Bitpack && zit->second->children.empty()) ||
+      (zit->second->op == ::codegen::OpKind::Raw && zit->second->children.empty());
+
+    body_ << "    // --- node " << id << ": Zigzag (reverse inline, " << elem_type << ") ---\n";
+
+    // Emit the per-element inverse, given a textual code-value expression
+    // `code_expr` (already position-substituted).
+    auto emit_inverse_loop = [&](const std::string& code_expr) {
+      body_ << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
+            << ") {\n"
+            << "        const " << utype << " _zc = static_cast<" << utype << ">(" << code_expr
+            << ");\n"
+            << "        (" << dst << ")[i] = static_cast<" << elem_type
+            << ">((_zc >> 1) ^ (static_cast<" << utype << ">(0) - (_zc & static_cast<" << utype
+            << ">(1))));\n"
+            << "    }\n"
+            << "    __syncthreads();\n";
+    };
+
+    if (child_is_leaf) {
+      const auto mark = sm_.mark();
+      ValueSource cvs = value_source(*zit->second, elem_type, len);
+      emit_inverse_loop(at_pos(cvs.read_expr, "i"));
+      sm_.release_to(mark);
+    } else {
+      const auto mark        = sm_.mark();
+      const std::string slab = "zz_slab_" + idstr;
+      const std::size_t off  = sm_.alloc(esize, ::codegen::kChunkSize);
+      body_ << "    " << elem_type << "* " << slab << " = reinterpret_cast<" << elem_type
+            << "*>(workspace + " << off << ");\n";
+      emit_producer(*zit->second, slab, len, elem_type);
+      body_ << "    __syncthreads();\n";
+      emit_inverse_loop(slab + "[i]");
+      sm_.release_to(mark);
+    }
+    return;
+  }
+
   ValueSource vs = zigzag_value_source_inline(node, elem_type);
   body_ << "    // --- node " << id_of(node) << ": Zigzag producer (" << elem_type << ") ---\n"
         << "    for (int32_t i = tid; i < (" << len << "); i += " << tbs_ << ") {\n"

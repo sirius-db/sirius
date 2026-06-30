@@ -897,38 +897,34 @@ void Walker::emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in)
 }
 
 // =====================================================================
-// emit_zigzag — LEAF (storing transform).
+// emit_zigzag — DUAL-MODE (inline transformer OR storing leaf).
 //
-// ZigZag is a sink, like Raw: it consumes the incoming LaneInput
-// (whatever transformer chain preceded it has rewritten read_expr into a
-// closed-form per-lane value) and stores the ZigZag-mapped stream into a
-// single output channel "zigzag".  Unlike Raw it applies the closed-form
-// ZigZag map on store:  z = (uv << 1) ^ (uv >> (W-1))  (arithmetic shift
-// supplies the sign mask).  The decode-side producer applies the inverse.
+// ZigZag is the closed-form per-lane bijection
+//   z = (uv << 1) ^ (uv >> (W-1))   (arithmetic shift supplies the sign mask)
+// which the decode side inverts with  n = (z >> 1) ^ -(z & 1).
 //
-// Layout — fixed-stride OverAllocate, identical to FOR's Raw passthrough.
+// Transformer mode (a FUSABLE op consumes the `zigzag` channel, e.g.
+// `zigzag.zigzag -> bitpack`):  ZigZag rewrites LaneInput.read_expr to the
+// closed-form map and recurses into the child WITHOUT storing anything — a
+// pure inline transform exactly like Delta/FOR splice their residual into the
+// child's read expression.  The child stores its own buffers; ZigZag carries
+// no per-chunk metadata.
+//
+// Leaf mode (no outgoing edge, or the edge feeds a NON-fused entropy coder
+// such as `…zigzag -> ans`):  ZigZag STORES the transformed stream into the
+// single output channel "zigzag" so a downstream non-fused op can entropy-code
+// it.  Layout — fixed-stride OverAllocate, identical to FOR's Raw passthrough.
 // Element i of chunk c lands at zigzag[c*CHUNK + i]; decode reads
-// zigzag[chunk_id*CHUNK + i] with the chunk_id known at kernel entry, so
-// no per-chunk offsets buffer is needed (the stride is the constant
-// CHUNK).  The buffer is num_chunks*CHUNK elements; trailing slots of the
-// final short chunk are pre-zeroed (default) and never read — keeping the
-// entropy tail deterministic.
-//
-// ZigZag preserves element count and order (a pure per-lane bijection), so
-// it carries no per-chunk metadata.  Storing the transformed stream as a
-// real rep channel (rather than rewriting read_expr inline) is what lets a
-// downstream NON-fused op entropy-code it:  the channel is exposed via the
-// rep's named_channels() and routed by the compress boundary loop exactly
-// like FOR's `references` or Bitpack's `packed`.
+// zigzag[chunk_id*CHUNK + i] with the chunk_id known at kernel entry, so no
+// per-chunk offsets buffer is needed (the stride is the constant CHUNK).  The
+// buffer is num_chunks*CHUNK elements; trailing slots of the final short chunk
+// are pre-zeroed (default) and never read — keeping the entropy tail
+// deterministic.  The channel is exposed via the rep's named_channels() and
+// routed by the compress boundary loop exactly like FOR's `references` or
+// Bitpack's `packed`.
 // =====================================================================
 void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
 {
-  if (!node.children.empty()) {
-    throw RenderError(
-      "render: Zigzag must be a leaf (no children) — it stores its "
-      "transformed stream to the `zigzag` channel; a downstream codec "
-      "attaches to that channel, not as a fused child");
-  }
   const DtypeInfo* op_dt = lookup_dtype(in.elem_type);
   if (op_dt == nullptr) {
     throw RenderError("render: Zigzag op-local dtype '" + in.elem_type +
@@ -939,6 +935,39 @@ void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
   const std::string utype = (op_dt->elem_size == 8) ? "uint64_t" : "uint32_t";
   const int shift         = static_cast<int>(op_dt->elem_size) * 8 - 1;
 
+  // ---- Transformer mode: rewrite read_expr inline, recurse, store nothing.
+  if (!node.children.empty()) {
+    if (node.children.size() != 1) {
+      throw RenderError(
+        "render: Zigzag transformer must have exactly one child named "
+        "'zigzag' (got " +
+        std::to_string(node.children.size()) + " children)");
+    }
+    auto zit = node.children.find("zigzag");
+    if (zit == node.children.end()) {
+      throw RenderError("render: Zigzag missing 'zigzag' child (got '" +
+                        node.children.begin()->first + "' instead)");
+    }
+    // Consume a node id to keep the encode counter aligned with the
+    // decode-side DFS-preorder ids (the child must be id+1), even though
+    // ZigZag emits no params/buffers of its own.
+    const std::int32_t id = take_id();
+    const std::string v   = at_lane(in.read_expr, "(__LANE__)");
+    body_ << "    // --- node " << id << ": Zigzag (inline transform, " << in.elem_type
+          << ") ---\n";
+
+    LaneInput out;
+    out.kind      = LaneInput::Expr;
+    out.elem_type = in.elem_type;
+    out.read_expr = "(static_cast<" + in.elem_type + ">(" + "(static_cast<" + utype + ">(" + v +
+                    ") << 1) ^ " + "static_cast<" + utype + ">((" + v + ") >> " +
+                    std::to_string(shift) + ")))";
+    out.length_expr = in.length_expr;
+    emit_node(*zit->second, std::move(out));
+    return;
+  }
+
+  // ---- Leaf mode: store the ZigZag-mapped stream to the `zigzag` channel.
   const std::int32_t id    = take_id();
   const std::string idstr  = std::to_string(id);
   const std::string p_data = "zigzag_" + idstr;

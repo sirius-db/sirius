@@ -110,14 +110,31 @@ void test_rle_raw_values_passthrough()
   expect(built->preorder[2].parent_rle == rle, "raw passthrough parent is rle");
 }
 
-void test_invalid_region_returns_nullopt()
+// delta with a non-fusable (ans) child on the differences channel now builds
+// a valid tree via the new dual-mode Raw passthrough, just like FOR's deltas.
+void test_delta_raw_differences_passthrough()
 {
   auto t = build_tree(
     "input -> delta -> differences\n"
     "delta.differences -> ans\n");
   simpatico::NodeId delta = node_for_op(t, "delta");
   auto built              = simpatico::build_fused_tree(t, delta, /*fixed_stride=*/true);
-  expect(!built.has_value(), "delta with ans child -> nullopt");
+  expect(built.has_value(), "delta with ans child -> valid Raw passthrough tree");
+
+  auto const& root = *built->tree;
+  expect(root.op == OpKind::Delta, "root is Delta");
+  auto diff_it = root.children.find("differences");
+  expect(diff_it != root.children.end(), "delta has 'differences' child");
+  expect(diff_it->second->op == OpKind::Raw, "differences child is Raw passthrough");
+  expect(diff_it->second->is_leaf(), "Raw passthrough has no children");
+
+  // Preorder: delta, raw(differences).
+  expect(built->preorder.size() == 2, "2 preorder nodes");
+  expect(!built->preorder[0].is_raw_passthrough, "preorder[0] is real Delta node");
+  expect(built->preorder[1].is_raw_passthrough, "preorder[1] is raw passthrough");
+  expect(built->preorder[1].parent_rle == delta, "raw passthrough parent is delta");
+  expect(built->preorder[1].parent_channel == "differences",
+         "raw passthrough channel is 'differences'");
 }
 
 }  // namespace
@@ -128,7 +145,7 @@ int main()
     test_cascade_shape_and_preorder();
     test_fixed_stride_false_for_decode();
     test_rle_raw_values_passthrough();
-    test_invalid_region_returns_nullopt();
+    test_delta_raw_differences_passthrough();
     std::printf("test_fused_tree_build: PASS\n");
     return 0;
   } catch (std::exception const& e) {

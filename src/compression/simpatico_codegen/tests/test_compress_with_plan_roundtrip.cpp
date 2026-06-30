@@ -404,6 +404,50 @@ int main()
     }
 
     {
+      // ZigZag -> Bitpack (FUSED): ZigZag is the region root acting as an
+      // inline transformer (stores nothing), bitpack is the covered leaf that
+      // packs the ZigZag-mapped codes.  Exercises the transformer encode path
+      // + the closed-form (Bitpack leaf) inverse decode path.  int32 and int64.
+      auto t32 = make_int32_table(2, 4096, 171);
+      std::string dsl32 =
+        "input -> zigzag -> zigzag\n"
+        "zigzag.zigzag -> bitpack\n"
+        "---\n"
+        "input -> zigzag -> zigzag\n"
+        "zigzag.zigzag -> bitpack\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_zigzag_bitpack_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_zigzag_bitpack_int32_mt");
+
+      auto t64 = make_int64_table(2, 4096, 173);
+      std::string dsl64 =
+        "input -> zigzag -> zigzag\n"
+        "zigzag.zigzag -> bitpack\n"
+        "---\n"
+        "input -> zigzag -> zigzag\n"
+        "zigzag.zigzag -> bitpack\n";
+      roundtrip_once(t64->view(), dsl64, 1, "jit_zigzag_bitpack_int64");
+      roundtrip_once(t64->view(), dsl64, 2, "jit_zigzag_bitpack_int64_mt");
+    }
+
+    {
+      // Delta -> ZigZag -> Bitpack (FUSED): delta is the region root (inline
+      // scan), ZigZag is an interior transformer, bitpack is the covered leaf.
+      // Exercises ZigZag fused BELOW another transformer (decode materialises
+      // ZigZag via the generic value_source slab path).
+      auto t = make_int32_table(2, 4096, 177);
+      std::string dsl =
+        "input -> delta -> differences\n"
+        "delta.differences -> zigzag -> zigzag\n"
+        "delta.differences.zigzag -> bitpack\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> zigzag -> zigzag\n"
+        "delta.differences.zigzag -> bitpack\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_delta_zigzag_bitpack_int32");
+      roundtrip_once(t->view(), dsl, 2, "jit_delta_zigzag_bitpack_int32_mt");
+    }
+
+    {
       // Delta -> ZigZag: delta is the region root (inline scan), ZigZag is the
       // covered leaf that stores the ZigZagged differences.  This is the
       // canonical signed-residual pipeline.
@@ -455,6 +499,174 @@ int main()
         "for.deltas.chunk_bits -> identity\n";
       roundtrip_once(t->view(), dsl, 1, "jit_for_bp_ans_int32");
       roundtrip_once(t->view(), dsl, 2, "jit_for_bp_ans_int32_mt");
+    }
+
+    // -----------------------------------------------------------------
+    // Dual-mode entropy-tail tests: delta, for, rle channels -> ans
+    // -----------------------------------------------------------------
+
+    {
+      // Delta.differences -> ANS (no zigzag): the differences stream is
+      // materialized via a Raw passthrough leaf and entropy-coded directly.
+      // int32 and int64.
+      auto t32 = make_int32_table(2, 4096, 191);
+      std::string dsl32 =
+        "input -> delta -> differences\n"
+        "delta.differences -> ans\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> ans\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_delta_differences_ans_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_delta_differences_ans_int32_mt");
+
+      auto t64 = make_int64_table(2, 4096, 193);
+      std::string dsl64 =
+        "input -> delta -> differences\n"
+        "delta.differences -> ans\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> ans\n";
+      roundtrip_once(t64->view(), dsl64, 1, "jit_delta_differences_ans_int64");
+      roundtrip_once(t64->view(), dsl64, 2, "jit_delta_differences_ans_int64_mt");
+    }
+
+    {
+      // FOR.deltas -> ANS: residuals (delta channel) entropy-tail-routed,
+      // references stored as identity. int32 and int64.
+      auto t32 = make_int32_table(2, 4096, 197);
+      std::string dsl32 =
+        "input -> for -> deltas, references\n"
+        "for.deltas -> ans\n"
+        "---\n"
+        "input -> for -> deltas, references\n"
+        "for.deltas -> ans\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_for_deltas_ans_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_for_deltas_ans_int32_mt");
+
+      auto t64 = make_int64_table(2, 4096, 199);
+      std::string dsl64 =
+        "input -> for -> deltas, references\n"
+        "for.deltas -> ans\n"
+        "---\n"
+        "input -> for -> deltas, references\n"
+        "for.deltas -> ans\n";
+      roundtrip_once(t64->view(), dsl64, 1, "jit_for_deltas_ans_int64");
+      roundtrip_once(t64->view(), dsl64, 2, "jit_for_deltas_ans_int64_mt");
+    }
+
+    {
+      // RLE.values -> ANS: unique run values entropy-tail-routed to ANS.
+      // The runs are bitpacked (fused). int32.
+      auto t32 = make_int32_table(2, 1024, 203);
+      std::string dsl32 =
+        "input -> rle -> values, runs\n"
+        "rle.runs -> bitpack\n"
+        "rle.values -> ans\n"
+        "---\n"
+        "input -> rle -> values, runs\n"
+        "rle.runs -> bitpack\n"
+        "rle.values -> ans\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_rle_values_ans_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_rle_values_ans_int32_mt");
+    }
+
+    {
+      // RLE.runs -> ANS: run counts entropy-tail-routed to ANS.
+      // The values are bitpacked (fused). int32.
+      auto t32 = make_int32_table(2, 1024, 211);
+      std::string dsl32 =
+        "input -> rle -> values, runs\n"
+        "rle.values -> bitpack\n"
+        "rle.runs -> ans\n"
+        "---\n"
+        "input -> rle -> values, runs\n"
+        "rle.values -> bitpack\n"
+        "rle.runs -> ans\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_rle_runs_ans_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_rle_runs_ans_int32_mt");
+    }
+
+    {
+      // RLE with BOTH channels entropy-tail-routed: values -> ans,
+      // runs -> snappy. All channels use Raw passthrough. int32.
+      auto t32 = make_int32_table(2, 1024, 223);
+      std::string dsl32 =
+        "input -> rle -> values, runs\n"
+        "rle.values -> ans\n"
+        "rle.runs -> snappy\n"
+        "---\n"
+        "input -> rle -> values, runs\n"
+        "rle.values -> ans\n"
+        "rle.runs -> snappy\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_rle_both_tails_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_rle_both_tails_int32_mt");
+    }
+
+    {
+      // Delta -> RLE -> values (ans) + runs (snappy): a two-stage fused
+      // region (delta inside rle) where both rle outputs are entropy tails.
+      // DSL path convention: nested output paths are <parent_path>.<output_name>,
+      // NOT <parent_path>.<op_name>.<output_name>.
+      auto t32 = make_int32_table(2, 1024, 227);
+      std::string dsl32 =
+        "input -> delta -> differences\n"
+        "delta.differences -> rle -> values, runs\n"
+        "delta.differences.values -> ans\n"
+        "delta.differences.runs -> snappy\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> rle -> values, runs\n"
+        "delta.differences.values -> ans\n"
+        "delta.differences.runs -> snappy\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_delta_rle_both_tails_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_delta_rle_both_tails_int32_mt");
+    }
+
+    {
+      // Phase-2 fused->fused: for.references -> bitpack.
+      // FOR fuses deltas with bitpack inline (one kernel); the per-chunk
+      // reference minimums are bitpacked separately in a second kernel.
+      // int32, int64.
+      auto t32 = make_int32_table(2, 2048, 241);
+      std::string dsl32 =
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n"
+        "for.references -> bitpack\n"
+        "---\n"
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n"
+        "for.references -> bitpack\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_for_refs_bitpack_int32");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_for_refs_bitpack_int32_mt");
+
+      auto t64 = make_int64_table(2, 2048, 251);
+      std::string dsl64 =
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n"
+        "for.references -> bitpack\n"
+        "---\n"
+        "input -> for -> deltas, references\n"
+        "for.deltas -> bitpack\n"
+        "for.references -> bitpack\n";
+      roundtrip_once(t64->view(), dsl64, 1, "jit_for_refs_bitpack_int64");
+    }
+
+    {
+      // Phase-2 fused->fused: delta -> for -> references -> bitpack.
+      // Delta fuses with FOR fuses with bitpack (deltas) inline; FOR's
+      // reference channel is bitpacked by a second independent kernel.
+      auto t32 = make_int32_table(2, 2048, 257);
+      std::string dsl32 =
+        "input -> delta -> differences\n"
+        "delta.differences -> for -> deltas, references\n"
+        "delta.differences.deltas -> bitpack\n"
+        "delta.differences.references -> bitpack\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> for -> deltas, references\n"
+        "delta.differences.deltas -> bitpack\n"
+        "delta.differences.references -> bitpack\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_delta_for_refs_bitpack_int32");
     }
 
     std::printf("test_compress_with_plan_roundtrip: PASS\n");

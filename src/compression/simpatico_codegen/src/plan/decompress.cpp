@@ -168,17 +168,42 @@ std::unique_ptr<cudf::column> resolve_channel_bytes_node(NodeId nid,
 // at preorder *node_id*. The Raw leaf has no PlanTree op of its own; its
 // bytes live in a RawFused rep parked on the parent node's ``channels``.
 //
-// The channel name is derived from origin.parent_op:
-//   "rle" -> "values" (run values), "for" -> "deltas" (residuals).
+// Two cases depending on whether the channel was entropy-tail-routed at encode:
+//
+//   Terminal (no downstream consumer): the RawFused rep holds both ``data``
+//   and ``offsets``; bind them directly.
+//
+//   Entropy-tail (data was routed to a downstream non-fused op, e.g. ans):
+//   the RawFused rep holds only ``offsets``; ``data`` is resolved by calling
+//   resolve_channel_bytes_node on the downstream PlanTree child node (the
+//   non-fused op that compressed the raw bytes). The resolved column is parked
+//   in *tail_scratches_out* so its device buffer outlives the decode launch.
+//
+// Element size for the data slot:
+//   rle.runs  -> always sizeof(int32_t) (run counts are int32 regardless of
+//               the column's original type).
+//   all others -> element_size (original column element size).
 bool bind_raw_passthrough_buffers(std::int32_t node_id,
                                   NodeId parent_id,
                                   std::string const& parent_op,
+                                  std::string const& parent_channel,
                                   PlanTree const& tree,
                                   std::size_t element_size,
+                                  rmm::cuda_stream_view stream,
+                                  rmm::device_async_resource_ref mr,
                                   codegen::jit::LabeledBuffers& labeled,
+                                  std::vector<std::unique_ptr<cudf::column>>& tail_scratches_out,
                                   std::string* error_out)
 {
-  std::string const channel_name       = (parent_op == "for") ? "deltas" : "values";
+  // Use the explicit channel name. Fall back to the old heuristic for
+  // forward-compatibility with any preorder that pre-dates parent_channel.
+  std::string const channel_name =
+    parent_channel.empty() ? ((parent_op == "for") ? "deltas" : "values") : parent_channel;
+
+  // run-count elements are always int32, regardless of the original column type.
+  const std::size_t data_elem_size = (channel_name == "runs") ? sizeof(std::int32_t) : element_size;
+
+  // Locate the RawFused rep in the parent's channels.
   compressed_representation const* rep = nullptr;
   if (parent_id < tree.nodes.size()) {
     auto const& parent_node = tree.nodes[parent_id];
@@ -197,11 +222,49 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
                    std::to_string(parent_id) + " (channel '" + channel_name + "')";
     return false;
   }
+
   std::vector<compressible_output> nb = rep->named_channels();
   std::unordered_map<std::string, cudf::column_view> by_name;
   for (auto const& o : nb)
     by_name.emplace(o.name, o.view);
+
   for (auto const& slot : consumed_slots("RawFused")) {
+    if (slot == "data" && by_name.find(slot) == by_name.end()) {
+      // Entropy-tail: data was stripped from the rep at encode time and
+      // compressed by a downstream non-fused op.  Find that child node and
+      // resolve (decompress) its bytes back to the raw element array.
+      if (parent_id >= tree.nodes.size()) {
+        if (error_out)
+          *error_out = "codegen decode: invalid parent_id for entropy-tail data resolve";
+        return false;
+      }
+      auto const& parent_node = tree.nodes[parent_id];
+      NodeId child_id         = static_cast<NodeId>(tree.nodes.size());
+      for (auto const& e : parent_node.children) {
+        if (e.channel == channel_name) {
+          child_id = e.child;
+          break;
+        }
+      }
+      if (child_id >= tree.nodes.size()) {
+        if (error_out)
+          *error_out = "codegen decode: no child edge '" + channel_name + "' on parent " +
+                       std::to_string(parent_id) + " for entropy-tail resolve";
+        return false;
+      }
+      auto resolved = resolve_channel_bytes_node(child_id, tree, stream, mr);
+      if (!resolved) {
+        if (error_out)
+          *error_out = "codegen decode: entropy-tail resolve failed for RawFused channel '" +
+                       channel_name + "'";
+        return false;
+      }
+      cudf::column_view dv                               = resolved->view();
+      labeled[codegen::jit::buffer_key(node_id, "data")] = {
+        dv.head<void>(), static_cast<std::size_t>(dv.size()), data_elem_size};
+      tail_scratches_out.push_back(std::move(resolved));
+      continue;
+    }
     auto bit = by_name.find(slot);
     if (bit == by_name.end()) {
       if (error_out) *error_out = "codegen decode: RawFused leaf missing slot '" + slot + "'";
@@ -210,7 +273,7 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
     labeled[codegen::jit::buffer_key(node_id, slot)] = {
       bit->second.head<void>(),
       static_cast<std::size_t>(bit->second.size()),
-      elem_size_for_slot(slot, element_size)};
+      elem_size_for_slot(slot, data_elem_size)};
   }
   return true;
 }
@@ -228,15 +291,17 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
 // the (synchronous) decode launch. An identity NO-OP terminal
 // (``…chunk_min -> identity``) leaves the bytes inside THIS rep and is bound
 // directly.
-bool bind_real_node_buffers(std::int32_t node_id,
-                            NodeId plan_node,
-                            PlanTree const& tree,
-                            std::size_t element_size,
-                            rmm::cuda_stream_view stream,
-                            rmm::device_async_resource_ref mr,
-                            codegen::jit::LabeledBuffers& labeled,
-                            std::vector<std::unique_ptr<cudf::column>>& tail_scratches_out,
-                            std::string* error_out)
+bool bind_real_node_buffers(
+  std::int32_t node_id,
+  NodeId plan_node,
+  PlanTree const& tree,
+  std::size_t element_size,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  codegen::jit::LabeledBuffers& labeled,
+  std::vector<std::unique_ptr<cudf::column>>& tail_scratches_out,
+  std::unordered_map<std::string, std::unique_ptr<cudf::column>> const& decompressed,
+  std::string* error_out)
 {
   PlanNode const& node                  = tree.nodes[plan_node];
   compressed_representation const* repr = node_rep(plan_node, tree);
@@ -273,14 +338,37 @@ bool bind_real_node_buffers(std::int32_t node_id,
     auto eit                      = edge_by_channel.find(slot);
     const bool has_edge           = eit != edge_by_channel.end();
     const bool downstream_has_rep = has_edge && node_rep(eit->second, tree) != nullptr;
+    // A codegen downstream was decoded post-order and its output column is
+    // already in `decompressed`; calling decompress() on it would throw.
+    const bool downstream_is_codegen =
+      has_edge && !codegen_kind_for_compressor(tree.nodes[eit->second].op).empty();
 
     const void* ptr = nullptr;
     std::size_t len = 0;
     auto bit        = by_name.find(slot);
     if (bit != by_name.end() && !downstream_has_rep) {
+      // Slot lives directly in this node's rep — bind it straight.
       ptr = bit->second.head<void>();
       len = static_cast<std::size_t>(bit->second.size());
+    } else if (downstream_is_codegen) {
+      // The downstream JIT region was decoded post-order before this node;
+      // its decompressed column is in `decompressed` keyed by the path it
+      // consumed (the downstream node's input_path, e.g. "for.references").
+      std::string const& downstream_path = tree.nodes[eit->second].input_path;
+      auto dit                           = decompressed.find(downstream_path);
+      if (dit == decompressed.end() || !dit->second) {
+        if (error_out)
+          *error_out = "codegen decode: pre-decoded column for '" + downstream_path +
+                       "' not found in decompressed map (post-order ordering issue)";
+        return false;
+      }
+      auto v = dit->second->view();
+      ptr    = v.head<void>();
+      len    = static_cast<std::size_t>(v.size());
+      // No tail_scratches_out push: the column is owned by decompressed map,
+      // which outlives the synchronous kernel launch below.
     } else if (has_edge) {
+      // Non-codegen entropy tail — resolve by decompressing the downstream rep.
       auto col = resolve_channel_bytes_node(eit->second, tree, stream, mr);
       if (!col) {
         if (error_out) {
@@ -321,6 +409,7 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
   rmm::device_async_resource_ref mr,
   codegen::jit::LabeledBuffers& labeled,
   std::vector<std::unique_ptr<cudf::column>>& tail_scratches_out,
+  std::unordered_map<std::string, std::unique_ptr<cudf::column>> const& decompressed,
   std::string* error_out)
 {
   auto built = build_fused_tree(tree, root_nid, /*fixed_stride=*/false);
@@ -333,9 +422,25 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
   for (std::int32_t node_id = 0; node_id < static_cast<std::int32_t>(built->preorder.size());
        ++node_id) {
     auto const& origin = built->preorder[node_id];
+    // Transformer-mode ZigZag stores nothing (it rewrites the lane value
+    // inline and recurses); the decode renderer emits no params for it, so
+    // there is no buffer to bind. Skip it — the child binds its own buffers.
+    if (origin.node != nullptr && origin.node->op == codegen::OpKind::Zigzag &&
+        !origin.node->children.empty()) {
+      continue;
+    }
     if (origin.is_raw_passthrough) {
-      if (!bind_raw_passthrough_buffers(
-            node_id, origin.parent_rle, origin.parent_op, tree, element_size, labeled, error_out)) {
+      if (!bind_raw_passthrough_buffers(node_id,
+                                        origin.parent_rle,
+                                        origin.parent_op,
+                                        origin.parent_channel,
+                                        tree,
+                                        element_size,
+                                        stream,
+                                        mr,
+                                        labeled,
+                                        tail_scratches_out,
+                                        error_out)) {
         return nullptr;
       }
     } else {
@@ -347,6 +452,7 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
                                   mr,
                                   labeled,
                                   tail_scratches_out,
+                                  decompressed,
                                   error_out)) {
         return nullptr;
       }
@@ -362,18 +468,37 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
 // call re-binds the reps and re-launches; the JIT compile is cached
 // process-wide in KernelCache.
 //
+// Some intermediate fuse nodes store nothing and own no rep;
+// their children own the reps. In that case, the first non-null rep in the
+// fused preorder provides the decoded type and num_rows.
+//
 // Returns nullptr + *error_out on failure.
-std::unique_ptr<cudf::column> dispatch_codegen_subtree(NodeId root_nid,
-                                                       PlanTree const& tree,
-                                                       rmm::cuda_stream_view stream,
-                                                       rmm::device_async_resource_ref mr,
-                                                       std::string* error_out)
+std::unique_ptr<cudf::column> dispatch_codegen_subtree(
+  NodeId root_nid,
+  PlanTree const& tree,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::unordered_map<std::string, std::unique_ptr<cudf::column>> const& decompressed,
+  std::string* error_out)
 {
   compressed_representation const* root_repr = node_rep(root_nid, tree);
   if (root_repr == nullptr) {
-    if (error_out)
-      *error_out = "codegen decompress: no rep at root node " + std::to_string(root_nid);
-    return nullptr;
+    // Transformer-mode root (e.g. ZigZag with a codegen child) stores no rep;
+    // find the first non-null rep in the fused preorder for metadata.
+    auto maybe_built = build_fused_tree(tree, root_nid, /*fixed_stride=*/false);
+    if (maybe_built) {
+      for (auto const& origin : maybe_built->preorder) {
+        if (!origin.is_raw_passthrough && origin.plan_node < tree.nodes.size()) {
+          root_repr = node_rep(origin.plan_node, tree);
+          if (root_repr) break;
+        }
+      }
+    }
+    if (root_repr == nullptr) {
+      if (error_out)
+        *error_out = "codegen decompress: no rep at root node " + std::to_string(root_nid);
+      return nullptr;
+    }
   }
   cudf::data_type root_type = root_repr->decoded_type();
   cudf::size_type num_rows  = root_repr->num_rows;
@@ -393,7 +518,7 @@ std::unique_ptr<cudf::column> dispatch_codegen_subtree(NodeId root_nid,
   const std::size_t element_size = static_cast<std::size_t>(cudf::size_of(root_type));
   std::string bind_err;
   auto fused = bind_fused_subtree(
-    root_nid, tree, element_size, stream, mr, labeled, tail_scratches, &bind_err);
+    root_nid, tree, element_size, stream, mr, labeled, tail_scratches, decompressed, &bind_err);
   if (!fused) {
     if (error_out) {
       *error_out = bind_err.empty() ? "codegen decompress: incomplete fused subtree" : bind_err;
@@ -589,7 +714,7 @@ bool decode_node(NodeId nid, TreeDecodeCtx& ctx, std::string* error_out)
       mark_subtree_nodes_skipped(nid, tree, ctx.skipped);
       return true;
     }
-    auto col = dispatch_codegen_subtree(nid, tree, ctx.stream, ctx.mr, error_out);
+    auto col = dispatch_codegen_subtree(nid, tree, ctx.stream, ctx.mr, ctx.decompressed, error_out);
     if (!col) return false;
     ctx.decompressed.emplace(target, std::move(col));
     mark_subtree_nodes_skipped(nid, tree, ctx.skipped);

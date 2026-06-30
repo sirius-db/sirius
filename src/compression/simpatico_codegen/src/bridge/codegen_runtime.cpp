@@ -944,11 +944,16 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
         }
 
         case cc::OpKind::Zigzag: {
-          // `zigzag` holds the transformed stream in fixed-stride OverAllocate
-          // layout: num_chunks * kChunkSize elements, element i of chunk c at
-          // [c*kChunkSize + i].  Decode is layout-aware (reads chunk_id*CHUNK +
-          // i), so no compaction is needed — the channel is published as-is and
-          // routed to a downstream codec (or stored) like any other rep channel.
+          // Transformer mode (fused child on the `zigzag` channel): ZigZag
+          // rewrote the lane value inline and stored NOTHING — the child owns
+          // all buffers, so there is no rep to build for this node.
+          if (!node.children.empty()) break;
+          // Leaf mode: `zigzag` holds the transformed stream in fixed-stride
+          // OverAllocate layout: num_chunks * kChunkSize elements, element i of
+          // chunk c at [c*kChunkSize + i].  Decode is layout-aware (reads
+          // chunk_id*CHUNK + i), so no compaction is needed — the channel is
+          // published as-is and routed to a downstream codec (or stored) like
+          // any other rep channel.
           const auto i_zz = find_buffer_idx(spec.buffers, node_id, "zigzag");
           const std::size_t zz_rows =
             static_cast<std::size_t>(num_chunks) * static_cast<std::size_t>(kChunkSize);
@@ -965,27 +970,45 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
         }
 
         case cc::OpKind::Raw: {
-          // The kernel wrote values in fixed-stride (OverAllocate) layout:
-          //   padded_data[c * kChunkSize + r]  for run/element r of chunk c.
-          //
-          // This is a synthesised Raw passthrough leaf (is_raw_passthrough==true):
-          // it has no PlanTree op node of its own. The rep is keyed by
+          // Synthesized Raw passthrough leaf (is_raw_passthrough == true).
+          // No PlanTree op node of its own.  The rep is keyed by
           // origin.parent_rle in builder->raw_passthrough_leaves; the compress
-          // driver parks it in tree.nodes[parent_rle].channels under the channel
-          // path for origin.parent_op ("values" for RLE, "deltas" for FOR).
+          // driver parks it in tree.nodes[parent_rle].channels under the
+          // output path for origin.parent_channel.
           //
-          // RLE parent: scatter padded → compact using rle_runs_offsets so the
-          // rep is born dense. FOR parent: the kernel wrote fixed-stride data
-          // (all CHUNK slots per chunk, no variable counts) — no compaction
-          // needed; data and offsets are consumed as-is.
-          const auto i_data = find_buffer_idx(spec.buffers, node_id, "data");
-          const std::int32_t elem_size =
-            static_cast<std::int32_t>((original_type.id() == cudf::type_id::INT64) ? 8 : 4);
+          // Two layout families, selected by parent_op:
+          //
+          //   Fixed-stride ("for" and "delta"): the kernel wrote
+          //     data[c*CHUNK + t] for each element t of chunk c.
+          //     The offsets buffer holds c*CHUNK for chunk c — a simple stride.
+          //     No compaction needed; data and offsets are copied as-is.
+          //
+          //   Compact ("rle", for both "values" and "runs"): the kernel wrote
+          //     data in padded OverAllocate layout; rle_runs_offsets gives the
+          //     per-chunk start + total element count, so we scatter → compact
+          //     via simpatico_compact_raw_values.
+          //
+          // Element type:
+          //   rle.runs  → always INT32 (run counts).
+          //   all others → original_type.
 
-          if (origin.parent_op == "for") {
-            // ─── FOR Raw: fixed-stride, no compaction ──────────────────────
+          const bool is_fixed_stride = (origin.parent_op == "for" || origin.parent_op == "delta");
+
+          // For rle.runs the kernel emits int32 counts; for every other channel
+          // the element type matches the column's original_type.
+          const bool is_runs_channel = (origin.parent_channel == "runs");
+          const cudf::data_type data_elem_type =
+            is_runs_channel ? cudf::data_type(cudf::type_id::INT32) : original_type;
+          const std::int32_t elem_size =
+            static_cast<std::int32_t>(is_runs_channel                                ? 4
+                                      : (original_type.id() == cudf::type_id::INT64) ? 8
+                                                                                     : 4);
+
+          const auto i_data = find_buffer_idx(spec.buffers, node_id, "data");
+
+          if (is_fixed_stride) {
+            // ─── Fixed-stride Raw (FOR deltas / Delta differences) ─────────
             // The kernel wrote data[c*CHUNK + t] and offsets[c] = c*CHUNK.
-            // Read the Raw node's own offsets buffer.
             const auto i_offs = find_buffer_idx(spec.buffers, node_id, "offsets");
 
             const std::size_t data_bytes = static_cast<std::size_t>(num_chunks) *
@@ -1002,7 +1025,8 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                                 stream.value());
                 e != cudaSuccess) {
               std::fprintf(stderr,
-                           "simpatico::codegen: FOR Raw: data DtoD failed: %s\n",
+                           "simpatico::codegen: %s Raw: data DtoD failed: %s\n",
+                           origin.parent_op.c_str(),
                            cudaGetErrorString(e));
               return -1;
             }
@@ -1014,14 +1038,15 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                                 stream.value());
                 e != cudaSuccess) {
               std::fprintf(stderr,
-                           "simpatico::codegen: FOR Raw: offsets DtoD failed: %s\n",
+                           "simpatico::codegen: %s Raw: offsets DtoD failed: %s\n",
+                           origin.parent_op.c_str(),
                            cudaGetErrorString(e));
               return -1;
             }
             cudaStreamSynchronize(stream.value());
 
             auto data_col =
-              std::make_unique<cudf::column>(original_type,
+              std::make_unique<cudf::column>(data_elem_type,
                                              static_cast<cudf::size_type>(num_chunks * kChunkSize),
                                              std::move(data_buf),
                                              rmm::device_buffer(0, stream),
@@ -1038,13 +1063,35 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             rep->buffers.emplace_back("data", std::move(data_col));
             rep->buffers.emplace_back("offsets", std::move(offs_col));
             builder->raw_passthrough_leaves.push_back(
-              {origin.parent_rle, "deltas", std::move(rep)});
+              {origin.parent_rle, origin.parent_channel, std::move(rep)});
             break;
           }
 
           {
-            // ─── RLE Raw: scatter padded → compact ────────────────────────
-            const auto i_rle_off    = find_buffer_idx(spec.buffers, 0, "rle_runs_offsets");
+            // ─── Compact Raw (RLE values / RLE runs) ──────────────────────
+            // Scatter padded OverAllocate → compact using rle_runs_offsets.
+            //
+            // Locate the parent RLE's node_id by scanning backward: the RLE
+            // node could be at index >0 when there is a transformer (e.g.
+            // Delta) in front of it in the same fused region.
+            std::int32_t rle_node_id = -1;
+            for (std::int32_t j = node_id - 1; j >= 0; --j) {
+              const simpatico::FusedNodeOrigin& o = head.preorder[j];
+              if (!o.is_raw_passthrough && o.node->op == cc::OpKind::Rle &&
+                  o.plan_node == origin.parent_rle) {
+                rle_node_id = j;
+                break;
+              }
+            }
+            if (rle_node_id < 0) {
+              std::fprintf(stderr,
+                           "simpatico::codegen: encode bridge: BUG - cannot find parent RLE "
+                           "node in preorder (nid=%d parent_rle=%u); preorder may be malformed\n",
+                           node_id,
+                           static_cast<unsigned>(origin.parent_rle));
+              return -1;
+            }
+            const auto i_rle_off = find_buffer_idx(spec.buffers, rle_node_id, "rle_runs_offsets");
             std::int32_t total_runs = 0;
             {
               const CUdeviceptr d_tail =
@@ -1055,9 +1102,11 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                                   cudaMemcpyDeviceToHost,
                                                   stream.value());
                   e != cudaSuccess) {
-                std::fprintf(stderr,
-                             "simpatico::codegen: Raw compact: total_runs DtoH failed: %s\n",
-                             cudaGetErrorString(e));
+                std::fprintf(
+                  stderr,
+                  "simpatico::codegen: RLE Raw compact (%s): total_runs DtoH failed: %s\n",
+                  origin.parent_channel.c_str(),
+                  cudaGetErrorString(e));
                 return -1;
               }
               cudaStreamSynchronize(stream.value());
@@ -1078,13 +1127,16 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                                  stream.value());
                   rc != 0) {
                 std::fprintf(
-                  stderr, "simpatico::codegen: Raw compact: compact_raw_values failed (%d)\n", rc);
+                  stderr,
+                  "simpatico::codegen: RLE Raw compact (%s): compact_raw_values failed (%d)\n",
+                  origin.parent_channel.c_str(),
+                  rc);
                 return -1;
               }
               cudaStreamSynchronize(stream.value());
             }
 
-            auto data_col = std::make_unique<cudf::column>(original_type,
+            auto data_col = std::make_unique<cudf::column>(data_elem_type,
                                                            static_cast<cudf::size_type>(total_runs),
                                                            std::move(compact_buf),
                                                            rmm::device_buffer(0, stream),
@@ -1100,7 +1152,8 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                                 stream.value());
                 e != cudaSuccess) {
               std::fprintf(stderr,
-                           "simpatico::codegen: Raw compact: offsets DtoD failed: %s\n",
+                           "simpatico::codegen: RLE Raw compact (%s): offsets DtoD failed: %s\n",
+                           origin.parent_channel.c_str(),
                            cudaGetErrorString(e));
               return -1;
             }
@@ -1117,7 +1170,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             rep->buffers.emplace_back("data", std::move(data_col));
             rep->buffers.emplace_back("offsets", std::move(offs_col));
             builder->raw_passthrough_leaves.push_back(
-              {origin.parent_rle, "values", std::move(rep)});
+              {origin.parent_rle, origin.parent_channel, std::move(rep)});
           }
           break;
         }
