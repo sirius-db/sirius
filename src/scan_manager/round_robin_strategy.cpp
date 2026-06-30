@@ -19,6 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <utility>
+#include <vector>
 
 namespace sirius::scan_manager {
 
@@ -27,11 +28,12 @@ round_robin_strategy::round_robin_strategy(std::vector<int> device_ids)
 {
 }
 
-int round_robin_strategy::get_next_gpu(std::size_t pipeline_id,
-                                       [[maybe_unused]] const op::operator_data* data,
-                                       [[maybe_unused]] balancing_strategy::device_id_hint hint)
+std::optional<int> round_robin_strategy::get_next_gpu(
+  std::size_t pipeline_id,
+  [[maybe_unused]] const op::operator_data* data,
+  [[maybe_unused]] balancing_strategy::device_id_hint hint)
 {
-  if (_device_ids.empty()) { return -1; }
+  if (_device_ids.empty()) { return std::nullopt; }
   auto const idx   = _cursor.fetch_add(1, std::memory_order_relaxed) % _device_ids.size();
   int const device = _device_ids[idx];
   return device;

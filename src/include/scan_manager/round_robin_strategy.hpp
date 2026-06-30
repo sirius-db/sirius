@@ -36,12 +36,12 @@ namespace sirius::scan_manager {
 class round_robin_strategy : public balancing_strategy {
  public:
   /// @param device_ids GPUs to round-robin over, in a stable order. An empty
-  ///                   set turns @ref get_next_gpu into a no-op returning -1.
+  ///                   set turns @ref get_next_gpu into a no-op returning std::nullopt.
   explicit round_robin_strategy(std::vector<int> device_ids);
 
-  int get_next_gpu(std::size_t pipeline_id,
-                   const op::operator_data* data,
-                   device_id_hint hint) override;
+  std::optional<int> get_next_gpu(std::size_t pipeline_id,
+                                  const op::operator_data* data,
+                                  device_id_hint hint) override;
 
  private:
   std::vector<int> _device_ids;

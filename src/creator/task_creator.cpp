@@ -16,7 +16,6 @@
 
 #include "creator/task_creator.hpp"
 
-#include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -363,10 +362,10 @@ void task_creator::manager_loop()
             // (cached_parquet_gpu_ingestible pins each chunk_memory_space
             // into the gpu_table_representation), so we just read it here.
             if (!preferred_device_id.has_value()) {
-              if (auto* cached = dynamic_cast<op::scan::scan_operator_with_pinned_table_input*>(
-                    local_state->_input_data.get())) {
-                if (cached->batch) {
-                  auto ro     = cached->batch->to_read_only();
+              if (auto* cached =
+                    dynamic_cast<op::scan::scan_operator_input*>(local_state->_input_data.get())) {
+                if (cached->is_resident()) {
+                  auto ro     = cached->get_cached_batch()->to_read_only();
                   auto* space = ro.get_memory_space();
                   if (space) {
                     if (space->get_tier() == cucascade::memory::Tier::GPU) {
