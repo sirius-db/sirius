@@ -912,17 +912,6 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--build-path",
-        type=str,
-        default=None,
-        help=(
-            "Path to the build directory. "
-            "Overrides the SIRIUS_BUILD_PATH env var and the default "
-            "build/release path. Example: "
-            "build/clang-relwithdebinfo"
-        ),
-    )
-    p.add_argument(
         "--duckdb-profiling",
         action="store_true",
         help=(
