@@ -139,7 +139,7 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   ~duckdb_native_gpu_ingestible() override;
 
-  std::unique_ptr<batch_coalecer> create_batch_coalecer() const override;
+  std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 

@@ -143,11 +143,11 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   // this hands the metadata reads a valid owning reference for the read's duration.
   auto io_ctx_sp = io_ctx.shared_from_this();
 
-  auto coalecer = ingestible.create_batch_coalecer();
+  auto coalescer = ingestible.create_batch_coalescer();
 
   // Materialize one coalesced batch into a GPU-resident cudf::table and hand it to on_batch
   // together with its GPU placement + the decode stream. Mirrors
-  // load_balancing_scan_batch_coalecer::process_provider_inputs, minus the connector/balancer
+  // load_balancing_scan_batch_coalescer::process_provider_inputs, minus the connector/balancer
   // and the post-decode step: there is no downstream scan operator at pin time, so the
   // unfiltered table is delivered to the sink directly. The device guard stays in scope across
   // the on_batch call, so the sink runs on the correct device.
@@ -184,11 +184,11 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
     if (!task) { continue; }
     auto info = task();
     if (!info) { continue; }
-    for (auto& b : coalecer->push(std::move(info))) {
+    for (auto& b : coalescer->push(std::move(info))) {
       handle_batch(std::move(b));
     }
   }
-  for (auto& b : coalecer->flush()) {
+  for (auto& b : coalescer->flush()) {
     handle_batch(std::move(b));
   }
 }

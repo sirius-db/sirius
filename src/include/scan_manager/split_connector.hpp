@@ -80,7 +80,7 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   [[nodiscard]] bool has_more_splits() const;
 
  private:
-  friend class load_balancing_scan_batch_coalecer;
+  friend class load_balancing_scan_batch_coalescer;
 
   /// \brief Enqueue a ready split. Producer side. Wakes a waiting consumer.
   ///        Reachable only via @ref split_provider::push_to_connector so all

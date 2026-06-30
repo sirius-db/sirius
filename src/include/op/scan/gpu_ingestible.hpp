@@ -21,7 +21,7 @@
 #include <cudf/table/table_view.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
-#include <op/scan/batch_coalecer.hpp>
+#include <op/scan/batch_coalescer.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
 
 // rmm
@@ -83,7 +83,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   filtered_table materialize_table(const op::scan::scan_operator_input& split,
                                    rmm::cuda_stream_view stream);
 
-  virtual std::unique_ptr<batch_coalecer> create_batch_coalecer() const = 0;
+  virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
 
   /**
    * @brief Snapshot check for remaining work. Thread-safe.

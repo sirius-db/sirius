@@ -67,7 +67,7 @@ namespace {
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
 //===----------------------------------------------------------------------===//
-// parquet_batch_coalecer
+// parquet_batch_coalescer
 //===----------------------------------------------------------------------===//
 /**
  * @brief Coalesces per-file metadata units into data-batch splits.
@@ -80,11 +80,11 @@ bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string:
  * safe when they share hive-partition values and the same pushdown decision, so
  * a mismatch on either forces a flush.
  */
-class parquet_batch_coalecer : public batch_coalecer {
+class parquet_batch_coalescer : public batch_coalescer {
  public:
-  parquet_batch_coalecer(std::size_t cap,
-                         std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                         std::shared_ptr<scan_plan const> plan)
+  parquet_batch_coalescer(std::size_t cap,
+                          std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
+                          std::shared_ptr<scan_plan const> plan)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
@@ -171,7 +171,7 @@ class parquet_batch_coalecer : public batch_coalecer {
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
     SIRIUS_LOG_INFO(
-      "[coalesce-debug] parquet_batch_coalecer emit #{}: {} slice(s), acc_bytes={}, cap={}",
+      "[coalesce-debug] parquet_batch_coalescer emit #{}: {} slice(s), acc_bytes={}, cap={}",
       ++_emit_count,
       split->rg_slices.size(),
       _acc_bytes,
@@ -314,9 +314,9 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 // coalescer / post-filter factories
 //===----------------------------------------------------------------------===//
-std::unique_ptr<batch_coalecer> parquet_gpu_ingestible::create_batch_coalecer() const
+std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
-  return std::make_unique<parquet_batch_coalecer>(
+  return std::make_unique<parquet_batch_coalescer>(
     _info->approximate_batch_size, _reader_options, _plan);
 }
 
@@ -338,7 +338,7 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
 
   // One metadata-scan task per file. Row-group chunking and file bundling happen
-  // downstream in parquet_batch_coalecer.
+  // downstream in parquet_batch_coalescer.
   return [this, file_path = _file_paths[idx], io_ctx = std::move(io_ctx)]()
            -> std::unique_ptr<scan_info> { return build_file_scan_info(file_path, io_ctx); };
 }

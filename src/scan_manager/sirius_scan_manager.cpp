@@ -293,7 +293,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   auto round_robin =
     std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
 
-  _metadata_processor = std::make_unique<load_balancing_scan_batch_coalecer>();
+  _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }

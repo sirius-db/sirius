@@ -63,7 +63,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
   /// Target uncompressed byte budget for one data-batch split. Consumed only by
-  /// parquet_batch_coalecer when it bundles files / chunks row groups — the
+  /// parquet_batch_coalescer when it bundles files / chunks row groups — the
   /// ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t scan_output_arity      = 0;
@@ -145,7 +145,7 @@ class parquet_split_info : public scan_info {
  * footer, prunes row groups against the filter, and records per-row-group byte
  * accounting. The result is one @c parquet_file_scan_info. File batching and
  * row-group chunking by byte budget are then performed downstream by
- * @c parquet_batch_coalecer, which coalesces these into @c parquet_split_info
+ * @c parquet_batch_coalescer, which coalesces these into @c parquet_split_info
  * data batches. The shared @c reader_options and @c scan_plan live on the
  * ingestible and are stamped onto the emitted splits by the coalescer.
  */
@@ -212,7 +212,7 @@ class parquet_file_scan_info : public scan_info {
  * @ref next_split_provider hands out one file at a time: each metadata-scan task
  * reads that file's footer, prunes its row groups, and emits a single
  * @c parquet_file_scan_info. File bundling and row-group chunking by byte budget
- * are handled downstream by @c parquet_batch_coalecer (@ref create_batch_coalecer),
+ * are handled downstream by @c parquet_batch_coalescer (@ref create_batch_coalescer),
  * which coalesces the per-file units into @c parquet_split_info data batches.
  *
  * @ref materialize_table is the per-split read + filter step; it also assembles
@@ -229,7 +229,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   ~parquet_gpu_ingestible() override;
 
-  std::unique_ptr<batch_coalecer> create_batch_coalecer() const override;
+  std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 

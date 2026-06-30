@@ -22,7 +22,7 @@
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
-#include "scan_manager/load_balancing_scan_batch_coalecer.hpp"
+#include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -69,7 +69,7 @@ class gpu_ingestible;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
-class load_balancing_scan_batch_coalecer;
+class load_balancing_scan_batch_coalescer;
 }  // namespace sirius::scan_manager
 
 namespace sirius::planner {
@@ -325,7 +325,7 @@ class sirius_scan_manager {
   /// per-query @c _dispatcher, which injects its own stop_token; the
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
-  std::unique_ptr<load_balancing_scan_batch_coalecer> _metadata_processor;
+  std::unique_ptr<load_balancing_scan_batch_coalescer> _metadata_processor;
   io::io_context_registry _ioctx_registry;
 };
 
