@@ -640,7 +640,8 @@ endif()
 # The testcontainers-backed S3 harness only compiles when its dependency is
 # built; unittest.cpp guards its use behind SIRIUS_HAVE_TESTCONTAINERS.
 if(SIRIUS_BUILD_S3_TESTS)
-  list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp)
+  list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp
+       test/cpp/io/rest/test_rest_ioctx_integration.cpp)
 endif()
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
