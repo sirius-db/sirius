@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "scan_manager/load_balancing_scan_batch_coalecer.hpp"
+#include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 
 #include "exec/try.hpp"
 #include "log/logging.hpp"
@@ -25,26 +25,26 @@
 
 namespace sirius::scan_manager {
 
-load_balancing_scan_batch_coalecer::metadata_processing_state*
-load_balancing_scan_batch_coalecer::register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                                      std::shared_ptr<balancing_strategy> balancer)
+load_balancing_scan_batch_coalescer::metadata_processing_state*
+load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
+                                                       std::shared_ptr<balancing_strategy> balancer)
 {
   if (!scan_op) return nullptr;
 
   auto connector   = scan_op->get_split_connector().shared_from_this();
   auto ingestible  = scan_op->get_ingestible().shared_from_this();
-  auto coalecer    = ingestible->create_batch_coalecer();
+  auto coalescer   = ingestible->create_batch_coalescer();
   auto uid         = scan_op->get_operator_id();
   auto pipeline_id = scan_op->get_pipeline()->get_pipeline_id();
   auto state       = std::make_unique<metadata_processing_state>(
-    uid, pipeline_id, std::move(coalecer), std::move(connector), std::move(balancer));
+    uid, pipeline_id, std::move(coalescer), std::move(connector), std::move(balancer));
   _pipeline_order.push_back(uid);
   auto state_ptr = state.get();
   _slots[uid]    = std::move(state);
   return state_ptr;
 }
 
-void load_balancing_scan_batch_coalecer::use_cached_entries_for_pipeline(
+void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
   op::scan::sirius_gpu_scan_operator* scan_op, std::unique_ptr<databatch_provider> provider)
 {
   if (!scan_op) return;
@@ -56,7 +56,7 @@ void load_balancing_scan_batch_coalecer::use_cached_entries_for_pipeline(
 }
 
 std::function<void(exec::try_t<std::unique_ptr<op::scan::scan_info>>&&)>
-load_balancing_scan_batch_coalecer::get_split_provider_bridge(
+load_balancing_scan_batch_coalescer::get_split_provider_bridge(
   op::scan::sirius_gpu_scan_operator* scan_op)
 {
   if (!scan_op) return nullptr;
@@ -68,7 +68,7 @@ load_balancing_scan_batch_coalecer::get_split_provider_bridge(
   };
 }
 
-void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_token const& stop)
+void load_balancing_scan_batch_coalescer::worker_loop([[maybe_unused]] std::stop_token const& stop)
 {
   for (auto pipeline_id : _pipeline_order) {
     if (stop.stop_requested()) { break; }
@@ -81,8 +81,8 @@ void load_balancing_scan_batch_coalecer::worker_loop([[maybe_unused]] std::stop_
   }
 }
 
-void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_processing_state& state,
-                                                                 std::stop_token const& stop)
+void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_processing_state& state,
+                                                                  std::stop_token const& stop)
 {
   std::stop_callback stop_cb(stop, [&state] {
     state.queue.enqueue(exec::make_empty_try<std::unique_ptr<op::scan::scan_info>>());
@@ -120,7 +120,7 @@ void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_proces
       }
 
       if (!entry.is_empty()) {
-        auto batches = state.coalecer->push(std::move(entry).value());
+        auto batches = state.coalescer->push(std::move(entry).value());
         for (auto& batch : batches) {
           emit(std::move(batch));
         }
@@ -141,12 +141,12 @@ void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_proces
           return;
         }
         if (leftover.is_empty()) { continue; }  // extra (e.g. stop) sentinel — ignore
-        auto batches = state.coalecer->push(std::move(leftover).value());
+        auto batches = state.coalescer->push(std::move(leftover).value());
         for (auto& batch : batches) {
           emit(std::move(batch));
         }
       }
-      auto final_batches = state.coalecer->flush();
+      auto final_batches = state.coalescer->flush();
       for (auto& batch : final_batches) {
         emit(std::move(batch));
       }
@@ -161,7 +161,7 @@ void load_balancing_scan_batch_coalecer::process_provider_inputs(metadata_proces
   state.connector->close();
 }
 
-void load_balancing_scan_batch_coalecer::process_cached_entries(
+void load_balancing_scan_batch_coalescer::process_cached_entries(
   metadata_processing_state& state, [[maybe_unused]] std::stop_token const& stop)
 {
   auto& batch_queue = state.queue;

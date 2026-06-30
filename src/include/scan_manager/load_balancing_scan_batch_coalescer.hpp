@@ -19,7 +19,7 @@
 #include "blockingconcurrentqueue.h"
 #include "cucascade/data/data_batch.hpp"
 #include "exec/try.hpp"
-#include "op/scan/batch_coalecer.hpp"
+#include "op/scan/batch_coalescer.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
@@ -67,7 +67,7 @@ struct databatch_provider {
  *     slots in registration order until either all slots are drained or the
  *     stop_token fires.
  */
-class load_balancing_scan_batch_coalecer {
+class load_balancing_scan_batch_coalescer {
  public:
   /// Per-pipeline mailbox.  The provider produces, the sequencer task
   /// consumes.  Holds its own semaphore so the sequencer can block on
@@ -75,16 +75,16 @@ class load_balancing_scan_batch_coalecer {
   struct metadata_processing_state {
     explicit metadata_processing_state(std::size_t op_id,
                                        std::size_t pipeline_id,
-                                       std::shared_ptr<op::scan::batch_coalecer> coalecer,
+                                       std::shared_ptr<op::scan::batch_coalescer> coalescer,
                                        std::shared_ptr<split_connector> connector,
                                        std::shared_ptr<balancing_strategy> balancer)
       : op_id(op_id),
         pipeline_id(pipeline_id),
-        coalecer(std::move(coalecer)),
+        coalescer(std::move(coalescer)),
         connector(std::move(connector)),
         balancer(std::move(balancer))
     {
-      assert(this->coalecer);
+      assert(this->coalescer);
       assert(this->connector);
       assert(this->balancer);
     }
@@ -98,15 +98,16 @@ class load_balancing_scan_batch_coalecer {
     std::size_t pipeline_id{0};
     using provider_value_t = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
     duckdb_moodycamel::BlockingConcurrentQueue<provider_value_t> queue;
-    std::shared_ptr<op::scan::batch_coalecer> coalecer;
+    std::shared_ptr<op::scan::batch_coalescer> coalescer;
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
     std::unique_ptr<databatch_provider> batch_provider;
   };
 
-  load_balancing_scan_batch_coalecer()                                          = default;
-  load_balancing_scan_batch_coalecer(load_balancing_scan_batch_coalecer const&) = delete;
-  load_balancing_scan_batch_coalecer& operator=(load_balancing_scan_batch_coalecer const&) = delete;
+  load_balancing_scan_batch_coalescer()                                           = default;
+  load_balancing_scan_batch_coalescer(load_balancing_scan_batch_coalescer const&) = delete;
+  load_balancing_scan_batch_coalescer& operator=(load_balancing_scan_batch_coalescer const&) =
+    delete;
 
   /// Register a slot for @p pipeline_id.  Slots are processed by the
   /// sequencer task in the order they were added — typically scan_manager

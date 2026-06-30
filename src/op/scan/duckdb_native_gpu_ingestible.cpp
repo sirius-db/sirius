@@ -66,10 +66,10 @@ std::size_t metadata_parse_chunk()
   return kDefaultParseChunk;
 }
 
-//===----------Batch Coalecer----------===//
-class duckdb_native_batch_coalecer : public batch_coalecer {
+//===----------Batch Coalescer----------===//
+class duckdb_native_batch_coalescer : public batch_coalescer {
  public:
-  duckdb_native_batch_coalecer(std::size_t approximate_batch_size, std::vector<bool> is_varchar)
+  duckdb_native_batch_coalescer(std::size_t approximate_batch_size, std::vector<bool> is_varchar)
     : _cap(approximate_batch_size),
       _is_varchar(std::move(is_varchar)),
       _any_varchar(std::find(_is_varchar.begin(), _is_varchar.end(), true) != _is_varchar.end()),
@@ -77,8 +77,8 @@ class duckdb_native_batch_coalecer : public batch_coalecer {
   {
   }
 
-  /// @brief Add a new scan info to the coalecer. The input granularity is a single scan info from a
-  /// metadata parse task (a chunk of row groups). The output is a vector of scan infos that have
+  /// @brief Add a new scan info to the coalescer. The input granularity is a single scan info from
+  /// a metadata parse task (a chunk of row groups). The output is a vector of scan infos that have
   /// been coalesced, each of which represents the metadata for a data batch.
   std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
   {
@@ -299,15 +299,15 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
 //===----------------------------------------------------------------------===//
 // batch_coalescer
 //===----------------------------------------------------------------------===//
-std::unique_ptr<batch_coalecer> duckdb_native_gpu_ingestible::create_batch_coalecer() const
+std::unique_ptr<batch_coalescer> duckdb_native_gpu_ingestible::create_batch_coalescer() const
 {
   std::vector<bool> is_varchar;
   is_varchar.reserve(_info->projected_types.size());
   for (auto const& t : _info->projected_types) {
     is_varchar.push_back(t.is_varchar());
   }
-  return std::make_unique<duckdb_native_batch_coalecer>(_info->approximate_batch_size,
-                                                        std::move(is_varchar));
+  return std::make_unique<duckdb_native_batch_coalescer>(_info->approximate_batch_size,
+                                                         std::move(is_varchar));
 }
 
 //===----------------------------------------------------------------------===//

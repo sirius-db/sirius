@@ -27,19 +27,19 @@ namespace sirius::op::scan {
  * @brief Coalesces incoming scan splits into larger batches.
  *
  * As a split provider emits per-split @c scan_info objects it feeds each one to
- * a batch_coalecer. The coalescer may buffer splits and re-emit them in larger,
+ * a batch_coalescer. The coalescer may buffer splits and re-emit them in larger,
  * more efficiently-sized batches: @c push accepts one split and returns whatever
  * batches are ready as a result (possibly none), while @c flush returns any
  * remaining buffered splits once the input is exhausted.
  */
 
-class batch_coalecer {
+class batch_coalescer {
  public:
   virtual std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info>) = 0;
 
   virtual std::vector<std::unique_ptr<scan_info>> flush() = 0;
 
-  virtual ~batch_coalecer() = default;
+  virtual ~batch_coalescer() = default;
 };
 
 }  // namespace sirius::op::scan
