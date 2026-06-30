@@ -60,12 +60,13 @@ TPCH_TABLES = (
     "supplier",
 )
 
-EXTENSION_PATH = os.environ.get(
-    "SIRIUS_EXTENSION_PATH",
-    os.path.join(REPO_ROOT, "build/release/extension/sirius/sirius.duckdb_extension"),
+BUILD_PATH = os.environ.get("SIRIUS_BUILD_PATH", "build/release")
+
+EXTENSION_PATH = os.path.join(
+    REPO_ROOT, BUILD_PATH, "extension/sirius/sirius.duckdb_extension"
 )
 
-DUCKDB_BIN = os.path.join(REPO_ROOT, "build/release/duckdb")
+DUCKDB_BIN = os.path.join(REPO_ROOT, BUILD_PATH, "duckdb")
 
 
 def _git_capture(args):
@@ -911,14 +912,14 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--extension-path",
+        "--build-path",
         type=str,
         default=None,
         help=(
-            "Path to the sirius.duckdb_extension to load. "
-            "Overrides the SIRIUS_EXTENSION_PATH env var and the default "
+            "Path to the build directory. "
+            "Overrides the SIRIUS_BUILD_PATH env var and the default "
             "build/release path. Example: "
-            "build/clang-relwithdebinfo/extension/sirius/sirius.duckdb_extension"
+            "build/clang-relwithdebinfo"
         ),
     )
     p.add_argument(
