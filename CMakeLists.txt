@@ -641,7 +641,8 @@ endif()
 # built; unittest.cpp guards its use behind SIRIUS_HAVE_TESTCONTAINERS.
 if(SIRIUS_BUILD_S3_TESTS)
   list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp
-       test/cpp/io/rest/test_rest_ioctx_integration.cpp)
+       test/cpp/io/rest/test_rest_ioctx_integration.cpp
+       test/cpp/scan_manager/test_describe_parquet_s3.cpp)
 endif()
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
