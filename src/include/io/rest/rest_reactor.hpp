@@ -28,6 +28,7 @@
 #include <blockingconcurrentqueue.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -73,6 +74,29 @@ class rest_io_object : public sirius_io_object {
   std::string _bucket;
   std::string _key;
   size_t _file_size{0};
+};
+
+// ---------------------------------------------------------------------------
+// rest_perf_snapshot
+// ---------------------------------------------------------------------------
+
+/// Plain-value perf counters read out of a reactor, or summed across the pool
+/// by @c rest_ioctx.  The ns totals/maxes and ttfb stay 0 unless the reactor's
+/// @c perf_instrumentation is on; retry / terminal / device-stream-sync counts
+/// are populated regardless.
+struct rest_perf_snapshot {
+  std::uint64_t chunk_get_ns_total{0};
+  std::uint64_t chunk_get_count{0};
+  std::uint64_t chunk_get_ns_max{0};
+  std::uint64_t queue_wait_ns_total{0};
+  std::uint64_t queue_wait_count{0};
+  std::uint64_t ttfb_ns{0};
+  std::uint64_t h2d_observed_ns_total{0};
+  std::uint64_t h2d_observed_count{0};
+  std::uint64_t h2d_observed_ns_max{0};
+  std::uint64_t retries_total{0};
+  std::uint64_t terminal_failures_total{0};
+  std::uint64_t device_stream_sync_total{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -190,6 +214,10 @@ class rest_reactor {
   /// an @c rest_io_object.  @p bucket / @p key identify the object.
   size_t head_object_size(std::string_view bucket, std::string_view key);
 
+  /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
+  /// loads); safe to call while the reactor is running.
+  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
+
   // -- capabilities / factory ----------------------------------------------
 
   /// True iff @p path is an s3:// URL this reactor can serve.
@@ -238,6 +266,26 @@ class rest_reactor {
 
   std::stop_source _stop_source;
   duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+
+  // Instrumentation counters, owned by the reactor (not worker_loop locals) so
+  // rest_ioctx can read them cross-thread.  Micro timings are stamped only under
+  // perf_instrumentation; retries/terminal/device_stream_sync are always-on.
+  struct perf_counters {
+    std::atomic<std::uint64_t> chunk_get_ns_total{0};
+    std::atomic<std::uint64_t> chunk_get_count{0};
+    std::atomic<std::uint64_t> chunk_get_ns_max{0};
+    std::atomic<std::uint64_t> queue_wait_ns_total{0};
+    std::atomic<std::uint64_t> queue_wait_count{0};
+    std::atomic<std::uint64_t> ttfb_ns{0};
+    std::atomic<std::uint64_t> h2d_observed_ns_total{0};
+    std::atomic<std::uint64_t> h2d_observed_count{0};
+    std::atomic<std::uint64_t> h2d_observed_ns_max{0};
+    std::atomic<std::uint64_t> retries_total{0};
+    std::atomic<std::uint64_t> terminal_failures_total{0};
+    std::atomic<std::uint64_t> device_stream_sync_total{0};
+  };
+  perf_counters _perf;
+
   std::jthread _worker;
 };
 

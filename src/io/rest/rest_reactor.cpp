@@ -48,6 +48,14 @@ namespace sirius::io::rest {
 
 namespace {
 
+// Lock-free max: raise @p a to @p v when v is larger.  Backs the *_ns_max perf
+// counters (relaxed — perf metrics tolerate reordering).
+void atomic_max_relaxed(std::atomic<std::uint64_t>& a, std::uint64_t v) noexcept
+{
+  std::uint64_t cur = a.load(std::memory_order_relaxed);
+  while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
+
 // ---- libcurl callbacks -----------------------------------------------------
 
 /// Write callback: copy curl's bytes into the sink's destination buffer at the
@@ -389,6 +397,12 @@ void rest_reactor::enqueue(request_type_ptr req)
 void rest_reactor::enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_request>> batch)
 {
   if (batch.empty()) { return; }
+  if (_config.perf_instrumentation) {
+    auto const now = std::chrono::steady_clock::now();
+    for (auto& c : batch) {
+      if (c) { c->t_enqueue = now; }
+    }
+  }
   bool const ok = _requests.enqueue_bulk(std::make_move_iterator(batch.data()), batch.size());
   if (!ok) { throw std::runtime_error("rest_reactor::enqueue_chunks: enqueue_bulk failed"); }
   interrupt();
@@ -649,6 +663,24 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
   auto fut = req->get_future();
   enqueue(std::move(req));
   return std::move(fut).get();
+}
+
+rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
+{
+  rest_perf_snapshot s;
+  s.chunk_get_ns_total       = _perf.chunk_get_ns_total.load(std::memory_order_relaxed);
+  s.chunk_get_count          = _perf.chunk_get_count.load(std::memory_order_relaxed);
+  s.chunk_get_ns_max         = _perf.chunk_get_ns_max.load(std::memory_order_relaxed);
+  s.queue_wait_ns_total      = _perf.queue_wait_ns_total.load(std::memory_order_relaxed);
+  s.queue_wait_count         = _perf.queue_wait_count.load(std::memory_order_relaxed);
+  s.ttfb_ns                  = _perf.ttfb_ns.load(std::memory_order_relaxed);
+  s.h2d_observed_ns_total    = _perf.h2d_observed_ns_total.load(std::memory_order_relaxed);
+  s.h2d_observed_count       = _perf.h2d_observed_count.load(std::memory_order_relaxed);
+  s.h2d_observed_ns_max      = _perf.h2d_observed_ns_max.load(std::memory_order_relaxed);
+  s.retries_total            = _perf.retries_total.load(std::memory_order_relaxed);
+  s.terminal_failures_total  = _perf.terminal_failures_total.load(std::memory_order_relaxed);
+  s.device_stream_sync_total = _perf.device_stream_sync_total.load(std::memory_order_relaxed);
+  return s;
 }
 
 size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
@@ -1022,6 +1054,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         if (st == query_status::success) {
           it->manager->chunk_complete(it->bytes);
         } else {
+          _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
           it->manager->report_error(
             std::make_exception_ptr(std::runtime_error("rest_reactor: device H2D copy failed")));
         }
@@ -1055,6 +1088,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       std::size_t const max_attempts =
         is_auth ? _config.max_auth_retry_attempts : _config.max_retry_attempts;
       if (counter + 1 >= max_attempts) {
+        _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
         req->manager->report_error(std::make_exception_ptr(std::runtime_error(
           "rest_reactor: exhausted retries for " + req->object.bucket + "/" + req->object.key)));
         return;
@@ -1062,6 +1096,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       // Backoff tracks the transient-attempt count; an auth retry re-presigns
       // and reuses the current step without inflating it.
       auto const delay = compute_backoff(req->attempt, retry_after, _config);
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
       counter += 1;
       retry_heap.push_back(retry_entry{std::chrono::steady_clock::now() + delay, std::move(req)});
       std::push_heap(retry_heap.begin(), retry_heap.end(), retry_cmp);
@@ -1115,6 +1150,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         bool const needs_bounce = dr->is_device() && !dr->chunk.is_buffer_allocated();
         if (needs_bounce && s.bounce == nullptr) {
           // Device staging requested but no host memory resource was configured.
+          _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
           dr->manager->report_error(std::make_exception_ptr(std::runtime_error(
             "rest_reactor: device staging unavailable (no host memory resource)")));
           dr.reset();
@@ -1122,6 +1158,16 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         }
 
         s.req = std::move(dr);
+        if (_config.perf_instrumentation) {
+          auto const now  = std::chrono::steady_clock::now();
+          s.req->t_submit = now;
+          if (s.req->attempt == 0) {
+            auto const wait_ns = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(now - s.req->t_enqueue).count());
+            _perf.queue_wait_ns_total.fetch_add(wait_ns, std::memory_order_relaxed);
+            _perf.queue_wait_count.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
         if (needs_bounce) { s.req->chunk.set_data(s.bounce); }
         s.token = std::move(tok);  // slot holds its token while in use
         setup_easy(s);
@@ -1148,6 +1194,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       if (rc == CURLE_OK && status == 206) {
         auto const start = content_range_start(s.hc.content_range);
         if (!start || *start != req.chunk.offset) {
+          _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
           req.manager->report_error(std::make_exception_ptr(std::runtime_error(
             "rest_reactor: 206 Content-Range mismatch (got '" + s.hc.content_range +
             "', requested offset " + std::to_string(req.chunk.offset) + ") for " +
@@ -1156,6 +1203,17 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         }
       }
       if (rc == CURLE_OK && ok_range && s.sink.written >= req.chunk.size) {
+        if (_config.perf_instrumentation) {
+          auto const get_ns =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - req.t_submit)
+                                         .count());
+          _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
+          _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
+          atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
+          std::uint64_t expected = 0;
+          _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
+        }
         if (req.is_device()) {
           // Issue the async H2D copy.  Bounce-staged reads need a CUDA event so
           // the slot (its bounce buffer) is only reused once the copy off it
@@ -1168,10 +1226,22 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             ev  = &copy_events[req.cpy_req->device_id][static_cast<size_t>(i)];
             cev = ev->get();
           }
+          std::chrono::steady_clock::time_point h2d_start;
+          if (_config.perf_instrumentation) { h2d_start = std::chrono::steady_clock::now(); }
           cudaError_t const err = req.copy_h2d_async(cev);
           if (err != cudaSuccess) {
+            _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
             req.manager->report_error(err);
             return false;
+          }
+          if (_config.perf_instrumentation) {
+            auto const h2d_ns =
+              static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - h2d_start)
+                                           .count());
+            _perf.h2d_observed_ns_total.fetch_add(h2d_ns, std::memory_order_relaxed);
+            _perf.h2d_observed_count.fetch_add(1, std::memory_order_relaxed);
+            atomic_max_relaxed(_perf.h2d_observed_ns_max, h2d_ns);
           }
           if (needs_event) {
             // Bounce buffer is still feeding the copy: hand the slot's token to
@@ -1195,6 +1265,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       if (rc == CURLE_OK && status == 200 && req.chunk.offset != 0) {
         // Server ignored Range and returned the whole object: the bytes start
         // at offset 0, not req.offset — non-retriable, would loop forever.
+        _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
         req.manager->report_error(std::make_exception_ptr(
           std::runtime_error("rest_reactor: server ignored Range (HTTP 200) for " +
                              req.object.bucket + "/" + req.object.key)));
@@ -1218,6 +1289,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       std::string const msg = rc != CURLE_OK
                                 ? std::string(curl_easy_strerror(rc))
                                 : (ok_range ? "short read" : "HTTP " + std::to_string(status));
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
       req.manager->report_error(std::make_exception_ptr(std::runtime_error(
         "rest_reactor: " + msg + " for " + req.object.bucket + "/" + req.object.key)));
       return false;
@@ -1300,6 +1372,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     // the request_manager would never reach total_chunks.
     for (auto& pc : copying) {
       try {
+        _perf.device_stream_sync_total.fetch_add(1, std::memory_order_relaxed);
         pc.event->synchronize();
         pc.manager->chunk_complete(pc.bytes);
       } catch (const std::exception& e) {

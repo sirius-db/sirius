@@ -82,6 +82,12 @@ struct config {
   std::chrono::milliseconds retry_backoff_base{50};
   std::chrono::milliseconds retry_jitter{50};
   bool honor_retry_after{true};
+
+  /// When set, the reactor records the per-chunk micro timings (chunk_get,
+  /// queue_wait, ttfb, h2d_observed) into its perf counters.  The retry,
+  /// terminal-failure and device-stream-sync counters are always recorded,
+  /// independent of this flag.
+  bool perf_instrumentation{false};
 };
 
 }  // namespace sirius::io::rest

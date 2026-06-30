@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -87,6 +88,12 @@ struct rest_chunked_rx_request {
   std::size_t auth_attempt{0};  // bounded HTTP 403 (re-presign) retries
   std::unique_ptr<device_cpy_request> cpy_req;
   std::shared_ptr<request_manager> manager;
+
+  // perf (set only when the reactor's perf_instrumentation is on): t_enqueue at
+  // queue insertion, t_submit at dequeue onto a connection; their delta is the
+  // queue_wait sample (attempt 0 only), and t_submit anchors the chunk_get span.
+  std::chrono::steady_clock::time_point t_enqueue{};
+  std::chrono::steady_clock::time_point t_submit{};
 
   /// True iff this read's bytes must be host->device copied after landing.
   [[nodiscard]] bool is_device() const noexcept { return cpy_req != nullptr; }

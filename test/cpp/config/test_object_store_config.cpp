@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "io/object_store_config.hpp"
+#include "io/rest/config.hpp"
 #include "sirius_config.hpp"
 
 #include <filesystem>
@@ -25,6 +26,17 @@
 using sirius::io::enum_to_string;
 using sirius::io::object_store_config;
 using sirius::io::string_to_enum;
+
+namespace {
+
+void write_yaml(std::filesystem::path const& path, std::string const& text)
+{
+  std::ofstream out(path);
+  out << text;
+  REQUIRE(out);
+}
+
+}  // namespace
 
 TEST_CASE("object_store_config defaults are inert", "[object_store_config]")
 {
@@ -211,6 +223,45 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
 
   sirius::sirius_config cfg;
   cfg.load_from_file(path);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config parses rest perf instrumentation flag",
+          "[scan_manager][config][s3][rest][perf]")
+{
+  CHECK_FALSE(sirius::io::rest::config{}.perf_instrumentation);
+
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_rest_perf_instrumentation.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      rest:\n"
+             "        perf_instrumentation: true\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK(cfg.get_scan_manager_config().rest.perf_instrumentation);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][config][rest]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_unknown_key.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      rest:\n"
+             "        perf_instrumentation_typo: true\n");
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(path));
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
