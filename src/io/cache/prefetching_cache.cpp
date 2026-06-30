@@ -516,19 +516,21 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
           every_chunk_is_cached = false;
           break;  // (3) miss, but we can't do H2D IO, so fall back to direct device read
         }
-        // Only stage a read through the chunk's cache buffer when this read covers
-        // the WHOLE chunk -- a cached chunk must be fully valid.  For the head and
-        // tail chunks of a read (partial overlap), caching the full chunk would
-        // force reading the non-overlapping remainder from disk: that boundary
-        // over-read is the dominant cold-pass cost.  Instead read only the needed,
-        // block-aligned span through an internal bounce slot (null host buffer) and
-        // leave the chunk uncached -- zero over-read.  (Short-term: a partial
-        // boundary chunk is re-read on every pass rather than cached; full partial
-        // caching is a larger redesign.)
-        size_t const need_lo    = std::max(off, offset);
-        size_t const need_hi    = std::min(off + chunk_bytes, offset + size);
-        bool const covers_chunk = (need_lo == off && need_hi == off + chunk_bytes);
-        if (covers_chunk && c != nullptr && c->state.mark_loading()) {
+        // Stage a read through the chunk's cache buffer only when caching the
+        // WHOLE chunk is cheap enough -- a cached chunk must be fully valid, so
+        // caching a partially-requested chunk costs reading its non-overlapping
+        // remainder from disk (boundary over-read, the dominant cold-pass cost).
+        // Cache when that over-read is < 25% of the chunk (so a read covering
+        // >75% of the chunk still warms it); otherwise read just the needed,
+        // block-aligned span through an internal bounce slot (null host buffer)
+        // and leave the chunk uncached -- zero over-read.  (Short-term: a heavily
+        // partial boundary chunk is re-read each pass; full partial caching is a
+        // larger redesign.)
+        size_t const need_lo     = std::max(off, offset);
+        size_t const need_hi     = std::min(off + chunk_bytes, offset + size);
+        size_t const overread    = chunk_bytes - (need_hi - need_lo);
+        bool const worth_caching = overread * 4 < chunk_bytes;  // over-read < 25% of chunk
+        if (worth_caching && c != nullptr && c->state.mark_loading()) {
           assert(c->data != nullptr);
           io_chunks.push_back(c);  // (2) host-to-device load into the cache buffer
           io_segments.emplace_back(off, chunk_bytes, c->data);
