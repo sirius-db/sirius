@@ -43,6 +43,25 @@ inline std::string partition_type_to_string(PartitionType type)
   return "UNKNOWN";
 }
 
+//! Operator data produced by the multi-GPU coalescing fast path of `sirius_physical_partition`.
+//! Carries, in parallel to the batches, the GPU "slot" each batch must be pushed to, so the
+//! slot-aware `sink()` routes a coalesced batch to its target partition slot (GPU) instead of
+//! using the running batch index. Non-coalesced paths keep returning plain
+//! `pipelineable_operator_data`, for which `sink()` falls back to the running index.
+class partition_slotted_operator_data : public pipelineable_operator_data {
+ public:
+  partition_slotted_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> batches,
+                                  std::vector<std::size_t> slots)
+    : pipelineable_operator_data(std::move(batches)), _slots(std::move(slots))
+  {
+  }
+
+  [[nodiscard]] const std::vector<std::size_t>& get_slots() const { return _slots; }
+
+ private:
+  std::vector<std::size_t> _slots;
+};
+
 class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
@@ -99,6 +118,14 @@ class sirius_physical_partition : public sirius_physical_operator {
     _small_table_bytes  = small_table_bytes;
   }
 
+  /// Cap on the size of a single coalesced cross-GPU batch produced by the multi-GPU fast path.
+  /// Each coalesced build batch becomes a cuco hash table downstream, so the default mirrors the
+  /// build-hash-table size limit.
+  void set_coalesce_batch_bytes(uint64_t coalesce_batch_bytes)
+  {
+    _coalesce_batch_bytes = coalesce_batch_bytes;
+  }
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
@@ -125,6 +152,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   uint64_t s_partition_size;
   int _min_num_partitions{1};
   uint64_t _small_table_bytes{0};
+  uint64_t _coalesce_batch_bytes{sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES};
 };
 
 }  // namespace op

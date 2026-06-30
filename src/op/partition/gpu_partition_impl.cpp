@@ -24,7 +24,8 @@
 namespace sirius {
 namespace op {
 
-std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
+std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::table_view>>
+gpu_partition_impl::hash_partition_sliced(
   const cucascade::read_only_data_batch& input,
   const std::vector<int>& partition_key_idx,
   const std::vector<cudf::data_type>& partition_key_cast_types,
@@ -34,7 +35,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
 {
   // Sanity check.
   if (num_partitions < 2) {
-    throw std::runtime_error("`num_partitions` in `hash_partition()` should be at least 2");
+    throw std::runtime_error("`num_partitions` in `hash_partition_sliced()` should be at least 2");
   }
 
   auto input_table = get_cudf_table_view(input);
@@ -78,9 +79,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
     orig_col_indices.push_back(i);
   }
 
-  // Slice from the reordered table to create separate table partitions.
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
-  output_batches.reserve(num_partitions);
+  // Slice from the reordered table to create per-partition views (zero-copy).
   std::vector<cudf::size_type> slice_indices;
   slice_indices.reserve(num_partitions * 2);
   for (int i = 0; i < num_partitions; ++i) {
@@ -89,15 +88,39 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
                                                     : partition_result.second[i + 1]);
   }
   auto sliced_partition_views = cudf::slice(partition_result.first->view(), slice_indices, stream);
+  std::vector<cudf::table_view> partition_views;
+  partition_views.reserve(num_partitions);
   for (int i = 0; i < num_partitions; ++i) {
-    // Drop any appended cast columns from the output.
-    auto output_partition =
-      std::make_unique<cudf::table>(sliced_partition_views[i].select(orig_col_indices),
-                                    stream,
-                                    memory_space.get_default_allocator());
-    output_batches.push_back(make_data_batch(std::move(output_partition), memory_space, stream));
+    // Drop any appended cast columns from the view. `select` copies the underlying column_views,
+    // so the result stays valid after `sliced_partition_views` is destroyed, as long as the
+    // returned reordered table (which owns the device buffers) is kept alive.
+    partition_views.push_back(sliced_partition_views[i].select(orig_col_indices));
   }
 
+  return {std::move(partition_result.first), std::move(partition_views)};
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
+  const cucascade::read_only_data_batch& input,
+  const std::vector<int>& partition_key_idx,
+  const std::vector<cudf::data_type>& partition_key_cast_types,
+  int num_partitions,
+  rmm::cuda_stream_view stream,
+  cucascade::memory::memory_space& memory_space)
+{
+  // Single source of truth: partition into views, then materialize each into its own table.
+  auto [reordered, partition_views] = hash_partition_sliced(
+    input, partition_key_idx, partition_key_cast_types, num_partitions, stream, memory_space);
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(partition_views.size());
+  for (const auto& view : partition_views) {
+    output_batches.push_back(make_data_batch(
+      std::make_unique<cudf::table>(view, stream, memory_space.get_default_allocator()),
+      memory_space,
+      stream));
+  }
+  // `reordered` (and the views into it) released here, after every partition has been copied out.
   return output_batches;
 }
 

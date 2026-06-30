@@ -17,12 +17,15 @@
 #pragma once
 
 #include <cudf/cudf_utils.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -58,6 +61,29 @@ class gpu_partition_impl {
     int num_partitions,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space);
+
+  /**
+   * @brief Hash-partition the input WITHOUT materializing each partition into its own table.
+   *
+   * Performs the same hashing + reordering + slicing as `hash_partition()`, but instead of copying
+   * each partition out, returns the single reordered parent table plus zero-copy `table_view`s into
+   * it (one per partition, with any transient hash-cast columns already dropped via `select`).
+   *
+   * Ownership / lifetime contract: the returned views reference the returned table's device
+   * buffers. The caller MUST (a) keep the returned table alive for as long as it uses the views,
+   * and (b) materialize (copy / concatenate) any view into an owning table before that data crosses
+   * a task boundary — a slice (offset) view is not spillable / downgradable and cannot be safely
+   * peer-copied across GPUs.
+   *
+   * @return A pair of {reordered parent table, per-partition views into it}.
+   */
+  static std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::table_view>>
+  hash_partition_sliced(const cucascade::read_only_data_batch& input,
+                        const std::vector<int>& partition_key_idx,
+                        const std::vector<cudf::data_type>& partition_key_cast_types,
+                        int num_partitions,
+                        rmm::cuda_stream_view stream,
+                        cucascade::memory::memory_space& memory_space);
 
   /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
