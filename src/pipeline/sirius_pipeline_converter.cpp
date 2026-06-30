@@ -31,19 +31,15 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
-#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -66,31 +62,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
   const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
     iceberg_cache)
 {
-  if (physical_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-    auto& scan_physical_op = physical_op.Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "parquet_scan" ||
-        scan_physical_op.function.name == "read_parquet" ||
-        scan_physical_op.function.name == "sirius_read_parquet") {
-      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
-    } else if (scan_physical_op.function.name == "iceberg_scan") {
-      if (!iceberg_cache) {
-        throw duckdb::InternalException(
-          "iceberg_cache must be provided when constructing iceberg scan operators");
-      }
-      auto iceberg_scan = duckdb::make_uniq<op::sirius_physical_iceberg_scan>(&scan_physical_op);
-      if (!scan_physical_op.parameters.empty()) {
-        std::string const table_path = scan_physical_op.parameters[0].ToString();
-        auto it                      = iceberg_cache->find(table_path);
-        if (it != iceberg_cache->end()) { iceberg_scan->delete_data = it->second; }
-      }
-      return iceberg_scan;
-    } else if (scan_physical_op.function.name == "seq_scan") {
-      return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
-    } else {
-      throw duckdb::NotImplementedException("Unsupported scan function: " +
-                                            scan_physical_op.function.name);
-    }
-  } else if (physical_op.type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY) {
+  if (physical_op.type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     auto& group_by_physical_op = physical_op.Cast<op::sirius_physical_grouped_aggregate>();
     return duckdb::make_uniq<op::sirius_physical_grouped_aggregate_merge>(&group_by_physical_op);
   } else if (physical_op.type == op::SiriusPhysicalOperatorType::ORDER_BY) {
@@ -395,45 +367,9 @@ void sirius_pipeline_converter::split_table_scan_source(
 void sirius_pipeline_converter::split_cpu_source(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
-  auto src_type = current_pipeline->source->type;
-  // COLUMN_DATA_SCAN with a null collection is LEFT_DELIM_JOIN's cached chunk
-  // scan — populated at runtime by the delim-join sink, not by a
-  // cpu_source_task. Splitting it would create a second pipeline referencing
-  // the same operator and trip "Repository already exists" on complex queries.
-  bool is_column_data_scan =
-    src_type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN &&
-    current_pipeline->get_source()->Cast<op::sirius_physical_column_data_scan>().collection !=
-      nullptr;
-  if (src_type != op::SiriusPhysicalOperatorType::EMPTY_RESULT &&
-      src_type != op::SiriusPhysicalOperatorType::DUMMY_SCAN && !is_column_data_scan) {
-    return;
-  }
-
-  auto* source_op = current_pipeline->get_source().get();
-
-  duckdb::unique_ptr<op::sirius_physical_cpu_source> cpu_source_op;
-  if (src_type == op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN) {
-    auto& col_scan = source_op->Cast<op::sirius_physical_column_data_scan>();
-    cpu_source_op  = duckdb::make_uniq<op::sirius_physical_cpu_source>(
-      source_op->types, source_op->estimated_cardinality, std::move(col_scan.collection));
-  } else if (src_type == op::SiriusPhysicalOperatorType::DUMMY_SCAN) {
-    cpu_source_op = duckdb::make_uniq<op::sirius_physical_cpu_source>(
-      source_op->types, source_op->estimated_cardinality, true);
-  } else {
-    // EMPTY_RESULT: no data
-    cpu_source_op = duckdb::make_uniq<op::sirius_physical_cpu_source>(
-      source_op->types, source_op->estimated_cardinality, false);
-  }
-
-  auto new_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-  new_pipeline->source = nullptr;
-  new_pipeline->sink   = cpu_source_op.get();
-
-  current_pipeline->source = cpu_source_op.get();
-  current_pipeline->operators.insert(current_pipeline->operators.begin(), *source_op);
-
-  scheduled_.push_back(new_pipeline);
-  inserted_operators_.push_back(std::move(cpu_source_op));
+  // cpu_source operator removed; COLUMN_DATA_SCAN, EMPTY_RESULT, and DUMMY_SCAN
+  // remain as direct pipeline sources without a CPU_SOURCE wrapper pipeline.
+  (void)current_pipeline;
 }
 
 void sirius_pipeline_converter::split_intermediate_joins(

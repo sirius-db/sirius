@@ -27,15 +27,12 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -204,54 +201,6 @@ void sirius_engine::execute()
   }
 }
 
-duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius_specific_operator(
-  op::sirius_physical_operator* op)
-{
-  if (op->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-    auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "parquet_scan" ||
-        scan_physical_op.function.name == "read_parquet") {
-      // Gather the configured GPU device ids so the parquet-scan op can build
-      // one translated filter tree per GPU (scalars end up on the right device
-      // for each task's dispatch target). Falls back to the current device if
-      // SiriusContext is not yet registered.
-      std::vector<int> gpu_device_ids;
-      auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-      if (ctx != nullptr) {
-        for (auto const* space :
-             ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-          gpu_device_ids.push_back(space->get_device_id());
-        }
-      }
-      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op,
-                                                                 std::move(gpu_device_ids));
-    } else if (scan_physical_op.function.name == "iceberg_scan") {
-      return construct_iceberg_scan_operator(scan_physical_op);
-    } else if (scan_physical_op.function.name == "seq_scan") {
-      return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
-    } else {
-      throw std::runtime_error("Unsupported scan function: " + scan_physical_op.function.name);
-    }
-  } else if (op->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY) {
-    auto& group_by_physical_op = op->Cast<op::sirius_physical_grouped_aggregate>();
-    return duckdb::make_uniq<op::sirius_physical_grouped_aggregate_merge>(&group_by_physical_op);
-  } else if (op->type == op::SiriusPhysicalOperatorType::ORDER_BY) {
-    auto& order_by_physical_op = op->Cast<op::sirius_physical_order>();
-    return duckdb::make_uniq<op::sirius_physical_merge_sort>(&order_by_physical_op);
-  } else if (op->type == op::SiriusPhysicalOperatorType::TOP_N) {
-    auto& topn_physical_op = op->Cast<op::sirius_physical_top_n>();
-    return duckdb::make_uniq<op::sirius_physical_top_n_merge>(&topn_physical_op);
-  } else if (op->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
-    auto& ungrouped_agg_physical_op = op->Cast<op::sirius_physical_ungrouped_aggregate>();
-    return duckdb::make_uniq<op::sirius_physical_ungrouped_aggregate_merge>(
-      &ungrouped_agg_physical_op);
-  } else {
-    throw internal_exception("Unsupported operator type" +
-                             SiriusPhysicalOperatorToString(op->type) +
-                             " for constructing sirius specific operator.");
-  }
-}
-
 /// Resolve the Iceberg table path from the scan operator.
 /// For file-based scans: parameters[0] contains the path.
 /// For REST catalog scans: parameters is empty; derive path from bind_data's
@@ -274,20 +223,6 @@ static std::string resolve_iceberg_table_path(op::sirius_physical_table_scan& sc
     }
   }
   return {};
-}
-
-duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_iceberg_scan_operator(
-  op::sirius_physical_table_scan& scan_op)
-{
-  auto iceberg_scan = duckdb::make_uniq<op::sirius_physical_iceberg_scan>(&scan_op);
-
-  auto table_path = resolve_iceberg_table_path(scan_op);
-  if (!table_path.empty()) {
-    auto it = iceberg_delete_data_cache_.find(table_path);
-    if (it != iceberg_delete_data_cache_.end()) { iceberg_scan->delete_data = it->second; }
-  }
-
-  return iceberg_scan;
 }
 
 void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& plan)

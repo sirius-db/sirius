@@ -90,12 +90,6 @@ class sirius_engine {
   void reset();
   //! Cancel the tasks
   void cancel_tasks();
-  //! Construct the sirius specific operator
-  duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
-    op::sirius_physical_operator* op);
-  //! Construct a sirius iceberg scan operator, populating delete file lists from cache.
-  duckdb::unique_ptr<op::sirius_physical_operator> construct_iceberg_scan_operator(
-    op::sirius_physical_table_scan& scan_op);
   //! Pre-fetch iceberg table metadata (delete files) for all iceberg scans in the plan.
   //! Must be called from initialize() BEFORE initialize_internal() assigns operator IDs
   //! to pipeline-breaker operators (PARTITION, CONCAT, etc.).
