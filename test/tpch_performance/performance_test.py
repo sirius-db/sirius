@@ -947,10 +947,7 @@ def parse_args():
 
 
 def main():
-    global EXTENSION_PATH
     args = parse_args()
-    if args.extension_path:
-        EXTENSION_PATH = args.extension_path
     source = args.input
     if not os.path.isdir(source):
         raise SystemExit(
