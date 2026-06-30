@@ -89,22 +89,6 @@ vcpkg_from_github(
   HEAD_REF
   dev)
 
-# GTest: cudf builds test utilities even with BUILD_TESTS=OFF. CPM can't
-# download due to FETCHCONTENT_FULLY_DISCONNECTED=ON. We provide source here and
-# use -isystem (not -I) for vcpkg includes below to avoid header version
-# conflicts with vcpkg's gtest 1.17.0.
-vcpkg_from_github(
-  OUT_SOURCE_PATH
-  GTEST_PATH
-  REPO
-  google/googletest
-  REF
-  v1.16.0
-  SHA512
-  bec8dad2a5abbea8e9e5f0ceedd8c9dbdb8939e9f74785476b0948f21f5db5901018157e78387e106c6717326558d6642fc0e39379c62af57bf1205a9df8a18b
-  HEAD_REF
-  main)
-
 # Patch get_zstd.cmake to remove forced download - we provide zstd source via
 # CPM variable
 vcpkg_replace_string(
@@ -126,10 +110,9 @@ vcpkg_replace_string(
   "set_target_properties(nanoarrow_static PROPERTIES POSITION_INDEPENDENT_CODE ON)"
   "# set_target_properties disabled for vcpkg ALIAS target")
 
-# Use -I for vcpkg include dir to ensure vcpkg CCCL 3.3.0 headers beat pixi's
-# older CCCL. GTest is excluded from vcpkg deps (see vcpkg.json) to avoid header
-# conflicts with the CPM-provided GTest source that cudf needs for test
-# utilities.
+# Use -I for vcpkg include dir to ensure vcpkg CCCL headers beat pixi's older
+# CCCL. CUDF_BUILD_TESTUTIL=OFF disables the test-utility targets (the only
+# thing that pulls GTest), so no GTest source needs to be provided.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"
@@ -140,11 +123,11 @@ vcpkg_cmake_configure(
   -DCPM_bs_thread_pool_SOURCE=${BS_THREAD_POOL_PATH}
   -DCPM_zstd_SOURCE=${ZSTD_PATH}
   -DCPM_cuco_SOURCE=${CUCO_PATH}
-  -DCPM_GTest_SOURCE=${GTEST_PATH}
   -DCMAKE_CUDA_ARCHITECTURES=RAPIDS
   -DBUILD_SHARED_LIBS=OFF
   -DCUDA_STATIC_RUNTIME=ON
   -DBUILD_TESTS=OFF
+  -DCUDF_BUILD_TESTUTIL=OFF
   -DBUILD_BENCHMARKS=OFF
   -DCUDF_KVIKIO_REMOTE_IO=OFF
   "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -Wno-error=sign-compare -Wno-error=parentheses"
