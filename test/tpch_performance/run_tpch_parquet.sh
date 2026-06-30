@@ -479,7 +479,7 @@ run_multi_session() {
             fi
         fi
 
-        # Build per-query SQL: views + scan cache level (sirius) + timer + N iterations.
+        # Build per-query SQL: views + timer + N iterations.
         # In --pinning-mode per-query, pin before iterations and unpin after — the unpin
         # is mandatory even though the process is about to exit, to release host-pinned
         # memory cleanly back to the allocator before the next process starts.
@@ -491,9 +491,6 @@ run_multi_session() {
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
             printf '%s\n' "$VIEW_SQL"
-            if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
-                printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
-            fi
             printf ".timer on\n"
             if [ "$PIN_ENABLED" = true ]; then
                 printf ".print __TPCH_PIN_BEGIN__ %s\n" "$q"

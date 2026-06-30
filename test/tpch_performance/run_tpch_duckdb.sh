@@ -16,7 +16,6 @@
 #   --duckdb-file <path>  Path to DuckDB file (default: <project>/performance_test.duckdb)
 #   --iterations <N>      Number of iterations per query (default: 2)
 #   --timeout <seconds>   Kill DuckDB session after N seconds (default: 1200)
-#   --cache-level <lvl>   Default Sirius scan_cache_level (sirius only)
 #   --multi-session       Run each query in its own DuckDB process
 #   --gpu-native-scan     No-op (sirius only). The GPU-native DuckDB scan is the only
 #                         seq_scan path; the plain `sirius` engine already uses it. Kept
