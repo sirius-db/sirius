@@ -86,7 +86,6 @@ class sirius_pipeline_converter {
   void insert_parquet_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void insert_duckdb_native_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_table_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
-  void split_cpu_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_intermediate_joins(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_join_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
   void split_group_aggregate_sink(

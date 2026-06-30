@@ -356,12 +356,6 @@ void sirius_pipeline_converter::split_table_scan_source(
   throw std::runtime_error("Unsupported scan function: " + scan_op.function.name);
 }
 
-void sirius_pipeline_converter::split_cpu_source(
-  duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
-{
-  (void)current_pipeline;
-}
-
 void sirius_pipeline_converter::split_intermediate_joins(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
@@ -864,8 +858,6 @@ void sirius_pipeline_converter::split_pipelines(
 
     // Preprocessing: replace TABLE_SCAN source with concrete scan operator
     split_table_scan_source(current_pipeline);
-
-    split_cpu_source(current_pipeline);
 
     // Preprocessing: split intermediate joins (modifies current_pipeline in place)
     split_intermediate_joins(current_pipeline);
