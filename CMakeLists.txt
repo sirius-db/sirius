@@ -340,6 +340,13 @@ endif()
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
+# rapidsai/rmm#826: DuckDB links the loadable extension with
+# -Wl,--exclude-libs,ALL, under which mold (but not bfd) hides RMM's GNU_UNIQUE
+# current-device-resource registry symbols, so cuDF's internal allocations
+# bypass the cuCascade reservation system. Force bfd to keep them exported.
+# Harmless for the single-DSO static vcpkg build.
+set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
+
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
   set_target_properties(
