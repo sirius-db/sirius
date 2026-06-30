@@ -245,7 +245,7 @@ bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 }
 
 duckdb_native_gpu_ingestible::metadata_scan_task_t
-duckdb_native_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx)
+duckdb_native_gpu_ingestible::next_split_provider(ioctx_resolver resolve)
 {
   auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _num_ranges) { return nullptr; }  // lost the race for the final range
@@ -253,6 +253,12 @@ duckdb_native_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioc
   auto const rg_begin = idx * _chunk_row_groups;
   auto const rg_end   = std::min(rg_begin + _chunk_row_groups, _plan.n_row_groups);
 
+  // All ranges read the one `.duckdb` file, so resolve its backend once by db_path.
+  auto io_ctx = resolve(_info->db_path);
+  if (!io_ctx) {
+    throw std::runtime_error("duckdb_native_gpu_ingestible: no backend supports path: " +
+                             _info->db_path);
+  }
   // Runs on a scan-manager dispatcher thread:
   return [this, rg_begin, rg_end, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
     auto range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);

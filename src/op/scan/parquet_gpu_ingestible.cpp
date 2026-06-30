@@ -329,18 +329,24 @@ bool parquet_gpu_ingestible::has_processed_all_metadata() const
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
-  std::shared_ptr<io::sirius_ioctx> io_ctx)
+  ioctx_resolver resolve)
 {
-  if (io_ctx == nullptr) {
-    throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
-  }
+  if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
 
-  // One metadata-scan task per file. Row-group chunking and file bundling happen
-  // downstream in parquet_batch_coalescer.
-  return [this, file_path = _file_paths[idx], io_ctx = std::move(io_ctx)]()
-           -> std::unique_ptr<scan_info> { return build_file_scan_info(file_path, io_ctx); };
+  // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
+  // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
+  // per file; row-group chunking and file bundling happen downstream in
+  // parquet_batch_coalescer.
+  auto const& file_path = _file_paths[idx];
+  auto io_ctx           = resolve(file_path);
+  if (!io_ctx) {
+    throw std::runtime_error("parquet_gpu_ingestible: no backend supports path: " + file_path);
+  }
+  return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(file_path, io_ctx);
+  };
 }
 
 //===----------------------------------------------------------------------===//

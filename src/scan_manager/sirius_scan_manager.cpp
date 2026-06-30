@@ -167,6 +167,7 @@ sirius_scan_manager::sirius_scan_manager(
   cucascade::memory::memory_reservation_manager& reservation_manager,
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _config(config),
+    _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _thread_pool(_config.thread_pool.num_threads + 1,
                  _config.thread_pool.thread_name_prefix,
@@ -236,6 +237,12 @@ sirius_scan_manager::~sirius_scan_manager()
   // in-flight IO before the pool is destroyed, so callbacks release their
   // chunks safely.
   if (_io_ctx) { _io_ctx->shutdown_cache(); }
+  // Same drain for any path-routed ioctxs; their reactors stop when the
+  // shared_ptrs in _routed_io_ctxs are released (member destruction below).
+  std::lock_guard lk{_routed_io_ctxs_mtx};
+  for (auto& [type, io_ctx] : _routed_io_ctxs) {
+    if (io_ctx) { io_ctx->shutdown_cache(); }
+  }
 }
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
@@ -307,7 +314,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
       _scan_op_order.push_back(op);
       continue;
     }
-    auto provider = std::make_unique<split_provider>(op->get_ingestible(), *_io_ctx);
+    auto provider = std::make_unique<split_provider>(
+      op->get_ingestible(),
+      [this](std::string_view file_path) { return ioctx_for_path(file_path); });
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);
   }
@@ -334,8 +343,35 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   std::string_view path) const
 {
   auto file_path = normalize_path(std::string(path));
-  if (!_io_ctx) { return nullptr; }
-  return _io_ctx->open_datasource(file_path);
+  auto io_ctx    = ioctx_for_path(file_path);
+  if (!io_ctx) { return nullptr; }  // no backend supports the path
+  // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
+  // only "no backend" is reported as nullptr (callers map it to that message).
+  return io_ctx->open_datasource(file_path);
+}
+
+std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(
+  std::string_view path) const
+{
+  // Normalize here so every caller (incl. the scan resolver, which forwards raw
+  // ingestible paths) routes `file://` the same way create_datasource does.
+  auto file_path = normalize_path(std::string(path));
+  auto type      = _ioctx_registry.lookup_path(file_path);
+  if (!type) { return nullptr; }
+  // The local default `_io_ctx` already serves uring/kvikio; only an off-default
+  // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
+  if (_io_ctx && _io_ctx->type() == *type) { return _io_ctx; }
+
+  std::lock_guard lk{_routed_io_ctxs_mtx};
+  if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+  auto io_ctx = _ioctx_registry.make_ioctx(*type);
+  if (!io_ctx) { return nullptr; }
+  io_ctx->start();
+  if (_config.enable_prefetch_cache && io_ctx->can_use_prefetching_cache()) {
+    io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
+  }
+  _routed_io_ctxs.emplace(*type, io_ctx);
+  return io_ctx;
 }
 
 void sirius_scan_manager::reset()

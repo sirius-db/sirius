@@ -233,7 +233,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
-  metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) override;
+  metadata_scan_task_t next_split_provider(ioctx_resolver resolve) override;
 
   filtered_table materialize_metadata_to_table(scan_info const& info,
                                                const cucascade::memory::memory_space& mem_space,
