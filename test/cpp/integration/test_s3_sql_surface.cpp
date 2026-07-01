@@ -666,6 +666,11 @@ struct metric_delta {
 
 struct bench_record {
   std::string scenario;
+  std::string transport;
+  std::string projection;
+  std::size_t max_connections{0};
+  std::size_t rest_n_reactors{0};
+  std::string prefetch_cache_mode;
   double wall_clock_ms{0.0};
   double open_ms{0.0};
   double footer_fetch_ms{0.0};
@@ -693,6 +698,11 @@ struct bench_record {
 };
 
 bench_record make_record(std::string scenario,
+                         std::string transport,
+                         std::string projection,
+                         std::size_t max_connections,
+                         std::size_t rest_n_reactors,
+                         std::string prefetch_cache_mode,
                          rest_bench_measurement measurement,
                          std::uint64_t dataset_bytes)
 {
@@ -701,6 +711,11 @@ bench_record make_record(std::string scenario,
     seconds > 0.0 ? static_cast<double>(dataset_bytes) / seconds : static_cast<double>(0);
   auto const& micro = measurement.micro;
   return bench_record{std::move(scenario),
+                      std::move(transport),
+                      std::move(projection),
+                      max_connections,
+                      rest_n_reactors,
+                      std::move(prefetch_cache_mode),
                       measurement.wall_clock_ms,
                       measurement.open_ms,
                       measurement.footer_fetch_ms,
@@ -745,6 +760,22 @@ std::string json_escape(std::string_view value)
   return escaped;
 }
 
+std::string projection_signature(std::vector<std::string> const& columns)
+{
+  if (columns.size() == 1) { return "single_column"; }
+  return "columns_" + std::to_string(columns.size());
+}
+
+std::string transport_signature(std::string const& endpoint)
+{
+  return endpoint.rfind("https://", 0) == 0 ? "https" : "http";
+}
+
+std::string prefetch_cache_signature(bool enable_prefetch_cache)
+{
+  return enable_prefetch_cache ? "on" : "off";
+}
+
 fs::path unittest_log_dir()
 {
 #ifdef SIRIUS_UNITTEST_LOG_DIR
@@ -777,26 +808,6 @@ std::optional<std::string> read_optional_text_file(fs::path const& path)
   return out.str();
 }
 
-std::optional<std::string> find_result_object(std::string const& json, std::string_view scenario)
-{
-  auto const needle = "\"scenario\": \"" + std::string{scenario} + "\"";
-  auto const pos    = json.find(needle);
-  if (pos == std::string::npos) { return std::nullopt; }
-  auto const start = json.rfind('{', pos);
-  if (start == std::string::npos) { return std::nullopt; }
-
-  int depth = 0;
-  for (std::size_t i = start; i < json.size(); ++i) {
-    if (json[i] == '{') {
-      ++depth;
-    } else if (json[i] == '}') {
-      --depth;
-      if (depth == 0) { return json.substr(start, i - start + 1); }
-    }
-  }
-  return std::nullopt;
-}
-
 std::optional<double> extract_json_number(std::string const& json_object, std::string_view key)
 {
   auto const needle = "\"" + std::string{key} + "\"";
@@ -826,11 +837,99 @@ std::optional<double> extract_json_number(std::string const& json_object, std::s
   }
 }
 
+std::optional<std::string> extract_json_string(std::string const& json_object, std::string_view key)
+{
+  auto const needle = "\"" + std::string{key} + "\"";
+  auto pos          = json_object.find(needle);
+  if (pos == std::string::npos) { return std::nullopt; }
+  pos = json_object.find(':', pos + needle.size());
+  if (pos == std::string::npos) { return std::nullopt; }
+  ++pos;
+  while (pos < json_object.size() &&
+         std::isspace(static_cast<unsigned char>(json_object[pos])) != 0) {
+    ++pos;
+  }
+  if (pos >= json_object.size() || json_object[pos] != '"') { return std::nullopt; }
+  ++pos;
+  std::string out;
+  while (pos < json_object.size()) {
+    char const c = json_object[pos++];
+    if (c == '"') { return out; }
+    if (c == '\\' && pos < json_object.size()) {
+      char const escaped = json_object[pos++];
+      switch (escaped) {
+        case 'n': out.push_back('\n'); break;
+        default: out.push_back(escaped); break;
+      }
+    } else {
+      out.push_back(c);
+    }
+  }
+  return std::nullopt;
+}
+
+bool baseline_signature_matches(std::string const& object, bench_record const& record)
+{
+  auto const transport       = extract_json_string(object, "transport");
+  auto const projection      = extract_json_string(object, "projection");
+  auto const prefetch        = extract_json_string(object, "prefetch_cache_mode");
+  auto const max_connections = extract_json_number(object, "max_connections");
+  auto const rest_n_reactors = extract_json_number(object, "rest_n_reactors");
+  if (!transport || !projection || !prefetch || !max_connections || !rest_n_reactors) {
+    return false;
+  }
+  return *transport == record.transport && *projection == record.projection &&
+         *prefetch == record.prefetch_cache_mode &&
+         static_cast<std::size_t>(*max_connections) == record.max_connections &&
+         static_cast<std::size_t>(*rest_n_reactors) == record.rest_n_reactors;
+}
+
+std::optional<std::string> find_result_object(std::string const& json, bench_record const& record)
+{
+  auto const needle      = "\"scenario\": \"" + record.scenario + "\"";
+  std::size_t search_pos = 0;
+  while (true) {
+    auto const pos = json.find(needle, search_pos);
+    if (pos == std::string::npos) { return std::nullopt; }
+    auto const start = json.rfind('{', pos);
+    if (start == std::string::npos) { return std::nullopt; }
+
+    int depth = 0;
+    for (std::size_t i = start; i < json.size(); ++i) {
+      if (json[i] == '{') {
+        ++depth;
+      } else if (json[i] == '}') {
+        --depth;
+        if (depth == 0) {
+          auto object = json.substr(start, i - start + 1);
+          if (baseline_signature_matches(object, record)) { return object; }
+          search_pos = pos + needle.size();
+          break;
+        }
+      }
+    }
+    if (search_pos <= pos) { return std::nullopt; }
+  }
+}
+
 void attach_baseline_comparison(bench_record& record, std::optional<std::string> const& baseline)
 {
   if (!baseline) { return; }
-  auto object = find_result_object(*baseline, record.scenario);
-  if (!object) { return; }
+  auto const baseline_host    = extract_json_string(*baseline, "host");
+  auto const baseline_backend = extract_json_string(*baseline, "backend");
+  auto const current_host     = env_or("HOSTNAME", "unknown");
+  if (!baseline_host || !baseline_backend || *baseline_host != current_host ||
+      *baseline_backend != "rest_minio") {
+    INFO("Skipping perf baseline comparison for scenario="
+         << record.scenario << " because the baseline host/backend does not match");
+    return;
+  }
+  auto object = find_result_object(*baseline, record);
+  if (!object) {
+    INFO("Skipping perf baseline comparison for scenario="
+         << record.scenario << " because no matching config signature was found");
+    return;
+  }
 
   auto add_delta = [&](std::string metric, double current) {
     auto baseline_value = extract_json_number(*object, metric);
@@ -871,6 +970,11 @@ void write_perf_json(fs::path const& path,
   for (std::size_t i = 0; i < records.size(); ++i) {
     auto const& r = records[i];
     out << "    {\"scenario\": \"" << json_escape(r.scenario) << "\", "
+        << "\"transport\": \"" << json_escape(r.transport) << "\", "
+        << "\"projection\": \"" << json_escape(r.projection) << "\", "
+        << "\"max_connections\": " << r.max_connections << ", "
+        << "\"rest_n_reactors\": " << r.rest_n_reactors << ", "
+        << "\"prefetch_cache_mode\": \"" << json_escape(r.prefetch_cache_mode) << "\", "
         << "\"wall_clock_ms\": " << std::fixed << std::setprecision(3) << r.wall_clock_ms << ", "
         << "\"open_ms\": " << r.open_ms << ", "
         << "\"footer_fetch_ms\": " << r.footer_fetch_ms << ", "
@@ -923,6 +1027,11 @@ void require_perf_json_schema(fs::path const& path)
                    "\"async_https\"",
                    "\"compat_http\"",
                    "\"compat_https\"",
+                   "\"transport\"",
+                   "\"projection\"",
+                   "\"max_connections\"",
+                   "\"rest_n_reactors\"",
+                   "\"prefetch_cache_mode\"",
                    "\"wall_clock_ms\"",
                    "\"open_ms\"",
                    "\"footer_fetch_ms\"",
@@ -1031,7 +1140,14 @@ bench_record run_rest_minio_bench_scenario(
         measurement.open_ms + measurement.footer_fetch_ms + measurement.scan_ms);
   CHECK(measurement.micro.device_stream_sync_total == 0);
   CHECK(measurement.micro.terminal_failures_total == 0);
-  return make_record(std::move(scenario), measurement, measurement.payload_bytes_read);
+  return make_record(std::move(scenario),
+                     transport_signature(endpoint),
+                     projection_signature(columns),
+                     rest_max_connections.value_or(std::size_t{8}),
+                     rest_n_reactors.value_or(std::size_t{2}),
+                     prefetch_cache_signature(enable_prefetch_cache),
+                     measurement,
+                     measurement.payload_bytes_read);
 }
 
 std::string explain_text(duckdb::Connection& con, std::string const& sql)
