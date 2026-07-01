@@ -29,6 +29,9 @@
 #include <duckdb/planner/expression.hpp>
 #include <duckdb/planner/table_filter.hpp>
 
+// cudf
+#include <cudf/types.hpp>
+
 // standard library
 #include <cstddef>
 #include <cstdint>
@@ -55,7 +58,8 @@ namespace sirius::op::scan {
  *
  * Hive-partition columns live in P-space but are not in the parquet file, so
  * they never appear in D-space. They are injected post-read into the final
- * output in the order column_ids expects.
+ * output in the order column_ids expects. Also, pure filter columns live in D-space
+ * but are not in the final output layout, so they are dropped after filter evaluation.
  */
 struct scan_plan {
   /// A column produced by the parquet reader, in batch order.
@@ -171,6 +175,12 @@ struct scan_plan {
   owning_table_view&& table,
   std::vector<std::string> const& partition_values,
   rmm::cuda_stream_view stream);
+
+/// Batch (D-space) positions of the output DATA columns, in @c output_layout order.
+/// Empty when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in
+/// which case the caller gathers all columns instead.
+/// @param plan  The scan plan describing the layout.
+[[nodiscard]] std::vector<cudf::size_type> output_data_positions(scan_plan const& plan);
 
 /// Build a scan_plan from DuckDB planner inputs. See @c scan_plan for semantics.
 ///
