@@ -31,7 +31,6 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/joinside.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "expression_executor/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
@@ -258,8 +257,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     rhs_output_columns.col_types.push_back(rhs_col_type);
   }
 
-  for (std::size_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-    auto& condition        = conditions[cond_idx];
+  for (auto& condition : conditions) {
     auto left_owned        = sirius::ast::to_duckdb(*condition.left);
     auto right_owned       = sirius::ast::to_duckdb(*condition.right);
     auto const* left_expr  = left_owned.get();
@@ -696,9 +694,9 @@ static join_side_keys_result prepare_join_keys(
 
   // Slow path: iterate over key columns and cast where needed
   for (size_t i = 0; i < key_col_indices.size(); i++) {
-    const auto& cast_info = key_casts[i];
-    cudf::column_view col = table.column(key_col_indices[i]);
-    bool needs_cast       = is_left_side ? cast_info.cast_left : cast_info.cast_right;
+    const auto& cast_info        = key_casts[i];
+    const cudf::column_view& col = table.column(key_col_indices[i]);
+    bool needs_cast              = is_left_side ? cast_info.cast_left : cast_info.cast_right;
     cudf::data_type target_type =
       is_left_side ? cast_info.left_target_type : cast_info.right_target_type;
 
@@ -723,8 +721,8 @@ static join_side_keys_result prepare_join_keys(
 /// @param memory_space   Memory space of the input batch used to tag the output data batch.
 static std::unique_ptr<operator_data> gather_join_output(
   duckdb::JoinType join_type,
-  cudf::table_view left_full,
-  cudf::table_view right_full,
+  const cudf::table_view& left_full,
+  const cudf::table_view& right_full,
   std::vector<cudf::size_type> const& lhs_col_idxs,
   std::vector<cudf::size_type> const& rhs_col_idxs,
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices,
@@ -786,8 +784,8 @@ static std::unique_ptr<operator_data> gather_join_output(
 /// distinct_hash_join::left_join returns only build indices (one per probe row, in probe order).
 /// Left (probe) columns are copied directly; right (build) columns are gathered with NULLIFY.
 static std::unique_ptr<operator_data> gather_distinct_left_join_output(
-  cudf::table_view left_full,
-  cudf::table_view right_full,
+  const cudf::table_view& left_full,
+  const cudf::table_view& right_full,
   std::vector<cudf::size_type> const& lhs_col_idxs,
   std::vector<cudf::size_type> const& rhs_col_idxs,
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> build_indices,
