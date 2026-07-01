@@ -141,23 +141,27 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       // Use clone_to to clone directly into HOST representation
       auto sirius_ctx  = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       auto& memory_mgr = sirius_ctx->get_memory_manager();
-      /// TODO: Find the closest memory space, not just any memory space, in HOST tier
-      auto reservation = memory_mgr.request_reservation(
-        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
-        data->get_size_in_bytes());
-      if (!reservation) {
+
+      auto host_spaces = memory_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      if (host_spaces.empty()) {
         throw internal_exception(
-          "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
+          "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
+          "collection");
       }
+      // Pick the host space with the most available memory.
+      /// TODO: prefer the NUMA-closest host space to the source GPU for locality.
+      auto const* mem_space =
+        *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto const* a, auto const* b) {
+          return a->get_available_memory() < b->get_available_memory();
+        });
 
       auto& registry      = sirius::converter_registry::get();
-      auto& mem_space     = reservation->get_memory_space();
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
 
       // clone_to: creates new batch with data converted to host_data_representation
       auto result_batch = ro.clone_to<cucascade::host_data_representation>(
-        registry, next_batch_id, &mem_space, stream);
+        registry, next_batch_id, mem_space, stream);
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.
