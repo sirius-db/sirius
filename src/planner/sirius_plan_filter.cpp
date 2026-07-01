@@ -61,7 +61,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
   // full input, but only the projected columns are materialized, so columns referenced only by the
   // predicate are never materialized and no trailing projection is needed. A projection map with no
   // predicate to absorb it (below) still emits a standalone projection.
-  bool projection_folded_into_filter = false;
   if (!op.expressions.empty()) {
     D_ASSERT(plan->types.size() > 0);
     // If the filter carries multiple predicates, AND them together into a single expression so
@@ -86,7 +85,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
       for (duckdb::idx_t const idx : op.projection_map) {
         output_indices.push_back(static_cast<cudf::size_type>(idx));
       }
-      projection_folded_into_filter = true;
     }
 
     auto filter =
@@ -96,8 +94,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
                                                             std::move(output_indices));
     filter->children.push_back(std::move(plan));
     plan = std::move(filter);
-  }
-  if (op.HasProjectionMap() && !projection_folded_into_filter) {
+  } else if (op.HasProjectionMap()) {
     // Projection map with no predicate to fold it into: emit a standalone projection.
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
     for (std::size_t i = 0; i < op.projection_map.size(); i++) {

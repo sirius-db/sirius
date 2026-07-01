@@ -35,8 +35,23 @@ sirius_physical_filter::sirius_physical_filter(duckdb::vector<sirius::logical_ty
                                                std::vector<cudf::size_type> output_indices_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality),
+    expression(std::move(expression_p))
+{
+  D_ASSERT(expression != nullptr);
+  if (output_indices_p.empty()) {
+    output_columns = passthrough{};
+  } else {
+    output_columns = std::move(output_indices_p);
+  }
+}
+
+sirius_physical_filter::sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
+                                               std::unique_ptr<sirius::ast::node> expression_p,
+                                               std::size_t estimated_cardinality)
+  : sirius_physical_operator(
+      SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality),
     expression(std::move(expression_p)),
-    output_indices(std::move(output_indices_p))
+    output_columns(passthrough{})
 {
   D_ASSERT(expression != nullptr);
 }
@@ -56,11 +71,16 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
 
   for (auto const& batch : input_batches) {
     auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
-    // Empty output_indices ⇒ keep every input column; otherwise gather only the requested
-    // output columns, so pure-filter columns are evaluated but never materialized.
-    auto filtered_table = output_indices.empty()
-                            ? gpu_expression_executor.select(view)
-                            : gpu_expression_executor.select(view, output_indices);
+    auto filtered_table = std::visit(
+      [&](const auto& indices) {
+        using IndicesType = std::decay_t<decltype(indices)>;
+        if constexpr (std::is_same_v<IndicesType, passthrough>) {
+          return gpu_expression_executor.select(view);
+        } else {
+          return gpu_expression_executor.select(view, indices);
+        }
+      },
+      output_columns);
     output_batches.push_back(
       sirius::make_data_batch(std::move(filtered_table), *batch.get_memory_space(), stream));
   }
