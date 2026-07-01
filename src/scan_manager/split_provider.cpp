@@ -27,8 +27,7 @@
 
 namespace sirius::scan_manager {
 
-split_provider::split_provider(op::scan::gpu_ingestible& ingestible,
-                               op::scan::ioctx_resolver resolve)
+split_provider::split_provider(op::scan::gpu_ingestible& ingestible, io::ioctx_resolver resolve)
   : _ingestible(&ingestible), _resolve(std::move(resolve))
 {
 }

@@ -333,7 +333,7 @@ bool parquet_gpu_ingestible::has_processed_all_metadata() const
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
-  ioctx_resolver resolve)
+  io::ioctx_resolver resolve)
 {
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
@@ -344,10 +344,8 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   // per file; row-group chunking and file bundling happen downstream in
   // parquet_batch_coalescer.
   auto const& file_path = _file_paths[idx];
-  auto io_ctx           = resolve(file_path);
-  if (!io_ctx) {
-    throw std::runtime_error("parquet_gpu_ingestible: no backend supports path: " + file_path);
-  }
+  // The resolver returns a valid ioctx or throws if no backend supports the path.
+  auto io_ctx = resolve(file_path);
   return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
     return build_file_scan_info(file_path, io_ctx);
   };

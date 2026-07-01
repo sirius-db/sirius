@@ -25,6 +25,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -237,5 +238,9 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// Independent of the prefetching machinery — exposed via @c metadata_store().
   cache::metadata_store _metadata_store;
 };
+
+/// Resolves the ioctx that serves a given file path (s3:// -> rest, local ->
+/// uring/kvikio).  Returns a valid ioctx or throws if no backend supports the path.
+using ioctx_resolver = std::function<std::shared_ptr<sirius_ioctx>(std::string_view)>;
 
 }  // namespace sirius::io

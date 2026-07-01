@@ -55,12 +55,6 @@ class gpu_ingestible;
 // include cycle; only used by const-reference below. Full definition pulled in by .cpp.
 class scan_operator_input;
 
-/// Resolves the ioctx that should serve a given file path.  The scan path routes
-/// each metadata task by path (s3:// -> rest, local -> uring/kvikio), so the
-/// scan_manager threads this through split_provider into next_split_provider
-/// rather than binding the whole scan to one ioctx.
-using ioctx_resolver = std::function<std::shared_ptr<io::sirius_ioctx>(std::string_view)>;
-
 //===----------------------------------------------------------------------===//
 // gpu_ingestible
 //===----------------------------------------------------------------------===//
@@ -111,7 +105,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * null callable indicates no work was claimed (the driver loop skips
    * empty handoffs).
    */
-  virtual metadata_scan_task_t next_split_provider(ioctx_resolver resolve) = 0;
+  virtual metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) = 0;
 
   /**
    * @brief Materialize the cudf table for one split. Called by

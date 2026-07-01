@@ -327,7 +327,14 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     }
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
-      [this](std::string_view file_path) { return ioctx_for_path(file_path); });
+      [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
+        auto io_ctx = ioctx_for_path(file_path);
+        if (!io_ctx) {
+          throw std::runtime_error("scan_manager: no backend supports path: " +
+                                   std::string(file_path));
+        }
+        return io_ctx;
+      });
     _providers_by_op.emplace(op, std::move(provider));
     _scan_op_order.push_back(op);
   }
@@ -351,7 +358,7 @@ void sirius_scan_manager::start_metadata_processing()
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path) const
+  std::string_view path)
 {
   auto file_path = normalize_path(std::string(path));
   auto io_ctx    = ioctx_for_path(file_path);
@@ -361,8 +368,7 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   return io_ctx->open_datasource(file_path);
 }
 
-std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(
-  std::string_view path) const
+std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.

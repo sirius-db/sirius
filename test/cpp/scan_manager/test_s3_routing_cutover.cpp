@@ -224,7 +224,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_tab
 using routing_observations = std::unordered_map<std::string, io_context_type>;
 
 routing_observations collect_routing_observations(
-  sirius::op::scan::parquet_gpu_ingestible& ingestible, sirius::op::scan::ioctx_resolver resolver)
+  sirius::op::scan::parquet_gpu_ingestible& ingestible, sirius::io::ioctx_resolver resolver)
 {
   routing_observations out;
   while (ingestible.has_processed_all_metadata() == false) {
@@ -241,11 +241,14 @@ routing_observations collect_routing_observations(
   return out;
 }
 
-sirius::op::scan::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager)
+sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager)
 {
   return [&manager](std::string_view path) -> std::shared_ptr<sirius::io::sirius_ioctx> {
     auto ds = manager.create_datasource(path);
-    if (!ds) { return nullptr; }
+    if (!ds) {
+      throw std::runtime_error("test datasource resolver: no backend supports path: " +
+                               std::string(path));
+    }
     return ds->io_ctx();
   };
 }

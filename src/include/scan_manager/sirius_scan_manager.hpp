@@ -296,7 +296,7 @@ class sirius_scan_manager {
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path) const;
+    std::string_view path);
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
@@ -312,7 +312,7 @@ class sirius_scan_manager {
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
   /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path) const;
+  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
@@ -325,8 +325,8 @@ class sirius_scan_manager {
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
   /// per type under the mutex; drained + torn down in the dtor.
-  mutable std::mutex _routed_io_ctxs_mtx;
-  mutable std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
+  std::mutex _routed_io_ctxs_mtx;
+  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
     _routed_io_ctxs;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;

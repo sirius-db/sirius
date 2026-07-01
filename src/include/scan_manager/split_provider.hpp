@@ -69,7 +69,7 @@ class split_provider {
   /// away. Callers that need a shared_ptr can promote via
   /// `provider.get_ingestible().shared_from_this()` (enabled by
   /// @c gpu_ingestible inheriting @c std::enable_shared_from_this).
-  explicit split_provider(op::scan::gpu_ingestible& ingestible, op::scan::ioctx_resolver resolve);
+  explicit split_provider(op::scan::gpu_ingestible& ingestible, io::ioctx_resolver resolve);
 
   virtual ~split_provider() = default;
 
@@ -126,7 +126,7 @@ class split_provider {
 
   /// Resolves each file's ioctx by path (s3:// -> rest, local -> uring/kvikio),
   /// forwarded into the ingestible so a mixed-scheme scan routes per file.
-  op::scan::ioctx_resolver _resolve;
+  io::ioctx_resolver _resolve;
 
   exec::completion_token _completion_token;
 };
