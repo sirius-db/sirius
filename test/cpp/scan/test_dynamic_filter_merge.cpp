@@ -616,8 +616,8 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT64 se
   auto stream      = cudf::get_default_stream();
   auto const dtype = cudf::data_type{cudf::type_id::INT64};
   // Build keys include INT64_MIN — the cuco empty-slot sentinel that static_set never inserts.
-  auto keys        = make_values_table<int64_t>(
-    {std::numeric_limits<int64_t>::min(), 0, 1, 2}, dtype, stream);
+  auto keys =
+    make_values_table<int64_t>({std::numeric_limits<int64_t>::min(), 0, 1, 2}, dtype, stream);
   auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
     keys->view().column(0), stream, cudf::get_current_device_resource_ref());
   REQUIRE(filter->has_persistent_set());  // stays on the exact IN-list path (no Bloom downgrade)
@@ -626,8 +626,8 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT64 se
   filters.push_filter(0, filter);
 
   // Probe {INT64_MIN, 2, 7}: INT64_MIN and 2 are build keys and must survive; 7 must be dropped.
-  auto probe = make_values_table<int64_t>(
-    {std::numeric_limits<int64_t>::min(), 2, 7}, dtype, stream);
+  auto probe =
+    make_values_table<int64_t>({std::numeric_limits<int64_t>::min(), 2, 7}, dtype, stream);
   auto out = sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), filters, stream);
   stream.synchronize();
   REQUIRE(out != nullptr);
@@ -640,8 +640,8 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT32 se
 {
   auto stream      = cudf::get_default_stream();
   auto const dtype = cudf::data_type{cudf::type_id::INT32};
-  auto keys        = make_values_table<int32_t>(
-    {std::numeric_limits<int32_t>::min(), 0, 1, 2}, dtype, stream);
+  auto keys =
+    make_values_table<int32_t>({std::numeric_limits<int32_t>::min(), 0, 1, 2}, dtype, stream);
   auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
     keys->view().column(0), stream, cudf::get_current_device_resource_ref());
   REQUIRE(filter->has_persistent_set());
@@ -649,8 +649,8 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT32 se
   sirius_dynamic_filter_set filters;
   filters.push_filter(0, filter);
 
-  auto probe = make_values_table<int32_t>(
-    {std::numeric_limits<int32_t>::min(), 2, 7}, dtype, stream);
+  auto probe =
+    make_values_table<int32_t>({std::numeric_limits<int32_t>::min(), 2, 7}, dtype, stream);
   auto out = sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), filters, stream);
   stream.synchronize();
   REQUIRE(out != nullptr);
