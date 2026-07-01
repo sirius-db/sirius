@@ -12,16 +12,16 @@ axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 instrumentation-model = { path = "../model", features = ["collector"] }
 sirius-telemetry-analyzer = { path = "../analyzer" }
-quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
-quent-exporter = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
-quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
+quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
+quent-exporter = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 uuid = "1"
 
 [build-dependencies]
 # Tracks a pinned commit from quent's main branch.
-quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
 ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }

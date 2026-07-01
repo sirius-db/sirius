@@ -8,13 +8,13 @@ collector = ["quent-model/collector"]
 
 [dependencies]
 # Tracks a pinned commit from quent's main branch.
-quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
-quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
-quent-stdlib = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
+quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
+quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
+quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
+quent-stdlib = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
 uuid = "1"
 
 [build-dependencies]
 # Captures this crate's git provenance into QUENT_SOURCE_* so the model! macro's
 # generated ModelSource records Sirius (not quent) as the model's source.
-quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "8755051b2ccd213fee8cd052e199230622c4610c" }
+quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "00f22d8ca1d3795c692398ab1840b1f8d3d670f8" }
