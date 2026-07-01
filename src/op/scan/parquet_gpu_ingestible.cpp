@@ -268,11 +268,15 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
-  // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
-  // injection — needs column names. Matches parquet_split_provider's ctor invariant.
+  // Any non-trivial scan shape — reader-side projection (incl. a pruned/reordered
+  // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
+  // case), filter pushdown, or hive-partition injection — needs column names.
+  // Matches parquet_split_provider's ctor invariant and build_scan_plan's
+  // needs_reader_projection trigger.
   bool const needs_names = !bind.projection_ids.empty() ||
                            (bind.table_filters && !bind.table_filters->filters.empty()) ||
-                           !bind.partition_indices.empty();
+                           !bind.partition_indices.empty() ||
+                           column_ids_need_reader_projection(bind.column_ids, bind.names.size());
   if (needs_names && bind.names.empty()) {
     throw sirius::internal_exception(
       "[parquet_gpu_ingestible] Projection, filter pushdown, or hive partitions "

@@ -98,11 +98,14 @@ struct scan_plan {
   std::unordered_set<std::size_t> partition_primary_indices;
 
   /// True iff the reader needs explicit column projection — set when the planner
-  /// pruned or reordered columns (non-empty @c projection_ids) or hive-partition
-  /// columns must be dropped from the physical read. When false, the reader's
-  /// natural "read everything in column_ids order" output already matches what
-  /// the pipeline expects, and the scan can skip @c set_column_names and
-  /// per-file name-based leaf resolution.
+  /// pruned or reordered columns (non-empty @c projection_ids, OR a pruned /
+  /// reordered @c column_ids subset even when @c projection_ids is empty — the
+  /// no-projection-pushdown @c sirius_read_parquet case; see
+  /// @c column_ids_need_reader_projection) or when hive-partition columns must be
+  /// dropped from the physical read. When false, the reader's natural "read
+  /// everything in column_ids order" output already matches what the pipeline
+  /// expects, and the scan can skip @c set_column_names and per-file name-based
+  /// leaf resolution.
   bool needs_reader_projection = false;
 
   //===--------------------------------------------------------------------===//
@@ -193,5 +196,18 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t output_types_size,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices);
+
+/// True when @p column_ids is a pruned or reordered subset of the full schema (of
+/// size @p full_schema_size) — a non-identity projection the cuDF reader must
+/// honor by name even when @c projection_ids is empty (the case for
+/// @c sirius_read_parquet, which DuckDB plans without projection pushdown, so the
+/// reader would otherwise return the full file width and the plan would assemble
+/// the wrong columns by compacted position). False for an empty @p column_ids
+/// (e.g. @c count(*), which must keep the reader's natural batch so the row count
+/// survives) and for a full-identity @c SELECT * read. @c build_scan_plan (to set
+/// @c needs_reader_projection) and the parquet ingestible (to enforce the
+/// column-names invariant) share this so their contracts agree.
+[[nodiscard]] bool column_ids_need_reader_projection(
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids, std::size_t full_schema_size);
 
 }  // namespace sirius::op::scan
