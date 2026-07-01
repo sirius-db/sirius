@@ -217,14 +217,20 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     // push a projection on top that does the projection
     duckdb::vector<duckdb::LogicalType> types;
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
-    for (auto& column_id : column_ids) {
+    for (std::size_t i = 0; i < column_ids.size(); ++i) {
+      auto& column_id = column_ids[i];
       if (column_id.IsVirtualColumn()) {
         throw duckdb::NotImplementedException("Virtual columns require projection pushdown");
       } else {
         auto col_id = column_id.GetPrimaryIndex();
         auto type   = op.returned_types[col_id];
         types.push_back(type);
-        expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, col_id));
+        // The Sirius scan emits exactly the column_ids columns, in order, at
+        // positions 0..M-1 (build_scan_plan with empty projection_ids) — unlike
+        // DuckDB's native full-width scan this branch was modeled on.  So
+        // reference the column by its position i in the scan output, not by its
+        // original parquet index col_id, which can exceed the M-column width.
+        expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, i));
       }
     }
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> scan_child;

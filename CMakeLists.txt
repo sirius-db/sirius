@@ -523,6 +523,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/exec/test_semi_future.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
@@ -555,6 +556,7 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
@@ -599,7 +601,6 @@ set(TEST_SOURCES
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
-    # test/cpp/scan/test_duckdb_native_gpu_ingestible.cpp  # stale against redesigned gpu_ingestible interface and removed s3 ioctx
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
@@ -622,7 +623,13 @@ endif()
 # The testcontainers-backed S3 harness only compiles when its dependency is
 # built; unittest.cpp guards its use behind SIRIUS_HAVE_TESTCONTAINERS.
 if(SIRIUS_BUILD_S3_TESTS)
-  list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp)
+  list(
+    APPEND
+    TEST_SOURCES
+    test/cpp/utils/s3_container.cpp
+    test/cpp/io/rest/test_rest_ioctx_integration.cpp
+    test/cpp/scan_manager/test_describe_parquet_s3.cpp
+    test/cpp/integration/test_s3_sql_surface.cpp)
 endif()
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are

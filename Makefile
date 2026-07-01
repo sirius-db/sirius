@@ -251,4 +251,5 @@ s3-bench:
 	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	export HOSTNAME="$${HOSTNAME:-$$(hostname)}"; \
 	$(S3_TEST_BIN) "[s3][bench]~[aws]"
