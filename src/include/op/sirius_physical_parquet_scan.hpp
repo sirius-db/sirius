@@ -21,7 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "expression_executor/gpu_expression_translator_internal.hpp"
+#include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 

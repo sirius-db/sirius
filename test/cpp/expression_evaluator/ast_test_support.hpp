@@ -16,11 +16,11 @@
 
 #pragma once
 
-// Shared test helpers for the expression_executor unit tests.
+// Shared test helpers for the expression_evaluator unit tests.
 //
 // Two families of helpers were previously copy-pasted across
-// test_gpu_expression_executor.cpp, test_gpu_expression_translator.cpp, and
-// test_gpu_expression_executor_ast_equivalence.cpp:
+// test_expression_evaluator.cpp, test_gpu_expression_translator.cpp, and
+// test_expression_evaluator_ast_equivalence.cpp:
 //   1. sirius::ast::node construction shortcuts (make_ref, make_int_const, ...)
 //   2. GPU->host column copy helpers (copy_column_to_host, ...)
 // They are gathered here so the three suites share one definition. All entities

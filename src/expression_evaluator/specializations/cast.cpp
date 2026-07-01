@@ -16,8 +16,8 @@
 
 // sirius
 #include <expression/ast/node.hpp>
-#include <expression_executor/ast_supported_types.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/ast_supported_types.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
 
@@ -29,7 +29,7 @@
 #include <algorithm>
 
 namespace sirius {
-using execute_result = gpu_expression_executor::execute_result;
+using evaluate_result = expression_evaluator::evaluate_result;
 
 namespace {
 
@@ -49,7 +49,7 @@ cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
 
 }  // namespace
 
-execute_result gpu_expression_executor::execute(sirius::ast::cast const& alt, execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, evaluation_mode mode)
 {
   auto const ast_supported =
     std::find(supported_ast_cast_types_native.begin(),
@@ -58,34 +58,34 @@ execute_result gpu_expression_executor::execute(sirius::ast::cast const& alt, ex
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
-    auto child            = execute(*alt.child, execution_mode::AST);
+  if (ast_supported && _strategy != expression_evaluator_strategy::MATERIALIZE &&
+      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
+    auto child            = evaluate(*alt.child, evaluation_mode::AST);
     auto const& cast_expr = _ast_tree.emplace<cudf::ast::operation>(
       cast_op_to_ast(alt.target_type.id()), child.get_expr());
 
-    if (mode == execution_mode::AST) {
+    if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
-      return execute_result(
+      return evaluate_result(
         ast_result(cast_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
     }
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    auto result_column = execute_ast(cast_expr);
+    auto result_column = evaluate_ast(cast_expr);
 
     release_temporaries(child.get_temp_scalar_indices(), child.get_temp_column_indices());
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
   auto const return_type = sirius::get_cudf_type(alt.target_type);
-  auto child             = execute(*alt.child, execution_mode::MATERIALIZE);
+  auto child             = evaluate(*alt.child, evaluation_mode::MATERIALIZE);
   D_ASSERT(!child.is_scalar());  // CAST should never be called on a scalar
   auto result_column = cudf::cast(child.get_column_view(), return_type, _stream, _mr);
-  if (mode == execution_mode::AST) {
+  if (mode == evaluation_mode::AST) {
     // The parent is executing in AST mode, so add the materialized result to the AST tree.
     return materialize_as_ast_column(std::move(result_column));
   }
-  return execute_result(std::move(result_column));
+  return evaluate_result(std::move(result_column));
 }
 
 }  // namespace sirius

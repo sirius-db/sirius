@@ -19,7 +19,7 @@
 // This test is the authoritative evidence that Sirius's expression IR is fully
 // decoupled from the DuckDB frontend: it constructs a sirius::ast::node tree BY
 // HAND (no DuckDB Bound*Expression, no sirius::ast::from_duckdb), runs it through
-// gpu_expression_executor against a small cuDF table built by hand, and asserts
+// expression_evaluator against a small cuDF table built by hand, and asserts
 // the final column values against a hand-computed expected column.
 //
 // The test deliberately includes NO duckdb/ header in its own body. A self-reading
@@ -42,8 +42,8 @@
 
 // sirius — the native expression IR + executor under test.
 #include <expression/function_id.hpp>
-#include <expression_executor/expression_executor_strategy.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/expression_evaluator_strategy.hpp>
 
 // cuda / standard library
 #include <cuda_runtime_api.h>
@@ -83,7 +83,7 @@ std::unique_ptr<cudf::table> make_int32_table(std::vector<int32_t> const& values
 // Exercises all four node kinds required by PROOF-01 — reference, constant,
 // binary function, cast — with no DuckDB expression types anywhere in the path.
 // Returns a fresh owning vector each call: the executor borrows node.get()
-// pointers, so the vector must outlive each execute(), and it is consumed (moved)
+// pointers, so the vector must outlive each evaluate(), and it is consumed (moved)
 // into a single executor per run.
 duckdb::vector<std::unique_ptr<ast_node>> build_cast_add_projection()
 {
@@ -121,13 +121,13 @@ TEST_CASE("nonduckdb proof - hand-built AST projection executes end-to-end",
   }
 
   // The proof must hold regardless of how the executor evaluates the tree.
-  for (auto strategy : {sirius::expression_executor_strategy::MATERIALIZE,
-                        sirius::expression_executor_strategy::AST_INTERPRET}) {
+  for (auto strategy : {sirius::expression_evaluator_strategy::MATERIALIZE,
+                        sirius::expression_evaluator_strategy::AST_INTERPRET}) {
     auto exprs = build_cast_add_projection();
-    sirius::gpu_expression_executor executor(
+    sirius::expression_evaluator executor(
       exprs, cudf::get_current_device_resource_ref(), cudf::get_default_stream(), strategy);
 
-    auto output = executor.execute(input->view());
+    auto output = executor.evaluate(input->view());
 
     REQUIRE(output->num_columns() == 1);
     REQUIRE(output->view().column(0).type().id() == cudf::type_id::INT64);
@@ -144,7 +144,7 @@ TEST_CASE("nonduckdb proof - test source includes no duckdb headers", "[nonduckd
   // the AST tree above is constructed and executed without the DuckDB frontend.
   std::filesystem::path const self =
     std::filesystem::path(SIRIUS_PROJECT_ROOT) /
-    "test/cpp/expression_executor/test_nonduckdb_frontend_proof.cpp";
+    "test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp";
 
   std::ifstream in(self);
   REQUIRE(in.is_open());

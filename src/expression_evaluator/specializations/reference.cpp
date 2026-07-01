@@ -16,20 +16,20 @@
 
 // sirius
 #include <expression/ast/node.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
 namespace sirius {
-using ast_result     = gpu_expression_executor::ast_result;
-using execute_result = gpu_expression_executor::execute_result;
+using ast_result      = expression_evaluator::ast_result;
+using evaluate_result = expression_evaluator::evaluate_result;
 
-execute_result gpu_expression_executor::execute(sirius::ast::reference const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::reference const& alt,
+                                               evaluation_mode mode)
 {
-  if (mode == execution_mode::AST) {
+  if (mode == evaluation_mode::AST) {
     auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(alt.column_index);
-    return execute_result(ast_result(col_expr));
+    return evaluate_result(ast_result(col_expr));
   }
-  return execute_result(_input_table.column(alt.column_index));
+  return evaluate_result(_input_table.column(alt.column_index));
 }
 }  // namespace sirius

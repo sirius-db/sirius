@@ -16,7 +16,7 @@
 
 // sirius
 #include <expression/ast/aggregate.hpp>
-#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
 
@@ -406,7 +406,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   }
 
   auto const cudf_type = sirius::get_cudf_type(alt.return_type);
-  // TODO: Expand type support as needed. See gpu_execute_constant.cpp.
+  // TODO: Expand type support as needed. See constant.cpp.
   switch (cudf_type.id()) {
     case cudf::type_id::INT8: {
       return add_literal_expression<cudf::numeric_scalar<int8_t>>(

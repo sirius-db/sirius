@@ -21,7 +21,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
-#include "expression_executor/expression_executor_strategy.hpp"
+#include "expression_evaluator/expression_evaluator_strategy.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
@@ -1364,19 +1364,35 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
 
-static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
+static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 {
-  auto value = StringValue::Get(parameter);
-  sirius::expression_executor_strategy parsed;
+  sirius::expression_evaluator_strategy parsed;
   if (!sirius::string_to_strategy(value, parsed)) {
     throw InvalidInputException(
-      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
+      "Invalid expression_evaluator_strategy '{}'. Valid values: materialize, ast_interpret, "
       "ast_jit",
       value);
   }
-  Config::EXPRESSION_EXECUTOR_STRATEGY = parsed;
-  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EXECUTOR_STRATEGY to {}",
-                   sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY));
+  Config::EXPRESSION_EVALUATOR_STRATEGY = parsed;
+  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EVALUATOR_STRATEGY to {}",
+                   sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY));
+}
+
+static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scope, Value& parameter)
+{
+  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
+}
+
+// Deprecated alias for `expression_evaluator_strategy`. Kept so existing
+// `SET expression_executor_strategy=...` statements keep working; remove in a future release.
+static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
+{
+  SIRIUS_LOG_WARN(
+    "The 'expression_executor_strategy' setting is deprecated; use "
+    "'expression_evaluator_strategy' instead.");
+  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
@@ -1584,12 +1600,21 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             SetUseCudfExpr);
 
   config.AddExtensionOption(
-    "expression_executor_strategy",
-    "Strategy for the gpu_expression_executor: 'materialize', 'ast_interpret', or "
+    "expression_evaluator_strategy",
+    "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
     "'ast_jit'",
     LogicalType::VARCHAR,
-    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY))),
-    SetExpressionExecutorStrategy);
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
+    SetExpressionEvaluatorStrategy);
+
+  // Deprecated alias for `expression_evaluator_strategy`; remove in a future release.
+  config.AddExtensionOption(
+    "expression_executor_strategy",
+    "[DEPRECATED - use expression_evaluator_strategy] Strategy for the expression_evaluator: "
+    "'materialize', 'ast_interpret', or 'ast_jit'",
+    LogicalType::VARCHAR,
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
+    SetExpressionExecutorStrategyDeprecated);
 
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",

@@ -22,8 +22,8 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/to_duckdb.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "expression_executor/gpu_expression_translator_internal.hpp"
+#include "expression_evaluator/expression_evaluator.hpp"
+#include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -497,8 +497,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       expr_to_idx[cond_hash]           = join_input_index;
       cudf::size_type source_idx       = 0;
       if (!get_column_index(expr, source_idx)) {
-        sirius::gpu_expression_executor executor(&ast_expr, mr, stream);
-        auto expr_result_table = executor.execute(table);
+        sirius::expression_evaluator evaluator(&ast_expr, mr, stream);
+        auto expr_result_table = evaluator.evaluate(table);
         auto expr_view         = expr_result_table->view();
         if (expr_view.num_columns() != 1) {
           throw std::runtime_error(std::string("sirius_physical_nested_loop_join: expression on ") +

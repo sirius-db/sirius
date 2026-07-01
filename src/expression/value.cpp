@@ -60,7 +60,7 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
     case type_id::TIMESTAMP_MS:
       return value{timestamp_ms_value{v.GetValue<duckdb::timestamp_ms_t>().value}};
     case type_id::TIMESTAMP:
-      // gpu_execute_constant.cpp uses duckdb::timestamp_tz_t for microsecond
+      // constant.cpp uses duckdb::timestamp_tz_t for microsecond
       // TIMESTAMP — mirror that accessor exactly so the executor migration is
       // a structural rewrite, not a behavior change.
       return value{timestamp_us_value{v.GetValue<duckdb::timestamp_tz_t>().value}};
@@ -76,7 +76,7 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
       // widths are widened on read. GetValueUnsafe<T> reinterprets the
       // value union — it does NOT cast — so each branch must read at the
       // actual storage width (mirrors to_duckdb above and
-      // gpu_execute_constant.cpp:148-167).
+      // constant.cpp:148-167).
       if (precision <= logical_type::decimal_max_precision_int16) {
         return value{decimal32{static_cast<int32_t>(v.GetValueUnsafe<int16_t>()), scale}};
       }
@@ -86,7 +86,7 @@ value from_duckdb(const duckdb::Value& v, const logical_type& type)
       if (precision <= logical_type::decimal_max_precision_int64) {
         return value{decimal64{v.GetValueUnsafe<int64_t>(), scale}};
       }
-      // DECIMAL128 unpack — mirror gpu_execute_constant.cpp:162-163 EXACTLY.
+      // DECIMAL128 unpack — mirror constant.cpp:162-163 EXACTLY.
       auto const hi  = v.GetValueUnsafe<duckdb::hugeint_t>();
       auto const rep = (static_cast<__int128_t>(hi.upper) << 64) | hi.lower;
       return value{decimal128{rep, scale}};

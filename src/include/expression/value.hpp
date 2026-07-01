@@ -72,7 +72,7 @@ struct timestamp_ms_value {
  *        (the SQL default TIMESTAMP precision).
  *
  * 64-bit signed microseconds from epoch. Mirrors duckdb::timestamp_tz_t.value
- * (the accessor used by gpu_execute_constant.cpp for microsecond TIMESTAMP).
+ * (the accessor used by constant.cpp for microsecond TIMESTAMP).
  */
 struct timestamp_us_value {
   int64_t value{};

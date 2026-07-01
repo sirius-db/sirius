@@ -17,7 +17,7 @@
 // sirius
 #include <expression/ast/node.hpp>
 #include <expression/value.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
@@ -238,31 +238,31 @@ std::unique_ptr<cudf::column> execute_string_in_ast(const ::sirius::ast::in_list
 }  // namespace
 
 namespace sirius {
-using execute_result = gpu_expression_executor::execute_result;
+using evaluate_result = expression_evaluator::evaluate_result;
 
 //===----------------------------------------------------------------------===//
 // unary_op
 //===----------------------------------------------------------------------===//
 
-execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
+                                               evaluation_mode mode)
 {
   if (alt.op == sirius::ast::unary_op::kind::op_try) {
     throw not_implemented_exception(
-      "[gpu_expression_executor] execute called on an unsupported TRY operator expression.");
+      "[expression_evaluator] evaluate called on an unsupported TRY operator expression.");
   }
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
-    auto child        = execute(*alt.child, execution_mode::AST);
-    auto build_output = [&](expr_ref const& produced) -> execute_result {
-      return execute_result(
+  if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
+      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
+    auto child        = evaluate(*alt.child, evaluation_mode::AST);
+    auto build_output = [&](expr_ref const& produced) -> evaluate_result {
+      return evaluate_result(
         ast_result(produced, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
     };
 
-    execute_result output = [&]() -> execute_result {
+    evaluate_result output = [&]() -> evaluate_result {
       switch (alt.op) {
         case sirius::ast::unary_op::kind::op_not: {
           auto const& not_expr =
@@ -283,48 +283,48 @@ execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& alt
         }
         default:
           throw internal_exception(
-            "[gpu_expression_executor] AST mode with unknown/unsupported unary_op kind: {}",
+            "[expression_evaluator] AST mode with unknown/unsupported unary_op kind: {}",
             static_cast<int>(alt.op));
       }
     }();
 
-    if (mode == execution_mode::AST) {
+    if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
       return output;
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    auto result_column = execute_ast(output.get_expr());
+    auto result_column = evaluate_ast(output.get_expr());
     release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
-  if (mode == execution_mode::AST) {
-    auto result = execute(alt, execution_mode::MATERIALIZE);
+  if (mode == evaluation_mode::AST) {
+    auto result = evaluate(alt, evaluation_mode::MATERIALIZE);
     if (!result.is_owned_column()) {
       throw internal_exception(
-        "[gpu_expression_executor:operator]: Expected an owned column after executing operator "
+        "[expression_evaluator:operator]: Expected an owned column after executing operator "
         "expression.");
     }
     return materialize_as_ast_column(result.release_column());
   }
 
-  auto child = execute(*alt.child, execution_mode::MATERIALIZE);
+  auto child = evaluate(*alt.child, evaluation_mode::MATERIALIZE);
   switch (alt.op) {
     case sirius::ast::unary_op::kind::op_not:
-      return execute_result(
+      return evaluate_result(
         cudf::unary_operation(child.get_column_view(), cudf::unary_operator::NOT, _stream, _mr));
     case sirius::ast::unary_op::kind::op_is_null:
-      return execute_result(cudf::is_null(child.get_column_view(), _stream, _mr));
+      return evaluate_result(cudf::is_null(child.get_column_view(), _stream, _mr));
     case sirius::ast::unary_op::kind::op_is_not_null: {
       auto is_null_result = cudf::is_null(child.get_column_view(), _stream, _mr);
-      return execute_result(
+      return evaluate_result(
         cudf::unary_operation(is_null_result->view(), cudf::unary_operator::NOT, _stream, _mr));
     }
     default:
       throw internal_exception(
-        "[gpu_expression_executor] execute called on an operator expression with "
+        "[expression_evaluator] evaluate called on an operator expression with "
         "unknown/unsupported unary_op kind: {}",
         static_cast<int>(alt.op));
   }
@@ -334,35 +334,35 @@ execute_result gpu_expression_executor::execute(sirius::ast::unary_op const& alt
 // in_list
 //===----------------------------------------------------------------------===//
 
-execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
+                                               evaluation_mode mode)
 {
   if (alt.values.empty()) {
     throw invalid_input_exception(
-      "[gpu_expression_executor:in_list] in_list has no values — malformed AST.");
+      "[expression_evaluator:in_list] in_list has no values — malformed AST.");
   }
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
+  if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
+      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     D_ASSERT(!alt.values.empty());
 
-    auto test                = execute(*alt.probe, execution_mode::AST);
-    auto comparator          = execute(*alt.values[0], execution_mode::AST);
+    auto test                = evaluate(*alt.probe, evaluation_mode::AST);
+    auto comparator          = evaluate(*alt.values[0], evaluation_mode::AST);
     expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
       cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
-    auto output = execute_result(
+    auto output = evaluate_result(
       ast_result(comparison_expr,
                  {test.get_temp_scalar_indices(), comparator.get_temp_scalar_indices()},
                  {test.get_temp_column_indices(), comparator.get_temp_column_indices()}));
 
     for (std::size_t value_idx = 1; value_idx < alt.values.size(); ++value_idx) {
-      auto next_comparator          = execute(*alt.values[value_idx], execution_mode::AST);
+      auto next_comparator          = evaluate(*alt.values[value_idx], evaluation_mode::AST);
       expr_ref next_comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::EQUAL, test.get_expr(), next_comparator.get_expr());
       comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
-      output = execute_result(
+      output = evaluate_result(
         ast_result(comparison_expr,
                    {output.get_temp_scalar_indices(), next_comparator.get_temp_scalar_indices()},
                    {output.get_temp_column_indices(), next_comparator.get_temp_column_indices()}));
@@ -370,40 +370,40 @@ execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
 
     if (!alt.negated) {
       // produce IN result (positive)
-      if (mode == execution_mode::AST) { return output; }
-      auto result_column = execute_ast(output.get_expr());
+      if (mode == evaluation_mode::AST) { return output; }
+      auto result_column = evaluate_ast(output.get_expr());
       release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
-      return execute_result(std::move(result_column));
+      return evaluate_result(std::move(result_column));
     }
     auto const& not_expr =
       _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
-    auto not_output = execute_result(
+    auto not_output = evaluate_result(
       ast_result(not_expr, output.get_temp_scalar_indices(), output.get_temp_column_indices()));
 
-    if (mode == execution_mode::AST) {
+    if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
       return not_output;
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    auto result_column = execute_ast(not_output.get_expr());
+    auto result_column = evaluate_ast(not_output.get_expr());
     release_temporaries(not_output.get_temp_scalar_indices(), not_output.get_temp_column_indices());
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
-  if (mode == execution_mode::AST) {
-    auto result = execute(alt, execution_mode::MATERIALIZE);
+  if (mode == evaluation_mode::AST) {
+    auto result = evaluate(alt, evaluation_mode::MATERIALIZE);
     if (!result.is_owned_column()) {
       throw internal_exception(
-        "[gpu_expression_executor:operator]: Expected an owned column after executing operator "
+        "[expression_evaluator:operator]: Expected an owned column after executing operator "
         "expression.");
     }
     return materialize_as_ast_column(result.release_column());
   }
 
   D_ASSERT(!alt.values.empty());
-  auto test = execute(*alt.probe, execution_mode::MATERIALIZE);
+  auto test = evaluate(*alt.probe, evaluation_mode::MATERIALIZE);
   D_ASSERT(!test.is_scalar());  // IN with scalar LHS should have been already resolved
 
   // Optimization: special handling when every haystack entry is a constant.
@@ -491,29 +491,29 @@ execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
         break;
       default:
         throw not_implemented_exception(
-          "[gpu_expression_executor] execute IN called with unsupported scalar haystack type {}",
+          "[expression_evaluator] evaluate IN called with unsupported scalar haystack type {}",
           static_cast<int>(test.get_column_view().type().id()));
     }
     if (alt.negated) {
       contains_column =
         cudf::unary_operation(contains_column->view(), cudf::unary_operator::NOT, _stream, _mr);
     }
-    return execute_result(std::move(contains_column));
+    return evaluate_result(std::move(contains_column));
   }
 
   // Some haystack referent is not a scalar — fall back to a chained OR of EQUAL comparisons.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
-  auto comparator        = execute(*alt.values[0], execution_mode::MATERIALIZE);
+  auto comparator        = evaluate(*alt.values[0], evaluation_mode::MATERIALIZE);
   auto comparison_column = cudf::binary_operation(test.get_column_view(),
                                                   comparator.get_column_view(),
                                                   cudf::binary_operator::EQUAL,
                                                   output_type,
                                                   _stream,
                                                   _mr);
-  auto output            = execute_result(std::move(comparison_column));
+  auto output            = evaluate_result(std::move(comparison_column));
 
   for (std::size_t value_idx = 1; value_idx < alt.values.size(); ++value_idx) {
-    auto next_comparator = execute(*alt.values[value_idx], execution_mode::MATERIALIZE);
+    auto next_comparator = evaluate(*alt.values[value_idx], evaluation_mode::MATERIALIZE);
     auto next_eq_column  = cudf::binary_operation(test.get_column_view(),
                                                  next_comparator.get_column_view(),
                                                  cudf::binary_operator::EQUAL,
@@ -526,47 +526,47 @@ execute_result gpu_expression_executor::execute(sirius::ast::in_list const& alt,
                                            output_type,
                                            _stream,
                                            _mr);
-    output               = execute_result(std::move(combined));
+    output               = evaluate_result(std::move(combined));
   }
 
   if (!alt.negated) { return output; }
   auto not_column =
     cudf::unary_operation(output.get_column_view(), cudf::unary_operator::NOT, _stream, _mr);
-  return execute_result(std::move(not_column));
+  return evaluate_result(std::move(not_column));
 }
 
 //===----------------------------------------------------------------------===//
 // coalesce — always materializes; no AST representation.
 //===----------------------------------------------------------------------===//
 
-execute_result gpu_expression_executor::execute(sirius::ast::coalesce const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::coalesce const& alt,
+                                               evaluation_mode mode)
 {
   D_ASSERT(alt.children.size() > 1);
 
-  auto current_result = execute(*alt.children[0], execution_mode::MATERIALIZE);
+  auto current_result = evaluate(*alt.children[0], evaluation_mode::MATERIALIZE);
   if (current_result.is_scalar()) {
-    current_result = execute_result(cudf::make_column_from_scalar(
+    current_result = evaluate_result(cudf::make_column_from_scalar(
       current_result.get_scalar(), _input_table.num_rows(), _stream, _mr));
   }
 
   for (std::size_t child_idx = 1; child_idx < alt.children.size(); ++child_idx) {
     // Short-circuit if the null_count is zero
     if (!current_result.get_column_view().has_nulls()) { break; }
-    auto replacement = execute(*alt.children[child_idx], execution_mode::MATERIALIZE);
+    auto replacement = evaluate(*alt.children[child_idx], evaluation_mode::MATERIALIZE);
     if (replacement.is_scalar()) {
-      current_result = execute_result(cudf::replace_nulls(
+      current_result = evaluate_result(cudf::replace_nulls(
         current_result.get_column_view(), replacement.get_scalar(), _stream, _mr));
     } else {
-      current_result = execute_result(cudf::replace_nulls(
+      current_result = evaluate_result(cudf::replace_nulls(
         current_result.get_column_view(), replacement.get_column_view(), _stream, _mr));
     }
   }
 
-  if (mode == execution_mode::AST) {
+  if (mode == evaluation_mode::AST) {
     if (!current_result.is_owned_column()) {
       throw internal_exception(
-        "[gpu_expression_executor:operator]: Expected an owned column after executing COALESCE "
+        "[expression_evaluator:operator]: Expected an owned column after executing COALESCE "
         "expression.");
     }
     return materialize_as_ast_column(current_result.release_column());

@@ -18,7 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/from_duckdb.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
+#include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
@@ -162,9 +162,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   if (local_filter_expr != nullptr) {
-    sirius::gpu_expression_executor gpu_expression_executor(
+    sirius::expression_evaluator evaluator(
       *local_filter_expr, cudf::get_current_device_resource_ref(), stream);
-    auto filtered_table = gpu_expression_executor.select(
+    auto filtered_table = evaluator.select(
       batch_ref.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batch =
       sirius::make_data_batch(std::move(filtered_table), *batch_ref.get_memory_space(), stream);

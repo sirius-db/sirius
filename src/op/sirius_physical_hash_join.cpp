@@ -33,7 +33,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/joinside.hpp"
 #include "expression/ast/to_duckdb.hpp"
-#include "expression_executor/gpu_expression_translator_internal.hpp"
+#include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"

@@ -18,7 +18,7 @@
 #include "op/scan/owning_table_view.hpp"
 
 #include <expression/ast/from_duckdb.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/utils.hpp>
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
@@ -330,7 +330,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   owning_table_view final_table;
   if (_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
-    sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
+    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
     if (projection_required) {
       // Fold the projection into the filter gather so pure-filter columns are never materialized.
       std::vector<cudf::size_type> output_indices(output_arity);
