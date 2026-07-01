@@ -103,13 +103,48 @@ bool needs_output_assembly(scan_plan const& plan)
   return false;
 }
 
-std::unique_ptr<cudf::table> assemble_scan_output(scan_plan const& plan,
-                                                  std::unique_ptr<cudf::table> reader_output,
-                                                  std::vector<std::string> const& partition_values,
-                                                  rmm::cuda_stream_view stream)
+std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)
 {
-  if (!reader_output) return reader_output;
+  std::vector<cudf::size_type> positions;
+  positions.reserve(plan.output_layout.size());
+  for (auto const& entry : plan.output_layout) {
+    if (entry.source == scan_plan::output_entry::DATA) {
+      positions.push_back(static_cast<cudf::size_type>(entry.idx));
+    }
+  }
+  return positions;
+}
 
+owning_table_view assemble_scan_output(scan_plan const& plan,
+                                       owning_table_view&& table,
+                                       std::vector<std::string> const& partition_values,
+                                       rmm::cuda_stream_view stream)
+{
+  if (!table) { return std::move(table); }
+
+  // Nothing to reshape (SELECT count(*) — empty output layout). Emitting a
+  // 0-column table would erase the row count downstream aggregations consume.
+  if (plan.output_layout.empty()) { return std::move(table); }
+
+  // No partition columns: the output is a pure projection / reordering of the
+  // reader's data columns. Express it as a non-owning view selection — no GPU
+  // copy. Every output_entry is DATA here (PARTITION entries only exist when the
+  // plan has partition columns), and entry.idx is the column's position in the
+  // current (D-order) view. Pure-filter data columns are dropped by the
+  // selection and freed when the view is later materialized.
+  if (!plan.has_partitions()) {
+    std::vector<std::size_t> positions;
+    positions.reserve(plan.output_layout.size());
+    for (auto const& entry : plan.output_layout) {
+      positions.push_back(entry.idx);
+    }
+    table.select_columns(positions);
+    return std::move(table);
+  }
+
+  // Partition columns present: materialize the reader batch and rebuild, moving
+  // DATA columns out and synthesizing constant PARTITION columns from the path.
+  auto reader_output  = table.release(stream);
   auto const num_rows = reader_output->num_rows();
   auto data_cols      = reader_output->release();  // move columns out, no GPU copy
 
@@ -121,25 +156,16 @@ std::unique_ptr<cudf::table> assemble_scan_output(scan_plan const& plan,
       out_cols.push_back(std::move(data_cols.at(entry.idx)));
     } else {
       auto const& pcol = plan.partition_columns.at(entry.idx);
-      // partition_values is in partition_columns order, so entry.idx indexes it directly.
-      if (entry.idx >= partition_values.size()) {
-        throw sirius::internal_exception(
-          "[assemble_scan_output] partition_values too short ({}) for partition column '{}' at "
-          "index {}.",
-          partition_values.size(),
-          pcol.name,
-          entry.idx);
-      }
-      auto duckdb_val =
-        duckdb::Value(partition_values[entry.idx]).DefaultCastAs(sirius::to_duckdb(pcol.type));
-      auto scalar = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
+      auto const& pval = partition_values.at(entry.idx);
+      auto duckdb_val  = duckdb::Value(pval).DefaultCastAs(sirius::to_duckdb(pcol.type));
+      auto scalar      = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
       out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
     }
   }
 
   // Unused data columns (pure-filter columns not in output_layout) fall out
   // of scope with data_cols and are freed.
-  return std::make_unique<cudf::table>(std::move(out_cols));
+  return owning_table_view{std::make_unique<cudf::table>(std::move(out_cols))};
 }
 
 //===----------------------------------------------------------------------===//

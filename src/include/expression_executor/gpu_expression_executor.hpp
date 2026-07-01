@@ -28,6 +28,7 @@
 // cudf
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
 // rmm
@@ -36,6 +37,7 @@
 
 // standard library
 #include <memory>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -312,19 +314,55 @@ class gpu_expression_executor {
     std::size_t min_ast_size                    = 2);
 
   /**
+   * @brief Non-owning ctor for a pre-filtered list of expressions (e.g. the projection operator's
+   * subset of select_list entries that actually need evaluation, after pulling out pure
+   * BOUND_REF passthroughs).
+   *
+   * The caller retains ownership of the nodes; the executor only reads from them. The output
+   * table produced by execute() contains one column per entry in @p expressions, in the same
+   * order.
+   */
+  gpu_expression_executor(
+    std::vector<sirius::ast::node const*> expressions,
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
+    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    expression_executor_strategy strategy       = strategy_from_config(),
+    std::size_t min_ast_size                    = 2);
+
+  /**
    * @brief Executes the current set of expressions against the given input batch and emits a new
    * output batch with the results.
    *
-   * @param input_batch The read-only locked input batch against which to evaluate expressions.
+   * @param input The read-only locked input batch against which to evaluate expressions.
    * @return A new idle batch containing the results of expression evaluation.
    */
   std::unique_ptr<cudf::table> execute(cudf::table_view input);
 
   /**
+   * @brief Select the rows passing the predicate, materializing only @p output_indices.
+   *
+   * The predicate is evaluated over the full @p input, so columns referenced only by the
+   * predicate (pure filter columns) are available to it but are never materialized in the
+   * result. Output column @c i is the filtered @p input column @c output_indices[i], so the
+   * caller controls both projection and column order in a single gather.
+   *
+   * @param input The read-only locked input batch from which to select rows.
+   * @param output_indices Indices into @p input's columns to materialize, in output order.
+   *        Must be non-empty: a 0-column result cannot carry a row count, so count(*)-style
+   *        filters with no output columns must use the all-columns select() overload.
+   * @return A new idle batch containing the selected rows and columns.
+   */
+  std::unique_ptr<cudf::table> select(cudf::table_view input,
+                                      std::span<cudf::size_type const> output_indices);
+
+  /**
    * @brief Selects rows from the input batch based on the executor's (singular) expression.
    *
-   * @param input_batch The read-only locked input batch from which to select rows.
+   * @param input The read-only locked input batch from which to select rows.
    * @return A new idle batch containing the selected rows.
+   *
+   * @note This method should only be used when there are no pure filter columns in @p input;
+   *       otherwise, the intermediate gather step materializes them unnecessarily.
    */
   std::unique_ptr<cudf::table> select(cudf::table_view input);
 
@@ -366,6 +404,10 @@ class gpu_expression_executor {
   std::vector<std::unique_ptr<cudf::column>>
     _temp_columns;  ///< The temporary columns that need to be kept alive for the AST nodes in
                     ///< _ast_tree.
+
+  // Evaluate the executor's single boolean predicate over @p input and return the resulting
+  // mask column (the sole column of execute()'s output). Shared by both select() overloads.
+  std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
 
   // Execute the AST tree rooted at the given expression reference and return the result as a
   // column.

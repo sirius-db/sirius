@@ -44,6 +44,7 @@
 #include <rmm/resource_ref.hpp>
 
 // standard library
+#include <memory>
 #include <numeric>
 #include <variant>
 
@@ -191,6 +192,19 @@ gpu_expression_executor::gpu_expression_executor(sirius::ast::node const* expres
   _ast_expressions.push_back(expression);
 }
 
+gpu_expression_executor::gpu_expression_executor(std::vector<sirius::ast::node const*> expressions,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 expression_executor_strategy strategy,
+                                                 std::size_t min_ast_size)
+  : _ast_expressions(std::move(expressions)),
+    _strategy(strategy),
+    _mr(resource_ref),
+    _stream(stream),
+    _min_ast_size(min_ast_size)
+{
+}
+
 std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root_expr)
 {
   std::vector<cudf::column_view> combined_column_views;
@@ -331,7 +345,7 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
   return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
 }
 
-std::unique_ptr<cudf::table> gpu_expression_executor::select(cudf::table_view input)
+std::unique_ptr<cudf::column> gpu_expression_executor::compute_mask(cudf::table_view input)
 {
   D_ASSERT(_ast_expressions.size() == 1);
 #ifdef D_ASSERT_IS_ENABLED
@@ -342,12 +356,29 @@ std::unique_ptr<cudf::table> gpu_expression_executor::select(cudf::table_view in
   D_ASSERT(duck_expr->return_type == duckdb::LogicalType::BOOLEAN);
 #endif
 
-  // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
-  auto mask_batch = execute(input);
-  auto mask_view  = mask_batch->view().column(0);
+  return std::move(execute(input)->release()[0]);
+}
 
-  // Apply the boolean mask to filter the input batch
-  return cudf::apply_boolean_mask(input, mask_view, _stream, _mr);
+std::unique_ptr<cudf::table> gpu_expression_executor::select(
+  cudf::table_view input, std::span<cudf::size_type const> output_indices)
+{
+  // A cuDF table with zero columns cannot carry a row count, so a pure-filter result with no
+  // output columns (e.g. count(*) over a filtered scan) is unrepresentable here. Such callers
+  // must use the all-columns select() overload so the surviving row count is preserved.
+  if (output_indices.empty()) {
+    throw duckdb::InternalException(
+      "[gpu_expression_executor] select(): output_indices must be non-empty; use the "
+      "all-columns select() overload for count(*)-style filters with no output columns");
+  }
+  auto mask = compute_mask(input);
+  return cudf::apply_boolean_mask(
+    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+}
+
+std::unique_ptr<cudf::table> gpu_expression_executor::select(cudf::table_view input)
+{
+  auto mask = compute_mask(input);
+  return cudf::apply_boolean_mask(input, mask->view(), _stream, _mr);
 }
 
 execute_result gpu_expression_executor::execute(sirius::ast::aggregate const& /*expr*/,

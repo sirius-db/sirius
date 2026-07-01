@@ -16,24 +16,24 @@
 
 #pragma once
 
-#include "exec/config.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/gpu_ingestible.hpp"
-#include "io/s3/s3_blocking_ioctx.hpp"
-#include "io/s3/s3_ioctx.hpp"
+#include "io/datasource_factory.hpp"
 #include "io/sirius_datasource.hpp"
-#include "scan_manager/gpu_ingestible_factory.hpp"
+#include "op/scan/gpu_ingestible_types.hpp"
+#include "scan_manager/config.hpp"
+#include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/split_provider.hpp"
 
-// Forward-declare sirius_ioctx via <io/types.hpp> for the owned-backend
-// vector used by create_datasource / create_ingestible_for.
+// Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
+// used by prepare_for_query / create_provider_for.
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
 #include <compression/compressed_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <io/types.hpp>
@@ -43,21 +43,35 @@ class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
 #include <memory>
-#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
+namespace cucascade::memory {
+class memory_reservation_manager;
+}  // namespace cucascade::memory
+
+namespace sirius::memory {
+class topology_index;
+}  // namespace sirius::memory
+
 namespace sirius::io {
 class sirius_ioctx;
+namespace cache {
 class buffer_pool;
+}  // namespace cache
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
+class gpu_ingestible;
 }  // namespace sirius::op::scan
+
+namespace sirius::scan_manager {
+class load_balancing_scan_batch_coalescer;
+}  // namespace sirius::scan_manager
 
 namespace sirius::planner {
 class query;
@@ -65,78 +79,36 @@ class query;
 
 namespace sirius::scan_manager {
 
-/**
- * @brief Configuration for the scan_manager.
- *
- * @c use_sirius_datasource gates whether LOCAL parquet paths are claimed by
- * the Sirius local-file backend in @c create_datasource. When false, local
- * paths resolve to no datasource and reads fall back to
- * @c cudf::io::datasource::create() (KvikIO); object-store paths (s3://)
- * always resolve through their backend regardless. The local @c uring_ioctx
- * itself is constructed unconditionally — the DuckDB-native GPU scan needs
- * it for host reads. Only valid in single-GPU configurations — when more
- * than one GPU is configured,
- * @c sirius_config::enforce_sirius_datasource_for_multi_gpu() forces this
- * field to @c true because kvikio's per-FileHandle CUDA-context binding
- * breaks multi-GPU residency.
- */
-struct scan_manager_config {
-  exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
-  bool use_sirius_datasource{false};
-  /// Size of the @c uring_reactor pool for the local-file backend. Since the
-  /// scan-manager cleanup (#913) the scan_manager constructs the @c uring_ioctx
-  /// itself and passes this through.
-  std::size_t uring_n_reactors{4};
-  /// io_uring submission/completion queue depth per reactor, passed through to
-  /// the scan_manager-constructed @c uring_ioctx.
-  unsigned uring_ring_entries{64};
-  /// Enable the prefetching cache.  Requires @c use_sirius_datasource=true;
-  /// when true, the scan_manager allocates a pinned-host buffer_pool and
-  /// initializes the cache on the IO backends it constructs (the local uring
-  /// and the S3 backend).  Off by default.
-  bool enable_prefetch_cache{false};
-  /// Total pinned-host bytes reserved for the prefetch cache.  Rounded
-  /// up to the nearest 500 MiB slab.  Ignored when
-  /// @c enable_prefetch_cache is false.
-  std::size_t prefetch_buffer_pool_bytes{20ULL << 30};
-  /// Maximum chunks the cache may have in flight at once (admission
-  /// control).  Ignored when @c enable_prefetch_cache is false.
-  std::size_t prefetch_inflight_budget_chunks{2048};
+/// Lightweight descriptor of a pinned table's cache identity + column layout,
+/// stored on @ref pinned_entry in place of the read-side ingestible_table_info.
+/// Captures only what serving needs — the table's identity (parquet file set OR
+/// duckdb catalog/schema/table name), the cached columns (by primary/storage
+/// index), and their names (aligned with @c column_ids) for the GPU gather — and
+/// owns the match logic that @ref sirius_scan_manager::try_assign_cached_entries consults.
+class cache_entry_info {
+ public:
+  std::vector<std::string> resolved_file_paths;    ///< parquet identity (file set)
+  std::string catalog_name;                        ///< duckdb identity: catalog (attach alias)
+  std::string schema_name;                         ///< duckdb identity: schema
+  std::string table_name;                          ///< duckdb identity: table
+  duckdb::vector<duckdb::ColumnIndex> column_ids;  ///< cached columns, by primary index
+  std::vector<std::string> names;                  ///< aligned with column_ids; gather keys
 
-  /// When true (default), the scan-side split build (parquet_gpu_ingestible)
-  /// prewarms the selected row groups' merged column-chunk byte ranges via
-  /// @c cache->insert(obj, metadata, ranges) once projection and row-group
-  /// pruning are final. When false, no ranges enter the cache at scan time
-  /// (describe_parquet's metadata-only insert is unaffected). Lets the
-  /// micro-bench A/B compare prefetch overlap on SF10. Ignored when
-  /// @c enable_prefetch_cache is false (no cache → no prewarm regardless).
-  bool enable_chunk_prewarm{true};
+  /// Build the cache descriptor from a read-side ingestible_table_info (parquet
+  /// or duckdb-native): captures the format's identity, the kept @c column_ids,
+  /// and the @c column_ids-aligned column names.
+  [[nodiscard]] static cache_entry_info from(const op::scan::ingestible_table_info& info);
 
-  /// S3 backend opt-in. When set, the scan_manager constructs and owns the S3
-  /// backend from these credentials/knobs — the async @c s3_ioctx or the
-  /// blocking @c s3_blocking_ioctx, selected by @c s3_use_async_backend.
-  /// Default construction (empty optional) leaves the S3 backend disabled.
-  /// SiriusContext populates this from object_store_config during initialize()
-  /// when the engine config requests S3.
-  std::optional<sirius::io::s3::s3_ioctx_config> s3_config{};
+  /// Gather projection (positions into @c column_ids) that lets this cached entry
+  /// serve @p other — matching identity (same parquet file set / same duckdb
+  /// catalog.schema.table) AND a superset of @p other's requested columns. The projection
+  /// reproduces @p other's requested column order. Empty when this entry cannot
+  /// serve @p other (different format, identity, or a missing column).
+  [[nodiscard]] std::vector<std::size_t> can_serve_with_columns(
+    const op::scan::ingestible_table_info& other) const;
 
-  /// Selects which S3 backend the scan_manager builds when @c s3_config is set.
-  /// Mirrors @c object_store_config::s3_use_async_backend (SiriusContext copies
-  /// it across in initialize()). When true (default) the manager builds the
-  /// async @c s3_ioctx (libcurl-multi reactor: concurrent GETs + pipelined
-  /// device reads); when false it builds the serial @c s3_blocking_ioctx fed by
-  /// @c s3_thread_pool. Ignored when @c s3_config is empty.
-  bool s3_use_async_backend{true};
-
-  /// Thread pool config for the blocking S3 backend's async workers. Ignored
-  /// when @c s3_config is empty or when @c s3_use_async_backend is true (the
-  /// async @c s3_ioctx reactor owns its own worker thread). Separate from the
-  /// main @c thread_pool because S3 I/O has different concurrency
-  /// characteristics (more threads, network-bound, not CPU-bound). Injected
-  /// into @c s3_ioctx_config::async_thread_pool before constructing the
-  /// @c s3_blocking_ioctx so its async paths bypass detached std::thread
-  /// fallbacks.
-  exec::thread_pool_config s3_thread_pool{.num_threads = 8, .thread_name_prefix = "s3_io"};
+  /// Column names in @c column_ids order — the keys @c data_batches_by_column uses.
+  [[nodiscard]] const std::vector<std::string>& column_names() const { return names; }
 };
 
 /**
@@ -147,11 +119,11 @@ struct scan_manager_config {
  * pinned table. The vector may be empty until splits are populated.
  */
 struct pinned_entry {
-  std::vector<std::string> column_names;
-  /// Resolved (globbed) file paths captured at pin time. The scan_manager uses
-  /// this list to match an incoming scan operator's scan_info::file_paths
-  /// against this entry, so it can swap in a cached split provider.
-  std::vector<std::string> file_paths;
+  /// Cache identity + column layout for this pinned table. Drives the cache-hit
+  /// match (@ref cache_entry_info::can_serve_with_columns) and the per-column
+  /// gather; replaces the heavyweight read-side ingestible_table_info.
+  cache_entry_info cache_info;
+
   /// GPU-tier storage: one chunk vector per pinned column name. Populated by
   /// @ref sirius_scan_manager::insert_pinned_entry. Empty when @ref tier is HOST.
   std::unordered_map<std::string, std::vector<std::shared_ptr<cudf::column>>>
@@ -163,8 +135,8 @@ struct pinned_entry {
   /// chunked_parquet_reader::read_chunk() call.
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   /// HOST-tier storage: one host_data_representation per chunk, each holding all
-  /// pinned columns. The pinned_table_gpu_ingestible slices these by column index
-  /// when serving a particular scan. Populated by @ref insert_pinned_entry_host.
+  /// pinned columns. The cached_split_provider slices these by column index when
+  /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   /// HOST-tier compressed storage: one compressed_host_representation per chunk,
   /// each holding all pinned columns in Simpatico-compressed form. Populated by
@@ -172,21 +144,15 @@ struct pinned_entry {
   /// when non-empty (the ingestible factory checks this first).
   std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_host_chunks;
   /// Tier the pinned data resides in. Drives which storage member above is used
-  /// and which pinned_table_gpu_ingestible variant @ref create_ingestible_for builds.
+  /// and which cached_split_provider variant @ref create_provider_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
   /// Memory space the pinned data resides in. Captured at pin time so the
-  /// pinned_table_gpu_ingestible can wrap copied tables as data_batch instances.
+  /// cached_split_provider can wrap copied tables as data_batch instances.
   cucascade::memory::memory_space* memory_space{nullptr};
   /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
-  /// True when the pin was created with a row-count budget (e.g.
-  /// `CALL pin_table(..., n_rows=N)`) that capped the captured rows below
-  /// the full file content. Partial entries MUST NOT serve cached reads
-  /// because a subsequent full scan of the same file paths would silently
-  /// return only the pinned prefix.
-  bool is_partial{false};
 };
 
 /**
@@ -217,15 +183,14 @@ class sirius_scan_manager {
    * The scan_manager owns a single io_context (uring_ioctx) and optionally
    * an S3 backend and a prefetch buffer pool, all created from @p config.
    *
-   * @param config   Scan-manager configuration (thread pool, io settings,
-   *                 S3 credentials, prefetch cache knobs).
-   * @param host_fsmr  Host fixed-size memory resource for S3 backend and
-   *                   prefetch cache buffer pool. May be nullptr when prefetch
-   *                   cache is disabled and no S3 backend is configured.
+   * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
+   * @param reservation_manager Memory reservation manager for GPU memory.
+   * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
+   *        GPU assignment for scans and is forwarded to the prefetching cache.
    */
-  explicit sirius_scan_manager(
-    scan_manager_config config,
-    cucascade::memory::fixed_size_host_memory_resource* host_fsmr = nullptr);
+  sirius_scan_manager(const scan_manager_config& config,
+                      cucascade::memory::memory_reservation_manager& reservation_manager,
+                      std::shared_ptr<const sirius::memory::topology_index> topology_index);
 
   ~sirius_scan_manager();
 
@@ -234,6 +199,8 @@ class sirius_scan_manager {
   sirius_scan_manager& operator=(const sirius_scan_manager&) = delete;
   sirius_scan_manager(sirius_scan_manager&&)                 = delete;
   sirius_scan_manager& operator=(sirius_scan_manager&&)      = delete;
+
+  using ingestible_table_info = op::scan::ingestible_table_info;
 
   /// \brief Prepare per-scan state for the given query.
   ///
@@ -248,14 +215,7 @@ class sirius_scan_manager {
   /// needed.
   ///
   /// @param query        The query whose scan operators must be prepared.
-  /// @param gpu_memory_spaces device_id -> GPU memory_space lookup used by the
-  ///                     HOST-tier pinned_table_gpu_ingestible to materialize host
-  ///                     chunks onto the executing GPU. Empty map disables the
-  ///                     HOST-tier cache path (queries against a host pin fall
-  ///                     through to parquet).
-  void prepare_for_query(
-    const sirius::planner::query& query,
-    std::unordered_map<int, cucascade::memory::memory_space*> const& gpu_memory_spaces = {});
+  void prepare_for_query(const sirius::planner::query& query);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -267,156 +227,128 @@ class sirius_scan_manager {
   /// \brief Stop the worker thread pool and the driver. Idempotent.
   void stop();
 
-  /// \brief Pin the entry for a table.
+  /// \brief Pin (or extend) the GPU-tier entry for a table.
   ///
   /// Releases the columns of each input @p data_tables into the entry's per-column
-  /// map, keyed by @p column_names (the i-th column of every table is appended to
-  /// @c data_batches_by_column[column_names[i]]). Tables become empty after this
-  /// call.
+  /// map, keyed by the column names carried in @p cache_info (the i-th column of
+  /// every table is appended to @c data_batches_by_column[cache_info.column_names()[i]]).
+  /// Tables become empty after this call.
   ///
-  /// Re-insert semantics:
+  /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
-  ///   - If an entry exists and its @c num_rows equals the new total row count,
-  ///     only columns whose names are not already present are merged in;
-  ///     duplicates are dropped. The existing file_paths and chunk_memory_spaces
-  ///     are preserved (merge MUST verify chunk_memory_spaces alignment
-  ///     between existing and new entry).
-  ///   - If row counts differ, the existing entry is dropped and replaced.
+  ///   - If an entry exists and its @c num_rows equals the new total row count, the
+  ///     incoming columns whose names are not already present are merged in
+  ///     (duplicate columns are dropped), and the entry's @c cache_info is extended
+  ///     to the union of pinned columns so later cache-hit matching can serve them.
+  ///     The existing cache identity is preserved; the merge requires the incoming
+  ///     @p chunk_memory_spaces to be identical to the existing entry's and rejects
+  ///     any mismatch.
+  ///   - If row counts differ, the existing entry is dropped and replaced. (An
+  ///     n_rows-capped "partial" pin therefore never merges with a full pin of the
+  ///     same table, since their row counts differ.)
   ///
   /// \param name                  Table name key.
-  /// \param column_names          Column names in the order returned by the parquet read.
-  /// \param file_paths            Resolved file paths captured at pin time (used to match scan
-  /// ops).
-  /// \param data_tables           Cudf tables produced by chunked parquet reads (may be empty).
-  /// \param chunk_memory_spaces   Per-chunk memory space placement (size MUST equal total chunk
-  ///                              count across data_tables; value at index i is shared by all
-  ///                              columns at chunk i).
-  /// \param is_partial            True when the caller capped row capture below the full file
-  ///                              content (e.g. pin_table n_rows budget). Partial entries
-  ///                              must NOT serve cached reads — see pinned_entry::is_partial.
+  /// \param cache_info            Cache identity (parquet file set or duckdb
+  ///                              catalog.schema.table) plus the cached columns by
+  ///                              primary index and their @c column_ids-aligned names;
+  ///                              drives later cache-hit matching and the per-column gather.
+  /// \param data_tables           Cudf tables produced by chunked reads, one per chunk
+  ///                              (may be empty). Each table's column count MUST equal
+  ///                              the number of columns described by @p cache_info.
+  /// \param chunk_memory_spaces   Per-chunk memory space placement; size MUST equal
+  ///                              data_tables.size() (the value at index i is shared by
+  ///                              all columns at chunk i).
   void insert_pinned_entry(const std::string& name,
-                           std::vector<std::string> column_names,
-                           std::vector<std::string> file_paths,
+                           cache_entry_info cache_info,
                            std::vector<std::unique_ptr<cudf::table>> data_tables,
-                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
-                           bool is_partial = false);
+                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
 
-  /// \brief Pin the entry for a table on the host tier.
+  /// \brief Pin the host-tier entry for a table.
   ///
   /// Each entry in @p host_chunks describes one batch's worth of pinned data
   /// (covering all pinned columns) as a host_data_representation. The
-  /// pinned_table_gpu_ingestible built from this entry slices each chunk by column
-  /// index at scan time. Re-insert with a different row count drops the
-  /// existing entry; otherwise the call replaces the entry's chunks.
+  /// cached_split_provider built from this entry slices each chunk by column
+  /// index at scan time. This path always REPLACES any existing entry for @p name
+  /// — there is no per-column merge analog to the GPU path because the
+  /// chunk-vs-column dimensions are flipped (each chunk already holds every column).
   ///
   /// \param name          Table name key.
-  /// \param column_names  Column names in the order the chunks were captured (i.e.
-  ///                      the i-th column in each host_data_representation
-  ///                      corresponds to @c column_names[i]).
-  /// \param file_paths    Resolved file paths captured at pin time.
+  /// \param cache_info    Cache identity plus the cached columns and their
+  ///                      @c column_ids-aligned names (the i-th column in each
+  ///                      host_data_representation corresponds to
+  ///                      @c cache_info.column_names()[i]); drives cache-hit matching.
   /// \param host_chunks   One host_data_representation per emitted batch.
-  /// \param memory_space  Host memory space the chunks reside in.
-  /// \param is_partial    True when the caller capped row capture below the full file
-  ///                      content (e.g. pin_table n_rows budget). Partial entries
-  ///                      must NOT serve cached reads — see pinned_entry::is_partial.
+  /// \param memory_space  Representative host memory space the chunks reside in
+  ///                      (metadata only; each chunk carries its own per-GPU
+  ///                      NUMA-local memory_space).
   void insert_pinned_entry_host(
     const std::string& name,
-    std::vector<std::string> column_names,
-    std::vector<std::string> file_paths,
+    cache_entry_info cache_info,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-    cucascade::memory::memory_space& memory_space,
-    bool is_partial = false);
+    cucascade::memory::memory_space& memory_space);
 
   /// \brief Pin the entry for a table on the host tier using Simpatico-compressed chunks.
   ///
   /// Each entry in @p compressed_chunks holds all pinned columns in compressed form.
-  /// The ingestible factory will prefer this over the uncompressed host_chunks when
-  /// it finds a non-empty compressed_host_chunks slot.
+  /// The cached provider prefers this over @c host_chunks when non-empty.
   ///
   /// \param name                Table name key.
-  /// \param column_names        Column names in capture order.
-  /// \param file_paths          Resolved file paths captured at pin time.
+  /// \param cache_info          Cache identity plus the cached columns and their
+  ///                            @c column_ids-aligned names.
   /// \param compressed_chunks   One compressed_host_representation per batch.
   /// \param memory_space        Representative host memory space (metadata only).
-  /// \param is_partial          True when the caller capped row capture below full file content.
   void insert_pinned_entry_host_compressed(
     const std::string& name,
-    const std::vector<std::string>& column_names,
-    const std::vector<std::string>& file_paths,
+    cache_entry_info cache_info,
     std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
-    cucascade::memory::memory_space& memory_space,
-    bool is_partial = false);
+    cucascade::memory::memory_space& memory_space);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
-  /// \brief Public read-accessor for the pinned-entries map. Used by unit
-  /// tests to assert per-chunk memory_space placement after CALL pin_table.
-  /// Const-only — callers cannot mutate the map.
-  [[nodiscard]] const std::unordered_map<std::string, pinned_entry>& get_pinned_entries()
-    const noexcept
-  {
-    return _pinned_entries;
-  }
+  void visit_pinned_entries(
+    const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
-  /// \brief Resolve @p path to the IO backend that claims it and build a
-  /// sirius_datasource for it (the datasource carries its io context, io
-  /// object and any cached metadata).
-  ///
-  /// Returns nullptr when no backend claims the path (e.g. a local file with
-  /// no local backend configured) — callers fall back to
-  /// cudf::io::datasource::create. Throws when the claiming backend fails to
-  /// materialize the object: for S3 this performs a HEAD request, so
-  /// missing-key (404), authorization and network failures propagate as
-  /// exceptions for the query layer to surface — they must NOT terminate the
-  /// process (deliberately not noexcept).
+  parquet_bind_result describe_parquet(std::string const& uri);
+
+  /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
+  ///        Returns nullptr when the manager was configured with
+  ///        @c use_sirius_datasource=false.
+  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path) const;
-
-  /// \brief Whether the scan-side split build should prewarm column-chunk
-  /// byte ranges via @c cache->insert(obj, metadata, ranges). Mirrors
-  /// @c scan_manager_config::enable_chunk_prewarm. False means no ranges are
-  /// inserted at scan time (describe_parquet stays metadata-only either way).
-  [[nodiscard]] bool chunk_prewarm_enabled() const noexcept { return _config.enable_chunk_prewarm; }
-
-  /// \brief Probe a parquet file's schema for the SQL bind path.
-  ///
-  /// Resolves @p uri to a backend via @c create_datasource, fetches only the parquet
-  /// footer (no full-file download), and infers the column types and names.
-  /// When the resolved backend has a prefetch cache, the parsed footer is
-  /// inserted as metadata-only so a subsequent scan reuses it instead of
-  /// fetching and parsing the footer a second time.
-  ///
-  /// This is the C++ entry point behind the @c sirius_read_parquet table
-  /// function's bind callback.
-  ///
-  /// \throws std::runtime_error when no backend supports @p uri, or when the
-  ///         footer fetch / schema inference fails.
-  [[nodiscard]] parquet_bind_result describe_parquet(std::string const& uri);
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
+  /// \brief Attach a cached batch_provider to @p op if a pinned entry can serve
+  ///        it. Returns true when a cache hit was assigned (the caller then skips
+  ///        the disk-reading split_provider for this operator).
+  bool try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op);
+
   scan_manager_config _config;
+  /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of
+  /// the GPU id set fed to the round-robin scan-balancing strategy.
+  std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
-  std::unique_ptr<sirius::io::buffer_pool> _prefetch_buffer_pool;
-  std::unique_ptr<sirius::exec::static_thread_pool> _s3_thread_pool;
-  /// Owned io_context backends, in priority order. The first entry is the
-  /// local-file backend (uring_ioctx); subsequent entries are object-store
-  /// backends (s3_ioctx). Per-path dispatch in create_datasource walks the
-  /// vector and uses the first whose supports(path) is true.
-  std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> _io_ctxs;
+  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
-  /// Produces the right gpu_ingestible per scan source during
-  /// prepare_for_query. Holds a borrowed reference to @c _pinned_entries
-  /// — declared AFTER it so its constructor's reference is bound to a
-  /// fully-constructed member.
-  gpu_ingestible_factory _factory;
+
+  /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
+  /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
+  /// parquet scan (allocated by @ref create_provider_for when it builds
+  /// a parquet_split_provider).  The sequencer task is enqueued on the
+  /// per-query @c _dispatcher, which injects its own stop_token; the
+  /// dispatcher's @c request_stop() in @ref reset() therefore tears the
+  /// sequencer down without an extra side-channel.
+  std::unique_ptr<load_balancing_scan_batch_coalescer> _metadata_processor;
+  io::io_context_registry _ioctx_registry;
 };
 
 }  // namespace sirius::scan_manager

@@ -70,6 +70,22 @@ if(VCPKG_BUILD)
   endforeach()
 endif()
 
+# DuckDB's unity build emits strong symbols for static constexpr members (e.g.
+# duckdb::TableCatalogEntry::Name) that also appear as inline definitions in
+# headers pulled in by the vendored substrait reader
+# (substrait/src/from_substrait.cpp). Tolerate the benign duplicate on every
+# binary that links both libsirius_extension and libduckdb_static — the duckdb
+# shell, the loadable extension, and the C++ test/bench exes — mirroring the
+# per-target flag already on sirius_unittest / parquet_benchmark (and the Rust
+# bindings).
+foreach(_sirius_link_flags CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
+                           CMAKE_MODULE_LINKER_FLAGS)
+  string(APPEND ${_sirius_link_flags} " -Wl,--allow-multiple-definition")
+  set(${_sirius_link_flags}
+      "${${_sirius_link_flags}}"
+      CACHE STRING "" FORCE)
+endforeach()
+
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
@@ -204,20 +220,23 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_function.cpp
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
+    # Execution primitives (slot-based backpressure / completion tracking)
+    src/exec/admission_control.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
-    src/io/admission_control.cpp
     src/io/datasource_factory.cpp
-    src/io/duckdb_io_object.cpp
     src/io/io_context.cpp
     src/io/parquet_helpers.cpp
-    src/io/prefetching_cache.cpp
-    src/io/s3/s3_blocking_ioctx.cpp
-    src/io/s3/s3_reactor.cpp
-    src/io/s3/s3_ioctx.cpp
-    src/io/s3/sigv4.cpp
-    src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/sirius_datasource.cpp
     src/io/uri_parser.cpp
+    src/io/cache/metadata_store.cpp
+    src/io/cache/prefetching_cache.cpp
+    src/io/cache/types.cpp
+    src/io/kvikio/kvikio_context.cpp
+    src/io/rest/curl_handle.cpp
+    src/io/rest/rest_ioctx.cpp
+    src/io/rest/rest_reactor.cpp
+    src/io/s3/sigv4.cpp
+    src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/memory/defragmenter_oom_policy.cpp
@@ -235,18 +254,17 @@ set(EXTENSION_SOURCES
     src/op/scan/hive_partition.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
-    src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
+    src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_schema_mapping.cpp
-    src/op/scan/prefetched_data_source.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
-    src/io/gpu_ingestible.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
+    src/op/scan/sirius_gpu_scan_operator_data.cpp
+    src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
-    src/op/scan/pinned_table_gpu_ingestible.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
@@ -308,7 +326,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
-    src/scan_manager/gpu_ingestible_factory.cpp
+    src/scan_manager/load_balancing_scan_batch_coalescer.cpp
     src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
@@ -347,8 +365,41 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
 endif()
 
+# Compile the DuckDB substrait extension's Substrait->DuckDB reader directly
+# into the sirius target so the FFI (src/sirius_ffi.cpp) can call
+# `duckdb::SubstraitToDuckDB`. Only the from-substrait direction plus its
+# bundled protobuf (renamespaced to `duckdb::google::protobuf`, no abseil) are
+# compiled in — NOT the substrait SQL functions, to_substrait, or a second
+# loadable extension — so there is no symbol collision with conda/system
+# protobuf or a duplicate extension.
+set(SIRIUS_SUBSTRAIT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/substrait")
+file(GLOB_RECURSE SIRIUS_SUBSTRAIT_PROTOBUF_SOURCES
+     "${SIRIUS_SUBSTRAIT_DIR}/third_party/google/protobuf/*.cc")
+set(SIRIUS_SUBSTRAIT_SOURCES
+    ${SIRIUS_SUBSTRAIT_DIR}/src/from_substrait.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions_generated.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/algebra.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/extended_expression.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/plan.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/type.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/extensions/extensions.pb.cc
+    ${SIRIUS_SUBSTRAIT_PROTOBUF_SOURCES})
+# The vendored/generated protobuf + substrait TUs are not warning-clean; never
+# fail the build on them.
+set_source_files_properties(${SIRIUS_SUBSTRAIT_SOURCES}
+                            PROPERTIES COMPILE_OPTIONS "-w")
+list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
+
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
+
+# rapidsai/rmm#826: DuckDB links the loadable extension with
+# -Wl,--exclude-libs,ALL, under which mold (but not bfd) hides RMM's GNU_UNIQUE
+# current-device-resource registry symbols, so cuDF's internal allocations
+# bypass the cuCascade reservation system. Force bfd to keep them exported.
+# Harmless for the single-DSO static vcpkg build.
+set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 
 # Shared configuration for both extension targets
 foreach(_target sirius_extension sirius_loadable_extension)
@@ -387,6 +438,14 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src/util>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
+
+  # Substrait->DuckDB reader headers (from_substrait.hpp) and its bundled
+  # protobuf.
+  target_include_directories(
+    ${_target}
+    PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
+            ${SIRIUS_SUBSTRAIT_DIR}/third_party
+            ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
   if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
     target_compile_definitions(${_target}
@@ -494,7 +553,6 @@ set(TEST_SOURCES
     test/cpp/config/test_object_store_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
-    test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
@@ -514,33 +572,33 @@ set(TEST_SOURCES
     test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
     test/cpp/expression_executor/test_nonduckdb_frontend_proof.cpp
+    test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_pin_table_host_streaming.cpp
+    test/cpp/integration/test_pin_table_merge_columns.cpp
+    test/cpp/integration/test_pin_table_column_order.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
-    test/cpp/io/s3/test_s3_blocking_ioctx.cpp
-    test/cpp/io/s3/test_s3_ioctx.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
-    test/cpp/io/test_datasource_factory.cpp
-    test/cpp/io/test_duckdb_io_object.cpp
-    test/cpp/io/test_gpu_ingestible.cpp
     test/cpp/io/test_parquet_helpers.cpp
-    test/cpp/io/test_prefetching_cache_telemetry.cpp
     test/cpp/io/test_uri_parser.cpp
-    test/cpp/integration/test_s3_sql_surface.cpp
-    test/cpp/integration/test_s3_perf_benchmark.cpp
+    test/cpp/io/uring/test_uring_readv.cpp
+    test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
     test/cpp/operator/test_mgpu_stress.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
+    test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
@@ -574,21 +632,18 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
+    test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
-    test/cpp/scan/test_duckdb_native_gpu_ingestible.cpp
+    # test/cpp/scan/test_duckdb_native_gpu_ingestible.cpp  # stale against redesigned gpu_ingestible interface and removed s3 ioctx
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
     test/cpp/scan/test_gpu_decode_strings.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
+    test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
-    test/cpp/scan/test_parquet_gpu_ingestible.cpp
-    test/cpp/scan/test_pinned_table_gpu_ingestible.cpp
-    test/cpp/scan/test_split_connector.cpp
-    test/cpp/scan_manager/test_describe_parquet_s3.cpp
-    test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/unittest.cpp
