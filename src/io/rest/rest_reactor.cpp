@@ -273,8 +273,9 @@ std::chrono::milliseconds compute_backoff(std::size_t attempt,
 /// host paths; device staging passes false so each caller buffer stays one
 /// buffer (its H2D copy maps 1:1 to that allocation), an oversized one simply
 /// becoming a standalone single-buffer GET.  Input segments must be in file
-/// order and carry non-null buffers; each output segment's @c size is the
-/// contiguous file span its buffers cover.
+/// order; a null-buffer segment (bounce-staged device read) is kept as a
+/// standalone single-buffer output and never fused into a scatter group.  Each
+/// output segment's @c size is the contiguous file span its buffers cover.
 std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_segment> segs,
                                                    size_t chunk_size,
                                                    size_t max_n_chunks,
@@ -291,20 +292,29 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
       continue;
     }
     if (allow_split && s.size > cs) {
-      // Split an oversized contiguous segment into chunk_size pieces.
+      // Split an oversized contiguous segment into chunk_size pieces.  A null
+      // buffer (bounce-staged) stays null per piece — never `nullptr + pos`
+      // (UB): each piece is a standalone single-buffer chunk that submit() backs
+      // with its own bounce slot, honoring the standalone-null contract above.
       uint8_t* base = s.data();
       for (size_t pos = 0; pos < s.size; pos += cs) {
         size_t const piece = std::min(cs, s.size - pos);
-        out.emplace_back(s.offset + pos, piece, base + pos);
+        out.emplace_back(s.offset + pos, piece, base != nullptr ? base + pos : nullptr);
       }
       ++i;
       continue;
     }
     // Greedily fuse following file-adjacent segments into one scatter GET while
-    // the fused span and buffer count stay within their caps.
+    // the fused span and buffer count stay within their caps.  Never fuse across
+    // a null buffer: a null-buffer segment (a reactor-bounce-staged device read,
+    // e.g. a prefetch-cache gap) must stay a standalone single-buffer chunk so
+    // submit() can back it with one pinned bounce slot and its H2D copy resolves
+    // to that slot — fusing it would either break the bounce (one slot per chunk)
+    // or leave a stale null-derived copy source.
     io_object_segment group{s.offset, s.size, s.data()};
     size_t j = i + 1;
     while (j < segs.size() && group.n_chunks() < max_bufs && segs[j].size > 0 &&
+           group.buffers.back().iov_base != nullptr && segs[j].data() != nullptr &&
            group.offset + group.size == segs[j].offset && group.size + segs[j].size <= cs) {
       group.append(iovec{static_cast<void*>(segs[j].data()), segs[j].size});
       ++j;
@@ -623,11 +633,22 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
       size_t const data_lo = std::max(offset, file_lo);
       size_t const data_hi = std::min(req_end, file_hi);
       if (data_lo < data_hi) {
-        cpy->copies.push_back(
-          device_cpy_request::copy{/*dst=*/dst + (data_lo - offset),
-                                   /*src=*/static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),
-                                   /*src_off=*/0,
-                                   /*size=*/data_hi - data_lo});
+        // A null buffer is a bounce-staged sub-range: submit() backs the chunk
+        // with a pinned bounce slot (set_data) and the H2D copy must read from
+        // that slot, so leave src null and carry the intra-buffer offset in
+        // src_off — copy_async then resolves src = bounce_buffer + src_off.
+        // Encoding a null buffer as `nullptr + off` (a non-null near-null
+        // pointer) instead would bypass that bounce fallback and fault the H2D.
+        // chunk_host_segments guarantees a null-buffer segment is standalone and
+        // single-buffer, so file_lo == g.offset and the bounce holds the whole
+        // segment from offset 0.
+        bool const bounce_staged = (b.iov_base == nullptr);
+        cpy->copies.push_back(device_cpy_request::copy{
+          /*dst=*/dst + (data_lo - offset),
+          /*src=*/bounce_staged ? nullptr
+                                : static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),
+          /*src_off=*/bounce_staged ? (data_lo - file_lo) : size_t{0},
+          /*size=*/data_hi - data_lo});
       }
       file_lo = file_hi;
     }
@@ -1147,7 +1168,14 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
         int const i             = tok.slot_index();
         io_slot& s              = slots[static_cast<size_t>(i)];
-        bool const needs_bounce = dr->is_device() && !dr->chunk.is_buffer_allocated();
+        // A bounce-staged device read must re-bind to THIS slot's bounce on
+        // every (re)submission.  A retried request still carries the previous
+        // attempt's set_data (chunk.data() == that now-freed slot's bounce) and
+        // staged_through_bounce, so without the second term needs_bounce would
+        // be false on retry: the sink would fill — and the parked H2D would
+        // drain from — a foreign slot's bounce while this slot's token is parked.
+        bool const needs_bounce =
+          dr->is_device() && (!dr->chunk.is_buffer_allocated() || dr->staged_through_bounce);
         if (needs_bounce && s.bounce == nullptr) {
           // Device staging requested but no host memory resource was configured.
           _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
@@ -1168,7 +1196,14 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             _perf.queue_wait_count.fetch_add(1, std::memory_order_relaxed);
           }
         }
-        if (needs_bounce) { s.req->chunk.set_data(s.bounce); }
+        if (needs_bounce) {
+          s.req->chunk.set_data(s.bounce);
+          // Record bounce-staging before finish() reads it: set_data has just
+          // made is_buffer_allocated() true, so finish() must rely on this flag
+          // (not the chunk) to take the event-synchronized recycle path and hold
+          // the slot's bounce until the H2D copy off it completes.
+          s.req->staged_through_bounce = true;
+        }
         s.token = std::move(tok);  // slot holds its token while in use
         setup_easy(s);
         curl_multi_add_handle(multi.get(), s.easy.get());
