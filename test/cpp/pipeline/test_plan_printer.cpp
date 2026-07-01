@@ -55,6 +55,9 @@
 #include <duckdb/planner/planner.hpp>
 
 // standard library
+#include <unistd.h>
+
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <source_location>
@@ -339,14 +342,16 @@ void create_tpch_schema(Connection& con)
   )");
 }
 
-// Static storage to keep sirius_prepared_statement_data alive during test execution
-// (sirius_physical_materialized_collector holds a reference to it)
-static duckdb::shared_ptr<sirius_prepared_statement_data> g_sirius_prepared;
-
 /// Generate a Sirius physical plan wrapped in a result collector.
 /// Returns the result collector operator that can be passed to engine.initialize().
-duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(Connection& con,
-                                                               const std::string& query)
+/// `out_prepared` receives the prepared-statement data that owns the physical plan (and the
+/// GPU-native ingestible's DuckDB RowGroups). The caller must keep it alive as long as the
+/// collector/engine and destroy it before its DuckDB instance — otherwise the RowGroups free
+/// block memory through an already-destroyed buffer manager.
+duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(
+  Connection& con,
+  const std::string& query,
+  duckdb::shared_ptr<sirius_prepared_statement_data>& out_prepared)
 {
   con.context->config.enable_optimizer      = true;
   con.context->config.use_replacement_scans = false;
@@ -385,23 +390,61 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(Connection& con,
   sirius_physical_plan_generator physical_planner(*con.context);
   auto sirius_physical_plan = physical_planner.create_plan(std::move(logical_plan));
 
-  g_sirius_prepared =
+  out_prepared =
     make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(sirius_physical_plan));
 
   auto gpu_collector =
     make_uniq_base<sirius_physical_result_collector, sirius_physical_materialized_collector>(
-      *g_sirius_prepared, *con.context);
+      *out_prepared, *con.context);
 
   con.Query("COMMIT TRANSACTION");
 
   return gpu_collector;
 }
 
+/// On-disk single-file DuckDB path (RAII). The GPU-native seq_scan ingestible requires a
+/// single-file block manager, so these plan-construction tests need an on-disk database rather
+/// than :memory:. Mirrors scoped_temp_db_path in test/cpp/scan.
+class scoped_temp_db_path {
+ public:
+  scoped_temp_db_path()
+  {
+    char tmpl[] = "/tmp/sirius_plan_printer_XXXXXX";
+    int fd      = ::mkstemp(tmpl);
+    REQUIRE(fd >= 0);
+    ::close(fd);
+    ::unlink(tmpl);
+    _path = tmpl;
+  }
+
+  ~scoped_temp_db_path()
+  {
+    if (!_path.empty()) {
+      std::remove(_path.c_str());
+      std::remove((_path + ".wal").c_str());
+    }
+  }
+
+  scoped_temp_db_path(const scoped_temp_db_path&)            = delete;
+  scoped_temp_db_path& operator=(const scoped_temp_db_path&) = delete;
+
+  const std::string& path() const { return _path; }
+
+ private:
+  std::string _path;
+};
+
 /// Helper struct to hold initialized engine state for tests.
 struct engine_test_state {
+  std::unique_ptr<scoped_temp_db_path> db_path;
   duckdb::unique_ptr<DuckDB> db;
   duckdb::unique_ptr<Connection> con;
   duckdb::unique_ptr<sirius_interface> iface;
+  // Owns the physical plan, including the GPU-native ingestible's DuckDB RowGroups. Declared
+  // after `db` so it destructs BEFORE `db` (the RowGroups free block memory through the DuckDB
+  // buffer manager, which must still be alive), and before `engine` so the engine — which
+  // references the plan via its collector and new_scheduled — tears down first.
+  duckdb::shared_ptr<sirius_prepared_statement_data> prepared;
   duckdb::unique_ptr<sirius_engine> engine;
 };
 
@@ -414,13 +457,14 @@ engine_test_state setup_and_initialize(const std::string& query)
   set_test_config_env();
   Config::MODIFIED_PIPELINE = true;
   unsetenv("SIRIUS_DISABLE");
-  state.db = duckdb::make_uniq<DuckDB>(nullptr);
+  state.db_path = std::make_unique<scoped_temp_db_path>();
+  state.db      = duckdb::make_uniq<DuckDB>(state.db_path->path());
   safe_load_extension(*state.db);
   state.con = duckdb::make_uniq<Connection>(*state.db);
   safe_init_gpu_buffer(*state.con);
   create_tpch_schema(*state.con);
 
-  auto gpu_plan = generate_gpu_plan(*state.con, query);
+  auto gpu_plan = generate_gpu_plan(*state.con, query, state.prepared);
   REQUIRE(gpu_plan != nullptr);
 
   state.iface  = duckdb::make_uniq<sirius_interface>(*state.con->context);

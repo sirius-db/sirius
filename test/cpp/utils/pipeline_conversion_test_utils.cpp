@@ -118,61 +118,69 @@ std::string convert_query_to_dump(duckdb::Connection& con, const std::string& qu
 {
   auto& context = *con.context;
 
-  // DuckDB's Optimizer reads catalog state, which requires an active transaction. The
-  // production path inherits one from the TableFunction bind callsite; tests must open one
-  // explicitly. Rollback because the conversion path is read-only.
+  // DuckDB's Optimizer reads catalog state, and the GPU-native seq_scan ingestible construction
+  // (make_ingestible -> prepare_duckdb_native_walk -> PartitionStatistics) touches
+  // ClientContext/LocalStorage — both require an active transaction. The production path inherits
+  // one from the TableFunction bind callsite; tests must open one explicitly and hold it across
+  // plan generation AND conversion, because both the tree-based plan generator and the legacy
+  // converter now build the ingestible eagerly. Rollback at the end since the path is read-only.
   con.BeginTransaction();
-  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
   try {
-    optimizer_disable_guard guard(context);
-    logical_plan = extract_logical_plan_sirius_order(context, query);
+    duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
+    {
+      optimizer_disable_guard guard(context);
+      logical_plan = extract_logical_plan_sirius_order(context, query);
+    }
+
+    sirius::planner::sirius_physical_plan_generator physical_planner(context);
+    auto sirius_plan = physical_planner.create_plan(std::move(logical_plan));
+
+    auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!sirius_ctx_ptr) {
+      throw std::runtime_error(
+        "[convert_query_to_dump] SiriusContext not registered on the connection");
+    }
+    const auto& op_params = sirius_ctx_ptr->get_config().get_operator_params();
+
+    // Null telemetry context: pipelines built without an engine (per the
+    // pipeline_build_context ctor contract for tests / optimizer-bind paths).
+    pipeline::pipeline_build_context build_ctx(
+      /*telemetry_context=*/nullptr,
+      duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
+      static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size()));
+
+    pipeline::sirius_pipeline_build_state state;
+    auto root_pipeline =
+      duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
+    root_pipeline->build(*sirius_plan);
+    root_pipeline->ready();
+
+    // Iceberg metadata cache: under flag ON the plan generator owns its own cache and the
+    // converter's pointer is ignored on the tree-based path. Under flag OFF the converter
+    // would read this cache to construct iceberg scans — TPC-H has no iceberg, so passing
+    // an empty (but non-null) map keeps the legacy lookup site happy.
+    static const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
+      kEmptyIcebergCache;
+    // Pass the connection's ClientContext so the legacy (flag-OFF) converter can build the
+    // GPU-native seq_scan operator, which requires it (mirrors sirius_engine's production
+    // construction). Without it, insert_duckdb_native_scan_operator throws for any seq_scan query.
+    pipeline::sirius_pipeline_converter converter(
+      build_ctx, op_params, &kEmptyIcebergCache, &context);
+    auto result = converter.convert(*root_pipeline);
+
+    // Dump *here* while `sirius_plan`, `root_pipeline`, `result` are all in scope. The result's
+    // pipelines reference operators in the plan tree; if we returned the result and dumped at
+    // the caller, the plan tree would already be destroyed and the dump would read dangling
+    // pointers. Legacy (flag OFF) partially survives that hazard because its converter-inserted
+    // operators (PARTITION, CONCAT, MERGE_*) are owned by result.inserted_operators_, but the
+    // tree path (flag ON) has no inserted_operators_ at all — everything dangles.
+    auto dump = pipeline::dump_pipeline_conversion_result(result);
+    con.Rollback();
+    return dump;
   } catch (...) {
     con.Rollback();
     throw;
   }
-  con.Rollback();
-
-  sirius::planner::sirius_physical_plan_generator physical_planner(context);
-  auto sirius_plan = physical_planner.create_plan(std::move(logical_plan));
-
-  auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx_ptr) {
-    throw std::runtime_error(
-      "[convert_query_to_dump] SiriusContext not registered on the connection");
-  }
-  const auto& op_params = sirius_ctx_ptr->get_config().get_operator_params();
-
-  pipeline::pipeline_build_context build_ctx;
-  build_ctx.preserve_insertion_order =
-    duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context);
-  build_ctx.num_gpus = static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size());
-
-  pipeline::sirius_pipeline_build_state state;
-  auto root_pipeline =
-    duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
-  root_pipeline->build(*sirius_plan);
-  root_pipeline->ready();
-
-  // Iceberg metadata cache: under flag ON the plan generator owns its own cache and the
-  // converter's pointer is ignored on the tree-based path. Under flag OFF the converter
-  // would read this cache to construct iceberg scans — TPC-H has no iceberg, so passing
-  // an empty (but non-null) map keeps the legacy lookup site happy.
-  static const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
-    kEmptyIcebergCache;
-  // Pass the connection's ClientContext so the legacy (flag-OFF) converter can build the
-  // GPU-native seq_scan operator, which requires it (mirrors sirius_engine's production
-  // construction). Without it, insert_duckdb_native_scan_operator throws for any seq_scan query.
-  pipeline::sirius_pipeline_converter converter(
-    build_ctx, op_params, &kEmptyIcebergCache, &context);
-  auto result = converter.convert(*root_pipeline);
-
-  // Dump *here* while `sirius_plan`, `root_pipeline`, `result` are all in scope. The result's
-  // pipelines reference operators in the plan tree; if we returned the result and dumped at
-  // the caller, the plan tree would already be destroyed and the dump would read dangling
-  // pointers. Legacy (flag OFF) partially survives that hazard because its converter-inserted
-  // operators (PARTITION, CONCAT, MERGE_*) are owned by result.inserted_operators_, but the
-  // tree path (flag ON) has no inserted_operators_ at all — everything dangles.
-  return pipeline::dump_pipeline_conversion_result(result);
 }
 
 tree_pipeline_flag_guard::tree_pipeline_flag_guard()

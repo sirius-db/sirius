@@ -61,7 +61,6 @@
 #include "sirius_context.hpp"
 
 #include <numeric>
-#include <optional>
 #include <utility>
 
 namespace sirius::planner {
@@ -259,18 +258,20 @@ void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   bool replace_slot = false;
   if (fn == "seq_scan") {
-    auto info = build_duckdb_native_table_info(scan, op_params, context);
-    leaf      = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types, scan.estimated_cardinality, sirius::op::scan::make_ingestible(std::move(info)));
+    auto info       = build_duckdb_native_table_info(scan, op_params, context);
+    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+    leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
+      scan.types, scan.estimated_cardinality, std::move(ingestible));
     // seq_scan lowers to the unified GPU_SCAN (mirrors the parquet branch and the legacy
     // insert_duckdb_native_scan_operator). Replace the TABLE_SCAN in place so the GPU leaf
     // becomes the pipeline source-leaf — the TABLE_SCAN is dropped (its bind_data / metadata
     // were lifted into the duckdb_native_ingestible_table_info).
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet") {
-    auto info = build_parquet_table_info(scan, op_params);
-    leaf      = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types, scan.estimated_cardinality, sirius::op::scan::make_ingestible(std::move(info)));
+    auto info       = build_parquet_table_info(scan, op_params);
+    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+    leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
+      scan.types, scan.estimated_cardinality, std::move(ingestible));
     // Parquet: legacy inlines GPU_SCAN into the current pipeline, so replace the TABLE_SCAN
     // in place rather than attaching as a child (which would make build_pipelines spin up a
     // separate wrap pipeline). The TABLE_SCAN object is dropped — its bind_data and metadata
@@ -842,37 +843,17 @@ void sirius_physical_plan_generator::prefetch_iceberg_delete_data(
   if (table_path.empty()) { return; }
   if (iceberg_delete_data_cache_.count(table_path)) { return; }  // already fetched
 
-  // Extract snapshot parameters if present (for snapshot-aware delete discovery).
-  std::optional<uint64_t> snapshot_id;
-  auto sid_it = scan_op.named_parameters.find("snapshot_from_id");
-  if (sid_it != scan_op.named_parameters.end() && !sid_it->second.IsNull()) {
-    snapshot_id = sid_it->second.GetValue<uint64_t>();
-  }
-
-  // Opening secondary connections triggers QueryBegin/QueryEnd on the shared SiriusContext;
-  // InternalQueryGuard suppresses those side-effects.
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    SIRIUS_LOG_WARN(
-      "[sirius_physical_plan_generator] SiriusContext not available; treating iceberg '{}' as V1.",
-      table_path);
-    iceberg_delete_data_cache_.emplace(table_path,
-                                       std::make_shared<sirius::op::scan::IcebergDeleteData>());
-    return;
-  }
-
-  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
-
-  auto& scan_mgr  = sirius_ctx->get_scan_manager();
-  auto datasource = scan_mgr.create_datasource(table_path);
-  if (!datasource) {
-    throw std::runtime_error(
-      "[sirius_physical_plan_generator] read_iceberg_delete_data: no IO backend supports path: " +
-      table_path);
-  }
-  auto data = sirius::op::scan::read_iceberg_delete_data(
-    context, table_path, datasource->io_ctx(), snapshot_id);
-  iceberg_delete_data_cache_.emplace(table_path, std::move(data));
+  // Iceberg delete-data reading is disabled in this build: the metadata reader
+  // (src/op/scan/iceberg_metadata_reader.cpp) is stale against the new io interface and is
+  // excluded from the build. Treat every iceberg table as having no delete files (V1
+  // semantics) so positional/equality deletes are simply not applied rather than producing an
+  // undefined-symbol link error. Mirrors sirius_engine::prefetch_iceberg_delete_data.
+  SIRIUS_LOG_WARN(
+    "[sirius_physical_plan_generator] iceberg delete-data reading is disabled; treating '{}' as "
+    "having no deletes.",
+    table_path);
+  iceberg_delete_data_cache_.emplace(table_path,
+                                     std::make_shared<sirius::op::scan::IcebergDeleteData>());
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
