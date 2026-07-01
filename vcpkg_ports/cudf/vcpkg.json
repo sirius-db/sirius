@@ -9,7 +9,6 @@
       "host": true,
       "name": "vcpkg-cmake-config"
     },
-    "arrow",
     "cccl",
     "dlpack",
     "flatbuffers",

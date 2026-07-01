@@ -10,58 +10,24 @@ vcpkg_from_github(
   HEAD_REF
   release-v3)
 
-# nvtx3 is header-only, just install the headers
-file(
-  INSTALL "${SOURCE_PATH}/c/include/"
-  DESTINATION "${CURRENT_PACKAGES_DIR}/include"
-  FILES_MATCHING
-  PATTERN "*.h")
-file(
-  INSTALL "${SOURCE_PATH}/c/include/"
-  DESTINATION "${CURRENT_PACKAGES_DIR}/include"
-  FILES_MATCHING
-  PATTERN "*.hpp")
+# nvtx3 is header-only; drive its own install rules (NVTX3_INSTALL) so the
+# exported nvtx3::nvtx3-c / nvtx3::nvtx3-cpp targets and the version file come
+# from upstream instead of a hand-written config.
+#
+# NVTX defines the targets' $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+# include dir before including GNUInstallDirs, and vcpkg does not predefine
+# CMAKE_INSTALL_INCLUDEDIR, so it must be set here or the exported targets carry
+# no INTERFACE_INCLUDE_DIRECTORIES.
+vcpkg_cmake_configure(SOURCE_PATH "${SOURCE_PATH}/c" OPTIONS -DNVTX3_INSTALL=ON
+                      -DCMAKE_INSTALL_INCLUDEDIR=include)
 
-# Create CMake config files for find_package support
-file(
-  WRITE "${CURRENT_PACKAGES_DIR}/share/nvtx3/nvtx3-config.cmake"
-  [[
-include(CMakeFindDependencyMacro)
+vcpkg_cmake_install()
 
-if(NOT TARGET nvtx3::nvtx3)
-    add_library(nvtx3::nvtx3 INTERFACE IMPORTED)
-    set_target_properties(nvtx3::nvtx3 PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/../../include"
-    )
-endif()
+vcpkg_cmake_config_fixup(PACKAGE_NAME nvtx3 CONFIG_PATH lib/cmake/nvtx3)
 
-# Create the nvtx3-cpp target that rmm expects
-if(NOT TARGET nvtx3::nvtx3-cpp)
-    add_library(nvtx3::nvtx3-cpp INTERFACE IMPORTED)
-    set_target_properties(nvtx3::nvtx3-cpp PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/../../include"
-    )
-endif()
-
-# Set version information
-set(nvtx3_VERSION "${VERSION}")
-set(nvtx3_FOUND TRUE)
-]])
-
-# Create version file for find_package version checking
-file(
-  WRITE "${CURRENT_PACKAGES_DIR}/share/nvtx3/nvtx3-config-version.cmake"
-  [[
-set(PACKAGE_VERSION "${VERSION}")
-
-if(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION)
-    set(PACKAGE_VERSION_COMPATIBLE FALSE)
-else()
-    set(PACKAGE_VERSION_COMPATIBLE TRUE)
-    if(PACKAGE_VERSION VERSION_EQUAL PACKAGE_FIND_VERSION)
-        set(PACKAGE_VERSION_EXACT TRUE)
-    endif()
-endif()
-]])
+# Header-only: config_fixup moves the CMake package to share/, leaving lib/
+# empty.
+file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug"
+     "${CURRENT_PACKAGES_DIR}/lib")
 
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE.txt")

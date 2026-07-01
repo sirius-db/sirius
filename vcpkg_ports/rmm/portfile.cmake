@@ -56,8 +56,7 @@ vcpkg_cmake_configure(
   -DBUILD_BENCHMARKS=OFF
   -DCMAKE_CUDA_ARCHITECTURES=RAPIDS
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
-  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include"
-  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include")
+  -DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include)
 
 vcpkg_cmake_install()
 
@@ -101,16 +100,6 @@ execute_process(
     "${CURRENT_PACKAGES_DIR}/share/rapids_logger/rapids_logger-targets.cmake")
 
 vcpkg_cmake_config_fixup(PACKAGE_NAME rmm CONFIG_PATH lib/cmake/rmm)
-
-# RMM still exports shared CUDA::cudart in its installed target file even when
-# built as a static library. That pulls libcudart.so into the final Sirius
-# loadable extension alongside libcudart_static.a. Rewrite the exported target
-# to prefer the static CUDA runtime for vcpkg consumers.
-file(READ "${CURRENT_PACKAGES_DIR}/share/rmm/rmm-targets.cmake" _rmm_targets)
-string(REGEX REPLACE "CUDA::cudart([;\">])" "CUDA::cudart_static\\1"
-                     _rmm_targets "${_rmm_targets}")
-file(WRITE "${CURRENT_PACKAGES_DIR}/share/rmm/rmm-targets.cmake"
-     "${_rmm_targets}")
 
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")
