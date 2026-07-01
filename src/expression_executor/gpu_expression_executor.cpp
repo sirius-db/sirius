@@ -24,7 +24,7 @@
 #include <sirius/exception.hpp>
 
 // cucascade
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
 
 // duckdb
@@ -191,6 +191,19 @@ gpu_expression_executor::gpu_expression_executor(sirius::ast::node const* expres
   _ast_expressions.push_back(expression);
 }
 
+gpu_expression_executor::gpu_expression_executor(std::vector<sirius::ast::node const*> expressions,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 expression_executor_strategy strategy,
+                                                 std::size_t min_ast_size)
+  : _ast_expressions(std::move(expressions)),
+    _strategy(strategy),
+    _mr(resource_ref),
+    _stream(stream),
+    _min_ast_size(min_ast_size)
+{
+}
+
 std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root_expr)
 {
   std::vector<cudf::column_view> combined_column_views;
@@ -312,6 +325,17 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
   // The per-result post-processing recovers expression_class + return_type by
   // round-tripping through sirius::ast::to_duckdb.
   for (auto const* ast_expr : _ast_expressions) {
+    if (!ast_expr) {
+      // This is a Sirius bug, not a user error: a null slot means from_duckdb
+      // declined an expression as unsupported, but the planner still routed it
+      // to the GPU executor.  This hard-fails the query instead of falling back to CPU.
+      // TODO fix to ensure the planner never builds a GPU projection containing unsupported
+      // expressions.
+      throw duckdb::InternalException(
+        "[gpu_expression_executor] null expression in select list — "
+        "from_duckdb returned nullptr for an unsupported expression; "
+        "cannot execute on GPU");
+    }
     auto result    = execute(*ast_expr, execution_mode::MATERIALIZE);
     auto duck_expr = sirius::ast::to_duckdb(*ast_expr);
     post_process(*duck_expr, std::move(result));

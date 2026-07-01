@@ -42,7 +42,18 @@ use thrift::{
         TWriteTransportFactory,
     },
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
+
+mod brpc;
+mod compute_node_service;
+mod file_schema;
+mod fragment_executor;
+mod proto;
+mod prpc;
+mod result_encoder;
+mod result_store;
+
+pub use brpc::BrpcServer;
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 
@@ -142,6 +153,9 @@ pub struct ComputeNodeConfig {
     pub http_port: u16,
     #[arg(long, default_value_t = 8060)]
     pub brpc_port: u16,
+    /// TODO: run a real starlet/worker agent on this advertised port.
+    #[arg(long, default_value_t = 9070)]
+    pub starlet_port: u16,
     #[arg(long)]
     pub arrow_flight_port: Option<u16>,
     #[arg(skip = default_compute_node_version())]
@@ -157,6 +171,7 @@ impl Default for ComputeNodeConfig {
             thrift_port: 9060,
             http_port: 8040,
             brpc_port: 8060,
+            starlet_port: 9070,
             arrow_flight_port: None,
             version: default_compute_node_version(),
         }
@@ -424,17 +439,17 @@ impl ComputeNodeHeartbeatHandler {
             .map(i32::from)
             .unwrap_or(PORT_DISABLED);
         TBackendInfo::new(
-            i32::from(self.config.thrift_port),     // be_port
-            i32::from(self.config.http_port),       // http_port
-            Some(BE_RPC_PORT_DISABLED),             // be_rpc_port
-            Some(i32::from(self.config.brpc_port)), // brpc_port
-            Some(self.config.version.clone()),      // version
-            Some(self.hardware_cores),              // num_hardware_cores
-            None,                                   // starlet_port
-            Some(self.reboot_time_secs),            // reboot_time
-            Some(false),                            // is_set_storage_path (CN has no storage)
-            Some(MEM_LIMIT_UNSET),                  // mem_limit_bytes
-            Some(arrow_flight_port),                // arrow_flight_port
+            i32::from(self.config.thrift_port),        // be_port
+            i32::from(self.config.http_port),          // http_port
+            Some(BE_RPC_PORT_DISABLED),                // be_rpc_port
+            Some(i32::from(self.config.brpc_port)),    // brpc_port
+            Some(self.config.version.clone()),         // version
+            Some(self.hardware_cores),                 // num_hardware_cores
+            Some(i32::from(self.config.starlet_port)), // starlet_port
+            Some(self.reboot_time_secs),               // reboot_time
+            Some(false),                               // is_set_storage_path (CN has no storage)
+            Some(MEM_LIMIT_UNSET),                     // mem_limit_bytes
+            Some(arrow_flight_port),                   // arrow_flight_port
         )
     }
 }
@@ -1031,6 +1046,7 @@ fn listener_wake_addr(local_addr: SocketAddr) -> SocketAddr {
 }
 
 /// Sends one empty inventory report to FE if heartbeat has provided FE address and CN id.
+#[instrument(skip_all)]
 pub fn report_to_frontend_once(
     node: &ComputeNodeConfig,
     state: &SharedHeartbeatState,
@@ -1154,6 +1170,16 @@ fn build_report_request(
     )
 }
 
+/// Registers the compute node with FE over the MySQL protocol.
+#[instrument(
+    skip_all,
+    fields(
+        fe_host = %fe.host,
+        fe_query_port = fe.query_port,
+        advertise_host = %node.advertise_host,
+        heartbeat_port = node.heartbeat_port,
+    )
+)]
 pub async fn register_node(fe: &FeConfig, node: &ComputeNodeConfig) -> Result<()> {
     let opts = OptsBuilder::default()
         .ip_or_hostname(fe.host.to_string())

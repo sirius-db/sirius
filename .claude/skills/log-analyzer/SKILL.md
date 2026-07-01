@@ -198,4 +198,33 @@ After you've localized the issue, recommend the right next step:
 | Re-materialized inputs after a downgrade (per-task view) | `<folder>/memory_history.csv -> peak_bytes_to_materialize_input > 0` |
 | Per-pipeline summary across one query | filter `_pipeline_aggregates.csv` by `query_begin_ts` |
 | How well work was balanced across GPUs (multi-GPU runs) | group `task_outputs.csv` by `gpu_id` (per pipeline or per operator type); see `references/single_query.md` § "GPU balance" |
+| Host (pinned) pool memory at query start/end | `<folder>/query_meta.json -> pool_stats.host` |
+| GPU device memory pool at query start/end (per GPU) | `<folder>/query_meta.json -> pool_stats.gpu[]` |
 | Why my parser run looks weird | `_summary.json -> format_warnings`, then `tools/log_analyzer/README.md` |
+
+## Pool stats: detecting memory leaks across queries
+
+`query_meta.json` contains a `pool_stats` section that captures memory state at the query boundary:
+
+```json
+{
+  "pool_stats": {
+    "host": {
+      "begin": {"allocated_bytes": 5242880, "peak_bytes": 307232768, "free_blocks": 5115},
+      "end":   {"allocated_bytes": 5242880, "peak_bytes": 307232768, "free_blocks": 5115}
+    },
+    "gpu": [
+      {
+        "device_id": 0,
+        "begin": {"allocated_bytes": 0, "peak_bytes": 104857600, "reserved_bytes": 107374182400},
+        "end":   {"allocated_bytes": 0, "peak_bytes": 104857600, "reserved_bytes": 107374182400}
+      }
+    ]
+  }
+}
+```
+
+- **Host pool** (`[query_pool]` log tag): uses a `fixed_size_host_memory_resource` slab allocator. `free_blocks` drops during the query and should return to the QueryBegin value at QueryEnd. A persistent `end.allocated_bytes > begin.allocated_bytes` is a pinned-host memory leak.
+- **GPU pool** (`[gpu_pool]` log tag, one line per GPU): uses a `reservation_aware_resource_adaptor`. `allocated_bytes` reflects live GPU allocations across all streams; `reserved_bytes` reflects the capacity claimed by active reservations. A persistent `end.allocated_bytes > begin.allocated_bytes` is a GPU device memory leak.
+
+The two pool tags are distinguishable in the raw log: host stats use `[query_pool]`, GPU stats use `[gpu_pool]`.

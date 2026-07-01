@@ -23,15 +23,19 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    env:
+      # CPU runner: no GPU/driver, so pixi can't detect `__cuda` to match the
+      # CUDA-pinned platform. Assert it so the (cuda13) environment resolves.
+      CONDA_OVERRIDE_CUDA: "13"
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           cache: false
-          pixi-version: v0.70.2
+          pixi-version: v0.71.1
           global-environments: |
             pre-commit
 
@@ -41,6 +45,10 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
+      # CPU build runners have no GPU/driver; assert `__cuda` so the CUDA-pinned
+      # platform resolves. All environments built here (default, vcpkg,
+      # nightly-runner) target CUDA 13.
+      CONDA_OVERRIDE_CUDA: "13"
     strategy:
       matrix:
         build:
@@ -109,7 +117,7 @@ jobs:
     timeout-minutes: ${{ case(matrix.build.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.build.cudf-channel == 'nightly' }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
 
@@ -117,10 +125,10 @@ jobs:
         if: matrix.build.environment == 'vcpkg'
         run: git -C vcpkg rev-parse --is-shallow-repository | grep -q true && git -C vcpkg fetch --unshallow || true
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           cache: false
-          pixi-version: v0.70.2
+          pixi-version: v0.71.1
           activate-environment: ${{ matrix.build.environment != 'vcpkg' && matrix.build.cudf-channel != 'nightly' }}
           environments: >-
             ${{ matrix.build.cudf-channel == 'nightly' && 'nightly-runner'

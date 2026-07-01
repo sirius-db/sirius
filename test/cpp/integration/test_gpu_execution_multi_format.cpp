@@ -226,21 +226,21 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - scan single column",
-//                  "[integration][gpu_execution][csv][scan]")
+//                  "[.][integration][gpu_execution][csv][scan]")
 // {
 //   compare_gpu_vs_cpu("select n_nationkey from nation;");
 // }
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - scan multiple columns",
-//                  "[integration][gpu_execution][csv][scan]")
+//                  "[.][integration][gpu_execution][csv][scan]")
 // {
 //   compare_gpu_vs_cpu("select n_nationkey, n_regionkey, n_name from nation;");
 // }
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - scan all columns",
-//                  "[integration][gpu_execution][csv][scan]")
+//                  "[.][integration][gpu_execution][csv][scan]")
 // {
 //   compare_gpu_vs_cpu("select * from region;");
 // }
@@ -251,21 +251,21 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - filter integer equality",
-//                  "[integration][gpu_execution][csv][filter]")
+//                  "[.][integration][gpu_execution][csv][filter]")
 // {
 //   compare_gpu_vs_cpu("select n_nationkey, n_name from nation where n_regionkey = 1;");
 // }
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - filter string equality",
-//                  "[integration][gpu_execution][csv][filter]")
+//                  "[.][integration][gpu_execution][csv][filter]")
 // {
 //   compare_gpu_vs_cpu("select r_regionkey from region where r_name = 'EUROPE';");
 // }
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - filter date comparison",
-//                  "[integration][gpu_execution][csv][filter]")
+//                  "[.][integration][gpu_execution][csv][filter]")
 // {
 //   // This tests the TIMESTAMP_DAYS constant materializer fix
 //   compare_gpu_vs_cpu(
@@ -275,7 +275,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - filter date between",
-//                  "[integration][gpu_execution][csv][filter]")
+//                  "[.][integration][gpu_execution][csv][filter]")
 // {
 //   // DuckDB may rewrite >= AND < to BETWEEN, exercising the BoundBetweenExpression path
 //   compare_gpu_vs_cpu(
@@ -285,7 +285,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - filter float comparison",
-//                  "[integration][gpu_execution][csv][filter]")
+//                  "[.][integration][gpu_execution][csv][filter]")
 // {
 //   // CSV reads DECIMAL columns as DOUBLE — tests FLOAT64 filter path
 //   compare_gpu_vs_cpu("select l_orderkey from lineitem where l_discount > 0.05;", 0.001f);
@@ -297,14 +297,14 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - group by with sum",
-//                  "[integration][gpu_execution][csv][aggregate]")
+//                  "[.][integration][gpu_execution][csv][aggregate]")
 // {
 //   compare_gpu_vs_cpu("select n_regionkey, count(*) as cnt from nation group by n_regionkey;");
 // }
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - aggregate with float columns",
-//                  "[integration][gpu_execution][csv][aggregate]")
+//                  "[.][integration][gpu_execution][csv][aggregate]")
 // {
 //   // Tests SUM/AVG on DOUBLE (CSV-inferred type)
 //   compare_gpu_vs_cpu(
@@ -319,7 +319,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - inner join",
-//                  "[integration][gpu_execution][csv][join]")
+//                  "[.][integration][gpu_execution][csv][join]")
 // {
 //   compare_gpu_vs_cpu(
 //     "select n.n_name, r.r_name from nation n inner join region r "
@@ -328,7 +328,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - multi table join",
-//                  "[integration][gpu_execution][csv][join]")
+//                  "[.][integration][gpu_execution][csv][join]")
 // {
 //   compare_gpu_vs_cpu(
 //     "select c.c_name, n.n_name from customer c "
@@ -344,7 +344,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - tpch q1 pricing summary",
-//                  "[integration][gpu_execution][csv][tpch]")
+//                  "[.][integration][gpu_execution][csv][tpch]")
 // {
 //   compare_gpu_vs_cpu(
 //     "select l_returnflag, l_linestatus, "
@@ -360,7 +360,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - tpch q3 shipping priority",
-//                  "[integration][gpu_execution][csv][tpch]")
+//                  "[.][integration][gpu_execution][csv][tpch]")
 // {
 //   compare_gpu_vs_cpu(
 //     "select l_orderkey, "
@@ -379,7 +379,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - tpch q4 order priority",
-//                  "[integration][gpu_execution][csv][tpch]")
+//                  "[.][integration][gpu_execution][csv][tpch]")
 // {
 //   compare_gpu_vs_cpu(
 //     "select o_orderpriority, count(*) as order_count "
@@ -397,7 +397,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - tpch q6 revenue forecast",
-//                  "[integration][gpu_execution][csv][tpch]")
+//                  "[.][integration][gpu_execution][csv][tpch]")
 // {
 //   // Tests date + float filters together (the original "Unknown cudf type: 12" trigger)
 //   compare_gpu_vs_cpu(
@@ -412,7 +412,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - tpch q10 returned item reporting",
-//                  "[integration][gpu_execution][csv][tpch]")
+//                  "[.][integration][gpu_execution][csv][tpch]")
 // {
 //   compare_gpu_vs_cpu(
 //     "select c_custkey, c_name, "
@@ -435,7 +435,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - order by with limit",
-//                  "[integration][gpu_execution][csv][order]")
+//                  "[.][integration][gpu_execution][csv][order]")
 // {
 //   compare_gpu_vs_cpu(
 //     "select o_orderkey, o_totalprice, o_orderdate "
@@ -445,7 +445,7 @@ class MultiFormatFixtureBase {
 
 // TEST_CASE_METHOD(GPUExecutionCSVFixture,
 //                  "gpu_execution csv - order by date column",
-//                  "[integration][gpu_execution][csv][order]")
+//                  "[.][integration][gpu_execution][csv][order]")
 // {
 //   compare_gpu_vs_cpu(
 //     "select o_orderkey, o_orderdate from orders "
@@ -474,8 +474,14 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     v2_path   = (root / "test/cpp/integration/data/iceberg_v2_delete").string();
 
     con->Query("INSTALL iceberg;");
-    auto load_result  = con->Query("LOAD iceberg;");
-    iceberg_available = load_result && !load_result->HasError();
+    auto load_result = con->Query("LOAD iceberg;");
+    // Disabled: the legacy scan path (parquet/duckdb/iceberg scan tasks) was
+    // removed, so iceberg_scan has no IO backend for delete data
+    // ("read_iceberg_delete_data: no IO backend"). Force-skip every iceberg
+    // integration case (all gate on iceberg_available, directly or via the
+    // derived *_available flags) until iceberg is ported to the GPU scan path.
+    static_cast<void>(load_result);
+    iceberg_available = false;
   }
 
   bool iceberg_available = false;
@@ -485,7 +491,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V1 basic scan",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -496,7 +502,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V1 count(*)",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -509,7 +515,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V1 filter and order by",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -521,7 +527,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V2 positional deletes basic scan",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -532,7 +538,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V2 positional deletes count(*)",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -545,7 +551,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V2 positional deletes order by desc",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -601,7 +607,7 @@ class GPUExecutionIcebergEqualityDeleteFixture : public GPUExecutionIcebergFixtu
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "gpu_execution iceberg - V2 equality deletes basic scan",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!eq_dataset_available) {
     WARN("equality-delete dataset not available — skipping");
@@ -621,7 +627,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "gpu_execution iceberg - V2 equality deletes count(*)",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!eq_dataset_available) {
     WARN("equality-delete dataset not available — skipping");
@@ -637,7 +643,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "gpu_execution iceberg - V2 equality deletes filter on surviving rows",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!eq_dataset_available) {
     WARN("equality-delete dataset not available — skipping");
@@ -724,7 +730,7 @@ class GPUExecutionIcebergEqEdgeCaseFixture : public GPUExecutionIcebergFixture {
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality deletes single-column key",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!datasets_available) {
     WARN("equality-delete edge-case datasets not available — skipping");
@@ -739,7 +745,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality deletes multiple delete files",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!datasets_available) {
     WARN("equality-delete edge-case datasets not available — skipping");
@@ -754,7 +760,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality deletes all rows deleted",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!datasets_available) {
     WARN("equality-delete edge-case datasets not available — skipping");
@@ -772,7 +778,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality and positional deletes combined",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!datasets_available) {
     WARN("equality-delete edge-case datasets not available — skipping");
@@ -789,7 +795,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality deletes multiple data files",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!datasets_available) {
     WARN("equality-delete edge-case datasets not available — skipping");
@@ -845,7 +851,7 @@ class GPUExecutionIcebergDVFixture : public GPUExecutionIcebergFixture {
 
 TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
                  "gpu_execution iceberg - V3 deletion vector basic scan",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!dv_available) {
     WARN("iceberg extension not available — skipping");
@@ -857,7 +863,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
                  "gpu_execution iceberg - V3 deletion vector count(*)",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!dv_available) {
     WARN("iceberg extension not available — skipping");
@@ -870,7 +876,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
                  "gpu_execution iceberg - V3 deletion vector filter",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!dv_available) {
     WARN("iceberg extension not available — skipping");
@@ -889,7 +895,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - schema evolution added column",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -903,7 +909,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - snapshot-aware deletes",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -919,7 +925,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - equality delete sequence numbers",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -935,7 +941,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - deflate compressed manifests",
-                 "[integration][gpu_execution][iceberg]")
+                 "[.][integration][gpu_execution][iceberg]")
 {
   if (!iceberg_available) {
     WARN("iceberg extension not available — skipping");
@@ -969,52 +975,77 @@ class GPUExecutionHivePartitionFixture : public MultiFormatFixtureBase {
   }
 
   std::string hive_path;
+  bool is_hive_available = false;  // Assume available; no extension needed for hive partitioning
 };
 
 TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
                  "gpu_execution hive partition - basic scan with partition columns",
-                 "[integration][gpu_execution][hive_partition]")
+                 "[.][integration][gpu_execution][hive_partition]")
 {
+  if (!is_hive_available) {
+    WARN("hive extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT * FROM read_parquet('" + hive_path +
                      "', hive_partitioning=true) ORDER BY id");
 }
 
 TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
                  "gpu_execution hive partition - filter on data column",
-                 "[integration][gpu_execution][hive_partition]")
+                 "[.][integration][gpu_execution][hive_partition]")
 {
+  if (!is_hive_available) {
+    WARN("hive extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT * FROM read_parquet('" + hive_path +
                      "', hive_partitioning=true) WHERE id >= 2 ORDER BY id");
 }
 
 TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
                  "gpu_execution hive partition - filter on partition column",
-                 "[integration][gpu_execution][hive_partition]")
+                 "[.][integration][gpu_execution][hive_partition]")
 {
+  if (!is_hive_available) {
+    WARN("hive extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT id, name, year FROM read_parquet('" + hive_path +
                      "', hive_partitioning=true) WHERE year = 2024 ORDER BY id");
 }
 
 TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
                  "gpu_execution hive partition - group by partition column",
-                 "[integration][gpu_execution][hive_partition]")
+                 "[.][integration][gpu_execution][hive_partition]")
 {
+  if (!is_hive_available) {
+    WARN("hive extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT year, SUM(amount) as total FROM read_parquet('" + hive_path +
                      "', hive_partitioning=true) GROUP BY year ORDER BY year");
 }
 
 TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
                  "gpu_execution hive partition - reversed column order",
-                 "[integration][gpu_execution][hive_partition]")
+                 "[.][integration][gpu_execution][hive_partition]")
 {
+  if (!is_hive_available) {
+    WARN("hive extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT year, month, amount, name, id FROM read_parquet('" + hive_path +
                      "', hive_partitioning=true) ORDER BY id");
 }
 
 TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
                  "gpu_execution hive partition - aggregation on data column",
-                 "[integration][gpu_execution][hive_partition]")
+                 "[.][integration][gpu_execution][hive_partition]")
 {
+  if (!is_hive_available) {
+    WARN("hive extension not available — skipping");
+    return;
+  }
   compare_gpu_vs_cpu("SELECT SUM(amount) as total FROM read_parquet('" + hive_path +
                      "', hive_partitioning=true)");
 }

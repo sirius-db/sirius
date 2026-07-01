@@ -30,9 +30,11 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -188,9 +190,13 @@ class downgrade_executor {
   exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
   std::thread _processing_thread;
   std::thread _monitor_thread;
+  std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
+
+  std::mutex _monitor_cv_mutex;
+  std::condition_variable _monitor_cv;
 
   cucascade::shared_data_repository_manager& _data_repo_mgr;
   cucascade::memory::memory_space_id _space_id;

@@ -1,0 +1,24 @@
+# Allowlist for scripts/check_orphan_tests.py (pre-commit hook).
+#
+# A test_*.cpp that exists in the tree but is missing from TEST_SOURCES never
+# compiles, so its coverage silently vanishes. The hook makes that a commit /
+# CI-lint error. This file is the ONLY escape hatch: every entry must carry a
+# reason, and the list should only ever shrink — when adding a new test file,
+# add it to TEST_SOURCES, not here.
+
+# -- Orphaned by the scan-manager cleanup (#913): removed from TEST_SOURCES
+#    together with the operators they exercised. Owners to decide whether to
+#    port the coverage to the gpu_ingestible layer or delete the files.
+test/cpp/integration/test_gpu_execution_order_nulls.cpp
+test/cpp/integration/test_transparent_execution.cpp
+test/cpp/memory/test_host_table_utils.cpp
+test/cpp/pipeline/test_plan_printer.cpp
+test/cpp/scan/test_column_builder.cpp
+
+# -- Pre-existing orphans (out of the build since before the guard existed;
+#    dates are the last commit that touched each file).
+test/cpp/creator/test_task_creator.cpp # 2026-05-06
+test/cpp/debug/test_debug_utils.cpp # 2026-05-21
+test/cpp/integration/test_tpcds_plan_translation.cpp # 2026-03-05
+test/cpp/memory_management/test_cpu_cache.cpp # 2026-03-05
+test/cpp/pipeline/test_modified_pipeline.cpp # 2026-03-30

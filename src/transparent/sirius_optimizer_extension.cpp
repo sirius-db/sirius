@@ -25,7 +25,7 @@
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/table_filter.hpp>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 
 namespace sirius::transparent {
 
@@ -157,7 +157,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     detail::preserved_counts counts;
     auto plan_copy = copy_logical_plan(*plan, context, &counts);
     if (counts.joins > 0 || counts.gets > 0) {
-      spdlog::debug(
+      SIRIUS_LOG_DEBUG(
         "Transparent execution: preserved dynamic-filter metadata on {} join(s), {} get(s)",
         counts.joins,
         counts.gets);
@@ -166,7 +166,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   } catch (duckdb::NotImplementedException&) {
     // Plan not serializable — skip GPU.
   } catch (std::exception& e) {
-    spdlog::debug("Transparent execution: failed to copy logical plan: {}", e.what());
+    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}", e.what());
   }
 }
 

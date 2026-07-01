@@ -19,7 +19,7 @@
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
@@ -249,4 +249,41 @@ TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
   REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{false, true, false});
+}
+
+TEST_CASE("sirius_physical_hash_join mark join - build-on-left (cudf::mark_join) path",
+          "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {10, 20, 30, 40};
+  std::vector<int32_t> left_payload = {1, 2, 3, 4};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  // Right (probe) side is larger than the left (output) side; only {20, 40} match.
+  std::vector<int32_t> right_ids = {20, 40, 11, 12, 13, 14, 15, 16};
+  auto right_batch = make_numeric_batch<int32_t>(*space, right_ids, cudf::type_id::INT32);
+
+  auto f = create_mark_join();
+  // Force the adaptive switch: with ratio 1.0 and right_rows (8) >= left_rows (4), the join must
+  // build on the left via cudf::mark_join and probe with the right. Output must stay identical to
+  // the filtered_join path.
+  f.hash_join->mark_join_build_switch_ratio = 1.0;
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(out_view.num_columns() == 3);
+  REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
+
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
+  REQUIRE(copy_column_to_host<bool>(out_view.column(2)) ==
+          std::vector<bool>{false, true, false, true});
 }

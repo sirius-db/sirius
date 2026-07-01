@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <io/gpu_ingestible.hpp>
+#include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 
@@ -42,7 +42,7 @@ namespace sirius::op::scan {
  * @c sirius_gpu_duckdb_native_scan_operator. The operator carries no
  * format-specific code: it pulls @c op::operator_data splits from its
  * bound @c split_connector, delegates per-split materialize/post-process
- * work to an installed @c io::gpu_ingestible, and wraps the result for the
+ * work to an installed @c gpu_ingestible, and wraps the result for the
  * downstream pipeline.
  *
  * Lifecycle:
@@ -51,7 +51,7 @@ namespace sirius::op::scan {
  *   2. @c sirius_scan_manager::prepare_for_query peeks the table_info to
  *      match pinned-cache entries. On match: builds the cached ingestible
  *      from the stolen table_info. On miss: calls
- *      @c io::make_gpu_ingestible(take_table_info(), mgr, gpu_ioctxs).
+ *      @c make_gpu_ingestible(take_table_info(), mgr, gpu_ioctxs).
  *      Either way, scan_manager calls @ref install_ingestible to hand
  *      the operator its source.
  *   3. The scan_manager also installs a fresh @c split_connector and
@@ -66,7 +66,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GPU_SCAN;
 
-  /**
+  /**gp
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
    * @param table_info             Per-table bind data; consumed by
@@ -75,7 +75,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
-                           std::unique_ptr<io::ingestible_table_info> table_info);
+                           std::shared_ptr<gpu_ingestible> ingestible);
 
   ~sirius_gpu_scan_operator() override;
 
@@ -112,27 +112,6 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
-  // -----------------------------
-  // scan_manager wiring (public for simplicity; scan_manager is the only caller)
-  // -----------------------------
-  /**
-   * @brief Take ownership of the per-table bind data. Called by
-   *        @c sirius_scan_manager::prepare_for_query when the pinned-cache
-   *        short-circuit either misses (and the ingestible is built via
-   *        @c io::make_gpu_ingestible) or wins (the cached ingestible
-   *        keeps the table_info alive for parquet-bind-data accessors).
-   *        After the call returns, @c peek_table_info would dereference
-   *        null — callers MUST peek BEFORE taking.
-   */
-  std::unique_ptr<io::ingestible_table_info> take_table_info();
-
-  /// @brief Inject the per-GPU sirius_ioctx map produced by SiriusContext::initialize()
-  ///        and held by sirius_scan_manager. Called by create_provider_for(...) before
-  ///        the operator is first executed.
-  /// @details Used by read_table_from_metadata() to select the per-chunk ioctx via
-  ///          scan_data.gpu_memory_space->get_device_id().
-  void set_gpu_ioctxs(std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs);
-
   /**
    * @brief Const accessor for the parked table_info. Used by
    *        @c sirius_scan_manager::try_make_cached_ingestible to match
@@ -140,38 +119,15 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    *
    * @pre @c take_table_info has not been called yet.
    */
-  [[nodiscard]] io::ingestible_table_info const& peek_table_info() const noexcept
-  {
-    return *_table_info;
-  }
+  [[nodiscard]] const ingestible_table_info& peek_table_info() const;
 
-  /**
-   * @brief Install the ingestible that will drive both the operator's
-   *        per-split execute and the @c split_provider's metadata
-   *        emission. Called by @c sirius_scan_manager exactly once per
-   *        query.
-   */
-  void install_ingestible(std::shared_ptr<io::gpu_ingestible> ingestible);
+  [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
-  [[nodiscard]] io::gpu_ingestible& get_ingestible() const;
-
-  void set_split_connector(std::unique_ptr<scan_manager::split_connector> c);
-  [[nodiscard]] scan_manager::split_connector* get_split_connector() noexcept
-  {
-    return _split_connector.get();
-  }
+  scan_manager::split_connector& get_split_connector();
 
  private:
-  std::unique_ptr<io::ingestible_table_info> _table_info;
-  std::shared_ptr<io::gpu_ingestible> _ingestible;
-  std::unique_ptr<scan_manager::split_connector> _split_connector;
-
-  // Per-GPU ioctx map for ioctx->make_datasource(uring_io_object) routing in
-  // read_table_from_metadata. Populated by set_gpu_ioctxs(); empty until
-  // sirius_scan_manager::create_provider_for() injects it (the operator can
-  // be constructed before SiriusContext is available — set_gpu_ioctxs is
-  // mandatory before the first execute()).
-  std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> _gpu_ioctxs;
+  std::shared_ptr<gpu_ingestible> _ingestible;
+  std::shared_ptr<scan_manager::split_connector> _split_connector;
 };
 
 }  // namespace sirius::op::scan

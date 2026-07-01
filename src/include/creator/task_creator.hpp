@@ -30,7 +30,6 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <atomic>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -40,13 +39,6 @@ namespace sirius::pipeline {
 class task_scheduler;
 class sirius_pipeline_task_global_state;
 }  // namespace sirius::pipeline
-
-namespace sirius::op::scan {
-class cpu_source_task_global_state;
-class duckdb_scan_task_global_state;
-class parquet_scan_task_global_state;
-class iceberg_scan_task_global_state;
-}  // namespace sirius::op::scan
 
 namespace sirius::planner {
 class query;
@@ -190,7 +182,6 @@ class task_creator {
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
-  size_t _num_scans_in_plan{0};
 
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task
@@ -198,13 +189,7 @@ class task_creator {
   exec::interruptible_mpmc<std::unique_ptr<task_creation_request>> _task_creation_queue;
 
   // Map of operator ID to global state for scan operators
-  std::map<size_t, std::shared_ptr<op::scan::duckdb_scan_task_global_state>>
-    _scan_operator_global_state_map;
-  std::map<size_t, std::shared_ptr<op::scan::parquet_scan_task_global_state>>
-    _parquet_scan_operator_global_state_map;
-  std::map<size_t, std::shared_ptr<op::scan::cpu_source_task_global_state>>
-    _cpu_source_operator_global_state_map;
-  std::map<size_t, std::shared_ptr<pipeline::sirius_pipeline_task_global_state>>
+  std::unordered_map<size_t, std::shared_ptr<pipeline::sirius_pipeline_task_global_state>>
     _gpu_operator_global_state_map;
   std::unique_ptr<duckdb::ThreadContext> _thread_context;
   std::unique_ptr<duckdb::ExecutionContext> _execution_context;
@@ -222,6 +207,10 @@ class task_creator {
   std::unordered_map<int, std::vector<int>> _numa_to_gpu;
   /// Round-robin counter for NUMA-affinity routing when multiple GPUs share a NUMA node.
   std::atomic<uint64_t> _numa_to_gpu_rr{0};
+  /// Sorted device ids that actually have a GPU executor (memory-manager GPU
+  /// spaces). Partition affinity indexes this, not the physical topology, so the
+  /// pin resolves to a real executor when num_gpus < physical GPU count.
+  std::vector<int> _active_gpu_ids;
 };
 
 }  // namespace sirius::creator

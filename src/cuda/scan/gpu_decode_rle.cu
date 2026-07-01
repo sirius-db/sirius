@@ -36,6 +36,7 @@
 //         CTAs. ('Expand' kernel)
 //===----------------------------------------------------------------------===//
 
+#include "cuda/scan/detail/warp.cuh"
 #include "cuda/scan/gpu_decode_rle.cuh"
 
 #include <rmm/detail/error.hpp>
@@ -46,7 +47,6 @@
 #include <cuda/std/algorithm>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
-#include <cuda/warp>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -61,16 +61,16 @@ namespace {
 
 using rle_count_t = uint16_t;
 
-constexpr uint32_t BLOCK_DIM          = 256;
+constexpr uint32_t RLE_BLOCK_DIM      = 256;
 constexpr uint32_t RLE_ROWS_PER_CHUNK = 2048;
-constexpr uint32_t VALUES_PER_THREAD  = RLE_ROWS_PER_CHUNK / BLOCK_DIM;
-// Catch silent integer truncation if BLOCK_DIM stops dividing the chunk.
-static_assert(BLOCK_DIM * VALUES_PER_THREAD == RLE_ROWS_PER_CHUNK);
+constexpr uint32_t VALUES_PER_THREAD  = RLE_ROWS_PER_CHUNK / RLE_BLOCK_DIM;
+// Catch silent integer truncation if RLE_BLOCK_DIM stops dividing the chunk.
+static_assert(RLE_BLOCK_DIM * VALUES_PER_THREAD == RLE_ROWS_PER_CHUNK);
 
 // Build kernel processes counts in tiles of BUILD_TILE_ENTRIES; running
 // total propagates across tiles.
 constexpr uint32_t BUILD_VALUES_PER_THREAD = 8;
-constexpr uint32_t BUILD_TILE_ENTRIES      = BLOCK_DIM * BUILD_VALUES_PER_THREAD;  // 2048
+constexpr uint32_t BUILD_TILE_ENTRIES      = RLE_BLOCK_DIM * BUILD_VALUES_PER_THREAD;  // 2048
 constexpr uint32_t RLE_SMEM_MAX_ENTRIES    = BUILD_TILE_ENTRIES;
 
 // Worst-case ec = (block_size - header) / (sizeof(T) + sizeof(rle_count_t))
@@ -80,11 +80,9 @@ constexpr uint32_t RLE_BUILD_MAX_ENTRIES =
   ::cuda::ceil_div(RLE_DUCKDB_MAX_EC, BUILD_TILE_ENTRIES) * BUILD_TILE_ENTRIES;  // 90112
 
 constexpr uint32_t MALFORMED_FLAG = 0u;
-constexpr int WARP_THREADS        = 32;
+using detail::FULL_MASK;
 
-/**
- * @brief Per-CTA input for segment-level prefix sum kernel over counts array.
- */
+//! @brief Per-CTA input for segment-level prefix sum kernel over counts array.
 struct rle_segment_desc {
   uint8_t const* d_bytes;
   uint32_t bytes_size;
@@ -95,9 +93,7 @@ struct rle_segment_desc {
   uint32_t type_size;
 };
 
-/**
- * @brief Per-CTA input for chunk-level value filling kernel into the output column.
- */
+//! @brief Per-CTA input for chunk-level value filling kernel into the output column.
 struct rle_chunk_desc {
   uint8_t const* d_values;
   uint32_t const* d_prefix_sums;
@@ -111,10 +107,8 @@ struct rle_chunk_desc {
 // Segment-level prefix sum kernel over counts array.
 //===----------------------------------------------------------------------===//
 
-/**
- * @brief Stateful prefix functor that carries running total across successive `cub::BlockScan`
- * invocations; used to scan a single segment in tiles.
- */
+//! @brief Stateful prefix functor that carries running total across successive `cub::BlockScan`
+//! invocations; used to scan a single segment in tiles.
 struct BlockPrefixCallbackOp {
   uint32_t running_total;
   __device__ uint32_t operator()(uint32_t block_aggregate)
@@ -125,15 +119,13 @@ struct BlockPrefixCallbackOp {
   }
 };
 
-/**
- * @brief Result of parsing a segment's RLE header.
- *
- * `is_malformed` is true if any header-level invariant fails:
- *  - segment smaller than the 8-byte header
- *  - counts_offset out of range
- * When malformed, the pointer/count fields are unspecified and the caller must zero-fill rather
- * than dereference.
- */
+//! @brief Result of parsing a segment's RLE header.
+//!
+//! `is_malformed` is true if any header-level invariant fails:
+//!  - segment smaller than the 8-byte header
+//!  - counts_offset out of range
+//! When malformed, the pointer/count fields are unspecified and the caller must zero-fill rather
+//! than dereference.
 struct rle_parsed_metadata {
   rle_count_t const* counts_ptr;
   /// Real entry count of the counts[] region, computed from the values
@@ -143,10 +135,8 @@ struct rle_parsed_metadata {
   bool is_malformed;
 };
 
-/**
- * @brief Decode an RLE segment's 8-byte header and bound the counts[] region.
- * Intended for single-thread execution and shared memory broadcast.
- */
+//! @brief Decode an RLE segment's 8-byte header and bound the counts[] region.
+//! Intended for single-thread execution and shared memory broadcast.
 __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_desc const& desc)
 {
   rle_parsed_metadata md{};
@@ -180,15 +170,13 @@ __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_de
   return md;
 }
 
-/**
- * @brief Compute the prefix sums over the counts in the segment to determine the positions in the
- * output columns into which to fill values.
- *
- * The work partitioning is 1 CTA per segment.
- */
+//! @brief Compute the prefix sums over the counts in the segment to determine the positions in the
+//! output columns into which to fill values.
+//!
+//! The work partitioning is 1 CTA per segment.
 template <int BLOCK_THREADS, int ITEMS_PER_THREAD, int PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT>
 __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_descriptors,
-                                 uint32_t num_segments,
+                                 int num_segments,
                                  uint32_t* __restrict__ d_prefix_sums,
                                  uint32_t* __restrict__ d_counts)
 {
@@ -247,7 +235,7 @@ __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_de
 
   //===----------Divide segment into tiles----------===//
   auto const n_tiles = ::cuda::ceil_div(n_counts_max, ITEMS_PER_TILE);
-  for (uint32_t tile = 0; tile < n_tiles; ++tile) {
+  for (int tile = 0; tile < n_tiles; ++tile) {
     auto const tile_offset          = tile * ITEMS_PER_TILE;
     auto const n_counts_max_current = n_counts_max - tile_offset;
     //===----------Process tile----------===//
@@ -332,12 +320,10 @@ __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_de
 // Expand kernel.
 //===----------------------------------------------------------------------===//
 
-/**
- * @brief Fill the values into the output array based on the corresponding output position
- * determined by the segment-local prefix sum. @p segment_entry_count is the per-segment number of
- * counts, @p chunk_rows is the number of rows in this segment chunk, and @p chunk_first_row is the
- * segment-local row index of this chunk's first row.
- */
+//! @brief Fill the values into the output array based on the corresponding output position
+//! determined by the segment-local prefix sum. @p segment_entry_count is the per-segment number of
+//! counts, @p chunk_rows is the number of rows in this segment chunk, and @p chunk_first_row is the
+//! segment-local row index of this chunk's first row.
 template <int ITEMS_PER_THREAD, typename T>
 __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ prefix_sums,
                                                  T const* __restrict__ values,
@@ -380,12 +366,12 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
   // Heuristic: if the average number of rows per warp in this chunk is >= the number of RLE entries
   // in the chunk, try to use a single search into the prefix_sums array for each warp in case all
   // the threads in the warp fill the same value. This is an optimization for long runs.
-  if (chunk_rows >= WARP_THREADS * (chunk_entry_hi - chunk_entry_lo)) {
-    auto const lane = threadIdx.x % WARP_THREADS;
+  if (chunk_rows >= cub::detail::warp_threads * (chunk_entry_hi - chunk_entry_lo)) {
+    auto const lane = threadIdx.x % cub::detail::warp_threads;
 #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
       auto const chunk_row        = i * blockDim.x + threadIdx.x;
-      auto const lane_0_chunk_row = chunk_row - (chunk_row % WARP_THREADS);
+      auto const lane_0_chunk_row = chunk_row - (chunk_row % cub::detail::warp_threads);
       if (lane_0_chunk_row >= chunk_rows) break;
       auto const lane_0_segment_row = chunk_first_row + lane_0_chunk_row;
 
@@ -395,19 +381,22 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
         lane_0_entry      = find_entry(chunk_entry_lo, chunk_entry_hi, lane_0_segment_row);
         lane_0_prefix_sum = prefix_sums[lane_0_entry];
       }
-      lane_0_entry      = ::cuda::device::warp_shuffle_idx(lane_0_entry, 0);
-      lane_0_prefix_sum = ::cuda::device::warp_shuffle_idx(lane_0_prefix_sum, 0);
+      lane_0_entry = cub::ShuffleIndex<cub::detail::warp_threads>(lane_0_entry, 0, FULL_MASK);
+      lane_0_prefix_sum =
+        cub::ShuffleIndex<cub::detail::warp_threads>(lane_0_prefix_sum, 0, FULL_MASK);
 
-      auto const lane_31_row = lane_0_segment_row + WARP_THREADS - 1;
+      auto const lane_31_row = lane_0_segment_row + cub::detail::warp_threads - 1;
 
       if (lane_31_row < lane_0_prefix_sum) {
-        __stwt(out_chunk + chunk_row, __ldg(values + lane_0_entry));
+        cub::ThreadStore<cub::STORE_WT>(out_chunk + chunk_row,
+                                        cub::ThreadLoad<cub::LOAD_LDG>(values + lane_0_entry));
       } else {
         // Warp straddles an entry boundary — per-lane fallback.
         if (chunk_row >= chunk_rows) { break; }
         auto const segment_row = chunk_first_row + chunk_row;
         auto const entry       = find_entry(chunk_entry_lo, chunk_entry_hi, segment_row);
-        __stwt(out_chunk + chunk_row, __ldg(values + entry));
+        cub::ThreadStore<cub::STORE_WT>(out_chunk + chunk_row,
+                                        cub::ThreadLoad<cub::LOAD_LDG>(values + entry));
       }
     }
   } else {
@@ -417,18 +406,17 @@ __device__ __forceinline__ void decode_chunk_rle(uint32_t const* __restrict__ pr
       if (chunk_row >= chunk_rows) break;
       auto const segment_row = chunk_first_row + chunk_row;
       auto const entry       = find_entry(chunk_entry_lo, chunk_entry_hi, segment_row);
-      __stwt(out_chunk + chunk_row, __ldg(values + entry));
+      cub::ThreadStore<cub::STORE_WT>(out_chunk + chunk_row,
+                                      cub::ThreadLoad<cub::LOAD_LDG>(values + entry));
     }
   }
 }
 
-/**
- * @brief Wrapper kernel for `decode_chunk_rle` that loads the chunk descriptor and stages the
- * segment prefix sums in shared memory, if possible, for faster binary search.
- */
+//! @brief Wrapper kernel for `decode_chunk_rle` that loads the chunk descriptor and stages the
+//! segment prefix sums in shared memory, if possible, for faster binary search.
 template <int ITEMS_PER_THREAD, typename T>
 __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs,
-                                  uint32_t num_chunks,
+                                  int num_chunks,
                                   uint32_t const* __restrict__ d_segment_entry_counts,
                                   T* __restrict__ d_output)
 {
@@ -446,7 +434,7 @@ __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs
 
   if (segment_entry_count == MALFORMED_FLAG) {
     // Zero-fill the output
-    for (uint32_t i = threadIdx.x; i < chunk_rows; i += blockDim.x) {
+    for (int i = threadIdx.x; i < chunk_rows; i += blockDim.x) {
       out_chunk_values[i] = 0;
     }
     return;
@@ -454,7 +442,7 @@ __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs
 
   // Try to use SMEM for the binary search space for a chunk
   if (segment_entry_count <= RLE_SMEM_MAX_ENTRIES) {
-    for (uint32_t i = threadIdx.x; i < segment_entry_count; i += blockDim.x) {
+    for (int i = threadIdx.x; i < segment_entry_count; i += blockDim.x) {
       s_segment_prefix_sums[i] = chunk_desc.d_prefix_sums[i];
     }
     __syncthreads();
@@ -480,25 +468,23 @@ __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs
 // Public entry.
 //===----------------------------------------------------------------------===//
 
-/**
- * @brief Decode all RLE-encoded segments in @p run into @p d_output.
- *
- * Runs the two-pass pipeline: a per-segment prefix-sum build kernel that
- * computes the cumulative row counts and the per-segment entry count,
- * followed by a per-chunk expand kernel that scatters run values to their
- * output positions. Malformed segments are zero-filled.
- *
- * @param run        Column of segments sharing the RLE codec.
- * @param d_output   Device pointer to the output column buffer; must hold
- *                   at least `sum(segment.row_count) * type_size` bytes.
- * @param type       Cudf type of the output column (unused; kept for API
- *                   parity with the dispatcher's other codec entry points).
- * @param type_size  Width of one output value in bytes. Must be 1, 2, 4, or
- *                   8; otherwise the function throws.
- * @param stream     Stream on which all kernels and allocations are issued.
- * @param mr         Memory resource for the transient prefix-sum / descriptor
- *                   buffers allocated during decode.
- */
+//! @brief Decode all RLE-encoded segments in @p run into @p d_output.
+//!
+//! Runs the two-pass pipeline: a per-segment prefix-sum build kernel that
+//! computes the cumulative row counts and the per-segment entry count,
+//! followed by a per-chunk expand kernel that scatters run values to their
+//! output positions. Malformed segments are zero-filled.
+//!
+//! @param run        Column of segments sharing the RLE codec.
+//! @param d_output   Device pointer to the output column buffer; must hold
+//!                   at least `sum(segment.row_count) * type_size` bytes.
+//! @param type       Cudf type of the output column (unused; kept for API
+//!                   parity with the dispatcher's other codec entry points).
+//! @param type_size  Width of one output value in bytes. Must be 1, 2, 4, or
+//!                   8; otherwise the function throws.
+//! @param stream     Stream on which all kernels and allocations are issued.
+//! @param mr         Memory resource for the transient prefix-sum / descriptor
+//!                   buffers allocated during decode.
 void decode_rle_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type /*type*/,
@@ -541,8 +527,8 @@ void decode_rle_data(gpu_codec_run const& run,
                                stream.value()));
 
   //===----------Pass 1: Build----------===//
-  kernel_build_rle<BLOCK_DIM, BUILD_VALUES_PER_THREAD, RLE_BUILD_MAX_ENTRIES>
-    <<<static_cast<uint32_t>(num_live_segments), BLOCK_DIM, 0, stream.value()>>>(
+  kernel_build_rle<RLE_BLOCK_DIM, BUILD_VALUES_PER_THREAD, RLE_BUILD_MAX_ENTRIES>
+    <<<static_cast<uint32_t>(num_live_segments), RLE_BLOCK_DIM, 0, stream.value()>>>(
       d_build_descs.data(),
       static_cast<uint32_t>(num_live_segments),
       d_segment_prefix_sums.data(),
@@ -588,29 +574,29 @@ void decode_rle_data(gpu_codec_run const& run,
   //===----------Pass 2: Expand----------===//
   switch (type_size) {
     case 1:
-      kernel_expand_rle<VALUES_PER_THREAD, uint8_t><<<n_ctas, BLOCK_DIM, 0, stream.value()>>>(
+      kernel_expand_rle<VALUES_PER_THREAD, uint8_t><<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(
         d_expand_descs.data(), n_ctas, d_entry_counts.data(), d_output);
       break;
     case 2:
       kernel_expand_rle<VALUES_PER_THREAD, uint16_t>
-        <<<n_ctas, BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                   n_ctas,
-                                                   d_entry_counts.data(),
-                                                   reinterpret_cast<uint16_t*>(d_output));
+        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
+                                                       n_ctas,
+                                                       d_entry_counts.data(),
+                                                       reinterpret_cast<uint16_t*>(d_output));
       break;
     case 4:
       kernel_expand_rle<VALUES_PER_THREAD, uint32_t>
-        <<<n_ctas, BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                   n_ctas,
-                                                   d_entry_counts.data(),
-                                                   reinterpret_cast<uint32_t*>(d_output));
+        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
+                                                       n_ctas,
+                                                       d_entry_counts.data(),
+                                                       reinterpret_cast<uint32_t*>(d_output));
       break;
     case 8:
       kernel_expand_rle<VALUES_PER_THREAD, uint64_t>
-        <<<n_ctas, BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                   n_ctas,
-                                                   d_entry_counts.data(),
-                                                   reinterpret_cast<uint64_t*>(d_output));
+        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
+                                                       n_ctas,
+                                                       d_entry_counts.data(),
+                                                       reinterpret_cast<uint64_t*>(d_output));
       break;
     default:
       // Unreachable — guarded by the type_size check at function entry.

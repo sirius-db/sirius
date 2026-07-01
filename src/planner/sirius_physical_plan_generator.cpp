@@ -27,6 +27,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_dynamic_filter.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
 namespace sirius::planner {
@@ -130,6 +131,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   auto plan = create_plan(*op);
   profiler.EndPhase();
 
+  plan = fold_adjacent_projections(std::move(plan));
   plan->verify();
   return plan;
 }

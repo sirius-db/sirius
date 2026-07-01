@@ -95,10 +95,6 @@ sirius:
       num_threads: 1
       thread_name_prefix: "sirius_downgrade_executor"
       monitor_period_ms: 10
-    duckdb_scan:
-      num_threads: 4
-      thread_name_prefix: "sirius_scan_executor"
-      cache: "parquet"
     task_creator:
       num_threads: 2
   operator_params:
@@ -109,7 +105,7 @@ sirius:
     concat_batch_bytes: 5Gi
     max_build_hash_table_bytes: 500Mi
   telemetry:
-    enable_quent: false
+    enable_quent: true
     output_directory: telemetry_data
     engine_name: siriusDB
 ```
@@ -208,11 +204,78 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | false | Emit Quent telemetry using the ndjson exporter. When false, telemetry uses the noop exporter. |
+| `enable_quent` | bool | true | Emit Quent telemetry using the ndjson exporter. When false, telemetry uses the noop exporter. |
 | `output_directory` | string | `telemetry_data` | Directory for Quent ndjson files. |
 | `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
-Per-query labels are configured separately with `CALL sirius_set_query_label(...)` SQL function or the `query_label` named parameter on `gpu_execution(...)`.
+Per-query labels are configured separately from YAML. They can be set with the
+`sirius_set_query_label` SQL function or inline with the `query_label` named
+parameter on `gpu_execution(...)`:
+
+```sql
+-- Applies to the next Sirius query, including transparent plain-SQL execution.
+CALL sirius_set_query_label('tpch_q1_iter1');
+SELECT *
+FROM lineitem
+WHERE l_orderkey < 100;
+
+-- Inline label for an explicit gpu_execution call.
+CALL gpu_execution(
+  'SELECT * FROM lineitem WHERE l_orderkey < 100',
+  query_label = 'tpch_q1_iter1'
+);
+```
+
+`sirius_set_query_label` is consumed once by the next Sirius query. For explicit
+`gpu_execution(...)`, an inline `query_label` parameter takes precedence over a
+pending label set with `sirius_set_query_label`.
+
+### Generating Query Telemetry
+
+To generate telemetry from Sirius queries, update the Sirius config file used by
+the query run and enable Quent export:
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+    engine_name: siriusDB
+```
+
+Load that config through the normal config resolution path, usually by setting
+`SIRIUS_CONFIG_FILE=/path/to/sirius.yaml`. Any Sirius query run with
+`enable_quent: true` writes Quent ndjson files into `output_directory`.
+
+For TPC-H Parquet runs, the helper script runs queries and labels each
+`(query, iteration)` pair before executing it:
+
+```bash
+pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+  --iterations 1 \
+  --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
+  100
+```
+
+Pass `--config <path>` to use a full Sirius config. If no query numbers are
+provided, the script runs all 22 TPC-H queries.
+
+Start the Quent analyzer server over the same telemetry directory to view the
+captured telemetry:
+
+```bash
+pixi run quent
+```
+
+The `quent` Pixi task defaults to `telemetry_data`, and runs the telemetry
+server with the UI enabled. If the config uses a different `output_directory`,
+pass that path as the task argument:
+
+```bash
+pixi run quent /path/to/telemetry_data
+```
+
+Then open `http://localhost:8080` and select the captured Sirius engine/query.
 
 ## Thread Pool Configuration
 
@@ -221,7 +284,6 @@ Per-query labels are configured separately with `CALL sirius_set_query_label(...
 | `task_creator` | 2 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | 4 | `downgrade` | Data tier migration (GPU→Host) |
-| `duckdb_scan_executor` | 4 | `scan_executor` | Scan task execution (DuckDB/Parquet) |
 
 Each pool supports optional CPU affinity lists for core pinning.
 
@@ -258,7 +320,6 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | `use_opt_table_scan` | - | Enable optimized table scan |
 | `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
 | `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
-| `scan_cache_level` | `NONE` | Scan caching level: `NONE`, `PARQUET`, `TABLE_HOST`, `TABLE_GPU` |
 | `scan_task_batch_size` | 512 MB | Target scan batch size |
 | `default_scan_task_varchar_size` | 256 | VARCHAR size estimate |
 

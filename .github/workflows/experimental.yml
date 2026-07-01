@@ -1,0 +1,81 @@
+# NOTICE - Actions permissions policy (Settings > Actions > General):
+#   - "Allow sirius-db, and select non-sirius-db, actions and reusable workflows"
+#     - Allow actions created by GitHub: YES (covers actions/*)
+#     - Allow actions by Marketplace verified creators: NO
+#     - Explicitly allowed third-party actions:
+#       prefix-dev/setup-pixi@*
+#       mozilla-actions/sccache-action@*
+#     - Require actions to be pinned to a full-length commit SHA: NO
+#
+# Adding a new action? You must:
+#   1. Pin it to a full-length commit SHA (e.g. uses: owner/repo@<40-char-sha> # vX.Y.Z)
+#   2. If it is not from sirius-db, GitHub, or the explicitly allowed third-party actions above, add it to the
+#      project-level allowlist above before merging
+name: Experimental
+
+on:
+  pull_request:
+    paths:
+      - 'experimental/**'
+      - '.github/workflows/experimental.yml'
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  starrocks:
+    name: starrocks
+    runs-on: ubuntu-24.04
+    env:
+      # CPU runner: no GPU/driver. The workspace platforms are CUDA-pinned (the
+      # `engine` feature targets CUDA 13), so assert `__cuda` for the `cn` env to
+      # resolve even though `cn` itself is CUDA-agnostic.
+      CONDA_OVERRIDE_CUDA: "13"
+    defaults:
+      run:
+        working-directory: experimental/starrocks
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: false
+
+      - name: Init starrocks submodules
+        working-directory: ${{ github.workspace }}
+        run: git submodule update --init --depth=1 experimental/starrocks/starrocks experimental/starrocks/brpc
+
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
+        with:
+          cache: false
+          pixi-version: v0.71.1
+          manifest-path: experimental/starrocks/pixi.toml
+          environments: cn
+
+      # Scope by package: `--all` would also reach the sibling rust/ workspace via the
+      # `sirius` path dep. Mirrors check.yml's scoped rust/ fmt check.
+      - name: fmt
+        run: pixi run -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-thrift -- --check
+
+      # The CN's `sirius-engine` feature is on by default but links a Sirius build
+      # tree (C++ toolchain + RAPIDS/CUDA) that this CI env does not have, so build
+      # the pure-Rust path here. The engine path is exercised on a GPU box via
+      # `pixi run cn-build` / `cn-test`.
+      - name: clippy
+        run: pixi run -e cn cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: test
+        run: pixi run -e cn cargo test --workspace --no-default-features
+
+  experimental:
+    name: experimental
+    runs-on: ubuntu-24.04
+    needs: [starrocks]
+    if: always()
+    steps:
+      - name: All checks ok
+        if: ${{ needs.starrocks.result == 'success' }}
+        run: exit 0
+      - name: Some checks failed
+        if: ${{ needs.starrocks.result != 'success' }}
+        run: exit 1

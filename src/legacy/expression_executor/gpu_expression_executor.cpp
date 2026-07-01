@@ -24,7 +24,7 @@
 #include <operator/gpu_materialize.hpp>
 
 // cucascade
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
 
 // duckdb

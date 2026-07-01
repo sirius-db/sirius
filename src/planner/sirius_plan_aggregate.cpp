@@ -32,6 +32,7 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
 
 #include <memory>
 
@@ -102,12 +103,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     }
   }
   if (expressions.empty()) { return child; }
-  auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-    sirius::from_duckdb_vec(types),
-    translate_expressions(std::move(expressions)),
-    child->estimated_cardinality);
-  projection->children.push_back(std::move(child));
-  return std::move(projection);
+  auto const estimated_cardinality = child->estimated_cardinality;
+  return push_projection(std::move(child),
+                         sirius::from_duckdb_vec(types),
+                         translate_expressions(std::move(expressions)),
+                         estimated_cardinality);
 }
 
 }  // namespace

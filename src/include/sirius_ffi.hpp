@@ -29,6 +29,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #ifndef SIRIUS_FFI_EXPORT
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
@@ -45,10 +46,18 @@ namespace sirius::ffi {
 /// Constructing a `Context` brings up an initialized engine (it constructs and
 /// `initialize()`s a `duckdb::SiriusContext`); destroying it tears the engine
 /// down. There is no uninitialized state. Held from Rust via `cxx::UniquePtr`,
-/// so it is created by `make_context()` and freed when the `UniquePtr` drops.
+/// so it is created by `make_context()` / `make_context_from_config()` and freed
+/// when the `UniquePtr` drops.
+///
+/// The default constructor configures the engine from built-in defaults; the
+/// `config_path` constructor loads a YAML config file instead. Both can throw
+/// (bad config file, GPU bring-up failure); the `make_*` factories below are
+/// bound from Rust as fallible, so the failure surfaces as an error rather than
+/// aborting.
 class SIRIUS_FFI_EXPORT Context {
  public:
   Context();
+  explicit Context(const std::string& config_path);
   ~Context();
 
   Context(const Context&)            = delete;
@@ -58,7 +67,12 @@ class SIRIUS_FFI_EXPORT Context {
   std::unique_ptr<duckdb::SiriusContext> context_;
 };
 
-/// Create an initialized [`Context`], owned by the returned `unique_ptr`.
+/// Create an initialized [`Context`] configured from built-in defaults, owned by
+/// the returned `unique_ptr`.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context();
+
+/// Create an initialized [`Context`] configured from the YAML file at
+/// `config_path`, owned by the returned `unique_ptr`.
+SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::string& config_path);
 
 }  // namespace sirius::ffi

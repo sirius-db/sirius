@@ -20,8 +20,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -128,6 +128,39 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
+  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+}
+
+/**
+ * @brief Create a shared_ptr<data_batch> that owns a cudf::table_view via a type-erased owner.
+ *
+ * Wraps the gpu_table_representation owning_table_view ctor: the batch holds a non-owning
+ * @p view whose underlying device memory is kept alive by @p owner (e.g. a read_only_data_batch
+ * lock on a source batch, and/or a shared_ptr<cudf::table> of freshly-evaluated columns). The
+ * owner must be copy-constructible (std::any requirement). Used by the projection operator to
+ * return columns without copying passthrough (BOUND_REF) inputs.
+ *
+ * STREAM-LINEAGE: @p writer_stream must be a stream that is ordered after every write to the
+ * memory referenced by @p view (the caller is responsible for inserting any cudaStreamWaitEvent
+ * needed to establish that ordering before calling this helper).
+ *
+ * @tparam Owner Copy-constructible type that keeps @p view's device memory alive.
+ * @param view The table view to expose (data ownership lives in @p owner).
+ * @param owner The owner keeping the viewed memory alive (moved/copied into std::any).
+ * @param alloc_size Allocation size in bytes attributed to this batch.
+ * @param memory_space The memory space where the viewed data resides.
+ * @param writer_stream Stream ordered after the writes that produced @p view's data.
+ */
+template <typename Owner>
+inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
+  cudf::table_view view,
+  Owner&& owner,
+  std::size_t alloc_size,
+  cucascade::memory::memory_space& memory_space,
+  rmm::cuda_stream_view writer_stream)
+{
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+    view, std::forward<Owner>(owner), alloc_size, memory_space, writer_stream);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 

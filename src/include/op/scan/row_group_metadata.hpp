@@ -17,10 +17,9 @@
 #pragma once
 
 // sirius
-#include <io/types.hpp>
-
+#include <io/sirius_datasource.hpp>
 // cudf
-#include <cudf/io/datasource.hpp>
+
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_schema.hpp>
 
@@ -51,15 +50,13 @@ struct row_group_slice {
                   std::vector<cudf::size_type> row_group_indices,
                   std::size_t reserved_uncompressed_bytes,
                   std::size_t reserved_compressed_bytes,
-                  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx        = nullptr,
-                  std::shared_ptr<sirius::io::sirius_io_object> io_object = nullptr)
+                  std::shared_ptr<io::sirius_datasource> datasource)
     : file_metadata(file_metadata),
       file_path(file_path),
       row_group_indices(std::move(row_group_indices)),
       reserved_uncompressed_bytes(reserved_uncompressed_bytes),
       reserved_compressed_bytes(reserved_compressed_bytes),
-      io_ctx(std::move(io_ctx)),
-      io_object(std::move(io_object))
+      datasource(std::move(datasource))
   {
   }
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
@@ -67,13 +64,10 @@ struct row_group_slice {
   std::vector<cudf::size_type> row_group_indices;
   std::size_t reserved_uncompressed_bytes;
   std::size_t reserved_compressed_bytes;
-  /// Sirius IO context that minted @c io_object. When non-null, the scan
-  /// operator builds a @c sirius_datasource via @c io_ctx->make_datasource;
-  /// when null, it falls back to @c cudf::io::datasource::create.
-  std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
-  /// Sirius io_object created by the split provider for this file. Shared
-  /// across every slice from the same parquet file.
-  std::shared_ptr<sirius::io::sirius_io_object> io_object;
+  /// Pre-built datasource for this file. Created once by the split provider
+  /// and reused by materialize_table. When null, materialize_table falls
+  /// back to cudf::io::datasource::create(file_path).
+  std::shared_ptr<io::sirius_datasource> datasource;
 };
 
 //===----------------------------------------------------------------------===//

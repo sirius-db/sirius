@@ -52,9 +52,6 @@ sirius:
   executor:
     pipeline:
       num_threads: ${pipeline}
-    duckdb_scan:
-      num_threads: ${scan}
-      cache: "parquet"
     task_creator:
       num_threads: ${task_creator}
     downgrade:

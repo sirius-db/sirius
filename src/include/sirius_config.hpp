@@ -18,9 +18,8 @@
 
 #include "config.hpp"
 #include "exec/config.hpp"
-#include "io/object_store_config.hpp"
-#include "op/scan/config.hpp"
-#include "scan_manager/sirius_scan_manager.hpp"
+#include "exec/inspectable_mpsc.hpp"
+#include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -41,6 +40,21 @@ constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  /
 
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
+
+/// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
+/// left/output side) instead of cudf::filtered_join (build on the right side). mark_join only
+/// wins when the left side is much smaller than the right (probe) side.
+///
+/// Provenance: a standalone microbenchmark (see issue #510) compared filtered_join (build right,
+/// probe left) vs. mark_join (build left, probe right) — including the BOOL8 scatter that
+/// resolve_mark_join_result performs — across many left/right size ratios on an NVIDIA L4. The
+/// scatter cost was negligible and identical for both. filtered_join won at or near parity and
+/// only lost once the right side was roughly >= 3-4x the left side, i.e. when mark_join's build
+/// side (left) was substantially smaller. We default to 8.0 (well above the measured ~3-4x
+/// crossover) so the switch only triggers when it is a clear win, leaving headroom for the fact
+/// that the crossover is hardware- and workload-dependent. Recalibrate per GPU; set to 0 to
+/// disable (always use filtered_join).
+constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
 }  // namespace config
 
@@ -73,10 +87,13 @@ struct operator_params {
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
 
-  /// Route DuckDB native `seq_scan` to the GPU-native scan operator
-  /// (sirius_gpu_duckdb_native_scan_operator) instead of the CPU fallback
-  /// (sirius_physical_duckdb_scan). Off by default.
-  bool enable_gpu_duckdb_native_scan = false;
+  /// For STANDARD-mode MARK joins: build the hash table on the left/output side via
+  /// cudf::mark_join (instead of on the right side via filtered_join) when the right (probe)
+  /// side has at least this many times more rows than the left side. mark_join only wins when
+  /// the left side is substantially smaller; the crossover is hardware-dependent (~3-4x on an
+  /// L4 in the issue #510 microbenchmark, defaulted higher to stay conservative). Set to 0 to
+  /// disable (always use filtered_join).
+  double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
   /// Wire dynamic table-filter pushdown: a hash-join build publishes a runtime membership filter
   /// (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan, which applies it
@@ -93,7 +110,7 @@ struct operator_params {
 };
 
 struct telemetry_config {
-  bool enable_quent{false};
+  bool enable_quent{true};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
 };
@@ -117,9 +134,9 @@ struct sirius_config {
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
-  /// Overwrite the stored scan_manager_config. SiriusContext::initialize() uses
-  /// this to persist the S3 backend it materialized from object_store_config,
-  /// so a later get_config() reflects the actual scan_manager wiring.
+  /// Overwrite the stored scan_manager_config. Allows callers (e.g.
+  /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
+  /// get_scan_manager_config() reflects the actual scan_manager state.
   void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
@@ -127,21 +144,11 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
-
-  [[nodiscard]] bool is_scan_caching_enabled() const noexcept
+  /// Pop ordering for the task_scheduler's pipeline-level task queue. See
+  /// exec::queue_ordering for semantics. Defaults to FIFO (legacy behavior).
+  [[nodiscard]] exec::queue_ordering get_task_queue_ordering() const noexcept
   {
-    return _scan_executor_config.cache != op::scan::cache_level::NONE;
-  }
-
-  [[nodiscard]] op::scan::cache_level get_cache_level() const noexcept
-  {
-    return _scan_executor_config.cache;
-  }
-
-  void set_cache_level(op::scan::cache_level level) noexcept
-  {
-    _scan_executor_config.cache = level;
+    return _task_queue_ordering;
   }
 
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
@@ -155,14 +162,6 @@ struct sirius_config {
   {
     return _telemetry_config;
   }
-
-  /// Object-store backend credentials + endpoint. Empty fields disable the
-  /// S3 backend; SiriusContext::initialize() reads this to populate
-  /// scan_manager_config::s3_config before constructing the scan_manager.
-  /// Direct member access (no getter/setter) to keep the test fixture and
-  /// future SET-handler wiring simple — both sides write into this struct
-  /// and SiriusContext consumes it at initialize() time.
-  sirius::io::object_store_config object_store_config{};
 
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -179,9 +178,9 @@ struct sirius_config {
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
-  op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
+  exec::queue_ordering _task_queue_ordering{exec::queue_ordering::FIFO};
 };
 
 }  // namespace sirius

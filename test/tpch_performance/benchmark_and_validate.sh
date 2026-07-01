@@ -25,13 +25,17 @@
 # Usage:
 #   export SIRIUS_CONFIG_FILE=...
 #   ./test/tpch_performance/benchmark_and_validate.sh <scale_factor>
+#   ./test/tpch_performance/benchmark_and_validate.sh --pinning-mode pinned-hot <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb <scale_factor>
+#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb-native <scale_factor>
 #   ./test/tpch_performance/benchmark_and_validate.sh --report <run_dir>
 #   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results <run_dir> <scale_factor>
 #
 # Example:
 #   ./test/tpch_performance/benchmark_and_validate.sh 1
+#   ./test/tpch_performance/benchmark_and_validate.sh --pinning-mode pinned-hot --iterations 5 1
 #   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb --duckdb-file ./performance_test.duckdb 1
+#   ./test/tpch_performance/benchmark_and_validate.sh --data-source duckdb-native --duckdb-file ./test_datasets/tpch_sf1.duckdb 1
 #   ./test/tpch_performance/benchmark_and_validate.sh --report runs/2026-03-10_12-00-00_sf1_2iter
 #   ./test/tpch_performance/benchmark_and_validate.sh --duckdb-results runs/2026-03-10_12-00-00_sf1_2iter 1
 
@@ -42,6 +46,10 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Set by --data-source (default: parquet → run_tpch_parquet.sh).
 DATA_SOURCE="parquet"
 RUN_SCRIPT="$SCRIPT_DIR/run_tpch_parquet.sh"
+
+# True for any data source backed by a .duckdb file; duckdb and duckdb-native share the
+# same file, runner, and file-resolution machinery.
+is_duckdb_source() { [ "$DATA_SOURCE" = "duckdb" ] || [ "$DATA_SOURCE" = "duckdb-native" ]; }
 
 # ---------------------------------------------------------------------------
 # Report generation from an existing run directory.
@@ -320,11 +328,11 @@ while [ $# -gt 1 ]; do
             ;;
         --data-source)
             case "$2" in
-                parquet | duckdb)
+                parquet | duckdb | duckdb-native)
                     DATA_SOURCE="$2"
                     ;;
                 *)
-                    echo "ERROR: --data-source must be 'parquet' or 'duckdb' (got: $2)"
+                    echo "ERROR: --data-source must be 'parquet', 'duckdb', or 'duckdb-native' (got: $2)"
                     exit 1
                     ;;
             esac
@@ -372,26 +380,38 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 case "$PINNING_MODE" in
-    none|per-query) ;;
+    none|per-query|pinned-hot) ;;
     *)
-        echo "ERROR: --pinning-mode must be 'none' or 'per-query' (got: $PINNING_MODE)"
+        echo "ERROR: --pinning-mode must be 'none', 'per-query', or 'pinned-hot' (got: $PINNING_MODE)"
         exit 1
         ;;
 esac
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb] [--parquet-dir <path>] [--duckdb-file <path>]"
+    echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb|duckdb-native] [--parquet-dir <path>] [--duckdb-file <path>]"
     echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>]"
-    echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query]"
+    echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot]"
     echo "          [--float-tolerance <value>] <scale_factor>"
     echo "       $0 --report [--float-tolerance <value>] <run_dir>"
-    echo "  --data-source parquet  (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
-    echo "  --data-source duckdb             → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file"
+    echo "  --data-source parquet       (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
+    echo "  --data-source duckdb                  → run_tpch_duckdb.sh + performance_test.duckdb or --duckdb-file (GPU-native scan — the default for sirius)"
+    echo "  --data-source duckdb-native           → alias of 'duckdb' (GPU-native scan is the default now; kept for compatibility)"
     echo "Example: $0 --config ~/.sirius/sirius.yaml --engines sirius --iterations 3 --timeout 120 1000"
     echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
     echo "         $0 --multi-session --engines duckdb 100            # run DuckDB with fresh process per query"
     echo "         $0 --data-source duckdb --duckdb-file ./performance_test.duckdb 1"
+    echo "         $0 --data-source duckdb-native --duckdb-file ./test_datasets/tpch_sf1.duckdb 1"
     echo "         $0 --multi-session --drop-os-cache --engines sirius 1000  # cold-run with OS cache drops"
+    exit 1
+fi
+
+if [ "$PINNING_MODE" != "none" ] && is_duckdb_source; then
+    echo "ERROR: --pinning-mode is parquet-only; do not combine it with --data-source $DATA_SOURCE."
+    exit 1
+fi
+
+if [ "$PINNING_MODE" = "pinned-hot" ] && [ "$MULTI_SESSION" = true ]; then
+    echo "ERROR: --pinning-mode pinned-hot requires single-session mode; remove --multi-session."
     exit 1
 fi
 
@@ -453,7 +473,7 @@ fi
 
 RUN_INFO_FILE="$RUN_DIR/run_info.txt"
 
-if [ "$DATA_SOURCE" = "duckdb" ]; then
+if is_duckdb_source; then
     RUN_SCRIPT="$SCRIPT_DIR/run_tpch_duckdb.sh"
     if [ ! -f "$RUN_SCRIPT" ]; then
         echo "ERROR: DuckDB run script not found: $RUN_SCRIPT"
@@ -476,7 +496,7 @@ fi
 
 echo "Scale factor: SF${SF}   Iterations: ${NUM_ITERATIONS} (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 echo "Data source: $DATA_SOURCE   Run script: $(basename "$RUN_SCRIPT")"
-if [ "$DATA_SOURCE" = "duckdb" ]; then
+if is_duckdb_source; then
     echo "DuckDB file: $DUCKDB_FILE"
 else
     echo "Parquet dir: $PARQUET_DIR"
@@ -519,7 +539,7 @@ echo "=== Collecting run info and filesystem benchmark ==="
 
     echo "--- Benchmark input ---"
     echo "data_source: $DATA_SOURCE"
-    if [ "$DATA_SOURCE" = "duckdb" ]; then
+    if is_duckdb_source; then
         echo "duckdb_file: $DUCKDB_FILE"
     else
         echo "parquet_dir: $PARQUET_DIR"
@@ -593,7 +613,7 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo ""
 
     echo "--- Filesystem benchmark (read-only, input location) ---"
-    if [ "$DATA_SOURCE" = "duckdb" ]; then
+    if is_duckdb_source; then
         if [ -f "$DUCKDB_FILE" ]; then
             SIZE_BYTES=$(stat -c %s "$DUCKDB_FILE" 2>/dev/null || stat -f %z "$DUCKDB_FILE" 2>/dev/null)
             SIZE_MB=$((SIZE_BYTES / 1048576))
@@ -659,7 +679,10 @@ for engine in $ENGINES; do
     echo ""
     echo "=== Running $engine ==="
     EXTRA_ARGS=()
-    if [ "$DATA_SOURCE" = "duckdb" ]; then
+    if is_duckdb_source; then
+        # Both duckdb and duckdb-native route the sirius engine's seq_scan to the
+        # GPU-native scan (the only seq_scan path); the duckdb engine stays an
+        # unaffected CPU baseline for validation.
         EXTRA_ARGS+=(--duckdb-file "$DUCKDB_FILE")
     elif [ -n "${PARQUET_DIR:-}" ]; then
         EXTRA_ARGS+=(--parquet-dir "$PARQUET_DIR")

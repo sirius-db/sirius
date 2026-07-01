@@ -45,6 +45,7 @@ CLAUDE.local.md
 newplan.md
 telemetry_data/
 log/
+.ai-helper/
 
 .planning/
 
@@ -53,3 +54,4 @@ log/
 /test/cpp/integration/s3/fixtures/local/
 /test/cpp/integration/s3/fixtures/generated/
 /test/cpp/integration/s3/certs/
+*.local.md

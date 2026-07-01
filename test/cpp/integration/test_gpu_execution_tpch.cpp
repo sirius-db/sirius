@@ -312,6 +312,25 @@ class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
   }
+
+  // // Disabled: these tests scan native (DuckDB-storage) tables via seq_scan. The
+  // // legacy duckdb_scan path was removed and GPU native scan has no IO backend
+  // // wired in this harness ("missing io_ctx, io_obj"), so every query throws
+  // // "Unsupported scan function: seq_scan" and poisons the shared integration
+  // // DB. Shadow the comparison helpers to skip until native scan is supported.
+  // void compare_gpu_vs_cpu(const std::string& /*query*/,
+  //                         std::optional<float> /*float_tolerance*/ = std::nullopt)
+  // {
+  //   WARN("duckdb-native tpch scan skipped — legacy duckdb_scan path removed");
+  // }
+
+  // bool compare_gpu_vs_cpu_for(int /*num_gpus*/,
+  //                             const std::string& /*query*/,
+  //                             std::optional<float> /*float_tolerance*/ = std::nullopt)
+  // {
+  //   WARN("duckdb-native tpch scan skipped — legacy duckdb_scan path removed");
+  //   return false;  // RUN_TPCH_MGPU returns out of the test on false
+  // }
 };
 
 /**
@@ -1610,6 +1629,40 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select n.n_name from nation n semi join customer c "
     "on n.n_nationkey = c.c_nationkey;");
+}
+
+//===----------------------------------------------------------------------===//
+// MARK join tests (issue #921: BUILD_PROBE mode for MARK join)
+//
+// `OR` combined with `IN (subquery)`, and `IN (subquery)` projected as a value,
+// both lower to a HASH_JOIN with "Join Type: MARK" in DuckDB. A large probe
+// (orders, 150k) over a small build/filter subquery (customer subset) drives the
+// planner into BUILD_PROBE, where one cudf::filtered_join is built on the right
+// (filter) side and reused across the streamed left probe batches.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - mark join via OR + IN subquery parquet",
+                 "[integration][gpu_execution][parquet][markjoin]")
+{
+  // OR forces the IN membership to be materialized as a MARK join rather than a
+  // semi join; the customer subset is the small build side.
+  compare_gpu_vs_cpu(
+    "select count(*) as n from orders "
+    "where o_orderkey < 0 "
+    "   or o_custkey in (select c_custkey from customer where c_nationkey < 3);");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - mark join via projected IN subquery parquet",
+                 "[integration][gpu_execution][parquet][markjoin]")
+{
+  // Projecting the IN result as a boolean value produces a MARK join; grouping on
+  // the mark exercises both the matched (true) and unmatched (false) partitions.
+  compare_gpu_vs_cpu(
+    "select (o_custkey in (select c_custkey from customer where c_nationkey < 3)) as is_member, "
+    "       count(*) as n "
+    "from orders group by 1 order by 1;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -2944,6 +2997,68 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "[integration][gpu_execution][parquet][order_by][order_by_types]")
 {
   compare_gpu_vs_cpu("select n_nationkey, n_name from nation order by n_nationkey;");
+}
+
+//===----------------------------------------------------------------------===//
+// String concat tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat || operator parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, l_returnflag || '-' || l_linestatus FROM lineitem ORDER BY l_orderkey "
+    "LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat() function parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, concat(l_returnflag, l_linestatus) FROM lineitem ORDER BY l_orderkey LIMIT "
+    "100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat column with longer varchar parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT p_partkey, p_brand || ': ' || p_type FROM part ORDER BY p_partkey LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat in WHERE clause parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey FROM lineitem WHERE l_returnflag || l_linestatus = 'NF' ORDER BY l_orderkey "
+    "LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat with nested expression parquet",
+                 "[integration][gpu_execution][parquet][string_concat]")
+{
+  // ORDER BY l_orderkey, l_linenumber for a deterministic primary-key sort —
+  // l_orderkey alone is non-unique in lineitem so LIMIT would pick different rows on GPU vs CPU.
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, substring(l_comment, 1, 5) || '...' FROM lineitem "
+    "ORDER BY l_orderkey, l_linenumber LIMIT 100;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - string concat NULL propagation parquet",
+                 "[integration][gpu_execution][parquet][string_concat][nulls]")
+{
+  // TPC-H has no nullable VARCHAR columns; introduce nulls via CASE so that
+  // concat's null-propagation semantics (any NULL input → NULL output) are exercised.
+  compare_gpu_vs_cpu(
+    "SELECT l_orderkey, "
+    "  CASE WHEN l_orderkey % 7 = 0 THEN NULL ELSE l_returnflag END || '-' || l_linestatus "
+    "FROM lineitem ORDER BY l_orderkey, l_linenumber LIMIT 100;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -4568,6 +4683,77 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
 
   auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+// duckdb-native pin: pin a table in the attached tpch .db (format='duckdb',
+// table='lineitem'), then a SELECT over the same table must be served from the
+// pinned cache (matched by DataTable* identity), bypassing the native scan.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - pin_table duckdb-native gpu tier scan and aggregate",
+                 "[integration][gpu_execution][duckdb_native][pin_table_duckdb]")
+{
+  auto pin_query  = std::string("CALL pin_table(format='duckdb', name='lineitem', tier='gpu');");
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+    "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+// duckdb-native host-tier pin: same as above but the pinned columns live in
+// pinned host memory; the cached host batches are sliced + served on hit.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - pin_table duckdb-native host tier scan and aggregate",
+                 "[integration][gpu_execution][duckdb_native][pin_table_duckdb_host]")
+{
+  auto pin_query  = std::string("CALL pin_table(format='duckdb', name='lineitem', tier='host');");
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+    "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+// Pin a column subset (cols=[...]) and then run a query that requests a strict
+// subset of those pinned columns — it must be served from the cache. A miss would
+// fall through to the separate (non-cached) scan path, so a passing run also
+// confirms the cache hit; compare_gpu_vs_cpu validates the served data.
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - pin_table column subset serves a subset query",
+                 "[integration][gpu_execution][parquet][pin_table_cols_subset]")
+{
+  auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+  auto pin_query   = "CALL pin_table('" + parquet_dir.string() +
+                   "/lineitem.parquet', tier='gpu', name='lineitem_subset', "
+                   "cols=['l_orderkey', 'l_returnflag', 'l_linestatus', 'l_quantity']);";
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  // Requests only l_returnflag, l_linestatus, l_quantity — a strict subset of the
+  // pinned columns (l_orderkey is pinned but unused here).
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
+    "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem_subset');");
   REQUIRE(unpin_result);
   REQUIRE_FALSE(unpin_result->HasError());
 }

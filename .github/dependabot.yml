@@ -5,3 +5,10 @@ updates:
     directory: /
     schedule:
       interval: daily
+
+  - package-ecosystem: cargo
+    directories:
+      - /rust
+      - /experimental/starrocks
+    schedule:
+      interval: daily
