@@ -113,6 +113,23 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
+
+// Read the per-session `enable_duckdb_fallback` setting (default true).  Mirrors
+// how `gpu_execution` is read via ClientContext::TryGetCurrentSetting, so a
+// `SET enable_duckdb_fallback = false` stays scoped to the connection that
+// issued it instead of leaking through a process-global to every other
+// connection (and, across a test binary, to every later test case).  The
+// AddExtensionOption registration already stores the value per-context; only the
+// read had been going through the global static.
+bool duckdb_fallback_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_duckdb_fallback", setting) && !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  return true;
+}
+
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
                                                         const string& query,
@@ -589,7 +606,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   } catch (std::exception& e) {
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
-    if (Config::ENABLE_DUCKDB_FALLBACK) {
+    if (duckdb_fallback_enabled(context)) {
       result->plan_error         = true;
       result->plan_error_message = error.RawMessage();
     } else {
@@ -627,7 +644,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
-        if (Config::ENABLE_DUCKDB_FALLBACK) {
+        if (duckdb_fallback_enabled(context)) {
           SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
@@ -1418,10 +1435,15 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
 
-static void SetEnableDuckdbFallback(ClientContext& context, SetScope scope, Value& parameter)
+static void SetEnableDuckdbFallback(ClientContext& /*context*/,
+                                    SetScope /*scope*/,
+                                    Value& /*parameter*/)
 {
-  Config::ENABLE_DUCKDB_FALLBACK = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DUCKDB_FALLBACK to {}", Config::ENABLE_DUCKDB_FALLBACK);
+  // No process-global mirror is kept.  DuckDB stores the value per-context and it
+  // is read via duckdb_fallback_enabled() -> ClientContext::TryGetCurrentSetting,
+  // so `SET enable_duckdb_fallback = ...` on one connection stays scoped to that
+  // connection instead of leaking to every other connection (and, across the test
+  // binary, to later test cases that create their own database).
 }
 
 static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value& parameter)
@@ -1633,7 +1655,9 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "enable_duckdb_fallback",
     "Whether to enable fallback to duckdb execution after an error is detected",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_DUCKDB_FALLBACK),
+    Value::BOOLEAN(true),  // literal default: never seed from a process-global that a
+                           // prior connection's SET may have mutated (that leaked the
+                           // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
   // Add in config options for special JIT implementation for regex
