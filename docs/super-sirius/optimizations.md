@@ -43,6 +43,16 @@ num_partitions = max(1, total_bytes / hash_partition_bytes)
 
 **Config:** `max_sort_partition_bytes` (default: auto, 33% of GPU memory)
 
+### SORT_SAMPLE Byte-Based Merge Sampling (PRs #876, #886)
+
+**Motivation:** Multi-partition sorting samples batches to compute partition boundaries. A fixed sample batch count does not scale with variable batch sizes, single-batch task input contradicted the multi-batch sample the hint waited for, and concatenating + fully re-sorting the sample wasted work because upstream ORDER_BY already emits locally sorted batches. Scheduling boundary computation with a CAS election also let losing tasks waste GPU work.
+
+**Mechanism:** `sirius_physical_sort_sample` overrides `get_next_task_input_data()` so the boundary task receives the full multi-batch sample the hint waited for. Sampling is byte-based: it pulls batches until `sort_sample_bytes` is reached (or upstream finishes), then merges the already-sorted sample batches with `gpu_merge_impl::merge_order_by` and computes boundaries from the merged run — no concatenate-and-full-sort. Boundary scheduling uses an explicit `NOT_DONE -> SCHEDULED -> DONE` state machine: `get_next_task_input_data()` claims the sample and moves to `SCHEDULED`, `get_next_task_hint()` returns `nullopt` while `SCHEDULED` so no duplicate boundary task is created, `execute()` moves to `DONE`, and OOM resets to `NOT_DONE` for retry. After boundaries are computed the operator falls back to single-batch passthrough.
+
+**Code path:** `src/op/sirius_physical_sort_sample.cpp` — `get_next_task_input_data()`, `get_next_task_hint()`, `execute()`; `src/pipeline/sirius_pipeline_converter.cpp` — wiring `sort_sample_bytes` into SORT_SAMPLE
+
+**Config:** `sort_sample_bytes` (default: 512 MB), settable via YAML and the `sort_sample_bytes` SET option
+
 ## Operator-Level Optimizations
 
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
@@ -106,6 +116,31 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 Only the entries needing evaluation are handed to the executor (its `std::vector<sirius::ast::node const*>` constructor), so passthrough columns are never materialized.
 
 **Code path:** `src/op/sirius_physical_projection.cpp` — `execute()`; `src/include/data/data_batch_utils.hpp` — `make_data_batch_from_view()`; `src/include/expression_executor/gpu_expression_executor.hpp` — subset constructor.
+
+### Adaptive MARK Join Build Side (PR #924)
+
+**Motivation:** Equality-only MARK joins build the hash table on the right (filter) side and probe with the left. When the right (probe) side is much larger than the left (output) side, building on the smaller left side is faster.
+
+**Mechanism:** `sirius_physical_hash_join` keeps both paths and picks the one that hashes the smaller side, producing identical output (all left rows plus a BOOL8 mark column):
+- `cudf::filtered_join` builds on the right and returns probe-side (left) match indices — used when the right side is not much larger than the left.
+- `cudf::mark_join` builds on the left and returns build-side (left) indices — used when `right_rows >= mark_join_build_switch_ratio * left_rows`.
+
+Both feed the same `resolve_mark_join_result()`, which scatters the match indices into the BOOL8 mark column, so only the hashed side changes. Setting the ratio to `0` disables the switch and always builds on the right.
+
+**Code path:** `src/op/sirius_physical_hash_join.cpp` — `make_left_mark_join()`, `make_right_filtered_join_ptr()`, `resolve_mark_join_result()`, and the ratio gate in the MARK branch
+
+**Config:** `mark_join_build_switch_ratio` (default: 8.0; `0` disables), settable via YAML and the `mark_join_build_switch_ratio` SET option
+
+### Projection Folding (PR #909)
+
+**Motivation:** Building a Sirius physical plan from DuckDB's logical plan inserts PROJECTION operators that DuckDB's optimizer never sees — for filter `projection_map` reordering, hoisted aggregate child/filter expressions, table-scan filter columns, and the user's SELECT list. Each PROJECTION is a full GPU pipeline stage that runs `gpu_expression_executor` over every batch and materializes an intermediate batch, so stacked projections evaluate expressions more than once.
+
+**Mechanism:** All planner projection creation goes through `push_projection()`, and a single `fold_adjacent_projections()` pass over the finished plan tree collapses any `PROJECTION -> PROJECTION` chain into one projection. Folding composes the two select lists with the AST helpers `visit_references()` (find which child outputs the outer list reads) and `substitute_references()` (rewrite outer references in terms of the inner projection's expressions), so the merged projection produces the same columns in one expression-evaluation stage.
+
+**Code path:**
+- `src/planner/sirius_plan_projection_utils.cpp` — `push_projection()`, `fold_adjacent_projections()`
+- `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
+- `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
 
 ## Memory Optimizations
 
@@ -179,24 +214,6 @@ Data is moved from GPU to HOST tier via converter registry.
 
 ## Scan Optimizations
 
-### Scan Output Caching (PR #340)
-
-**Motivation:** Repeated queries on the same data waste time re-scanning from storage.
-
-**Mechanism:** Four caching levels:
-- `NONE` — no caching
-- `PARQUET` — cache raw compressed Parquet bytes in host memory
-- `TABLE_HOST` — cache decoded table in host memory
-- `TABLE_GPU` — cache decoded table in GPU memory (fastest warm runs)
-
-Query hash matching detects cache hits. On cache hit (PRELOAD mode), data is loaded from cache with shallow cloning for zero-copy sharing.
-
-**Code path:**
-- `src/include/op/scan/config.hpp` — `cache_level` enum
-- `src/op/scan/duckdb_scan_executor.cpp` — cache/preload logic
-
-**Config:** `scan_cache_level` SET variable
-
 ### Row Group Pruning with Filter Pushdown (PR #363)
 
 **Motivation:** Scanning all row groups wastes I/O bandwidth when filter predicates can eliminate entire groups.
@@ -210,7 +227,7 @@ If translation fails, filtering falls back to `gpu_expression_executor` on the d
 
 **Code path:**
 - `src/op/scan/scan_utils.cpp` — `convert_table_filters_to_expression()`, `filter_row_groups_with_stats()`
-- `src/op/scan/parquet_scan_task.cpp` — filter integration in global state initialization
+- `src/op/scan/parquet_gpu_ingestible.cpp` — filter translation + row-group pruning in the per-file metadata task
 
 ### Batch Coalescing for Small Files (PR #503)
 
@@ -226,22 +243,22 @@ If translation fails, filtering falls back to `gpu_expression_executor` on the d
 
 **Motivation:** Synchronous metadata parsing on the GPU pipeline thread blocks all pipeline tasks until file footers are read, AST filters are translated, and row-group partitions are computed.
 
-**Mechanism:** A dedicated `sirius_scan_manager` runs alongside the GPU executors and owns a thread pool that drives one `split_provider` per parquet scan operator. The provider parses footers (up to 8 files per task by default), translates AST filters, prunes row groups, and pushes `parquet_scan_data` splits into a per-operator `split_connector`. The GPU scan operator's `get_next_task_input_data()` blocks on the connector and returns each split as it arrives, so consumer scheduling is decoupled from production order. Providers are started sequentially in plan order so per-query memory pressure stays bounded.
+**Mechanism:** A dedicated `sirius_scan_manager` runs alongside the GPU executors and owns a thread pool that drives a `split_provider` per GPU scan operator. Each provider composes the format's `gpu_ingestible`, which parses footers (one file per metadata task), translates AST filters, and prunes row groups; a per-query sequencer coalesces the parsed metadata into splits and pushes them into each operator's `split_connector`. The GPU scan operator's `get_next_task_input_data()` blocks on the connector and returns each split as it arrives, so consumer scheduling is decoupled from production order. Metadata tasks run on the shared pool so per-query memory pressure stays bounded.
 
 **Code path:**
-- `src/scan_manager/sirius_scan_manager.cpp` — manager thread pool, provider registry, sequential driver loop
-- `src/scan_manager/parquet_split_provider.cpp` — metadata parsing, AST filter translation, row-group bundling
-- `src/scan_manager/split_connector.cpp` — blocking queue between provider and operator
+- `src/scan_manager/sirius_scan_manager.cpp` — manager thread pool, provider registry, per-query sequencer
+- `src/op/scan/parquet_gpu_ingestible.cpp` — footer parsing, AST filter translation, row-group pruning
+- `src/scan_manager/split_connector.cpp` — blocking queue between the sequencer and the operator
 
 ### Multifile Parquet Splits (PR #738)
 
 **Motivation:** Many small parquet files each yielding a tiny GPU batch causes per-task scheduling and kernel-launch overhead to dominate scan throughput.
 
-**Mechanism:** `parquet_split_provider` coalesces row-group slices from multiple parquet files into a single split when the bundled files share identical hive-partition values (so synthesized partition columns remain scalar). `accum.total_uncompressed_bytes` accumulates across files; a split is emitted once the total exceeds `approximate_batch_size` or partition values change. The downstream `cudf::io::read_parquet` reads from all bundled files in one invocation.
+**Mechanism:** The `parquet_batch_coalescer` coalesces row-group slices from multiple parquet files into a single split when the bundled files share identical hive-partition values (so synthesized partition columns remain scalar) and the same reader-pushdown decision. Decoded bytes accumulate across files; a split is emitted once the total reaches `approximate_batch_size` or partition values change. The downstream `cudf::io::read_parquet` reads from all bundled slices in one invocation.
 
-**Code path:** `src/scan_manager/parquet_split_provider.cpp` — `run_batch()` accumulator
+**Code path:** `src/op/scan/parquet_gpu_ingestible.cpp` — `parquet_batch_coalescer`
 
-**Config:** `scan_task_batch_size` (default: 512 MB) is forwarded as `approximate_batch_size` to the provider.
+**Config:** `scan_task_batch_size` (default: 512 MB) is forwarded as `approximate_batch_size` to the coalescer.
 
 ### Sirius IO + Prefetching Cache (PR #675)
 
@@ -251,20 +268,81 @@ If translation fails, filtering falls back to `gpu_expression_executor` on the d
 
 **Code path:**
 - `src/io/sirius_datasource.cpp` — `cudf::io::datasource` implementation
-- `src/io/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
+- `src/io/cache/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
 - `src/io/uring/uring_reactor.cpp` — io_uring backend reactor
-- `src/io/admission_control.cpp` — RAII budget enforcement
+- `src/exec/admission_control.cpp` — RAII budget enforcement
 
-### Skip File I/O from Cache (PR #455)
+### DuckDB-Native Scan Metadata Walk (PRs #868, #895, #936, #900)
 
-**Motivation:** Cached Parquet data should avoid redundant file I/O.
+**Motivation:** The DuckDB-native GPU scan's per-row-group metadata walk dominates cold-query runtime at small scale factors. It issues roughly one cold block read per (row group × projected column), and the original walk both read metadata for every column and parsed DuckDB's stringified `GetColumnSegmentInfo` output, which builds and re-parses compression / column-path / `statistics.ToString()` blobs.
 
-**Mechanism:** `prefetched_data_source` implements `cudf::io::datasource`:
-- `cache_ranges` coalesces adjacent byte ranges from cached Parquet files
-- `host_read()` satisfies reads from cache via `get_ranges()`, falling back to file I/O only on cache miss
-- `device_read()` uses `cudaMemcpyBatchAsync()` (CUDA 13+) for efficient multi-span H2D copies with NUMA/device locality hints
-- Tracks `bytes_read_from_cache` vs `bytes_read_from_fallback` for monitoring
+**Mechanism:** The walk is structured for minimal, parallel, typed metadata access with statistics pruning:
+1. **Projected-column-only, typed walk (#868, #936):** `walk_duckdb_native_row_group_range()` walks the DuckDB segment trees directly for only the projected columns, reading typed `block_id` / compression / row counts / validity-child / max-string-length per segment instead of calling `GetColumnSegmentInfo` and re-parsing strings.
+2. **Stats pruning (#900):** `prepare_duckdb_native_walk()` evaluates DuckDB's own `TableFilter::CheckStatistics` against each row group's per-column statistics and drops any row group a pushed-down filter proves `FILTER_ALWAYS_FALSE` before it is staged, copied to the GPU, or decoded; an all-pruned table routes to DuckDB CPU up front.
+3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into ranges of `SIRIUS_METADATA_PARSE_CHUNK` groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
 
 **Code path:**
-- `src/op/scan/cached_ranges.cpp` — byte range coalescing
-- `src/op/scan/prefetched_data_source.cpp` — cached datasource
+- `src/op/scan/duckdb_native_metadata.cpp` — `prepare_duckdb_native_walk()`, `walk_duckdb_native_row_group_range()`, `mark_row_groups_pruned_by_filter_stats()`
+- `src/op/scan/duckdb_native_gpu_ingestible.cpp` — parse-range slicing, per-range walk thunks, and the `duckdb_native_batch_coalescer`
+
+**Config:** `SIRIUS_METADATA_PARSE_CHUNK` (row groups per parallel parse range, default 8)
+
+### DuckDB-Native Async Coalesced Reads (PR #849)
+
+**Motivation:** The DuckDB-native decoder issues many small segment reads. Synchronous `host_read()` calls bypass the datasource backend in favor of direct `pread()`, serializing I/O and inflating the request count per split.
+
+**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `sirius_ioctx::host_read_ranges_async_io()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
+
+**Code path:** `src/op/scan/duckdb_native_decoder.cpp` — range coalescing and `host_read_ranges_async_io()` dispatch
+
+### Async S3 / REST Reactor Backend (PR #859)
+
+**Motivation:** A per-request serial S3 backend staged each chunk as GET → H2D copy → `cudaStreamSynchronize`, serializing the GPU stream once per chunk and leaving request latency unhidden — costly when the reader issues many small ranged reads over high-RTT links.
+
+**Mechanism:** The remote read path is an asynchronous, concurrent reactor that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend, so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into a bounded pinned host staging block, then `cudaMemcpyAsync` H2D, detecting completion by polling a per-chunk `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` chunks are in flight while host staging stays O(`max_connections`).
+
+**Code path:**
+- `src/io/rest/rest_reactor.cpp`, `src/io/rest/rest_ioctx.cpp` — async REST/S3 reactor over the shared `templated_ioctx` base
+- `src/include/io/templated_ioctx.hpp` — backend-agnostic async machinery shared with the io_uring path
+
+**Config:** `object_store` config (endpoint / region / credentials / signing mode) under `executor.scan_manager`
+
+### Zero-Copy from Pinned and Cached Tables (PR #881)
+
+**Motivation:** When scan input is an already-resident pinned/cached host table, copying the data again on consumption is wasted work.
+
+**Mechanism:** The pinned-table scan path moves host-pinned data to the GPU during prepare-for-processing (so the work is attributed correctly and bounded by the per-task reservation) and avoids copying out of cached tables when the batch can be consumed directly. A synchronization point after prepare-for-processing makes the prepare cost observable in logs and Quent.
+
+**Code path:**
+- `src/scan_manager/sirius_scan_manager.cpp` — cached-entry assignment (`try_assign_cached_entries`) and zero-copy resident-batch handoff
+- `src/pipeline/gpu_pipeline_task.cpp` — prepare-for-processing synchronization
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — resident (cached) input path
+
+### Partial-Read Prefetching Cache (PR #997)
+
+**Motivation:** A read often overlaps the cache only partially. Treating a partial overlap as a miss re-reads bytes already pinned in the cache, and a prefetch-only cache never warms itself from ordinary reads.
+
+**Mechanism:** The prefetching cache is chunk-granular (a fixed chunk size backed by a cuCascade pinned pool) and serves partial reads from cache while populating the cache on read, OS-page-cache style:
+- On `device_read_async`, cached chunks are copied straight to the device buffer; the remaining chunks complete the read using pinned chunks in the cache. When the backend supports host-to-device reads, the coverage policy is `partial` so only the uncached chunks hit the backend.
+- A read whose chunks are not yet cached can populate those chunk buffers as it reads (interior chunks are cached; block-aligned partial head/tail boundary chunks are read through an internal bounce slot and not cached), so a subsequent read of the same range is a hit.
+- Chunk readiness uses a packed atomic state machine; admission control caps concurrent in-flight chunks and a tiered-LRU evictor returns chunks to the pool. Asynchronous results are delivered through the `exec::semi_future` primitive, which can be waited on or connected to an executor callback.
+
+**Code path:**
+- `src/io/cache/prefetching_cache.cpp` — `device_read_async()`, partial-read + populate-on-read, evictor
+- `src/io/io_context.cpp` — `sirius_ioctx` cache integration and coverage policy
+- `src/include/exec/semi_future.hpp` — async I/O completion primitive
+
+**Config:** `enable_prefetch_cache` and the `cache` sub-config under `executor.scan_manager`
+
+### Load-Balanced Scan Batch Coalescing (PR #997)
+
+**Motivation:** Scan splits arrive sized by metadata-parse completion rather than by the configured batch size, so batches could come out smaller than requested, and multi-GPU runs need scan inputs spread across devices. Opportunistic prefetch hints issued in metadata-completion order also rob the head-of-line pipeline of lead time.
+
+**Mechanism:** The scan manager owns a `load_balancing_scan_batch_coalescer`. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. A single sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
+
+**Code path:**
+- `src/scan_manager/load_balancing_scan_batch_coalescer.cpp` — per-pipeline slots, sequencer loop, coalesce + place + push
+- `src/include/scan_manager/balancing_strategy.hpp`, `src/scan_manager/round_robin_strategy.cpp` — device-distribution interface and default
+- `src/include/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
+
+**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and reactor counts
