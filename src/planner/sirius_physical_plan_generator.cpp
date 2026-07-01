@@ -34,7 +34,7 @@ namespace sirius::planner {
 
 namespace {
 /// Read the dynamic-filter-pushdown enable flag from the active SiriusContext config. Defaults to
-/// enabled when the state is unavailable (preserves behavior outside a configured query).
+/// disabled when the state is unavailable (no config to consult outside a configured query).
 bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
 {
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
