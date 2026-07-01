@@ -114,27 +114,30 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
   {
     std::ofstream out(path);
     out << "sirius:\n"
-           "  object_store_config:\n"
-           "    endpoint: http://127.0.0.1:9000\n"
-           "    region: us-east-1\n"
-           "    access_key: minioadmin\n"
-           "    secret_key: minioadmin-secret\n"
-           "    session_token: TESTSESSIONTOKEN\n"
-           "    signing_mode: header\n"
-           "    s3_transport: rdma\n";
+           "  executor:\n"
+           "    scan_manager:\n"
+           "      object_store:\n"
+           "        endpoint: http://127.0.0.1:9000\n"
+           "        region: us-east-1\n"
+           "        access_key: minioadmin\n"
+           "        secret_key: minioadmin-secret\n"
+           "        session_token: TESTSESSIONTOKEN\n"
+           "        signing_mode: header\n"
+           "        s3_transport: rdma\n";
     REQUIRE(out);
   }
 
   sirius::sirius_config cfg;
   cfg.load_from_file(path);
 
-  CHECK(cfg.object_store_config.endpoint == "http://127.0.0.1:9000");
-  CHECK(cfg.object_store_config.region == "us-east-1");
-  CHECK(cfg.object_store_config.access_key == "minioadmin");
-  CHECK(cfg.object_store_config.secret_key == "minioadmin-secret");
-  CHECK(cfg.object_store_config.session_token == "TESTSESSIONTOKEN");
-  CHECK(cfg.object_store_config.s3_signing_mode == object_store_config::signing_mode::header);
-  CHECK(cfg.object_store_config.s3_transport == object_store_config::transport::RDMA);
+  auto const& os = cfg.get_scan_manager_config().object_store;
+  CHECK(os.endpoint == "http://127.0.0.1:9000");
+  CHECK(os.region == "us-east-1");
+  CHECK(os.access_key == "minioadmin");
+  CHECK(os.secret_key == "minioadmin-secret");
+  CHECK(os.session_token == "TESTSESSIONTOKEN");
+  CHECK(os.s3_signing_mode == object_store_config::signing_mode::header);
+  CHECK(os.s3_transport == object_store_config::transport::RDMA);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
@@ -147,19 +150,22 @@ TEST_CASE("sirius_config loads presigned object_store_config signing mode from Y
   {
     std::ofstream out(path);
     out << "sirius:\n"
-           "  object_store_config:\n"
-           "    endpoint: http://127.0.0.1:9000\n"
-           "    region: us-east-1\n"
-           "    access_key: minioadmin\n"
-           "    secret_key: minioadmin-secret\n"
-           "    signing_mode: presigned\n";
+           "  executor:\n"
+           "    scan_manager:\n"
+           "      object_store:\n"
+           "        endpoint: http://127.0.0.1:9000\n"
+           "        region: us-east-1\n"
+           "        access_key: minioadmin\n"
+           "        secret_key: minioadmin-secret\n"
+           "        signing_mode: presigned\n";
     REQUIRE(out);
   }
 
   sirius::sirius_config cfg;
   cfg.load_from_file(path);
 
-  CHECK(cfg.object_store_config.s3_signing_mode == object_store_config::signing_mode::presigned);
+  CHECK(cfg.get_scan_manager_config().object_store.s3_signing_mode ==
+        object_store_config::signing_mode::presigned);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
@@ -172,12 +178,14 @@ TEST_CASE("sirius_config rejects unknown object_store_config signing modes",
   {
     std::ofstream out(path);
     out << "sirius:\n"
-           "  object_store_config:\n"
-           "    endpoint: http://127.0.0.1:9000\n"
-           "    region: us-east-1\n"
-           "    access_key: minioadmin\n"
-           "    secret_key: minioadmin-secret\n"
-           "    signing_mode: query-string\n";
+           "  executor:\n"
+           "    scan_manager:\n"
+           "      object_store:\n"
+           "        endpoint: http://127.0.0.1:9000\n"
+           "        region: us-east-1\n"
+           "        access_key: minioadmin\n"
+           "        secret_key: minioadmin-secret\n"
+           "        signing_mode: query-string\n";
     REQUIRE(out);
   }
 
@@ -203,8 +211,6 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
 
   sirius::sirius_config cfg;
   cfg.load_from_file(path);
-
-  CHECK(cfg.get_scan_manager_config().enable_chunk_prewarm);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

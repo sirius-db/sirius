@@ -47,8 +47,11 @@ use tracing::{debug, info, instrument, warn};
 mod brpc;
 mod compute_node_service;
 mod file_schema;
+mod fragment_executor;
 mod proto;
 mod prpc;
+mod result_encoder;
+mod result_store;
 
 pub use brpc::BrpcServer;
 

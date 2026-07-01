@@ -44,6 +44,7 @@
 #include "helper/logical_type.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/null_mask.hpp>
 #include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
@@ -51,6 +52,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
@@ -60,6 +62,8 @@
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/types/value.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -79,6 +83,68 @@ inline int GetCudfDecimalTypeSize(const cudf::data_type& type)
   if (type.id() == cudf::type_id::DECIMAL128) { return sizeof(__int128_t); }
   throw internal_exception("Non decimal cudf type called in GetCudfDecimalTypeSize: " +
                            std::to_string(static_cast<int>(type.id())));
+}
+
+/**
+ * @brief Estimate the device-memory footprint of a subset of an input table's columns.
+ *
+ * cuDF exposes an exact allocation size only for an *owned* column/table
+ * (`cudf::column::alloc_size`), not for a `column_view`. So when we only hold views into a
+ * subset of a table (e.g. the zero-copy passthrough columns of a projection) we estimate:
+ *   - Fixed-width columns (numeric/temporal/decimal/bool): counted exactly as
+ *     `size * size_of(type)` plus the validity bitmask when nullable.
+ *   - Variable-width columns (STRING/LIST/STRUCT/...): their true size is not derivable from a
+ *     view, so each is attributed the *average* variable-width column size — computed by
+ *     subtracting the exact fixed-width total from the whole-table @p total_input_bytes and
+ *     dividing by the number of variable-width columns.
+ *
+ * Duplicate indices are counted once (the same device buffers back every reference to a column).
+ *
+ * @param input              The full input table_view (provides per-column type, nullability,
+ * rows).
+ * @param referenced_indices Indices into @p input of the columns to size (duplicates ignored).
+ * @param total_input_bytes  Total allocated size of the whole input (e.g. `get_size_in_bytes()`).
+ * @return Estimated bytes occupied by the distinct referenced columns.
+ */
+inline std::size_t estimate_referenced_column_bytes(
+  const cudf::table_view& input,
+  const std::vector<cudf::size_type>& referenced_indices,
+  std::size_t total_input_bytes)
+{
+  auto const fixed_width_bytes = [](const cudf::column_view& col) -> std::size_t {
+    std::size_t bytes = static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
+    if (col.nullable()) { bytes += cudf::bitmask_allocation_size_bytes(col.size()); }
+    return bytes;
+  };
+
+  // Split the whole input into fixed-width (exactly sizable) vs. variable-width columns.
+  std::size_t fixed_total  = 0;
+  std::size_t num_variable = 0;
+  for (const auto& col : input) {
+    if (cudf::is_fixed_width(col.type())) {
+      fixed_total += fixed_width_bytes(col);
+    } else {
+      ++num_variable;
+    }
+  }
+
+  // Whatever the fixed-width columns don't account for belongs to the variable-width columns;
+  // spread it evenly across them as the per-column average.
+  std::size_t const variable_total =
+    (total_input_bytes > fixed_total) ? (total_input_bytes - fixed_total) : 0;
+  std::size_t const avg_variable = (num_variable > 0) ? variable_total / num_variable : 0;
+
+  // Count each distinct referenced column once.
+  std::vector<cudf::size_type> distinct(referenced_indices.begin(), referenced_indices.end());
+  std::sort(distinct.begin(), distinct.end());
+  distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+
+  std::size_t estimate = 0;
+  for (auto const idx : distinct) {
+    const auto& col = input.column(idx);
+    estimate += cudf::is_fixed_width(col.type()) ? fixed_width_bytes(col) : avg_variable;
+  }
+  return estimate;
 }
 
 /**
