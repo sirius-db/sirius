@@ -18,7 +18,7 @@
 
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
+#include "expression_evaluator/expression_evaluator.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -63,7 +63,7 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   const auto& input         = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
-  sirius::gpu_expression_executor gpu_expression_executor(
+  sirius::expression_evaluator evaluator(
     *expression, cudf::get_current_device_resource_ref(), stream);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
@@ -75,9 +75,9 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
       [&](const auto& indices) {
         using IndicesType = std::decay_t<decltype(indices)>;
         if constexpr (std::is_same_v<IndicesType, passthrough>) {
-          return gpu_expression_executor.select(view);
+          return evaluator.select(view);
         } else {
-          return gpu_expression_executor.select(view, indices);
+          return evaluator.select(view, indices);
         }
       },
       output_columns);

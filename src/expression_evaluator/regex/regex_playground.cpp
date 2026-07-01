@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "expression_executor/regex/regex_playground.hpp"
+#include "expression_evaluator/regex/regex_playground.hpp"
 
 namespace sirius {
 namespace regex {

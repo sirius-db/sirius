@@ -97,18 +97,7 @@ pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
-# cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
-# as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
-# in the vcpkg installed lib dir, which isn't on the default linker search path.
-# Create an imported target so CMake resolves the bare name to the full path
-# instead of emitting -lnuma.
-if(VCPKG_BUILD)
-  add_library(numa STATIC IMPORTED)
-  set_target_properties(
-    numa
-    PROPERTIES IMPORTED_LOCATION
-               "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libnuma.a")
-endif()
+# cuCascade - GPU Memory Reservation Library (submodule)
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
@@ -196,20 +185,20 @@ set(EXTENSION_SOURCES
     src/expression/join_condition.cpp
     src/expression/to_duckdb.cpp
     src/expression/value.cpp
-    src/expression_executor/expression_executor_strategy.cpp
-    src/expression_executor/ast_op_counter.cpp
-    src/expression_executor/gpu_expression_executor.cpp
-    src/expression_executor/gpu_expression_translator.cpp
-    src/expression_executor/regex/regex_playground.cpp
-    src/expression_executor/specializations/gpu_execute_between.cpp
-    src/expression_executor/specializations/gpu_execute_case.cpp
-    src/expression_executor/specializations/gpu_execute_cast.cpp
-    src/expression_executor/specializations/gpu_execute_comparison.cpp
-    src/expression_executor/specializations/gpu_execute_conjunction.cpp
-    src/expression_executor/specializations/gpu_execute_constant.cpp
-    src/expression_executor/specializations/gpu_execute_function.cpp
-    src/expression_executor/specializations/gpu_execute_operator.cpp
-    src/expression_executor/specializations/gpu_execute_reference.cpp
+    src/expression_evaluator/expression_evaluator_strategy.cpp
+    src/expression_evaluator/ast_op_counter.cpp
+    src/expression_evaluator/expression_evaluator.cpp
+    src/expression_evaluator/gpu_expression_translator.cpp
+    src/expression_evaluator/regex/regex_playground.cpp
+    src/expression_evaluator/specializations/between.cpp
+    src/expression_evaluator/specializations/case.cpp
+    src/expression_evaluator/specializations/cast.cpp
+    src/expression_evaluator/specializations/comparison.cpp
+    src/expression_evaluator/specializations/conjunction.cpp
+    src/expression_evaluator/specializations/constant.cpp
+    src/expression_evaluator/specializations/function.cpp
+    src/expression_evaluator/specializations/operator.cpp
+    src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
@@ -452,14 +441,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(
-  sirius_extension
-  PkgConfig::NUMA
-  PkgConfig::LIBURING
-  PkgConfig::CURL
-  OpenSSL::Crypto
-  yaml-cpp::yaml-cpp
-  absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
+                      PkgConfig::CURL OpenSSL::Crypto absl::any_invocable)
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto)
@@ -549,10 +532,10 @@ set(TEST_SOURCES
     test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
-    test/cpp/expression_executor/test_gpu_expression_executor.cpp
-    test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
-    test/cpp/expression_executor/test_gpu_expression_translator.cpp
-    test/cpp/expression_executor/test_nonduckdb_frontend_proof.cpp
+    test/cpp/expression_evaluator/test_expression_evaluator.cpp
+    test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
+    test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
+    test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp

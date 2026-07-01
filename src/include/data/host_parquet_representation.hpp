@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <op/scan/hive_partition.hpp>  // For partition_inject_fn_t
 
 // cucascade

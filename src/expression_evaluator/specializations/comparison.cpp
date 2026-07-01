@@ -17,7 +17,7 @@
 // sirius
 #include <expression/ast/node.hpp>
 #include <expression/join_condition.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
@@ -34,7 +34,7 @@
 #include <memory>
 
 namespace sirius {
-using execute_result = gpu_expression_executor::execute_result;
+using evaluate_result = expression_evaluator::evaluate_result;
 
 namespace {
 
@@ -51,7 +51,8 @@ cudf::ast::ast_operator comparison_op_to_ast(sirius::comparison_type op)
     case sirius::comparison_type::not_distinct_from: return cudf::ast::ast_operator::NULL_EQUAL;
     default:
       throw invalid_input_exception(
-        "[expression_executor:comparison] Unrecognized comparison type : {}", static_cast<int>(op));
+        "[expression_evaluator:comparison] Unrecognized comparison type : {}",
+        static_cast<int>(op));
   }
 }
 
@@ -68,20 +69,21 @@ cudf::binary_operator comparison_op_to_binary(sirius::comparison_type op)
     case sirius::comparison_type::not_distinct_from: return cudf::binary_operator::NULL_EQUALS;
     default:
       throw invalid_input_exception(
-        "[expression_executor:comparison] Unrecognized comparison type : {}", static_cast<int>(op));
+        "[expression_evaluator:comparison] Unrecognized comparison type : {}",
+        static_cast<int>(op));
   }
 }
 
 }  // namespace
 
-execute_result gpu_expression_executor::execute(sirius::ast::comparison const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& alt,
+                                               evaluation_mode mode)
 {
   auto const ast_op_count = alt.cudf_ast_op_count();
-  if (_strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
-    auto left             = execute(*alt.left, execution_mode::AST);
-    auto right            = execute(*alt.right, execution_mode::AST);
+  if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
+      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
+    auto left             = evaluate(*alt.left, evaluation_mode::AST);
+    auto right            = evaluate(*alt.right, evaluation_mode::AST);
     auto const& comp_expr = _ast_tree.emplace<cudf::ast::operation>(
       comparison_op_to_ast(alt.op), left.get_expr(), right.get_expr());
     // DISTINCT_FROM is semantically equivalent to NOT(NULL_EQUAL())
@@ -91,29 +93,29 @@ execute_result gpu_expression_executor::execute(sirius::ast::comparison const& a
         : comp_expr;
 
     //===----------1: AST Mode----------===//
-    if (mode == execution_mode::AST) {
-      return execute_result(
+    if (mode == evaluation_mode::AST) {
+      return evaluate_result(
         ast_result(final_comp_expr,
                    {left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
                    {left.get_temp_column_indices(), right.get_temp_column_indices()}));
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    auto result_column = execute_ast(final_comp_expr);
+    auto result_column = evaluate_ast(final_comp_expr);
 
     release_temporaries({left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
                         {left.get_temp_column_indices(), right.get_temp_column_indices()});
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
-  if (mode == execution_mode::AST) {
-    auto result = execute(alt, execution_mode::MATERIALIZE);
+  if (mode == evaluation_mode::AST) {
+    auto result = evaluate(alt, evaluation_mode::MATERIALIZE);
     return materialize_as_ast_column(result.release_column());
   }
 
-  auto left  = execute(*alt.left, execution_mode::MATERIALIZE);
-  auto right = execute(*alt.right, execution_mode::MATERIALIZE);
+  auto left  = evaluate(*alt.left, evaluation_mode::MATERIALIZE);
+  auto right = evaluate(*alt.right, evaluation_mode::MATERIALIZE);
   // Comparison ops always return BOOLEAN — no logical_type on the AST node, so use BOOL8 directly.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
   auto const binary_op   = comparison_op_to_binary(alt.op);
@@ -129,6 +131,6 @@ execute_result gpu_expression_executor::execute(sirius::ast::comparison const& a
     result_column = cudf::binary_operation(
       left.get_column_view(), right.get_column_view(), binary_op, output_type, _stream, _mr);
   }
-  return execute_result(std::move(result_column));
+  return evaluate_result(std::move(result_column));
 }
 }  // namespace sirius

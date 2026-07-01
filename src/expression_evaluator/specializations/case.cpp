@@ -17,7 +17,7 @@
 // sirius
 #include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
 // cudf
@@ -30,10 +30,10 @@
 #include <ranges>
 
 namespace sirius {
-using execute_result = gpu_expression_executor::execute_result;
+using evaluate_result = expression_evaluator::evaluate_result;
 
-execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt,
+                                               evaluation_mode mode)
 {
   //===----------MATERIALIZE (AST breaker)----------===//
   // CASE cannot be represented as a cudf AST operation, so we always materialize it. If the caller
@@ -41,8 +41,8 @@ execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& al
   // parent's AST tree can reference.
   std::unique_ptr<cudf::column> output;
 
-  // First, execute the ELSE
-  auto current_result = execute(*alt.else_, execution_mode::MATERIALIZE);
+  // First, evaluate the ELSE
+  auto current_result = evaluate(*alt.else_, evaluation_mode::MATERIALIZE);
 
   // Iterate in reverse so the THEN of the first true WHEN is copied to the
   // output column last (overwrites any later match). SQL CASE semantics:
@@ -51,7 +51,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& al
 
   for (auto const& case_check : std::views::reverse(alt.cases)) {
     // Execute the WHEN expression to get a boolean array intermediate.
-    auto current_mask = execute(*case_check.when_, execution_mode::MATERIALIZE);
+    auto current_mask = evaluate(*case_check.when_, evaluation_mode::MATERIALIZE);
 
     // Check for the implicit error() function that DuckDB inserts as a CASE THEN.
     if (case_check.then_->holds<sirius::ast::function_call>() &&
@@ -73,14 +73,14 @@ execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& al
       }
       if (throw_error) {
         throw internal_exception(
-          "[gpu_expression_executor:case]: More than one row returned by a subquery used as an "
+          "[expression_evaluator:case]: More than one row returned by a subquery used as an "
           "expression.");
       }
       continue;
     }
 
-    // Otherwise, execute the THEN and selectively copy to the output.
-    auto current_then = execute(*case_check.then_, execution_mode::MATERIALIZE);
+    // Otherwise, evaluate the THEN and selectively copy to the output.
+    auto current_then = evaluate(*case_check.then_, evaluation_mode::MATERIALIZE);
     if (current_result.is_scalar()) {
       // This can only possibly happen when i = num_checks - 1
       if (current_then.is_scalar()) {
@@ -109,14 +109,14 @@ execute_result gpu_expression_executor::execute(sirius::ast::case_expr const& al
                                   _stream,
                                   _mr);
     }
-    current_result = execute_result(std::move(output));
+    current_result = evaluate_result(std::move(output));
   }
-  if (mode == execution_mode::AST) {
+  if (mode == evaluation_mode::AST) {
     // The caller wants an AST node.
     // Since at least one copy_if_else has been executed, current_result must have an owned column.
     if (!current_result.is_owned_column()) {
       throw internal_exception(
-        "[gpu_expression_executor:case]: Expected an owned column after executing CASE "
+        "[expression_evaluator:case]: Expected an owned column after executing CASE "
         "expression.");
     }
     return materialize_as_ast_column(std::move(current_result.release_column()));
