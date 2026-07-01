@@ -312,9 +312,14 @@ For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrato
 `nsys_report.sh` orchestrates profiling + analysis + report packaging into a self-contained report directory with human-readable markdown, machine-readable JSON, and all raw artifacts.
 
 ```bash
-# Profile and generate report
+# Profile and generate report (parquet source, default)
 ./test/tpch_performance/nsys_report.sh --sf 300_rg2m
 ./test/tpch_performance/nsys_report.sh --sf 100 --iterations 4 1 3 6 10
+
+# DuckDB-native source: --data-source duckdb (defaults to test_datasets/tpch_sf<SF>.duckdb,
+# or pass --duckdb-file). Forwards --data-source to performance_test.py --mode nsys-profile.
+./test/tpch_performance/nsys_report.sh --sf 10 --data-source duckdb 1 3 6
+./test/tpch_performance/nsys_report.sh --data-source duckdb --duckdb-file ./test_datasets/tpch_sf10.duckdb --sf 10
 
 # Report from existing profiles
 ./test/tpch_performance/nsys_report.sh --profile-dir /path/to/nsys_profiles/sf300/
