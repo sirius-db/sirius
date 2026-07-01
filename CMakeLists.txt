@@ -97,18 +97,7 @@ pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
-# cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
-# as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
-# in the vcpkg installed lib dir, which isn't on the default linker search path.
-# Create an imported target so CMake resolves the bare name to the full path
-# instead of emitting -lnuma.
-if(VCPKG_BUILD)
-  add_library(numa STATIC IMPORTED)
-  set_target_properties(
-    numa
-    PROPERTIES IMPORTED_LOCATION
-               "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libnuma.a")
-endif()
+# cuCascade - GPU Memory Reservation Library (submodule)
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
@@ -452,14 +441,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(
-  sirius_extension
-  PkgConfig::NUMA
-  PkgConfig::LIBURING
-  PkgConfig::CURL
-  OpenSSL::Crypto
-  yaml-cpp::yaml-cpp
-  absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
+                      PkgConfig::CURL OpenSSL::Crypto absl::any_invocable)
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto)
