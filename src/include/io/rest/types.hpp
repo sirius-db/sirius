@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -88,6 +89,19 @@ struct rest_chunked_rx_request {
   std::unique_ptr<device_cpy_request> cpy_req;
   std::shared_ptr<request_manager> manager;
 
+  // Set by submit() once this (originally null-buffer) device read has been
+  // staged through a pinned bounce slot (set_data).  Recorded explicitly because
+  // set_data makes chunk.is_buffer_allocated() true, so finish() can no longer
+  // infer bounce-staging from the chunk itself; it must consult this flag to
+  // take the event-synchronized recycle path (see needs_event_for_synchronization).
+  bool staged_through_bounce{false};
+
+  // perf (set only when the reactor's perf_instrumentation is on): t_enqueue at
+  // queue insertion, t_submit at dequeue onto a connection; their delta is the
+  // queue_wait sample (attempt 0 only), and t_submit anchors the chunk_get span.
+  std::chrono::steady_clock::time_point t_enqueue{};
+  std::chrono::steady_clock::time_point t_submit{};
+
   /// True iff this read's bytes must be host->device copied after landing.
   [[nodiscard]] bool is_device() const noexcept { return cpy_req != nullptr; }
 
@@ -100,11 +114,15 @@ struct rest_chunked_rx_request {
   }
 
   /// True iff the H2D copy must be synchronized through a CUDA event: it stages
-  /// through a reactor-owned bounce slot (null destination) that can only be
-  /// recycled once the copy off it has completed.
+  /// through a reactor-owned bounce slot that can only be recycled once the copy
+  /// off it has completed.  Keys off @c staged_through_bounce rather than
+  /// chunk.is_buffer_allocated(), because submit() sets the chunk's data to the
+  /// bounce (set_data) *before* finish() evaluates this — reading the chunk
+  /// would report "already buffered" and wrongly skip the event/park path,
+  /// letting the slot (and its bounce) be recycled while the copy still drains.
   [[nodiscard]] bool needs_event_for_synchronization() const noexcept
   {
-    return !chunk.is_buffer_allocated() && cpy_req != nullptr;
+    return staged_through_bounce && cpy_req != nullptr;
   }
 };
 

@@ -18,6 +18,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <catch.hpp>
 #include <io/rest/rest_reactor.hpp>
 #include <io/rest/types.hpp>
@@ -30,6 +32,7 @@
 #include <vector>
 
 using cudf::io::text::byte_range_info;
+using sirius::io::device_cpy_request;
 using sirius::io::io_object_segment;
 using sirius::io::rest::rest_chunked_rx_request;
 using sirius::io::rest::rest_io_object;
@@ -344,9 +347,11 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
       auto const& cp = c.cpy_req->copies[i];
       CHECK(reinterpret_cast<uintptr_t>(cp.dst) == kDst + i * 100);
       CHECK(reinterpret_cast<uintptr_t>(cp.src) == bufs[i]);  // absolute per-buffer src
+      CHECK(cp.src_off == 0);
       CHECK(cp.size == 100);
     }
   }
+
   SECTION("partial device window clips each buffer's copy")
   {
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
@@ -359,19 +364,23 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
     auto chunks   = req->get_all_chunks();
     auto const& c = *chunks[0];
     REQUIRE(c.cpy_req->copies.size() == 3);
-    // buffer0 file [0,100) ∩ [50,250) = [50,100)
+    // buffer0 file [0,100) intersects [50,250) as [50,100)
     CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[0].src) == kB0 + 50);
+    CHECK(c.cpy_req->copies[0].src_off == 0);
     CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[0].dst) == kDst + 0);
     CHECK(c.cpy_req->copies[0].size == 50);
     // buffer1 file [100,200) fully inside -> [100,200)
     CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[1].src) == kB1);
+    CHECK(c.cpy_req->copies[1].src_off == 0);
     CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[1].dst) == kDst + 50);
     CHECK(c.cpy_req->copies[1].size == 100);
-    // buffer2 file [200,300) ∩ [50,250) = [200,250)
+    // buffer2 file [200,300) intersects [50,250) as [200,250)
     CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[2].src) == kB2);
+    CHECK(c.cpy_req->copies[2].src_off == 0);
     CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[2].dst) == kDst + 150);
     CHECK(c.cpy_req->copies[2].size == 50);
   }
+
   SECTION("max_n_chunks caps the fused buffers per chunk")
   {
     cfg.max_n_chunks = 2;
@@ -382,6 +391,7 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
       cfg, file, segs, fake_ptr(kDst), 0, 300, rmm::cuda_stream_view{}, 0);
     REQUIRE(req->size() == 2);  // [0,200) over 2 buffers, then [200,300)
   }
+
   SECTION("non-contiguous buffers stay separate single-copy chunks")
   {
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
@@ -395,4 +405,121 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
       REQUIRE(cp->cpy_req->copies.size() == 1);
     }
   }
+}
+
+TEST_CASE("prep_host_to_device keeps null-buffer segments as standalone bounce-staged chunks",
+          "[rest]")
+{
+  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kDst = 0x100000;
+  constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000;
+
+  SECTION("real-null-real neighbors are not fused across the null segment")
+  {
+    std::vector<io_object_segment> segs{io_object_segment{100, 100, fake_ptr(kB0)},
+                                        io_object_segment{200, 100, nullptr},
+                                        io_object_segment{300, 100, fake_ptr(kB1)}};
+    // Device window [150, 380): clips the first and last real buffers while the
+    // null-buffer gap is staged later through a reactor-owned bounce slot.
+    auto req = rest_reactor::prep_host_to_device_rx_request(
+      cfg, file, segs, fake_ptr(kDst), /*offset=*/150, /*size=*/230, rmm::cuda_stream_view{}, 0);
+
+    auto chunks = req->get_all_chunks();
+    REQUIRE(chunks.size() == 3);
+    for (auto const& chunk : chunks) {
+      CHECK(chunk->is_device());
+      CHECK(chunk->chunk.n_chunks() == 1);
+      REQUIRE(chunk->cpy_req != nullptr);
+      REQUIRE(chunk->cpy_req->copies.size() == 1);
+    }
+
+    auto const& first = chunks[0]->cpy_req->copies[0];
+    CHECK(chunks[0]->chunk.offset == 100);
+    CHECK(chunks[0]->chunk.size == 100);
+    CHECK(reinterpret_cast<uintptr_t>(first.dst) == kDst);
+    CHECK(reinterpret_cast<uintptr_t>(first.src) == kB0 + 50);
+    CHECK(first.src_off == 0);
+    CHECK(first.size == 50);
+
+    auto const& gap = chunks[1]->cpy_req->copies[0];
+    CHECK(chunks[1]->chunk.offset == 200);
+    CHECK(chunks[1]->chunk.size == 100);
+    CHECK(chunks[1]->chunk.data() == nullptr);
+    CHECK(gap.dst == fake_ptr(kDst + 50));
+    CHECK(gap.src == nullptr);
+    CHECK(gap.src_off == 0);
+    CHECK(gap.size == 100);
+
+    auto const& last = chunks[2]->cpy_req->copies[0];
+    CHECK(chunks[2]->chunk.offset == 300);
+    CHECK(chunks[2]->chunk.size == 100);
+    CHECK(reinterpret_cast<uintptr_t>(last.dst) == kDst + 150);
+    CHECK(reinterpret_cast<uintptr_t>(last.src) == kB1);
+    CHECK(last.src_off == 0);
+    CHECK(last.size == 80);
+  }
+
+  SECTION("adjacent null-buffer segments are not fused")
+  {
+    std::vector<io_object_segment> segs{io_object_segment{100, 100, nullptr},
+                                        io_object_segment{200, 100, nullptr}};
+    // Device window [125, 275): the first null-buffer chunk starts 25 bytes into
+    // its future bounce slot, proving the copy carries a src_off instead of a
+    // near-null absolute pointer.
+    auto req = rest_reactor::prep_host_to_device_rx_request(
+      cfg, file, segs, fake_ptr(kDst), /*offset=*/125, /*size=*/150, rmm::cuda_stream_view{}, 0);
+
+    auto chunks = req->get_all_chunks();
+    REQUIRE(chunks.size() == 2);
+    for (auto const& chunk : chunks) {
+      CHECK(chunk->is_device());
+      CHECK(chunk->chunk.n_chunks() == 1);
+      CHECK(chunk->chunk.data() == nullptr);
+      REQUIRE(chunk->cpy_req != nullptr);
+      REQUIRE(chunk->cpy_req->copies.size() == 1);
+      CHECK(chunk->cpy_req->copies[0].src == nullptr);
+    }
+
+    CHECK(chunks[0]->chunk.offset == 100);
+    CHECK(chunks[0]->chunk.size == 100);
+    CHECK(chunks[0]->cpy_req->copies[0].dst == fake_ptr(kDst));
+    CHECK(chunks[0]->cpy_req->copies[0].src_off == 25);
+    CHECK(chunks[0]->cpy_req->copies[0].size == 75);
+
+    CHECK(chunks[1]->chunk.offset == 200);
+    CHECK(chunks[1]->chunk.size == 100);
+    CHECK(chunks[1]->cpy_req->copies[0].dst == fake_ptr(kDst + 75));
+    CHECK(chunks[1]->cpy_req->copies[0].src_off == 0);
+    CHECK(chunks[1]->cpy_req->copies[0].size == 75);
+  }
+}
+
+TEST_CASE("device_cpy_request rejects null-derived host sources before cuda memcpy", "[rest][gpu]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping device_cpy_request CUDA guard: no CUDA device");
+    return;
+  }
+
+  device_cpy_request invalid;
+  invalid.stream    = rmm::cuda_stream_view{};
+  invalid.device_id = 0;
+  invalid.copies.push_back(device_cpy_request::copy{
+    /*dst=*/fake_ptr(0x100000), /*src=*/nullptr, /*src_off=*/4, /*size=*/4});
+  CHECK(invalid.copy_async(nullptr, 0) == cudaErrorInvalidValue);
+
+  std::array<uint8_t, 8> host{0, 1, 2, 3, 4, 5, 6, 7};
+  uint8_t* device_dst = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void**>(&device_dst), host.size()) == cudaSuccess);
+
+  device_cpy_request valid;
+  valid.stream    = rmm::cuda_stream_view{};
+  valid.device_id = 0;
+  valid.copies.push_back(device_cpy_request::copy{
+    /*dst=*/device_dst, /*src=*/nullptr, /*src_off=*/0, /*size=*/host.size()});
+  CHECK(valid.copy_async(host.data(), host.size()) == cudaSuccess);
+  CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  CHECK(cudaFree(device_dst) == cudaSuccess);
 }

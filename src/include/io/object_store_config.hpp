@@ -56,13 +56,6 @@ struct object_store_config {
   /// Verify the S3 endpoint's TLS certificate (peer + host). Default true;
   /// false disables verification — INSECURE, dev/test only.
   bool tls_verify = true;
-
-  /// Select the async (libcurl-multi) S3 backend. Default true: the datasource
-  /// factory builds @c s3_ioctx (concurrent GETs + pipelined
-  /// device reads). Set false to fall back to the blocking @c s3_blocking_ioctx (a
-  /// per-request, serial-staging path) — the escape hatch if the async backend
-  /// misbehaves against a particular store.
-  bool s3_use_async_backend = true;
 };
 
 inline bool string_to_enum(std::string_view sv, object_store_config::transport& t)

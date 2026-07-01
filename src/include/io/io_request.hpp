@@ -145,9 +145,7 @@ struct device_cpy_request {
 
   // Issue every copy on @p stream (a batch when there is more than one), then
   // record @p event once after the last so a single wait covers them all.
-  cudaError_t copy_async(uint8_t* host_buffer,
-                         [[maybe_unused]] size_t bytes,
-                         cudaEvent_t event = nullptr) noexcept
+  cudaError_t copy_async(uint8_t* host_buffer, size_t bytes, cudaEvent_t event = nullptr) noexcept
   {
     assert(host_buffer != nullptr && "Caller must provide a valid host buffer for the copy.");
     rmm::cuda_set_device_raii device_guard(rmm::cuda_device_id{device_id});
@@ -157,8 +155,24 @@ struct device_cpy_request {
              "Caller must provide a valid device destination buffer for the copy.");
       assert((c.src != nullptr || c.src_off + c.size <= bytes) &&
              "Caller must ensure the copy fits in the host buffer.");
-      uint8_t* src_ptr = c.src != nullptr ? c.src : host_buffer + c.src_off;
-      err              = cudaMemcpyAsync(c.dst, src_ptr, c.size, cudaMemcpyHostToDevice, stream);
+      // Resolve the host source.  The asserts above are compiled out in release,
+      // so validate *before* forming the pointer: for a bounce-staged copy
+      // (c.src == nullptr) the source is host_buffer + c.src_off, but a null
+      // host_buffer or an out-of-range [src_off, src_off + size) would otherwise
+      // produce UB (nullptr + offset) or a wild in-range pointer that the
+      // near-null check below cannot catch.  A null-buffer segment must reach
+      // here as c.src == nullptr, never as a non-null "nullptr + offset" pointer.
+      uint8_t* src_ptr = nullptr;
+      if (c.src != nullptr) {
+        src_ptr = c.src;
+      } else if (host_buffer != nullptr && c.src_off <= bytes && c.size <= bytes - c.src_off) {
+        src_ptr = host_buffer + c.src_off;
+      }
+      if (c.dst == nullptr || src_ptr == nullptr ||
+          reinterpret_cast<std::uintptr_t>(src_ptr) < 4096U) {
+        return cudaErrorInvalidValue;
+      }
+      err = cudaMemcpyAsync(c.dst, src_ptr, c.size, cudaMemcpyHostToDevice, stream);
       if (err != cudaSuccess) { return err; }
     }
     if (event != nullptr) { err = cudaEventRecord(event, stream); }

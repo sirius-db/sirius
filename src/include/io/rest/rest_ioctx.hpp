@@ -49,6 +49,11 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
+  /// Pool-aggregated perf counters: every reactor's snapshot summed (ns totals,
+  /// counts, retries, terminal, device-sync), maxes maxed, and ttfb the first
+  /// non-zero reactor value.  Lock-free; drives the s3-bench JSON baseline.
+  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
+
  protected:
   /// Backend hook invoked by @c sirius_ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.

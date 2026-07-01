@@ -268,11 +268,15 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
-  // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
-  // injection — needs column names. Matches parquet_split_provider's ctor invariant.
+  // Any non-trivial scan shape — reader-side projection (incl. a pruned/reordered
+  // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
+  // case), filter pushdown, or hive-partition injection — needs column names.
+  // Matches parquet_split_provider's ctor invariant and build_scan_plan's
+  // needs_reader_projection trigger.
   bool const needs_names = !bind.projection_ids.empty() ||
                            (bind.table_filters && !bind.table_filters->filters.empty()) ||
-                           !bind.partition_indices.empty();
+                           !bind.partition_indices.empty() ||
+                           column_ids_need_reader_projection(bind.column_ids, bind.names.size());
   if (needs_names && bind.names.empty()) {
     throw sirius::internal_exception(
       "[parquet_gpu_ingestible] Projection, filter pushdown, or hive partitions "
@@ -329,18 +333,22 @@ bool parquet_gpu_ingestible::has_processed_all_metadata() const
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
-  std::shared_ptr<io::sirius_ioctx> io_ctx)
+  io::ioctx_resolver resolve)
 {
-  if (io_ctx == nullptr) {
-    throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
-  }
+  if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
 
-  // One metadata-scan task per file. Row-group chunking and file bundling happen
-  // downstream in parquet_batch_coalescer.
-  return [this, file_path = _file_paths[idx], io_ctx = std::move(io_ctx)]()
-           -> std::unique_ptr<scan_info> { return build_file_scan_info(file_path, io_ctx); };
+  // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
+  // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
+  // per file; row-group chunking and file bundling happen downstream in
+  // parquet_batch_coalescer.
+  auto const& file_path = _file_paths[idx];
+  // The resolver returns a valid ioctx or throws if no backend supports the path.
+  auto io_ctx = resolve(file_path);
+  return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(file_path, io_ctx);
+  };
 }
 
 //===----------------------------------------------------------------------===//

@@ -25,8 +25,10 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -196,6 +198,52 @@ inline bool futex_wait_until(std::atomic<std::uint32_t>& atom,
 }
 
 // ---------------------------------------------------------------------------
+// Process-global count of raw FUTEX_WAKE syscalls issued by raw_futex_wake().
+// The raw wake is issued only to serve a parked timed waiter (wait_until), so
+// this is exposed for tests to assert the syscall is gated — i.e. not paid on
+// the common resolution where no timed waiter is parked.
+inline std::atomic<std::uint64_t>& raw_futex_wake_count() noexcept
+{
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+
+// ---------------------------------------------------------------------------
+// Wake threads parked in futex_wait_until() on @p atom.
+//
+// std::atomic::notify_*() routes through libstdc++'s internal waiter pool, which
+// does NOT wake a raw SYS_futex waiter on the atom's own address — and the timed
+// pull-wait (wait_until) uses exactly such a raw wait.  A resolution pairs its
+// notify_all() (which serves the untimed wait()) with this matching FUTEX_WAKE,
+// but only when a timed waiter is actually parked (see core::wake_timed_waiters
+// / core::wait_until); otherwise a timed waiter would sleep to its deadline even
+// though the result is already published.
+
+inline void raw_futex_wake(std::atomic<std::uint32_t>& atom) noexcept
+{
+  raw_futex_wake_count().fetch_add(1, std::memory_order_relaxed);
+#ifdef __linux__
+  static_assert(sizeof(std::atomic<std::uint32_t>) == sizeof(std::uint32_t),
+                "futex requires atomic<uint32_t> to have no overhead storage");
+  // Mirror of futex_wait_until's FUTEX_WAIT_BITSET (stable ABI constants).
+  constexpr unsigned futex_wake_bitset      = 10U;
+  constexpr unsigned futex_private_flag     = 128U;
+  constexpr unsigned futex_bitset_match_any = 0xFFFFFFFFU;
+  syscall(SYS_futex,
+          reinterpret_cast<std::uint32_t*>(&atom),
+          static_cast<int>(futex_wake_bitset | futex_private_flag),
+          std::numeric_limits<int>::max(),  // wake every parked waiter
+          nullptr,
+          nullptr,
+          futex_bitset_match_any);
+#else
+  // Non-Linux: the timed path is a spin-yield loop that polls the state word, so
+  // no explicit wake is required here.
+  (void)atom;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // core: the shared slot between promise and semi_future/future.
 //
 // Lock-free FSM with four states, one-shot:
@@ -238,6 +286,7 @@ class core {
       // Pull-mode consumer (if any) is woken; push-mode set_callback (if it
       // arrives later) will fire inline.
       _state.notify_all();
+      wake_timed_waiters();
       return;
     }
     // The only other valid prior state is has_callback: a callback was
@@ -283,8 +332,25 @@ class core {
       auto s = _state.load(std::memory_order_acquire);
       if (s == has_result || s == done) { return true; }
       if (std::chrono::steady_clock::now() >= deadline) { return false; }
+
+      // Register as a timed waiter before parking on the raw futex. The seq_cst
+      // fence pairs with the resolver's fence (wake_timed_waiters): in the total
+      // order either the resolver observes this increment and issues the raw
+      // wake, or its state store is ordered before the re-load below and we skip
+      // the park — so a resolution can never leave us parked past it (eventcount
+      // / Dekker). futex_wait_until additionally returns immediately (EAGAIN) if
+      // the state already moved off @c s, closing the store-before-park window.
+      _timed_waiters.fetch_add(1, std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      s = _state.load(std::memory_order_acquire);
+      if (s == has_result || s == done) {
+        _timed_waiters.fetch_sub(1, std::memory_order_relaxed);
+        return true;
+      }
       // Blocks until _state != s or deadline passes; no busy spinning.
-      if (!detail::futex_wait_until(_state, s, deadline)) { return false; }
+      bool changed = detail::futex_wait_until(_state, s, deadline);
+      _timed_waiters.fetch_sub(1, std::memory_order_relaxed);
+      if (!changed) { return false; }
     }
   }
 
@@ -309,9 +375,22 @@ class core {
     std::move(cb)(std::move(_try));
     _state.store(done, std::memory_order_release);
     _state.notify_all();
+    wake_timed_waiters();
+  }
+
+  // Issue the raw FUTEX_WAKE only when a timed waiter is parked. The seq_cst
+  // fence is ordered after the state store at the call site and pairs with
+  // wait_until's fence, so a registered timed waiter is always observed here.
+  void wake_timed_waiters() noexcept
+  {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (_timed_waiters.load(std::memory_order_relaxed) != 0) { detail::raw_futex_wake(_state); }
   }
 
   std::atomic<std::uint32_t> _state{empty};
+  // Threads currently parked (or about to park) in wait_until() on the raw
+  // futex; gates the raw FUTEX_WAKE at each resolution.
+  std::atomic<std::uint32_t> _timed_waiters{0};
   try_t<value_t> _try;
   callback _callback;
 };

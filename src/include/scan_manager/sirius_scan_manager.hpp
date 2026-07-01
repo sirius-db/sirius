@@ -42,6 +42,7 @@ class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -295,7 +296,7 @@ class sirius_scan_manager {
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path) const;
+    std::string_view path);
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
@@ -306,13 +307,27 @@ class sirius_scan_manager {
   ///        the disk-reading split_provider for this operator).
   bool try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op);
 
+  /// Resolve the ioctx that should serve @p path (normalized internally, so callers
+  /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
+  /// building it once per backend on first use.  Routes by path through the registry
+  /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
+  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
+  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
+
   scan_manager_config _config;
+  cucascade::memory::memory_reservation_manager& _reservation_manager;
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of
   /// the GPU id set fed to the round-robin scan-balancing strategy.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
+  /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
+  /// per type under the mutex; drained + torn down in the dtor.
+  std::mutex _routed_io_ctxs_mtx;
+  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
+    _routed_io_ctxs;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
