@@ -52,6 +52,7 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
     agg.retries_total += s.retries_total;
     agg.terminal_failures_total += s.terminal_failures_total;
     agg.device_stream_sync_total += s.device_stream_sync_total;
+    agg.payload_bytes_read_total += s.payload_bytes_read_total;
   }
   return agg;
 }

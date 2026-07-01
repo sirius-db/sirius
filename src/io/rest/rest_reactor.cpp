@@ -645,8 +645,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
         bool const bounce_staged = (b.iov_base == nullptr);
         cpy->copies.push_back(device_cpy_request::copy{
           /*dst=*/dst + (data_lo - offset),
-          /*src=*/bounce_staged ? nullptr
-                                : static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),
+          /*src=*/bounce_staged ? nullptr : static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),
           /*src_off=*/bounce_staged ? (data_lo - file_lo) : size_t{0},
           /*size=*/data_hi - data_lo});
       }
@@ -701,6 +700,7 @@ rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
   s.retries_total            = _perf.retries_total.load(std::memory_order_relaxed);
   s.terminal_failures_total  = _perf.terminal_failures_total.load(std::memory_order_relaxed);
   s.device_stream_sync_total = _perf.device_stream_sync_total.load(std::memory_order_relaxed);
+  s.payload_bytes_read_total = _perf.payload_bytes_read_total.load(std::memory_order_relaxed);
   return s;
 }
 
@@ -1166,8 +1166,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           continue;
         }
 
-        int const i             = tok.slot_index();
-        io_slot& s              = slots[static_cast<size_t>(i)];
+        int const i = tok.slot_index();
+        io_slot& s  = slots[static_cast<size_t>(i)];
         // A bounce-staged device read must re-bind to THIS slot's bounce on
         // every (re)submission.  A retried request still carries the previous
         // attempt's set_data (chunk.data() == that now-freed slot's bounce) and
@@ -1215,7 +1215,12 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     // `copying` (held until its H2D copy finishes); otherwise the caller
     // recycles the slot immediately.
     auto finish = [&](int i, CURLcode rc, long status) -> bool {
-      io_slot& s          = slots[static_cast<size_t>(i)];
+      io_slot& s = slots[static_cast<size_t>(i)];
+      // Always-on: credit the HTTP response body bytes this attempt received
+      // (write_to_sink already summed them in sink.total_received) BEFORE any
+      // success / retry / terminal branching, so a 503 -> retry -> 206 counts
+      // both bodies and short / failed reads are reflected in the byte budget.
+      _perf.payload_bytes_read_total.fetch_add(s.sink.total_received, std::memory_order_relaxed);
       auto& req           = *s.req;
       bool const ok_range = (status == 206) || (status == 200 && req.chunk.offset == 0);
       // A 206 must report, via Content-Range, that it delivered the exact range

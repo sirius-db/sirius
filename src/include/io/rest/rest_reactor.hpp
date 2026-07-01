@@ -82,8 +82,8 @@ class rest_io_object : public sirius_io_object {
 
 /// Plain-value perf counters read out of a reactor, or summed across the pool
 /// by @c rest_ioctx.  The ns totals/maxes and ttfb stay 0 unless the reactor's
-/// @c perf_instrumentation is on; retry / terminal / device-stream-sync counts
-/// are populated regardless.
+/// @c perf_instrumentation is on; retry / terminal / device-stream-sync and
+/// payload-bytes counts are populated regardless.
 struct rest_perf_snapshot {
   std::uint64_t chunk_get_ns_total{0};
   std::uint64_t chunk_get_count{0};
@@ -97,6 +97,10 @@ struct rest_perf_snapshot {
   std::uint64_t retries_total{0};
   std::uint64_t terminal_failures_total{0};
   std::uint64_t device_stream_sync_total{0};
+  // Always-on: HTTP response *body* bytes received (sink.total_received), summed
+  // over every completed curl attempt incl. retries / partial / failed bodies.
+  // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
+  std::uint64_t payload_bytes_read_total{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -269,7 +273,8 @@ class rest_reactor {
 
   // Instrumentation counters, owned by the reactor (not worker_loop locals) so
   // rest_ioctx can read them cross-thread.  Micro timings are stamped only under
-  // perf_instrumentation; retries/terminal/device_stream_sync are always-on.
+  // perf_instrumentation; retries/terminal/device_stream_sync/payload_bytes are
+  // always-on.
   struct perf_counters {
     std::atomic<std::uint64_t> chunk_get_ns_total{0};
     std::atomic<std::uint64_t> chunk_get_count{0};
@@ -283,6 +288,7 @@ class rest_reactor {
     std::atomic<std::uint64_t> retries_total{0};
     std::atomic<std::uint64_t> terminal_failures_total{0};
     std::atomic<std::uint64_t> device_stream_sync_total{0};
+    std::atomic<std::uint64_t> payload_bytes_read_total{0};
   };
   perf_counters _perf;
 
