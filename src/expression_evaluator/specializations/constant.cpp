@@ -17,7 +17,7 @@
 // sirius
 #include <expression/ast/node.hpp>
 #include <expression/value.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
 
@@ -39,33 +39,33 @@
 #include <variant>
 
 namespace {
-using execute_result = ::sirius::gpu_expression_executor::execute_result;
-using ast_node       = ::sirius::gpu_expression_executor::ast_result;
-using execution_mode = ::sirius::gpu_expression_executor::execution_mode;
+using evaluate_result = ::sirius::expression_evaluator::evaluate_result;
+using ast_node        = ::sirius::expression_evaluator::ast_result;
+using evaluation_mode = ::sirius::expression_evaluator::evaluation_mode;
 
 template <typename T>
-execute_result make_execute_result_from_scalar(
+evaluate_result make_evaluate_result_from_scalar(
   cudf::ast::tree& ast_tree,
   std::vector<std::unique_ptr<cudf::scalar>>& temp_scalars,
   T device_scalar,
-  execution_mode mode)
+  evaluation_mode mode)
 {
-  if (mode == execution_mode::AST) {
+  if (mode == evaluation_mode::AST) {
     auto const& expr_ref       = ast_tree.emplace<cudf::ast::literal>(*device_scalar);
     auto const temp_scalar_idx = temp_scalars.size();
     temp_scalars.push_back(std::move(device_scalar));
-    return execute_result(ast_node(expr_ref, {temp_scalar_idx}, std::vector<std::size_t>{}));
+    return evaluate_result(ast_node(expr_ref, {temp_scalar_idx}, std::vector<std::size_t>{}));
   }
-  return execute_result(std::move(device_scalar));
+  return evaluate_result(std::move(device_scalar));
 }
 
 }  // namespace
 
 namespace sirius {
-using execute_result = gpu_expression_executor::execute_result;
+using evaluate_result = expression_evaluator::evaluate_result;
 
-execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
+                                               evaluation_mode mode)
 {
   auto const cudf_type = sirius::get_cudf_type(alt.return_type);
   bool const is_valid  = !std::holds_alternative<sirius::null_value>(alt.payload);
@@ -74,57 +74,57 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
     case cudf::type_id::INT8: {
       auto scalar = std::make_unique<cudf::numeric_scalar<int8_t>>(
         is_valid ? std::get<int8_t>(alt.payload) : int8_t{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::INT16: {
       auto scalar = std::make_unique<cudf::numeric_scalar<int16_t>>(
         is_valid ? std::get<int16_t>(alt.payload) : int16_t{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::INT32: {
       auto scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
         is_valid ? std::get<int32_t>(alt.payload) : int32_t{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::INT64: {
       auto scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
         is_valid ? std::get<int64_t>(alt.payload) : int64_t{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::UINT8: {
       auto scalar = std::make_unique<cudf::numeric_scalar<uint8_t>>(
         is_valid ? std::get<uint8_t>(alt.payload) : uint8_t{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::UINT16: {
       auto scalar = std::make_unique<cudf::numeric_scalar<uint16_t>>(
         is_valid ? std::get<uint16_t>(alt.payload) : uint16_t{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::UINT32: {
       auto scalar = std::make_unique<cudf::numeric_scalar<uint32_t>>(
         is_valid ? std::get<uint32_t>(alt.payload) : uint32_t{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::UINT64: {
       auto scalar = std::make_unique<cudf::numeric_scalar<uint64_t>>(
         is_valid ? std::get<uint64_t>(alt.payload) : uint64_t{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::FLOAT32: {
       auto scalar = std::make_unique<cudf::numeric_scalar<float>>(
         is_valid ? std::get<float>(alt.payload) : float{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::FLOAT64: {
       auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
         is_valid ? std::get<double>(alt.payload) : double{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::BOOL8: {
       auto scalar = std::make_unique<cudf::numeric_scalar<bool>>(
         is_valid ? std::get<bool>(alt.payload) : false, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::TIMESTAMP_DAYS: {
       auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_D>>(
@@ -132,7 +132,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
         is_valid,
         _stream,
         _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::TIMESTAMP_SECONDS: {
       auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_s>>(
@@ -140,7 +140,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
         is_valid,
         _stream,
         _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::TIMESTAMP_MILLISECONDS: {
       auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_ms>>(
@@ -148,7 +148,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
         is_valid,
         _stream,
         _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::TIMESTAMP_MICROSECONDS: {
       auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_us>>(
@@ -156,7 +156,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
         is_valid,
         _stream,
         _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::TIMESTAMP_NANOSECONDS: {
       auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_ns>>(
@@ -164,7 +164,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
         is_valid,
         _stream,
         _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::DECIMAL32: {
       auto const scale =
@@ -173,7 +173,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
         is_valid ? std::get<sirius::decimal32>(alt.payload).value : numeric::decimal32::rep{};
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
         rep, scale, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::DECIMAL64: {
       auto const scale =
@@ -182,7 +182,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
         is_valid ? std::get<sirius::decimal64>(alt.payload).value : numeric::decimal64::rep{};
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
         rep, scale, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::DECIMAL128: {
       auto const scale =
@@ -191,15 +191,15 @@ execute_result gpu_expression_executor::execute(sirius::ast::constant const& alt
         is_valid ? std::get<sirius::decimal128>(alt.payload).value : __int128_t{};
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
         rep, scale, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     case cudf::type_id::STRING: {
       auto scalar = std::make_unique<cudf::string_scalar>(
         is_valid ? std::get<std::string>(alt.payload) : std::string{}, is_valid, _stream, _mr);
-      return make_execute_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return make_evaluate_result_from_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
     }
     default:
-      throw not_implemented_exception("[gpu_expression_executor] Unsupported scalar type: %s",
+      throw not_implemented_exception("[expression_evaluator] Unsupported scalar type: %s",
                                       alt.return_type.to_string());
   }
 }

@@ -18,9 +18,9 @@
 #include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
 #include <expression/value.hpp>
-#include <expression_executor/ast_supported_types.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/regex/regex_playground.hpp>
+#include <expression_evaluator/ast_supported_types.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/regex/regex_playground.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
 
@@ -50,10 +50,10 @@
 #include <variant>
 
 namespace sirius {
-using execute_result = gpu_expression_executor::execute_result;
+using evaluate_result = expression_evaluator::evaluate_result;
 
-execute_result gpu_expression_executor::execute(sirius::ast::function_call const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const& alt,
+                                               evaluation_mode mode)
 {
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
@@ -70,8 +70,8 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (ast_supported && _strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
+  if (ast_supported && _strategy != expression_evaluator_strategy::MATERIALIZE &&
+      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     // Only numeric binary functions are supported in AST currently.
     D_ASSERT(args.size() == 2);
 
@@ -85,37 +85,36 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
         case function_id::mod: return cudf::ast::ast_operator::MOD;
         default:
           throw invalid_input_exception(
-            "[gpu_expression_executor:function] unsupported AST function id {}",
-            static_cast<int>(id));
+            "[expression_evaluator:function] unsupported AST function id {}", static_cast<int>(id));
       }
     };
 
-    auto left             = execute(*args[0], execution_mode::AST);
-    auto right            = execute(*args[1], execution_mode::AST);
+    auto left             = evaluate(*args[0], evaluation_mode::AST);
+    auto right            = evaluate(*args[1], evaluation_mode::AST);
     auto const& func_expr = _ast_tree.emplace<cudf::ast::operation>(
       function_type_switch_ast(resolved_id), left.get_expr(), right.get_expr());
 
-    if (mode == execution_mode::AST) {
+    if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
-      return execute_result(
+      return evaluate_result(
         ast_result(func_expr,
                    {left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
                    {left.get_temp_column_indices(), right.get_temp_column_indices()}));
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    auto result_column = execute_ast(func_expr);
+    auto result_column = evaluate_ast(func_expr);
     release_temporaries({left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
                         {left.get_temp_column_indices(), right.get_temp_column_indices()});
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with solo operation----------===//
-  if (mode == execution_mode::AST) {
-    auto result = execute(alt, execution_mode::MATERIALIZE);
+  if (mode == evaluation_mode::AST) {
+    auto result = evaluate(alt, evaluation_mode::MATERIALIZE);
     if (!result.is_owned_column()) {
       throw internal_exception(
-        "[gpu_expression_executor:function]: Expected an owned column after executing function "
+        "[expression_evaluator:function]: Expected an owned column after executing function "
         "expression.");
     }
     return materialize_as_ast_column(std::move(result.release_column()));
@@ -123,19 +122,19 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
   auto const output_type = sirius::get_cudf_type(alt.return_type());
 
   //----------Numeric Binary Functions----------//
-  auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> execute_result {
-    auto left  = execute(*args[0], execution_mode::MATERIALIZE);
-    auto right = execute(*args[1], execution_mode::MATERIALIZE);
+  auto execute_numeric_binary_func = [&](cudf::binary_operator op) -> evaluate_result {
+    auto left  = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto right = evaluate(*args[1], evaluation_mode::MATERIALIZE);
     D_ASSERT(!left.is_scalar() || !right.is_scalar());  // Both sides cannot be scalars
     if (left.is_scalar()) {
-      return execute_result(cudf::binary_operation(
+      return evaluate_result(cudf::binary_operation(
         left.get_scalar(), right.get_column_view(), op, output_type, _stream, _mr));
     }
     if (right.is_scalar()) {
-      return execute_result(cudf::binary_operation(
+      return evaluate_result(cudf::binary_operation(
         left.get_column_view(), right.get_scalar(), op, output_type, _stream, _mr));
     }
-    return execute_result(cudf::binary_operation(
+    return evaluate_result(cudf::binary_operation(
       left.get_column_view(), right.get_column_view(), op, output_type, _stream, _mr));
   };
   if (resolved_id == function_id::add) {
@@ -156,7 +155,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
 
   //----------Substring Function----------//
   if (resolved_id == function_id::substring) {
-    auto input = execute(*args[0], execution_mode::MATERIALIZE);
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
 
     // DuckDB binds substring as (VARCHAR, BIGINT, BIGINT), so the start/len
     // children are BIGINT constants — the payload variant holds int64_t.
@@ -179,17 +178,17 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
                                    cudf::numeric_scalar<cudf::size_type>(1, true, _stream, _mr),
                                    _stream,
                                    _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //----------String Matching Functions----------//
-  auto setup_string_matching = [&]() -> std::pair<execute_result, std::string> {
+  auto setup_string_matching = [&]() -> std::pair<evaluate_result, std::string> {
     D_ASSERT(args.size() == 2);
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
 
-    auto input     = execute(*args[0], execution_mode::MATERIALIZE);
+    auto input     = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
-    return {execute_result(std::move(input)), std::move(match_str)};
+    return {evaluate_result(std::move(input)), std::move(match_str)};
   };
   if (resolved_id == function_id::like || resolved_id == function_id::not_like) {
     auto [input, match_str] = setup_string_matching();
@@ -202,7 +201,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
       result_column =
         cudf::unary_operation(result_column->view(), cudf::unary_operator::NOT, _stream, _mr);
     }
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
   if (resolved_id == function_id::contains) {
     auto [input, match_str] = setup_string_matching();
@@ -210,7 +209,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
                                                  cudf::string_scalar(match_str, true, _stream, _mr),
                                                  _stream,
                                                  _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
   if (resolved_id == function_id::prefix) {
     auto [input, match_str] = setup_string_matching();
@@ -219,7 +218,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
                                  cudf::string_scalar(match_str, true, _stream, _mr),
                                  _stream,
                                  _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
   if (resolved_id == function_id::suffix) {
     auto [input, match_str] = setup_string_matching();
@@ -228,17 +227,17 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
                                cudf::string_scalar(match_str, true, _stream, _mr),
                                _stream,
                                _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //----------DateTime Extraction Functions----------//
   auto execute_datetime_extract_func =
-    [&](cudf::datetime::datetime_component component) -> execute_result {
+    [&](cudf::datetime::datetime_component component) -> evaluate_result {
     D_ASSERT(args.size() == 1);
-    auto input = execute(*args[0], execution_mode::MATERIALIZE);
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto result_column =
       cudf::datetime::extract_datetime_component(input.get_column_view(), component, _stream, _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   };
   if (resolved_id == function_id::year) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::YEAR);
@@ -271,7 +270,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
     // The first child is the frequency, which should be a constant string
     D_ASSERT(args[0]->holds<sirius::ast::constant>());
     auto const& freq_str = std::get<std::string>(args[0]->get<sirius::ast::constant>().payload);
-    auto input           = execute(*args[1], execution_mode::MATERIALIZE);
+    auto input           = evaluate(*args[1], evaluation_mode::MATERIALIZE);
     D_ASSERT(!input.is_scalar());
 
     auto freq_string_switch =
@@ -290,23 +289,23 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
         return cudf::datetime::rounding_frequency::MICROSECOND;
       } else {
         throw invalid_input_exception(
-          "[gpu_expression_executor:function] unrecognized/unsupported date_trunc frequency: {}",
+          "[expression_evaluator:function] unrecognized/unsupported date_trunc frequency: {}",
           freq_str);
       }
     };
 
     auto result_column = cudf::datetime::floor_datetimes(
       input.get_column_view(), freq_string_switch(freq_str), _stream, _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //----------String Concatenation----------//
   if (resolved_id == function_id::concat) {
     // Evaluate every argument to a materialized column or scalar.
-    std::vector<execute_result> arg_results;
+    std::vector<evaluate_result> arg_results;
     arg_results.reserve(args.size());
     for (auto const& arg : args) {
-      arg_results.push_back(execute(*arg, execution_mode::MATERIALIZE));
+      arg_results.push_back(evaluate(*arg, evaluation_mode::MATERIALIZE));
     }
 
     // cudf::strings::concatenate takes a table_view — scalars must be expanded
@@ -336,23 +335,23 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
                                                      // separator logic runs
       _stream,
       _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //----------Unary Functions----------//
   if (resolved_id == function_id::strlen) {
     D_ASSERT(args.size() == 1);
-    auto input = execute(*args[0], execution_mode::MATERIALIZE);
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto result_column =
       cudf::strings::count_bytes(cudf::strings_column_view(input.get_column_view()), _stream, _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
   if (resolved_id == function_id::length) {
     D_ASSERT(args.size() == 1);
-    auto input         = execute(*args[0], execution_mode::MATERIALIZE);
+    auto input         = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto result_column = cudf::strings::count_characters(
       cudf::strings_column_view(input.get_column_view()), _stream, _mr);
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
   if (resolved_id == function_id::regexp_replace) {
     // The input should be <input column, pattern string scalar, replace string scalar>
@@ -360,7 +359,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
     D_ASSERT(args[2]->holds<sirius::ast::constant>());
 
-    auto input = execute(*args[0], execution_mode::MATERIALIZE);
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     D_ASSERT(!input.is_scalar());
 
     auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
@@ -398,7 +397,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
     D_ASSERT(!args.empty());
     std::vector<std::unique_ptr<cudf::column>> child_cols;
     for (const auto& a : args) {
-      auto result = execute(*a, execution_mode::MATERIALIZE);
+      auto result = evaluate(*a, evaluation_mode::MATERIALIZE);
       if (result.is_scalar()) {
         child_cols.push_back(cudf::make_column_from_scalar(
           result.get_scalar(), _input_table.num_rows(), _stream, _mr));
@@ -417,7 +416,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
   // handle it on the CPU.
   if (resolved_id == function_id::error) {
     throw not_implemented_exception(
-      "[gpu_expression_executor:function] error() is not dispatched on GPU; "
+      "[expression_evaluator:function] error() is not dispatched on GPU; "
       "expected to fall back to CPU execution");
   }
 
@@ -425,7 +424,7 @@ execute_result gpu_expression_executor::execute(sirius::ast::function_call const
   // dispatch arm above claimed it. This means an entry was added to
   // function_id without a corresponding GPU handler here.
   throw internal_exception(
-    "[gpu_expression_executor:function]: registered function_id has no GPU dispatch arm: id={}",
+    "[expression_evaluator:function]: registered function_id has no GPU dispatch arm: id={}",
     static_cast<int>(resolved_id));
 }
 

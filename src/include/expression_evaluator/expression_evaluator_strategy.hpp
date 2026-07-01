@@ -21,7 +21,7 @@
 namespace sirius {
 
 /**
- * @brief The expression_executor_strategy defines how the gpu_expression_executor executes.
+ * @brief The expression_evaluator_strategy defines how the expression_evaluator executes.
  * MATERIALIZE: Executes by materializing intermediate results as cudf::columns (every expression
  *              node is a single kernel).
  * AST_INTERPRET: Executes by constructing a cudf::ast::tree and interpreting it with cudf::compute
@@ -32,22 +32,22 @@ namespace sirius {
  * strategies build ASTs for as many nodes as they can before encountering AST breakers. The result
  * is a tree whose nodes are AST trees and whose edges are AST breakers.
  */
-enum class expression_executor_strategy {
+enum class expression_evaluator_strategy {
   MATERIALIZE,
   AST_INTERPRET,
   AST_JIT,
 };
 
 /**
- * @brief Parse a string into an expression_executor_strategy.
+ * @brief Parse a string into an expression_evaluator_strategy.
  * Accepts "materialize", "ast_interpret", "ast_jit".
  * @return true on success; false on unrecognized input.
  */
-bool string_to_strategy(std::string_view sv, expression_executor_strategy& out);
+bool string_to_strategy(std::string_view sv, expression_evaluator_strategy& out);
 
 /**
- * @brief Returns the canonical string representation of an expression_executor_strategy.
+ * @brief Returns the canonical string representation of an expression_evaluator_strategy.
  */
-std::string_view strategy_to_string(expression_executor_strategy s);
+std::string_view strategy_to_string(expression_evaluator_strategy s);
 
 }  // namespace sirius

@@ -19,7 +19,7 @@
 // sirius
 #include <config.hpp>
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
-#include <expression_executor/expression_executor_strategy.hpp>
+#include <expression_evaluator/expression_evaluator_strategy.hpp>
 
 // cucascades
 #include <cucascade/data/data_batch.hpp>
@@ -48,27 +48,27 @@ class Expression;
 namespace sirius {
 
 /**
- * @brief Returns the current default expression_executor_strategy configured via
- * `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
+ * @brief Returns the current default expression_evaluator_strategy configured via
+ * `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
  */
-inline expression_executor_strategy strategy_from_config()
+inline expression_evaluator_strategy strategy_from_config()
 {
-  return duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY;
+  return duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
 }
 
 /**
- * @brief The gpu_expression_executor is responsible for evaluating DuckDB expressions on the GPU
+ * @brief The expression_evaluator is responsible for evaluating DuckDB expressions on the GPU
  * using cuDF.
  *
  * It builds a tree of AST trees whose edges are 'AST breakers', i.e., expression
  * operations that don't have cuDF AST equivalents (e.g., LIKE, SUBSTRING, CASE, etc.). Each AST
  * tree is then interpreted or JIT-compiled with cuDF to produce the final result. If the
- * expression_executor_strategy is MATERIALIZE, the AST trees are single operators and revert to
+ * expression_evaluator_strategy is MATERIALIZE, the AST trees are single operators and revert to
  * direct unary/binary operators. To control how many nodes should be in an AST tree before we
- * execute in AST mode (rather than MATERIALIZE mode), toggle the `min_ast_size` parameter in the
+ * evaluate in AST mode (rather than MATERIALIZE mode), toggle the `min_ast_size` parameter in the
  * constructor.
  */
-class gpu_expression_executor {
+class expression_evaluator {
   using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
 
  public:
@@ -143,32 +143,32 @@ class gpu_expression_executor {
    *                 4) a std::unique_ptr<cudf::column> if the expression is an interior
    *                    node evaluated in MATERIALIZE mode.
    */
-  struct execute_result {
+  struct evaluate_result {
     std::variant<ast_result,
                  cudf::column_view,
                  std::unique_ptr<cudf::scalar>,
                  std::unique_ptr<cudf::column>>
       payload;
 
-    execute_result() = delete;
+    evaluate_result() = delete;
 
-    /// @brief Constructs an execute_result holding an AST expression reference.
-    execute_result(ast_result ast_payload) : payload(std::move(ast_payload)) {}
+    /// @brief Constructs an evaluate_result holding an AST expression reference.
+    evaluate_result(ast_result ast_payload) : payload(std::move(ast_payload)) {}
 
-    /// @brief Constructs an execute_result holding a non-owning column view (e.g. a bound
+    /// @brief Constructs an evaluate_result holding a non-owning column view (e.g. a bound
     /// reference in MATERIALIZE mode).
-    execute_result(cudf::column_view column_view_payload) : payload(column_view_payload) {}
+    evaluate_result(cudf::column_view column_view_payload) : payload(column_view_payload) {}
 
-    /// @brief Constructs an execute_result holding an owning scalar (e.g. a bound constant in
+    /// @brief Constructs an evaluate_result holding an owning scalar (e.g. a bound constant in
     /// MATERIALIZE mode).
-    execute_result(std::unique_ptr<cudf::scalar> scalar_payload)
+    evaluate_result(std::unique_ptr<cudf::scalar> scalar_payload)
       : payload(std::move(scalar_payload))
     {
     }
 
-    /// @brief Constructs an execute_result holding an owning column (e.g. an interior expression
+    /// @brief Constructs an evaluate_result holding an owning column (e.g. an interior expression
     /// node evaluated in MATERIALIZE mode).
-    execute_result(std::unique_ptr<cudf::column> column_payload)
+    evaluate_result(std::unique_ptr<cudf::column> column_payload)
       : payload(std::move(column_payload))
     {
     }
@@ -240,64 +240,64 @@ class gpu_expression_executor {
   };
 
   /**
-   * @brief The mode in which to execute an expression.
+   * @brief The mode in which to evaluate an expression.
    *
    * This is used internally by the expression executor to switch between trying to add expression
    * nodes to the AST tree or materializing them as cudf::columns during execution. The mode is
-   * determined by the expression_executor_strategy and the min_ast_size parameters of the
+   * determined by the expression_evaluator_strategy and the min_ast_size parameters of the
    * constructor, but can also be overridden for individual expressions by passing the desired mode
-   * to the execute method. Note that if an expression is executed in AST mode, it is added to the
+   * to the evaluate method. Note that if an expression is executed in AST mode, it is added to the
    * AST tree and the result is an ast_result; if it is executed in MATERIALIZE mode, it is executed
-   * directly and the result is a column or scalar. The execution_mode parameter of the execute
-   * method is just a hint and is not strictly enforced, e.g., if you pass execution_mode::AST but
+   * directly and the result is a column or scalar. The evaluation_mode parameter of the evaluate
+   * method is just a hint and is not strictly enforced, e.g., if you pass evaluation_mode::AST but
    * the expression node is an AST breaker, it will be executed in MATERIALIZE mode instead.
    */
-  enum class execution_mode {
+  enum class evaluation_mode {
     AST,
     MATERIALIZE,
   };
 
   /**
-   * @brief Construct a gpu_expression_executor with the given set of expressions (for PROJECTION
+   * @brief Construct a expression_evaluator with the given set of expressions (for PROJECTION
    * operators).
    *
-   * @param expressions The expressions to execute.
+   * @param expressions The expressions to evaluate.
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
-   * @param stream The rmm::cuda_stream_view in which to execute any cuDF operations.
+   * @param stream The rmm::cuda_stream_view in which to evaluate any cuDF operations.
    * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
-   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
+   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
    * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
    * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
    * adding nodes to the AST tree.
    */
-  gpu_expression_executor(
+  expression_evaluator(
     duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
-    expression_executor_strategy strategy       = strategy_from_config(),
+    expression_evaluator_strategy strategy      = strategy_from_config(),
     std::size_t min_ast_size                    = 2);
 
   /**
-   * @brief Construct a gpu_expression_executor with the given expression (for FILTER operators).
+   * @brief Construct a expression_evaluator with the given expression (for FILTER operators).
    *
-   * @param expression The expressions to execute.
+   * @param expression The expressions to evaluate.
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
-   * @param stream The rmm::cuda_stream_view in which to execute any cuDF operations.
+   * @param stream The rmm::cuda_stream_view in which to evaluate any cuDF operations.
    * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
-   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`.
+   * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
    * MATERIALIZE mode to AST mode. If an expression subtree rooted at a given node produces an AST
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
    * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
    * adding nodes to the AST tree.
    */
-  gpu_expression_executor(
+  expression_evaluator(
     sirius::ast::node const& expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
-    expression_executor_strategy strategy       = strategy_from_config(),
+    expression_evaluator_strategy strategy      = strategy_from_config(),
     std::size_t min_ast_size                    = 2);
 
   /**
@@ -306,11 +306,11 @@ class gpu_expression_executor {
    *
    * The caller retains ownership; the executor only reads from the node tree.
    */
-  gpu_expression_executor(
+  expression_evaluator(
     sirius::ast::node const* expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
-    expression_executor_strategy strategy       = strategy_from_config(),
+    expression_evaluator_strategy strategy      = strategy_from_config(),
     std::size_t min_ast_size                    = 2);
 
   /**
@@ -319,14 +319,14 @@ class gpu_expression_executor {
    * BOUND_REF passthroughs).
    *
    * The caller retains ownership of the nodes; the executor only reads from them. The output
-   * table produced by execute() contains one column per entry in @p expressions, in the same
+   * table produced by evaluate() contains one column per entry in @p expressions, in the same
    * order.
    */
-  gpu_expression_executor(
+  expression_evaluator(
     std::vector<sirius::ast::node const*> expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
-    expression_executor_strategy strategy       = strategy_from_config(),
+    expression_evaluator_strategy strategy      = strategy_from_config(),
     std::size_t min_ast_size                    = 2);
 
   /**
@@ -336,7 +336,7 @@ class gpu_expression_executor {
    * @param input The read-only locked input batch against which to evaluate expressions.
    * @return A new idle batch containing the results of expression evaluation.
    */
-  std::unique_ptr<cudf::table> execute(cudf::table_view input);
+  std::unique_ptr<cudf::table> evaluate(cudf::table_view input);
 
   /**
    * @brief Select the rows passing the predicate, materializing only @p output_indices.
@@ -371,7 +371,7 @@ class gpu_expression_executor {
    *
    * Dispatches via std::visit over @p expr's variant to the matching private
    * per-alternative overload. The per-alternative overloads currently round-
-   * trip back to the existing DuckDB-typed execute() via sirius::ast::to_duckdb;
+   * trip back to the existing DuckDB-typed evaluate() via sirius::ast::to_duckdb;
    * subsequent commits replace the round-trip with native Sirius-AST evaluation
    * one specialization at a time. See
    * https://github.com/sirius-db/sirius/issues/699 for the per-specialization
@@ -382,13 +382,14 @@ class gpu_expression_executor {
    *             supports AST mode. AST breakers (case_expr, coalesce, op_try,
    *             etc.) always materialize regardless of the hint.
    */
-  execute_result execute(sirius::ast::node const& expr, execution_mode mode = execution_mode::AST);
+  evaluate_result evaluate(sirius::ast::node const& expr,
+                           evaluation_mode mode = evaluation_mode::AST);
 
  private:
-  std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to execute
-  expression_executor_strategy _strategy;  ///< The strategy to use for expression evaluation
+  std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to evaluate
+  expression_evaluator_strategy _strategy;  ///< The strategy to use for expression evaluation
   rmm::device_async_resource_ref _mr;  ///< The allocator to pass to cudf APIs for any allocations
-  rmm::cuda_stream_view _stream;       ///< The stream in which to execute any cuDF operations
+  rmm::cuda_stream_view _stream;       ///< The stream in which to evaluate any cuDF operations
   std::size_t _min_ast_size;  ///< The minimum number of nodes in an AST tree before we switch from
                               ///< MATERIALIZE mode to AST mode
   cudf::table_view _input_table;  ///< The input table for expression evaluation
@@ -406,22 +407,22 @@ class gpu_expression_executor {
                     ///< _ast_tree.
 
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
-  // mask column (the sole column of execute()'s output). Shared by both select() overloads.
+  // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
   std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
 
   // Execute the AST tree rooted at the given expression reference and return the result as a
   // column.
-  std::unique_ptr<cudf::column> execute_ast(expr_ref root_expr);
+  std::unique_ptr<cudf::column> evaluate_ast(expr_ref root_expr);
 
   /**
    * @brief Stores a materialized column as a temporary and returns an ast_result referencing it.
    *
    * This is used by AST breakers (e.g. CASE, unsupported CAST) that cannot represent their logic
-   * as cudf AST nodes. When called with execution_mode::AST from a parent expression, they
+   * as cudf AST nodes. When called with evaluation_mode::AST from a parent expression, they
    * materialize their result, stash it in _temp_columns, and return an ast_result with a
    * column_reference pointing to the temp column's index in the combined table.
    */
-  execute_result materialize_as_ast_column(std::unique_ptr<cudf::column> column);
+  evaluate_result materialize_as_ast_column(std::unique_ptr<cudf::column> column);
 
   // Release memory for the temporary scalars and columns with the given indices.
   void release_temporaries(std::vector<std::size_t> const& scalar_indices,
@@ -430,23 +431,23 @@ class gpu_expression_executor {
                            std::vector<std::vector<std::size_t>> const& column_indices);
 
   // Leaf Sirius-AST nodes — dispatch targets for the std::visit-based
-  // execute(sirius::ast::node, mode) above.
-  execute_result execute(sirius::ast::reference const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::constant const& expr, execution_mode mode);
+  // evaluate(sirius::ast::node, mode) above.
+  evaluate_result evaluate(sirius::ast::reference const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::constant const& expr, evaluation_mode mode);
 
   // Interior Sirius-AST nodes — 11 alternatives total. Compared to the 9
   // DuckDB-typed overloads, Sirius AST splits BOUND_OPERATOR's kinds across
   // 3 alternative types (unary_op, coalesce, in_list).
-  execute_result execute(sirius::ast::between const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::case_expr const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::cast const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::comparison const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::conjunction const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::function_call const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::unary_op const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::coalesce const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::in_list const& expr, execution_mode mode);
-  execute_result execute(sirius::ast::aggregate const& expr, execution_mode mode);
+  evaluate_result evaluate(sirius::ast::between const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::case_expr const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::cast const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::comparison const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::conjunction const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::function_call const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::unary_op const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::coalesce const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::in_list const& expr, evaluation_mode mode);
+  evaluate_result evaluate(sirius::ast::aggregate const& expr, evaluation_mode mode);
 };
 
 }  // namespace sirius

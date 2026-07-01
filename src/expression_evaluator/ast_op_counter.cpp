@@ -28,7 +28,7 @@
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
-#include <expression_executor/ast_supported_types.hpp>
+#include <expression_evaluator/ast_supported_types.hpp>
 #include <sirius/exception.hpp>
 
 // standard library
@@ -38,7 +38,7 @@
 
 // Single source of truth for "how many cuDF AST operators does this Sirius AST
 // alternative lower to, recursively." Drives the AST-vs-MATERIALIZE strategy
-// gate in each gpu_expression_executor::execute(alt, mode) body via the
+// gate in each expression_evaluator::evaluate(alt, mode) body via the
 // `ast_op_count >= _min_ast_size` check.
 //
 // The method name carries the cuDF coupling: counts are tied to cuDF's

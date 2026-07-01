@@ -236,7 +236,7 @@ std::unique_ptr<duckdb::Expression> to_duckdb(function_call const& alt)
 
   // Minimal ScalarFunction stub: name + empty argument-types + return_type +
   // null function pointer. The downstream executor specialization
-  // (gpu_execute_function.cpp) dispatches via the function-name lookup, never
+  // (function.cpp) dispatches via the function-name lookup, never
   // invokes function_ptr_t or inspects arguments().
   auto name = std::string{sirius::to_duckdb_function_name(alt.function())};
   duckdb::ScalarFunction stub_fn(
