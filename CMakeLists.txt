@@ -93,6 +93,7 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
@@ -338,6 +339,7 @@ set(EXTENSION_SOURCES
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
+    src/op/partition/crc32_partition_hash.cu
     src/op/scan/equality_delete_mask.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
@@ -584,6 +586,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
+    test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
@@ -681,7 +684,7 @@ target_include_directories(
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
-target_link_libraries(sirius_unittest sirius_extension duckdb_static)
+target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
 link_extension_libraries(sirius_unittest "")
 
 # S3 container harness: the testcontainers-native bridge plus libcurl for
