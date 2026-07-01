@@ -13,6 +13,3 @@ sirius:
   executor:
     pipeline:
       num_threads: 4
-    duckdb_scan:
-      cache: "parquet"
-      num_threads: 5

@@ -17,9 +17,9 @@
 #pragma once
 
 // sirius
-
+#include <io/sirius_datasource.hpp>
 // cudf
-#include <cudf/io/datasource.hpp>
+
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_schema.hpp>
 
@@ -50,7 +50,7 @@ struct row_group_slice {
                   std::vector<cudf::size_type> row_group_indices,
                   std::size_t reserved_uncompressed_bytes,
                   std::size_t reserved_compressed_bytes,
-                  std::shared_ptr<cudf::io::datasource> datasource = nullptr)
+                  std::shared_ptr<io::sirius_datasource> datasource)
     : file_metadata(file_metadata),
       file_path(file_path),
       row_group_indices(std::move(row_group_indices)),
@@ -67,7 +67,7 @@ struct row_group_slice {
   /// Pre-built datasource for this file. Created once by the split provider
   /// and reused by materialize_table. When null, materialize_table falls
   /// back to cudf::io::datasource::create(file_path).
-  std::shared_ptr<cudf::io::datasource> datasource;
+  std::shared_ptr<io::sirius_datasource> datasource;
 };
 
 //===----------------------------------------------------------------------===//

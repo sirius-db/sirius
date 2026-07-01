@@ -24,9 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <numeric>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace sirius::op::scan {

@@ -15,7 +15,7 @@ sed \
   -e 's|libcudf = "[^"]*"|libcudf = "*"|' \
   -e 's|librmm = "[^"]*"|librmm = "*"|' \
   -e 's|"scripts/pixi_activate.sh"|"../../scripts/pixi_activate.sh"|' \
-  -e '/\[feature\.nightly-runner/d' \
+  -e '/^\[feature\.nightly-runner/,/^$/d' \
   -e '/^nightly-/d' \
   -e '/^# .*nightly cudf/d' \
   "$REPO_ROOT/pixi.toml" > "$TARGET_DIR/pixi.toml"

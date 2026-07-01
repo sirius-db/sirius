@@ -13,8 +13,6 @@ sirius:
   executor:
     pipeline:
       num_threads: 4
-    duckdb_scan:
-      num_threads: 2
     task_creator:
       num_threads: 2
     downgrade:

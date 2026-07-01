@@ -3,8 +3,9 @@ use quent_model::{instrumentation, model};
 pub mod task;
 
 model! {
-    Sirius {
-        root: quent_query_engine_model::engine::Engine,
+    name: Sirius,
+    root: quent_query_engine_model::engine::Engine,
+    entities: {
         quent_query_engine_model::worker::Worker,
         quent_query_engine_model::query_group::QueryGroup,
         quent_query_engine_model::query::Query,
@@ -15,7 +16,7 @@ model! {
         task::TaskQueue,
         task::TaskManagerLoopThread,
         task::ExecutorThread,
-    }
+    },
 }
 
 instrumentation!(Sirius);

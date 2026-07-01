@@ -137,6 +137,7 @@ jq -r --slurpfile curr "$CURRENT_JSON" --argjson threshold "$THRESHOLD" '
         [
             ["Passed Queries", $ba.passed, $ca.passed],
             ["Failed Queries", $ba.failed, $ca.failed],
+            ["cudaMalloc during query (count)", $ba.total_cuda_malloc_during_query, $ca.total_cuda_malloc_during_query],
             ["Total Hot Time (s)", $ba.total_hot_s, $ca.total_hot_s],
             ["Avg Hot Time (s)", $ba.avg_hot_s, $ca.avg_hot_s],
             ["Total GPU Time (s)", $ba.total_gpu_time_s, $ca.total_gpu_time_s],
@@ -147,12 +148,18 @@ jq -r --slurpfile curr "$CURRENT_JSON" --argjson threshold "$THRESHOLD" '
             ["Total Sync Time (s)", $ba.total_sync_time_s, $ca.total_sync_time_s]
         ][] |
         .[0] as $name | .[1] as $bv | .[2] as $cv |
-        if $bv != null and $cv != null and $bv != 0 then
+        # Count metrics compare directly: any increase is a REGRESSION, even 0 -> N.
+        (["Failed Queries", "cudaMalloc during query (count)"] | index($name)) as $is_count |
+        if $is_count != null then
+            (if $bv == null or $cv == null then "~"
+             elif $cv > $bv then "REGRESSION"
+             elif $cv < $bv then "IMPROVED"
+             else "~" end) as $status |
+            "| " + $name + " | " + ($bv // "-" | tostring) + " | " + ($cv // "-" | tostring) + " | " + ((($cv // 0) - ($bv // 0)) | tostring) + " | - | " + $status + " |"
+        elif $bv != null and $cv != null and $bv != 0 then
             (($cv - $bv) * 1000 | round / 1000) as $delta |
             (($cv - $bv) * 100 / $bv * 10 | round / 10) as $pct |
-            (if $name == "Failed Queries" then
-                (if $cv < $bv then "IMPROVED" elif $cv > $bv then "REGRESSION" else "~" end)
-             elif $pct > $threshold then "REGRESSION"
+            (if $pct > $threshold then "REGRESSION"
              elif $pct < (0 - $threshold) then "IMPROVED"
              else "~" end) as $status |
             "| " + $name + " | " + ($bv | tostring) + " | " + ($cv | tostring) + " | " + ($delta | tostring) + " | " + ($pct | tostring) + "% | " + $status + " |"
@@ -188,6 +195,33 @@ jq -r --slurpfile curr "$CURRENT_JSON" --argjson threshold "$THRESHOLD" '
         else
             "| " + $q + " | " + ($bg // "-" | tostring) + " | " + ($cg // "-" | tostring) + " | - | - |"
         end
+    )
+' "$BASELINE_JSON"
+
+echo ""
+
+# --- Per-query cudaMalloc on the hot path ---
+echo "## Per-Query cudaMalloc (during query execution)"
+echo ""
+echo "(Raw cudaMalloc inside the operator window bypasses the RMM pool. Any increase — especially 0 → N — flags an allocation newly introduced on the hot path.)"
+echo ""
+
+jq -r --slurpfile curr "$CURRENT_JSON" '
+    ([.queries[] | select(.status == "OK") | {(.query): (.memory.cuda_malloc_during_query // 0)}] | add // {}) as $base_cm |
+    ([$curr[0].queries[] | select(.status == "OK") | {(.query): (.memory.cuda_malloc_during_query // 0)}] | add // {}) as $curr_cm |
+
+    ([$base_cm, $curr_cm | keys[]] | unique | sort) as $queries |
+
+    "| Query | Base | Current | Delta | Status |",
+    "|-------|------|---------|-------|--------|",
+
+    ($queries[] |
+        . as $q |
+        ($base_cm[$q] // 0) as $bc |
+        ($curr_cm[$q] // 0) as $cc |
+        ($cc - $bc) as $delta |
+        (if $cc > $bc then "REGRESSION" elif $cc < $bc then "IMPROVED" else "~" end) as $status |
+        "| " + $q + " | " + ($bc | tostring) + " | " + ($cc | tostring) + " | " + ($delta | tostring) + " | " + $status + " |"
     )
 ' "$BASELINE_JSON"
 

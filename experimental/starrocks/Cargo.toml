@@ -12,6 +12,10 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
+# Pinned to the arrow version `parquet` already pulls in, so the engine→CN result interchange
+# (Arrow C Data Interface) and the parquet schema reader share one arrow build.
+arrow-array = "59"
+arrow-schema = "59"
 backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive", "env"] }
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
@@ -35,6 +39,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = "1"
 
 [features]
 # On by default so a normal build links the GPU engine. CI disables it
@@ -46,6 +51,8 @@ sirius-engine = ["dep:sirius"]
 
 [dependencies]
 anyhow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
 backon.workspace = true
 clap.workspace = true
 mysql_async.workspace = true
@@ -63,6 +70,7 @@ tokio-util.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [build-dependencies]
 heck.workspace = true

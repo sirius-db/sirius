@@ -47,8 +47,11 @@ use tracing::{debug, info, instrument, warn};
 mod brpc;
 mod compute_node_service;
 mod file_schema;
+mod fragment_executor;
 mod proto;
 mod prpc;
+mod result_encoder;
+mod result_store;
 
 pub use brpc::BrpcServer;
 
@@ -150,6 +153,9 @@ pub struct ComputeNodeConfig {
     pub http_port: u16,
     #[arg(long, default_value_t = 8060)]
     pub brpc_port: u16,
+    /// TODO: run a real starlet/worker agent on this advertised port.
+    #[arg(long, default_value_t = 9070)]
+    pub starlet_port: u16,
     #[arg(long)]
     pub arrow_flight_port: Option<u16>,
     #[arg(skip = default_compute_node_version())]
@@ -165,6 +171,7 @@ impl Default for ComputeNodeConfig {
             thrift_port: 9060,
             http_port: 8040,
             brpc_port: 8060,
+            starlet_port: 9070,
             arrow_flight_port: None,
             version: default_compute_node_version(),
         }
@@ -432,17 +439,17 @@ impl ComputeNodeHeartbeatHandler {
             .map(i32::from)
             .unwrap_or(PORT_DISABLED);
         TBackendInfo::new(
-            i32::from(self.config.thrift_port),     // be_port
-            i32::from(self.config.http_port),       // http_port
-            Some(BE_RPC_PORT_DISABLED),             // be_rpc_port
-            Some(i32::from(self.config.brpc_port)), // brpc_port
-            Some(self.config.version.clone()),      // version
-            Some(self.hardware_cores),              // num_hardware_cores
-            None,                                   // starlet_port
-            Some(self.reboot_time_secs),            // reboot_time
-            Some(false),                            // is_set_storage_path (CN has no storage)
-            Some(MEM_LIMIT_UNSET),                  // mem_limit_bytes
-            Some(arrow_flight_port),                // arrow_flight_port
+            i32::from(self.config.thrift_port),        // be_port
+            i32::from(self.config.http_port),          // http_port
+            Some(BE_RPC_PORT_DISABLED),                // be_rpc_port
+            Some(i32::from(self.config.brpc_port)),    // brpc_port
+            Some(self.config.version.clone()),         // version
+            Some(self.hardware_cores),                 // num_hardware_cores
+            Some(i32::from(self.config.starlet_port)), // starlet_port
+            Some(self.reboot_time_secs),               // reboot_time
+            Some(false),                               // is_set_storage_path (CN has no storage)
+            Some(MEM_LIMIT_UNSET),                     // mem_limit_bytes
+            Some(arrow_flight_port),                   // arrow_flight_port
         )
     }
 }

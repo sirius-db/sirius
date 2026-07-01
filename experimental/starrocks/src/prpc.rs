@@ -83,6 +83,16 @@ pub(crate) struct Reply<M> {
     pub(crate) attachment: Vec<u8>,
 }
 
+impl<M> Reply<M> {
+    /// Builds a reply whose message is accompanied by an attachment.
+    pub(crate) fn with_attachment(message: M, attachment: Vec<u8>) -> Self {
+        Self {
+            message,
+            attachment,
+        }
+    }
+}
+
 impl<M> From<M> for Reply<M> {
     /// Wraps a bare protobuf message as an attachment-less reply.
     fn from(message: M) -> Self {

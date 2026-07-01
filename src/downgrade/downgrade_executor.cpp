@@ -113,6 +113,7 @@ void downgrade_executor::stop()
 
   _pool->interrupt();
   _request_queue.interrupt();
+  _monitor_cv.notify_one();
 
   if (_monitor_thread.joinable()) { _monitor_thread.join(); }
   if (_processing_thread.joinable()) { _processing_thread.join(); }
@@ -462,8 +463,11 @@ void downgrade_executor::monitor_loop()
       // Pressure gone -- reset so the next stall episode warns again.
       backed_off = false;
     }
-    // Brief sleep to avoid busy-spinning; the monitor re-checks after each interval
-    std::this_thread::sleep_for(std::chrono::milliseconds(_config.monitor_period_ms));
+    // Wait for the monitor period, but wake immediately on shutdown.
+    std::unique_lock<std::mutex> lock(_monitor_cv_mutex);
+    _monitor_cv.wait_for(lock, std::chrono::milliseconds(_config.monitor_period_ms), [this]() {
+      return !_running.load(std::memory_order_relaxed);
+    });
   }
 }
 

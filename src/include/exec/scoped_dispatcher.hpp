@@ -28,6 +28,12 @@
 
 namespace sirius::exec {
 
+/// Concept matching the two task signatures the dispatcher supports:
+/// either zero-arg @c F() or stop-token-aware @c F(std::stop_token).
+/// @c wrap dispatches between the two via constexpr-if internally.
+template <typename F>
+concept scoped_dispatcher_task = std::invocable<F> || std::invocable<F, std::stop_token>;
+
 class scoped_dispatcher {
  public:
   scoped_dispatcher(static_thread_pool& pool, std::size_t max_concurrent_task = 0)
@@ -53,7 +59,7 @@ class scoped_dispatcher {
   // @brief Non-blocking. Always returns immediately. Overflow goes to the
   // dispatcher-local pending queue (unbounded by contract).
   // After request_stop(), enqueue is a silent no-op.
-  void enqueue(std::invocable auto&& f)
+  void enqueue(scoped_dispatcher_task auto&& f)
   {
     auto task = wrap(std::forward<decltype(f)>(f));
 
@@ -72,7 +78,7 @@ class scoped_dispatcher {
   // @brief Blocking. Waits for an inflight slot, then submits directly to the pool.
   // Bypasses the pending queue — this is the producer-side back-pressure path.
   // Returns false iff request_stop() was observed while waiting (or already set).
-  bool schedule(std::invocable auto&& f)
+  bool schedule(scoped_dispatcher_task auto&& f)
   {
     auto task = wrap(std::forward<decltype(f)>(f));
 
