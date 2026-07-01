@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/logical_type.hpp>
 
 // duckdb

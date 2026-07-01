@@ -19,8 +19,8 @@
 #include "op/scan/owning_table_view.hpp"
 
 #include <expression/ast/from_duckdb.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
@@ -632,12 +632,12 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // post_filter info. Apply the row filter first when pushdown did not, then
   // inject the partition columns and project to the output layout, so the
   // result is fully ROW_FILTERED_AND_PROJECTED and post_filter_and_project is
-  // skipped. `sirius_filter_ast` must outlive `exec` — the executor borrows it.
+  // skipped. `sirius_filter_ast` must outlive `exec` — the evaluator borrows it.
   if (_plan->has_partitions()) {
     owning_table_view view{std::move(table)};
     if (!ast_expression.has_value() && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-      sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
       auto const data_positions = output_data_positions(*_plan);
       view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
                                     : owning_table_view{exec.select(view.view(), data_positions)};
@@ -669,12 +669,12 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   // Apply the row filter post-decode when materialization did not — reader-side
   // pushdown was disabled (FLBA-decimal file) or AST translation failed. A
   // ROW_FILTERED / ROW_FILTERED_AND_PROJECTED state means the reader already
-  // applied it. `sirius_filter_ast` must outlive `exec` — the executor only
+  // applied it. `sirius_filter_ast` must outlive `exec` — the evaluator only
   // borrows the AST.
   if (input.state != filter_state::ROW_FILTERED &&
       input.state != filter_state::ROW_FILTERED_AND_PROJECTED && _duckdb_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-    sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
+    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
     auto const data_positions = output_data_positions(*_plan);
     auto filtered             = data_positions.empty() ? exec.select(input.table.view())
                                                        : exec.select(input.table.view(), data_positions);

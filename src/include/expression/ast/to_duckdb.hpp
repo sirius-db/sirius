@@ -45,7 +45,7 @@ namespace sirius::ast {
  */
 std::unique_ptr<duckdb::Expression> to_duckdb(node const& expr);
 
-// Per-alternative overloads — called directly by gpu_expression_executor shims
+// Per-alternative overloads — called directly by expression_evaluator shims
 // to sidestep node's move-only constraint. The top-level to_duckdb(node) above
 // dispatches to these via std::visit.
 std::unique_ptr<duckdb::Expression> to_duckdb(aggregate const& alt);

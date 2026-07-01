@@ -16,7 +16,7 @@
 
 // sirius
 #include <expression/ast/node.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
 // duckdb
@@ -27,7 +27,7 @@
 #include <cudf/cudf_utils.hpp>
 
 namespace sirius {
-using execute_result = gpu_expression_executor::execute_result;
+using evaluate_result = expression_evaluator::evaluate_result;
 
 namespace {
 
@@ -38,7 +38,7 @@ cudf::ast::ast_operator conjunction_op_to_ast(sirius::ast::conjunction::kind op)
     case sirius::ast::conjunction::kind::op_or: return cudf::ast::ast_operator::LOGICAL_OR;
     default:
       throw invalid_input_exception(
-        "[gpu_expression_executor:conjunction] unrecognized conjunction type {}",
+        "[expression_evaluator:conjunction] unrecognized conjunction type {}",
         static_cast<int>(op));
   }
 }
@@ -50,47 +50,47 @@ cudf::binary_operator conjunction_op_to_binary(sirius::ast::conjunction::kind op
     case sirius::ast::conjunction::kind::op_or: return cudf::binary_operator::LOGICAL_OR;
     default:
       throw invalid_input_exception(
-        "[gpu_expression_executor:conjunction] unrecognized conjunction type {}",
+        "[expression_evaluator:conjunction] unrecognized conjunction type {}",
         static_cast<int>(op));
   }
 }
 
 }  // namespace
 
-execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& alt,
-                                                execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::conjunction const& alt,
+                                               evaluation_mode mode)
 {
   if (alt.children.empty()) {
     throw invalid_input_exception(
-      "[gpu_expression_executor:conjunction] conjunction has no children — malformed AST.");
+      "[expression_evaluator:conjunction] conjunction has no children — malformed AST.");
   }
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (_strategy != expression_executor_strategy::MATERIALIZE &&
-      (mode == execution_mode::AST || ast_op_count >= _min_ast_size)) {
+  if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
+      (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto const ast_op = conjunction_op_to_ast(alt.op);
 
-    auto output = execute(*alt.children[0], execution_mode::AST);
+    auto output = evaluate(*alt.children[0], evaluation_mode::AST);
 
     for (std::size_t i = 1; i < alt.children.size(); ++i) {
-      auto child = execute(*alt.children[i], execution_mode::AST);
+      auto child = evaluate(*alt.children[i], evaluation_mode::AST);
       auto const& output_expr =
         _ast_tree.emplace<cudf::ast::operation>(ast_op, output.get_expr(), child.get_expr());
-      output = execute_result(
+      output = evaluate_result(
         ast_result(output_expr,
                    {output.get_temp_scalar_indices(), child.get_temp_scalar_indices()},
                    {output.get_temp_column_indices(), child.get_temp_column_indices()}));
     }
 
-    if (mode == execution_mode::AST) {
+    if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
       return output;
     }
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
-    auto result_column = execute_ast(output.get_expr());
+    auto result_column = evaluate_ast(output.get_expr());
 
     release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
-    return execute_result(std::move(result_column));
+    return evaluate_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
@@ -99,15 +99,15 @@ execute_result gpu_expression_executor::execute(sirius::ast::conjunction const& 
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
 
   // Resolve the children incrementally into the output
-  auto output = execute(*alt.children[0], execution_mode::MATERIALIZE);
+  auto output = evaluate(*alt.children[0], evaluation_mode::MATERIALIZE);
   // DuckDB should prune all scalar conjuncts away
   D_ASSERT(!output.is_scalar());
   for (std::size_t i = 1; i < alt.children.size(); ++i) {
-    auto child = execute(*alt.children[i], execution_mode::MATERIALIZE);
+    auto child = evaluate(*alt.children[i], evaluation_mode::MATERIALIZE);
     D_ASSERT(!child.is_scalar());
     auto output_column = cudf::binary_operation(
       output.get_column_view(), child.get_column_view(), binary_op, output_type, _stream, _mr);
-    output = execute_result(std::move(output_column));
+    output = evaluate_result(std::move(output_column));
   }
   return output;
 }

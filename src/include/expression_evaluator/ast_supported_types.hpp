@@ -28,7 +28,7 @@
 
 // Internal header shared by expression-executor .cpp files that need to consult the static
 // allow-lists of AST-compatible CAST target types and BOUND_FUNCTION names. Keeps DuckDB
-// includes out of the public gpu_expression_executor.hpp surface.
+// includes out of the public expression_evaluator.hpp surface.
 
 namespace sirius {
 

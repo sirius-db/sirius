@@ -36,7 +36,7 @@
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>  // sirius::comparison_type, sirius::from_duckdb (enum mapper)
 #include <expression/value.hpp>
-#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/logical_type.hpp>
 
 // duckdb — only the comparison-type enum the join-condition test parameterizes over.

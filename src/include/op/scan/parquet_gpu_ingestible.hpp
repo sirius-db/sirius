@@ -106,7 +106,7 @@ class parquet_split_info : public scan_info {
   /// When true, @c materialize_table MUST NOT call @c set_filter on its
   /// reader options; the parquet file has a FLBA-decimal column whose
   /// row-group stats cudf cannot compare against an AST literal. The
-  /// filter still applies post-decode via @c gpu_expression_executor.
+  /// filter still applies post-decode via @c expression_evaluator.
   bool disable_filter_pushdown = false;
   /// Hive partition values for this split, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns. Duplicated here
