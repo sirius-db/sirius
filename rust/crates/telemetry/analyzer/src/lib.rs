@@ -59,9 +59,8 @@ impl QuentViewer for Viewer {
 
     fn import_events(
         dir: &std::path::Path,
-        format: quent_model::exporter::FileSystemFormat,
     ) -> quent_model::exporter::ImporterResult<ViewerEventStream<Self::Analyzer>> {
-        Sirius::import_events(dir, format)
+        Sirius::import_events(dir)
     }
 }
 
