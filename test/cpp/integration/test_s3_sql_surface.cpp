@@ -7,10 +7,17 @@
 
 #include "catch.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/s3/s3_object_ref.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
+
+#include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_io_utils.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
@@ -22,11 +29,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iomanip>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -516,6 +528,467 @@ duckdb::idx_t local_parquet_file_row_count(fs::path const& path)
   return static_cast<duckdb::idx_t>(rows);
 }
 
+using bench_clock = std::chrono::steady_clock;
+
+double elapsed_ms(bench_clock::time_point start, bench_clock::time_point stop)
+{
+  return std::chrono::duration<double, std::milli>(stop - start).count();
+}
+
+double mean_ns_as_ms(std::uint64_t total_ns, std::uint64_t count)
+{
+  if (count == 0) { return 0.0; }
+  return static_cast<double>(total_ns) / static_cast<double>(count) / 1'000'000.0;
+}
+
+std::uint64_t sat_sub(std::uint64_t after, std::uint64_t before)
+{
+  return after >= before ? after - before : 0;
+}
+
+sirius::io::rest::rest_perf_snapshot delta_snapshot(
+  sirius::io::rest::rest_perf_snapshot const& after,
+  sirius::io::rest::rest_perf_snapshot const& before)
+{
+  sirius::io::rest::rest_perf_snapshot out;
+  out.chunk_get_ns_total    = sat_sub(after.chunk_get_ns_total, before.chunk_get_ns_total);
+  out.chunk_get_count       = sat_sub(after.chunk_get_count, before.chunk_get_count);
+  out.chunk_get_ns_max      = after.chunk_get_ns_max;
+  out.queue_wait_ns_total   = sat_sub(after.queue_wait_ns_total, before.queue_wait_ns_total);
+  out.queue_wait_count      = sat_sub(after.queue_wait_count, before.queue_wait_count);
+  out.ttfb_ns               = sat_sub(after.ttfb_ns, before.ttfb_ns);
+  out.h2d_observed_ns_total = sat_sub(after.h2d_observed_ns_total, before.h2d_observed_ns_total);
+  out.h2d_observed_count    = sat_sub(after.h2d_observed_count, before.h2d_observed_count);
+  out.h2d_observed_ns_max   = after.h2d_observed_ns_max;
+  out.retries_total         = sat_sub(after.retries_total, before.retries_total);
+  out.terminal_failures_total =
+    sat_sub(after.terminal_failures_total, before.terminal_failures_total);
+  out.device_stream_sync_total =
+    sat_sub(after.device_stream_sync_total, before.device_stream_sync_total);
+  return out;
+}
+
+struct rest_bench_measurement {
+  double wall_clock_ms{0.0};
+  double open_ms{0.0};
+  double footer_fetch_ms{0.0};
+  double metadata_parse_ms{0.0};
+  double scan_ms{0.0};
+  std::uint64_t wire_bytes_read{0};
+  duckdb::idx_t rows{0};
+  sirius::io::rest::rest_perf_snapshot micro;
+};
+
+std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer_for_bench(
+  cudf::io::datasource& source)
+{
+  auto constexpr footer_tail_size = sizeof(cudf::io::parquet::file_ender_s);
+  auto const file_size            = source.size();
+  REQUIRE(file_size >= footer_tail_size);
+
+  auto tail                 = source.host_read(file_size - footer_tail_size, footer_tail_size);
+  std::uint32_t footer_size = 0;
+  std::memcpy(&footer_size, tail->data(), sizeof(footer_size));
+  REQUIRE(file_size >= footer_tail_size + footer_size);
+
+  return source.host_read(file_size - footer_tail_size - footer_size, footer_size);
+}
+
+rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
+                                             std::string const& uri,
+                                             std::vector<std::string> const& columns)
+{
+  auto& manager = require_sirius_context(fixture).get_scan_manager();
+
+  auto const wall_start = bench_clock::now();
+
+  auto const open_start = bench_clock::now();
+  auto datasource       = manager.create_datasource(uri);
+  auto const open_stop  = bench_clock::now();
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  auto io_ctx = datasource->io_ctx();
+  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  REQUIRE(rest != nullptr);
+  auto const object_size = static_cast<std::uint64_t>(datasource->size());
+  auto const before      = rest->perf_snapshot();
+
+  auto const footer_start = bench_clock::now();
+  auto footer_buffer      = read_parquet_footer_for_bench(*datasource);
+  auto const footer_stop  = bench_clock::now();
+
+  auto opts = cudf::io::parquet_reader_options::builder().column_names(columns).build();
+
+  auto const parse_start = bench_clock::now();
+  cudf::io::parquet::experimental::hybrid_scan_reader reader{
+    cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()), opts};
+  std::vector<cudf::io::parquet::FileMetaData> metadatas;
+  metadatas.push_back(reader.parquet_metadata());
+  auto const parse_stop = bench_clock::now();
+
+  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+  sources.push_back(datasource->duplicate());
+
+  auto const scan_start  = bench_clock::now();
+  auto [table, metadata] = cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts);
+  (void)metadata;
+  auto const scan_stop = bench_clock::now();
+  auto const wall_stop = bench_clock::now();
+  auto const after     = rest->perf_snapshot();
+
+  return rest_bench_measurement{elapsed_ms(wall_start, wall_stop),
+                                elapsed_ms(open_start, open_stop),
+                                elapsed_ms(footer_start, footer_stop),
+                                elapsed_ms(parse_start, parse_stop),
+                                elapsed_ms(scan_start, scan_stop),
+                                object_size,
+                                static_cast<duckdb::idx_t>(table->num_rows()),
+                                delta_snapshot(after, before)};
+}
+
+struct metric_delta {
+  std::string metric;
+  double baseline{0.0};
+  double current{0.0};
+  double delta_pct{0.0};
+};
+
+struct bench_record {
+  std::string scenario;
+  double wall_clock_ms{0.0};
+  double open_ms{0.0};
+  double footer_fetch_ms{0.0};
+  double metadata_parse_ms{0.0};
+  double scan_ms{0.0};
+  std::uint64_t wire_bytes_read{0};
+  duckdb::idx_t row_count{0};
+  double effective_bytes_per_sec{0.0};
+  std::uint64_t chunk_get_ns_total{0};
+  std::uint64_t chunk_get_count{0};
+  std::uint64_t chunk_get_ns_max{0};
+  double chunk_get_ms_mean{0.0};
+  std::uint64_t queue_wait_ns_total{0};
+  std::uint64_t queue_wait_count{0};
+  double queue_wait_ms_mean{0.0};
+  std::uint64_t h2d_observed_ns_total{0};
+  std::uint64_t h2d_observed_count{0};
+  std::uint64_t h2d_observed_ns_max{0};
+  double h2d_observed_ms_mean{0.0};
+  std::uint64_t ttfb_ns{0};
+  std::uint64_t retries_total{0};
+  std::uint64_t terminal_failures_total{0};
+  std::uint64_t device_stream_sync_total{0};
+  std::vector<metric_delta> comparisons;
+};
+
+bench_record make_record(std::string scenario,
+                         rest_bench_measurement measurement,
+                         std::uint64_t dataset_bytes)
+{
+  auto seconds = measurement.wall_clock_ms / 1000.0;
+  auto effective =
+    seconds > 0.0 ? static_cast<double>(dataset_bytes) / seconds : static_cast<double>(0);
+  auto const& micro = measurement.micro;
+  return bench_record{std::move(scenario),
+                      measurement.wall_clock_ms,
+                      measurement.open_ms,
+                      measurement.footer_fetch_ms,
+                      measurement.metadata_parse_ms,
+                      measurement.scan_ms,
+                      measurement.wire_bytes_read,
+                      measurement.rows,
+                      effective,
+                      micro.chunk_get_ns_total,
+                      micro.chunk_get_count,
+                      micro.chunk_get_ns_max,
+                      mean_ns_as_ms(micro.chunk_get_ns_total, micro.chunk_get_count),
+                      micro.queue_wait_ns_total,
+                      micro.queue_wait_count,
+                      mean_ns_as_ms(micro.queue_wait_ns_total, micro.queue_wait_count),
+                      micro.h2d_observed_ns_total,
+                      micro.h2d_observed_count,
+                      micro.h2d_observed_ns_max,
+                      mean_ns_as_ms(micro.h2d_observed_ns_total, micro.h2d_observed_count),
+                      micro.ttfb_ns,
+                      micro.retries_total,
+                      micro.terminal_failures_total,
+                      micro.device_stream_sync_total,
+                      {}};
+}
+
+std::string json_escape(std::string_view value)
+{
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (char c : value) {
+    switch (c) {
+      case '\\':
+      case '"':
+        escaped.push_back('\\');
+        escaped.push_back(c);
+        break;
+      case '\n': escaped += "\\n"; break;
+      default: escaped.push_back(c); break;
+    }
+  }
+  return escaped;
+}
+
+fs::path unittest_log_dir()
+{
+#ifdef SIRIUS_UNITTEST_LOG_DIR
+  return fs::path{SIRIUS_UNITTEST_LOG_DIR};
+#else
+  return fs::path(SIRIUS_PROJECT_ROOT) / "build" / "release" / "extension" / "sirius" / "test" /
+         "cpp" / "log";
+#endif
+}
+
+fs::path perf_json_path()
+{
+  auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::system_clock::now().time_since_epoch())
+                 .count();
+  return unittest_log_dir() / ("s3_rest_perf_" + std::to_string(stamp) + ".json");
+}
+
+fs::path perf_baseline_path()
+{
+  return fs::path(SIRIUS_PROJECT_ROOT) / "doc" / "s3support" / "perf-baseline-minio.json";
+}
+
+std::optional<std::string> read_optional_text_file(fs::path const& path)
+{
+  std::ifstream in(path);
+  if (!in) { return std::nullopt; }
+  std::ostringstream out;
+  out << in.rdbuf();
+  return out.str();
+}
+
+std::optional<std::string> find_result_object(std::string const& json, std::string_view scenario)
+{
+  auto const needle = "\"scenario\": \"" + std::string{scenario} + "\"";
+  auto const pos    = json.find(needle);
+  if (pos == std::string::npos) { return std::nullopt; }
+  auto const start = json.rfind('{', pos);
+  if (start == std::string::npos) { return std::nullopt; }
+
+  int depth = 0;
+  for (std::size_t i = start; i < json.size(); ++i) {
+    if (json[i] == '{') {
+      ++depth;
+    } else if (json[i] == '}') {
+      --depth;
+      if (depth == 0) { return json.substr(start, i - start + 1); }
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<double> extract_json_number(std::string const& json_object, std::string_view key)
+{
+  auto const needle = "\"" + std::string{key} + "\"";
+  auto pos          = json_object.find(needle);
+  if (pos == std::string::npos) { return std::nullopt; }
+  pos = json_object.find(':', pos + needle.size());
+  if (pos == std::string::npos) { return std::nullopt; }
+  ++pos;
+  while (pos < json_object.size() &&
+         std::isspace(static_cast<unsigned char>(json_object[pos])) != 0) {
+    ++pos;
+  }
+  auto end = pos;
+  while (end < json_object.size()) {
+    auto const c = json_object[end];
+    if (!(std::isdigit(static_cast<unsigned char>(c)) != 0 || c == '-' || c == '+' || c == '.' ||
+          c == 'e' || c == 'E')) {
+      break;
+    }
+    ++end;
+  }
+  if (end == pos) { return std::nullopt; }
+  try {
+    return std::stod(json_object.substr(pos, end - pos));
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+void attach_baseline_comparison(bench_record& record, std::optional<std::string> const& baseline)
+{
+  if (!baseline) { return; }
+  auto object = find_result_object(*baseline, record.scenario);
+  if (!object) { return; }
+
+  auto add_delta = [&](std::string metric, double current) {
+    auto baseline_value = extract_json_number(*object, metric);
+    if (!baseline_value || *baseline_value == 0.0) { return; }
+    auto const delta_pct = ((current - *baseline_value) / *baseline_value) * 100.0;
+    record.comparisons.push_back(
+      metric_delta{std::move(metric), *baseline_value, current, delta_pct});
+  };
+
+  add_delta("effective_bytes_per_sec", record.effective_bytes_per_sec);
+  add_delta("footer_fetch_ms", record.footer_fetch_ms);
+  add_delta("chunk_get_ms_mean", record.chunk_get_ms_mean);
+
+  for (auto const& delta : record.comparisons) {
+    if (delta.metric == "effective_bytes_per_sec" && delta.delta_pct < -40.0) {
+      WARN(record.scenario << " throughput is " << delta.delta_pct
+                           << "% below perf-baseline-minio.json");
+    }
+    if (delta.metric == "footer_fetch_ms" && delta.delta_pct > 50.0) {
+      WARN(record.scenario << " footer_fetch_ms is " << delta.delta_pct
+                           << "% above perf-baseline-minio.json");
+    }
+  }
+}
+
+void write_perf_json(fs::path const& path,
+                     s3_test_env const& env,
+                     std::uint64_t dataset_bytes,
+                     std::vector<bench_record> const& records)
+{
+  fs::create_directories(path.parent_path());
+  std::ofstream out(path);
+  REQUIRE(out);
+
+  out << "{\n";
+  out << "  \"git_sha\": \"" << json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\n";
+  out << "  \"host\": \"" << json_escape(env_or("HOSTNAME", "unknown")) << "\",\n";
+  out << "  \"backend\": \"rest_minio\",\n";
+  out << "  \"dataset_bytes\": " << dataset_bytes << ",\n";
+  out << "  \"config\": {\"bucket\": \"" << json_escape(env.bucket) << "\", \"key\": \""
+      << json_escape(sf10_lineitem_key()) << "\"},\n";
+  out << "  \"results\": [\n";
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    auto const& r = records[i];
+    out << "    {\"scenario\": \"" << json_escape(r.scenario) << "\", "
+        << "\"wall_clock_ms\": " << std::fixed << std::setprecision(3) << r.wall_clock_ms << ", "
+        << "\"open_ms\": " << r.open_ms << ", "
+        << "\"footer_fetch_ms\": " << r.footer_fetch_ms << ", "
+        << "\"metadata_parse_ms\": " << r.metadata_parse_ms << ", "
+        << "\"scan_ms\": " << r.scan_ms << ", "
+        << "\"wire_bytes_read\": " << r.wire_bytes_read << ", "
+        << "\"row_count\": " << r.row_count << ", "
+        << "\"effective_bytes_per_sec\": " << r.effective_bytes_per_sec << ", "
+        << "\"chunk_get_ns_total\": " << r.chunk_get_ns_total << ", "
+        << "\"chunk_get_count\": " << r.chunk_get_count << ", "
+        << "\"chunk_get_ns_max\": " << r.chunk_get_ns_max << ", "
+        << "\"chunk_get_ms_mean\": " << r.chunk_get_ms_mean << ", "
+        << "\"queue_wait_ns_total\": " << r.queue_wait_ns_total << ", "
+        << "\"queue_wait_count\": " << r.queue_wait_count << ", "
+        << "\"queue_wait_ms_mean\": " << r.queue_wait_ms_mean << ", "
+        << "\"h2d_observed_ns_total\": " << r.h2d_observed_ns_total << ", "
+        << "\"h2d_observed_count\": " << r.h2d_observed_count << ", "
+        << "\"h2d_observed_ns_max\": " << r.h2d_observed_ns_max << ", "
+        << "\"h2d_observed_ms_mean\": " << r.h2d_observed_ms_mean << ", "
+        << "\"ttfb_ns\": " << r.ttfb_ns << ", "
+        << "\"retries_total\": " << r.retries_total << ", "
+        << "\"terminal_failures_total\": " << r.terminal_failures_total << ", "
+        << "\"device_stream_sync_total\": " << r.device_stream_sync_total;
+    if (!r.comparisons.empty()) {
+      out << ", \"comparison\": {";
+      for (std::size_t c = 0; c < r.comparisons.size(); ++c) {
+        auto const& cmp = r.comparisons[c];
+        out << "\"" << json_escape(cmp.metric) << "\": {\"baseline\": " << cmp.baseline
+            << ", \"current\": " << cmp.current << ", \"delta_pct\": " << cmp.delta_pct << "}";
+        if (c + 1 != r.comparisons.size()) { out << ", "; }
+      }
+      out << "}";
+    }
+    out << "}";
+    out << (i + 1 == records.size() ? "\n" : ",\n");
+  }
+  out << "  ]\n";
+  out << "}\n";
+}
+
+void require_perf_json_schema(fs::path const& path)
+{
+  auto const json = read_text_file(path);
+  for (auto key : {"\"git_sha\"",
+                   "\"host\"",
+                   "\"backend\"",
+                   "\"dataset_bytes\"",
+                   "\"scenario\"",
+                   "\"async_http\"",
+                   "\"async_https\"",
+                   "\"wall_clock_ms\"",
+                   "\"open_ms\"",
+                   "\"footer_fetch_ms\"",
+                   "\"metadata_parse_ms\"",
+                   "\"scan_ms\"",
+                   "\"wire_bytes_read\"",
+                   "\"row_count\"",
+                   "\"effective_bytes_per_sec\"",
+                   "\"chunk_get_ns_total\"",
+                   "\"chunk_get_count\"",
+                   "\"chunk_get_ns_max\"",
+                   "\"chunk_get_ms_mean\"",
+                   "\"queue_wait_ns_total\"",
+                   "\"queue_wait_count\"",
+                   "\"queue_wait_ms_mean\"",
+                   "\"h2d_observed_ns_total\"",
+                   "\"h2d_observed_count\"",
+                   "\"h2d_observed_ns_max\"",
+                   "\"h2d_observed_ms_mean\"",
+                   "\"ttfb_ns\"",
+                   "\"device_stream_sync_total\"",
+                   "\"retries_total\"",
+                   "\"terminal_failures_total\"",
+                   "\"config\""}) {
+    CHECK(json.find(key) != std::string::npos);
+  }
+}
+
+std::optional<large_lineitem_fixture> read_large_lineitem_bench_fixture(s3_test_env const& env)
+{
+  if (!truthy_env("SIRIUS_TEST_S3_LARGE")) {
+    SUCCEED("SIRIUS_TEST_S3_LARGE not set; skipping S3 perf benchmark");
+    return std::nullopt;
+  }
+
+  large_lineitem_fixture out;
+  out.uri        = s3_large_lineitem_uri(env);
+  out.local_path = local_sf10_lineitem_path();
+  if (!fs::exists(out.local_path)) {
+    if (truthy_env("SIRIUS_TEST_S3_STRICT")) {
+      FAIL("SF10 local parquet fixture is required in strict mode: " + out.local_path.string());
+    }
+    SUCCEED("SF10 local parquet fixture is absent; skipping S3 perf benchmark");
+    return std::nullopt;
+  }
+  out.total_num_rows = local_parquet_file_row_count(out.local_path);
+  return out;
+}
+
+bench_record run_rest_minio_bench_scenario(s3_test_env const& env,
+                                           large_lineitem_fixture const& large,
+                                           std::string scenario,
+                                           std::string const& endpoint,
+                                           std::optional<std::string> ca_bundle,
+                                           bool tls_verify,
+                                           bool perf_instrumentation)
+{
+  auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
+  limits.rest_perf_instrumentation = perf_instrumentation;
+  s3_sql_fixture fixture(env, limits, std::nullopt, endpoint, std::move(ca_bundle), tls_verify);
+  auto measurement = run_rest_parquet_scan(fixture, large.uri, {"l_orderkey"});
+  CHECK(measurement.rows == large.total_num_rows);
+  CHECK(measurement.wire_bytes_read > 0);
+  CHECK(measurement.open_ms > 0.0);
+  CHECK(measurement.footer_fetch_ms > 0.0);
+  CHECK(measurement.metadata_parse_ms > 0.0);
+  CHECK(measurement.scan_ms > 0.0);
+  CHECK(measurement.wall_clock_ms + 0.001 >=
+        measurement.open_ms + measurement.footer_fetch_ms + measurement.scan_ms);
+  CHECK(measurement.micro.device_stream_sync_total == 0);
+  CHECK(measurement.micro.terminal_failures_total == 0);
+  return make_record(std::move(scenario), measurement, measurement.wire_bytes_read);
+}
+
 std::string explain_text(duckdb::Connection& con, std::string const& sql)
 {
   auto result = require_query_ok(con, "EXPLAIN " + sql);
@@ -693,6 +1166,135 @@ TEST_CASE("S3 SQL config guard writes nested object_store options only when conf
     CHECK(yaml.find("session_token: 'temporary-session-token'") != std::string::npos);
     CHECK(yaml.find("signing_mode: 'header'") != std::string::npos);
   }
+}
+
+TEST_CASE("S3 bench STS session token reaches presigned URLs", "[.][s3][bench]")
+{
+  sirius::io::s3::static_credentials creds;
+  creds.access_key_id     = "AKIAFAKEBENCHKEY";
+  creds.secret_access_key = "fake-secret-key";
+  creds.session_token     = "fake-session-token";
+
+  sirius::io::s3::sirius_sigv4_presigned_authorizer authorizer{
+    std::move(creds), "us-east-2", "https://s3.us-east-2.amazonaws.com"};
+  auto request = authorizer.authorize(
+    sirius::io::s3::s3_object_ref{"sirius-bench", "tpch/lineitem_sf10.parquet"},
+    sirius::io::s3::s3_request_method::GET,
+    std::chrono::seconds{60});
+
+  CHECK(request.headers.empty());
+  CHECK(request.url.find("X-Amz-Security-Token=") != std::string::npos);
+  CHECK(request.url.find("fake-session-token") != std::string::npos);
+}
+
+TEST_CASE("S3 REST bench perf instrumentation gate keeps micro counters zero", "[.][s3][bench]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  auto large = read_large_lineitem_bench_fixture(*env);
+  if (!large) { return; }
+
+  auto record = run_rest_minio_bench_scenario(*env,
+                                              *large,
+                                              "async_http_gate_off",
+                                              env->endpoint,
+                                              std::nullopt,
+                                              false,
+                                              /*perf_instrumentation=*/false);
+  CHECK(record.row_count == large->total_num_rows);
+  CHECK(record.wire_bytes_read > 0);
+  CHECK(record.chunk_get_count == 0);
+  CHECK(record.chunk_get_ns_total == 0);
+  CHECK(record.chunk_get_ns_max == 0);
+  CHECK(record.queue_wait_count == 0);
+  CHECK(record.queue_wait_ns_total == 0);
+  CHECK(record.h2d_observed_count == 0);
+  CHECK(record.h2d_observed_ns_total == 0);
+  CHECK(record.h2d_observed_ns_max == 0);
+  CHECK(record.ttfb_ns == 0);
+  CHECK(record.retries_total == 0);
+  CHECK(record.terminal_failures_total == 0);
+  CHECK(record.device_stream_sync_total == 0);
+}
+
+TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][bench]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  if (env->https_endpoint.empty() || env->ca_bundle_path.empty()) {
+    if (truthy_env("SIRIUS_TEST_S3_STRICT")) {
+      FAIL(
+        "SIRIUS_TEST_S3_HTTPS_ENDPOINT and SIRIUS_TEST_S3_CA_BUNDLE are required in strict "
+        "s3-bench mode");
+    }
+    SUCCEED("HTTPS MinIO endpoint is absent; skipping S3 REST perf benchmark");
+    return;
+  }
+  auto large = read_large_lineitem_bench_fixture(*env);
+  if (!large) { return; }
+
+  auto baseline_json = read_optional_text_file(perf_baseline_path());
+  std::vector<bench_record> records;
+  records.reserve(2);
+
+  auto http  = run_rest_minio_bench_scenario(*env,
+                                            *large,
+                                            "async_http",
+                                            env->endpoint,
+                                            std::nullopt,
+                                            false,
+                                            /*perf_instrumentation=*/true);
+  auto https = run_rest_minio_bench_scenario(*env,
+                                             *large,
+                                             "async_https",
+                                             env->https_endpoint,
+                                             env->ca_bundle_path,
+                                             true,
+                                             /*perf_instrumentation=*/true);
+
+  for (auto const& r : {std::cref(http), std::cref(https)}) {
+    auto const& record = r.get();
+    CHECK(record.row_count == large->total_num_rows);
+    CHECK(record.wire_bytes_read > 0);
+    CHECK(record.effective_bytes_per_sec >= 10.0 * 1024.0 * 1024.0);
+    CHECK(record.chunk_get_count > 0);
+    CHECK(record.chunk_get_ns_total > 0);
+    CHECK(record.chunk_get_ns_max > 0);
+    CHECK(record.chunk_get_ns_max <= record.chunk_get_ns_total);
+    CHECK(record.queue_wait_count > 0);
+    CHECK(record.queue_wait_ns_total > 0);
+    CHECK(record.h2d_observed_count > 0);
+    CHECK(record.h2d_observed_ns_total > 0);
+    CHECK(record.h2d_observed_ns_max > 0);
+    CHECK(record.h2d_observed_ns_max <= record.h2d_observed_ns_total);
+    CHECK(record.ttfb_ns > 0);
+    CHECK(record.device_stream_sync_total == 0);
+    CHECK(record.terminal_failures_total == 0);
+  }
+
+  CHECK(http.row_count == https.row_count);
+  CHECK(http.wire_bytes_read == https.wire_bytes_read);
+  if (https.footer_fetch_ms > http.footer_fetch_ms * 3.0) {
+    WARN("HTTPS footer_fetch_ms is more than 3x HTTP on this MinIO run: http="
+         << http.footer_fetch_ms << "ms https=" << https.footer_fetch_ms << "ms");
+  }
+  WARN("S3 REST perf async_http throughput=" << http.effective_bytes_per_sec
+                                             << " B/s footer_fetch_ms=" << http.footer_fetch_ms
+                                             << " chunk_get_ms_mean=" << http.chunk_get_ms_mean);
+  WARN("S3 REST perf async_https throughput=" << https.effective_bytes_per_sec
+                                              << " B/s footer_fetch_ms=" << https.footer_fetch_ms
+                                              << " chunk_get_ms_mean=" << https.chunk_get_ms_mean);
+
+  attach_baseline_comparison(http, baseline_json);
+  attach_baseline_comparison(https, baseline_json);
+  records.push_back(std::move(http));
+  records.push_back(std::move(https));
+  REQUIRE(records.size() >= 2);
+
+  auto const path = perf_json_path();
+  write_perf_json(path, *env, records.front().wire_bytes_read, records);
+  require_perf_json_schema(path);
+  WARN("Wrote S3 REST perf JSON baseline to " << path.string());
 }
 
 TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
