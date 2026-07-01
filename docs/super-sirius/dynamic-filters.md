@@ -139,7 +139,7 @@ A **consumer** holds the channel directly via `std::shared_ptr<sirius_dynamic_fi
 
 ## Static + dynamic filter mixing at the consumer
 
-A parquet partition's static filter is a `shared_ptr<duckdb::Expression>` (`parquet_scan_operator_data::filter_expression`). At execute time, `sirius_gpu_parquet_scan_operator` calls `gpu_expression_translator::translate_expression_with_names` to lower it to a cuDF AST. The translation outcome is what the dynamic-filter merge has to interleave with:
+A parquet scan's static filter is a DuckDB `Expression` stored on the `parquet_gpu_ingestible`. During the per-file metadata task it is lowered to a cuDF AST via `gpu_expression_translator::translate_expression_with_names`. The translation outcome is what the dynamic-filter merge has to interleave with:
 
 - **No static filter.** The consumer builds an AST tree containing only the dynamic-filter fragments and installs it via `reader_options::set_filter`.
 - **Static filter, translation succeeds.** The consumer takes the translated AST, calls `merge_ast_dynamic_filters_into_tree(tree, static_root, set, resolver)` to AND-conjoin every dynamic fragment into it, and installs the resulting root via `set_filter`. Parquet row-group pruning sees the combined predicate.
@@ -154,7 +154,7 @@ This mixing rule is a property of the consumer (parquet metadata scan), not the 
 **Goal:** establish the framework end-to-end against a single (producer, consumer) pair — hash-join build → parquet scan — and exercise filter-kind polymorphism via progressively richer filters.
 
 **Producer:** hash-join build side.
-**Consumer:** parquet scan task (`parquet_scan_task_global_state`).
+**Consumer:** parquet GPU scan (`parquet_gpu_ingestible`).
 **Routing:** DuckDB-paired (`DynamicTableFilterSet*` route key).
 **Coordination:** implicit (meta-pipeline ordering).
 
@@ -170,7 +170,7 @@ What this PR adds:
 - `sirius_physical_hash_join::probe_target` struct + `probe_targets` vector (producer endpoint)
 - Plan-gen wiring in `sirius_plan_get.cpp` and `sirius_plan_comparison_join.cpp`
 - Producer-side push in `sirius_physical_hash_join::finalize_operator()`: `cudf::reduce` to compute global (min, max) per join key, emit a single-zone `sirius_dynamic_zone_map_filter`, push into each probe target's channel
-- Consumer-side merge in `parquet_scan_task_global_state`: replace the current "Dynamic table filters are not supported" `throw` with a call to `merge_ast_dynamic_filters_into_tree`, AND-conjoin with the static filter, install via `reader_options::set_filter`
+- Consumer-side merge in `parquet_gpu_ingestible`: replace the current "Dynamic table filters are not supported" `throw` with a call to `merge_ast_dynamic_filters_into_tree`, AND-conjoin with the static filter, install via `reader_options::set_filter`
 - E2E TPC-H test (Q14, Q19) verifying row-group pruning fires
 
 ### 1.2 Multi-zone zone maps

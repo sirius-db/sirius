@@ -34,7 +34,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Expression Executor](expression-executor.md) | gpu_expression_executor, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
-| [Scan](scan.md) | Scan subsystem: parquet scan, DuckDB scan, DuckDB-native GPU scan, S3, caching, prefetched data source |
+| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
@@ -58,4 +58,4 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
 
-<!-- last-updated-commit: 46e7cb063196f7f59c9877ee497325ec5fc0d22a -->
+<!-- last-updated-commit: 84543810a303c81c891b2adbae222157a4e17204 -->

@@ -73,6 +73,12 @@ When a `LogicalGet` has table filters and the table function supports `FILTER_PU
 
 Projections are omitted when columns are already in the correct order (passthrough case like `PROJECTION(#0, #1, #2, ...)`).
 
+### Projection Folding
+
+After the operator tree is built, `create_plan()` runs `fold_adjacent_projections()` over the whole plan as a final pass. Sirius routes every planner-created projection through `push_projection()`, which both elides identity passthrough projections and, when its child is already a projection, composes the two select lists into one. The standalone `fold_adjacent_projections()` post-pass then collapses any remaining `PROJECTION → PROJECTION` stacks anywhere in the tree — including projection pairs that arise from separate plan-builder steps (filter `projection_map` reordering, aggregate child/filter hoisting, table-scan unsupported-filter projections, and the user's `SELECT` list) and projections sitting under other operators such as joins.
+
+Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (an unsupported-expression fallback) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `gpu_expression_executor` over every batch.
+
 ## Part 2: Pipeline Structure
 
 ### `sirius_pipeline`
@@ -97,10 +103,7 @@ A pipeline is an ordered list of operators:
 Key methods:
 - `mark_task_created()` — increments `tasks_created`, starts NVTX range on first task
 - `mark_task_completed()` — increments `tasks_completed`, calls `update_pipeline_status()`
-- `update_pipeline_status()` — checks source-dependent completion logic:
-  - DUCKDB_SCAN: finished when `exhausted` flag is set
-  - GPU_PARQUET_SCAN: finished when the bound `split_connector` is closed and drained and `tasks_created == tasks_completed`
-  - Others: finished when upstream done, ports empty, and all tasks completed
+- `update_pipeline_status()` — checks completion: a pipeline finishes when any of its operators has exhausted a limit, or when its first node reports `is_source_pipeline_finished()` and `all_ports_empty()`, and `tasks_created == tasks_completed`. Source-specific completion (a drained DuckDB source vs. a closed/drained scan `split_connector`) is encapsulated behind the operator's `is_source_pipeline_finished()` rather than a per-operator-type switch.
 - `is_ready()` — marks pipeline ready and reverses operators to execution order
 - `register_new_batch_index()` / `update_batch_index()` — batch ordering for order-preserving execution
 
@@ -206,20 +209,15 @@ In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` 
 
 ### TABLE_SCAN Splitting
 
-TABLE_SCAN splits along two paths depending on the table function:
+During splitting, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) at `operators[0]` of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `io::gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `split_table_scan_source()` dispatches on the bound table function name:
 
-**Parquet (`parquet_scan` / `read_parquet`, including `s3://` paths):** TABLE_SCAN is replaced with `GPU_PARQUET_SCAN` at `operators[0]` of the same pipeline — no separate scan pipeline is created. The DuckDB bind data is captured into a `parquet_scan_info` (a concrete `scan_info` subclass) and parked on the operator. During `prepare_for_query`, `sirius_scan_manager` reads the info, builds a `split_provider` via `scan_info::make_provider()` (parquet or cached), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+**Parquet (`parquet_scan` / `read_parquet` / `sirius_read_parquet`, including `s3://` paths):** `insert_parquet_scan_operator()` captures the DuckDB bind data (resolved file paths, hive-partition indices, returned/column/projection ids, table filters) into a `parquet_ingestible_table_info`, builds a parquet ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
 
-**DuckDB-native (`seq_scan` against an attached `.duckdb` file):** TABLE_SCAN is replaced with `GPU_DUCKDB_NATIVE_SCAN` at `operators[0]` when the bound table entry is a native DuckDB format table. A `duckdb_native_scan_info` is parked on the operator and consumed by a `duckdb_native_split_provider` during `prepare_for_query`.
+**DuckDB-native (`seq_scan` against an attached `.duckdb` file):** `insert_duckdb_native_scan_operator()` resolves the `DuckTableEntry`, fills a `duckdb_native_ingestible_table_info` (storage handle, client context, qualified table identity for the pin cache, projected columns/types, table filters), builds a duckdb-native ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
 
-**DuckDB-managed (`seq_scan`, `iceberg_scan`):** A separate scan pipeline is created, and the original TABLE_SCAN is kept as the first operator of the main pipeline:
+Any other scan function is unsupported on the GPU scan path and raises an error.
 
-```mermaid
-graph LR
-    SP["Scan Pipeline<br/>[DUCKDB_SCAN]"] -->|"PIPELINE, 'scan'"| MP["Main Pipeline<br/>[TABLE_SCAN, filter, ..., sink]"]
-```
-
-DUCKDB_SCAN (or ICEBERG_SCAN) is the sole operator in the scan pipeline. TABLE_SCAN stays at `operators[0]` of the main pipeline. The repository uses `PIPELINE` barrier on the `"scan"` port.
+During `prepare_for_query`, `sirius_scan_manager` takes the ingestible off each `GPU_SCAN` operator, peeks its file paths for a pinned-cache match (substituting a cached ingestible on a hit), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
 
 ### HASH_JOIN Probe Side
 

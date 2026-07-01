@@ -70,40 +70,27 @@ config.load_from_file("/path/to/config.yaml");  // Optional
 
 ```yaml
 sirius:
-  topology:
-    num_gpus: 1
+  topology: { num_gpus: 1 }
   memory:
     gpu:
-      usage_limit_fraction: 0.9
+      usage_limit_fraction: 0.95
       reservation_limit_fraction: 1.0
       downgrade_trigger_fraction: 0.8
       downgrade_stop_fraction: 0.6
-    host:
-      capacity_bytes: 439Gi
-      initial_number_pools: 785
-      pool_size: 512
-      block_size: 1Mi
-    disk:
-      disk_id: 0
-      capacity_bytes: 1Ti
-      downgrade_root_dirs: "/mnt/nvme/sirius_spill"
+    host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
+    disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
-    pipeline:
-      num_threads: 4
-      thread_name_prefix: "sirius_pipeline_executor"
-    downgrade:
-      num_threads: 1
-      thread_name_prefix: "sirius_downgrade_executor"
-      monitor_period_ms: 10
-    task_creator:
-      num_threads: 2
+    scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, enable_prefetch_cache: false }
+    pipeline:     { num_threads: 4 }
+    downgrade:    { num_threads: 1 }
+    task_creator: { num_threads: 1 }
   operator_params:
-    scan_task_batch_size: 5Gi
+    scan_task_batch_size:       805306368   # 768 MiB
     default_scan_task_varchar_size: 256
-    max_sort_partition_bytes: 0          # 0 = auto (33% GPU memory)
-    hash_partition_bytes: 5Gi
-    concat_batch_bytes: 5Gi
-    max_build_hash_table_bytes: 500Mi
+    max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
+    hash_partition_bytes:       805306368   # 768 MiB
+    concat_batch_bytes:         805306368   # 768 MiB
+    max_build_hash_table_bytes: 805306368   # 768 MiB
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -177,6 +164,66 @@ Each memory tier uses a trigger/stop threshold pair to control data eviction:
 
 The gap between `trigger` and `stop` prevents oscillation — without it, evicting one batch could drop below trigger, then the next allocation re-triggers eviction.
 
+## Scan Manager & IO Configuration
+
+**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
+
+The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `num_threads` | int | 8 | Threads in the scan-manager pool that run metadata tasks. |
+| `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
+| `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
+| `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
+| `uring_n_reactors` | int | 1 | Number of io_uring reactor threads for local-disk reads. |
+| `rest_n_reactors` | int | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
+| `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
+
+Four optional nested sub-configs tune the individual backends and caches:
+
+### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `use_odirect` | bool | true | Use `O_DIRECT` for local-disk reads. |
+| `max_n_chunks` | int | 1 | Max contiguous file segments fused into one vectored read. |
+
+### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `request_timeout_s` | int | 30 | Per-request timeout in seconds (0 = unlimited). |
+| `max_connections` | int | 16 | Max concurrent connections per reactor. |
+| `chunk_size` | bytes | 8Mi | Target bytes per ranged GET. |
+| `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous read. |
+| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
+| `tls_verify` | bool | true | Verify the endpoint's TLS certificate. |
+| `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
+| `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). |
+
+### `scan_manager.cache` — prefetching cache (`io/cache/config.hpp`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `inflight_io_chunk_budget` | int | 2048 | Max in-flight IO chunks (enforced by admission control). |
+| `eviction_threshold_fraction` | double | 0.6 | Start evicting when the pool fills to this fraction. |
+| `min_prefetching_budget_fraction` | double | 0.05 | Floor of the budget reserved for prefetching. |
+| `dispose_after_use` | bool | false | Discard chunks immediately after use. |
+
+### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `endpoint` | string | "" | S3 endpoint URL. |
+| `region` | string | "" | AWS region. |
+| `access_key` / `secret_key` | string | "" | Static credentials. |
+| `session_token` | string | "" | STS session token for temporary credentials. |
+| `signing_mode` | enum | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). |
+| `s3_transport` | enum | `AUTO` | Transport selection (`AUTO` / `HTTP` / `RDMA`). |
+| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
+| `tls_verify` | bool | true | Verify the endpoint's TLS certificate. |
+
 ## Operator Parameters
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct
@@ -188,7 +235,10 @@ The gap between `trigger` and `stop` prevents oscillation — without it, evicti
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | 512 MB | Target partition size for hash joins and group-bys |
 | `concat_batch_bytes` | 512 MB | Target output batch size for CONCAT operator |
+| `sort_sample_bytes` | 512 MB | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 500 MB | Max build-side size for BUILD_PROBE join mode |
+| `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
+| `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -284,6 +334,7 @@ Then open `http://localhost:8080` and select the captured Sirius engine/query.
 | `task_creator` | 2 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | 4 | `downgrade` | Data tier migration (GPU→Host) |
+| `scan_manager` | 8 | `scan_manager` | Scan metadata production + IO reactor management |
 
 Each pool supports optional CPU affinity lists for core pinning.
 
@@ -311,6 +362,7 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `use_cudf_expr` | true | Use cuDF-based expression evaluation |
+| `expression_executor_strategy` | `materialize` | Expression executor strategy |
 | `use_custom_top_n` | false | Use custom top-N implementation |
 
 ### Scan
@@ -329,9 +381,12 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 |----------|---------|-------------|
 | `modified_pipeline` | - | Enable modified pipeline execution |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
+| `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | 512 MB | Hash partition target size |
 | `concat_batch_bytes` | 512 MB | CONCAT output batch size |
+| `sort_sample_bytes` | 512 MB | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 500 MB | Max build-side hash table bytes |
+| `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 
 ### Transparent Execution
 
@@ -373,4 +428,5 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
 | `src/include/config.hpp` | Legacy config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/include/op/scan/config.hpp` | Scan executor config, cache_level enum |
+| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
+| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |

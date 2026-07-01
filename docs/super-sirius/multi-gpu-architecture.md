@@ -122,11 +122,11 @@ The pin pipeline (`src/scan_manager/`):
 
 Repeat invocations of `pin_table('lineitem', ...)` are idempotent — duplicates dropped, existing `chunk_memory_spaces` preserved (Phase 22 Pitfall 3 invariant: any merge must verify `chunk_memory_spaces` integrity).
 
-When the new HOST-tier pinning path is used (`2e197c6` upstream feature, integrated in Phase 24), `pin_table` constructs a `cucascade::host_data_representation` and stores it in `pinned_entry`'s host-mode slot; subsequent scans go through a host-mode `cached_split_provider` that slices the host chunks per query and converts back to GPU only when a scan task starts. The GPU-tier and HOST-tier pinning paths coexist as parallel code paths — both maintain the `chunk_memory_spaces` invariant.
+When the new HOST-tier pinning path is used (`2e197c6` upstream feature, integrated in Phase 24), `pin_table` constructs a `cucascade::host_data_representation` and stores it in `pinned_entry`'s host-mode slot; subsequent scans go through the unified `split_provider` in cached host-mode, which slices the host chunks per query and converts back to GPU only when a scan task starts. The GPU-tier and HOST-tier pinning paths coexist as parallel code paths — both maintain the `chunk_memory_spaces` invariant.
 
 ## Scan-Time: Routing to the Right GPU
 
-When a query selects from a pinned table, the `cached_split_provider` walks `pinned_entry`'s chunks. For each chunk:
+When a query selects from a pinned table, the unified `split_provider` (cached mode) walks `pinned_entry`'s chunks. For each chunk:
 
 1. **Look up the chunk's owning memory_space** from `chunk_memory_spaces[i]`.
 2. **Create a scan task** carrying the chunk plus the memory_space.
@@ -144,14 +144,29 @@ locality(task, gpu_id) = bytes of task input data already on gpu_id
 
 The task goes to the GPU with the highest score, falling back to the task's NUMA-paired GPU if locality is tied or all data is on HOST. This is the **SCHED-RR** (round-robin with locality) distribution policy. Source-pipeline tasks (those at the start of a pipeline) are distributed using strict round-robin; downstream tasks use locality.
 
+The task creator resolves a task's `preferred_device_id` in priority order:
+
+1. **Upstream input-data preference** — a fresh-read scan split carries the device the scan manager stamped onto it.
+2. **Partition device pin** (see below) — partitioned operator inputs.
+3. **Data-locality by bytes** — the GPU already holding the most of the task's input bytes.
+4. **NUMA-affinity** — when all input lives on HOST, a GPU on the same NUMA node (round-robin when that NUMA hosts several GPUs).
+
 Two-level `preferred_device_id`:
 
 - `gpu_pipeline_task_local_state::_preferred_device_id` — per-task override (winner)
 - `sirius_pipeline_task_global_state::_preferred_device_id` — pipeline-level default
 
-`task->get_preferred_device_id()` checks local first, falls back to global. Operators that materialize cross-GPU data (e.g., partition-then-merge) propagate the right device id through the task tree.
+`task->get_preferred_device_id()` checks local first, falls back to global.
 
 See [`pipeline-execution.md`](pipeline-execution.md) "Per-task-device contract under SCHED-RR" for the deeper contract.
+
+### Partition device pin for cuco-backed operators
+
+Partitioned operators — BUILD_PROBE hash join, `grouped_aggregate_merge`, and the other partition-keyed operators — build a per-partition cuco hash table that is **only valid on the GPU it was built on**. A stream bound to GPU A that touches a cuco counter built under GPU B trips `cudaErrorInvalidValue` in cuco's `counter_storage`. The device a partition runs on is therefore a **correctness constraint, not just a locality preference**: every task of a given partition (its build and all its probes) must land on the same GPU.
+
+The task creator enforces this by pinning any task whose input is a `partitioned_operator_data` to `partition_idx % num_active_gpus`. The index is taken over the **active GPU executor set** — `task_creator::_active_gpu_ids`, the device ids that actually have a GPU executor, derived from the memory manager's `Tier::GPU` memory spaces (the same set `task_scheduler` keys executors on). Indexing the active set, rather than the physical hardware topology, is essential: when the configured GPU count is smaller than the physical GPU count (e.g. `num_gpus=2` on a 4-GPU box), a physical-topology modulo can resolve to a device id with no executor; the scheduler treats a pin to a non-existent executor as "no preference" and round-robins the task, which scatters a partition's build and probe across GPUs and lets a probe touch a build table cross-device.
+
+The pin also survives OOM reschedule. When a partitioned task OOMs and is rebuilt with a fresh `local_state`, the per-task `preferred_device_id` is carried forward; without it the rescheduled task would demote to "no preference" and scatter. (A pin held on the pipeline-level global state already survives reconstruction, so only the local-state pin needs to be copied.)
 
 ## Cross-GPU Data Movement
 
@@ -183,7 +198,7 @@ The Sirius path:
 3. **Schemes are resolved through `datasource_registry_`.** A scan task that wants to read `file:///path/to/x.parquet` passes the URL to the registry, which returns a factory bound to the per-GPU `sirius_ioctx`. No silent fallback.
 4. **Pin-table chunk reads route through the owning GPU's ioctx.** Chunk `i` reads through `gpu_ioctxs_.at(chunk_memory_spaces[i]->get_device_id())`. The read lands directly in the target GPU's pinned memory region.
 
-The 7 historical sites that bypassed this contract (kvikio-fallback in `sirius_gpu_parquet_scan_operator`, `sirius_extension`, `iceberg_metadata_reader`, `datasource_factory`, `parquet_split_provider`) were all migrated to `sirius_ioctx::make_datasource` over Phase 22.1; the remaining `cudf::io::datasource::create` callsites are reached only under the single-GPU `use_sirius_datasource=false` opt-out.
+Every read on the multi-GPU path resolves through `sirius_ioctx::make_datasource` — the unified `sirius_gpu_scan_operator`, the `split_provider`, `sirius_extension`, and `datasource_factory` all route through it. The remaining `cudf::io::datasource::create` callsites are reached only under the single-GPU `use_sirius_datasource=false` opt-out.
 
 ## Memory Pressure: Reservations and Downgrade
 
@@ -212,6 +227,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | Per-GPU `sirius_ioctx` binds device via RAII in `uring_reactor` setup | `src/io/uring/uring_reactor.cpp` | Reactor thread must hold the right device context for all uring submissions |
 | `_per_thread_init` in `downgrade_executor` gated on `tier == GPU` | `src/downgrade/downgrade_executor.cpp` (Phase 22.2 K.6) | HOST-tier workers must not call `cudaSetDevice(-1)` |
 | `chunk_memory_spaces[i]` parallel to `data_batches_by_column[col][i]` | `src/include/scan_manager/sirius_scan_manager.hpp` | Pin-table merge must preserve owning-space per chunk (Phase 22 Pitfall 3) |
+| All tasks of a partition pinned to one active GPU via `partition_idx % _active_gpu_ids.size()`; pin preserved across OOM reschedule | `src/creator/task_creator.cpp`, `src/pipeline/gpu_pipeline_executor.cpp` | A cuco hash table is valid only on the GPU it was built on; cross-device access trips `cudaErrorInvalidValue`. Indexing the active executor set avoids phantom pins when `num_gpus` < physical GPU count |
 | HYG-02 invariant: 0 new `rmm::cuda_stream_default` in `src/` outside `legacy/` | grep gate | Default-stream usage breaks per-task-device contract under SCHED-RR |
 | Multi-GPU runs use `sirius_datasource` everywhere | `sirius_config::enforce_sirius_datasource_for_multi_gpu()` forces `use_sirius_datasource=true` when >1 GPU is configured | Any file-path datasource via cudf silently uses kvikio, which binds to a single CUDA context |
 
@@ -229,13 +245,13 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `src/sirius_context.{hpp,cpp}` | `SiriusContext`, per-GPU initialization, datasource registry |
 | `src/memory/sirius_memory_reservation_manager.{hpp,cpp}` | Extends `cucascade::memory_reservation_manager`; sets cudf device resource refs per GPU; synchronizes on destruction |
 | `src/include/scan_manager/sirius_scan_manager.hpp` | `pinned_entry`, `chunk_memory_spaces` invariant |
-| `src/scan_manager/parquet_split_provider.cpp` + `cached_split_provider.cpp` | Per-chunk memory_space lookup, GPU-mode + host-mode split providers |
+| `src/scan_manager/split_provider.cpp` | Unified split provider (fresh-read + cached, GPU-mode + host-mode); per-chunk memory_space lookup |
 | `src/io/datasource_factory.{hpp,cpp}` | Strict scheme registry; routes every resolved URI through a registered `sirius_ioctx`. Used when `use_sirius_datasource=true` (always in multi-GPU). |
 | `src/io/uring/uring_reactor.cpp` | Per-GPU `uring_reactor` with RAII `cudaSetDevice` |
-| `src/op/scan/sirius_gpu_parquet_scan_operator.cpp` | Multi-GPU-aware GPU parquet scan |
-| `src/op/scan/duckdb_scan_executor.cpp` | NUMA-preference reservation requests |
+| `src/op/scan/sirius_gpu_scan_operator.cpp` | Unified `GPU_SCAN` source operator (multi-GPU-aware) |
+| `src/creator/task_creator.cpp` | Per-task `preferred_device_id` resolution, partition device pin |
 | `src/include/pipeline/gpu_pipeline_task.hpp` | `preferred_device_id` two-level lookup |
-| `src/pipeline/gpu_pipeline_executor.cpp` + `task_scheduler.cpp` | SCHED-RR distribution, locality scoring |
+| `src/pipeline/gpu_pipeline_executor.cpp` + `task_scheduler.cpp` | SCHED-RR distribution, locality scoring, OOM-reschedule pin carry-forward |
 | `src/downgrade/downgrade_executor.cpp` | Per-tier downgrade workers, K.6-gated `cudaSetDevice` |
 | `cucascade/src/data/representation_converter.cpp` | `convert_gpu_to_gpu` / `alloc_and_peer_copy_async` with peer-DMA probe + dst_guard |
 | `cucascade/src/memory/common.cpp` | `probe_peer_dma_works`, `run_p2p_probe_locked` |
@@ -245,4 +261,4 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 - [Architecture Overview](architecture-overview.md) — component diagram, thread model, ownership hierarchy (covers single-GPU too)
 - [Pipeline Execution](pipeline-execution.md) — Per-task-device contract under SCHED-RR (the deeper task-routing contract)
 - [Memory Management](memory-management.md) — cuCascade tiers, reservations, downgrade executor (mechanics of memory_spaces)
-- [Scan](scan.md) — scan path, pin tables, cache, parquet/iceberg readers
+- [Scan](scan.md) — unified `GPU_SCAN` path, pin tables, cache, split providers
