@@ -1415,10 +1415,7 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
     char const* choice     = "none";
     bool const in_list_fits =
       l2 > 0 && sirius::op::sirius_dynamic_in_list_filter::supports(col) && set_bytes <= l2;
-    bool const sentinel_safe =
-      in_list_fits &&
-      !sirius::op::sirius_dynamic_in_list_filter::keys_contain_sentinel(col, stream);
-    if (in_list_fits && sentinel_safe) {
+    if (in_list_fits) {
       nvtx3::scoped_range vr{"dynfilter::build_in_list"};
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);
@@ -1431,14 +1428,13 @@ void sirius_physical_hash_join::push_build_side_dynamic_filters(cudf::table_view
     }
     SIRIUS_LOG_DEBUG(
       "[sirius_physical_hash_join] dynamic filter key {}: build_rows={} zone_map={} membership: "
-      "in_list_set={}B bloom={}B L2={}B sentinel_safe={} -> {}",
+      "in_list_set={}B bloom={}B L2={}B -> {}",
       k,
       n,
       per_key_zone_map[k] ? "yes" : "no",
       set_bytes,
       bloom_bytes,
       l2,
-      sentinel_safe,
       choice);
   }
 

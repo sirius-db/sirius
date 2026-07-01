@@ -210,6 +210,13 @@ class sirius_mask_applicable {
 //===----------------------------------------------------------------------===//
 /**
  * @brief Exact set-membership filter: keeps rows whose key appears on the build side.
+ *
+ * @note Exact for every key except the backing static_set's empty-slot sentinel
+ *       (numeric_limits<KeyT>::min()), which the set never stores. A probe key equal to that
+ *       sentinel is always kept (never pruned), so a build key equal to it can never be a false
+ *       negative -- the authoritative join still filters it. This costs at most a lost pruning
+ *       opportunity for that single value. We save an extra kernel pass that would have to scan the
+ *       probe set for sentinel values.
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable {
@@ -248,13 +255,6 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 
   /// Whether @p keys can back the persistent exact membership set.
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
-
-  /// True iff some key equals the cuco empty-slot sentinel (numeric_limits<KeyT>::min()), which
-  /// static_set silently refuses to insert. Caller must ensure @ref supports (INT32/INT64,
-  /// null_count()==0). Inspects the raw keys.data<KeyT>() buffer synchronizes @p stream to deliver
-  /// the host-side bool used to choose in-list vs bloom.
-  [[nodiscard]] static bool keys_contain_sentinel(cudf::column_view const& keys,
-                                                  rmm::cuda_stream_view stream);
 
   /// Estimated device footprint (bytes) of the @c cuco::static_set built over an IN-list of
   /// @p num_keys keys of @p key_type — the structure that must stay L2-resident for the per-row

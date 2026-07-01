@@ -23,6 +23,7 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -37,6 +38,7 @@
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_dynamic_filter.hpp>
 
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -452,6 +454,38 @@ std::unique_ptr<cudf::table> make_int64_sequence_table(int64_t size, rmm::cuda_s
                                 stream));
   return std::make_unique<cudf::table>(std::move(cols));
 }
+
+/// Single-column table from explicit host values — for keys/probes that aren't arithmetic
+/// sequences (e.g. ones containing the type-min sentinel).
+template <class T>
+std::unique_ptr<cudf::table> make_values_table(std::vector<T> const& values,
+                                               cudf::data_type dtype,
+                                               rmm::cuda_stream_view stream)
+{
+  auto col = cudf::make_numeric_column(
+    dtype, static_cast<cudf::size_type>(values.size()), cudf::mask_state::UNALLOCATED, stream);
+  cudaMemcpyAsync(col->mutable_view().data<T>(),
+                  values.data(),
+                  values.size() * sizeof(T),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// Copy an INT64 column's values to host (companion to to_host_int32).
+std::vector<int64_t> to_host_int64(cudf::column_view const& col, rmm::cuda_stream_view stream)
+{
+  std::vector<int64_t> host(static_cast<std::size_t>(col.size()));
+  cudaMemcpyAsync(host.data(),
+                  col.data<int64_t>(),
+                  host.size() * sizeof(int64_t),
+                  cudaMemcpyDeviceToHost,
+                  stream.value());
+  stream.synchronize();
+  return host;
+}
 }  // namespace
 
 TEST_CASE("sirius_dynamic_in_list_filter keeps exactly the rows whose key is a build key",
@@ -574,6 +608,54 @@ TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negativ
   REQUIRE(survivors.size() <= 10);
   REQUIRE(std::vector<int32_t>(survivors.begin(), survivors.begin() + 5) ==
           std::vector<int32_t>{0, 1, 2, 3, 4});
+}
+
+TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT64 sentinel",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream      = cudf::get_default_stream();
+  auto const dtype = cudf::data_type{cudf::type_id::INT64};
+  // Build keys include INT64_MIN — the cuco empty-slot sentinel that static_set never inserts.
+  auto keys        = make_values_table<int64_t>(
+    {std::numeric_limits<int64_t>::min(), 0, 1, 2}, dtype, stream);
+  auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+    keys->view().column(0), stream, cudf::get_current_device_resource_ref());
+  REQUIRE(filter->has_persistent_set());  // stays on the exact IN-list path (no Bloom downgrade)
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, filter);
+
+  // Probe {INT64_MIN, 2, 7}: INT64_MIN and 2 are build keys and must survive; 7 must be dropped.
+  auto probe = make_values_table<int64_t>(
+    {std::numeric_limits<int64_t>::min(), 2, 7}, dtype, stream);
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), filters, stream);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(to_host_int64(out->view().column(0), stream) ==
+          std::vector<int64_t>{std::numeric_limits<int64_t>::min(), 2});
+}
+
+TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT32 sentinel",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream      = cudf::get_default_stream();
+  auto const dtype = cudf::data_type{cudf::type_id::INT32};
+  auto keys        = make_values_table<int32_t>(
+    {std::numeric_limits<int32_t>::min(), 0, 1, 2}, dtype, stream);
+  auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+    keys->view().column(0), stream, cudf::get_current_device_resource_ref());
+  REQUIRE(filter->has_persistent_set());
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, filter);
+
+  auto probe = make_values_table<int32_t>(
+    {std::numeric_limits<int32_t>::min(), 2, 7}, dtype, stream);
+  auto out = sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), filters, stream);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(to_host_int32(out->view().column(0), stream) ==
+          std::vector<int32_t>{std::numeric_limits<int32_t>::min(), 2});
 }
 
 //===----------------------------------------------------------------------===//

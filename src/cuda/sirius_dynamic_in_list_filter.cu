@@ -14,24 +14,26 @@
  * limitations under the License.
  */
 
+// sirius
+#include <op/sirius_dynamic_filter.hpp>
+
+// cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/utilities/traits.hpp>
 
-#include <rmm/exec_policy.hpp>
-
+// cccl
+#include <cub/device/device_for.cuh>
+#include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
 #include <cuda/stream_ref>
-#include <thrust/logical.h>
 
-#include <op/sirius_dynamic_filter.hpp>
-
+// standard library
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 
 namespace sirius::op {
@@ -43,6 +45,7 @@ constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 
 // Threads per key probe.
 constexpr std::size_t kCgSize = 1;
+static_assert(kCgSize == 1, "cuco::static_set requires kCgSize==1 for device_for bulk iteration");
 
 // Minimum set capacity.
 constexpr std::size_t kMinCapacity = 8;
@@ -66,7 +69,7 @@ std::unique_ptr<set_type<KeyT>> build_set(cudf::column_view const& keys,
 {
   std::unique_ptr<set_type<KeyT>> set(
     new set_type<KeyT>{cuco::extent<std::size_t>{capacity},
-                       cuco::empty_key<KeyT>{std::numeric_limits<KeyT>::min()},
+                       cuco::empty_key<KeyT>{cuda::std::numeric_limits<KeyT>::min()},
                        {},
                        {},
                        {},
@@ -84,9 +87,22 @@ template <class KeyT>
 struct equals_sentinel {
   __device__ __forceinline__ bool operator()(KeyT const& k) const noexcept
   {
-    return k == std::numeric_limits<KeyT>::min();
+    return k == cuda::std::numeric_limits<KeyT>::min();
   }
 };
+
+template <class KeyT, class SetRef>
+struct contains_or_sentinel {
+  KeyT const* probe;
+  bool* out;
+  SetRef set;
+  __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
+  {
+    auto const& key = probe[idx];
+    out[idx]        = set.contains(key) || equals_sentinel<KeyT>{}(key);
+  }
+};
+
 }  // namespace
 
 struct sirius_dynamic_in_list_filter::set_impl {
@@ -120,24 +136,6 @@ bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noex
   return (id == cudf::type_id::INT32 || id == cudf::type_id::INT64) && keys.null_count() == 0;
 }
 
-bool sirius_dynamic_in_list_filter::keys_contain_sentinel(cudf::column_view const& keys,
-                                                          rmm::cuda_stream_view stream)
-{
-  auto const n = keys.size();
-  /// @note Implicit stream synchronization in thrust::any_of() for return of host-side bool
-  switch (keys.type().id()) {
-    case cudf::type_id::INT32: {
-      auto const* d = keys.data<std::int32_t>();
-      return thrust::any_of(rmm::exec_policy(stream), d, d + n, equals_sentinel<std::int32_t>{});
-    }
-    case cudf::type_id::INT64: {
-      auto const* d = keys.data<std::int64_t>();
-      return thrust::any_of(rmm::exec_policy(stream), d, d + n, equals_sentinel<std::int64_t>{});
-    }
-    default: return true;  // unreachable: supports() gates the type (fallthrough to Bloom)
-  }
-}
-
 sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter() = default;
 
 bool sirius_dynamic_in_list_filter::has_persistent_set() const noexcept
@@ -155,16 +153,18 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   auto const n = probe.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  cuda::stream_ref const s{stream.value()};
   auto* const outp = out->mutable_view().data<bool>();
 
-  // probe.type() == _key_type, so the populated set matches the probe width.
   if (_set->s32) {
     auto const* d = probe.data<std::int32_t>();
-    _set->s32->contains_async(d, d + n, outp, s);
+    auto ref      = _set->s32->ref(cuco::contains);
+    cub::DeviceFor::Bulk(
+      n, contains_or_sentinel<std::int32_t, decltype(ref)>{d, outp, ref}, stream.value());
   } else {
     auto const* d = probe.data<std::int64_t>();
-    _set->s64->contains_async(d, d + n, outp, s);
+    auto ref      = _set->s64->ref(cuco::contains);
+    cub::DeviceFor::Bulk(
+      n, contains_or_sentinel<std::int64_t, decltype(ref)>{d, outp, ref}, stream.value());
   }
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
