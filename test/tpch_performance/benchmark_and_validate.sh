@@ -385,9 +385,9 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-2}"
 QUERY_TIMEOUT="${QUERY_TIMEOUT:-1200}"
 
 case "$PINNING_MODE" in
-    none|per-query) ;;
+    none|per-query|pinned-hot) ;;
     *)
-        echo "ERROR: --pinning-mode must be 'none' or 'per-query' (got: $PINNING_MODE)"
+        echo "ERROR: --pinning-mode must be 'none', 'per-query', or 'pinned-hot' (got: $PINNING_MODE)"
         exit 1
         ;;
 esac
@@ -395,7 +395,7 @@ esac
 if [ $# -ne 1 ]; then
     echo "Usage: $0 [--config <config_file>] [--data-source parquet|duckdb|duckdb-native] [--parquet-dir <path>] [--duckdb-file <path>]"
     echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>]"
-    echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query] [--pin-after-iteration <N>]"
+    echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] [--pin-after-iteration <N>]"
     echo "          [--float-tolerance <value>] <scale_factor>"
     echo "       $0 --report [--float-tolerance <value>] <run_dir>"
     echo "  --data-source parquet       (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"
@@ -403,6 +403,7 @@ if [ $# -ne 1 ]; then
     echo "  --data-source duckdb-native           → alias of 'duckdb' (GPU-native scan is the default now; kept for compatibility)"
     echo "  --pin-after-iteration N     with --pinning-mode per-query: run each query's first N iterations"
     echo "                              unpinned (e.g. cold + warm), then pin for the rest. Default: 0."
+    echo "                              Ignored with --pinning-mode pinned-hot."
     echo "Example: $0 --config ~/.sirius/sirius.yaml --engines sirius --iterations 3 --timeout 120 1000"
     echo "         $0 --duckdb-results runs/2026-03-10_sf1_2iter 1   # reuse stored DuckDB results for validation"
     echo "         $0 --multi-session --engines duckdb 100            # run DuckDB with fresh process per query"
@@ -414,6 +415,11 @@ fi
 
 if [ "$PINNING_MODE" != "none" ] && is_duckdb_source; then
     echo "ERROR: --pinning-mode is parquet-only; do not combine it with --data-source $DATA_SOURCE."
+    exit 1
+fi
+
+if [ "$PINNING_MODE" = "pinned-hot" ] && [ "$MULTI_SESSION" = true ]; then
+    echo "ERROR: --pinning-mode pinned-hot requires single-session mode; remove --multi-session."
     exit 1
 fi
 
@@ -536,16 +542,22 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo "--- Benchmark settings ---"
     echo "multi_session: $MULTI_SESSION"
     echo "drop_os_cache: $DROP_OS_CACHE"
-    # Compose a "pinned-<tier>" label from the pin tier (SIRIUS_PIN_TIER, same
-    # env var tpch_pin_columns.py / run_tpch_parquet.sh already read; defaults
-    # to 'gpu' when unset, matching CALL pin_table's own default). Pinning is
-    # always per-query now (no more union/"pinned-hot" scope).
+    # Compose a combined "pinned-<tier>-<scope>" label from the pinning scope
+    # (--pinning-mode) and the pin tier (SIRIUS_PIN_TIER, same env var
+    # tpch_pin_columns.py / run_tpch_parquet.sh already read; defaults to
+    # 'gpu' when unset, matching CALL pin_table's own default).
     PIN_TIER_REPORTED="${SIRIUS_PIN_TIER:-gpu}"
-    if [ "$PINNING_MODE" = "none" ]; then
-        PINNING_MODE_LABEL="none"
-    else
-        PINNING_MODE_LABEL="pinned-${PIN_TIER_REPORTED}"
-    fi
+    case "$PINNING_MODE" in
+        none)
+            PINNING_MODE_LABEL="none"
+            ;;
+        per-query)
+            PINNING_MODE_LABEL="pinned-${PIN_TIER_REPORTED}-grouped"
+            ;;
+        pinned-hot)
+            PINNING_MODE_LABEL="pinned-${PIN_TIER_REPORTED}-sequential"
+            ;;
+    esac
     echo "pinning_mode: $PINNING_MODE_LABEL"
     echo "pin_after_iteration: $PIN_AFTER_ITERATION"
     echo ""
