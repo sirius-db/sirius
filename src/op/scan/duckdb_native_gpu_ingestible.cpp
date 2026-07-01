@@ -34,6 +34,7 @@
 
 // cudf
 #include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
@@ -330,12 +331,23 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   if (_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
     sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
-    final_table = owning_table_view{exec.select(input.table.view())};
+    if (projection_required) {
+      // Fold the projection into the filter gather so pure-filter columns are never materialized.
+      std::vector<cudf::size_type> output_indices(output_arity);
+      std::iota(output_indices.begin(), output_indices.end(), cudf::size_type{0});
+      final_table = owning_table_view{exec.select(input.table.view(), output_indices)};
+    } else {
+      // Nothing to project away, or output_arity == 0 (count(*)) — keep all columns.
+      final_table = owning_table_view{exec.select(input.table.view())};
+    }
   } else {
     final_table = std::move(input.table);
   }
 
   //===----------Projection----------===//
+  // No filter was applied, but pure-filter columns may still have been decoded (e.g. a pinned
+  // column-superset scan): drop the trailing columns. This is a no-op after the folded filter
+  // gather above, which already produced exactly output_arity columns.
   if (projection_required &&
       static_cast<std::size_t>(final_table.view().num_columns()) > output_arity) {
     std::vector<size_t> selected_cols(output_arity);

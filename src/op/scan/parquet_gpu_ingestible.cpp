@@ -638,7 +638,9 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     if (!ast_expression.has_value() && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
       sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
-      view = owning_table_view{exec.select(view.view())};
+      auto const data_positions = output_data_positions(*_plan);
+      view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
+                                    : owning_table_view{exec.select(view.view(), data_positions)};
     }
     auto assembled = assemble_scan_output(*_plan, std::move(view), split.partition_values, stream);
     return op::scan::filtered_table{std::move(assembled),
@@ -673,7 +675,9 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
       input.state != filter_state::ROW_FILTERED_AND_PROJECTED && _duckdb_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
     sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
-    auto filtered = exec.select(input.table.view());
+    auto const data_positions = output_data_positions(*_plan);
+    auto filtered             = data_positions.empty() ? exec.select(input.table.view())
+                                                       : exec.select(input.table.view(), data_positions);
     input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
     SIRIUS_LOG_DEBUG(
       "[parquet_gpu_ingestible::post_filter_and_project] Applied duckdb filter expression "
