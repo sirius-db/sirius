@@ -24,6 +24,7 @@
 #include "sirius_config.hpp"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 
 #include <nvtx3/nvtx3.hpp>
@@ -142,7 +143,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
       auto concat_rep   = std::make_unique<cucascade::gpu_table_representation>(
         std::move(concatenated), *space, stream);
-      single_batch = std::make_shared<cucascade::data_batch>(0, std::move(concat_rep));
+      single_batch = cucascade::data_batch::make(0, std::move(concat_rep));
     }
   }
 
@@ -204,40 +205,39 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                     expected_output_columns,
                     projection_ids.size()));
     }
-    std::vector<std::unique_ptr<cudf::column>> columns;
-    auto batch_id                          = output_batch->get_batch_id();
-    cucascade::memory::memory_space* space = nullptr;
-    {
-      auto output_ro = output_batch->to_read_only();
-      space          = output_ro.get_memory_space();
-      auto& gpu_rep  = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
-      auto table     = gpu_rep.release_table(stream);
-      columns        = table->release();
-    }  // read lock released here
+    auto output_ro              = output_batch->to_read_only();
+    auto* space                 = output_ro.get_memory_space();
+    auto const& gpu_rep         = output_ro.get_data()->cast<cucascade::gpu_table_representation>();
+    cudf::table_view input_view = gpu_rep.get_table_view();
 
     // Select output columns using the batch column map.
     // projection_ids[0..expected_output_columns) are the output columns
     // in the order the downstream operator expects.
-    std::vector<std::unique_ptr<cudf::column>> selected;
+    std::vector<cudf::column_view> selected;
+    std::vector<cudf::size_type> referenced_indices;
     selected.reserve(expected_output_columns);
+    referenced_indices.reserve(expected_output_columns);
     for (std::size_t i = 0; i < expected_output_columns; i++) {
       auto const& batch_idx_opt = batch_column_map[projection_ids[i]];
-      if (!batch_idx_opt.has_value() || *batch_idx_opt >= columns.size()) {
+      if (!batch_idx_opt.has_value() || *batch_idx_opt >= input_view.num_columns()) {
         throw std::runtime_error(
           std::format("TABLE_SCAN projection OOB: projection_ids[{}]={} → batch_idx={} >= "
-                      "columns.size()={}",
+                      "input_view.num_columns()={}",
                       i,
                       projection_ids[i],
                       batch_idx_opt.has_value() ? std::to_string(*batch_idx_opt) : "(nullopt)",
-                      columns.size()));
+                      input_view.num_columns()));
       }
-      selected.push_back(std::move(columns[*batch_idx_opt]));
+      auto const batch_idx = static_cast<cudf::size_type>(*batch_idx_opt);
+      selected.push_back(input_view.column(batch_idx));
+      referenced_indices.push_back(batch_idx);
     }
 
-    auto projected_table = std::make_unique<cudf::table>(std::move(selected));
-    auto projected_rep   = std::make_unique<cucascade::gpu_table_representation>(
-      std::move(projected_table), *space, stream);
-    output_batch = std::make_shared<cucascade::data_batch>(batch_id, std::move(projected_rep));
+    cudf::table_view projected_view(selected);
+    std::size_t const referenced_bytes = sirius::estimate_referenced_column_bytes(
+      input_view, referenced_indices, output_ro.get_data()->get_size_in_bytes());
+    output_batch = sirius::make_data_batch_from_view(
+      projected_view, std::move(output_ro), referenced_bytes, *space, stream);
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
