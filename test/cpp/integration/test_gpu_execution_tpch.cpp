@@ -1632,6 +1632,23 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 //===----------------------------------------------------------------------===//
+// SEMI join in BUILD_PROBE mode: a large probe (orders, 150k) over a small build/filter subset
+// (customer where c_nationkey < 3) drives the planner into BUILD_PROBE, where one
+// cudf::filtered_join is built once on the right (filter) side and reused across the streamed left
+// probe batches via semi_join.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - semi join build_probe large probe parquet",
+                 "[integration][gpu_execution][parquet][semijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select o.o_orderkey from orders o "
+    "semi join (select c_custkey from customer where c_nationkey < 3) c "
+    "on o.o_custkey = c.c_custkey;");
+}
+
+//===----------------------------------------------------------------------===//
 // MARK join tests (issue #921: BUILD_PROBE mode for MARK join)
 //
 // `OR` combined with `IN (subquery)`, and `IN (subquery)` projected as a value,
@@ -1860,6 +1877,22 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select c.c_nationkey, c.c_custkey, c.c_name  "
     "from customer c anti join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+// ANTI join in BUILD_PROBE mode: a large probe (orders, 150k) over a small build/filter subset
+// (customer where c_nationkey < 3) drives the planner into BUILD_PROBE, where one
+// cudf::filtered_join is built once on the right (filter) side and reused across the streamed left
+// probe batches via anti_join.
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - anti join build_probe large probe parquet",
+                 "[integration][gpu_execution][parquet][antijoin]")
+{
+  // count(*) keeps the materialized result small while the full orders probe still streams through
+  // anti_join + gather across many batches, exercising the reused filtered_join.
+  compare_gpu_vs_cpu(
+    "select count(*) as n from orders o "
+    "anti join (select c_custkey from customer where c_nationkey < 3) c "
+    "on o.o_custkey = c.c_custkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
