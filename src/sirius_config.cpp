@@ -93,7 +93,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.optional("signing_mode", opt.s3_signing_mode);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);
-  r.optional("s3_use_async_backend", opt.s3_use_async_backend);
   r.reject_unknown();
 }
 

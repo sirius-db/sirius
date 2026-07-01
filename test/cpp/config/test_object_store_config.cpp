@@ -208,6 +208,28 @@ TEST_CASE("sirius_config rejects unknown object_store_config signing modes",
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config rejects removed s3_use_async_backend object_store key",
+          "[object_store_config][s3][config]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_removed_s3_async_key.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      object_store:\n"
+             "        endpoint: http://127.0.0.1:9000\n"
+             "        region: us-east-1\n"
+             "        access_key: minioadmin\n"
+             "        secret_key: minioadmin-secret\n"
+             "        s3_use_async_backend: false\n");
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(path));
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the key",
           "[scan_manager][config][prefetching_cache]")
 {
