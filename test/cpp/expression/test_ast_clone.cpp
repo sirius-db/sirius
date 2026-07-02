@@ -58,7 +58,7 @@ TEST_CASE("ast_clone - cloning a reference yields an independent node with equal
   REQUIRE(cloned->holds<reference>());
   auto const& ref = cloned->get<reference>();
   REQUIRE(ref.column_index == 7);
-  REQUIRE(ref.return_type.id() == sirius::type_id::INTEGER);
+  REQUIRE(ref.return_type().id() == sirius::type_id::INTEGER);
 }
 
 // ============================================================================

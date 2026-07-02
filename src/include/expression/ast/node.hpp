@@ -16,6 +16,9 @@
 
 #pragma once
 
+// sirius
+#include "helper/logical_type.hpp"  // sirius::logical_type
+
 // standard library
 #include <concepts>
 #include <cstddef>
@@ -65,6 +68,13 @@ concept has_cudf_ast_op_count = requires(T const& t) {
   { t.cudf_ast_op_count() } -> std::convertible_to<std::size_t>;
 };
 
+/// Compile-time contract: every alternative must expose `return_type()` so the
+/// std::visit dispatch in node::return_type() type-checks for every kind.
+template <class T>
+concept has_return_type = requires(T const& t) {
+  { t.return_type() } -> std::convertible_to<sirius::logical_type>;
+};
+
 namespace detail {
 
 template <class Variant>
@@ -73,6 +83,14 @@ struct all_have_cudf_ast_op_count;
 template <class... Ts>
 struct all_have_cudf_ast_op_count<std::variant<Ts...>> {
   static constexpr bool value = (has_cudf_ast_op_count<Ts> && ...);
+};
+
+template <class Variant>
+struct all_have_return_type;
+
+template <class... Ts>
+struct all_have_return_type<std::variant<Ts...>> {
+  static constexpr bool value = (has_return_type<Ts> && ...);
 };
 
 }  // namespace detail
@@ -111,6 +129,11 @@ struct node {
   static_assert(detail::all_have_cudf_ast_op_count<variant_t>::value,
                 "Every alternative in sirius::ast::node::variant_t must implement "
                 "std::size_t cudf_ast_op_count() const. Add the method to the "
+                "missing alternative struct.");
+
+  static_assert(detail::all_have_return_type<variant_t>::value,
+                "Every alternative in sirius::ast::node::variant_t must implement "
+                "sirius::logical_type return_type() const. Add the method to the "
                 "missing alternative struct.");
 
   variant_t v;
@@ -165,6 +188,10 @@ struct node {
   [[nodiscard]] function_call const& as_function_call() const;
 
   [[nodiscard]] std::size_t cudf_ast_op_count() const;
+
+  /// The SQL result type of this expression node, recovered natively (no DuckDB
+  /// round-trip). Dispatches via std::visit to each alternative's return_type().
+  [[nodiscard]] sirius::logical_type return_type() const;
 };
 
 /// Strict accessors for operator boundaries: return the held alternative or throw

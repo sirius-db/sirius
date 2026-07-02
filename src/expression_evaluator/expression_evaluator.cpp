@@ -19,18 +19,12 @@
 
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
 #include <expression/ast/node.hpp>       // sirius::ast::node alternatives
-#include <expression/ast/to_duckdb.hpp>  // sirius::ast::to_duckdb (per-alternative overloads + node dispatcher)
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
 // cucascade
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
-
-// duckdb
-#include <duckdb/common/exception.hpp>
-#include <duckdb/common/types.hpp>
-#include <duckdb/planner/expression.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -283,20 +277,19 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // Get the table_view from the input_batch
   _input_table = std::move(input);
 
-  // Per-result column post-processing. The AST node is round-tripped through
-  // sirius::ast::to_duckdb to recover the expression_class + return_type fields
-  // that drive the post-processing path.
-  auto post_process = [this](duckdb::Expression const& expr, evaluate_result result) {
-    if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
-      // BOUND_REF: pass column through without type check
+  // Per-result column post-processing. The node's kind and result type are read
+  // natively from the Sirius AST (no DuckDB round-trip).
+  auto post_process = [this](sirius::ast::node const& expr, evaluate_result result) {
+    if (expr.holds<sirius::ast::reference>()) {
+      // Bound reference: pass column through without type check
       _output_columns.push_back(
         std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
     } else {
-      // Cast the `result` from libcudf to `return_type` if `result` has a different type.
-      // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
-      // Only use cudf::cast when both types are fixed-width (cast does not support
+      // Cast the `result` from libcudf to the node's return type if `result` has a different
+      // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
+      // int64_t. Only use cudf::cast when both types are fixed-width (cast does not support
       // STRING/LIST/STRUCT).
-      auto const cudf_return_type = GetCudfType(expr.return_type);
+      auto const cudf_return_type = sirius::get_cudf_type(expr.return_type());
       std::unique_ptr<cudf::column> result_column;
       if (result.is_scalar()) {
         result_column =
@@ -311,18 +304,17 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
         if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
           result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);
         } else {
-          throw duckdb::InternalException("[expression_evaluator] Unsupported type conversion: " +
-                                          cudf::type_to_name(result_column->type()) + " to " +
-                                          cudf::type_to_name(cudf_return_type));
+          throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
+                                   cudf::type_to_name(result_column->type()),
+                                   cudf::type_to_name(cudf_return_type));
         }
       }
       _output_columns.push_back(std::move(result_column));
     }
   };
 
-  // Iterate _ast_expressions and route through the std::visit dispatcher.
-  // The per-result post-processing recovers expression_class + return_type by
-  // round-tripping through sirius::ast::to_duckdb.
+  // Iterate _ast_expressions and route through the std::visit dispatcher, then
+  // post-process each result using the node's native kind + return type.
   for (auto const* ast_expr : _ast_expressions) {
     if (!ast_expr) {
       // This is a Sirius bug, not a user error: a null slot means from_duckdb
@@ -330,14 +322,13 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
       // to the GPU executor.  This hard-fails the query instead of falling back to CPU.
       // TODO fix to ensure the planner never builds a GPU projection containing unsupported
       // expressions.
-      throw duckdb::InternalException(
+      throw internal_exception(
         "[expression_evaluator] null expression in select list — "
         "from_duckdb returned nullptr for an unsupported expression; "
         "cannot evaluate on GPU");
     }
-    auto result    = evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
-    auto duck_expr = sirius::ast::to_duckdb(*ast_expr);
-    post_process(*duck_expr, std::move(result));
+    auto result = evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
+    post_process(*ast_expr, std::move(result));
   }
 
   return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
@@ -346,13 +337,8 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
 std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_view input)
 {
   D_ASSERT(_ast_expressions.size() == 1);
-#ifdef D_ASSERT_IS_ENABLED
-  // Round-trip the single node through sirius::ast::to_duckdb so the BOOLEAN
-  // return-type assertion holds. Guarded so release builds skip the wasted
-  // DuckDB tree allocation (D_ASSERT is a no-op under NDEBUG).
-  auto duck_expr = sirius::ast::to_duckdb(*_ast_expressions[0]);
-  D_ASSERT(duck_expr->return_type == duckdb::LogicalType::BOOLEAN);
-#endif
+  // A filter predicate must be BOOLEAN. Read the type natively from the Sirius AST.
+  D_ASSERT(_ast_expressions[0]->return_type().id() == sirius::type_id::BOOLEAN);
 
   return std::move(evaluate(input)->release()[0]);
 }
@@ -364,7 +350,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
   // output columns (e.g. count(*) over a filtered scan) is unrepresentable here. Such callers
   // must use the all-columns select() overload so the surviving row count is preserved.
   if (output_indices.empty()) {
-    throw duckdb::InternalException(
+    throw internal_exception(
       "[expression_evaluator] select(): output_indices must be non-empty; use the "
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
