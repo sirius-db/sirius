@@ -61,14 +61,17 @@ class host_table_chunk_reader {
    * validity masks
    */
   struct column_reader {
-    size_t size{0};        ///< The number of rows in the column
-    size_t null_count{0};  ///< The number of null values in the column
+    size_t size{0};              ///< The number of rows in the column
+    size_t null_count{0};        ///< The number of null values in the column
+    size_t child_null_count{0};  ///< Null count of the LIST/ARRAY values child (0 if none)
     cudf::data_type cudf_col_type{
       cudf::type_id::EMPTY};  ///< Source cudf type (with scale for decimals)
     memory::multiple_blocks_allocation_accessor<uint8_t>
       data_accessor;  ///< Accessor to the column data in the multiple blocks allocation
     memory::multiple_blocks_allocation_accessor<uint8_t>
       mask_accessor;  ///< Accessor to the null mask data in the multiple blocks allocation
+    memory::multiple_blocks_allocation_accessor<uint8_t>
+      child_mask_accessor;  ///< Accessor to a LIST/ARRAY child's null mask (element-level nulls)
     memory::multiple_blocks_allocation_accessor<int32_t>
       offset_accessor_32;  ///< Accessor to the STRING offsets (INT32) in the multiple blocks
                            ///< allocation
@@ -125,6 +128,25 @@ class host_table_chunk_reader {
                      size_t row_offset,
                      size_t count,
                      std::shared_ptr<multiple_blocks_allocation> const& allocation);
+
+    /**
+     * @brief Copy a fixed-size ARRAY (cudf LIST) column into the duckdb ARRAY vector.
+     *
+     * The stored values child (children[1]) is laid out row-major (K elements per row),
+     * matching DuckDB's fixed-size array child layout, so the values are copied contiguously
+     * into the array's child vector. The list-level null mask becomes the array vector's
+     * validity, and the values child's null mask (element-level nulls) becomes the child
+     * vector's validity.
+     *
+     * @param[in,out] vector The duckdb ARRAY vector to copy into
+     * @param[in] row_offset The starting row offset to copy from
+     * @param[in] count The number of rows (arrays) to copy
+     * @param[in] allocation The multiple blocks allocation containing the column data
+     */
+    void copy_array(duckdb::Vector& vector,
+                    size_t row_offset,
+                    size_t count,
+                    std::shared_ptr<multiple_blocks_allocation> const& allocation);
   };
 
  public:
