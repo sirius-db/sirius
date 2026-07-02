@@ -33,6 +33,8 @@
 #include <duckdb/common/vector_size.hpp>
 
 #include <cstring>
+#include <format>
+#include <stdexcept>
 
 namespace sirius::op::scan {
 
@@ -375,6 +377,18 @@ void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_s
   // TINYINT sentinel column (1 row) so downstream cudf-based operators see
   // the correct row count.
   auto& pipelineable_output = dynamic_cast<op::pipelineable_operator_data&>(output_data);
+  // Empty _data_repos is only valid for terminal pipelines (sink =
+  // RESULT_COLLECTOR), which today are always EMPTY_RESULT and produce no
+  // batches. Unlike gpu_pipeline_task::publish_output, this path never routes
+  // through the sink — a terminal CPU-source pipeline that produces real
+  // batches would drop them and complete "successfully" with a wrong (empty)
+  // result. Fail the query instead: supporting that shape requires routing
+  // output through the sink, like gpu_pipeline_task::publish_output does.
+  if (_data_repos.empty() && !pipelineable_output.get_data_batches().empty()) {
+    throw std::runtime_error(std::format(
+      "[cpu_source_task] {} batches produced but no downstream repository to publish to",
+      pipelineable_output.get_data_batches().size()));
+  }
   for (auto& batch : pipelineable_output.get_data_batches()) {
     if (!batch) { continue; }
     {
