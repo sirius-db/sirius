@@ -408,6 +408,17 @@ void task_creator::manager_loop()
           task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
         }
+        // TODO(rca-s3-filter-pushdown-deadlock.md): zero-task completion
+        // protocol. A source that creates zero tasks never completes its
+        // pipeline: pipeline_finished is only re-evaluated from
+        // mark_task_completed(), and calling pipeline->update_pipeline_status()
+        // here — while locally possible — is NOT sufficient, because
+        // completion_handler::mark_completed() has a single call site in
+        // gpu_pipeline_executor's task-completion path, gated on a completed
+        // task of the RESULT_COLLECTOR pipeline. A fully zero-task query would
+        // still hang. Needs executor-side surgery as its own follow-up; the
+        // parquet all-pruned shape is unblocked by parquet_batch_coalescer's
+        // empty-split fallback.
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
         _task_scheduler->terminate_query(std::current_exception());

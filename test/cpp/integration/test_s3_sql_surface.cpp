@@ -32,6 +32,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -40,10 +41,12 @@
 #include <functional>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -62,6 +65,35 @@ bool truthy_env(std::string_view name)
   auto value = env_or(name);
   return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
 }
+
+class scoped_env_var {
+ public:
+  scoped_env_var(std::string name, std::string value) : name_(std::move(name))
+  {
+    if (auto* current = std::getenv(name_.c_str()); current != nullptr) {
+      had_original_ = true;
+      original_     = current;
+    }
+    setenv(name_.c_str(), value.c_str(), 1);
+  }
+
+  ~scoped_env_var()
+  {
+    if (had_original_) {
+      setenv(name_.c_str(), original_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+  scoped_env_var(scoped_env_var const&)            = delete;
+  scoped_env_var& operator=(scoped_env_var const&) = delete;
+
+ private:
+  std::string name_;
+  std::string original_;
+  bool had_original_{false};
+};
 
 struct s3_test_env {
   std::string endpoint;
@@ -363,6 +395,72 @@ std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResu
     rows.push_back(std::move(row));
   }
   return rows;
+}
+
+struct watchdog_query_result {
+  duckdb::idx_t row_count{0};
+  duckdb::idx_t column_count{0};
+  std::vector<std::string> column_names;
+  std::vector<std::vector<std::string>> rows;
+  std::string error;
+};
+
+watchdog_query_result require_query_ok_with_watchdog(std::shared_ptr<s3_sql_fixture> fixture,
+                                                     std::string sql,
+                                                     std::chrono::seconds timeout)
+{
+  struct shared_state {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool done{false};
+    watchdog_query_result result;
+  };
+
+  auto state      = std::make_shared<shared_state>();
+  auto worker_sql = sql;
+  std::thread worker([fixture, sql = std::move(worker_sql), state]() {
+    watchdog_query_result out;
+    try {
+      auto result = fixture->con.Query(sql);
+      if (!result) {
+        out.error = "query returned nullptr";
+      } else if (result->HasError()) {
+        out.error = result->GetError();
+      } else {
+        out.row_count    = result->RowCount();
+        out.column_count = result->ColumnCount();
+        out.column_names.reserve(result->ColumnCount());
+        for (duckdb::idx_t c = 0; c < result->ColumnCount(); ++c) {
+          out.column_names.push_back(result->ColumnName(c));
+        }
+        out.rows = collect_rows(*result);
+      }
+    } catch (std::exception const& e) {
+      out.error = e.what();
+    } catch (...) {
+      out.error = "query threw an unknown exception";
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(state->mtx);
+      state->result = std::move(out);
+      state->done   = true;
+    }
+    state->cv.notify_one();
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(state->mtx);
+    if (!state->cv.wait_for(lock, timeout, [&] { return state->done; })) {
+      worker.detach();
+      FAIL("query timed out after " << timeout.count() << " seconds: " << sql);
+    }
+  }
+
+  worker.join();
+  INFO(state->result.error);
+  REQUIRE(state->result.error.empty());
+  return std::move(state->result);
 }
 
 void check_rows_equal_with_tolerant_columns(duckdb::MaterializedQueryResult& actual,
@@ -1548,6 +1646,99 @@ TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
   auto result = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
   CHECK(result->RowCount() == 0);
 }
+
+TEST_CASE("S3 pushdown all-pruned filter completes with an empty result",
+          "[.][s3][pushdown][deadlock]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  auto fixture        = std::make_shared<s3_sql_fixture>(*env);
+  auto const s3_query = "SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation") +
+                        " WHERE n_regionkey = 99 ORDER BY n_nationkey";
+
+  auto result =
+    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
+  CHECK(result.row_count == 0);
+  REQUIRE(result.column_count == 1);
+  REQUIRE(result.column_names.size() == 1);
+  CHECK(result.column_names[0] == "n_nationkey");
+  CHECK(result.rows.empty());
+}
+
+TEST_CASE("S3 pushdown all-pruned aggregate returns zero rows counted",
+          "[.][s3][pushdown][deadlock]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  auto fixture = std::make_shared<s3_sql_fixture>(*env);
+  auto const s3_query =
+    "SELECT count(*) AS c FROM " + s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
+
+  auto result =
+    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
+  REQUIRE(result.row_count == 1);
+  REQUIRE(result.column_count == 1);
+  REQUIRE(result.rows.size() == 1);
+  REQUIRE(result.rows[0].size() == 1);
+  CHECK(result.rows[0][0] == "0");
+}
+
+TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
+          "[.][s3][pushdown][deadlock]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  auto fixture     = std::make_shared<s3_sql_fixture>(*env);
+  auto const shape = std::string{
+    "SELECT l_returnflag, count(*) AS c FROM %s "
+    "WHERE l_shipdate BETWEEN DATE '1996-01-01' AND DATE '1996-06-30' "
+    "GROUP BY l_returnflag ORDER BY l_returnflag"};
+  auto const s3_query = [&] {
+    auto query = shape;
+    auto scan  = s3_parquet_scan(*env, "lineitem");
+    query.replace(query.find("%s"), 2, scan);
+    return query;
+  }();
+  auto const local_query = [&] {
+    auto query = shape;
+    auto scan  = local_parquet_scan(*env, "lineitem");
+    query.replace(query.find("%s"), 2, scan);
+    return query;
+  }();
+
+  auto s3_result =
+    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto local_result = require_query_ok(baseline_con, local_query);
+  auto local_rows   = collect_rows(*local_result);
+
+  CHECK_FALSE(s3_result.rows.empty());
+  CHECK(s3_result.rows == local_rows);
+}
+
+// Protocol follow-up sketch: the tactical fix for this PR is parquet-scoped empty-split emission.
+// The long-term contract should make a zero-task source complete the pipeline without requiring
+// every source to fabricate an empty unit of work. Keep this disabled until that protocol seam
+// exists, then turn it into an active regression test.
+#if 0
+TEST_CASE("zero-task scan source completes the pipeline",
+          "[.][s3][pushdown][zero-task-protocol][!mayfail]")
+{
+  auto source = make_zero_task_scan_source();
+  auto query = make_single_source_query(source);
+  auto pipeline = run_pipeline(query);
+  CHECK(pipeline.completed());
+  CHECK(pipeline.output_rows() == 0);
+}
+#endif
 
 TEST_CASE("gpu_execution S3 SQL surface counts every uploaded TPCH parquet table",
           "[s3][integration][sql][gpu_execution]")
