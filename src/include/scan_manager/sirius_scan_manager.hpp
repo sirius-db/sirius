@@ -324,7 +324,11 @@ class sirius_scan_manager {
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
-  /// per type under the mutex; drained + torn down in the dtor.
+  /// per type: `_routed_io_ctxs_build_mtx` serializes construction (reactor
+  /// threads + cache allocation happen outside the map mutex), while
+  /// `_routed_io_ctxs_mtx` guards only map lookup/insert; drained + torn down
+  /// in the dtor.
+  std::mutex _routed_io_ctxs_build_mtx;
   std::mutex _routed_io_ctxs_mtx;
   std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
     _routed_io_ctxs;
