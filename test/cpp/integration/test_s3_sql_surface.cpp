@@ -1672,7 +1672,7 @@ TEST_CASE("S3 pushdown all-pruned filter completes with an empty result",
 }
 
 TEST_CASE("S3 pushdown all-pruned aggregate returns zero rows counted",
-          "[.][s3][pushdown][deadlock]")
+          "[.][s3][pushdown][deadlock][agg-identity]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1689,6 +1689,101 @@ TEST_CASE("S3 pushdown all-pruned aggregate returns zero rows counted",
   REQUIRE(result.rows.size() == 1);
   REQUIRE(result.rows[0].size() == 1);
   CHECK(result.rows[0][0] == "0");
+}
+
+TEST_CASE("S3 pushdown zero-input ungrouped count emits the aggregate identity row",
+          "[.][s3][pushdown][agg-identity]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+  auto fixture = std::make_shared<s3_sql_fixture>(*env);
+  auto const s3_query =
+    "SELECT count(*) AS c FROM " + s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
+
+  auto result =
+    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
+  REQUIRE(result.row_count == 1);
+  REQUIRE(result.column_count == 1);
+  REQUIRE(result.rows.size() == 1);
+  REQUIRE(result.rows[0].size() == 1);
+  CHECK(result.rows[0][0] == "0");
+}
+
+TEST_CASE("S3 pushdown zero-input ungrouped aggregates emit SQL identity and null values",
+          "[.][s3][pushdown][agg-identity]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+  auto fixture = std::make_shared<s3_sql_fixture>(*env);
+  auto const s3_query =
+    "SELECT count(*) AS c_all, count(n_name) AS c_name, sum(n_nationkey) AS sum_key, "
+    "min(n_name) AS min_name, max(n_name) AS max_name, avg(n_nationkey) AS avg_key, "
+    "first(n_name) AS first_name FROM " +
+    s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
+
+  auto result =
+    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
+  REQUIRE(result.row_count == 1);
+  REQUIRE(result.column_count == 7);
+  REQUIRE(result.rows.size() == 1);
+  REQUIRE(result.rows[0].size() == 7);
+  CHECK(result.rows[0] ==
+        std::vector<std::string>{"0", "0", "NULL", "NULL", "NULL", "NULL", "NULL"});
+}
+
+TEST_CASE("S3 pushdown zero-input grouped aggregate still emits no groups",
+          "[.][s3][pushdown][agg-identity]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+  auto fixture        = std::make_shared<s3_sql_fixture>(*env);
+  auto const s3_query = "SELECT n_regionkey, count(*) AS c FROM " +
+                        s3_parquet_scan(*env, "nation") +
+                        " WHERE n_regionkey = 99 GROUP BY n_regionkey ORDER BY n_regionkey";
+
+  auto result =
+    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
+  CHECK(result.row_count == 0);
+  REQUIRE(result.column_count == 2);
+  CHECK(result.rows.empty());
+}
+
+TEST_CASE("S3 pushdown non-pruned aggregate still matches the local parquet oracle",
+          "[.][s3][pushdown][agg-identity]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+  auto fixture = std::make_shared<s3_sql_fixture>(*env);
+  auto const s3_query =
+    "SELECT count(*) AS c, min(o_orderdate) AS min_date, max(o_orderdate) AS max_date FROM " +
+    s3_parquet_scan(*env, "orders") + " WHERE o_orderdate >= DATE '1994-01-01'";
+  auto const local_query =
+    "SELECT count(*) AS c, min(o_orderdate) AS min_date, max(o_orderdate) AS max_date FROM " +
+    local_parquet_scan(*env, "orders") + " WHERE o_orderdate >= DATE '1994-01-01'";
+
+  auto s3_result =
+    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto local_result = require_query_ok(baseline_con, local_query);
+  auto local_rows   = collect_rows(*local_result);
+
+  REQUIRE(s3_result.row_count == 1);
+  REQUIRE(s3_result.column_count == local_result->ColumnCount());
+  CHECK(s3_result.rows == local_rows);
 }
 
 TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
