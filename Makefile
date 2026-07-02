@@ -159,10 +159,12 @@ list-presets: $(PRESETS_LINK)
 # environment yourself first — including SIRIUS_TEST_S3_ENDPOINT — (regional S3
 # endpoint, real bucket, and assume-role TEMPORARY credentials including the
 # session token); keep usage bounded.
-# `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint.
+# `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint
+#                     ([s3][aws] minus [bench] — the aws perf benchmark is
+#                     selected by `SIRIUS_BENCH_BACKEND=aws-s3 make s3-bench`).
 # `make s3-test-aws-sigv4`
 #                     subset using Sirius's built-in SigV4 presigner only
-#                     ([s3][aws] minus [broker]).
+#                     ([s3][aws] minus [broker]/[bench]).
 # `make s3-test-aws-broker`
 #                     subset driven by an external presign broker
 #                     ([s3][aws][broker]).
@@ -206,7 +208,7 @@ s3-test-aws:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]"
+	$(S3_TEST_BIN) "[s3][aws]~[bench]"
 
 s3-test-aws-sigv4:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -215,7 +217,7 @@ s3-test-aws-sigv4:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]~[broker]"
+	$(S3_TEST_BIN) "[s3][aws]~[broker]~[bench]"
 
 s3-test-aws-broker:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
