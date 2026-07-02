@@ -4695,6 +4695,16 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu("select b from (values (1), (2), (3)) t(b);");
 }
 
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - CPU source with multiple downstream repositories",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  // A VALUES-backed CTE referenced twice fans the cpu_source output out to
+  // multiple downstream data repositories.
+  compare_gpu_vs_cpu(
+    "with t(b) as (values (1), (2), (3)) select a.b, c.b from t a join t c using (b);");
+}
+
 //===----------------------------------------------------------------------===//
 // pin_table tests
 //===----------------------------------------------------------------------===//

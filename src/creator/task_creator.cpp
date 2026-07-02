@@ -324,16 +324,20 @@ void task_creator::manager_loop()
               this->schedule(consumer);
             }
           } else {
-            _task_scheduler->signal_query_complete();
+            this->signal_query_complete();
           }
-        } catch (...) {
-          SIRIUS_LOG_ERROR("Task Creator: Exception during cpu_source_task execution");
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_ERROR("Task Creator: Exception during cpu_source_task execution: {}",
+                           e.what());
           // Do NOT call stop() here: this lambda runs on a _bounded_pool worker
           // thread, and stop() -> do_stop_thread_pool() -> wait_all() would wait
           // for this very task's slot to release — a self-deadlock that also
           // holds _global_state_mutex and hangs the client's drain_after_error().
           // terminate_query() reports the error; the client thread tears the
           // task_creator down via drain_after_error() once future.get() throws.
+          _task_scheduler->terminate_query(std::current_exception());
+        } catch (...) {
+          SIRIUS_LOG_ERROR("Task Creator: Exception during cpu_source_task execution");
           _task_scheduler->terminate_query(std::current_exception());
         }
       });
