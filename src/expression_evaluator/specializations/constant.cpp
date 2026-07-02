@@ -67,7 +67,7 @@ using evaluate_result = expression_evaluator::evaluate_result;
 evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
                                                evaluation_mode mode)
 {
-  auto const cudf_type = sirius::get_cudf_type(alt.return_type);
+  auto const cudf_type = sirius::get_cudf_type(alt.return_type());
   bool const is_valid  = !std::holds_alternative<sirius::null_value>(alt.payload);
 
   switch (cudf_type.id()) {
@@ -168,7 +168,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
     }
     case cudf::type_id::DECIMAL32: {
       auto const scale =
-        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())};
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type().decimal_scale())};
       auto const rep =
         is_valid ? std::get<sirius::decimal32>(alt.payload).value : numeric::decimal32::rep{};
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
@@ -177,7 +177,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
     }
     case cudf::type_id::DECIMAL64: {
       auto const scale =
-        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())};
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type().decimal_scale())};
       auto const rep =
         is_valid ? std::get<sirius::decimal64>(alt.payload).value : numeric::decimal64::rep{};
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
@@ -186,7 +186,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
     }
     case cudf::type_id::DECIMAL128: {
       auto const scale =
-        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())};
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type().decimal_scale())};
       __int128_t const rep =
         is_valid ? std::get<sirius::decimal128>(alt.payload).value : __int128_t{};
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
@@ -200,7 +200,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::constant const& alt,
     }
     default:
       throw not_implemented_exception("[expression_evaluator] Unsupported scalar type: %s",
-                                      alt.return_type.to_string());
+                                      alt.return_type().to_string());
   }
 }
 

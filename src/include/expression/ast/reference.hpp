@@ -21,6 +21,7 @@
 
 // standard library
 #include <cstdint>
+#include <utility>
 
 namespace sirius::ast {
 
@@ -30,14 +31,24 @@ namespace sirius::ast {
  * Carries an index into the input data batch's column vector and the SQL type
  * of the referenced column (mirroring duckdb::BoundReferenceExpression's
  * return_type). The executor resolves column types from the input table_view at
- * runtime and ignores return_type; it exists so the cuDF-AST translator's
+ * runtime and ignores return_type(); it exists so the cuDF-AST translator's
  * decimal-propagation guard can see the type of a referenced decimal column.
  */
 struct reference {
   uint32_t column_index{0};
-  sirius::logical_type return_type{};
+
+  reference() = default;
+  explicit reference(uint32_t column_index, sirius::logical_type return_type = {})
+    : column_index(column_index), return_type_(std::move(return_type))
+  {
+  }
+
+  [[nodiscard]] sirius::logical_type const& return_type() const noexcept { return return_type_; }
 
   std::size_t cudf_ast_op_count() const;
+
+ private:
+  sirius::logical_type return_type_{};
 };
 
 }  // namespace sirius::ast
