@@ -40,7 +40,7 @@
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>
 #include <expression/value.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
@@ -300,8 +300,8 @@ std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
   return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
-using exp_executor      = ::sirius::gpu_expression_executor;
-using exp_strategy_enum = ::sirius::expression_executor_strategy;
+using exp_executor      = ::sirius::expression_evaluator;
+using exp_strategy_enum = ::sirius::expression_evaluator_strategy;
 auto constexpr MAT      = exp_strategy_enum::MATERIALIZE;
 
 // Strategy tag types for TEMPLATE_TEST_CASE: each test instantiates against all three strategies
@@ -318,12 +318,12 @@ struct ast_jit_strategy {
 
 // Native sirius::ast::node construction helpers (make_ref / make_int_const / ...)
 // and GPU->host copy helpers live in ast_test_support.hpp, shared across the
-// expression_executor test suites.
+// expression_evaluator test suites.
 
 using sirius::logical_type;
 using sirius::type_id;
 
-// Shorthand: build executor, run execute(), return output table view and input table view.
+// Shorthand: build executor, run evaluate(), return output table view and input table view.
 struct exec_result {
   std::shared_ptr<data_batch> input;
   std::shared_ptr<data_batch> output;
@@ -343,7 +343,7 @@ exec_result run_execute(memory_space& space,
   exp_executor executor(ast_nodes, get_resource_ref(space), cudf::get_default_stream(), strategy);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
-  auto output_table = executor.execute(in_repr.get_table_view());
+  auto output_table = executor.evaluate(in_repr.get_table_view());
   REQUIRE(output_table != nullptr);
   auto output_batch = sirius::make_data_batch(
     std::move(output_table), *input_ro.get_memory_space(), cudf::get_default_stream());
@@ -379,11 +379,11 @@ std::vector<std::unique_ptr<ast_node>> one(std::unique_ptr<ast_node> n)
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// execute() — reference, constant, comparison (basic smoke test per type)
+// evaluate() — reference, constant, comparison (basic smoke test per type)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
-                   "[expression_executor]",
+TEMPLATE_TEST_CASE("evaluate projects references, constants, and comparisons",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -483,7 +483,7 @@ TEMPLATE_TEST_CASE("execute projects references, constants, and comparisons",
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -559,8 +559,8 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
 // Arithmetic functions (AST-capable): col + const, col * col
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("execute arithmetic functions",
-                   "[expression_executor]",
+TEMPLATE_TEST_CASE("evaluate arithmetic functions",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -631,8 +631,8 @@ TEMPLATE_TEST_CASE("execute arithmetic functions",
 // cudf::binary_operation on fixed_point columns/scalars).
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
-                   "[expression_executor][decimal]",
+TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL64)",
+                   "[expression_evaluator][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -720,8 +720,8 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL64)",
   }
 }
 
-TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL32)",
-                   "[expression_executor][decimal]",
+TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL32)",
+                   "[expression_evaluator][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -731,7 +731,7 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL32)",
   REQUIRE(space != nullptr);
 
   // Width 8 → INT32 physical (DuckDB) → DECIMAL32 (cudf). Exercises the
-  // DECIMAL32 branches in gpu_execute_constant.cpp and GetCudfType.
+  // DECIMAL32 branches in constant.cpp and GetCudfType.
   uint8_t const width = 8;
   uint8_t const scale = 2;
   auto const dec_type = logical_type::make_decimal(width, scale);
@@ -760,8 +760,8 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL32)",
   REQUIRE(out0 == expected);
 }
 
-TEMPLATE_TEST_CASE("execute nested decimal arithmetic (col + 1.00) * 2",
-                   "[expression_executor][decimal]",
+TEMPLATE_TEST_CASE("evaluate nested decimal arithmetic (col + 1.00) * 2",
+                   "[expression_evaluator][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -809,14 +809,14 @@ TEMPLATE_TEST_CASE("execute nested decimal arithmetic (col + 1.00) * 2",
   REQUIRE(out0 == expected);
 }
 
-TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL128)",
-                   "[expression_executor][decimal]",
+TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL128)",
+                   "[expression_evaluator][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
 {
   // Width 38 → INT128 physical (DuckDB) → DECIMAL128 (cudf). Exercises the
-  // hugeint_t → __int128_t conversion branch in gpu_execute_constant.cpp for
+  // hugeint_t → __int128_t conversion branch in constant.cpp for
   // decimal constants, plus cudf::binary_operation on DECIMAL128 columns.
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
@@ -849,8 +849,8 @@ TEMPLATE_TEST_CASE("execute decimal arithmetic (DECIMAL128)",
   }
 }
 
-TEMPLATE_TEST_CASE("execute decimal DIV (DECIMAL64)",
-                   "[expression_executor][decimal]",
+TEMPLATE_TEST_CASE("evaluate decimal DIV (DECIMAL64)",
+                   "[expression_evaluator][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -891,8 +891,8 @@ TEMPLATE_TEST_CASE("execute decimal DIV (DECIMAL64)",
   REQUIRE(out0 == expected);
 }
 
-TEMPLATE_TEST_CASE("execute decimal TPC-H Q1 shape price * (1 - discount)",
-                   "[expression_executor][decimal]",
+TEMPLATE_TEST_CASE("evaluate decimal TPC-H Q1 shape price * (1 - discount)",
+                   "[expression_evaluator][decimal]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -956,7 +956,7 @@ TEMPLATE_TEST_CASE("execute decimal TPC-H Q1 shape price * (1 - discount)",
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1023,8 +1023,8 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
 // CASE/WHEN (always materializes — AST breaker)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("execute CASE expression",
-                   "[expression_executor]",
+TEMPLATE_TEST_CASE("evaluate CASE expression",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1054,8 +1054,8 @@ TEMPLATE_TEST_CASE("execute CASE expression",
   }
 }
 
-TEMPLATE_TEST_CASE("execute CASE with multiple WHEN branches",
-                   "[expression_executor]",
+TEMPLATE_TEST_CASE("evaluate CASE with multiple WHEN branches",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1089,8 +1089,11 @@ TEMPLATE_TEST_CASE("execute CASE with multiple WHEN branches",
 // BETWEEN (decomposed into two comparisons + AND)
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE(
-  "select BETWEEN", "[expression_executor]", mat_strategy, ast_interpret_strategy, ast_jit_strategy)
+TEMPLATE_TEST_CASE("select BETWEEN",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
 {
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
@@ -1120,7 +1123,7 @@ TEMPLATE_TEST_CASE(
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("select IN and NOT IN",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1173,7 +1176,7 @@ TEMPLATE_TEST_CASE("select IN and NOT IN",
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("select IS NULL and IS NOT NULL",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1211,8 +1214,8 @@ TEMPLATE_TEST_CASE("select IS NULL and IS NOT NULL",
 // COALESCE — AST breaker, always materialized, exercised across all strategies
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("execute COALESCE",
-                   "[expression_executor]",
+TEMPLATE_TEST_CASE("evaluate COALESCE",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1365,7 +1368,7 @@ TEMPLATE_TEST_CASE("execute COALESCE",
 }
 
 TEMPLATE_TEST_CASE("select COALESCE nested in predicate",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1394,7 +1397,7 @@ TEMPLATE_TEST_CASE("select COALESCE nested in predicate",
 }
 
 TEMPLATE_TEST_CASE("select respects null mask under plain comparison",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1421,7 +1424,7 @@ TEMPLATE_TEST_CASE("select respects null mask under plain comparison",
 }
 
 TEMPLATE_TEST_CASE("select COMPARE_NOT_DISTINCT_FROM",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy)
 {
@@ -1444,7 +1447,7 @@ TEMPLATE_TEST_CASE("select COMPARE_NOT_DISTINCT_FROM",
 }
 
 TEMPLATE_TEST_CASE("select COMPARE_DISTINCT_FROM",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy)
 {
@@ -1466,7 +1469,7 @@ TEMPLATE_TEST_CASE("select COMPARE_DISTINCT_FROM",
 }
 
 TEMPLATE_TEST_CASE("select NOT operator",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1496,7 +1499,7 @@ TEMPLATE_TEST_CASE("select NOT operator",
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("select conjunction with AST breaker",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1539,7 +1542,7 @@ TEMPLATE_TEST_CASE("select conjunction with AST breaker",
 }
 
 TEMPLATE_TEST_CASE("select OR conjunction",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1575,7 +1578,7 @@ TEMPLATE_TEST_CASE("select OR conjunction",
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("select with nested CASE in predicate",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1611,7 +1614,7 @@ TEMPLATE_TEST_CASE("select with nested CASE in predicate",
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("select IN with conjunction multi-column",
-                   "[expression_executor]",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1657,11 +1660,11 @@ TEMPLATE_TEST_CASE("select IN with conjunction multi-column",
 }
 
 // ---------------------------------------------------------------------------
-// Arithmetic in projection combined with CASE — complex execute() output
+// Arithmetic in projection combined with CASE — complex evaluate() output
 // ---------------------------------------------------------------------------
 
-TEMPLATE_TEST_CASE("execute mixed arithmetic and CASE projection",
-                   "[expression_executor]",
+TEMPLATE_TEST_CASE("evaluate mixed arithmetic and CASE projection",
+                   "[expression_evaluator]",
                    mat_strategy,
                    ast_interpret_strategy,
                    ast_jit_strategy)
@@ -1749,12 +1752,12 @@ std::unique_ptr<cudf::table> run_native_ast(memory_space& space,
                                             exp_strategy_enum strategy = MAT)
 {
   exp_executor executor(expr_ptr, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  return executor.execute(tv);
+  return executor.evaluate(tv);
 }
 
 }  // namespace
 
-TEST_CASE("native_ast - reference identity", "[expression_executor_ast_native][reference]")
+TEST_CASE("native_ast - reference identity", "[expression_evaluator_ast_native][reference]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1768,7 +1771,7 @@ TEST_CASE("native_ast - reference identity", "[expression_executor_ast_native][r
   REQUIRE(out_host == in_host);
 }
 
-TEST_CASE("native_ast - constant INTEGER", "[expression_executor_ast_native][constant]")
+TEST_CASE("native_ast - constant INTEGER", "[expression_evaluator_ast_native][constant]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1783,7 +1786,7 @@ TEST_CASE("native_ast - constant INTEGER", "[expression_executor_ast_native][con
   REQUIRE(copy_column_to_host<int32_t>(out->view().column(0)) == expected);
 }
 
-TEST_CASE("native_ast - constant VARCHAR", "[expression_executor_ast_native][constant]")
+TEST_CASE("native_ast - constant VARCHAR", "[expression_evaluator_ast_native][constant]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1803,7 +1806,7 @@ TEST_CASE("native_ast - constant VARCHAR", "[expression_executor_ast_native][con
 }
 
 TEST_CASE("native_ast - comparison EQUAL (MATERIALIZE)",
-          "[expression_executor_ast_native][comparison]")
+          "[expression_evaluator_ast_native][comparison]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1823,7 +1826,7 @@ TEST_CASE("native_ast - comparison EQUAL (MATERIALIZE)",
 }
 
 TEST_CASE("native_ast - comparison LESS_THAN (AST_INTERPRET)",
-          "[expression_executor_ast_native][comparison]")
+          "[expression_evaluator_ast_native][comparison]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1843,7 +1846,7 @@ TEST_CASE("native_ast - comparison LESS_THAN (AST_INTERPRET)",
 }
 
 TEST_CASE("native_ast - conjunction AND (MATERIALIZE)",
-          "[expression_executor_ast_native][conjunction]")
+          "[expression_evaluator_ast_native][conjunction]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1875,7 +1878,7 @@ TEST_CASE("native_ast - conjunction AND (MATERIALIZE)",
   }
 }
 
-TEST_CASE("native_ast - between (MATERIALIZE)", "[expression_executor_ast_native][between]")
+TEST_CASE("native_ast - between (MATERIALIZE)", "[expression_evaluator_ast_native][between]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1898,7 +1901,7 @@ TEST_CASE("native_ast - between (MATERIALIZE)", "[expression_executor_ast_native
   }
 }
 
-TEST_CASE("native_ast - unary_op NOT (MATERIALIZE)", "[expression_executor_ast_native][unary_op]")
+TEST_CASE("native_ast - unary_op NOT (MATERIALIZE)", "[expression_evaluator_ast_native][unary_op]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1920,7 +1923,7 @@ TEST_CASE("native_ast - unary_op NOT (MATERIALIZE)", "[expression_executor_ast_n
 }
 
 TEST_CASE("native_ast - unary_op IS_NULL (MATERIALIZE)",
-          "[expression_executor_ast_native][unary_op]")
+          "[expression_evaluator_ast_native][unary_op]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1944,7 +1947,7 @@ TEST_CASE("native_ast - unary_op IS_NULL (MATERIALIZE)",
 }
 
 TEST_CASE("native_ast - unary_op IS_NOT_NULL (MATERIALIZE)",
-          "[expression_executor_ast_native][unary_op]")
+          "[expression_evaluator_ast_native][unary_op]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1967,7 +1970,7 @@ TEST_CASE("native_ast - unary_op IS_NOT_NULL (MATERIALIZE)",
   }
 }
 
-TEST_CASE("native_ast - in_list IN (MATERIALIZE)", "[expression_executor_ast_native][in_list]")
+TEST_CASE("native_ast - in_list IN (MATERIALIZE)", "[expression_evaluator_ast_native][in_list]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -1991,7 +1994,7 @@ TEST_CASE("native_ast - in_list IN (MATERIALIZE)", "[expression_executor_ast_nat
   }
 }
 
-TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_executor_ast_native][coalesce]")
+TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_evaluator_ast_native][coalesce]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -2018,7 +2021,7 @@ TEST_CASE("native_ast - coalesce (MATERIALIZE)", "[expression_executor_ast_nativ
 }
 
 TEST_CASE("native_ast - cast INTEGER->BIGINT (MATERIALIZE)",
-          "[expression_executor_ast_native][cast]")
+          "[expression_evaluator_ast_native][cast]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -2040,7 +2043,7 @@ TEST_CASE("native_ast - cast INTEGER->BIGINT (MATERIALIZE)",
 }
 
 TEST_CASE("native_ast - function_call add (MATERIALIZE)",
-          "[expression_executor_ast_native][function_call]")
+          "[expression_evaluator_ast_native][function_call]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -2073,7 +2076,7 @@ TEST_CASE("native_ast - function_call add (MATERIALIZE)",
 }
 
 TEST_CASE("native_ast - function_call add (AST_INTERPRET)",
-          "[expression_executor_ast_native][function_call]")
+          "[expression_evaluator_ast_native][function_call]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -2105,7 +2108,7 @@ TEST_CASE("native_ast - function_call add (AST_INTERPRET)",
 }
 
 TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
-          "[expression_executor_ast_native][case_expr]")
+          "[expression_evaluator_ast_native][case_expr]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -2138,7 +2141,7 @@ TEST_CASE("native_ast - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
 // (sirius-db/sirius#699). DuckDB->Sirius lowering of these kinds is covered by
 // the dedicated [ast_from_duckdb] suite.
 TEST_CASE("native_ast - comparison DISTINCT_FROM / NOT_DISTINCT_FROM executes",
-          "[expression_executor_ast_native][comparison]")
+          "[expression_evaluator_ast_native][comparison]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);

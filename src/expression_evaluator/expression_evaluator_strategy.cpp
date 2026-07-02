@@ -15,38 +15,38 @@
  */
 
 // sirius
-#include <expression_executor/expression_executor_strategy.hpp>
+#include <expression_evaluator/expression_evaluator_strategy.hpp>
 
 // standard library
 #include <cassert>
 
 namespace sirius {
 
-bool string_to_strategy(std::string_view sv, expression_executor_strategy& out)
+bool string_to_strategy(std::string_view sv, expression_evaluator_strategy& out)
 {
   if (sv == "materialize") {
-    out = expression_executor_strategy::MATERIALIZE;
+    out = expression_evaluator_strategy::MATERIALIZE;
     return true;
   }
   if (sv == "ast_interpret") {
-    out = expression_executor_strategy::AST_INTERPRET;
+    out = expression_evaluator_strategy::AST_INTERPRET;
     return true;
   }
   if (sv == "ast_jit") {
-    out = expression_executor_strategy::AST_JIT;
+    out = expression_evaluator_strategy::AST_JIT;
     return true;
   }
   return false;
 }
 
-std::string_view strategy_to_string(expression_executor_strategy s)
+std::string_view strategy_to_string(expression_evaluator_strategy s)
 {
   switch (s) {
-    case expression_executor_strategy::MATERIALIZE: return "materialize";
-    case expression_executor_strategy::AST_INTERPRET: return "ast_interpret";
-    case expression_executor_strategy::AST_JIT: return "ast_jit";
+    case expression_evaluator_strategy::MATERIALIZE: return "materialize";
+    case expression_evaluator_strategy::AST_INTERPRET: return "ast_interpret";
+    case expression_evaluator_strategy::AST_JIT: return "ast_jit";
   }
-  assert(false && "Unrecognized expression_executor_strategy");
+  assert(false && "Unrecognized expression_evaluator_strategy");
   __builtin_unreachable();
 }
 

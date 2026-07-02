@@ -21,7 +21,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
-#include "expression_executor/expression_executor_strategy.hpp"
+#include "expression_evaluator/expression_evaluator_strategy.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
@@ -113,6 +113,23 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
+
+// Read the per-session `enable_duckdb_fallback` setting (default true).  Mirrors
+// how `gpu_execution` is read via ClientContext::TryGetCurrentSetting, so a
+// `SET enable_duckdb_fallback = false` stays scoped to the connection that
+// issued it instead of leaking through a process-global to every other
+// connection (and, across a test binary, to every later test case).  The
+// AddExtensionOption registration already stores the value per-context; only the
+// read had been going through the global static.
+bool duckdb_fallback_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_duckdb_fallback", setting) && !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  return true;
+}
+
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
                                                         const string& query,
@@ -589,7 +606,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   } catch (std::exception& e) {
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
-    if (Config::ENABLE_DUCKDB_FALLBACK) {
+    if (duckdb_fallback_enabled(context)) {
       result->plan_error         = true;
       result->plan_error_message = error.RawMessage();
     } else {
@@ -627,7 +644,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
-        if (Config::ENABLE_DUCKDB_FALLBACK) {
+        if (duckdb_fallback_enabled(context)) {
           SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
@@ -1364,19 +1381,35 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
 
-static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
+static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 {
-  auto value = StringValue::Get(parameter);
-  sirius::expression_executor_strategy parsed;
+  sirius::expression_evaluator_strategy parsed;
   if (!sirius::string_to_strategy(value, parsed)) {
     throw InvalidInputException(
-      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
+      "Invalid expression_evaluator_strategy '{}'. Valid values: materialize, ast_interpret, "
       "ast_jit",
       value);
   }
-  Config::EXPRESSION_EXECUTOR_STRATEGY = parsed;
-  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EXECUTOR_STRATEGY to {}",
-                   sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY));
+  Config::EXPRESSION_EVALUATOR_STRATEGY = parsed;
+  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EVALUATOR_STRATEGY to {}",
+                   sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY));
+}
+
+static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scope, Value& parameter)
+{
+  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
+}
+
+// Deprecated alias for `expression_evaluator_strategy`. Kept so existing
+// `SET expression_executor_strategy=...` statements keep working; remove in a future release.
+static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
+{
+  SIRIUS_LOG_WARN(
+    "The 'expression_executor_strategy' setting is deprecated; use "
+    "'expression_evaluator_strategy' instead.");
+  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
@@ -1418,10 +1451,15 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
 
-static void SetEnableDuckdbFallback(ClientContext& context, SetScope scope, Value& parameter)
+static void SetEnableDuckdbFallback(ClientContext& /*context*/,
+                                    SetScope /*scope*/,
+                                    Value& /*parameter*/)
 {
-  Config::ENABLE_DUCKDB_FALLBACK = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DUCKDB_FALLBACK to {}", Config::ENABLE_DUCKDB_FALLBACK);
+  // No process-global mirror is kept.  DuckDB stores the value per-context and it
+  // is read via duckdb_fallback_enabled() -> ClientContext::TryGetCurrentSetting,
+  // so `SET enable_duckdb_fallback = ...` on one connection stays scoped to that
+  // connection instead of leaking to every other connection (and, across the test
+  // binary, to later test cases that create their own database).
 }
 
 static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value& parameter)
@@ -1584,12 +1622,21 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             SetUseCudfExpr);
 
   config.AddExtensionOption(
-    "expression_executor_strategy",
-    "Strategy for the gpu_expression_executor: 'materialize', 'ast_interpret', or "
+    "expression_evaluator_strategy",
+    "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
     "'ast_jit'",
     LogicalType::VARCHAR,
-    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY))),
-    SetExpressionExecutorStrategy);
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
+    SetExpressionEvaluatorStrategy);
+
+  // Deprecated alias for `expression_evaluator_strategy`; remove in a future release.
+  config.AddExtensionOption(
+    "expression_executor_strategy",
+    "[DEPRECATED - use expression_evaluator_strategy] Strategy for the expression_evaluator: "
+    "'materialize', 'ast_interpret', or 'ast_jit'",
+    LogicalType::VARCHAR,
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
+    SetExpressionExecutorStrategyDeprecated);
 
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",
@@ -1633,7 +1680,9 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "enable_duckdb_fallback",
     "Whether to enable fallback to duckdb execution after an error is detected",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_DUCKDB_FALLBACK),
+    Value::BOOLEAN(true),  // literal default: never seed from a process-global that a
+                           // prior connection's SET may have mutated (that leaked the
+                           // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
   // Add in config options for special JIT implementation for regex

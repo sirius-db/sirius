@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Byte-equivalence tests for the (now single-path) gpu_expression_executor.
+// Byte-equivalence tests for the (now single-path) expression_evaluator.
 //
 // For each Sirius AST alternative, the test constructs the same expression two
 // ways:
@@ -48,7 +48,7 @@
 #include <expression/ast/node.hpp>
 #include <expression/ast/to_duckdb.hpp>
 #include <expression/value.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
@@ -129,8 +129,8 @@ std::shared_ptr<data_batch> make_input_batch(
   return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
-using exp_executor      = ::sirius::gpu_expression_executor;
-using exp_strategy_enum = ::sirius::expression_executor_strategy;
+using exp_executor      = ::sirius::expression_evaluator;
+using exp_strategy_enum = ::sirius::expression_evaluator_strategy;
 auto constexpr MAT      = exp_strategy_enum::MATERIALIZE;
 auto constexpr AST_I    = exp_strategy_enum::AST_INTERPRET;
 
@@ -150,7 +150,7 @@ std::unique_ptr<cudf::table> run_one(memory_space& space,
                                      exp_strategy_enum strategy)
 {
   exp_executor executor(expr_ptr, get_resource_ref(space), cudf::get_default_stream(), strategy);
-  return executor.execute(tv);
+  return executor.evaluate(tv);
 }
 
 // DuckDB-side BoundReferenceExpression with INTEGER placeholder.
@@ -210,7 +210,7 @@ std::vector<std::optional<std::pair<int, int>>> range(int lo, int hi)
 // reference
 // ============================================================================
 
-TEST_CASE("ast_equivalence - reference identity round-trip", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - reference identity round-trip", "[expression_evaluator_ast]")
 {
   auto duck_expr =
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
@@ -223,7 +223,7 @@ TEST_CASE("ast_equivalence - reference identity round-trip", "[gpu_expression_ex
 // constant — INTEGER and VARCHAR variants.
 // ============================================================================
 
-TEST_CASE("ast_equivalence - constant INTEGER", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - constant INTEGER", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(42));
   auto hand_ast  = make_int_const(42);
@@ -231,7 +231,7 @@ TEST_CASE("ast_equivalence - constant INTEGER", "[gpu_expression_executor_ast]")
     *duck_expr, *hand_ast, int32_col(), range(0, 100), MAT, copy_column_to_host<int32_t>);
 }
 
-TEST_CASE("ast_equivalence - constant VARCHAR", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - constant VARCHAR", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundConstantExpression>(Value("hello"));
   auto hand_ast  = make_str_const("hello");
@@ -244,7 +244,7 @@ TEST_CASE("ast_equivalence - constant VARCHAR", "[gpu_expression_executor_ast]")
 // MATERIALIZE LESSTHAN.
 // ============================================================================
 
-TEST_CASE("ast_equivalence - comparison EQUAL (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - comparison EQUAL (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
@@ -253,7 +253,7 @@ TEST_CASE("ast_equivalence - comparison EQUAL (MATERIALIZE)", "[gpu_expression_e
     *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
-TEST_CASE("ast_equivalence - comparison EQUAL (AST_INTERPRET)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - comparison EQUAL (AST_INTERPRET)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
@@ -262,7 +262,7 @@ TEST_CASE("ast_equivalence - comparison EQUAL (AST_INTERPRET)", "[gpu_expression
     *duck_expr, *hand_ast, int32_col(), range(0, 10), AST_I, copy_bool_column_to_host);
 }
 
-TEST_CASE("ast_equivalence - comparison LESSTHAN (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - comparison LESSTHAN (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_LESSTHAN, duck_int_ref(0), duck_int_const(5));
@@ -297,7 +297,7 @@ std::unique_ptr<sirius::ast::node> hand_and_1_9()
 }
 }  // namespace
 
-TEST_CASE("ast_equivalence - conjunction AND (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - conjunction AND (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duck_and_1_9();
   auto hand_ast  = hand_and_1_9();
@@ -305,7 +305,7 @@ TEST_CASE("ast_equivalence - conjunction AND (MATERIALIZE)", "[gpu_expression_ex
     *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
-TEST_CASE("ast_equivalence - conjunction AND (AST_INTERPRET)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - conjunction AND (AST_INTERPRET)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duck_and_1_9();
   auto hand_ast  = hand_and_1_9();
@@ -317,7 +317,7 @@ TEST_CASE("ast_equivalence - conjunction AND (AST_INTERPRET)", "[gpu_expression_
 // between — BoundBetweenExpression with INTEGER bounds (MATERIALIZE).
 // ============================================================================
 
-TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundBetweenExpression>(
     duck_int_ref(0), duck_int_const(5), duck_int_const(15), /*lo=*/true, /*hi=*/true);
@@ -330,8 +330,7 @@ TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[gpu_expression_executor_a
 // case_expr — single WHEN/THEN + ELSE (MATERIALIZE — AST breaker).
 // ============================================================================
 
-TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
-          "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_when = duckdb::make_uniq<BoundComparisonExpression>(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
@@ -358,7 +357,7 @@ TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)",
 // cast — INTEGER -> BIGINT (MATERIALIZE).
 // ============================================================================
 
-TEST_CASE("ast_equivalence - cast INTEGER->BIGINT (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - cast INTEGER->BIGINT (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr =
     BoundCastExpression::AddDefaultCastToType(duck_int_ref(0), LogicalType{LogicalTypeId::BIGINT});
@@ -372,7 +371,7 @@ TEST_CASE("ast_equivalence - cast INTEGER->BIGINT (MATERIALIZE)", "[gpu_expressi
 // unary_op — one TEST_CASE per kind (MATERIALIZE).
 // ============================================================================
 
-TEST_CASE("ast_equivalence - unary_op NOT (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - unary_op NOT (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   // Need a BOOLEAN-producing child; use a comparison.
   auto duck_inner = duckdb::make_uniq<BoundComparisonExpression>(
@@ -389,7 +388,7 @@ TEST_CASE("ast_equivalence - unary_op NOT (MATERIALIZE)", "[gpu_expression_execu
     *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
-TEST_CASE("ast_equivalence - unary_op IS_NULL (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - unary_op IS_NULL (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
@@ -401,7 +400,7 @@ TEST_CASE("ast_equivalence - unary_op IS_NULL (MATERIALIZE)", "[gpu_expression_e
     *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_bool_column_to_host);
 }
 
-TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
@@ -413,11 +412,11 @@ TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[gpu_expressi
     *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_bool_column_to_host);
 }
 
-TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[expression_evaluator_ast]")
 {
   // OPERATOR_TRY is recognized by the AST surface but not executable by the
-  // current gpu_expression_executor (it throws on dispatch through
-  // gpu_execute_operator.cpp). Verify only the translation half of the contract
+  // current expression_evaluator (it throws on dispatch through
+  // operator.cpp). Verify only the translation half of the contract
   // for this kind: the translated node has the expected unary_op kind and round-
   // trips back to OPERATOR_TRY. Execution coverage is intentionally omitted until
   // the underlying OPERATOR_TRY specialization lands.
@@ -439,7 +438,7 @@ TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[gpu_expressi
 // coalesce — 2-arg INTEGER (MATERIALIZE — AST breaker).
 // ============================================================================
 
-TEST_CASE("ast_equivalence - coalesce (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - coalesce (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
                                                               LogicalType{LogicalTypeId::INTEGER});
@@ -482,7 +481,7 @@ std::unique_ptr<sirius::ast::node> hand_in_2_5_8()
 }
 }  // namespace
 
-TEST_CASE("ast_equivalence - in_list IN (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - in_list IN (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duck_in_2_5_8();
   auto hand_ast  = hand_in_2_5_8();
@@ -490,7 +489,7 @@ TEST_CASE("ast_equivalence - in_list IN (MATERIALIZE)", "[gpu_expression_executo
     *duck_expr, *hand_ast, int32_col(), range(0, 10), MAT, copy_bool_column_to_host);
 }
 
-TEST_CASE("ast_equivalence - in_list IN (AST_INTERPRET)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - in_list IN (AST_INTERPRET)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duck_in_2_5_8();
   auto hand_ast  = hand_in_2_5_8();
@@ -527,7 +526,7 @@ std::unique_ptr<sirius::ast::node> hand_add_3()
 }
 }  // namespace
 
-TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duck_add_3();
   auto hand_ast  = hand_add_3();
@@ -535,7 +534,7 @@ TEST_CASE("ast_equivalence - function_call add (MATERIALIZE)", "[gpu_expression_
     *duck_expr, *hand_ast, int32_col(), range(0, 50), MAT, copy_column_to_host<int32_t>);
 }
 
-TEST_CASE("ast_equivalence - function_call add (AST_INTERPRET)", "[gpu_expression_executor_ast]")
+TEST_CASE("ast_equivalence - function_call add (AST_INTERPRET)", "[expression_evaluator_ast]")
 {
   auto duck_expr = duck_add_3();
   auto hand_ast  = hand_add_3();

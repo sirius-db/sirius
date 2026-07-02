@@ -92,8 +92,13 @@ One `downgrade_executor` per memory space monitors pressure and moves data to lo
 ### Thread Model
 
 - **Processing thread**: dequeues `downgrade_request` objects sequentially from an `interruptible_mpmc` queue
-- **Monitor thread** (if `monitor_period_ms > 0`): polls memory space for pressure and fires monitor requests via fire-and-forget into the same queue
+- **Monitor thread** (if `monitor_period_ms > 0`): each cycle, if the memory space reports `should_downgrade_memory()`, it applies a **stateless viability gate** (`has_viable_downgrade_target()`) before enqueuing. A request is only fired when a lower tier could plausibly accept the data:
+  - A configured DISK tier is always a viable target.
+  - Without DISK, only a GPU source has a lower tier (HOST). Viability is confirmed by probing each HOST space with a chunk-sized `make_reservation_or_null` (released immediately) — the ground truth for whether downgraded data can actually land, since HOST capacity reflects both live reservations and already-stored downgraded data.
+  - If no target is viable (e.g. idle GPU batches whose only lower tier is a full HOST with no DISK configured), the monitor **backs off** for that cycle without enqueuing, warning once per stall episode. The gate is re-evaluated every cycle with no latched state, so the monitor resumes automatically the instant HOST frees space or GPU pressure drops.
 - **Worker thread pool** (`exec::bounded_thread_pool`): executes actual data movement concurrently
+
+The monitor is not on the correctness-critical path: the pipeline executor drives downgrade on demand via `request_downgrade()` independently, so monitor back-off can never wedge a query. Monitor-issued requests are fire-and-forget.
 
 ### Downgrade Request Pattern
 

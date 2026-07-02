@@ -103,6 +103,18 @@ bool needs_output_assembly(scan_plan const& plan)
   return false;
 }
 
+std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)
+{
+  std::vector<cudf::size_type> positions;
+  positions.reserve(plan.output_layout.size());
+  for (auto const& entry : plan.output_layout) {
+    if (entry.source == scan_plan::output_entry::DATA) {
+      positions.push_back(static_cast<cudf::size_type>(entry.idx));
+    }
+  }
+  return positions;
+}
+
 owning_table_view assemble_scan_output(scan_plan const& plan,
                                        owning_table_view&& table,
                                        std::vector<std::string> const& partition_values,
@@ -144,18 +156,9 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
       out_cols.push_back(std::move(data_cols.at(entry.idx)));
     } else {
       auto const& pcol = plan.partition_columns.at(entry.idx);
-      // partition_values is in partition_columns order, so entry.idx indexes it directly.
-      if (entry.idx >= partition_values.size()) {
-        throw sirius::internal_exception(
-          "[assemble_scan_output] partition_values too short ({}) for partition column '{}' at "
-          "index {}.",
-          partition_values.size(),
-          pcol.name,
-          entry.idx);
-      }
-      auto duckdb_val =
-        duckdb::Value(partition_values[entry.idx]).DefaultCastAs(sirius::to_duckdb(pcol.type));
-      auto scalar = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
+      auto const& pval = partition_values.at(entry.idx);
+      auto duckdb_val  = duckdb::Value(pval).DefaultCastAs(sirius::to_duckdb(pcol.type));
+      auto scalar      = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
       out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
     }
   }
@@ -177,6 +180,32 @@ bool is_output_position(std::size_t i, std::size_t output_types_size)
 
 }  // namespace
 
+bool column_ids_need_reader_projection(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+                                       std::size_t full_schema_size)
+{
+  // count(*) / zero-column scans are NOT a projection: assemble_scan_output keeps
+  // the reader's natural batch (its empty-output_layout path) so the row count the
+  // downstream aggregation consumes is preserved. Projecting to 0 columns would
+  // erase it.
+  if (column_ids.empty()) { return false; }
+  // Virtual columns (e.g. count(*)'s row-id marker) are not physical file columns
+  // and must never drive a by-name reader projection — a scan that reads ONLY
+  // virtual columns (count(*)) keeps the reader's natural batch.  Mirror the
+  // IsVirtualColumn guard handle_position uses below.
+  bool any_real = false;
+  for (std::size_t i = 0; i < column_ids.size(); ++i) {
+    auto const primary_idx = column_ids[i].GetPrimaryIndex();
+    if (duckdb::IsVirtualColumn(primary_idx)) { continue; }
+    any_real = true;
+    // A real column read out of its identity position ⇒ pruned / reordered.
+    if (primary_idx != i) { return true; }
+  }
+  if (!any_real) { return false; }  // only virtual columns (count(*)) — natural batch
+  // All real columns sit at identity positions: a projection only if the read is a
+  // proper prefix (fewer columns than the file's full schema).
+  return column_ids.size() != full_schema_size;
+}
+
 scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<duckdb::idx_t> const& projection_ids,
                           duckdb::vector<std::string> const& names,
@@ -195,10 +224,15 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
 
   // Reader projection is needed whenever the planner pruned / reordered columns
   // (non-empty projection_ids) or hive-partition columns must be stripped from
-  // the physical read. When both are false, column_ids already describes the
-  // natural read order and the reader's unset-projection output matches what
-  // the pipeline expects — matching the old @c _is_projected semantics.
-  plan.needs_reader_projection = !projection_ids.empty() || !partition_indices.empty();
+  // the physical read. It is ALSO needed when projection_ids is empty but
+  // column_ids is itself a pruned/reordered subset — DuckDB's no-projection-
+  // pushdown plan for sirius_read_parquet. Without it the reader returns the full
+  // file width in file order while output_layout assembles by compacted subset
+  // position, selecting the wrong columns. (Guarded on names: the reader is
+  // projected by name, and the ingestible's needs_names check enforces presence.)
+  plan.needs_reader_projection =
+    !projection_ids.empty() || !partition_indices.empty() ||
+    (!names.empty() && column_ids_need_reader_projection(column_ids, names.size()));
 
   // Walk positions in output-first order. When projection_ids is non-empty the
   // first output_types_size entries are the output columns in output order;

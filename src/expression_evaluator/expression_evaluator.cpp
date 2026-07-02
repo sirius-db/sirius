@@ -19,18 +19,12 @@
 
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
 #include <expression/ast/node.hpp>       // sirius::ast::node alternatives
-#include <expression/ast/to_duckdb.hpp>  // sirius::ast::to_duckdb (per-alternative overloads + node dispatcher)
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
 // cucascade
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
-
-// duckdb
-#include <duckdb/common/exception.hpp>
-#include <duckdb/common/types.hpp>
-#include <duckdb/planner/expression.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -44,6 +38,7 @@
 #include <rmm/resource_ref.hpp>
 
 // standard library
+#include <memory>
 #include <numeric>
 #include <variant>
 
@@ -58,18 +53,17 @@ bool IsFixedWidth(cudf::data_type const& type)
 }  // namespace
 
 namespace sirius {
-using data_batch     = cucascade::data_batch;
-using execute_result = gpu_expression_executor::execute_result;
-using ast_result     = gpu_expression_executor::ast_result;
+using data_batch      = cucascade::data_batch;
+using evaluate_result = expression_evaluator::evaluate_result;
+using ast_result      = expression_evaluator::ast_result;
 
 //===----------------------------------------------------------------------===//
 // ast_result
 //===----------------------------------------------------------------------===//
 
-gpu_expression_executor::ast_result::ast_result(
-  expr_ref e,
-  std::vector<std::vector<std::size_t>> scalar_indices,
-  std::vector<std::vector<std::size_t>> column_indices)
+expression_evaluator::ast_result::ast_result(expr_ref e,
+                                             std::vector<std::vector<std::size_t>> scalar_indices,
+                                             std::vector<std::vector<std::size_t>> column_indices)
   : expr(e)
 {
   auto const total_scalars = std::accumulate(
@@ -98,45 +92,45 @@ gpu_expression_executor::ast_result::ast_result(
 }
 
 //===----------------------------------------------------------------------===//
-// execute_result
+// evaluate_result
 //===----------------------------------------------------------------------===//
 
 std::reference_wrapper<cudf::ast::expression const>
-gpu_expression_executor::execute_result::get_expr() const
+expression_evaluator::evaluate_result::get_expr() const
 {
   if (!is_ast()) {
-    throw std::runtime_error("[execute_result] Attempted to get expr from materialized result");
+    throw std::runtime_error("[evaluate_result] Attempted to get expr from materialized result");
   }
   return std::get<ast_result>(payload).expr;
 }
 
-std::vector<std::size_t> gpu_expression_executor::execute_result::get_temp_scalar_indices() const
+std::vector<std::size_t> expression_evaluator::evaluate_result::get_temp_scalar_indices() const
 {
   if (is_ast()) { return std::get<ast_result>(payload).temp_scalar_indices; }
   return {};
 }
 
-std::vector<std::size_t> gpu_expression_executor::execute_result::get_temp_column_indices() const
+std::vector<std::size_t> expression_evaluator::evaluate_result::get_temp_column_indices() const
 {
   if (is_ast()) { return std::get<ast_result>(payload).temp_column_indices; }
   return {};
 }
 
-cudf::scalar const& gpu_expression_executor::execute_result::get_scalar() const
+cudf::scalar const& expression_evaluator::evaluate_result::get_scalar() const
 {
   if (!is_scalar()) {
     throw std::runtime_error(
-      "[execute_result] Attempted to get scalar from non-scalar execute_result");
+      "[evaluate_result] Attempted to get scalar from non-scalar evaluate_result");
   }
   auto const& scalar_payload = std::get<std::unique_ptr<cudf::scalar>>(payload);
   return *scalar_payload;
 }
 
-cudf::column_view gpu_expression_executor::execute_result::get_column_view() const
+cudf::column_view expression_evaluator::evaluate_result::get_column_view() const
 {
   if (is_ast() || is_scalar()) {
     throw std::runtime_error(
-      "[execute_result] Attempted to get column view from non-column execute_result");
+      "[evaluate_result] Attempted to get column view from non-column evaluate_result");
   }
   if (std::holds_alternative<cudf::column_view>(payload)) {
     return std::get<cudf::column_view>(payload);
@@ -145,24 +139,24 @@ cudf::column_view gpu_expression_executor::execute_result::get_column_view() con
   return column_payload->view();
 }
 
-std::unique_ptr<cudf::column> gpu_expression_executor::execute_result::release_column()
+std::unique_ptr<cudf::column> expression_evaluator::evaluate_result::release_column()
 {
   if (std::holds_alternative<std::unique_ptr<cudf::column>>(payload)) {
     return std::move(std::get<std::unique_ptr<cudf::column>>(payload));
   }
   throw std::runtime_error(
-    "[execute_result] Attempted to get column from execute_result that does not hold a column");
+    "[evaluate_result] Attempted to get column from evaluate_result that does not hold a column");
 }
 
 //===----------------------------------------------------------------------===//
-// gpu_expression_executor
+// expression_evaluator
 //===----------------------------------------------------------------------===//
 
-gpu_expression_executor::gpu_expression_executor(
+expression_evaluator::expression_evaluator(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
   rmm::device_async_resource_ref resource_ref,
   rmm::cuda_stream_view stream,
-  expression_executor_strategy strategy,
+  expression_evaluator_strategy strategy,
   std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
@@ -172,30 +166,30 @@ gpu_expression_executor::gpu_expression_executor(
   }
 }
 
-gpu_expression_executor::gpu_expression_executor(sirius::ast::node const& expression,
-                                                 rmm::device_async_resource_ref resource_ref,
-                                                 rmm::cuda_stream_view stream,
-                                                 expression_executor_strategy strategy,
-                                                 std::size_t min_ast_size)
-  : gpu_expression_executor(&expression, resource_ref, stream, strategy, min_ast_size)
+expression_evaluator::expression_evaluator(sirius::ast::node const& expression,
+                                           rmm::device_async_resource_ref resource_ref,
+                                           rmm::cuda_stream_view stream,
+                                           expression_evaluator_strategy strategy,
+                                           std::size_t min_ast_size)
+  : expression_evaluator(&expression, resource_ref, stream, strategy, min_ast_size)
 {
 }
 
-gpu_expression_executor::gpu_expression_executor(sirius::ast::node const* expression,
-                                                 rmm::device_async_resource_ref resource_ref,
-                                                 rmm::cuda_stream_view stream,
-                                                 expression_executor_strategy strategy,
-                                                 std::size_t min_ast_size)
+expression_evaluator::expression_evaluator(sirius::ast::node const* expression,
+                                           rmm::device_async_resource_ref resource_ref,
+                                           rmm::cuda_stream_view stream,
+                                           expression_evaluator_strategy strategy,
+                                           std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
   _ast_expressions.push_back(expression);
 }
 
-gpu_expression_executor::gpu_expression_executor(std::vector<sirius::ast::node const*> expressions,
-                                                 rmm::device_async_resource_ref resource_ref,
-                                                 rmm::cuda_stream_view stream,
-                                                 expression_executor_strategy strategy,
-                                                 std::size_t min_ast_size)
+expression_evaluator::expression_evaluator(std::vector<sirius::ast::node const*> expressions,
+                                           rmm::device_async_resource_ref resource_ref,
+                                           rmm::cuda_stream_view stream,
+                                           expression_evaluator_strategy strategy,
+                                           std::size_t min_ast_size)
   : _ast_expressions(std::move(expressions)),
     _strategy(strategy),
     _mr(resource_ref),
@@ -204,7 +198,7 @@ gpu_expression_executor::gpu_expression_executor(std::vector<sirius::ast::node c
 {
 }
 
-std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root_expr)
+std::unique_ptr<cudf::column> expression_evaluator::evaluate_ast(expr_ref root_expr)
 {
   std::vector<cudf::column_view> combined_column_views;
   combined_column_views.reserve(_input_table.num_columns() + _temp_columns.size());
@@ -225,25 +219,25 @@ std::unique_ptr<cudf::column> gpu_expression_executor::execute_ast(expr_ref root
   }
 
   cudf::table_view combined_table_view(combined_column_views);
-  if (_strategy == expression_executor_strategy::AST_INTERPRET) {
+  if (_strategy == expression_evaluator_strategy::AST_INTERPRET) {
     return cudf::compute_column(combined_table_view, root_expr.get(), _stream, _mr);
   } else {
     return cudf::compute_column_jit(combined_table_view, root_expr.get(), _stream, _mr);
   }
 }
 
-execute_result gpu_expression_executor::materialize_as_ast_column(
+evaluate_result expression_evaluator::materialize_as_ast_column(
   std::unique_ptr<cudf::column> column)
 {
   auto const col_idx         = _input_table.num_columns() + _temp_columns.size();
   auto const temp_column_idx = _temp_columns.size();
   _temp_columns.push_back(std::move(column));
   auto const& col_ref = _ast_tree.emplace<cudf::ast::column_reference>(col_idx);
-  return execute_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
+  return evaluate_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
 }
 
-void gpu_expression_executor::release_temporaries(std::vector<std::size_t> const& scalar_indices,
-                                                  std::vector<std::size_t> const& column_indices)
+void expression_evaluator::release_temporaries(std::vector<std::size_t> const& scalar_indices,
+                                               std::vector<std::size_t> const& column_indices)
 {
   for (auto const idx : scalar_indices) {
     _temp_scalars[idx].reset();
@@ -253,7 +247,7 @@ void gpu_expression_executor::release_temporaries(std::vector<std::size_t> const
   }
 }
 
-void gpu_expression_executor::release_temporaries(
+void expression_evaluator::release_temporaries(
   std::vector<std::vector<std::size_t>> const& scalar_indices,
   std::vector<std::vector<std::size_t>> const& column_indices)
 {
@@ -269,7 +263,7 @@ void gpu_expression_executor::release_temporaries(
   }
 }
 
-std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view input)
+std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)
 {
   _output_columns.clear();
   _output_columns.reserve(_ast_expressions.size());
@@ -283,20 +277,19 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
   // Get the table_view from the input_batch
   _input_table = std::move(input);
 
-  // Per-result column post-processing. The AST node is round-tripped through
-  // sirius::ast::to_duckdb to recover the expression_class + return_type fields
-  // that drive the post-processing path.
-  auto post_process = [this](duckdb::Expression const& expr, execute_result result) {
-    if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
-      // BOUND_REF: pass column through without type check
+  // Per-result column post-processing. The node's kind and result type are read
+  // natively from the Sirius AST (no DuckDB round-trip).
+  auto post_process = [this](sirius::ast::node const& expr, evaluate_result result) {
+    if (expr.holds<sirius::ast::reference>()) {
+      // Bound reference: pass column through without type check
       _output_columns.push_back(
         std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
     } else {
-      // Cast the `result` from libcudf to `return_type` if `result` has a different type.
-      // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
-      // Only use cudf::cast when both types are fixed-width (cast does not support
+      // Cast the `result` from libcudf to the node's return type if `result` has a different
+      // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
+      // int64_t. Only use cudf::cast when both types are fixed-width (cast does not support
       // STRING/LIST/STRUCT).
-      auto const cudf_return_type = GetCudfType(expr.return_type);
+      auto const cudf_return_type = sirius::get_cudf_type(expr.return_type());
       std::unique_ptr<cudf::column> result_column;
       if (result.is_scalar()) {
         result_column =
@@ -311,19 +304,17 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
         if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
           result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);
         } else {
-          throw duckdb::InternalException(
-            "[gpu_expression_executor] Unsupported type conversion: " +
-            cudf::type_to_name(result_column->type()) + " to " +
-            cudf::type_to_name(cudf_return_type));
+          throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
+                                   cudf::type_to_name(result_column->type()),
+                                   cudf::type_to_name(cudf_return_type));
         }
       }
       _output_columns.push_back(std::move(result_column));
     }
   };
 
-  // Iterate _ast_expressions and route through the std::visit dispatcher.
-  // The per-result post-processing recovers expression_class + return_type by
-  // round-tripping through sirius::ast::to_duckdb.
+  // Iterate _ast_expressions and route through the std::visit dispatcher, then
+  // post-process each result using the node's native kind + return type.
   for (auto const* ast_expr : _ast_expressions) {
     if (!ast_expr) {
       // This is a Sirius bug, not a user error: a null slot means from_duckdb
@@ -331,53 +322,64 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
       // to the GPU executor.  This hard-fails the query instead of falling back to CPU.
       // TODO fix to ensure the planner never builds a GPU projection containing unsupported
       // expressions.
-      throw duckdb::InternalException(
-        "[gpu_expression_executor] null expression in select list — "
+      throw internal_exception(
+        "[expression_evaluator] null expression in select list — "
         "from_duckdb returned nullptr for an unsupported expression; "
-        "cannot execute on GPU");
+        "cannot evaluate on GPU");
     }
-    auto result    = execute(*ast_expr, execution_mode::MATERIALIZE);
-    auto duck_expr = sirius::ast::to_duckdb(*ast_expr);
-    post_process(*duck_expr, std::move(result));
+    auto result = evaluate(*ast_expr, evaluation_mode::MATERIALIZE);
+    post_process(*ast_expr, std::move(result));
   }
 
   return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
 }
 
-std::unique_ptr<cudf::table> gpu_expression_executor::select(cudf::table_view input)
+std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_view input)
 {
   D_ASSERT(_ast_expressions.size() == 1);
-#ifdef D_ASSERT_IS_ENABLED
-  // Round-trip the single node through sirius::ast::to_duckdb so the BOOLEAN
-  // return-type assertion holds. Guarded so release builds skip the wasted
-  // DuckDB tree allocation (D_ASSERT is a no-op under NDEBUG).
-  auto duck_expr = sirius::ast::to_duckdb(*_ast_expressions[0]);
-  D_ASSERT(duck_expr->return_type == duckdb::LogicalType::BOOLEAN);
-#endif
+  // A filter predicate must be BOOLEAN. Read the type natively from the Sirius AST.
+  D_ASSERT(_ast_expressions[0]->return_type().id() == sirius::type_id::BOOLEAN);
 
-  // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
-  auto mask_batch = execute(input);
-  auto mask_view  = mask_batch->view().column(0);
-
-  // Apply the boolean mask to filter the input batch
-  return cudf::apply_boolean_mask(input, mask_view, _stream, _mr);
+  return std::move(evaluate(input)->release()[0]);
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::aggregate const& /*expr*/,
-                                                execution_mode /*mode*/)
+std::unique_ptr<cudf::table> expression_evaluator::select(
+  cudf::table_view input, std::span<cudf::size_type const> output_indices)
+{
+  // A cuDF table with zero columns cannot carry a row count, so a pure-filter result with no
+  // output columns (e.g. count(*) over a filtered scan) is unrepresentable here. Such callers
+  // must use the all-columns select() overload so the surviving row count is preserved.
+  if (output_indices.empty()) {
+    throw internal_exception(
+      "[expression_evaluator] select(): output_indices must be non-empty; use the "
+      "all-columns select() overload for count(*)-style filters with no output columns");
+  }
+  auto mask = compute_mask(input);
+  return cudf::apply_boolean_mask(
+    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+}
+
+std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
+{
+  auto mask = compute_mask(input);
+  return cudf::apply_boolean_mask(input, mask->view(), _stream, _mr);
+}
+
+evaluate_result expression_evaluator::evaluate(sirius::ast::aggregate const& /*expr*/,
+                                               evaluation_mode /*mode*/)
 {
   throw not_implemented_exception(
-    "[gpu_expression_executor] aggregate nodes are not executed via the expression executor "
+    "[expression_evaluator] aggregate nodes are not executed via the expression executor "
     "(#863).");
 }
 
-execute_result gpu_expression_executor::execute(sirius::ast::node const& expr, execution_mode mode)
+evaluate_result expression_evaluator::evaluate(sirius::ast::node const& expr, evaluation_mode mode)
 {
-  // Every sirius::ast alternative has a matching private execute(alt, mode)
+  // Every sirius::ast alternative has a matching private evaluate(alt, mode)
   // overload, so overload resolution enforces dispatch completeness at compile
   // time (a new alternative without an overload fails to compile here).
   return std::visit(
-    [this, mode](auto const& alt) -> execute_result { return this->execute(alt, mode); }, expr.v);
+    [this, mode](auto const& alt) -> evaluate_result { return this->evaluate(alt, mode); }, expr.v);
 }
 
 }  // namespace sirius

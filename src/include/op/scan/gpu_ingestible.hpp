@@ -33,6 +33,7 @@
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 // cucascade (forward-declare to keep this header light; full include in .cpp)
@@ -104,7 +105,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * null callable indicates no work was claimed (the driver loop skips
    * empty handoffs).
    */
-  virtual metadata_scan_task_t next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx) = 0;
+  virtual metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) = 0;
 
   /**
    * @brief Materialize the cudf table for one split. Called by

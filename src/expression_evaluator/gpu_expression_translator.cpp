@@ -16,7 +16,7 @@
 
 // sirius
 #include <expression/ast/aggregate.hpp>
-#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <log/logging.hpp>
 #include <sirius/exception.hpp>
 
@@ -339,9 +339,9 @@ sirius::type_id node_logical_type_id(sirius::ast::node const& expr)
     [](auto const& alt) -> sirius::type_id {
       using T = std::decay_t<decltype(alt)>;
       if constexpr (std::is_same_v<T, sirius::ast::reference>) {
-        return alt.return_type.id();
+        return alt.return_type().id();
       } else if constexpr (std::is_same_v<T, sirius::ast::constant>) {
-        return alt.return_type.id();
+        return alt.return_type().id();
       } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
         return alt.target_type.id();
       } else if constexpr (std::is_same_v<T, sirius::ast::function_call>) {
@@ -405,8 +405,8 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     return std::nullopt;
   }
 
-  auto const cudf_type = sirius::get_cudf_type(alt.return_type);
-  // TODO: Expand type support as needed. See gpu_execute_constant.cpp.
+  auto const cudf_type = sirius::get_cudf_type(alt.return_type());
+  // TODO: Expand type support as needed. See constant.cpp.
   switch (cudf_type.id()) {
     case cudf::type_id::INT8: {
       return add_literal_expression<cudf::numeric_scalar<int8_t>>(
@@ -495,7 +495,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     case cudf::type_id::DECIMAL32: {
       return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal32>>(
         std::get<sirius::decimal32>(alt.payload).value,
-        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())},
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type().decimal_scale())},
         true,
         _stream,
         _resource_ref);
@@ -503,7 +503,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     case cudf::type_id::DECIMAL64: {
       return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal64>>(
         std::get<sirius::decimal64>(alt.payload).value,
-        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())},
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type().decimal_scale())},
         true,
         _stream,
         _resource_ref);
@@ -511,7 +511,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     case cudf::type_id::DECIMAL128: {
       return add_literal_expression<cudf::fixed_point_scalar<numeric::decimal128>>(
         std::get<sirius::decimal128>(alt.payload).value,
-        numeric::scale_type{-static_cast<int32_t>(alt.return_type.decimal_scale())},
+        numeric::scale_type{-static_cast<int32_t>(alt.return_type().decimal_scale())},
         true,
         _stream,
         _resource_ref);

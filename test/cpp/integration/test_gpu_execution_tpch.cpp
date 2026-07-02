@@ -1632,6 +1632,23 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 //===----------------------------------------------------------------------===//
+// SEMI join in BUILD_PROBE mode: a large probe (orders, 150k) over a small build/filter subset
+// (customer where c_nationkey < 3) drives the planner into BUILD_PROBE, where one
+// cudf::filtered_join is built once on the right (filter) side and reused across the streamed left
+// probe batches via semi_join.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - semi join build_probe large probe parquet",
+                 "[integration][gpu_execution][parquet][semijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select o.o_orderkey from orders o "
+    "semi join (select c_custkey from customer where c_nationkey < 3) c "
+    "on o.o_custkey = c.c_custkey;");
+}
+
+//===----------------------------------------------------------------------===//
 // MARK join tests (issue #921: BUILD_PROBE mode for MARK join)
 //
 // `OR` combined with `IN (subquery)`, and `IN (subquery)` projected as a value,
@@ -1860,6 +1877,22 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select c.c_nationkey, c.c_custkey, c.c_name  "
     "from customer c anti join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+// ANTI join in BUILD_PROBE mode: a large probe (orders, 150k) over a small build/filter subset
+// (customer where c_nationkey < 3) drives the planner into BUILD_PROBE, where one
+// cudf::filtered_join is built once on the right (filter) side and reused across the streamed left
+// probe batches via anti_join.
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - anti join build_probe large probe parquet",
+                 "[integration][gpu_execution][parquet][antijoin]")
+{
+  // count(*) keeps the materialized result small while the full orders probe still streams through
+  // anti_join + gather across many batches, exercising the reused filtered_join.
+  compare_gpu_vs_cpu(
+    "select count(*) as n from orders o "
+    "anti join (select c_custkey from customer where c_nationkey < 3) c "
+    "on o.o_custkey = c.c_custkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -4667,6 +4700,28 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - pin_table gpu tier filter drops pure-filter column",
+                 "[integration][gpu_execution][parquet][pin_table][filter]")
+{
+  auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+  auto pin_query =
+    "CALL pin_table('" + parquet_dir.string() + "/lineitem.parquet', tier='gpu', name='lineitem');";
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  // l_linenumber is referenced only by the predicate, so the cached-scan post-filter fold must
+  // gather just l_orderkey and never materialize l_linenumber (#987).
+  compare_gpu_vs_cpu(
+    "select l_orderkey from lineitem where l_linenumber = 1 and l_orderkey < 1000;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - pin_table host tier scan and aggregate",
                  "[integration][gpu_execution][parquet][pin_table_host]")
 {
@@ -4681,6 +4736,28 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select l_returnflag, l_linestatus, count(*), sum(l_quantity) "
     "from lineitem group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus;");
+
+  auto unpin_result = con->Query("CALL unpin_table('lineitem');");
+  REQUIRE(unpin_result);
+  REQUIRE_FALSE(unpin_result->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - pin_table host tier filter drops pure-filter column",
+                 "[integration][gpu_execution][parquet][pin_table_host][filter]")
+{
+  auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+  auto pin_query   = "CALL pin_table('" + parquet_dir.string() +
+                   "/lineitem.parquet', tier='host', name='lineitem');";
+  auto pin_result = con->Query(pin_query);
+  REQUIRE(pin_result);
+  if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
+  REQUIRE_FALSE(pin_result->HasError());
+
+  // l_linenumber is referenced only by the predicate, so the cached-scan post-filter fold must
+  // gather just l_orderkey and never materialize l_linenumber (#987).
+  compare_gpu_vs_cpu(
+    "select l_orderkey from lineitem where l_linenumber = 1 and l_orderkey < 1000;");
 
   auto unpin_result = con->Query("CALL unpin_table('lineitem');");
   REQUIRE(unpin_result);
@@ -4756,4 +4833,24 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   auto unpin_result = con->Query("CALL unpin_table('lineitem_subset');");
   REQUIRE(unpin_result);
   REQUIRE_FALSE(unpin_result->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - standalone filter drops pure-filter column via projection map",
+                 "[integration][gpu_execution][parquet][filter][projection_map]")
+{
+  // A HAVING predicate over an aggregate cannot be pushed below the aggregate, so it materializes
+  // as a standalone LogicalFilter above it. The aggregate it filters on is dropped from the output,
+  // so DuckDB attaches a projection_map to that filter. The filter must gather only the projected
+  // columns and never materialize the aggregate(s) referenced only by the predicate (#987) — the
+  // trailing projection is folded into the filter's select() rather than emitted as its own op.
+
+  // Drops one pure-filter aggregate (sum(l_quantity)); keeps only the group key l_orderkey.
+  compare_gpu_vs_cpu(
+    "select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 100;");
+
+  // Drops two pure-filter aggregates; keeps a two-column group-key prefix.
+  compare_gpu_vs_cpu(
+    "select l_returnflag, l_linestatus from lineitem group by l_returnflag, l_linestatus "
+    "having sum(l_quantity) > 100 and count(*) > 5;");
 }
