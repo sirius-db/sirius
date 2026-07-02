@@ -639,6 +639,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
+    test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
