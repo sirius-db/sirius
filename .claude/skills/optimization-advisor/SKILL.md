@@ -89,6 +89,8 @@ pixi run python test/tpch_performance/performance_test.py \
 
 Compare the resulting `<bench>/csv/runtimes.csv` against a previous non-profiled baseline to confirm the optimization actually improved wall-clock performance. Then run a new profiled analysis (`nsys_report.sh`) to understand what changed internally.
 
+**Data source (parquet or duckdb).** `--input` is a parquet directory (`--data-source parquet`, the default) or a single `.duckdb` file (`--data-source duckdb`); `--pin gpu|host` works for both. When a scan is the hotspot, note which path is exercised: parquet `read_parquet` → the parquet GPU scan, vs duckdb `seq_scan` → the GPU-native scan (`src/op/scan/duckdb_native_gpu_ingestible.cpp`). They are different source files, so the optimization target differs by source.
+
 ## Analysis Sections
 
 The report contains these sections per query:

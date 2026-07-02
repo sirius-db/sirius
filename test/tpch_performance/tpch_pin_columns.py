@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Emit `CALL pin_table(...)` / `CALL unpin_table(...)` SQL for TPC-H.
 
-Used by run_tpch_parquet.sh when --pinning-mode per-query or pinned-hot is set.
-The path argument passed to pin_table is a glob whose FileSystem::GlobFiles
-expansion must match the file list in the corresponding CREATE VIEW
-read_parquet([...]) call — otherwise the scan_manager path-equality check
-in src/scan_manager/sirius_scan_manager.cpp will fall through to disk.
+Used by run_tpch_parquet.sh (--pinning-mode per-query/pinned-hot) and imported by
+performance_test.py for both parquet and duckdb sources.
+
+For parquet, the path argument passed to pin_table is a glob whose
+FileSystem::GlobFiles expansion must match the file list in the corresponding
+CREATE VIEW read_parquet([...]) call — otherwise the scan_manager path-equality
+check in src/scan_manager/sirius_scan_manager.cpp will fall through to disk. For
+duckdb there is no path: the table is resolved from the attached catalog by name
+and the source is selected with format='duckdb'.
 
 Pin tier: defaults to 'gpu'; both 'gpu' and 'host' are supported. Set
 SIRIUS_PIN_TIER=host to select the host tier, which converts the pinned
@@ -254,19 +258,35 @@ def detect_pin_glob(parquet_dir: str, table: str) -> str:
     raise RuntimeError(f"no parquet files for table '{table}' under {abs_dir}")
 
 
-def emit_pin(query_num: int, parquet_dir: str) -> str:
-    # Tier defaults to 'gpu'; SIRIUS_PIN_TIER=host selects the host tier
-    # (both are supported — see src/sirius_extension.cpp). Any other tier
-    # throws NotImplementedException at bind time.
+def _pin_call(table: str, cols: list[str], source: str, data_source: str) -> str:
+    """Emit a single `CALL pin_table(...)` for `table` in the given data source.
+
+    Tier defaults to 'gpu'; SIRIUS_PIN_TIER=host selects the host tier (both are
+    supported — see src/sirius_extension.cpp). Any other tier throws
+    NotImplementedException at bind time.
+
+    parquet: a positional glob path whose FileSystem::GlobFiles expansion must
+             match the corresponding CREATE VIEW read_parquet([...]) file list.
+    duckdb:  no positional path — the table is named by 'name' and resolved from
+             the attached catalog; the source is selected with format='duckdb'.
+    """
     tier = os.environ.get("SIRIUS_PIN_TIER", "gpu")
-    cols_by_table = QUERY_COLUMNS[query_num]
-    lines = []
-    for table, cols in cols_by_table.items():
-        path = detect_pin_glob(parquet_dir, table)
-        col_literals = ",".join(f"'{c}'" for c in cols)
-        lines.append(
-            f"CALL pin_table('{path}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+    col_literals = ",".join(f"'{c}'" for c in cols)
+    if data_source == "duckdb":
+        return (
+            f"CALL pin_table(format='duckdb', tier='{tier}', "
+            f"name='{table}', cols=[{col_literals}]);"
         )
+    path = detect_pin_glob(source, table)
+    return f"CALL pin_table('{path}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+
+
+def emit_pin(query_num: int, source: str, data_source: str = "parquet") -> str:
+    cols_by_table = QUERY_COLUMNS[query_num]
+    lines = [
+        _pin_call(table, cols, source, data_source)
+        for table, cols in cols_by_table.items()
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -284,20 +304,16 @@ def _union_columns_by_table() -> dict[str, list[str]]:
     return {table: sorted(cols) for table, cols in by_table.items()}
 
 
-def emit_pin_all(parquet_dir: str) -> str:
+def emit_pin_all(source: str, data_source: str = "parquet") -> str:
     """Emit one CALL pin_table per table with the union of columns across all queries.
 
     Used by sequential-mode benchmarks where re-pinning between queries would
     erase the cache; pin everything once up front instead.
     """
-    tier = os.environ.get("SIRIUS_PIN_TIER", "gpu")
-    lines = []
-    for table, cols in _union_columns_by_table().items():
-        path = detect_pin_glob(parquet_dir, table)
-        col_literals = ",".join(f"'{c}'" for c in cols)
-        lines.append(
-            f"CALL pin_table('{path}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
-        )
+    lines = [
+        _pin_call(table, cols, source, data_source)
+        for table, cols in _union_columns_by_table().items()
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -310,27 +326,53 @@ def emit_unpin_all() -> str:
     )
 
 
+def _extract_format(args: list[str]) -> tuple[list[str], str]:
+    """Pull an optional `--format parquet|duckdb` out of `args` (default parquet)."""
+    data_source = "parquet"
+    if "--format" in args:
+        i = args.index("--format")
+        if i + 1 >= len(args):
+            raise ValueError("--format requires a value (parquet|duckdb)")
+        data_source = args[i + 1]
+        if data_source not in ("parquet", "duckdb"):
+            raise ValueError(
+                f"--format must be parquet or duckdb (got {data_source!r})"
+            )
+        del args[i : i + 2]
+    return args, data_source
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(
-            "Usage: tpch_pin_columns.py pin   <q_num> <parquet_dir>\n"
+            "Usage: tpch_pin_columns.py pin   <q_num> [<parquet_dir>] [--format duckdb]\n"
             "       tpch_pin_columns.py unpin <q_num>\n"
-            "       tpch_pin_columns.py pin-all <parquet_dir>\n"
+            "       tpch_pin_columns.py pin-all [<parquet_dir>] [--format duckdb]\n"
             "       tpch_pin_columns.py unpin-all\n"
             "\n"
+            "Source: --format parquet (default) needs <parquet_dir>; --format duckdb\n"
+            "pins native catalog tables by name (no path).\n"
             "Tier: defaults to 'gpu'; set SIRIUS_PIN_TIER=host for the host tier\n"
             "(both 'gpu' and 'host' are supported).",
             file=sys.stderr,
         )
         return 1
     cmd, *args = argv[1:]
+    try:
+        args, data_source = _extract_format(args)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
     if cmd == "pin-all":
-        if len(args) != 1:
-            print("pin-all requires <parquet_dir>", file=sys.stderr)
+        if data_source == "parquet" and len(args) != 1:
+            print("pin-all requires <parquet_dir> (parquet format)", file=sys.stderr)
+            return 1
+        if data_source == "duckdb" and len(args) > 1:
+            print("pin-all (duckdb) takes no <parquet_dir>", file=sys.stderr)
             return 1
         try:
-            sys.stdout.write(emit_pin_all(args[0]))
+            sys.stdout.write(emit_pin_all(args[0] if args else "", data_source))
         except RuntimeError as e:
             print(str(e), file=sys.stderr)
             return 1
@@ -364,11 +406,14 @@ def main(argv: list[str]) -> int:
         return 1
 
     if cmd == "pin":
-        if len(rest) != 1:
-            print("pin requires <parquet_dir>", file=sys.stderr)
+        if data_source == "parquet" and len(rest) != 1:
+            print("pin requires <parquet_dir> (parquet format)", file=sys.stderr)
+            return 1
+        if data_source == "duckdb" and len(rest) > 1:
+            print("pin (duckdb) takes only <q_num>", file=sys.stderr)
             return 1
         try:
-            sys.stdout.write(emit_pin(q, rest[0]))
+            sys.stdout.write(emit_pin(q, rest[0] if rest else "", data_source))
         except RuntimeError as e:
             print(str(e), file=sys.stderr)
             return 1

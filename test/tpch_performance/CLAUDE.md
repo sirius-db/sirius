@@ -101,7 +101,7 @@ All commands run from the **project root** directory.
 
 ### TPC-H benchmark with performance_test.py (primary runner)
 
-`performance_test.py` is the canonical TPC-H runner shared by the `benchmark` and `profile-analyzer` skills. It registers TPC-H tables as parquet views over a single in-memory DuckDB connection per engine, runs each query for N iterations, and produces a structured per-query benchmark directory.
+`performance_test.py` is the canonical TPC-H runner shared by the `benchmark` and `profile-analyzer` skills. With `--data-source parquet` (default) it registers TPC-H tables as parquet views over a single in-memory DuckDB connection per engine; with `--data-source duckdb` it opens a `.duckdb` file directly (read-only) and queries its native tables (GPU-native `seq_scan`). Either way it runs each query for N iterations and produces a structured per-query benchmark directory, and pinning works for both sources.
 
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
@@ -121,6 +121,16 @@ pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
     --engine gpu --iterations 3 --pin gpu
 
+# DuckDB native source from disk (both engines, validate). --input is a .duckdb FILE.
+pixi run python test/tpch_performance/performance_test.py \
+    --input ~/sirius/test_datasets/tpch_sf1.duckdb --data-source duckdb \
+    --engine both --iterations 1 --validation --queries 1,3,6
+
+# DuckDB native source, pinned into the GPU cache
+pixi run python test/tpch_performance/performance_test.py \
+    --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
+    --engine gpu --iterations 3 --pin gpu
+
 # Cold-start measurement (drops OS cache between runs; requires passwordless sudo)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf10 \
@@ -133,6 +143,7 @@ pixi run python test/tpch_performance/performance_test.py \
 ```
 
 Key flags:
+- `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
 - `--engine gpu|cpu|both` — which engine to benchmark.
 - `--iterations N` — per-query iteration count.
 - `--mode grouped|sequential|isolated|nsys-profile` — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (fresh connection + drop_os_cache per run; requires passwordless sudo), `nsys-profile` (see below).
@@ -144,9 +155,15 @@ Key flags:
 - `--name <NAME>` — override the auto-timestamped benchmark subdirectory name.
 - `--config <yaml>` — override `$SIRIUS_CONFIG_FILE` for this run.
 
-#### `--data-source parquet | duckdb | duckdb-native` (scan path)
+#### `--data-source parquet | duckdb | duckdb-native` (shell runners — scan path)
 
-`--data-source` selects which engine scan path is exercised:
+> **Two flags, same name.** This `--data-source` belongs to the **legacy shell**
+> orchestrator `benchmark_and_validate.sh` and is 3-value (`parquet`, `duckdb`,
+> `duckdb-native` — the last a redundant alias of `duckdb`). The Python harness
+> `performance_test.py` has its **own** 2-value `--data-source` (`parquet`,
+> `duckdb`), documented above. They are independent flags on independent tools.
+
+`benchmark_and_validate.sh --data-source` selects which engine scan path is exercised:
 
 | Value | Runner | Input | Sirius scan path |
 |-------|--------|-------|------------------|
@@ -175,7 +192,7 @@ grep -c 'duckdb_native_gpu_ingestible::materialize_table] decoded split' /tmp/na
 grep -c 'duckdb_native_metadata] refused'                       /tmp/native_verify/sirius_*.log   # expect 0
 ```
 
-> **Note:** `--pinning-mode per-query` and `--pinning-mode pinned-hot` are parquet-only — `run_tpch_duckdb.sh` does not accept `--pinning-mode`, so do not combine either with `--data-source duckdb` or `duckdb-native`. The Python harness (`performance_test.py`) is also parquet-only and does not support the native scan.
+> **Note:** `--pinning-mode per-query` and `--pinning-mode pinned-hot` are parquet-only — `run_tpch_duckdb.sh` does not accept `--pinning-mode`, so do not combine either with `--data-source duckdb` or `duckdb-native`. This limitation is specific to the **shell runners**. The Python harness `performance_test.py` **does** support the duckdb native scan via its own `--data-source duckdb`, including pinning with `--pin gpu|host` (which emits `CALL pin_table(format='duckdb', name=<table>, cols=[...])`). To confirm a Python-harness duckdb run hit the pinned cache, grep the per-query log `<bench>/sirius/q<N>/sirius.log` for `using cached_split_provider` (cache hit) vs `not all the columns are pinned` (fell through to disk).
 
 #### `--pinning-mode per-query | pinned-hot` (PR #721 pin_table)
 
@@ -219,7 +236,7 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
 ```
 <bench>/                              # tpch_<ts>_<mode>_<engine>_iter<N>[_nsys] or --name override
-  metadata.json                       # commit, branch, date, mode, iterations, engine, queries, pin, nsys_profile
+  metadata.json                       # commit, branch, date, mode, iterations, engine, data_source, queries, pin, nsys_profile
   csv/runtimes.csv                    # engine,query,iteration,runtime_s
   log_dir/sirius_<YYYY-MM-DD>.log     # combined Sirius spdlog (non-profile mode)
   <engine>/q<N>/result.txt            # fetched rows, one repr(row) per line (last iter wins)
@@ -298,9 +315,14 @@ For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrato
 `nsys_report.sh` orchestrates profiling + analysis + report packaging into a self-contained report directory with human-readable markdown, machine-readable JSON, and all raw artifacts.
 
 ```bash
-# Profile and generate report
+# Profile and generate report (parquet source, default)
 ./test/tpch_performance/nsys_report.sh --sf 300_rg2m
 ./test/tpch_performance/nsys_report.sh --sf 100 --iterations 4 1 3 6 10
+
+# DuckDB-native source: --data-source duckdb (defaults to test_datasets/tpch_sf<SF>.duckdb,
+# or pass --duckdb-file). Forwards --data-source to performance_test.py --mode nsys-profile.
+./test/tpch_performance/nsys_report.sh --sf 10 --data-source duckdb 1 3 6
+./test/tpch_performance/nsys_report.sh --data-source duckdb --duckdb-file ./test_datasets/tpch_sf10.duckdb --sf 10
 
 # Report from existing profiles
 ./test/tpch_performance/nsys_report.sh --profile-dir /path/to/nsys_profiles/sf300/

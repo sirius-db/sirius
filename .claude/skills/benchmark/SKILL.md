@@ -90,17 +90,23 @@ Scripts are in `test/tpch_performance/`.
 
 ## Workflow H-A: Generate TPC-H Data
 
+Data generation is owned by the **`/dataset-manager`** skill — the single source of truth for both formats. Prefer delegating to it rather than calling the script directly. It produces:
+
+- **parquet** → `test_datasets/tpch_parquet_sf<SF>/` (a directory; built via `tpchgen-rs`)
+- **duckdb** → `test_datasets/tpch_sf<SF>.duckdb` (a single file; built via DuckDB `dbgen()`), or `tpch_sf<SF>_sorted.duckdb` when generated with `--cluster` (tables physically sorted so native-scan row-group pruning fires on date-filtered queries)
+
+If `/dataset-manager` is unavailable, the underlying script is:
+
 ```bash
 cd test/tpch_performance
-pixi run bash generate_tpch_data.sh <scale_factor> [output_dir] [jobs]
+pixi run bash generate_tpch_data.sh <scale_factor> --format parquet|duckdb [--cluster] [--output <path>]
 ```
 
-- Builds `sirius-db/tpchgen-rs` from source, generates partitioned parquet files to `test_datasets/tpch_parquet_sf<SF>/`.
-- `performance_test.py` only accepts parquet directories (`.duckdb` files are rejected), so generate (or pre-stage) the parquet first.
+`performance_test.py` consumes either source: pass the parquet **directory** with `--data-source parquet` (default) or the `.duckdb` **file** with `--data-source duckdb`.
 
 ## Workflow H-B: Python Performance Test (only supported TPC-H runner)
 
-`performance_test.py` runs the 22 TPC-H queries against a parquet dataset for either or both engines, writes per-query timings/results/logs into a structured benchmark directory, and supports pinning tables into the Sirius cache.
+`performance_test.py` runs the 22 TPC-H queries against a parquet **or** duckdb dataset (`--data-source`) for either or both engines, writes per-query timings/results/logs into a structured benchmark directory, and supports pinning tables into the Sirius cache.
 
 ```bash
 export SIRIUS_CONFIG_FILE=/path/to/config.yaml
@@ -109,9 +115,10 @@ pixi run python test/tpch_performance/performance_test.py \
 ```
 
 **Required:**
-- `--input <path>` — Parquet directory containing TPC-H tables (one `.parquet` file or sub-directory per table).
+- `--input <path>` — the dataset. A **parquet directory** (with `--data-source parquet`, default) or a single **`.duckdb` file** (with `--data-source duckdb`).
 
 **Most-used flags** — the complete reference lives in `test/tpch_performance/CLAUDE.md` and `performance_test.py --help`; consult it rather than re-deriving flags here:
+- `--data-source {parquet,duckdb}` (default `parquet`) — input source/format. `parquet`: `--input` is a parquet directory (`read_parquet` scan). `duckdb`: `--input` is a single `.duckdb` file (GPU-native `seq_scan`). Works in all modes; `--pin` works for both.
 - `--engine {gpu,cpu,both}` (default `both`) — `gpu`/`both` load the Sirius extension; `cpu` does not.
 - `--iterations <N>` (default `1`) and `--queries 1,3,6-10` (default: all 22).
 - `--mode {grouped,sequential,isolated,nsys-profile}` (default `grouped`) — `grouped` is hot-cache; `isolated` is true cold-start (needs the sudo setup below); `nsys-profile` is GPU-only and owned by the `profile-analyzer` skill.
@@ -119,11 +126,11 @@ pixi run python test/tpch_performance/performance_test.py \
 - `--validation` — byte-compare GPU vs CPU results after timing (`abs_tol=1e-10` on floats); requires `--engine both`.
 - `--name <NAME>` — label the output subdir instead of the default `tpch_<ts>_<mode>_<engine>_iter<N>`.
 
-The CLAUDE.md is the source of truth for the rest of the surface (`--config`, `--output`, `--duckdb-profiling`, `--query-timeout`), the per-query pin column lists in `tpch_pin_columns.py`, and the shell-runner-only `--data-source` / `--pinning-mode` paths.
+The CLAUDE.md is the source of truth for the rest of the surface (`--config`, `--output`, `--duckdb-profiling`, `--query-timeout`), the per-query pin column lists in `tpch_pin_columns.py`, and the shell-runner-only `--pinning-mode` path. (Note: `performance_test.py --data-source` is the harness's own 2-value flag, distinct from the legacy shell `benchmark_and_validate.sh --data-source`.)
 
 **Examples:**
 ```bash
-# SF1, hot cache, both engines, 2 iterations
+# SF1, hot cache, both engines, 2 iterations (parquet directory)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --iterations 2 --mode grouped --engine both
@@ -132,7 +139,26 @@ pixi run python test/tpch_performance/performance_test.py \
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --engine both --iterations 1 --validation --queries 1,3,6
+
+# DuckDB source (a .duckdb FILE) from disk, both engines, validate
+pixi run python test/tpch_performance/performance_test.py \
+    --input ~/sirius/test_datasets/tpch_sf1.duckdb --data-source duckdb \
+    --engine both --iterations 1 --validation --queries 1,3,6
+
+# DuckDB source pinned into the GPU cache
+pixi run python test/tpch_performance/performance_test.py \
+    --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
+    --engine gpu --iterations 3 --pin gpu
 ```
+
+### Data Source: parquet vs duckdb (disk vs pinned)
+
+- **parquet** (`--data-source parquet`, default): `--input` is a **directory** of TPC-H `.parquet` files (`read_parquet` → `GPU_PARQUET_SCAN`).
+- **duckdb** (`--data-source duckdb`): `--input` is a single **`.duckdb` file** whose native TPC-H tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`).
+- **Disk vs pinned** is controlled by `--pin`, independently of the source:
+  - *from disk*: omit `--pin` (or `--pin none`) — data is read from the parquet/`.duckdb` file each scan.
+  - *pinned*: `--pin gpu` or `--pin host` pre-loads the referenced columns into the Sirius cache.
+- To confirm a pinned run actually hit the cache, grep `<benchmark_dir>/sirius/q<N>/sirius.log` for `using cached_split_provider` (cache hit) vs `not all the columns are pinned for this query` (fell through to disk).
 
 ### Cold-Run Benchmarking (`--mode isolated`)
 
@@ -148,10 +174,30 @@ A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<
 
 ---
 
-# Before Running
+# Before Running — ALWAYS Confirm Every Parameter First
 
-- **Ask the user** for any paths you don't know. Do NOT assume paths.
-- **Ask about data**: Does the parquet dataset already exist? If yes, ask for the directory path. If no, confirm the user wants to generate it before proceeding — data generation can take significant time and disk space at large scale factors. Do NOT auto-generate without asking.
-- **Optionally ask for `--name`**: offer the user the option to label the output subdirectory (e.g. `baseline`, `with-fix`, `sf1000-host-pin`). If they decline or don't provide one, omit `--name` and let the default `tpch_<ts>_<mode>_<engine>_iter<N>` name be used. Do not invent a name unprompted.
-- Ensure the Sirius extension is built: `pixi run -e clang make release` (the runner loads `build/release/extension/sirius/sirius.duckdb_extension` for any GPU engine).
-- For Super Sirius: ensure `SIRIUS_CONFIG_FILE` is set, or pass `--config <yaml>` to `performance_test.py`.
+**This is mandatory and must not be skipped.** Before invoking `performance_test.py`, you MUST confirm **every** parameter with the user via the `AskUserQuestion` tool — never silently assume defaults, and never skip this gate even when the request looks complete. Pre-fill any value the user already gave (present it as the recommended option) and ask for the rest, so a `/benchmark` run never starts with an unconfirmed configuration.
+
+Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). Mark sensible defaults as "(Recommended)".
+
+**Round 1 — data & engine**
+1. **Data source** (`--data-source`) — `parquet` or `duckdb`.
+2. **Dataset** (`--input`) — the parquet **directory** or `.duckdb` **file** path. Confirm it exists; if it does not, ask whether to generate it via the `/dataset-manager` skill first (generation can take significant time and disk at large scale factors — **never auto-generate without asking**). For duckdb, clarify plain vs `--cluster` (sorted) if generating.
+3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — which Sirius config YAML to use (required for any GPU engine). Do not guess the path; confirm it.
+4. **Engine** (`--engine`) — `gpu`, `cpu`, or `both` (default `both`).
+
+**Round 2 — execution shape**
+1. **Mode** (`--mode`) — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (true cold-start; needs the sudo setup below), or `nsys-profile` (GPU-only; owned by the `profile-analyzer` skill).
+2. **Pin** (`--pin`) — `none` (from disk), `gpu`, or `host` (pinned cache tier; rejected with `--engine cpu`). This is how "from disk vs pinned" is chosen, for either source.
+3. **Iterations** (`--iterations`) — per-query iteration count (default `1`).
+4. **Queries** (`--queries`) — all 22 (default) or a subset like `1,3,6-10`.
+
+**Round 3 — output**
+1. **Validation** (`--validation`) — byte-compare GPU vs CPU after timing (requires `--engine both`).
+2. **Name** (`--name`) — optional label for the output subdir (e.g. `baseline`, `sf1000-host-pin`); if declined, omit it and let the default `tpch_<ts>_<mode>_<engine>_iter<N>` be used. Do not invent a name unprompted.
+
+After confirming, echo the final `performance_test.py` command back to the user before running it.
+
+**Environment prerequisites** (verify these yourself; they are not user questions):
+- Sirius extension built: `pixi run -e clang make release` (the runner loads `build/release/extension/sirius/sirius.duckdb_extension` for any GPU engine).
+- For Super Sirius: `SIRIUS_CONFIG_FILE` set, or `--config <yaml>` passed (confirmed in Round 1).
