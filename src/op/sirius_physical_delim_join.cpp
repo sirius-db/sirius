@@ -31,7 +31,6 @@ namespace op {
 class sirius_left_delim_join_local_state : public duckdb::LocalSinkState {
  public:
   duckdb::unique_ptr<duckdb::LocalSinkState> distinct_state;
-  // duckdb::shared_ptr<GPUIntermediateRelation> lhs_data;
   duckdb::ColumnDataAppendState append_state;
 };
 

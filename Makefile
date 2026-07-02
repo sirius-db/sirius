@@ -18,7 +18,6 @@ TEST_BUILD_TARGET ?= sirius_unittest
 MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
-	legacy-release \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
@@ -61,9 +60,6 @@ relwithdebinfo: build/relwithdebinfo/build.ninja
 ifneq ($(TEST_BUILD_TARGET),)
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(TEST_BUILD_TARGET)
 endif
-
-legacy-release: build/legacy-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset legacy-release --target $(MAIN_BUILD_TARGETS)
 
 clang-release: build/clang-release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(MAIN_BUILD_TARGETS)

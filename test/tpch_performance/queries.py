@@ -12,7 +12,7 @@
 # the License.
 # =============================================================================
 
-"""TPC-H query definitions (base SQL without gpu_processing wrapper)."""
+"""TPC-H query definitions."""
 
 QUERIES = {
     "q1": """select

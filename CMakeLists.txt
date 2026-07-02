@@ -324,8 +324,6 @@ set(EXTENSION_SOURCES
     src/util/segfault_backtrace_handler.cpp)
 # cmake-format: on
 
-# Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
-# Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/scan/equality_delete_mask.cu
     src/cuda/scan/gpu_decode_alp.cu
@@ -337,12 +335,6 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/dictionary.cu
     src/cuda/scan/strings/fsst.cu
     src/cuda/scan/strings/uncompressed.cu)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
-  add_subdirectory(src/legacy)
-  list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
-       ${SIRIUS_LEGACY_CONDITIONAL_SOURCES})
-  list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
-endif()
 
 # Compile the DuckDB substrait extension's Substrait->DuckDB reader directly
 # into the sirius target so the FFI (src/sirius_ffi.cpp) can call
@@ -406,10 +398,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   target_include_directories(
     ${_target}
-    PRIVATE
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-      $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
-  )
+    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
 
   # Substrait->DuckDB reader headers (from_substrait.hpp) and its bundled
   # protobuf.
@@ -418,11 +407,6 @@ foreach(_target sirius_extension sirius_loadable_extension)
     PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
             ${SIRIUS_SUBSTRAIT_DIR}/third_party
             ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
-
-  if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
-    target_compile_definitions(${_target}
-                               PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
-  endif()
 
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
@@ -616,10 +600,6 @@ set(TEST_SOURCES
     test/cpp/utils/utils.cpp)
 # cmake-format: on
 
-if(SIRIUS_LEGACY_TEST_SOURCES)
-  list(APPEND TEST_SOURCES ${SIRIUS_LEGACY_TEST_SOURCES})
-endif()
-
 # The testcontainers-backed S3 harness only compiles when its dependency is
 # built; unittest.cpp guards its use behind SIRIUS_HAVE_TESTCONTAINERS.
 if(SIRIUS_BUILD_S3_TESTS)
@@ -667,9 +647,7 @@ target_include_directories(
   PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-    $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
-)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static)
 link_extension_libraries(sirius_unittest "")
@@ -700,11 +678,6 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
-
-if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
-  target_compile_definitions(sirius_unittest
-                             PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
-endif()
 
 # -----------------------------------------------------------------------------
 # test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource

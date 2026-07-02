@@ -216,10 +216,6 @@ TEST_CASE("Sirius configuration loading from file with spaces",
 //          are dispatched in the pipeline executor's GPU context.
 //    Status: N/A — no direct GPU operations; data upload handled by converters.
 //
-// 5. Legacy CUDA wrappers (src/cuda/cudf/*.cu)
-//    Role: Only called from gpu_processing (legacy) path, never from gpu_execution.
-//    Status: N/A for Super Sirius (new path).
-//
 // Summary: All GPU thread entry points in the Super Sirius (gpu_execution) path
 // correctly set the CUDA device before performing GPU operations. The device_id
 // is derived from the memory_space associated with each executor, ensuring

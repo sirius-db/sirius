@@ -24,7 +24,6 @@
 
 namespace duckdb {
 class ClientContext;
-class GPUContext;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
@@ -66,8 +65,6 @@ class sirius_physical_plan_generator {
     std::size_t,
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>>
     materialized_ctes;
-  // duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::GPUIntermediateRelation>>
-  // gpu_recursive_cte_tables;
 
  public:
   //! Creates a plan from the logical operator. This involves resolving column bindings and
@@ -173,6 +170,5 @@ class sirius_physical_plan_generator {
 
  public:
   duckdb::ClientContext& context;
-  // duckdb::GPUContext& gpu_context;
 };
 }  // namespace sirius::planner

@@ -66,11 +66,6 @@ extern "C" int cudaProfilerStop();
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
-#ifdef SIRIUS_ENABLE_LEGACY
-#include "gpu_buffer_manager.hpp"
-#include "gpu_context.hpp"
-#include "gpu_physical_plan_generator.hpp"
-#endif
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
@@ -104,11 +99,6 @@ extern "C" int cudaProfilerStop();
 #include <unordered_map>
 
 namespace duckdb {
-
-const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
-#ifdef SIRIUS_ENABLE_LEGACY
-bool SiriusExtension::buffer_is_initialized = false;
-#endif
 
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
@@ -307,227 +297,6 @@ struct SiriusTableFunctionData : public TableFunctionData {
   }
 };
 
-#ifdef SIRIUS_ENABLE_LEGACY
-struct GPUTableFunctionData : public TableFunctionData {
-  GPUTableFunctionData() = default;
-  shared_ptr<Relation> plan;
-  shared_ptr<GPUPreparedStatementData> gpu_prepared;
-  unique_ptr<QueryResult> res;
-  unique_ptr<Connection> conn;
-  unique_ptr<GPUContext> gpu_context;
-  string query;
-  bool enable_optimizer;
-  bool finished   = false;
-  bool plan_error = false;
-  //! Original options from the connection
-  ClientConfig original_config;
-  set<OptimizerType> original_disabled_optimizers;
-
-  void PrepareConnection(ClientContext& context)
-  {
-    // First collect original options
-    original_config              = context.config;
-    original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
-
-    // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer = enable_optimizer;
-    // We want for sure to disable the internal compression optimizations.
-    // These are DuckDB specific, no other system implements these. Also,
-    // respect the user's settings if they chose to disable any specific optimizers.
-    //
-    // The InClauseRewriter optimization converts large `IN` clauses to a
-    // "mark join" against a `ColumnDataCollection`, which may not make
-    // sense in other systems and would complicate the conversion to Substrait.
-    set<OptimizerType> disabled_optimizers =
-      DBConfig::GetConfig(context).options.disabled_optimizers;
-    disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
-    disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-    // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
-    // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
-    // The GPU pipeline cannot schedule COLUMN_DATA_SCAN sources, so disable this
-    // to keep the query on the scan -> aggregate path where the GPU can execute it.
-    disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
-#ifdef DEBUG
-    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
-#endif
-    // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
-    // If error(varchar) gets implemented in substrait this can be removed
-    // context.config.scalar_subquery_error_on_multiple_rows = false;
-    DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
-  }
-
-  // Reset configuration
-  void CleanupConnection(ClientContext& context) const
-  {
-    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled_optimizers;
-    context.config                                           = original_config;
-  }
-
-  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context)
-  {
-    PrepareConnection(context);
-    unique_ptr<LogicalOperator> plan;
-    try {
-      Parser parser(context.GetParserOptions());
-      parser.ParseQuery(query);
-
-      Planner planner(context);
-      planner.CreatePlan(std::move(parser.statements[0]));
-      D_ASSERT(planner.plan);
-
-      plan = std::move(planner.plan);
-
-      if (context.config.enable_optimizer) {
-        Optimizer optimizer(*planner.binder, context);
-        plan = optimizer.Optimize(std::move(plan));
-      }
-
-      // After optimization, refresh types before column binding resolution
-      // to ensure types are consistent (some optimizers may have set stale types)
-      plan->ResolveOperatorTypes();
-
-      ColumnBindingResolver resolver;
-      ColumnBindingResolver::Verify(*plan);
-      resolver.VisitOperator(*plan);
-    } catch (...) {
-      CleanupConnection(context);
-      throw;
-    }
-
-    CleanupConnection(context);
-    return plan;
-  }
-};
-
-void do_nothing_context(ClientContext*) {}
-
-static unique_ptr<GPUPhysicalOperator> GPUGeneratePhysicalPlan(
-  ClientContext& context,
-  GPUContext& gpu_context,
-  unique_ptr<LogicalOperator>& logical_plan,
-  Connection& new_conn)
-{
-  GPUPhysicalPlanGenerator physical_planner = GPUPhysicalPlanGenerator(context, gpu_context);
-  auto physical_plan                        = physical_planner.CreatePlan(std::move(logical_plan));
-  return physical_plan;
-}
-
-// The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
-// This result of this function is used as an argument to the GPUProcessingFunction function (data_p
-// argument), which is called to execute the table function.
-unique_ptr<FunctionData> SiriusExtension::GPUProcessingBind(ClientContext& context,
-                                                            TableFunctionBindInput& input,
-                                                            vector<LogicalType>& return_types,
-                                                            vector<string>& names)
-{
-  auto result              = make_uniq<GPUTableFunctionData>();
-  result->conn             = make_uniq<Connection>(*context.db);
-  result->query            = input.inputs[0].ToString();
-  result->enable_optimizer = true;
-  result->gpu_context      = make_uniq<GPUContext>(context);
-  if (input.inputs[0].IsNull()) {
-    throw BinderException("gpu_processing cannot be called with a NULL parameter");
-  }
-
-  // Parse the query just to get the result type information and to create preparedstatmement data
-  auto statements = result->conn->context->ParseStatements(result->query);
-  Planner planner(context);
-  auto statement_type = statements[0]->type;
-  planner.CreatePlan(std::move(statements[0]));
-  D_ASSERT(planner.plan);
-
-  auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
-  prepared->names     = planner.names;
-  prepared->types     = planner.types;
-  prepared->value_map = std::move(planner.value_map);
-
-  // generate physical plan from the logical plan
-  unique_ptr<LogicalOperator> query_plan = result->ExtractPlan(context);
-  SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
-  if (buffer_is_initialized) {
-    try {
-      auto gpu_physical_plan =
-        GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-      auto gpu_prepared    = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared),
-                                                                    std::move(gpu_physical_plan));
-      result->gpu_prepared = gpu_prepared;
-    } catch (std::exception& e) {
-      ErrorData error(e);
-      SIRIUS_LOG_ERROR("Error in GPUGeneratePhysicalPlan: {}", error.RawMessage());
-      result->plan_error = true;
-    }
-  } else {
-    result->gpu_prepared = nullptr;
-  }
-
-  for (auto& column : planner.names) {
-    names.emplace_back(column);
-  }
-  for (auto& type : planner.types) {
-    return_types.emplace_back(type);
-  }
-
-  return std::move(result);
-}
-
-void SiriusExtension::GPUProcessingFunction(ClientContext& context,
-                                            TableFunctionInput& data_p,
-                                            DataChunk& output)
-{
-  auto& data = (GPUTableFunctionData&)*data_p.bind_data;
-  if (data.finished) { return; }
-
-  if (!data.res) {
-    auto start = std::chrono::high_resolution_clock::now();
-    if (!buffer_is_initialized) {
-      printf("\033[1;31m");
-      printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n");
-      printf("\033[0m");
-      printf(
-        "=============================================\nError in GPUExecuteQuery, fallback to "
-        "DuckDB\n=============================================\n");
-      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
-    } else if (data.plan_error) {
-      printf(
-        "=============================================\nError in GPUExecuteQuery, fallback to "
-        "DuckDB\n=============================================\n");
-      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
-    } else {
-      data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-      if (data.res->HasError()) {
-        printf(
-          "=============================================\nError in GPUExecuteQuery, fallback to "
-          "DuckDB\n=============================================\n");
-        data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
-      }
-    }
-    auto end      = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    SIRIUS_LOG_INFO("Execute query time: {:.2f} ms", duration.count() / 1000.0);
-  }
-
-  auto result_chunk = data.res->Fetch();
-  if (result_chunk == nullptr) {
-    output.SetCardinality(0);
-    return;
-  }
-
-  output.Reference(*result_chunk);
-  return;
-}
-
-static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog& catalog)
-{
-  TableFunction gpu_processing("gpu_processing",
-                               {LogicalType::VARCHAR},
-                               SiriusExtension::GPUProcessingFunction,
-                               SiriusExtension::GPUProcessingBind);
-  gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
-  CreateTableFunctionInfo gpu_processing_info(gpu_processing);
-  catalog.CreateTableFunction(transaction, gpu_processing_info);
-}
-#endif  // SIRIUS_ENABLE_LEGACY
-
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
   ClientContext& context, unique_ptr<LogicalOperator>& logical_plan)
 {
@@ -691,120 +460,6 @@ static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
 
   return plan;
 }
-
-#ifdef SIRIUS_ENABLE_LEGACY
-struct GPUBufferInitFunctionData : public TableFunctionData {
-  GPUBufferInitFunctionData() {}
-  bool finished = false;
-  size_t cache_size;
-  size_t processing_size;
-  size_t pinned_memory_size;
-};
-
-unique_ptr<FunctionData> SiriusExtension::GPUBufferInitBind(ClientContext& context,
-                                                            TableFunctionBindInput& input,
-                                                            vector<LogicalType>& return_types,
-                                                            vector<string>& names)
-{
-  auto result = make_uniq<GPUBufferInitFunctionData>();
-
-  string gpu_cache_size      = input.inputs[0].ToString();
-  string gpu_processing_size = input.inputs[1].ToString();
-  string pinned_memory_size("0 GB");  // Default size of pinned memory
-  if (input.named_parameters.find(PINNED_MEMORY_PARAM_KEY) != input.named_parameters.end()) {
-    // If the pinned memory size is specified in the arguments then use that
-    pinned_memory_size = input.named_parameters[PINNED_MEMORY_PARAM_KEY].ToString();
-  }
-
-  // parsing 2GB or 2GiB to size_t
-  //  Function to parse size strings like "2GB" or "2GiB" to size_t
-  auto parse_size = [](const string& size_str) -> size_t {
-    size_t result     = 0;
-    size_t multiplier = 1;
-    string num_part;
-    string unit_part;
-
-    size_t i = 0;
-    // Skip any whitespace between number and unit
-    while (i < size_str.length() && isspace(size_str[i])) {
-      i++;
-    }
-
-    // Find where the number ends and unit begins
-    while (i < size_str.length() && (isdigit(size_str[i]) || size_str[i] == '.')) {
-      num_part += size_str[i];
-      i++;
-    }
-
-    // Skip any whitespace between number and unit
-    while (i < size_str.length() && isspace(size_str[i])) {
-      i++;
-    }
-
-    // Extract unit part
-    unit_part = size_str.substr(i);
-
-    // Convert number part to double
-    double num_value = stod(num_part);
-
-    // Determine multiplier based on unit
-    if (unit_part == "B") {
-      multiplier = 1;
-    } else if (unit_part == "KB" || unit_part == "KiB") {
-      multiplier = 1024;
-    } else if (unit_part == "MB" || unit_part == "MiB") {
-      multiplier = 1024 * 1024;
-    } else if (unit_part == "GB" || unit_part == "GiB") {
-      multiplier = 1024 * 1024 * 1024;
-    } else if (unit_part == "TB" || unit_part == "TiB") {
-      multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
-    } else {
-      throw InvalidInputException("Invalid format");
-    }
-
-    result = (size_t)(num_value * multiplier);
-    return result;
-  };
-
-  // Parse the input sizes
-  result->cache_size         = parse_size(gpu_cache_size);
-  result->processing_size    = parse_size(gpu_processing_size);
-  result->pinned_memory_size = parse_size(pinned_memory_size);
-
-  auto type = LogicalType(LogicalTypeId::BOOLEAN);
-  return_types.emplace_back(type);
-  names.emplace_back("Success");
-  return std::move(result);
-}
-
-void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
-                                            TableFunctionInput& data_p,
-                                            DataChunk& output)
-{
-  auto& data = data_p.bind_data->CastNoConst<GPUBufferInitFunctionData>();
-  if (data.finished) { return; }
-
-  size_t cache_size         = data.cache_size;
-  size_t processing_size    = data.processing_size;
-  size_t pinned_memory_size = data.pinned_memory_size;
-  if (pinned_memory_size == 0) { pinned_memory_size = std::max(cache_size, processing_size); }
-
-  if (!buffer_is_initialized) {
-    SIRIUS_LOG_DEBUG(
-      "GPU Buffer Manager initialized with args: Cache Size - {}, Processing Size - {}, Pinned Mem "
-      "Size - {}\n",
-      cache_size,
-      processing_size,
-      pinned_memory_size);
-    GPUBufferManager* gpuBufferManager =
-      &(GPUBufferManager::GetInstance(cache_size, processing_size, pinned_memory_size));
-    buffer_is_initialized = true;
-  } else {
-    SIRIUS_LOG_WARN("GPUBufferManager already initialized");
-  }
-  data.finished = true;
-}
-#endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<FunctionData> ProfilerBind(ClientContext& context,
                                              TableFunctionBindInput& input,
@@ -1286,18 +941,6 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
 
-#ifdef SIRIUS_ENABLE_LEGACY
-  TableFunction gpu_buffer_init("gpu_buffer_init",
-                                {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                GPUBufferInitFunction,
-                                GPUBufferInitBind);
-  gpu_buffer_init.named_parameters[PINNED_MEMORY_PARAM_KEY] = LogicalType::VARCHAR;
-  CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
-  catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
-
-  RegisterLegacyGPUFunctions(transaction, catalog);
-#endif
-
   TableFunction gpu_execution("gpu_execution",
                               {LogicalType::VARCHAR},
                               GPUExecutionFunction,
@@ -1360,19 +1003,6 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
-}
-
-static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
-{
-  Config::USE_PIN_MEM_FOR_CPU_PROCESSING = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CPU_PROCESSING to {}",
-                   Config::USE_PIN_MEM_FOR_CPU_PROCESSING);
-}
-
-static void SetUsePinMemoryForCaching(ClientContext& context, SetScope scope, Value& parameter)
-{
-  Config::USE_PIN_MEM_FOR_CACHING = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CACHING to {}", Config::USE_PIN_MEM_FOR_CACHING);
 }
 
 static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parameter)
@@ -1600,20 +1230,6 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
-  // Add in config option for gpu buffer manager
-  config.AddExtensionOption("use_pin_memory",
-                            "Whether or not the buffer manager is initialized with pinned memory",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CPU_PROCESSING),
-                            SetUsePinMemory);
-
-  config.AddExtensionOption(
-    "use_pin_memory_for_caching",
-    "Whether or not the cache buffer is allocated with pinned host memory instead of GPU memory",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CACHING),
-    SetUsePinMemoryForCaching);
-
   // Add in config option for expression executor
   config.AddExtensionOption("use_cudf_expr",
                             "Whether or not cudf is used to evaluate expressions",
