@@ -207,24 +207,50 @@ def detect_pin_glob(parquet_dir: str, table: str) -> str:
       1. <dir>/<table>.parquet         (single file)
       2. <dir>/<table>_*.parquet       (numbered partitions)
       3. <dir>/<table>/*.parquet       (subdirectory)
-    Patterns 1+2 are both captured by `<dir>/<table>*.parquet`.
+    The single-file and numbered-partition patterns are matched precisely (exact
+    file, then `<table>_*.parquet`) so a shared name prefix (e.g. "part" vs
+    "partsupp") is never over-matched by a bare `<table>*.parquet` glob. When both
+    coexist, only the broad glob covers both files, so it is returned only if its
+    expansion is exactly {single + numbered} — otherwise the layout can't be
+    expressed as one glob and is rejected rather than silently pinning a subset.
     """
     abs_dir = os.path.abspath(parquet_dir)
-    same_dir_glob = os.path.join(abs_dir, f"{table}*.parquet")
+    single_file = os.path.join(abs_dir, f"{table}.parquet")
+    has_single = os.path.exists(single_file)
+    numbered_glob = os.path.join(abs_dir, f"{table}_*.parquet")
+    numbered = sorted(glob.glob(numbered_glob))
     sub_dir_glob = os.path.join(abs_dir, table, "*.parquet")
-    same_dir = sorted(glob.glob(same_dir_glob))
     sub_dir = sorted(glob.glob(sub_dir_glob))
 
-    if same_dir and sub_dir:
+    # Subdirectory layout is mutually exclusive with same-dir files.
+    if sub_dir and (has_single or numbered):
         raise RuntimeError(
             f"mixed parquet layout for table '{table}' under {abs_dir}: "
             f"both '{table}*.parquet' and '{table}/*.parquet' exist; "
             "pin_table needs a single glob"
         )
-    if same_dir:
-        return same_dir_glob
     if sub_dir:
         return sub_dir_glob
+
+    # Same-dir layouts: match a single pattern precisely so a shared prefix
+    # (e.g. "part*" also grabbing "partsupp.parquet") is never over-matched.
+    if has_single and not numbered:
+        return single_file
+    if numbered and not has_single:
+        return numbered_glob
+    if has_single and numbered:
+        # Only the broad glob spans both an exact file and numbered partitions;
+        # use it only when it doesn't also pull in a prefix sibling.
+        same_dir_glob = os.path.join(abs_dir, f"{table}*.parquet")
+        matched = sorted(glob.glob(same_dir_glob))
+        intended = sorted([single_file, *numbered])
+        if matched == intended:
+            return same_dir_glob
+        raise RuntimeError(
+            f"cannot form a single precise pin glob for table '{table}' under "
+            f"{abs_dir}: '{table}*.parquet' also matches unrelated files "
+            f"{sorted(set(matched) - set(intended))}"
+        )
     raise RuntimeError(f"no parquet files for table '{table}' under {abs_dir}")
 
 
