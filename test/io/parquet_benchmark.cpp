@@ -288,19 +288,19 @@ int main(int argc, char** argv)
     // Size the buffer pool to fit the working set, plus headroom.
     constexpr uint32_t POOL_MAX_SLABS       = 20;
     constexpr size_t INFLIGHT_BUDGET_CHUNKS = 2048;
+    constexpr size_t CHUNKS_PER_SLAB =
+      cucascade::memory::fixed_size_host_memory_resource::default_pool_size;
     constexpr size_t POOL_CAPACITY =
-      static_cast<size_t>(POOL_MAX_SLABS) *
-      static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB) * (1 << 20);
+      static_cast<size_t>(POOL_MAX_SLABS) * CHUNKS_PER_SLAB * (1 << 20);
 
     cucascade::memory::numa_region_pinned_host_memory_resource upstream(0, /*make_portable=*/true);
-    cucascade::memory::fixed_size_host_memory_resource host_mr(
-      0,                                                                     // device_id
-      upstream,                                                              // upstream allocator
-      POOL_CAPACITY,                                                         // mem_limit
-      POOL_CAPACITY,                                                         // capacity
-      1 << 20,                                                               // block_size = 1 MiB
-      static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB),  // pool_size
-      1);                                                                    // initial_pools
+    cucascade::memory::fixed_size_host_memory_resource host_mr(0,              // device_id
+                                                               upstream,       // upstream allocator
+                                                               POOL_CAPACITY,  // mem_limit
+                                                               POOL_CAPACITY,  // capacity
+                                                               1 << 20,        // block_size = 1 MiB
+                                                               CHUNKS_PER_SLAB,  // pool_size
+                                                               1);               // initial_pools
 
     auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
       sirius::io::uring::uring_reactor::reactor_config_type{.bounce_size =
