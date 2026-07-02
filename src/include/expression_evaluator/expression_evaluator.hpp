@@ -73,7 +73,7 @@ class expression_evaluator {
 
  public:
   using data_batch              = cucascade::data_batch;
-  using data_repository_manager = cucascade::data_repository_manager<std::shared_ptr<data_batch>>;
+  using data_repository_manager = cucascade::data_repository_manager;
 
   /**
    * @brief The result of adding an expression to the executor's AST tree.

@@ -104,7 +104,7 @@ std::shared_ptr<data_batch> make_input_batch(
   auto gpu_repr =
     std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
@@ -140,7 +140,7 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
   auto gpu_repr =
     std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
@@ -180,7 +180,7 @@ std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
   auto gpu_repr =
     std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
@@ -208,7 +208,7 @@ std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
   auto gpu_repr =
     std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_decimal64_two_col_batch(memory_space& space,
@@ -241,7 +241,7 @@ std::shared_ptr<data_batch> make_decimal64_two_col_batch(memory_space& space,
   auto gpu_repr =
     std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_decimal32_batch(memory_space& space,
@@ -269,7 +269,7 @@ std::shared_ptr<data_batch> make_decimal32_batch(memory_space& space,
   auto gpu_repr =
     std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
@@ -297,7 +297,7 @@ std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
   auto gpu_repr =
     std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
   auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
+  return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
 using exp_executor      = ::sirius::expression_evaluator;
