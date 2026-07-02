@@ -55,7 +55,9 @@ log/
 /test/cpp/integration/s3/fixtures/generated/
 /test/cpp/integration/s3/certs/
 
-# Host-specific s3-bench perf baseline: seeded locally per host, deliberately not
-# committed (a run without it bootstrap-skips the delta comparison).
-/doc/s3support/perf-baseline-minio.json
+# Host-specific s3-bench perf baselines + per-run history: seeded/accumulated
+# locally per host, deliberately not committed (a run without a baseline
+# bootstrap-skips the delta comparison).
+/doc/s3support/perf-baseline-*.json
+/doc/s3support/perf-history-*.jsonl
 *.local.md
