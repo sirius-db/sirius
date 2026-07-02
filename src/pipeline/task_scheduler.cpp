@@ -22,6 +22,7 @@
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -162,6 +163,23 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
+  // Zero-task completion signal (s3-zero-task-protocol-plan.md S2): the RC
+  // pipeline's level-triggered listener posts query_finished so the management
+  // event loop — not a completing task, which a zero-task query never has —
+  // can signal the completion handler. The listener is per-query (pipelines
+  // are per-query objects); a stale listener firing after the channel closed
+  // fails silently in send(), which is fine.
+  for (const auto& pipeline : _query->get_pipelines()) {
+    auto sink = pipeline->get_sink();
+    if (!sink || sink->type != op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) { continue; }
+    pipeline->set_completion_listener([this]() {
+      if (!_self_publisher) { return; }
+      auto evt                  = std::make_unique<task_request>();
+      evt->kind                 = task_request_kind::query_finished;
+      [[maybe_unused]] auto _ok = _self_publisher->send(std::move(evt));
+    });
+  }
+
   // Reset the round-robin counter so the walk is reproducible across
   // iterations of the same query (cache=table_gpu warm path keys cache
   // entries by device_id; without this reset the second iteration's source
@@ -296,13 +314,19 @@ void task_scheduler::management_eventloop()
       SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
       break;
     }
-    if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
+    if (evt->kind == task_request_kind::query_finished) {
+      handle_query_finished();
+    } else if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
       _ready_devices.emplace_back(evt->device_id);
     }
     // Drain any further events that are already queued, so a single matcher
     // pass handles a burst of ready signals plus task pushes together.
+    // query_finished must be handled here too — dropping it in the drain loop
+    // loses the signal (s3-zero-task-protocol-plan.md S2).
     while (auto more = _task_request_channel.try_get()) {
-      if (more->kind == task_request_kind::device_ready && !more->is_scan) {
+      if (more->kind == task_request_kind::query_finished) {
+        handle_query_finished();
+      } else if (more->kind == task_request_kind::device_ready && !more->is_scan) {
         _ready_devices.emplace_back(more->device_id);
       }
     }
@@ -368,6 +392,29 @@ void task_scheduler::management_eventloop()
       it = _ready_devices.erase(it);
     }
   }
+}
+
+void task_scheduler::handle_query_finished()
+{
+  // The event may be stale: a previous query's listener firing late, or the
+  // handler already signaled by the executor path. Re-validate against the
+  // CURRENT query under _query_mutex (s3-zero-task-protocol-plan.md §2); the
+  // level-triggered listener re-fires any suppressed-but-needed signal.
+  std::lock_guard lock(_query_mutex);
+  if (!_query || !_completion_handler || _completion_handler->is_completed()) { return; }
+  bool rc_finished = false;
+  for (const auto& pipeline : _query->get_pipelines()) {
+    auto sink = pipeline->get_sink();
+    if (!sink || sink->type != op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) { continue; }
+    if (!pipeline->is_pipeline_finished()) { return; }
+    rc_finished = true;
+  }
+  if (!rc_finished) { return; }
+  // Same ordering as gpu_pipeline_executor's completion path: drain queued
+  // creation requests before signaling, so wait_for_completion's empty-queue
+  // validation doesn't race a late request.
+  if (_task_creator) { _task_creator->drain_pending_tasks(); }
+  _completion_handler->mark_completed();
 }
 
 }  // namespace pipeline

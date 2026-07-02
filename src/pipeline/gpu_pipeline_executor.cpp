@@ -449,6 +449,9 @@ void gpu_pipeline_executor::manager_loop()
         }
 
         if (query_complete && _completion_handler) {
+          // Redundant second signaler alongside the RC pipeline's completion
+          // listener (s3-zero-task-protocol-plan.md S2); mark_completed is
+          // CAS-idempotent.
           _task_creator->drain_pending_tasks();
           _completion_handler->mark_completed();
         }

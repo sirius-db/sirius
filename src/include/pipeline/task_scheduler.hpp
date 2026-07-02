@@ -205,6 +205,12 @@ class task_scheduler {
  private:
   void management_eventloop();
 
+  /// Handles a task_request_kind::query_finished event on the management thread:
+  /// re-validates the CURRENT query's RESULT_COLLECTOR pipeline under _query_mutex
+  /// (the event may be stale — a previous query's listener or an already-signaled
+  /// handler), then drains pending task creation and marks the handler completed.
+  void handle_query_finished();
+
   std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
 

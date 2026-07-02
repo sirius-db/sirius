@@ -55,9 +55,11 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -66,6 +68,18 @@ namespace sirius::op::scan {
 namespace {
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
+
+/// Gate for the tactical all-pruned empty-split fallback. Default ON; only
+/// SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK=0 disables it — the sanctioned way for
+/// tests to force a true zero-split scan. Stays default-enabled until the
+/// zero-task protocol's documented limitations close
+/// (s3-zero-task-protocol-plan.md §3). Read per-flush so tests can toggle it
+/// within one process.
+bool empty_split_fallback_enabled()
+{
+  auto* val = std::getenv("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK");
+  return val == nullptr || std::string(val) != "0";
+}
 
 //===----------------------------------------------------------------------===//
 // parquet_batch_coalescer
@@ -178,8 +192,9 @@ class parquet_batch_coalescer : public batch_coalescer {
     // with a single zero-row-group slice so the scan still creates one task
     // (materialize_metadata_to_table short-circuits it to a schema-correct
     // empty table). Partial prunes never reach here — any surviving slice sets
-    // _produced_any. See rca-s3-filter-pushdown-deadlock.md.
-    if (!_produced_any && _empty_split_fallback) {
+    // _produced_any. See rca-s3-filter-pushdown-deadlock.md; gated by
+    // SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK (empty_split_fallback_enabled above).
+    if (!_produced_any && _empty_split_fallback && empty_split_fallback_enabled()) {
       _slices.emplace_back(_empty_split_fallback->file_metadata,
                            _empty_split_fallback->file_path,
                            std::vector<cudf::size_type>{},

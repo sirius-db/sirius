@@ -27,6 +27,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -174,6 +175,14 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
+  //! Set the per-query completion listener, invoked from notify_downstream_pipelines()
+  //! when this pipeline's sink is the RESULT_COLLECTOR. Level-triggered: it fires on
+  //! the finish transition AND on every already-finished re-notification, so a signal
+  //! the consumer suppressed as stale can be re-delivered later
+  //! (s3-zero-task-protocol-plan.md S2). Wire it before the query starts; it is not
+  //! synchronized against concurrent invocation.
+  void set_completion_listener(std::function<void()> listener);
+
   //! Returns a scoped lock on the pipeline status mutex.
   //! Callers must hold this lock across the operation that consumes pipeline state
   //! (port data pop, partition claim, etc.) and the task constructor that calls
@@ -217,6 +226,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
   sirius::creator::task_creator* _task_creator{nullptr};
+
+  //! Per-query completion listener for RESULT_COLLECTOR pipelines (see
+  //! set_completion_listener)
+  std::function<void()> _completion_listener;
 
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;

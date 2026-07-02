@@ -224,12 +224,33 @@ void task_creator::manager_loop()
       continue;
     }
 
-    auto node = request->node;
-    if (node == nullptr) { continue; }
+    auto* original_node = request->node;
+    if (original_node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    auto* node = get_operator_for_next_task(original_node);
 
-    if (node == nullptr) { continue; }
+    if (node == nullptr) {
+      // Zero-task exit before dispatch (s3-zero-task-protocol-plan.md S1): the
+      // hint resolved to nothing (e.g. the split connector closed before this
+      // request ran), so no creation lambda will run the paired post-loop
+      // re-evaluation — re-evaluate the request's own pipeline here instead.
+      // Dispatch on the reserved pool slot, never inline on this manager
+      // thread: update_pipeline_status() can block on _status_mutex held
+      // across a scan's blocking get_next_split().
+      if (auto original_pipeline = original_node->get_pipeline()) {
+        _bounded_pool->dispatch(std::move(slot), [this, original_pipeline]() {
+          try {
+            original_pipeline->update_pipeline_status(false);
+          } catch (const std::exception& e) {
+            SIRIUS_LOG_ERROR("Task Creator: Exception during pipeline status re-evaluation: {}",
+                             e.what());
+            _task_scheduler->terminate_query(std::current_exception());
+            stop();
+          }
+        });
+      }
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {
@@ -408,17 +429,14 @@ void task_creator::manager_loop()
           task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
         }
-        // TODO(rca-s3-filter-pushdown-deadlock.md): zero-task completion
-        // protocol. A source that creates zero tasks never completes its
-        // pipeline: pipeline_finished is only re-evaluated from
-        // mark_task_completed(), and calling pipeline->update_pipeline_status()
-        // here — while locally possible — is NOT sufficient, because
-        // completion_handler::mark_completed() has a single call site in
-        // gpu_pipeline_executor's task-completion path, gated on a completed
-        // task of the RESULT_COLLECTOR pipeline. A fully zero-task query would
-        // still hang. Needs executor-side surgery as its own follow-up; the
-        // parquet all-pruned shape is unblocked by parquet_batch_coalescer's
-        // empty-split fallback.
+        // Unconditional re-evaluation at every creation exit
+        // (s3-zero-task-protocol-plan.md S1): with the source-exhaustion finish
+        // guard, "last task completed at T1, connector closed at T2>T1" has no
+        // later mark_task_completed() to re-check the pipeline — this call,
+        // observing the now-exhausted source, is the paired re-evaluation.
+        // Without it, normal fast-GPU queries would hang, so it must not be
+        // gated on the zero-task case.
+        pipeline->update_pipeline_status(false);
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
         _task_scheduler->terminate_query(std::current_exception());

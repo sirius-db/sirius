@@ -325,6 +325,11 @@ bool sirius_pipeline::is_pipeline_finished() const
 
 void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
 
+void sirius_pipeline::set_completion_listener(std::function<void()> listener)
+{
+  _completion_listener = std::move(listener);
+}
+
 void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
   // If this pipeline's sink is the RESULT_COLLECTOR, it is the terminal
@@ -332,6 +337,11 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // no parent pipeline whose status needs updating. Returning early avoids
   // racing with engine teardown after mark_completed() signals the future.
   if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    // Level-triggered completion signal (s3-zero-task-protocol-plan.md S2):
+    // every (re-)notification of the finished RC pipeline fires the listener,
+    // so a query_finished event the consumer discarded as stale gets
+    // re-delivered by the next re-evaluation.
+    if (_completion_listener) { _completion_listener(); }
     return;
   }
 
@@ -386,8 +396,18 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
           break;
         }
       }
-      if (limit_exhausted ||
-          (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
+      // Source-exhaustion conjunct (s3-zero-task-protocol-plan.md S3): the task
+      // counters can be transiently balanced (0==0 before the first split
+      // arrives, or all-done-before-close), so finishing additionally requires
+      // the pipeline's SOURCE MEMBER — get_operators()/first_node excludes it —
+      // to be past the point where it could ever create another task. For a GPU
+      // scan source, all_ports_empty() is split_connector::is_closed() (closed
+      // AND drained); port-less sources are trivially exhausted. limit_exhausted
+      // keeps its early exit: it finishes without draining the source.
+      bool source_exhausted =
+        !source || (source->is_source_pipeline_finished() && source->all_ports_empty());
+      if (limit_exhausted || (source_exhausted && first_node->is_source_pipeline_finished() &&
+                              first_node->all_ports_empty())) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
           for (auto& op : get_operators()) {

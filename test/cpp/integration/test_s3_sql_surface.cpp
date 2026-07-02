@@ -1654,6 +1654,10 @@ TEST_CASE("S3 pushdown all-pruned filter completes with an empty result",
   if (should_skip_s3_env(env)) { return; }
 
   scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  // Post-env-gate contract: this is a no-op until production consumes the env.
+  // Once the gate lands, this disables the tactical empty-split fallback so the
+  // zero-task protocol itself must complete the all-pruned query.
+  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
   auto fixture        = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query = "SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation") +
                         " WHERE n_regionkey = 99 ORDER BY n_nationkey";
@@ -1694,6 +1698,9 @@ TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
   if (should_skip_s3_env(env)) { return; }
 
   scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  // Post-env-gate contract: with the tactical fallback disabled, a partially
+  // pruned scan must still avoid premature completion and match the oracle.
+  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
   auto fixture     = std::make_shared<s3_sql_fixture>(*env);
   auto const shape = std::string{
     "SELECT l_returnflag, count(*) AS c FROM %s "
@@ -1727,10 +1734,12 @@ TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
 // Protocol follow-up sketch: the tactical fix for this PR is parquet-scoped empty-split emission.
 // The long-term contract should make a zero-task source complete the pipeline without requiring
 // every source to fabricate an empty unit of work. Keep this disabled until that protocol seam
-// exists, then turn it into an active regression test.
+// exists, then turn it into an active regression test. Keep this disabled rather
+// than [!mayfail]: a known hanging protocol limitation must never run a long
+// watchdog in normal or opt-in suites.
 #if 0
 TEST_CASE("zero-task scan source completes the pipeline",
-          "[.][s3][pushdown][zero-task-protocol][!mayfail]")
+          "[.][s3][pushdown][zero-task-protocol]")
 {
   auto source = make_zero_task_scan_source();
   auto query = make_single_source_query(source);
