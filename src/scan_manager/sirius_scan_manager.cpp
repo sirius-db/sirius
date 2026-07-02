@@ -104,7 +104,7 @@ struct cached_databatch_provider : public databatch_provider {
     const auto& chunk = _entry.host_chunks.at(index);
     if (!chunk) { return nullptr; }
     auto data_rep = chunk->slice(_column_indices);
-    return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(data_rep));
+    return cucascade::data_batch::make(get_next_batch_id(), std::move(data_rep));
   }
 
   std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
@@ -125,8 +125,7 @@ struct cached_databatch_provider : public databatch_provider {
                                                             : _entry.memory_space;
     auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
       view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-    return std::make_shared<::cucascade::data_batch>(::sirius::get_next_batch_id(),
-                                                     std::move(gpu_repr));
+    return ::cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
   }
 
   std::size_t _n_chunks;

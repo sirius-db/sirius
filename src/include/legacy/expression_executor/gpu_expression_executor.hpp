@@ -62,7 +62,7 @@ namespace sirius {
  */
 struct GpuExpressionExecutor {
   using data_batch              = cucascade::data_batch;
-  using data_repository_manager = cucascade::data_repository_manager<std::shared_ptr<data_batch>>;
+  using data_repository_manager = cucascade::data_repository_manager;
 
   //===----------Constructor/Destructor(s)----------===//
   /**

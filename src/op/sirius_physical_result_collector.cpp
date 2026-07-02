@@ -174,7 +174,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }
     // Data already in HOST tier -- read directly through the read_only accessor
-    assert(dynamic_cast<cucascade::host_data_representation*>(data) != nullptr);
+    assert(dynamic_cast<const cucascade::host_data_representation*>(data) != nullptr);
 
     using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
     auto const& host_table        = data->cast<cucascade::host_data_representation>();

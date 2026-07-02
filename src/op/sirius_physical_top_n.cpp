@@ -193,7 +193,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
   outputs.push_back(
-    std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
+    cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(output_data)));
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
@@ -292,7 +292,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
   outputs.push_back(
-    std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
+    cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(output_data)));
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 

@@ -111,7 +111,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+  return cucascade::data_batch::make(get_next_batch_id(), std::move(gpu_repr));
 }
 
 /**
@@ -128,7 +128,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+  return cucascade::data_batch::make(get_next_batch_id(), std::move(gpu_repr));
 }
 
 /**
@@ -161,7 +161,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     view, std::forward<Owner>(owner), alloc_size, memory_space, writer_stream);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+  return cucascade::data_batch::make(get_next_batch_id(), std::move(gpu_repr));
 }
 
 }  // namespace sirius
