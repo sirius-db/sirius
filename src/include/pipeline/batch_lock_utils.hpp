@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "cudf/list_offset_fixup.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -94,6 +95,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   switch (target_space->get_tier()) {
     case cucascade::memory::Tier::GPU:
       mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
+      normalize_gpu_list_offsets(mut_accessor, target_space, stream);
       break;
     case cucascade::memory::Tier::HOST:
       mut_accessor.convert_to<cucascade::host_data_representation>(registry, target_space, stream);

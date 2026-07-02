@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -57,6 +58,7 @@ enum class type_id : uint8_t {
   VARCHAR,
   STRUCT,
   LIST,
+  ARRAY,  // fixed-sized list type
   DECIMAL,
 };
 
@@ -95,7 +97,9 @@ class logical_type {
   //===--------------------------------------------------------------------===//
 
   /// Default-constructs a SQLNULL type (used as a sentinel/placeholder).
-  logical_type() : _id(type_id::SQLNULL), _precision(0), _scale(0) {}
+  logical_type() : _id(type_id::SQLNULL), _precision(0), _scale(0), _array_size(0), _child(nullptr)
+  {
+  }
 
   /**
    * @brief Construct a non-DECIMAL logical type.
@@ -113,6 +117,19 @@ class logical_type {
     return logical_type(type_id::DECIMAL, precision, scale);
   }
 
+  /**
+   * @brief Construct an ARRAY logical type with child element type and size.
+   * @param child  The type of elements in the array.
+   * @param size   Fixed array size (0 = any size).
+   */
+  static logical_type make_array(const logical_type& child, uint32_t size)
+  {
+    logical_type result(type_id::ARRAY, 0, 0);
+    result._child      = std::make_shared<logical_type>(child);
+    result._array_size = size;
+    return result;
+  }
+
   //===--------------------------------------------------------------------===//
   // Type inspection
   //===--------------------------------------------------------------------===//
@@ -125,6 +142,9 @@ class logical_type {
 
   /// Returns true if this is a VARCHAR (variable-length string) type.
   bool is_varchar() const noexcept { return _id == type_id::VARCHAR; }
+
+  /// Returns true if this is a fixed-size ARRAY type
+  bool is_array() const noexcept { return _id == type_id::ARRAY; }
 
   /// Returns true if this is an integer type (signed or unsigned, including HUGEINT variants).
   bool is_integer() const noexcept
@@ -173,7 +193,7 @@ class logical_type {
   bool is_fixed_width() const noexcept
   {
     return _id != type_id::VARCHAR && _id != type_id::STRUCT && _id != type_id::LIST &&
-           _id != type_id::SQLNULL && _id != type_id::INVALID;
+           _id != type_id::ARRAY && _id != type_id::SQLNULL && _id != type_id::INVALID;
   }
 
   /**
@@ -187,6 +207,27 @@ class logical_type {
    * @note Only meaningful when is_decimal() == true.
    */
   uint8_t decimal_scale() const noexcept { return _scale; }
+
+  /**
+   * @brief Returns the child element type for ARRAY types.
+   * @note Only valid when id() == type_id::ARRAY and has_child() == true.
+   */
+  const logical_type& array_child() const
+  {
+    if (!_child) { throw std::runtime_error("array_child: ARRAY type has no child metadata"); }
+    return *_child;
+  }
+
+  /**
+   * @brief Returns the fixed array size, or 0 if any size is allowed.
+   * @note Only meaningful when id() == type_id::ARRAY.
+   */
+  uint32_t array_size() const noexcept { return _array_size; }
+
+  /**
+   * @brief Returns true if this type has child type metadata (ARRAY/LIST).
+   */
+  bool has_child() const noexcept { return _child != nullptr; }
 
   /**
    * @brief Returns the storage size in bytes for fixed-width types.
@@ -221,6 +262,7 @@ class logical_type {
         return 16;                                                // DECIMAL128
       case type_id::VARCHAR: return 0;                            // variable-length
       case type_id::LIST:
+      case type_id::ARRAY:
       case type_id::STRUCT:
       case type_id::SQLNULL:
       case type_id::INVALID:
@@ -256,6 +298,10 @@ class logical_type {
       case type_id::VARCHAR: return "VARCHAR";
       case type_id::STRUCT: return "STRUCT";
       case type_id::LIST: return "LIST";
+      case type_id::ARRAY: {
+        std::string child = _child ? _child->to_string() : "?";
+        return _array_size == 0 ? child + "[ANY]" : child + "[" + std::to_string(_array_size) + "]";
+      }
       case type_id::DECIMAL:
         return "DECIMAL(" + std::to_string(_precision) + "," + std::to_string(_scale) + ")";
       default: return "UNKNOWN";
@@ -268,20 +314,31 @@ class logical_type {
 
   bool operator==(const logical_type& other) const noexcept
   {
-    return _id == other._id && _precision == other._precision && _scale == other._scale;
+    // base field
+    bool base_eq = _id == other._id && _precision == other._precision && _scale == other._scale &&
+                   _array_size == other._array_size;
+    if (!base_eq) return false;
+
+    // recursively compare types for child
+    if (_child && other._child) return *_child == *other._child;
+    return !_child && !other._child;
   }
 
   bool operator!=(const logical_type& other) const noexcept { return !(*this == other); }
 
  private:
   explicit logical_type(type_id id, uint8_t precision, uint8_t scale)
-    : _id(id), _precision(precision), _scale(scale)
+    : _id(id), _precision(precision), _scale(scale), _array_size(0), _child(nullptr)
   {
   }
 
   type_id _id;
   uint8_t _precision{0};  ///< Meaningful only for DECIMAL: total significant digits (1–38)
   uint8_t _scale{0};      ///< Meaningful only for DECIMAL: fractional digits (0–precision)
+
+  // array
+  uint32_t _array_size{0};               ///< Meaningful only for ARRAY: fixed size (0 = any size)
+  std::shared_ptr<logical_type> _child;  ///< Child type for ARRAY/LIST (nullptr if not nested)
 };
 
 }  // namespace sirius
