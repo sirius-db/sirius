@@ -17,6 +17,7 @@
 #include "sirius_context.hpp"
 
 #include "config.hpp"
+#include "cucascade/memory/memory_reservation_manager.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -279,8 +280,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
-  config_            = config;
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(config_.get_telemetry_config());
+  config_ = config;
 
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
@@ -303,6 +303,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(
+    config_.get_telemetry_config(),
+    dynamic_cast<cucascade::memory::memory_reservation_manager*>(memory_manager_.get()));
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);

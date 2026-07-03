@@ -34,18 +34,21 @@
 namespace sirius::telemetry {
 
 std::shared_ptr<const telemetry_context> telemetry_context::create(
-  const sirius::telemetry_config& config)
+  const sirius::telemetry_config& config,
+  const cucascade::memory::memory_reservation_manager* manager)
 {
-  return std::shared_ptr<telemetry_context>(new telemetry_context(config));
+  return std::shared_ptr<telemetry_context>(new telemetry_context(config, manager));
 }
 
-telemetry_context::telemetry_context(const sirius::telemetry_config& config)
+telemetry_context::telemetry_context(const sirius::telemetry_config& config,
+                                     const cucascade::memory::memory_reservation_manager* manager)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
     context_(
       quent::create_context(config.enable_quent ? "ndjson" : "noop", config.output_directory)),
     engine_observer_(quent::engine::create_observer(*context_)),
-    worker_observer_(quent::worker::create_observer(*context_))
+    worker_observer_(quent::worker::create_observer(*context_)),
+    memory_context_(std::make_shared<memory_context>(engine_uuid_, *context_, manager))
 {
   engine_observer_->init(engine_uuid_,
                          quent::engine::Init{
