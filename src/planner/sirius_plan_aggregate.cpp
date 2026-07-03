@@ -329,6 +329,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   // Downcast HUGEINT to BIGINT since cuDF does not support int128
   downcast_hugeint_types(op.types, op.expressions);
 
+  // Phase-1 boundary: reject GROUP BY on a nested (STRUCT/LIST/MAP) column. Checked
+  // before planning the child and before extract_aggregate_expressions rewrites the
+  // groups into bare references (which drop the column name needed for a clear error).
+  for (auto const& group : op.groups) {
+    reject_nested_column_operation(*group, "GROUP BY");
+  }
+
   auto plan = create_plan(*op.children[0]);
 
   plan = extract_aggregate_expressions(
