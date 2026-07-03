@@ -22,6 +22,7 @@
 #include "telemetry-bridge/gen/context.rs.h"
 #include "telemetry-bridge/gen/engine.rs.h"
 #include "telemetry-bridge/gen/executor_thread.rs.h"
+#include "telemetry-bridge/gen/query_group.rs.h"
 #include "telemetry-bridge/gen/task_manager_loop_thread.rs.h"
 #include "telemetry-bridge/gen/task_queue.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
@@ -61,6 +62,8 @@ class telemetry_context {
 
   [[nodiscard]] const uuid::UUID& engine_id() const { return engine_uuid_; }
   [[nodiscard]] const uuid::UUID& worker_id() const { return worker_uuid_; }
+  /// The single, session-scoped query group that every query in this context is reported under.
+  [[nodiscard]] const uuid::UUID& query_group_id() const { return query_group_uuid_; }
   [[nodiscard]] const quent::Context& context() const { return *context_; }
   [[nodiscard]] const std::shared_ptr<const memory_context>& get_memory_context() const
   {
@@ -73,9 +76,11 @@ class telemetry_context {
 
   uuid::UUID engine_uuid_;
   uuid::UUID worker_uuid_;
+  uuid::UUID query_group_uuid_;
   rust::Box<quent::Context> context_;
   rust::Box<quent::engine::EngineObserver> engine_observer_;
   rust::Box<quent::worker::WorkerObserver> worker_observer_;
+  rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
   std::shared_ptr<const memory_context> memory_context_;
 };
 

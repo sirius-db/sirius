@@ -44,10 +44,12 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
                                      const cucascade::memory::memory_reservation_manager* manager)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
+    query_group_uuid_(uuid::now_v7()),
     context_(
       quent::create_context(config.enable_quent ? "ndjson" : "noop", config.output_directory)),
     engine_observer_(quent::engine::create_observer(*context_)),
     worker_observer_(quent::worker::create_observer(*context_)),
+    query_group_observer_(quent::query_group::create_observer(*context_)),
     memory_context_(std::make_shared<memory_context>(engine_uuid_, *context_, manager))
 {
   engine_observer_->init(engine_uuid_,
@@ -66,6 +68,15 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
                            .parent_engine_id = engine_uuid_,
                            .instance_name    = fmt::format("worker-{}", getpid()),
                          });
+
+  // One session-scoped query group under this engine; every query in this context is reported
+  // under it, so a whole run shows up as a single group rather than one group per query.
+  query_group_observer_->declaration(
+    query_group_uuid_,
+    quent::query_group::Declaration{
+      .instance_name = fmt::format("{}-session-{}", config.engine_name, getpid()),
+      .engine_id     = engine_uuid_,
+    });
 
   SIRIUS_LOG_INFO("Telemetry context initialized (engine={})", config.engine_name);
 }

@@ -65,4 +65,29 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   cucascade::memory::memory_space& mem_space,
   rmm::cuda_stream_view stream);
 
+//===----------------------------------------------------------------------===//
+// checked_array_child_advance
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Advance an ARRAY child-element cursor by @p row_count * @p array_size.
+ *
+ * The running child-element total feeds the cudf LIST child offsets downstream,
+ * which are @c cudf::size_type (int32). The math is done in 64-bit to avoid the
+ * @c uint32_t wrap, and rejected if the new total would exceed the
+ * @c cudf::size_type range so the caller can refuse the scan rather than emit
+ * corrupt offsets.
+ *
+ * @return The advanced cursor, or @c std::nullopt on overflow.
+ */
+inline std::optional<uint32_t> checked_array_child_advance(uint32_t cursor,
+                                                           uint64_t row_count,
+                                                           uint64_t array_size)
+{
+  uint64_t const next = static_cast<uint64_t>(cursor) + row_count * array_size;
+  if (next > static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max())) {
+    return std::nullopt;
+  }
+  return static_cast<uint32_t>(next);
+}
+
 }  // namespace sirius::op::scan
