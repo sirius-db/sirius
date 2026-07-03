@@ -53,6 +53,8 @@ pixi run python test/tpch_performance/performance_test.py \
 
 The non-profiled run produces a long-format `<bench>/csv/runtimes.csv` (`engine,query,iteration,runtime_s`) and per-query `result.txt`. `--validation` additionally byte-compares the saved Sirius vs DuckDB results (with a small `abs_tol` on floats).
 
+**Data source (parquet or duckdb).** `--input` accepts either a parquet directory (`--data-source parquet`, the default) or a single `.duckdb` file (`--data-source duckdb`, exercising the GPU-native `seq_scan`); `--pin gpu|host` works for both. Profiling works for both sources through the **same** orchestrator — `nsys_report.sh --data-source duckdb --duckdb-file <file>.duckdb` (or just `--sf <SF>`, which defaults to `test_datasets/tpch_sf<SF>.duckdb`). See `test/tpch_performance/CLAUDE.md`.
+
 **When comparing across runs:**
 - Use the non-profiled timings to determine if performance actually improved or regressed
 - Use the profiled data to understand *why* performance changed (kernel times, operator attribution, occupancy, memory patterns)
@@ -63,6 +65,8 @@ The non-profiled run produces a long-format `<bench>/csv/runtimes.csv` (`engine,
 bash test/tpch_performance/nsys_report.sh \
     --sf <scale_factor> \
     --parquet-dir <path_to_parquet_dir> \
+    --data-source parquet|duckdb \
+    --duckdb-file <path_to.duckdb> \
     --output-dir ./reports \
     --label <custom_name> \
     --iterations 4 \
@@ -71,7 +75,7 @@ bash test/tpch_performance/nsys_report.sh \
     [query_numbers...]
 ```
 
-`--parquet-dir` defaults to `$PROJECT_DIR/test_datasets/tpch_parquet_sf<SF>`.
+`--parquet-dir` defaults to `$PROJECT_DIR/test_datasets/tpch_parquet_sf<SF>`; with `--data-source duckdb`, `--duckdb-file` defaults to `$PROJECT_DIR/test_datasets/tpch_sf<SF>.duckdb`.
 
 **Output directory structure (profiled):**
 ```
@@ -183,7 +187,7 @@ Domain numbers are not registered by Sirius — they're discovered from each nsy
 ### Sirius Physical Operators
 | Operator | Purpose |
 |----------|---------|
-| `table_scan` | Read parquet files via cuDF |
+| `table_scan` | Read input via cuDF — parquet (`read_parquet`) or DuckDB-native tables (`seq_scan`, `src/op/scan/duckdb_native_gpu_ingestible.cpp`) |
 | `projection` | Evaluate column expressions |
 | `filter` | Row filtering |
 | `hash_join` | Hash-based join |

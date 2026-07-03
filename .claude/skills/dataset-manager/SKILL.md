@@ -4,7 +4,7 @@ description: >
   Use this skill to generate benchmark datasets (TPC-H, TPC-DS, etc.). Trigger when the user
   needs test data at a specific scale factor for benchmarking or testing. Supports parquet and
   duckdb output formats.
-argument-hint: "[benchmark] [scale_factor] [--format duckdb|parquet] [--output <path>]"
+argument-hint: "[benchmark] [scale_factor] [--format duckdb|parquet] [--cluster] [--output <path>]"
 ---
 
 # Dataset Generator
@@ -17,6 +17,7 @@ Parse `$ARGUMENTS` for:
 - **Benchmark**: name from the registry below (first positional arg)
 - **Scale factor**: integer (second positional arg)
 - **Format**: `--format duckdb|parquet` (optional — each benchmark has a default)
+- **Cluster** (TPC-H duckdb only): `--cluster` / `--cluster-keys <spec>` (optional — physically sorts tables so row-group pruning works; errors with `--format parquet`)
 - **Output path**: `--output <path>` (optional — scripts have sensible defaults)
 
 If any required parameter (benchmark, scale factor) is missing, ask the user.
@@ -36,14 +37,18 @@ Each entry follows the same structure: script location, command template, suppor
 | Formats | `parquet` (tpchgen-rs), `duckdb` (DuckDB `dbgen()`) |
 | Default output (parquet) | `test_datasets/tpch_parquet_sf<SF>` |
 | Default output (duckdb) | `test_datasets/tpch_sf<SF>.duckdb` |
+| Default output (duckdb + `--cluster`) | `test_datasets/tpch_sf<SF>_sorted.duckdb` |
 | Prerequisites | Parquet: pixi env (rust, python, pyarrow). DuckDB: `build/release/duckdb` |
 
 ```bash
-cd test/tpch_performance && pixi run bash generate_tpch_data.sh <SF> --format <FORMAT> [--output <path>]
+cd test/tpch_performance && pixi run bash generate_tpch_data.sh <SF> --format <FORMAT> [--cluster] [--cluster-keys <spec>] [--output <path>]
 ```
 
 Notes:
 - If the parquet output directory already exists, the script skips generation
+- `--cluster` (duckdb only) physically sorts tables at load so each row group's per-column min/max becomes selective — this is what makes Sirius's native-scan row-group pruning skip work on date-filtered queries. It writes a distinct `tpch_sf<SF>_sorted.duckdb` so it can coexist with the unsorted dataset.
+- Default cluster keys: `lineitem:l_shipdate,orders:o_orderdate`. Override with `--cluster-keys "table:col,table:col,..."` (implies `--cluster`).
+- `--cluster` errors if combined with `--format parquet` (tpchgen-rs writes decimals as FIXED_LEN_BYTE_ARRAY, which disables Sirius row-group pruning for the whole file).
 
 ### TPC-DS
 

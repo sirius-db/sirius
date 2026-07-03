@@ -95,6 +95,45 @@ class scoped_env_var {
   bool had_original_{false};
 };
 
+class scoped_env_vars {
+ public:
+  explicit scoped_env_vars(std::vector<std::string> names)
+  {
+    originals_.reserve(names.size());
+    for (auto& name : names) {
+      std::optional<std::string> value;
+      if (auto const* current = std::getenv(name.c_str()); current != nullptr) {
+        value = std::string{current};
+      }
+      originals_.push_back({std::move(name), std::move(value)});
+    }
+  }
+
+  scoped_env_vars(scoped_env_vars const&)            = delete;
+  scoped_env_vars& operator=(scoped_env_vars const&) = delete;
+
+  ~scoped_env_vars()
+  {
+    for (auto const& [name, value] : originals_) {
+      if (value.has_value()) {
+        setenv(name.c_str(), value->c_str(), 1);
+      } else {
+        unsetenv(name.c_str());
+      }
+    }
+  }
+
+  void set(std::string const& name, std::string const& value)
+  {
+    setenv(name.c_str(), value.c_str(), 1);
+  }
+
+  void unset(std::string const& name) { unsetenv(name.c_str()); }
+
+ private:
+  std::vector<std::pair<std::string, std::optional<std::string>>> originals_;
+};
+
 struct s3_test_env {
   std::string endpoint;
   std::string https_endpoint;
@@ -141,6 +180,75 @@ bool should_skip_s3_env(std::optional<s3_test_env> const& env)
   }
   SUCCEED("SIRIUS_TEST_S3_* not set; skipping live S3 SQL-surface test");
   return true;
+}
+
+enum class aws_live_env_decision { ready, skip, fail };
+
+struct aws_live_env_result {
+  aws_live_env_decision decision{aws_live_env_decision::skip};
+  std::optional<s3_test_env> env;
+  std::string message;
+};
+
+bool is_regional_aws_s3_endpoint(std::string const& endpoint, std::string const& region)
+{
+  if (region.empty()) { return false; }
+  auto const expected = "https://s3." + region + ".amazonaws.com";
+  return endpoint == expected;
+}
+
+aws_live_env_result classify_aws_live_env()
+{
+  auto endpoint      = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto access_key    = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  auto secret_key    = env_or("SIRIUS_TEST_S3_SECRET_KEY");
+  auto bucket        = env_or("SIRIUS_TEST_S3_BUCKET");
+  auto region        = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  auto session_token = env_or("SIRIUS_TEST_S3_SESSION_TOKEN");
+  auto local_dir =
+    env_or("SIRIUS_TEST_S3_LOCAL_DIR",
+           (fs::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "data").string());
+  auto const strict = truthy_env("SIRIUS_TEST_S3_STRICT");
+
+  auto skip_or_fail = [&](std::string message) {
+    return aws_live_env_result{strict ? aws_live_env_decision::fail : aws_live_env_decision::skip,
+                               std::nullopt,
+                               std::move(message)};
+  };
+
+  if (endpoint.empty() || access_key.empty() || secret_key.empty() || bucket.empty()) {
+    return skip_or_fail("SIRIUS_TEST_S3_* real-AWS environment is not complete");
+  }
+  if (session_token.empty()) {
+    return skip_or_fail(
+      "SIRIUS_TEST_S3_SESSION_TOKEN is required for real-AWS tests; use assume-role temporary "
+      "credentials");
+  }
+  if (!is_regional_aws_s3_endpoint(endpoint, region)) {
+    return skip_or_fail(
+      "SIRIUS_TEST_S3_ENDPOINT must be regional https://s3.<region>.amazonaws.com");
+  }
+
+  return aws_live_env_result{aws_live_env_decision::ready,
+                             s3_test_env{std::move(endpoint),
+                                         "",
+                                         "",
+                                         std::move(region),
+                                         std::move(access_key),
+                                         std::move(secret_key),
+                                         std::move(bucket),
+                                         std::move(session_token),
+                                         fs::path{std::move(local_dir)}},
+                             ""};
+}
+
+std::optional<s3_test_env> read_aws_live_env()
+{
+  auto result = classify_aws_live_env();
+  if (result.decision == aws_live_env_decision::ready) { return std::move(result.env); }
+  if (result.decision == aws_live_env_decision::fail) { FAIL(result.message); }
+  SUCCEED(result.message);
+  return std::nullopt;
 }
 
 std::string s3_uri(std::string_view bucket, std::string_view key)
@@ -861,6 +969,7 @@ std::string json_escape(std::string_view value)
 std::string projection_signature(std::vector<std::string> const& columns)
 {
   if (columns.size() == 1) { return "single_column"; }
+  if (columns.size() == 16) { return "all_columns"; }
   return "columns_" + std::to_string(columns.size());
 }
 
@@ -892,9 +1001,18 @@ fs::path perf_json_path()
   return unittest_log_dir() / ("s3_rest_perf_" + std::to_string(stamp) + ".json");
 }
 
-fs::path perf_baseline_path()
+fs::path perf_baseline_path(std::string_view backend)
 {
-  return fs::path(SIRIUS_PROJECT_ROOT) / "doc" / "s3support" / "perf-baseline-minio.json";
+  auto const filename =
+    backend == "rest_aws" ? "perf-baseline-aws.json" : "perf-baseline-minio.json";
+  return fs::path(SIRIUS_PROJECT_ROOT) / "doc" / "s3support" / filename;
+}
+
+fs::path perf_history_path(std::string_view backend)
+{
+  auto const filename =
+    backend == "rest_aws" ? "perf-history-aws.jsonl" : "perf-history-minio.jsonl";
+  return fs::path(SIRIUS_PROJECT_ROOT) / "doc" / "s3support" / filename;
 }
 
 std::optional<std::string> read_optional_text_file(fs::path const& path)
@@ -1010,14 +1128,16 @@ std::optional<std::string> find_result_object(std::string const& json, bench_rec
   }
 }
 
-void attach_baseline_comparison(bench_record& record, std::optional<std::string> const& baseline)
+void attach_baseline_comparison(bench_record& record,
+                                std::optional<std::string> const& baseline,
+                                std::string_view backend)
 {
   if (!baseline) { return; }
   auto const baseline_host    = extract_json_string(*baseline, "host");
   auto const baseline_backend = extract_json_string(*baseline, "backend");
   auto const current_host     = env_or("HOSTNAME", "unknown");
   if (!baseline_host || !baseline_backend || *baseline_host != current_host ||
-      *baseline_backend != "rest_minio") {
+      *baseline_backend != backend) {
     INFO("Skipping perf baseline comparison for scenario="
          << record.scenario << " because the baseline host/backend does not match");
     return;
@@ -1040,16 +1160,21 @@ void attach_baseline_comparison(bench_record& record, std::optional<std::string>
   add_delta("footer_fetch_ms", record.footer_fetch_ms);
   add_delta("chunk_get_ms_mean", record.chunk_get_ms_mean);
 
+  auto const footer_threshold = backend == "rest_aws" ? 100.0 : 50.0;
+  auto const baseline_name =
+    backend == "rest_aws" ? "perf-baseline-aws.json" : "perf-baseline-minio.json";
   for (auto const& delta : record.comparisons) {
-    if (delta.metric == "footer_fetch_ms" && delta.delta_pct > 50.0) {
-      WARN(record.scenario << " footer_fetch_ms is " << delta.delta_pct
-                           << "% above perf-baseline-minio.json");
+    if (delta.metric == "footer_fetch_ms" && delta.delta_pct > footer_threshold) {
+      WARN(record.scenario << " footer_fetch_ms is " << delta.delta_pct << "% above "
+                           << baseline_name);
     }
   }
 }
 
 void write_perf_json(fs::path const& path,
                      s3_test_env const& env,
+                     std::string_view backend,
+                     std::string_view object_key,
                      std::uint64_t dataset_bytes,
                      std::vector<bench_record> const& records)
 {
@@ -1060,10 +1185,10 @@ void write_perf_json(fs::path const& path,
   out << "{\n";
   out << "  \"git_sha\": \"" << json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\n";
   out << "  \"host\": \"" << json_escape(env_or("HOSTNAME", "unknown")) << "\",\n";
-  out << "  \"backend\": \"rest_minio\",\n";
+  out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
   out << "  \"dataset_bytes\": " << dataset_bytes << ",\n";
   out << "  \"config\": {\"bucket\": \"" << json_escape(env.bucket) << "\", \"key\": \""
-      << json_escape(sf10_lineitem_key()) << "\"},\n";
+      << json_escape(object_key) << "\"},\n";
   out << "  \"results\": [\n";
   for (std::size_t i = 0; i < records.size(); ++i) {
     auto const& r = records[i];
@@ -1113,7 +1238,44 @@ void write_perf_json(fs::path const& path,
   out << "}\n";
 }
 
-void require_perf_json_schema(fs::path const& path)
+void append_perf_history_jsonl(fs::path const& path,
+                               s3_test_env const& env,
+                               std::string_view backend,
+                               std::string_view object_key,
+                               std::uint64_t dataset_bytes,
+                               std::vector<bench_record> const& records)
+{
+  fs::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::app);
+  REQUIRE(out);
+
+  auto const stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+  out << "{\"ts_ms\":" << stamp << ",\"git_sha\":\""
+      << json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\"host\":\""
+      << json_escape(env_or("HOSTNAME", "unknown")) << "\",\"backend\":\"" << json_escape(backend)
+      << "\",\"dataset_bytes\":" << dataset_bytes << ",\"config\":{\"bucket\":\""
+      << json_escape(env.bucket) << "\",\"key\":\"" << json_escape(object_key)
+      << "\"},\"results\":[";
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    auto const& r = records[i];
+    out << "{\"scenario\":\"" << json_escape(r.scenario) << "\",\"transport\":\""
+        << json_escape(r.transport) << "\",\"projection\":\"" << json_escape(r.projection)
+        << "\",\"max_connections\":" << r.max_connections
+        << ",\"rest_n_reactors\":" << r.rest_n_reactors
+        << ",\"payload_bytes_read\":" << r.payload_bytes_read << ",\"row_count\":" << r.row_count
+        << ",\"wall_clock_ms\":" << std::fixed << std::setprecision(3) << r.wall_clock_ms
+        << ",\"effective_bytes_per_sec\":" << r.effective_bytes_per_sec
+        << ",\"retries_total\":" << r.retries_total
+        << ",\"terminal_failures_total\":" << r.terminal_failures_total
+        << ",\"device_stream_sync_total\":" << r.device_stream_sync_total << "}";
+    if (i + 1 != records.size()) { out << ","; }
+  }
+  out << "]}\n";
+}
+
+void require_perf_json_schema(fs::path const& path, std::vector<std::string> expected_scenarios)
 {
   auto const json = read_text_file(path);
   for (auto key : {"\"git_sha\"",
@@ -1121,10 +1283,6 @@ void require_perf_json_schema(fs::path const& path)
                    "\"backend\"",
                    "\"dataset_bytes\"",
                    "\"scenario\"",
-                   "\"async_http\"",
-                   "\"async_https\"",
-                   "\"compat_http\"",
-                   "\"compat_https\"",
                    "\"transport\"",
                    "\"projection\"",
                    "\"max_connections\"",
@@ -1155,6 +1313,9 @@ void require_perf_json_schema(fs::path const& path)
                    "\"terminal_failures_total\"",
                    "\"config\""}) {
     CHECK(json.find(key) != std::string::npos);
+  }
+  for (auto const& scenario : expected_scenarios) {
+    CHECK(json.find("\"" + scenario + "\"") != std::string::npos);
   }
 }
 
@@ -1190,6 +1351,36 @@ std::vector<std::string> bench_compat_projection()
           "l_quantity",
           "l_extendedprice",
           "l_discount"};
+}
+
+std::vector<std::string> bench_full_lineitem_projection()
+{
+  return {"l_orderkey",
+          "l_partkey",
+          "l_suppkey",
+          "l_linenumber",
+          "l_quantity",
+          "l_extendedprice",
+          "l_discount",
+          "l_tax",
+          "l_returnflag",
+          "l_linestatus",
+          "l_shipdate",
+          "l_commitdate",
+          "l_receiptdate",
+          "l_shipinstruct",
+          "l_shipmode",
+          "l_comment"};
+}
+
+std::string aws_bench_lineitem_key()
+{
+  return env_or("SIRIUS_BENCH_S3_KEY", "tpch/lineitem_sf1.parquet");
+}
+
+std::string aws_bench_lineitem_uri(s3_test_env const& env)
+{
+  return s3_uri(env.bucket, aws_bench_lineitem_key());
 }
 
 bench_record run_rest_minio_bench_scenario(
@@ -1244,6 +1435,45 @@ bench_record run_rest_minio_bench_scenario(
                      rest_max_connections.value_or(std::size_t{8}),
                      rest_n_reactors.value_or(std::size_t{2}),
                      prefetch_cache_signature(enable_prefetch_cache),
+                     measurement,
+                     measurement.payload_bytes_read);
+}
+
+bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
+                                         std::string const& uri,
+                                         std::string scenario,
+                                         std::vector<std::string> columns,
+                                         std::size_t rest_max_connections,
+                                         std::optional<duckdb::idx_t> expected_rows)
+{
+  INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
+                   << " columns=" << columns.size() << " max_connections=" << rest_max_connections);
+  auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
+  limits.rest_perf_instrumentation = true;
+  limits.rest_max_connections      = rest_max_connections;
+  limits.rest_n_reactors           = std::size_t{2};
+  limits.gpu_usage                 = "8 GiB";
+  limits.gpu_reservation           = "3 GiB";
+  limits.host_capacity             = "12 GiB";
+
+  s3_sql_fixture fixture(env,
+                         limits,
+                         std::string{"presigned"},
+                         env.endpoint,
+                         std::nullopt,
+                         /*tls_verify=*/true);
+  auto measurement = run_rest_parquet_scan(fixture, uri, columns);
+  CHECK(measurement.rows > 0);
+  if (expected_rows.has_value()) { CHECK(measurement.rows == *expected_rows); }
+  CHECK(measurement.payload_bytes_read > 0);
+  CHECK(measurement.micro.device_stream_sync_total == 0);
+  CHECK(measurement.micro.terminal_failures_total == 0);
+  return make_record(std::move(scenario),
+                     "https",
+                     projection_signature(columns),
+                     rest_max_connections,
+                     limits.rest_n_reactors.value(),
+                     prefetch_cache_signature(true),
                      measurement,
                      measurement.payload_bytes_read);
 }
@@ -1466,6 +1696,76 @@ TEST_CASE("S3 bench STS session token reaches presigned URLs",
   CHECK(request.url.find("fake-session-token") != std::string::npos);
 }
 
+TEST_CASE("real-AWS live env guard requires regional endpoint and temporary credentials",
+          "[s3][aws][env]")
+{
+  scoped_env_vars env{{"SIRIUS_TEST_S3_ENDPOINT",
+                       "SIRIUS_TEST_S3_ACCESS_KEY",
+                       "SIRIUS_TEST_S3_SECRET_KEY",
+                       "SIRIUS_TEST_S3_BUCKET",
+                       "SIRIUS_TEST_S3_REGION",
+                       "SIRIUS_TEST_S3_SESSION_TOKEN",
+                       "SIRIUS_TEST_S3_LOCAL_DIR",
+                       "SIRIUS_TEST_S3_STRICT"}};
+
+  auto set_complete_base = [&]() {
+    env.set("SIRIUS_TEST_S3_ENDPOINT", "https://s3.us-east-2.amazonaws.com");
+    env.set("SIRIUS_TEST_S3_ACCESS_KEY", "AKIAFAKE");
+    env.set("SIRIUS_TEST_S3_SECRET_KEY", "fake-secret");
+    env.set("SIRIUS_TEST_S3_BUCKET", "sirius-s3-test");
+    env.set("SIRIUS_TEST_S3_REGION", "us-east-2");
+    env.set("SIRIUS_TEST_S3_LOCAL_DIR",
+            (fs::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "data").string());
+  };
+
+  SECTION("missing session token skips outside strict mode")
+  {
+    set_complete_base();
+    env.unset("SIRIUS_TEST_S3_SESSION_TOKEN");
+    env.unset("SIRIUS_TEST_S3_STRICT");
+    auto result = classify_aws_live_env();
+    CHECK(result.decision == aws_live_env_decision::skip);
+    CHECK(result.message.find("SESSION_TOKEN") != std::string::npos);
+  }
+
+  SECTION("missing session token fails in strict mode")
+  {
+    set_complete_base();
+    env.unset("SIRIUS_TEST_S3_SESSION_TOKEN");
+    env.set("SIRIUS_TEST_S3_STRICT", "1");
+    auto result = classify_aws_live_env();
+    CHECK(result.decision == aws_live_env_decision::fail);
+    CHECK(result.message.find("assume-role") != std::string::npos);
+  }
+
+  SECTION("non-regional endpoint skips or fails before any AWS work")
+  {
+    set_complete_base();
+    env.set("SIRIUS_TEST_S3_ENDPOINT", "https://s3.amazonaws.com");
+    env.set("SIRIUS_TEST_S3_SESSION_TOKEN", "temporary-token");
+    env.unset("SIRIUS_TEST_S3_STRICT");
+    auto result = classify_aws_live_env();
+    CHECK(result.decision == aws_live_env_decision::skip);
+    CHECK(result.message.find("regional") != std::string::npos);
+
+    env.set("SIRIUS_TEST_S3_STRICT", "1");
+    result = classify_aws_live_env();
+    CHECK(result.decision == aws_live_env_decision::fail);
+  }
+
+  SECTION("complete temporary regional env is accepted")
+  {
+    set_complete_base();
+    env.set("SIRIUS_TEST_S3_SESSION_TOKEN", "temporary-token");
+    env.unset("SIRIUS_TEST_S3_STRICT");
+    auto result = classify_aws_live_env();
+    REQUIRE(result.decision == aws_live_env_decision::ready);
+    REQUIRE(result.env.has_value());
+    CHECK(result.env->endpoint == "https://s3.us-east-2.amazonaws.com");
+    CHECK(result.env->session_token == "temporary-token");
+  }
+}
+
 TEST_CASE("S3 REST bench perf instrumentation gate keeps micro counters zero", "[.][s3][bench]")
 {
   auto env = load_s3_test_env();
@@ -1513,7 +1813,8 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
   auto large = read_large_lineitem_bench_fixture(*env);
   if (!large) { return; }
 
-  auto baseline_json = read_optional_text_file(perf_baseline_path());
+  auto constexpr backend = std::string_view{"rest_minio"};
+  auto baseline_json     = read_optional_text_file(perf_baseline_path(backend));
   std::vector<bench_record> records;
   records.reserve(4);
 
@@ -1605,10 +1906,10 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
        << compat_https.footer_fetch_ms << " chunk_get_ms_mean=" << compat_https.chunk_get_ms_mean
        << " chunk_get_count=" << compat_https.chunk_get_count);
 
-  attach_baseline_comparison(http, baseline_json);
-  attach_baseline_comparison(https, baseline_json);
-  attach_baseline_comparison(compat_http, baseline_json);
-  attach_baseline_comparison(compat_https, baseline_json);
+  attach_baseline_comparison(http, baseline_json, backend);
+  attach_baseline_comparison(https, baseline_json, backend);
+  attach_baseline_comparison(compat_http, baseline_json, backend);
+  attach_baseline_comparison(compat_https, baseline_json, backend);
   records.push_back(std::move(http));
   records.push_back(std::move(https));
   records.push_back(std::move(compat_http));
@@ -1616,10 +1917,86 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
   REQUIRE(records.size() >= 4);
 
   auto const path = perf_json_path();
-  write_perf_json(
-    path, *env, static_cast<std::uint64_t>(fs::file_size(large->local_path)), records);
-  require_perf_json_schema(path);
+  write_perf_json(path,
+                  *env,
+                  backend,
+                  sf10_lineitem_key(),
+                  static_cast<std::uint64_t>(fs::file_size(large->local_path)),
+                  records);
+  require_perf_json_schema(path, {"async_http", "async_https", "compat_http", "compat_https"});
   WARN("Wrote S3 REST perf JSON baseline to " << path.string());
+}
+
+TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
+          "[.][s3][bench][aws][live]")
+{
+  auto env = read_aws_live_env();
+  if (!env) { return; }
+
+  auto constexpr backend = std::string_view{"rest_aws"};
+  auto const object_key  = aws_bench_lineitem_key();
+  auto const uri         = aws_bench_lineitem_uri(*env);
+  auto baseline_json     = read_optional_text_file(perf_baseline_path(backend));
+
+  std::vector<bench_record> records;
+  records.reserve(4);
+
+  std::optional<duckdb::idx_t> projected_rows;
+  std::optional<duckdb::idx_t> full_rows;
+  std::optional<std::uint64_t> projected_payload_bytes;
+  std::optional<std::uint64_t> full_payload_bytes;
+
+  for (auto max_connections : {std::size_t{1}, std::size_t{32}}) {
+    auto projected = run_rest_aws_bench_scenario(*env,
+                                                 uri,
+                                                 "aws_https_projected",
+                                                 bench_single_column_projection(),
+                                                 max_connections,
+                                                 projected_rows);
+    if (!projected_rows.has_value()) { projected_rows = projected.row_count; }
+    if (!projected_payload_bytes.has_value()) {
+      projected_payload_bytes = projected.payload_bytes_read;
+    }
+    CHECK(projected.row_count == *projected_rows);
+    CHECK(projected.payload_bytes_read == *projected_payload_bytes);
+    CHECK(projected.terminal_failures_total == 0);
+    CHECK(projected.device_stream_sync_total == 0);
+    WARN("AWS REST projected mc=" << max_connections
+                                  << " throughput=" << projected.effective_bytes_per_sec
+                                  << " B/s footer_fetch_ms=" << projected.footer_fetch_ms
+                                  << " ttfb_ns=" << projected.ttfb_ns
+                                  << " retries=" << projected.retries_total);
+    attach_baseline_comparison(projected, baseline_json, backend);
+    records.push_back(std::move(projected));
+
+    auto full = run_rest_aws_bench_scenario(
+      *env, uri, "aws_https_full", bench_full_lineitem_projection(), max_connections, full_rows);
+    if (!full_rows.has_value()) { full_rows = full.row_count; }
+    if (!full_payload_bytes.has_value()) { full_payload_bytes = full.payload_bytes_read; }
+    CHECK(full.row_count == *full_rows);
+    CHECK(full.payload_bytes_read == *full_payload_bytes);
+    CHECK(full.terminal_failures_total == 0);
+    CHECK(full.device_stream_sync_total == 0);
+    WARN("AWS REST full mc=" << max_connections << " throughput=" << full.effective_bytes_per_sec
+                             << " B/s footer_fetch_ms=" << full.footer_fetch_ms
+                             << " ttfb_ns=" << full.ttfb_ns << " retries=" << full.retries_total);
+    attach_baseline_comparison(full, baseline_json, backend);
+    records.push_back(std::move(full));
+  }
+  REQUIRE(records.size() == 4);
+
+  auto dataset_bytes = std::uint64_t{0};
+  for (auto const& record : records) {
+    dataset_bytes = std::max(dataset_bytes, record.payload_bytes_read);
+  }
+  CHECK(dataset_bytes > 0);
+
+  auto const path = perf_json_path();
+  write_perf_json(path, *env, backend, object_key, dataset_bytes, records);
+  require_perf_json_schema(path, {"aws_https_projected", "aws_https_full"});
+  append_perf_history_jsonl(
+    perf_history_path(backend), *env, backend, object_key, dataset_bytes, records);
+  WARN("Wrote AWS S3 REST perf JSON to " << path.string());
 }
 
 TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
@@ -2342,6 +2719,56 @@ TEST_CASE("gpu_execution S3 SQL supports both configured SigV4 signing modes",
   SECTION("header")
   {
     s3_sql_fixture fixture(*env, {}, std::string{"header"});
+    compare_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  }
+}
+
+TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",
+          "[.][s3][aws][live][sql][gpu_execution]")
+{
+  auto env = read_aws_live_env();
+  if (!env) { return; }
+
+  auto const s3_query = std::string{"SELECT n_nationkey, n_name, n_regionkey FROM read_parquet("} +
+                        sql_quote(s3_uri(env->bucket, "fixtures/nation.parquet")) +
+                        ") ORDER BY n_nationkey";
+  auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
+                           local_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+
+  SECTION("presigned")
+  {
+    s3_sql_fixture fixture(*env, {}, std::string{"presigned"}, env->endpoint, std::nullopt, true);
+    compare_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  }
+
+  SECTION("header")
+  {
+    s3_sql_fixture fixture(*env, {}, std::string{"header"}, env->endpoint, std::nullopt, true);
+    compare_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  }
+}
+
+TEST_CASE("gpu_execution aggregates real AWS S3 parquet through Sirius SigV4",
+          "[.][s3][aws][live][sql][gpu_execution]")
+{
+  auto env = read_aws_live_env();
+  if (!env) { return; }
+
+  auto const s3_query =
+    std::string{"SELECT count(*), min(n_nationkey), max(n_nationkey) FROM read_parquet("} +
+    sql_quote(s3_uri(env->bucket, "fixtures/nation.parquet")) + ")";
+  auto const local_query = "SELECT count(*), min(n_nationkey), max(n_nationkey) FROM " +
+                           local_parquet_scan(*env, "nation");
+
+  SECTION("presigned")
+  {
+    s3_sql_fixture fixture(*env, {}, std::string{"presigned"}, env->endpoint, std::nullopt, true);
+    compare_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  }
+
+  SECTION("header")
+  {
+    s3_sql_fixture fixture(*env, {}, std::string{"header"}, env->endpoint, std::nullopt, true);
     compare_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   }
 }
