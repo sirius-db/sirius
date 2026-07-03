@@ -125,8 +125,8 @@ class GpuExecutionFixture {
     REQUIRE_FALSE(result->HasError());
   }
 
-  /// Collect all rows as sorted vectors of stringified values for deterministic comparison.
-  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
+                                                            bool sort = true)
   {
     std::vector<std::vector<std::string>> rows;
     for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
@@ -137,11 +137,13 @@ class GpuExecutionFixture {
       }
       rows.push_back(std::move(row));
     }
-    std::sort(rows.begin(), rows.end());
+    if (sort) { std::sort(rows.begin(), rows.end()); }
     return rows;
   }
 
-  void compare_gpu_vs_cpu(const std::string& query)
+  // ordered=true compares rows in result order; use only for
+  // tie-free queries. Default sorts rows and checks the set.
+  void compare_gpu_vs_cpu(const std::string& query, bool ordered = false)
   {
     // Run on GPU (transparent, plain SQL goes through the Sirius optimizer hook).
     con->Query("SET gpu_execution = true;");
@@ -169,8 +171,8 @@ class GpuExecutionFixture {
 
     auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
     auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
-    auto gpu_rows = collect_rows(gpu_mat);
-    auto cpu_rows = collect_rows(cpu_mat);
+    auto gpu_rows = collect_rows(gpu_mat, !ordered);
+    auto cpu_rows = collect_rows(cpu_mat, !ordered);
 
     for (size_t r = 0; r < gpu_rows.size(); r++) {
       for (size_t c = 0; c < gpu_rows[r].size(); c++) {

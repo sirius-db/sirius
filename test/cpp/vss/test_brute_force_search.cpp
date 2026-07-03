@@ -203,6 +203,61 @@ TEST_CASE("brute_force_knn distance magnitudes match the requested metric", "[vs
   }
 }
 
+// Regression for float32 catastrophic cancellation.
+TEST_CASE("brute_force_knn stays accurate for large-magnitude off-origin queries", "[vss]")
+{
+  constexpr cudf::size_type dim    = 3;
+  constexpr cudf::size_type n_rows = 5000;
+
+  std::vector<float> dataset_vals(static_cast<std::size_t>(n_rows) * dim);
+  for (cudf::size_type i = 0; i < n_rows; ++i) {
+    dataset_vals[i * dim + 0] = static_cast<float>(i);
+    dataset_vals[i * dim + 1] = static_cast<float>(i + 1);
+    dataset_vals[i * dim + 2] = static_cast<float>(i + 2);
+  }
+  auto dataset_col  = make_fixed_size_float_list(dataset_vals, n_rows, dim);
+  auto dataset_view = sirius::vss::list_column_as_dataset_view(dataset_col->view(), dim);
+
+  // Query far from the origin so <x,q> is large, where the cancellation is triggered
+  std::vector<float> query_vals = {4980.0f, 4981.0f, 4982.0f};
+  auto query_col                = make_fixed_size_float_list(query_vals, 1, dim);
+  auto query_view               = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
+
+  constexpr int64_t k = 5;
+  auto result         = sirius::vss::brute_force_knn(
+    dataset_view, query_view, k, cuvs::distance::DistanceType::L2SqrtUnexpanded);
+
+  auto neighbors = to_host(result.neighbors->view());
+  auto distances = to_host_f(result.distances->view());
+
+  // Exact euclidean distance in double precision for a given dataset row
+  auto exact = [&](int64_t row) {
+    double s = 0.0;
+    for (cudf::size_type d = 0; d < dim; ++d) {
+      double const diff =
+        static_cast<double>(dataset_vals[row * dim + d]) - static_cast<double>(query_vals[d]);
+      s += diff * diff;
+    }
+    return std::sqrt(s);
+  };
+
+  // Every returned distance must match its own exact value. The tolerance is far
+  // below the ~1.7 spacing the expanded metric was collapsing to 0, so this
+  // fails hard on the buggy metric and passes on the unexpanded one
+  for (int64_t j = 0; j < k; ++j) {
+    REQUIRE(distances[j] == Approx(exact(neighbors[j])).margin(1e-2));
+  }
+
+  // Row 4980 is the exact match; it must rank first at distance 0
+  REQUIRE(neighbors[0] == 4980);
+  REQUIRE(distances[0] == Approx(0.0).margin(1e-2));
+
+  // Results are ordered by ascending distance
+  for (int64_t j = 1; j < k; ++j) {
+    REQUIRE(distances[j - 1] <= distances[j] + 1e-3f);
+  }
+}
+
 TEST_CASE("brute_force_knn handles boundary shapes", "[vss]")
 {
   SECTION("k == n_rows returns every row, ordered by distance")
