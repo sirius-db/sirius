@@ -69,16 +69,16 @@ namespace {
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
-/// Gate for the tactical all-pruned empty-split fallback. Default ON; only
-/// SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK=0 disables it — the sanctioned way for
-/// tests to force a true zero-split scan. Stays default-enabled until the
-/// zero-task protocol's documented limitations close
-/// (s3-zero-task-protocol-plan.md §3). Read per-flush so tests can toggle it
-/// within one process.
+/// Escape hatch for the legacy all-pruned empty-split fallback. Default OFF:
+/// the zero-task completion protocol finishes zero-split scans and downstream
+/// operators emit their zero-input semantics directly (identity aggregates,
+/// zero-side joins). SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK=1 restores the
+/// synthetic empty split. Read per-flush so tests can toggle it within one
+/// process.
 bool empty_split_fallback_enabled()
 {
   auto* val = std::getenv("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK");
-  return val == nullptr || std::string(val) != "0";
+  return val != nullptr && std::string(val) == "1";
 }
 
 //===----------------------------------------------------------------------===//
