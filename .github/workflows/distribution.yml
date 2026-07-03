@@ -5,6 +5,8 @@
 #     - Explicitly allowed third-party actions:
 #       prefix-dev/setup-pixi@*
 #       mozilla-actions/sccache-action@*
+#       docker/setup-buildx-action@*
+#       docker/build-push-action@*
 #     - Require actions to be pinned to a full-length commit SHA: NO
 #
 # Adding a new action? You must:
@@ -27,6 +29,9 @@ jobs:
   cuda-13:
     if: github.event_name != 'pull_request'
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
+    permissions:
+      actions: write
+      contents: read
     with:
       extension_name: sirius
       duckdb_version: v1.5.4
@@ -38,6 +43,7 @@ jobs:
       vcpkg_binary_cache_enabled: true
       skip_tests: true
       reduced_ci_mode: "disabled"
+      docker_build_cache: true
       override_ci_tools_repository: "sirius-db/extension-ci-tools"
       build_type: ci-release
       build_duckdb_shell: false
@@ -51,6 +57,9 @@ jobs:
   cuda-12:
     if: github.event_name != 'pull_request'
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
+    permissions:
+      actions: write
+      contents: read
     with:
       extension_name: sirius
       duckdb_version: v1.5.4
@@ -62,6 +71,7 @@ jobs:
       vcpkg_binary_cache_enabled: true
       skip_tests: true
       reduced_ci_mode: "disabled"
+      docker_build_cache: true
       override_ci_tools_repository: "sirius-db/extension-ci-tools"
       build_type: ci-release
       build_duckdb_shell: false
