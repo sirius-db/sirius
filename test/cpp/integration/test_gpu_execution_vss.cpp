@@ -58,18 +58,38 @@ TEST_CASE_METHOD(VssFixture,
   // Nearest-5 by L2 distance to the origin.
   compare_gpu_vs_cpu(
     "SELECT id FROM test_vss "
-    "ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5;");
+    "ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5;",
+    true);
 
   // With OFFSET: exercises the merge's offset slice.
   compare_gpu_vs_cpu(
     "SELECT id FROM test_vss "
-    "ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5 OFFSET 3;");
+    "ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5 OFFSET 3;",
+    true);
 
   // SELECT *: the FLOAT[3] vector column is gathered by the neighbor map and
   // round-trips back to a DuckDB ARRAY in the result (passthrough output column).
   compare_gpu_vs_cpu(
     "SELECT * FROM test_vss "
-    "ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5;");
+    "ORDER BY array_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5;",
+    true);
+}
+
+TEST_CASE_METHOD(VssFixture,
+                 "gpu_execution vss - brute-force top-k (large-magnitude off-origin query)",
+                 "[integration][gpu_execution][array][vss]")
+{
+  // Regression for float32 catastrophic cancellation in the L2 distance
+  run_ok(
+    "CREATE TABLE test_vss_far AS "
+    "SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(5000) t(i);");
+  run_ok("CHECKPOINT;");  // Persist to disk for the native GPU scan.
+
+  // Off-origin query so <x,q> is large; tie-free order is 4999,4998,...,4995.
+  compare_gpu_vs_cpu(
+    "SELECT id FROM test_vss_far "
+    "ORDER BY array_distance(vec, [5000.0, 5000.0, 5000.0]::FLOAT[3]) LIMIT 5;",
+    true);
 }
 
 TEST_CASE_METHOD(VssFixture,

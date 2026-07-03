@@ -31,7 +31,8 @@ namespace {
 
 std::optional<cuvs::distance::DistanceType> metric_for_function(std::string const& name)
 {
-  if (name == "array_distance") { return cuvs::distance::DistanceType::L2SqrtExpanded; }
+  // Use unexpanded here to prevent catastrophic cancellation for large-magnitude vectors
+  if (name == "array_distance") { return cuvs::distance::DistanceType::L2SqrtUnexpanded; }
   if (name == "array_cosine_distance") { return cuvs::distance::DistanceType::CosineExpanded; }
   return std::nullopt;
 }
