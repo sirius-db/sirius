@@ -19,6 +19,11 @@
 #include "vss/cudf_raft_interop.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuvs/distance/distance.hpp>
 
@@ -42,16 +47,18 @@ struct knn_result {
 };
 
 /**
- * @brief Exact (brute-force) k-nearest-neighbour search via cuVS.
+ * @brief Exact (brute-force) k-nearest-neighbor search via cuVS.
  *
  * For every query vector, finds the @p k nearest dataset vectors under @p
  * metric. @p dataset and @p queries must share the same dimensionality and be
  * row-major `[n, dim]` FLOAT32 matrices (see @ref list_column_as_dataset_view).
  *
- * Output columns are allocated through cudf's current device resource — i.e.
- * Sirius's cucascade-backed memory resource during execution — so the results
- * (and cuVS's internal workspace, which also draws from the current device
- * resource) are tracked by the reservation system.
+ * Output columns are allocated through @p mr (defaulting to cudf's current
+ * device resource). In Sirius, pass the owning memory space's allocator so the
+ * results are reserved against that exact space rather than the ambient default.
+ * cuVS's internal scratch is separate: it draws from rmm's current device
+ * resource (not @p mr), which Sirius installs as the cucascade allocator, so it
+ * is still reserved, just against the ambient current space rather than @p mr.
  *
  * @warning NON-OWNING inputs: @p dataset and @p queries borrow device memory
  *          that must remain alive AND resident on-device for the duration of the
@@ -66,14 +73,18 @@ struct knn_result {
  *
  * @param dataset Row-major `[n_rows, dim]` dataset to search.
  * @param queries Row-major `[n_queries, dim]` query vectors.
- * @param k       Number of neighbours per query (`1 <= k <= n_rows`).
- * @param metric  Distance metric (default: squared L2).
+ * @param k       Number of neighbors per query (`1 <= k <= n_rows`).
+ * @param metric  Distance metric (default: Euclidean L2, unexpanded).
+ * @param stream  Stream the search and output allocations run on.
+ * @param mr      Device resource for the output columns (default: cudf's current).
  * @return Flattened neighbour-index and distance columns, plus `n_queries`/`k`.
  */
 knn_result brute_force_knn(
   dataset_matrix_view dataset,
   dataset_matrix_view queries,
   int64_t k,
-  cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2Expanded);
+  cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2SqrtUnexpanded,
+  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr   = cudf::get_current_device_resource_ref());
 
 }  // namespace sirius::vss

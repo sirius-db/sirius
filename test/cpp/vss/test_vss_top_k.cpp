@@ -117,7 +117,7 @@ sirius::vss::vss_top_k_pattern make_id_distance_pattern(std::vector<float> query
   pattern.vector_column_index = 1;  // input column 1 is the vector column
   pattern.dim                 = static_cast<int64_t>(query.size());
   pattern.query               = std::move(query);
-  pattern.metric              = cuvs::distance::DistanceType::L2SqrtExpanded;
+  pattern.metric              = cuvs::distance::DistanceType::L2SqrtUnexpanded;
   pattern.output_columns      = {
     {sirius::vss::vss_output_column::kind::gather_input, /*input_index=*/0},
     {sirius::vss::vss_output_column::kind::distance, /*input_index=*/-1},

@@ -148,11 +148,11 @@ TEST_CASE("brute_force_knn finds exact nearest neighbours", "[vss]")
   }
 }
 
-// The metric decides whether returned distances are squared or rooted. The SQL
-// surface relies on this exact contract: `array_distance` is wired to
-// L2SqrtExpanded (Euclidean), `array_cosine_distance` to CosineExpanded. Without
-// magnitude assertions, a metric/sqrt regression (e.g. defaulting to the squared
-// L2Expanded) would silently still pass ordering-only checks, so pin the values.
+// The metric decides the returned distance magnitude. The SQL surface relies on
+// this exact contract: `array_distance` is wired to L2SqrtUnexpanded (Euclidean),
+// `array_cosine_distance` to CosineExpanded. Without magnitude assertions, a
+// metric/sqrt regression (e.g. returning squared L2) would silently still pass
+// ordering-only checks, so pin the values.
 TEST_CASE("brute_force_knn distance magnitudes match the requested metric", "[vss]")
 {
   constexpr cudf::size_type dim = 2;
@@ -176,10 +176,10 @@ TEST_CASE("brute_force_knn distance magnitudes match the requested metric", "[vs
   auto query_col                = make_fixed_size_float_list(query_vals, 1, dim);
   auto query_view               = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
 
-  SECTION("L2SqrtExpanded returns Euclidean distance (the array_distance contract)")
+  SECTION("L2SqrtUnexpanded returns Euclidean distance (the array_distance contract)")
   {
     auto result = sirius::vss::brute_force_knn(
-      dataset_view, query_view, /*k=*/4, cuvs::distance::DistanceType::L2SqrtExpanded);
+      dataset_view, query_view, /*k=*/4, cuvs::distance::DistanceType::L2SqrtUnexpanded);
 
     auto neighbors = to_host(result.neighbors->view());
     auto distances = to_host_f(result.distances->view());
@@ -188,18 +188,6 @@ TEST_CASE("brute_force_knn distance magnitudes match the requested metric", "[vs
     REQUIRE(distances[1] == Approx(5.0f));
     REQUIRE(distances[2] == Approx(10.0f));
     REQUIRE(distances[3] == Approx(13.0f));
-  }
-
-  SECTION("L2Expanded returns squared L2 distance")
-  {
-    auto result = sirius::vss::brute_force_knn(
-      dataset_view, query_view, /*k=*/4, cuvs::distance::DistanceType::L2Expanded);
-
-    auto distances = to_host_f(result.distances->view());
-    REQUIRE(distances[0] == Approx(0.0f));
-    REQUIRE(distances[1] == Approx(25.0f));
-    REQUIRE(distances[2] == Approx(100.0f));
-    REQUIRE(distances[3] == Approx(169.0f));
   }
 }
 
@@ -272,7 +260,7 @@ TEST_CASE("brute_force_knn handles boundary shapes", "[vss]")
     auto query_view = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
 
     auto result = sirius::vss::brute_force_knn(
-      dataset_view, query_view, /*k=*/3, cuvs::distance::DistanceType::L2SqrtExpanded);
+      dataset_view, query_view, /*k=*/3, cuvs::distance::DistanceType::L2SqrtUnexpanded);
 
     auto neighbors = to_host(result.neighbors->view());
     auto distances = to_host_f(result.distances->view());
@@ -294,7 +282,7 @@ TEST_CASE("brute_force_knn handles boundary shapes", "[vss]")
     auto query_view = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
 
     auto result = sirius::vss::brute_force_knn(
-      dataset_view, query_view, /*k=*/1, cuvs::distance::DistanceType::L2SqrtExpanded);
+      dataset_view, query_view, /*k=*/1, cuvs::distance::DistanceType::L2SqrtUnexpanded);
 
     REQUIRE(result.neighbors->size() == 1);
     auto neighbors = to_host(result.neighbors->view());
@@ -318,7 +306,7 @@ TEST_CASE("brute_force_knn breaks distance ties without dropping rows", "[vss]")
   auto query_view               = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
 
   auto result = sirius::vss::brute_force_knn(
-    dataset_view, query_view, /*k=*/2, cuvs::distance::DistanceType::L2SqrtExpanded);
+    dataset_view, query_view, /*k=*/2, cuvs::distance::DistanceType::L2SqrtUnexpanded);
 
   auto neighbors = to_host(result.neighbors->view());
   auto distances = to_host_f(result.distances->view());
