@@ -25,14 +25,14 @@ make = "*"
 ninja = "*"
 sccache = "=0.15.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
-clang = "21.*"
+clang = "22.*"
 wget = "*"
 pre-commit = "*"
 identify = ">=2.6"
-clang-tools = "21.*"
+clang-tools = "22.*"
 # Provides llvm-symbolizer (and friends) matching the clang version above, so
 # ASan/TSan reports are symbolized. Kept in lockstep with `clang` at 21.*.
-llvm-tools = "21.*"
+llvm-tools = "22.*"
 pkg-config = "*"
 mold = "*"
 libprotobuf = "*"
