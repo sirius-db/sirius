@@ -185,6 +185,11 @@ void task_scheduler::terminate_query(std::exception_ptr error)
   stop();
 }
 
+void task_scheduler::signal_query_complete()
+{
+  if (_completion_handler) { _completion_handler->mark_completed(); }
+}
+
 void task_scheduler::drain_after_error()
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");

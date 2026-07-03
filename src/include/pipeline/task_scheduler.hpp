@@ -164,6 +164,18 @@ class task_scheduler {
   void terminate_query(std::exception_ptr error);
 
   /**
+   * @brief Signal successful query completion from a task_creator pool thread.
+   *
+   * Called by the cpu_source_task lambda when a terminal CPU-only pipeline
+   * completes without dispatching any downstream GPU tasks (e.g. EMPTY_RESULT,
+   * DUMMY_SCAN → RESULT_COLLECTOR with no intermediate operators). Unlike
+   * gpu_pipeline_executor::mark_completed(), this must NOT call
+   * drain_pending_tasks() — doing so from within a bounded_pool lambda
+   * deadlocks on wait_all(). wait_for_completion() drains the queues anyway.
+   */
+  void signal_query_complete();
+
+  /**
    * @brief Drain all in-flight tasks after a query error.
    *
    * Drains the top-level task queue and waits for each GPU executor to finish

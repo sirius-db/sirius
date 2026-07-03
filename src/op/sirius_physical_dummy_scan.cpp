@@ -19,5 +19,20 @@
 namespace sirius {
 namespace op {
 
+std::unique_ptr<operator_data> sirius_physical_dummy_scan::execute(const operator_data& input_data,
+                                                                   rmm::cuda_stream_view /*stream*/)
+{
+  /// DUMMY_SCAN is the source of its pipeline. The upstream CPU_SOURCE produces
+  /// a single 1-row sentinel batch into this operator's input port; execute()
+  /// must forward that batch unchanged so downstream operators (e.g. a
+  /// PROJECTION of constant expressions) see one input row and produce one
+  /// output row. The base execute() returns an empty batch, which would drop
+  /// the row and yield zero output rows.
+
+  // Forward the upstream CPU_SOURCE's single 1-row sentinel batch unchanged.
+  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+}
+
 }  // namespace op
 }  // namespace sirius
