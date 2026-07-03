@@ -31,9 +31,11 @@
 #include <duckdb/parallel/thread_context.hpp>
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace sirius::creator {
 
@@ -233,21 +235,48 @@ void task_creator::manager_loop()
       // Zero-task exit before dispatch (s3-zero-task-protocol-plan.md S1): the
       // hint resolved to nothing (e.g. the split connector closed before this
       // request ran), so no creation lambda will run the paired post-loop
-      // re-evaluation — re-evaluate the request's own pipeline here instead.
-      // Dispatch on the reserved pool slot, never inline on this manager
-      // thread: update_pipeline_status() can block on _status_mutex held
-      // across a scan's blocking get_next_split().
+      // re-evaluation. Re-evaluate the request's pipeline AND its transitive
+      // dependency closure, upstream-first: only the first scan is scheduled
+      // directly, so a zero-task upstream chain (e.g. an all-pruned second
+      // scan feeding a join) may never have had a status evaluation at all —
+      // the finish guard of every pipeline in between blocks on it, and no
+      // task completion will ever come to unblock the cascade. Dependencies
+      // are evaluated only while unfinished: their finish transition performs
+      // its own one-shot downstream notification, whereas re-evaluating an
+      // already-finished dependency re-notifies level-triggered and
+      // re-schedules its consumers, whose zero-task creation exits dispatch
+      // this handler again — a self-sustaining request storm that livelocks
+      // the query. Only the requesting pipeline keeps the unconditional
+      // level-triggered re-evaluation (its re-notify is what re-delivers a
+      // lost query_finished event). Dispatch on the reserved pool slot, never
+      // inline on this manager thread: update_pipeline_status() can block on
+      // _status_mutex held across a scan's blocking get_next_split().
       if (auto original_pipeline = original_node->get_pipeline()) {
-        _bounded_pool->dispatch(std::move(slot), [this, original_pipeline]() {
-          try {
-            original_pipeline->update_pipeline_status(false);
-          } catch (const std::exception& e) {
-            SIRIUS_LOG_ERROR("Task Creator: Exception during pipeline status re-evaluation: {}",
-                             e.what());
-            _task_scheduler->terminate_query(std::current_exception());
-            stop();
-          }
-        });
+        duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> eval_order;
+        std::unordered_set<pipeline::sirius_pipeline*> visited;
+        std::function<void(const duckdb::shared_ptr<pipeline::sirius_pipeline>&)> visit =
+          [&](const duckdb::shared_ptr<pipeline::sirius_pipeline>& p) {
+            if (!p || !visited.insert(p.get()).second) { return; }
+            for (auto& dep : p->dependencies) {
+              visit(dep);
+            }
+            eval_order.push_back(p);
+          };
+        visit(original_pipeline);
+        _bounded_pool->dispatch(
+          std::move(slot), [this, eval_order = std::move(eval_order), original_pipeline]() {
+            try {
+              for (auto& p : eval_order) {
+                if (p != original_pipeline && p->is_pipeline_finished()) { continue; }
+                p->update_pipeline_status(false);
+              }
+            } catch (const std::exception& e) {
+              SIRIUS_LOG_ERROR("Task Creator: Exception during pipeline status re-evaluation: {}",
+                               e.what());
+              _task_scheduler->terminate_query(std::current_exception());
+              stop();
+            }
+          });
       }
       continue;
     }
