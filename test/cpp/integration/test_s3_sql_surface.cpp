@@ -1374,6 +1374,25 @@ void compare_s3_gpu_to_local_cpu(s3_sql_fixture& fixture,
   check_rows_equal_with_tolerant_columns(*s3_result, *local_result, tolerant_columns);
 }
 
+void compare_s3_gpu_to_local_cpu_with_watchdog(std::shared_ptr<s3_sql_fixture> const& fixture,
+                                               std::string_view label,
+                                               std::string const& s3_query,
+                                               std::string const& local_query,
+                                               std::chrono::seconds timeout)
+{
+  INFO("shape-c case: " << label);
+  auto s3_result = require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), timeout);
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto local_result = require_query_ok(baseline_con, local_query);
+  auto local_rows   = collect_rows(*local_result);
+
+  REQUIRE(s3_result.row_count == local_result->RowCount());
+  REQUIRE(s3_result.column_count == local_result->ColumnCount());
+  CHECK(s3_result.rows == local_rows);
+}
+
 }  // namespace
 
 TEST_CASE("internal sirius_read_parquet is registered as a one-argument table function",
@@ -1824,6 +1843,280 @@ TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
 
   CHECK_FALSE(s3_result.rows.empty());
   CHECK(s3_result.rows == local_rows);
+}
+
+TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
+          "[.][s3][integration][pushdown][shape-c]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
+  auto fixture = std::make_shared<s3_sql_fixture>(*env);
+
+  auto make_scans = [&](bool use_s3) {
+    struct scans {
+      std::string nation;
+      std::string region;
+      std::string pruned_nation;
+      std::string pruned_region;
+    };
+
+    auto nation = use_s3 ? s3_parquet_scan(*env, "nation") : local_parquet_scan(*env, "nation");
+    auto region = use_s3 ? s3_parquet_scan(*env, "region") : local_parquet_scan(*env, "region");
+    return scans{
+      nation,
+      region,
+      "(SELECT * FROM " + nation + " WHERE n_regionkey = 99)",
+      "(SELECT * FROM " + region + " WHERE r_regionkey = 99)",
+    };
+  };
+
+  struct query_case {
+    std::string_view label;
+    std::string sql;
+  };
+
+  auto compare_cases = [&](std::string_view matrix_label,
+                           std::vector<query_case> const& s3_queries,
+                           std::vector<query_case> const& local_queries) {
+    INFO("shape-c matrix: " << matrix_label);
+    REQUIRE(s3_queries.size() == local_queries.size());
+    for (std::size_t i = 0; i < s3_queries.size(); ++i) {
+      REQUIRE(s3_queries[i].label == local_queries[i].label);
+      compare_s3_gpu_to_local_cpu_with_watchdog(fixture,
+                                                s3_queries[i].label,
+                                                s3_queries[i].sql,
+                                                local_queries[i].sql,
+                                                std::chrono::seconds{120});
+    }
+  };
+
+  auto select_cases = [](std::vector<query_case> const& queries,
+                         std::vector<std::string_view> const& labels) {
+    std::vector<query_case> selected;
+    selected.reserve(labels.size());
+    for (auto const label : labels) {
+      auto iter = std::find_if(queries.begin(), queries.end(), [&](query_case const& candidate) {
+        return candidate.label == label;
+      });
+      REQUIRE(iter != queries.end());
+      selected.push_back(*iter);
+    }
+    return selected;
+  };
+
+  auto compare_selected_cases = [&](std::string_view matrix_label,
+                                    std::vector<query_case> const& s3_queries,
+                                    std::vector<query_case> const& local_queries,
+                                    std::vector<std::string_view> const& labels) {
+    compare_cases(
+      matrix_label, select_cases(s3_queries, labels), select_cases(local_queries, labels));
+  };
+
+  auto build_zero_side_queries = [](auto const& s) {
+    return std::vector<query_case>{
+      {"hash inner dead left",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.pruned_nation + " n INNER JOIN " + s.region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"hash inner dead right",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.nation + " n INNER JOIN " + s.pruned_region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"hash left dead left",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.pruned_nation + " n LEFT JOIN " + s.region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"hash left dead right",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.nation + " n LEFT JOIN " + s.pruned_region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"hash right dead left",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.pruned_nation + " n RIGHT JOIN " + s.region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"hash right dead right",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.nation + " n RIGHT JOIN " + s.pruned_region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"hash full outer dead left",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.pruned_nation + " n FULL OUTER JOIN " + s.region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"hash full outer dead right",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.nation + " n FULL OUTER JOIN " + s.pruned_region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"hash not exists dead inner",
+       "SELECT n.n_nationkey FROM " + s.nation + " n WHERE NOT EXISTS (SELECT 1 FROM " +
+         s.pruned_region + " r WHERE r.r_regionkey = n.n_regionkey) ORDER BY n.n_nationkey"},
+      {"hash in mark dead inner",
+       "SELECT n.n_nationkey, n.n_regionkey IN (SELECT r_regionkey FROM " + s.pruned_region +
+         ") AS in_pruned FROM " + s.nation + " n ORDER BY n.n_nationkey"},
+      {"hash exists dead inner",
+       "SELECT n.n_nationkey FROM " + s.nation + " n WHERE EXISTS (SELECT 1 FROM " +
+         s.pruned_region + " r WHERE r.r_regionkey = n.n_regionkey) ORDER BY n.n_nationkey"},
+      {"hash count over zero-side join",
+       "SELECT count(*) FROM " + s.pruned_nation + " n INNER JOIN " + s.region +
+         " r ON n.n_regionkey = r.r_regionkey"},
+      {"hash both sides pruned",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.pruned_nation + " n INNER JOIN " +
+         s.pruned_region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"nlj left dead right",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.nation + " n LEFT JOIN " + s.pruned_region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"nlj right dead left",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.pruned_nation + " n RIGHT JOIN " + s.region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"nlj full outer dead left",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.pruned_nation + " n FULL OUTER JOIN " +
+         s.region + " r ON n.n_regionkey < r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"nlj full outer dead right",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.nation + " n FULL OUTER JOIN " +
+         s.pruned_region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"nlj anti dead right",
+       "SELECT n.n_nationkey FROM " + s.nation + " n ANTI JOIN " + s.pruned_region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY n.n_nationkey"},
+      {"nlj inner dead left",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.pruned_nation + " n INNER JOIN " + s.region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"nlj inner dead right",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.nation + " n INNER JOIN " + s.pruned_region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"nlj mark both alive",
+       "SELECT n.n_nationkey, n.n_regionkey < ANY (SELECT r_regionkey FROM " + s.region +
+         ") AS lt_any_region FROM " + s.nation + " n ORDER BY n.n_nationkey"},
+      {"nlj mark dead right",
+       "SELECT n.n_nationkey, n.n_regionkey < ANY (SELECT r_regionkey FROM " + s.pruned_region +
+         ") AS lt_any_region FROM " + s.nation + " n ORDER BY n.n_nationkey"},
+      {"nlj mark dead left",
+       "SELECT n.n_nationkey, n.n_regionkey < ANY (SELECT r_regionkey FROM " + s.region +
+         ") AS lt_any_region FROM " + s.pruned_nation + " n ORDER BY n.n_nationkey"},
+    };
+  };
+
+  auto build_empty_batch_queries = [](auto const& s) {
+    return std::vector<query_case>{
+      {"hash fallback left dead right",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.nation + " n LEFT JOIN " + s.pruned_region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"hash fallback right dead left",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.pruned_nation + " n RIGHT JOIN " + s.region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"hash fallback full outer dead left",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.pruned_nation + " n FULL OUTER JOIN " + s.region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"hash fallback full outer dead right",
+       "SELECT n.n_nationkey, r.r_name FROM " + s.nation + " n FULL OUTER JOIN " + s.pruned_region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"hash fallback anti dead right",
+       "SELECT n.n_nationkey FROM " + s.nation + " n ANTI JOIN " + s.pruned_region +
+         " r ON n.n_regionkey = r.r_regionkey ORDER BY n.n_nationkey"},
+      {"nlj fallback left dead right",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.nation + " n LEFT JOIN " + s.pruned_region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"nlj fallback right dead left",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.pruned_nation + " n RIGHT JOIN " + s.region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"nlj fallback full outer dead left",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.pruned_nation + " n FULL OUTER JOIN " +
+         s.region + " r ON n.n_regionkey < r.r_regionkey ORDER BY r.r_regionkey, n.n_nationkey"},
+      {"nlj fallback full outer dead right",
+       "SELECT n.n_nationkey, r.r_regionkey FROM " + s.nation + " n FULL OUTER JOIN " +
+         s.pruned_region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY n.n_nationkey, r.r_regionkey"},
+      {"nlj fallback anti dead right",
+       "SELECT n.n_nationkey FROM " + s.nation + " n ANTI JOIN " + s.pruned_region +
+         " r ON n.n_regionkey < r.r_regionkey ORDER BY n.n_nationkey"},
+      {"nlj fallback mark dead right",
+       "SELECT n.n_nationkey, n.n_regionkey < ANY (SELECT r_regionkey FROM " + s.pruned_region +
+         ") AS lt_any_region FROM " + s.nation + " n ORDER BY n.n_nationkey"},
+    };
+  };
+
+  auto const empty_batch_s3_queries    = build_empty_batch_queries(make_scans(/*use_s3=*/true));
+  auto const empty_batch_local_queries = build_empty_batch_queries(make_scans(/*use_s3=*/false));
+  auto const zero_side_s3_queries      = build_zero_side_queries(make_scans(/*use_s3=*/true));
+  auto const zero_side_local_queries   = build_zero_side_queries(make_scans(/*use_s3=*/false));
+
+  SECTION("hash fallback empty-batch pins")
+  {
+    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "1");
+    compare_selected_cases("hash fallback empty-batch pins",
+                           empty_batch_s3_queries,
+                           empty_batch_local_queries,
+                           {
+                             "hash fallback left dead right",
+                             "hash fallback right dead left",
+                             "hash fallback full outer dead left",
+                             "hash fallback full outer dead right",
+                             "hash fallback anti dead right",
+                           });
+  }
+
+  SECTION("true zero-side hash and non-MARK NLJ pins")
+  {
+    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+    compare_selected_cases(
+      "true zero-side hash and non-MARK NLJ pins",
+      zero_side_s3_queries,
+      zero_side_local_queries,
+      {
+        "hash inner dead left",      "hash inner dead right",      "hash left dead left",
+        "hash left dead right",      "hash right dead left",       "hash right dead right",
+        "hash full outer dead left", "hash full outer dead right", "hash not exists dead inner",
+        "hash in mark dead inner",   "hash exists dead inner",     "hash count over zero-side join",
+        "hash both sides pruned",    "nlj left dead right",        "nlj right dead left",
+        "nlj full outer dead left",  "nlj full outer dead right",  "nlj anti dead right",
+        "nlj inner dead left",       "nlj inner dead right",
+      });
+  }
+
+  SECTION("AC-R1 NLJ fallback empty-batch cells")
+  {
+    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "1");
+    compare_selected_cases("AC-R1 NLJ fallback empty-batch cells",
+                           empty_batch_s3_queries,
+                           empty_batch_local_queries,
+                           {
+                             "nlj fallback left dead right",
+                             "nlj fallback right dead left",
+                             "nlj fallback full outer dead left",
+                             "nlj fallback full outer dead right",
+                             "nlj fallback anti dead right",
+                           });
+  }
+
+  SECTION("AC-R2 MARK NLJ both sides alive")
+  {
+    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+    compare_selected_cases("AC-R2 MARK NLJ both sides alive",
+                           zero_side_s3_queries,
+                           zero_side_local_queries,
+                           {"nlj mark both alive"});
+  }
+
+  SECTION("AC-R2 MARK NLJ dead build side")
+  {
+    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+    compare_selected_cases("AC-R2 MARK NLJ dead build side",
+                           zero_side_s3_queries,
+                           zero_side_local_queries,
+                           {"nlj mark dead right"});
+  }
+
+  SECTION("AC-R2 MARK NLJ dead probe side")
+  {
+    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+    compare_selected_cases("AC-R2 MARK NLJ dead probe side",
+                           zero_side_s3_queries,
+                           zero_side_local_queries,
+                           {"nlj mark dead left"});
+  }
+
+  SECTION("AC-R2 MARK NLJ fallback dead build side")
+  {
+    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "1");
+    compare_selected_cases("AC-R2 MARK NLJ fallback dead build side",
+                           empty_batch_s3_queries,
+                           empty_batch_local_queries,
+                           {"nlj fallback mark dead right"});
+  }
 }
 
 // Protocol follow-up sketch: the tactical fix for this PR is parquet-scoped empty-split emission.

@@ -34,8 +34,10 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/join/conditional_join.hpp>
 #include <cudf/join/join.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -275,11 +277,62 @@ void sirius_physical_nested_loop_join::build_pipelines(
   sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this);
 }
 
+bool sirius_physical_nested_loop_join::zero_side_pending_locked()
+{
+  auto* probe_port = get_port("default");
+  auto* build_port = get_port("build");
+  if (!probe_port || !probe_port->repo || !build_port || !build_port->repo) { return false; }
+  if (!is_source_pipeline_finished()) { return false; }
+  bool const probe_dead = !_saw_probe_input && probe_port->repo->total_size() == 0;
+  bool const build_dead = !_saw_build_input && build_port->repo->total_size() == 0;
+  // Exactly one dead side: both-dead completes through the normal protocol today, and
+  // no-dead is the regular join path.
+  if (probe_dead == build_dead) { return false; }
+  auto* surviving_port = probe_dead ? build_port : probe_port;
+  return surviving_port->repo->total_size() > 0;
+}
+
+std::optional<task_creation_hint> sirius_physical_nested_loop_join::get_next_task_hint()
+{
+  {
+    std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
+    // Zero-side join (s3-shape-c-zero-side-join-plan.md §8): exactly one input side died
+    // while the other port still holds data. Offer the zero-side task ahead of the base
+    // hint, which would otherwise wait forever on the finished dead-side pipeline.
+    if (zero_side_pending_locked()) { return task_creation_hint{TaskCreationHint::READY, this}; }
+  }
+  return sirius_physical_operator::get_next_task_hint();
+}
+
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()
 {
   // Hold the mutex for the entire operation to prevent concurrent pop/get races.
   // A pop on one thread must not remove a batch that another thread's get expects to find.
+  //
+  // Lock order: the task creator calls this under the pipeline's task creation lock
+  // (_status_mutex), so the order is always _status_mutex -> batches_to_processed_mutex —
+  // never inverted.
   std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
+
+  // Zero-side join (s3-shape-c-zero-side-join-plan.md §8): pop ONE surviving batch per call
+  // and hand out the marker. The task creator's drain loop keeps calling until the surviving
+  // port is empty; the pop and the task's mark_task_created happen under the same
+  // _status_mutex hold, so the pipeline-finish guard can never observe "ports empty ∧
+  // counters balanced" mid-window.
+  if (zero_side_pending_locked()) {
+    bool const probe_dead = !_saw_probe_input && get_port("default")->repo->total_size() == 0;
+    auto* surviving_port  = probe_dead ? get_port("build") : get_port("default");
+    auto const dead_side  = probe_dead ? nested_loop_join_zero_side_input::side::PROBE
+                                       : nested_loop_join_zero_side_input::side::BUILD;
+    for (std::size_t partition_idx = 0; partition_idx < surviving_port->repo->num_partitions();
+         partition_idx++) {
+      if (surviving_port->repo->size(partition_idx) == 0) { continue; }
+      auto batch = surviving_port->repo->pop_next_data_batch(partition_idx);
+      if (!batch) { continue; }
+      return std::make_unique<nested_loop_join_zero_side_input>(std::move(batch), dead_side);
+    }
+    return nullptr;
+  }
 
   // One-time initialization: snapshot all batch IDs from both ports.
   if (left_batch_ids.empty() && right_batch_ids.empty()) {
@@ -298,6 +351,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
     for (size_t i = 0; i < default_port->repo->num_partitions(); i++) {
       left_batch_ids.push_back(default_port->repo->get_batch_ids(i));
       right_batch_ids.push_back(build_port->repo->get_batch_ids(i));
+      if (!left_batch_ids.back().empty()) { _saw_probe_input = true; }
+      if (!right_batch_ids.back().empty()) { _saw_build_input = true; }
       num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
     }
   }
@@ -384,10 +439,195 @@ bool get_column_index(const duckdb::Expression& expr, cudf::size_type& out_idx)
 
 }  // namespace
 
+/// @brief MARK join output from semi-join matching row indices.
+///
+/// Every left row passes through unchanged (unprojected, matching this operator's SEMI/ANTI
+/// convention), plus a BOOL8 mark column that starts all-false and gets true scattered at every
+/// position in @p semi_indices.
+static std::unique_ptr<operator_data> resolve_mark_join_result(
+  const rmm::device_uvector<cudf::size_type>& semi_indices,
+  const cudf::table_view& left_full,
+  cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream)
+{
+  std::vector<std::unique_ptr<cudf::column>> out_cols;
+  out_cols.reserve(left_full.num_columns() + 1);
+  for (cudf::size_type i = 0; i < left_full.num_columns(); i++) {
+    out_cols.push_back(std::make_unique<cudf::column>(left_full.column(i), stream));
+  }
+
+  cudf::numeric_scalar<bool> false_scalar(false, true, stream);
+  auto mark_column = cudf::make_column_from_scalar(false_scalar, left_full.num_rows(), stream);
+  if (semi_indices.size() > 0) {
+    cudf::numeric_scalar<bool> true_scalar(true, true, stream);
+    cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
+                                  static_cast<cudf::size_type>(semi_indices.size()),
+                                  semi_indices.data(),
+                                  nullptr,
+                                  0,
+                                  0,
+                                  {});
+    auto scattered = cudf::scatter({std::ref(static_cast<const cudf::scalar&>(true_scalar))},
+                                   scatter_map,
+                                   cudf::table_view({mark_column->view()}),
+                                   stream);
+    mark_column    = std::move(scattered->release()[0]);
+  }
+  out_cols.push_back(std::move(mark_column));
+
+  auto output_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{
+      make_data_batch(std::move(output_table), space, stream)});
+}
+
+std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute_zero_side(
+  const nested_loop_join_zero_side_input& input, rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute_zero_side"};
+  const auto& input_batches = input.get_read_only_batches();
+  if (input_batches.size() != 1) {
+    throw internal_exception(
+      "sirius_physical_nested_loop_join::execute_zero_side: expected exactly 1 surviving batch, "
+      "got " +
+      std::to_string(input_batches.size()));
+  }
+  auto const& surviving_batch = input_batches[0];
+  auto* space                 = surviving_batch.get_memory_space();
+  if (space == nullptr) {
+    throw internal_exception(
+      "sirius_physical_nested_loop_join::execute_zero_side: surviving batch carries no memory "
+      "space");
+  }
+  bool const probe_dead = input.dead_side == nested_loop_join_zero_side_input::side::PROBE;
+
+  // The dead side never delivered a batch — represent it as a 0-row cudf table over the dead
+  // child's output types so the projection maps and gather NULLIFY policies apply unchanged.
+  auto const& dead_types = probe_dead ? children[0]->get_types() : children[1]->get_types();
+  std::vector<std::unique_ptr<cudf::column>> dead_cols;
+  dead_cols.reserve(dead_types.size());
+  for (auto const& dead_type : dead_types) {
+    if (dead_type.id() == type_id::STRUCT || dead_type.id() == type_id::LIST) {
+      throw not_implemented_exception(
+        "sirius_physical_nested_loop_join::execute_zero_side: nested type " +
+        dead_type.to_string() + " is not supported on the dead join side");
+    }
+    dead_cols.push_back(cudf::make_empty_column(get_cudf_type(dead_type)));
+  }
+  cudf::table dead_table(std::move(dead_cols), stream);
+
+  cudf::table_view surviving = get_cudf_table_view(surviving_batch);
+  cudf::table_view left      = probe_dead ? dead_table.view() : surviving;
+  cudf::table_view right     = probe_dead ? surviving : dead_table.view();
+
+  return emit_one_side_empty_result(left, right, probe_dead, *space, stream);
+}
+
+std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_empty_result(
+  const cudf::table_view& left,
+  const cudf::table_view& right,
+  bool left_side_empty,
+  cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream)
+{
+  auto mr                       = space.get_default_allocator();
+  auto const num_surviving_rows = left_side_empty ? right.num_rows() : left.num_rows();
+
+  if (join_type == duckdb::JoinType::MARK) {
+    // Both empty-side MARK cases are "no matches": an empty left side emits 0 rows with the
+    // mark column still in the schema; an empty right side marks every left row false.
+    rmm::device_uvector<cudf::size_type> no_matches(0, stream);
+    return resolve_mark_join_result(no_matches, left, space, stream);
+  }
+
+  // Gather maps per the §3 semantics table, filled on the task stream (cudf::sequence /
+  // make_column_from_scalar run the device fill; this TU is host-compiled, so raw thrust
+  // device algorithms are not available here). -1 entries gathered from the 0-row empty-side
+  // table become NULL rows under the NULLIFY policy.
+  auto iota = [&]() -> std::unique_ptr<cudf::column> {
+    cudf::numeric_scalar<cudf::size_type> init(0, true, stream);
+    return cudf::sequence(num_surviving_rows, init, stream, mr);
+  };
+  auto pad = [&]() -> std::unique_ptr<cudf::column> {
+    cudf::numeric_scalar<cudf::size_type> minus_one(-1, true, stream);
+    return cudf::make_column_from_scalar(minus_one, num_surviving_rows, stream, mr);
+  };
+  auto none = [&]() -> std::unique_ptr<cudf::column> {
+    return cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
+  };
+
+  std::unique_ptr<cudf::column> left_map, right_map;
+  switch (join_type) {
+    case duckdb::JoinType::LEFT:
+      left_map  = left_side_empty ? none() : iota();
+      right_map = left_side_empty ? none() : pad();
+      break;
+    case duckdb::JoinType::RIGHT:
+      left_map  = left_side_empty ? pad() : none();
+      right_map = left_side_empty ? iota() : none();
+      break;
+    case duckdb::JoinType::OUTER:
+      left_map  = left_side_empty ? pad() : iota();
+      right_map = left_side_empty ? iota() : pad();
+      break;
+    case duckdb::JoinType::INNER:
+      left_map  = none();
+      right_map = none();
+      break;
+    case duckdb::JoinType::SEMI:
+    case duckdb::JoinType::ANTI: {
+      // Mirror execute(): SEMI/ANTI output the full (unprojected) left table. An empty side
+      // means no matches — SEMI keeps nothing; ANTI keeps every left row when the right
+      // side is the empty one.
+      bool const keep_all = (join_type == duckdb::JoinType::ANTI) && !left_side_empty;
+      auto left_map_col   = keep_all ? iota() : none();
+      auto gathered       = cudf::gather(
+        left, left_map_col->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+      return std::make_unique<pipelineable_operator_data>(
+        std::vector<std::shared_ptr<cucascade::data_batch>>{
+          make_data_batch(std::move(gathered), space, stream)});
+    }
+    default:
+      throw std::runtime_error("sirius_physical_nested_loop_join: unsupported join type: " +
+                               duckdb::JoinTypeToString(join_type));
+  }
+
+  auto left_out_of_bounds =
+    (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER)
+      ? cudf::out_of_bounds_policy::NULLIFY
+      : cudf::out_of_bounds_policy::DONT_CHECK;
+  auto right_out_of_bounds =
+    (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER)
+      ? cudf::out_of_bounds_policy::NULLIFY
+      : cudf::out_of_bounds_policy::DONT_CHECK;
+
+  auto left_gathered  = cudf::gather(left, left_map->view(), left_out_of_bounds, stream, mr);
+  auto right_gathered = cudf::gather(right, right_map->view(), right_out_of_bounds, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> out_cols;
+  auto left_released  = left_gathered->release();
+  auto right_released = right_gathered->release();
+  out_cols.reserve(left_output_col_idxs.size() + right_output_col_idxs.size());
+  for (std::size_t idx : left_output_col_idxs) {
+    if (idx < left_released.size()) { out_cols.push_back(std::move(left_released[idx])); }
+  }
+  for (std::size_t idx : right_output_col_idxs) {
+    if (idx < right_released.size()) { out_cols.push_back(std::move(right_released[idx])); }
+  }
+  auto result_table = std::make_unique<cudf::table>(std::move(out_cols), stream, mr);
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{
+      make_data_batch(std::move(result_table), space, stream)});
+}
+
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
+  // The zero-side marker carries one batch instead of a (left, right) pair, so it must be
+  // dispatched before the two-batch handling below.
+  if (auto const* zero_side = dynamic_cast<const nested_loop_join_zero_side_input*>(&input_data)) {
+    return execute_zero_side(*zero_side, stream);
+  }
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   size_t pipeline_id = (this->get_pipeline() != nullptr) ? this->get_pipeline()->get_pipeline_id()
@@ -419,23 +659,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   auto mr = space->get_default_allocator();
 
   if (left.num_rows() == 0 || right.num_rows() == 0) {
-    std::vector<std::unique_ptr<cudf::column>> empty_cols;
-    empty_cols.reserve(left_output_col_idxs.size() + right_output_col_idxs.size());
-    for (std::size_t idx : left_output_col_idxs) {
-      if (idx < static_cast<std::size_t>(left.num_columns())) {
-        empty_cols.push_back(cudf::make_empty_column(left.column(idx).type()));
-      }
-    }
-    for (std::size_t idx : right_output_col_idxs) {
-      if (idx < static_cast<std::size_t>(right.num_columns())) {
-        empty_cols.push_back(cudf::make_empty_column(right.column(idx).type()));
-      }
-    }
-    auto empty_table = std::make_unique<cudf::table>(std::move(empty_cols), stream, mr);
-    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 empty output batches", pipeline_id);
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{
-        make_data_batch(std::move(empty_table), *space, stream)});
+    // A real 0-row batch on one side (e.g. an all-pruned scan under the empty-split fallback)
+    // must produce the same join-type-correct output as a dead side — LEFT/RIGHT/OUTER pad the
+    // preserved rows, ANTI keeps them, MARK marks them false — not an unconditionally empty
+    // table.
+    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, one input side empty", pipeline_id);
+    return emit_one_side_empty_result(left, right, left.num_rows() == 0, *space, stream);
   }
 
   std::unique_ptr<cudf::table> result_table;
@@ -622,6 +851,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         return std::make_unique<pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{
             make_data_batch(std::move(gathered), *space, stream)});
+      }
+      case duckdb::JoinType::MARK: {
+        auto left_indices = cudf::conditional_left_semi_join(
+          left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
+        return resolve_mark_join_result(*left_indices, left, *space, stream);
       }
       case duckdb::JoinType::OUTER:
         join_result =
