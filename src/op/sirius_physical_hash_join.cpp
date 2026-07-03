@@ -728,7 +728,8 @@ static std::unique_ptr<operator_data> gather_join_output(
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices,
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> right_indices,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry_info = {})
 {
   bool collect_left =
     (join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::RIGHT_ANTI);
@@ -777,7 +778,7 @@ static std::unique_ptr<operator_data> gather_join_output(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), memory_space, stream)});
+      make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
 }
 
 /// Assemble output for a distinct_hash_join left_join.
@@ -790,7 +791,8 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
   std::vector<cudf::size_type> const& rhs_col_idxs,
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> build_indices,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry_info = {})
 {
   std::vector<std::unique_ptr<cudf::column>> out_cols;
 
@@ -818,7 +820,7 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), memory_space, stream)});
+      make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
 }
 
 /// @brief the MARK join output from the semi_join matching row indices.
@@ -840,7 +842,8 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   cudf::table_view const& left_full,
   std::vector<cudf::size_type> const& lhs_output_col_idxs,
   ::cucascade::read_only_data_batch const& left_batch,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry_info = {})
 {
   cudf::table_view left_cols_to_output = left_full.select(lhs_output_col_idxs);
   auto num_left_rows                   = left_cols_to_output.num_rows();
@@ -878,8 +881,8 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   mark_out_cols.push_back(std::move(mark_column));
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
-    std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), *left_batch.get_memory_space(), stream)});
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
+      std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
@@ -961,8 +964,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         // Reuse the persistent filtered_join (built on the right/filter side): probe with this left
         // batch to get its matched left-row indices, then materialize all left rows + BOOL8 mark.
         auto semi_indices = _filtered_table->semi_join(probe_keys, stream);
-        return resolve_mark_join_result(
-          *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
+        return resolve_mark_join_result(*semi_indices,
+                                        left_full,
+                                        lhs_output_columns.col_idxs,
+                                        input_batches[0],
+                                        stream,
+                                        batch_telemetry());
       }
 
       if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI) {
@@ -994,7 +1001,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                     rhs_output_columns.col_idxs,
                                                     std::move(build_indices),
                                                     *input_batches[0].get_memory_space(),
-                                                    stream);
+                                                    stream,
+                                                    batch_telemetry());
           }
         } else {
           if (join_type == duckdb::JoinType::INNER) {
@@ -1065,8 +1073,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                      pred->back(),
                                                      cudf::null_equality::UNEQUAL,
                                                      stream);
-      return resolve_mark_join_result(
-        *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
+      return resolve_mark_join_result(*semi_indices,
+                                      left_full,
+                                      lhs_output_columns.col_idxs,
+                                      input_batches[0],
+                                      stream,
+                                      batch_telemetry());
     } else if (join_type == duckdb::JoinType::INNER) {
       auto result   = cudf::mixed_inner_join(left_eq,
                                            right_eq,
@@ -1211,7 +1223,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                 rhs_output_columns.col_idxs,
                                                 std::move(build_indices),
                                                 *input_batches[0].get_memory_space(),
-                                                stream);
+                                                stream,
+                                                batch_telemetry());
       }
     } else if (join_type == duckdb::JoinType::INNER) {
       auto join_result =
@@ -1260,13 +1273,21 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           right_full.num_rows());
         auto mark_join_object = make_left_mark_join(left_keys, stream);
         auto semi_indices     = mark_join_object.semi_join(right_keys, stream);
-        return resolve_mark_join_result(
-          *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
+        return resolve_mark_join_result(*semi_indices,
+                                        left_full,
+                                        lhs_output_columns.col_idxs,
+                                        input_batches[0],
+                                        stream,
+                                        batch_telemetry());
       }
       auto filtered_join_object = make_right_filtered_join(right_keys, stream);
       auto semi_indices         = filtered_join_object.semi_join(left_keys, stream);
-      return resolve_mark_join_result(
-        *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
+      return resolve_mark_join_result(*semi_indices,
+                                      left_full,
+                                      lhs_output_columns.col_idxs,
+                                      input_batches[0],
+                                      stream,
+                                      batch_telemetry());
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto join_result =
         cudf::full_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
@@ -1285,7 +1306,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             std::move(left_indices),
                             std::move(right_indices),
                             *input_batches[0].get_memory_space(),
-                            stream);
+                            stream,
+                            batch_telemetry());
 }
 
 void sirius_physical_hash_join::on_finalize_operator()

@@ -19,6 +19,7 @@
 #include "log/logging.hpp"
 #include "telemetry-bridge/gen/data_batch.rs.h"
 #include "telemetry-bridge/gen/memory.rs.h"
+#include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/memory_context.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -29,7 +30,17 @@
 #include <memory>
 #include <optional>
 
-namespace sirius {
+namespace sirius::telemetry {
+
+//! Telemetry attribution for a newly-created data_batch: the telemetry context
+//! to emit events into and the pipeline that produced the batch. Passed to the
+//! data_batch factories / quent_data_batch_probe::create. A null @ref context
+//! yields the no-op base probe, so batch construction stays telemetry-free (e.g.
+//! in unit tests, or when pipelines are built without an engine).
+struct batch_telemetry_info {
+  const telemetry_context* context = nullptr;
+  uuid::UUID producer_pipeline_uuid{};
+};
 
 /**
  * @brief Implementation of idata_batch_probe that forwards data_batch events to a quent
@@ -45,26 +56,28 @@ namespace sirius {
 class quent_data_batch_probe : public cucascade::idata_batch_probe {
  public:
   /**
-   * @brief Construct a probe that forwards state transitions to a telemetry observer.
+   * @brief Build  a probe that forwards state transitions to a telemetry observer.
    *
    * Creates its own DataBatchObserver from the given telemetry_context.
    * The memory resource UUID for idle events is resolved at runtime based on the
    * data's current memory tier.
    *
-   * @param ctx The telemetry context providing instrumentation and memory UUIDs.
-   * @param producer_pipeline_id UUID of the pipeline (operator) that produced this batch.
+   * @param telemetry_info Telemetry attribution (context + producing pipeline).
+   * @param batch_id The unique id of the data_batch this probe is attached to.
+   *
+   * @note When @p telemetry_info.context is non-null, returns a
+   * quent_data_batch_probe that forwards the batch's lifecycle to telemetry. When
+   * null (e.g. in unit tests that don't set up a telemetry context), returns the
+   * no-op base probe so batch construction stays telemetry-free.
    */
-  quent_data_batch_probe(const telemetry::telemetry_context& ctx,
-                         const uint64_t batch_id,
-                         uuid::UUID producer_pipeline_id)
-    : handle_(quent::data_batch::create(ctx.context(),
-                                        {
-                                          .instance_name        = "",
-                                          .data_batch_id        = batch_id,
-                                          .producer_operator_id = 0  // producer_pipeline_id,
-                                        })),
-      memory_context_(ctx.get_memory_context())
+  static std::unique_ptr<cucascade::idata_batch_probe> create(
+    const batch_telemetry_info& telemetry_info, const uint64_t batch_id)
   {
+    if (telemetry_info.context == nullptr) {
+      return std::make_unique<cucascade::idata_batch_probe>();
+    }
+    return std::unique_ptr<quent_data_batch_probe>(new quent_data_batch_probe(
+      *(telemetry_info.context), batch_id, telemetry_info.producer_pipeline_uuid));
   }
 
   ~quent_data_batch_probe() override
@@ -164,8 +177,30 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
   void reader_count_changed([[maybe_unused]] const size_t& new_read_only_count) override {}
 
  private:
+  /**
+   * @brief Construct a probe that forwards state transitions to a telemetry observer.
+   *
+   * Creates its own DataBatchObserver from the given telemetry_context.
+   * The memory resource UUID for idle events is resolved at runtime based on the
+   * data's current memory tier.
+   *
+   * @param ctx The telemetry context providing instrumentation and memory UUIDs.
+   * @param producer_pipeline_uuid UUID of the pipeline that produced this batch.
+   */
+  quent_data_batch_probe(const telemetry_context& ctx,
+                         const uint64_t batch_id,
+                         uuid::UUID producer_pipeline_uuid)
+    : handle_(quent::data_batch::create(ctx.context(),
+                                        {
+                                          .instance_name          = "batch",
+                                          .data_batch_id          = batch_id,
+                                          .producer_pipeline_uuid = producer_pipeline_uuid,
+                                        })),
+      memory_context_(ctx.get_memory_context())
+  {
+  }
   rust::Box<quent::data_batch::DataBatchHandle> handle_;
-  std::shared_ptr<const telemetry::memory_context> memory_context_;
+  std::shared_ptr<const memory_context> memory_context_;
 };
 
-}  // namespace sirius
+}  // namespace sirius::telemetry

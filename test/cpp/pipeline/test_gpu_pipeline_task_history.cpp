@@ -180,7 +180,7 @@ struct pipeline_context {
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_source = std::make_unique<stub_operator>();

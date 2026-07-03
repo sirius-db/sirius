@@ -117,7 +117,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
 
-  auto batch = sirius::make_data_batch(std::move(output_table), *mem_space, stream);
+  auto batch =
+    sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }

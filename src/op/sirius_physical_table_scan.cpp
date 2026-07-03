@@ -143,7 +143,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
       auto concat_rep   = std::make_unique<cucascade::gpu_table_representation>(
         std::move(concatenated), *space, stream);
-      single_batch = cucascade::data_batch::make(0, std::move(concat_rep));
+      single_batch = cucascade::data_batch::make(
+        0, std::move(concat_rep), telemetry::quent_data_batch_probe::create(batch_telemetry(), 0));
     }
   }
 
@@ -167,8 +168,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       *local_filter_expr, cudf::get_current_device_resource_ref(), stream);
     auto filtered_table = evaluator.select(
       batch_ref.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
-    output_batch =
-      sirius::make_data_batch(std::move(filtered_table), *batch_ref.get_memory_space(), stream);
+    output_batch = sirius::make_data_batch(
+      std::move(filtered_table), *batch_ref.get_memory_space(), stream, batch_telemetry());
   } else {
     output_batch = ::cucascade::data_batch::to_idle(std::move(batch_ref));
   }
@@ -237,7 +238,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     std::size_t const referenced_bytes = sirius::estimate_referenced_column_bytes(
       input_view, referenced_indices, output_ro.get_data()->get_size_in_bytes());
     output_batch = sirius::make_data_batch_from_view(
-      projected_view, std::move(output_ro), referenced_bytes, *space, stream);
+      projected_view, std::move(output_ro), referenced_bytes, *space, stream, batch_telemetry());
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;

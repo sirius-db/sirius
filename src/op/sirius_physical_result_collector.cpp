@@ -18,6 +18,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
@@ -161,7 +162,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
 
       // clone_to: creates new batch with data converted to host_data_representation
       auto result_batch = ro.clone_to<cucascade::host_data_representation>(
-        registry, next_batch_id, mem_space, stream);
+        registry,
+        next_batch_id,
+        mem_space,
+        stream,
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.

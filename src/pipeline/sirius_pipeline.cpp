@@ -54,7 +54,7 @@ bool sirius_pipeline::is_order_dependent() const
     if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
     if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!build_ctx_.preserve_insertion_order) { return false; }
+  if (!build_ctx_.preserve_insertion_order()) { return false; }
   if (sink && sink->sink_order_dependent()) { return true; }
   return false;
 }

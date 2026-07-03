@@ -114,7 +114,10 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
         std::move(sliced_table), *batch.get_memory_space(), stream);
 
     auto const batch_id = ::sirius::get_next_batch_id();
-    auto output_batch   = cucascade::data_batch::make(batch_id, std::move(output_data));
+    auto output_batch   = cucascade::data_batch::make(
+      batch_id,
+      std::move(output_data),
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
     output_batches.push_back(std::move(output_batch));
   }
 

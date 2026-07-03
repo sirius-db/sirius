@@ -196,7 +196,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
     auto output = cucascade::data_batch::to_idle(std::move(copy));
     output_batches.push_back(std::move(output));
   } else {
-    auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space);
+    auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry());
     output_batches.push_back(std::move(merged_batch));
   }
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);

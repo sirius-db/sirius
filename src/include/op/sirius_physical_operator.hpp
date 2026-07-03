@@ -35,6 +35,10 @@
 
 namespace sirius {
 
+namespace telemetry {
+struct batch_telemetry_info;
+}  // namespace telemetry
+
 namespace op {
 class sirius_physical_operator;
 }  // namespace op
@@ -353,6 +357,11 @@ class sirius_physical_operator {
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }
+
+  //! Bundle this operator's telemetry attribution (context + producing pipeline)
+  //! for passing to the data_batch factories. Returns {nullptr, nil-UUID} if this
+  //! operator has no pipeline set.
+  [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 
