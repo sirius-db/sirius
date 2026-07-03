@@ -207,7 +207,6 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
-    src/helper/list_offset_fixup.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
