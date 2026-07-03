@@ -1319,8 +1319,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   sirius_read_parquet.cardinality = SiriusReadParquetCardinality;
   // Reader-side pushdown for sirius_read_parquet is opt-in while it soaks
   // (default-on is deferred): flipping these flags exposed the zero-split
-  // pipeline hang fixed in parquet_gpu_ingestible.cpp — see
-  // rca-s3-filter-pushdown-deadlock.md.
+  // pipeline hang fixed in parquet_gpu_ingestible.cpp.
   if (auto* val = std::getenv("SIRIUS_PARQUET_PUSHDOWN");
       val != nullptr && std::string(val) == "1") {
     sirius_read_parquet.projection_pushdown = true;

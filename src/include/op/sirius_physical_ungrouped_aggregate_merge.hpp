@@ -34,7 +34,7 @@ namespace op {
 
 /**
  * @brief Marker input for the synthetic zero-input identity task
- *        (s3-zero-input-aggregate-identity-plan.md §1).
+ *.
  *
  * Handed out by sirius_physical_ungrouped_aggregate_merge::get_next_task_input_data when the
  * upstream pipeline finished without ever producing a partial batch. Carries no data batches;
@@ -87,7 +87,7 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   // Zero-input identity overrides — hard contract
-  // (s3-zero-input-aggregate-identity-plan.md §7.2): both read _saw_input /
+  //: both read _saw_input /
   // _zero_input_task_created under the same operator `lock`; all_ports_empty() reports
   // non-empty while the identity task still needs creating (blocks premature pipeline
   // finish), and get_next_task_hint() returns READY{this} in that state so the task is
@@ -107,7 +107,7 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
   bool needs_zero_input_task_locked();
 
   //! Set (under `lock`) when a partial batch is popped from the FULL port — exactly at
-  //! the pop, nowhere else (s3-zero-input-aggregate-identity-plan.md §7.1); suppresses
+  //! the pop, nowhere else; suppresses
   //! the identity task (no double emit).
   bool _saw_input{false};
   //! Set (under `lock`) once the zero-input marker has been handed out: at most one

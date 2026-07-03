@@ -296,7 +296,7 @@ std::optional<task_creation_hint> sirius_physical_nested_loop_join::get_next_tas
 {
   {
     std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
-    // Zero-side join (s3-shape-c-zero-side-join-plan.md §8): exactly one input side died
+    // Zero-side join: exactly one input side died
     // while the other port still holds data. Offer the zero-side task ahead of the base
     // hint, which would otherwise wait forever on the finished dead-side pipeline.
     if (zero_side_pending_locked()) { return task_creation_hint{TaskCreationHint::READY, this}; }
@@ -314,7 +314,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
   // never inverted.
   std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
 
-  // Zero-side join (s3-shape-c-zero-side-join-plan.md §8): pop ONE surviving batch per call
+  // Zero-side join: pop ONE surviving batch per call
   // and hand out the marker. The task creator's drain loop keeps calling until the surviving
   // port is empty; the pop and the task's mark_task_created happen under the same
   // _status_mutex hold, so the pipeline-finish guard can never observe "ports empty ∧

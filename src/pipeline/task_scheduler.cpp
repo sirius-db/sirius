@@ -163,7 +163,7 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  // Zero-task completion signal (s3-zero-task-protocol-plan.md S2): the RC
+  // Zero-task completion signal: the RC
   // pipeline's level-triggered listener posts query_finished so the management
   // event loop — not a completing task, which a zero-task query never has —
   // can signal the completion handler. The listener is per-query (pipelines
@@ -322,7 +322,7 @@ void task_scheduler::management_eventloop()
     // Drain any further events that are already queued, so a single matcher
     // pass handles a burst of ready signals plus task pushes together.
     // query_finished must be handled here too — dropping it in the drain loop
-    // loses the signal (s3-zero-task-protocol-plan.md S2).
+    // loses the signal.
     while (auto more = _task_request_channel.try_get()) {
       if (more->kind == task_request_kind::query_finished) {
         handle_query_finished();
@@ -398,7 +398,7 @@ void task_scheduler::handle_query_finished()
 {
   // The event may be stale: a previous query's listener firing late, or the
   // handler already signaled by the executor path. Re-validate against the
-  // CURRENT query under _query_mutex (s3-zero-task-protocol-plan.md §2); the
+  // CURRENT query under _query_mutex; the
   // level-triggered listener re-fires any suppressed-but-needed signal.
   std::lock_guard lock(_query_mutex);
   if (!_query || !_completion_handler || _completion_handler->is_completed()) { return; }

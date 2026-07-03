@@ -116,8 +116,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     // Remember the first fully-pruned file. If the WHOLE source coalesces to
     // nothing, flush() emits one empty split built from it — zero splits mean
     // zero tasks, and the pipeline-completion accounting only fires from task
-    // completion, hanging sirius_engine::execute() (see
-    // rca-s3-filter-pushdown-deadlock.md).
+    // completion, hanging sirius_engine::execute().
     if (file->row_groups.empty() && !_empty_split_fallback) {
       _empty_split_fallback = fallback_file{
         file->file_metadata,
@@ -192,8 +191,8 @@ class parquet_batch_coalescer : public batch_coalescer {
     // with a single zero-row-group slice so the scan still creates one task
     // (materialize_metadata_to_table short-circuits it to a schema-correct
     // empty table). Partial prunes never reach here — any surviving slice sets
-    // _produced_any. See rca-s3-filter-pushdown-deadlock.md; gated by
-    // SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK (empty_split_fallback_enabled above).
+    // _produced_any. Gated by SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK
+    // (empty_split_fallback_enabled above).
     if (!_produced_any && _empty_split_fallback && empty_split_fallback_enabled()) {
       _slices.emplace_back(_empty_split_fallback->file_metadata,
                            _empty_split_fallback->file_path,
@@ -671,8 +670,8 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     metadatas.push_back(*slice.file_metadata);
     rg_per_src.push_back(slice.row_group_indices);
   }
-  // All-pruned fallback split (parquet_batch_coalescer::flush — see
-  // rca-s3-filter-pushdown-deadlock.md): every slice carries zero row groups.
+  // All-pruned fallback split (parquet_batch_coalescer::flush): every slice
+  // carries zero row groups.
   // Don't express that via set_row_groups — the meaning of an empty per-source
   // vector has flipped between cudf versions ("all row groups" vs "none").
   // Instead bound the read to zero rows against the footer metadata alone:

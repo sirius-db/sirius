@@ -179,7 +179,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! when this pipeline's sink is the RESULT_COLLECTOR. Level-triggered: it fires on
   //! the finish transition AND on every already-finished re-notification, so a signal
   //! the consumer suppressed as stale can be re-delivered later
-  //! (s3-zero-task-protocol-plan.md S2). Wire it before the query starts; it is not
+  //!. Wire it before the query starts; it is not
   //! synchronized against concurrent invocation.
   void set_completion_listener(std::function<void()> listener);
 

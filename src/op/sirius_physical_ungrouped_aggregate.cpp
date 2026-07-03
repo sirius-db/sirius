@@ -433,7 +433,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  // Zero-input identity task (s3-zero-input-aggregate-identity-plan.md §1): the marker is
+  // Zero-input identity task: the marker is
   // not pipelineable, so this branch must precede the pipelineable cast below. Emits the
   // FINAL output row per build_aggregate_layout: COUNT/COUNT_STAR -> INT64 0 (valid),
   // everything else -> 1-row all-null column of the aggregate's return type.
@@ -569,7 +569,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
     }
   }
   if (input_batch.empty()) {
-    // Zero-input identity (s3-zero-input-aggregate-identity-plan.md §1): upstream finished
+    // Zero-input identity: upstream finished
     // without ever producing a partial — hand out the marker so one normal merge task emits
     // the identity row. The flag flips under _status_mutex + `lock`, and the task ctor's
     // mark_task_created runs before the creation lock is released, so the pipeline-finish

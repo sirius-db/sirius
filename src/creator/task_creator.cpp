@@ -232,7 +232,7 @@ void task_creator::manager_loop()
     auto* node = get_operator_for_next_task(original_node);
 
     if (node == nullptr) {
-      // Zero-task exit before dispatch (s3-zero-task-protocol-plan.md S1): the
+      // Zero-task exit before dispatch: the
       // hint resolved to nothing (e.g. the split connector closed before this
       // request ran), so no creation lambda will run the paired post-loop
       // re-evaluation. Re-evaluate the request's pipeline AND its transitive
@@ -459,7 +459,7 @@ void task_creator::manager_loop()
           _task_scheduler->schedule(std::move(task));
         }
         // Unconditional re-evaluation at every creation exit
-        // (s3-zero-task-protocol-plan.md S1): with the source-exhaustion finish
+        //: with the source-exhaustion finish
         // guard, "last task completed at T1, connector closed at T2>T1" has no
         // later mark_task_completed() to re-check the pipeline — this call,
         // observing the now-exhausted source, is the paired re-evaluation.

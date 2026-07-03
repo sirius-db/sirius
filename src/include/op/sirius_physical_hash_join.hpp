@@ -52,7 +52,7 @@ enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
 enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
 
 /**
- * @brief Marker input for a zero-side join task (s3-shape-c-zero-side-join-plan.md §4).
+ * @brief Marker input for a zero-side join task.
  *
  * Handed out by sirius_physical_hash_join::get_next_task_input_data when exactly one join
  * input side died (its source pipeline finished without ever delivering a batch) while the
@@ -185,7 +185,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                          rmm::cuda_stream_view stream) override;
 
   /// @brief Emit the join-type-correct output for one surviving batch whose other input side
-  /// died (s3-shape-c-zero-side-join-plan.md §3/§4). Builds gather index vectors on the task
+  /// died. Builds gather index vectors on the task
   /// stream (iota for keep-all, -1 padding for the NULLed dead side, empty for empty-correct
   /// cells) and publishes through the same output path as a normal join task. No cudf join
   /// call, no hash table.
@@ -211,7 +211,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Set under op_state_mutex exactly where batches leave (or are snapshotted from) each
   //! input port. A side whose flag never flips while every source pipeline finishes is
   //! "dead"; zero_side_pending_locked() then offers the zero-side task for the surviving
-  //! port's batches (s3-shape-c-zero-side-join-plan.md §4). Any real batch — including a
+  //! port's batches. Any real batch — including a
   //! fallback-ON empty one — suppresses the zero-side path for its side.
   bool _saw_probe_input = false;
   bool _saw_build_input = false;

@@ -463,7 +463,7 @@ bool sirius_physical_hash_join::zero_side_pending_locked()
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
-  // Zero-side join (s3-shape-c-zero-side-join-plan.md §4): exactly one input side died while
+  // Zero-side join: exactly one input side died while
   // the other port still holds data. Offer the zero-side task ahead of any mode-specific
   // logic — both the BUILD_PROBE branch and the base hint would otherwise wait forever on
   // the finished dead-side pipeline.
@@ -595,7 +595,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   // (_status_mutex), so the order is always _status_mutex -> op_state_mutex — never inverted.
   std::lock_guard<std::mutex> lg(op_state_mutex);
 
-  // Zero-side join (s3-shape-c-zero-side-join-plan.md §4): pop ONE surviving batch per call,
+  // Zero-side join: pop ONE surviving batch per call,
   // preserving its partition affinity, and hand out the marker. The task creator's drain loop
   // keeps calling until the surviving port is empty; the pop and the task's
   // mark_task_created happen under the same _status_mutex hold, so the pipeline-finish guard
@@ -934,7 +934,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
       make_data_batch(std::move(output_cudf_table), *left_batch.get_memory_space(), stream)});
 }
 
-/// Zero-side gather-map builders (s3-shape-c-zero-side-join-plan.md §4). Both fill on the
+/// Zero-side gather-map builders. Both fill on the
 /// task stream; this TU is host-compiled, so libcudf's device fill (cudf::sequence) stands in
 /// for a raw thrust::sequence, and the -1 padding uses the all-0xFF byte pattern of two's
 /// complement directly.

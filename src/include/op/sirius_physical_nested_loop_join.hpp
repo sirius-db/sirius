@@ -44,7 +44,7 @@ namespace op {
 
 /**
  * @brief Marker input for a zero-side nested-loop-join task
- *        (s3-shape-c-zero-side-join-plan.md §8).
+ *.
  *
  * Handed out by sirius_physical_nested_loop_join::get_next_task_input_data when exactly one
  * join input side died (its source pipeline finished without ever delivering a batch) while
@@ -159,7 +159,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
                                          rmm::cuda_stream_view stream) override;
 
   /// @brief Emit the join-type-correct output for one surviving batch whose other input side
-  /// died (s3-shape-c-zero-side-join-plan.md §3/§8). Builds gather maps on the task stream
+  /// died. Builds gather maps on the task stream
   /// (iota for keep-all, -1 padding for the NULLed dead side, empty for empty-correct cells)
   /// and publishes through the same output path as a normal join task. The join condition is
   /// never evaluated.
@@ -192,7 +192,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! Set under batches_to_processed_mutex exactly where the port snapshot observes batches on
   //! each input side. A side whose flag never flips while every source pipeline finishes is
   //! "dead"; zero_side_pending_locked() then offers the zero-side task for the surviving
-  //! port's batches (s3-shape-c-zero-side-join-plan.md §8).
+  //! port's batches.
   bool _saw_probe_input = false;
   bool _saw_build_input = false;
 
