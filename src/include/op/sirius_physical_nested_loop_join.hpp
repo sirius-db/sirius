@@ -177,6 +177,11 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
                                                             cucascade::memory::memory_space& space,
                                                             rmm::cuda_stream_view stream);
 
+  //! Left table restricted to left_output_col_idxs (the plan's left projection map). Applied
+  //! by the left-only output paths (SEMI/ANTI/MARK), whose result must match op.types;
+  //! selection drops columns only, so row indices from joins on the full table stay valid.
+  cudf::table_view select_left_output(const cudf::table_view& left) const;
+
  protected:
   std::mutex batches_to_processed_mutex;
   std::size_t current_partition_index = 0;
