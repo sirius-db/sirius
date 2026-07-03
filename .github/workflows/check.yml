@@ -57,56 +57,43 @@ jobs:
             build-type: release
             environment: default
             cudf-channel: stable
-            variant: super
             run-on-pr: true
           - arch: x64
             compiler: clang
             build-type: debug
             environment: default
             cudf-channel: stable
-            variant: super
             run-on-pr: true
           - arch: arm64
             compiler: gcc
             build-type: release
             environment: default
             cudf-channel: stable
-            variant: super
             run-on-pr: false
           - arch: arm64
             compiler: clang
             build-type: debug
             environment: default
             cudf-channel: stable
-            variant: super
             run-on-pr: false
           - arch: x64
             compiler: gcc
             build-type: release
             environment: vcpkg
             cudf-channel: stable
-            variant: super
             run-on-pr: false
           - arch: arm64
             compiler: gcc
             build-type: release
             environment: default
             cudf-channel: nightly
-            variant: super
-            run-on-pr: false
-          - arch: x64
-            compiler: gcc
-            build-type: release
-            environment: default
-            cudf-channel: stable
-            variant: legacy
             run-on-pr: false
         exclude:
           # On PRs, drop rows marked merge/dev-only; on merge_group/dev, match nothing.
           - build:
               run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
       fail-fast: false
-    name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }}, ${{ matrix.build.variant }})
+    name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }})
     runs-on: >-
       ${{ matrix.build.environment == 'vcpkg'
         && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
@@ -149,7 +136,7 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
-      - run: ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ matrix.build.variant == 'legacy' && format('legacy-{0}', matrix.build.build-type) || case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc)
+      - run: ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc)
         if: matrix.build.environment != 'vcpkg'
         env:
           CUDAARCHS: "100"
@@ -165,7 +152,7 @@ jobs:
         if: >-
           matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
           && matrix.build.build-type == 'release' && matrix.build.environment == 'default'
-          && matrix.build.cudf-channel == 'stable' && matrix.build.variant == 'super'
+          && matrix.build.cudf-channel == 'stable'
         run: |
           set -euo pipefail
           pixi run cargo fmt --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --check
