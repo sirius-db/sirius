@@ -28,10 +28,12 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
+#include "op/dynamic_filter_replica_space.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -49,6 +51,55 @@ class sirius_meta_pipeline;
 namespace op {
 
 class sirius_dynamic_filter_set;
+
+//===----------------------------------------------------------------------===//
+// Dynamic Filters
+//===----------------------------------------------------------------------===//
+/// @brief Immutable plan-time description of one hash join's dynamic-filter publication.
+///
+/// The planner owns routing and placement decisions. The runtime publisher consumes this value but
+/// cannot mutate its targets, policy, or device set after operator construction. Replica spaces are
+/// the active GPU spaces from the Sirius context, including the GPU on which the build may execute;
+/// their owner follows the lifetime contract on @ref dynamic_filter_replica_space.
+class dynamic_filter_publish_plan final {
+ public:
+  struct probe_target {
+    std::shared_ptr<sirius_dynamic_filter_set> filter_set;
+    std::vector<std::size_t> probe_col_idx;
+  };
+
+  dynamic_filter_publish_plan() = default;
+  dynamic_filter_publish_plan(std::vector<probe_target> probe_targets,
+                              bool emit_zone_map_filters,
+                              std::size_t build_key_domain_cardinality,
+                              std::vector<dynamic_filter_replica_space> replica_spaces);
+
+  [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
+  [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
+  {
+    return _probe_targets;
+  }
+  [[nodiscard]] bool emit_zone_map_filters() const noexcept { return _emit_zone_map_filters; }
+  [[nodiscard]] std::size_t build_key_domain_cardinality() const noexcept
+  {
+    return _build_key_domain_cardinality;
+  }
+  [[nodiscard]] std::vector<dynamic_filter_replica_space> const& replica_spaces() const noexcept
+  {
+    return _replica_spaces;
+  }
+
+  /// Fraction of the key-domain proxy a build may cover and still publish.
+  static constexpr double k_domain_coverage_threshold = 0.5;
+
+ private:
+  std::vector<probe_target> _probe_targets;
+  bool _emit_zone_map_filters               = false;
+  std::size_t _build_key_domain_cardinality = 0;
+  /// Non-owning GPU placements. See @ref dynamic_filter_replica_space for the lifetime contract.
+  std::vector<dynamic_filter_replica_space> _replica_spaces;
+};
+//===----------------------------------------------------------------------===//
 
 // STANDARD uses cudf APIs where the build and probe is a single operation.
 // BUILD_PROBE builds the hash table in one step and then probes it in a separate step, which allows
@@ -78,7 +129,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::vector<sirius::logical_type> delim_types,
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
-    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+    uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    dynamic_filter_publish_plan dynamic_filter_plan = {});
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -92,43 +144,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   duckdb::vector<sirius::join_condition> conditions;
   //! Scans where we should push generated filters into (if any)
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
-
-  //===----------------------------------------------------------------------===//
-  // Dynamic Filters
-  //===----------------------------------------------------------------------===//
-  /// @brief A downstream scan that this join's build side feeds dynamic filters into. The probe
-  /// target is paired with the consumer via a shared @ref sirius_dynamic_filter_set channel.
-  ///
-  /// @c probe_col_idx[k] is the consumer's output column index for the filter computed from the
-  /// k-th build key, where k indexes @c filter_pushdown->probe_info[t].columns (also aligned with
-  /// @c filter_pushdown->join_condition).
-  struct probe_target {
-    std::shared_ptr<sirius_dynamic_filter_set> filter_set;
-    std::vector<std::size_t> probe_col_idx;
-  };
-
-  /// @brief Downstream targets the producer pushes per-build-key filters into at finalize time.
-  /// Populated by the plan builder after construction (see sirius_plan_comparison_join.cpp).
-  /// Empty when DuckDB did not generate filter pushdown for this join.
-  std::vector<probe_target> probe_targets;
-
-  /// @brief When true, the producer also emits a read-time zone-map (build-key min/max) per key for
-  /// row-group pruning, in addition to the membership filter. Set at plan time from
-  /// operator_params::enable_dynamic_zone_map_filter. Off by default (see that flag).
-  bool emit_zone_map_filters = false;
-
-  /// @brief Key-domain proxy for the publish-time selectivity gate: the largest unfiltered
-  /// base-table cardinality in the build-side logical subtree, captured from DuckDB statistics
-  /// when the probe targets were wired (0 = unknown, gate disabled). At publish time the exact
-  /// build row count divided by this approximates the probe keep ratio for FK-shaped joins; a
-  /// build covering ≥ @ref k_publish_domain_coverage_threshold of the domain is not published.
-  std::size_t build_key_domain_cardinality = 0;
-
-  /// @brief Fraction of the key-domain proxy a build may cover and still publish. This is
-  /// intentionally looser than the consumer-side measured keep threshold because the
-  /// denominator is a base-table cardinality proxy, not a proven join-key domain size.
-  static constexpr double k_publish_domain_coverage_threshold = 0.5;
-  //===----------------------------------------------------------------------===//
 
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
@@ -194,6 +209,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();
 
+  /// @brief True when plan construction wired at least one dynamic-filter consumer.
+  [[nodiscard]] bool publishes_dynamic_filters() const noexcept
+  {
+    return _dynamic_filter_plan.enabled();
+  }
+
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -252,45 +273,58 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //===----------------------------------------------------------------------===//
   // Dynamic Filters
   //===----------------------------------------------------------------------===//
-  /// @brief Compute @c (min, max) per build key over @p build_view via @c cudf::reduce and push a
-  /// single-zone @ref sirius_dynamic_zone_map_filter into each entry of @ref probe_targets. Caller
-  /// holds @ref op_state_mutex and must have verified @ref filter_pushdown is set and
-  /// @ref probe_targets is non-empty. No-op when @p build_view has zero rows.
-  /// @param build_view The materialized build side (its key columns are reduced).
-  /// @param stream     CUDA stream for the @c cudf::reduce work.
-  void push_build_side_dynamic_filters(cudf::table_view const& build_view,
-                                       rmm::cuda_stream_view stream);
-
-  /// @brief Publish dynamic filters to the wired probe-target channels exactly once from a
-  /// materialized build table.
+  /// @brief Claim and perform this join's one dynamic-filter publication attempt.
   ///
-  /// Called from the two data-bearing sites below, whichever fires first winning via
-  /// @ref _dynamic_filters_published:
-  ///   1. @ref push_data_batch_partitioned when the (single, concat-folded) build batch is
-  ///      delivered to the build port — the earliest point, before any probe batch, so the probe
-  ///      scan can prune at read;
-  ///   2. the @c BUILD_PROBE @c BUILT transition in @ref execute (fallback if (1) was skipped).
+  /// The normal caller is @ref push_data_batch_partitioned: it publishes as soon as the single,
+  /// concat-folded build batch reaches the build port, before any probe batch is required.
   ///
-  /// @ref on_finalize_operator does not publish filters; it only closes the publication window
-  /// before releasing BUILD_PROBE state. Caller must hold @ref op_state_mutex.
+  /// The @c BUILD_PROBE @c BUILT transition in @ref execute is a defense-in-depth second claim
+  /// point, not a dependency or an intentional delay. In the normal path it is a no-op because the
+  /// build-port caller has already changed the state to @c FINISHED. It exists because execute is
+  /// guaranteed to hold the *GPU resident* build batch. That remains a safe publication opportunity
+  /// if an earlier delivery could not use its batch (for example, if it was not GPU-resident).
+  ///
+  /// The first caller to change @c OPEN to @c PUBLISHING owns construction, device replication,
+  /// and channel fan-out. GPU work runs without holding @ref op_state_mutex. A successful attempt
+  /// ends in @c FINISHED even when selectivity gates or drained targets cause it to emit no
+  /// filters. @ref on_finalize_operator never publishes; it only changes an unclaimed @c OPEN
+  /// window to @c CLOSED before releasing BUILD_PROBE state.
+  ///
   /// @param build_view The build side to reduce / build membership over.
-  /// @param stream     CUDA stream used for filter construction.
-  void publish_dynamic_filters_locked(cudf::table_view const& build_view,
-                                      rmm::cuda_stream_view stream);
+  /// @param stream     Durable build-memory-space stream used for filter construction.
+  void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
 
-  /// Guards @ref publish_dynamic_filters_locked so filters are pushed at most once.
-  bool _dynamic_filters_published = false;
+  enum class dynamic_filter_publication_state : std::uint8_t {
+    OPEN,        ///< No publication site has claimed the build table.
+    PUBLISHING,  ///< One caller owns construction, replication, and fan-out.
+    FINISHED,    ///< The one publication attempt completed successfully (possibly emitting none).
+    FAILED,      ///< The claimed attempt threw; another caller must not retry uncertain state.
+    CLOSED       ///< Finalization closed the window before any caller claimed it.
+  };
+
+  /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
+  dynamic_filter_publish_plan const _dynamic_filter_plan;
+  /// Arbitration for the two possible data-bearing publication sites described above.
+  std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
+    dynamic_filter_publication_state::OPEN};
+  //===----------------------------------------------------------------------===//
 
  public:
-  /// @brief Build-port hook: when the build batch is delivered to this join, compute and publish
-  /// the dynamic filter from the build keys alone — independent of any probe batch and of the
-  /// join's task state machine — so the probe-side scan can prune at read. Routes the batch
-  /// normally, then (build port + BUILD_PROBE + wired + GPU-resident, once) reduces (min,max) on a
-  /// private stream and publishes. Other ports / modes just route.
+  /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch if possible / applicable.
+  ///
+  /// Every batch is first routed exactly as in the base partition consumer. For the @c build port
+  /// of a wired @c BUILD_PROBE join, a non-null, GPU-resident, single concat-folded batch is the
+  /// normal and earliest publication point. A stream borrowed from the build memory space waits on
+  /// the batch writer event, then builds and replicates filters from the build keys without
+  /// requiring a probe batch or a built hash table.
+  ///
+  /// Other ports and join modes only route. If the eligible build batch is not yet GPU-resident,
+  /// this hook deliberately leaves publication @c OPEN; @ref execute may then claim publication
+  /// from the execution-ready GPU batch at its @c BUILT transition. Consumers never wait for that
+  /// fallback and simply process any earlier splits without the optional filter.
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
-  //===----------------------------------------------------------------------===//
 
  public:
   // Sink Interface

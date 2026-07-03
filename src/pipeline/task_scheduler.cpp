@@ -186,7 +186,7 @@ std::unordered_set<const sirius_pipeline*> collect_filter_build_pipelines(
   for (auto const& p : pipelines) {
     for (auto const& op_ref : p->get_operators()) {
       auto* join = dynamic_cast<op::sirius_physical_hash_join*>(&op_ref.get());
-      if (join && !join->probe_targets.empty()) {
+      if (join && join->publishes_dynamic_filters()) {
         work.emplace_back(&op_ref.get(), std::string_view{"build"});
       }
     }

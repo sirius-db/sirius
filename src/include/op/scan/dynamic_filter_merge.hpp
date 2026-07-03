@@ -50,11 +50,13 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
 /// The returned pointer (when non-null) points into @p tree and remains valid for the lifetime
 /// of @p tree. Device scalars referenced by filter literals are owned by the filter objects in
 /// @p filters and must outlive any installed AST built from this call.
+/// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
 [[nodiscard]] cudf::ast::expression const* merge_dynamic_filters_into_ast(
   cudf::ast::tree& tree,
   cudf::ast::expression const* existing_root,
   sirius::op::sirius_dynamic_filter_set const& filters,
-  scan_plan const& plan);
+  scan_plan const& plan,
+  int device_id = -1);
 
 /// @brief Drop rows of @p input that fail the dynamic filters in @p filters, returning only the
 /// gathered survivors (the caller keeps @p input).
@@ -69,6 +71,7 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
 /// filters before it. When @p gate is non-null it supplies per-filter marginal keep ratios:
 /// measured-useless filters are dropped from the cascade, and each filter's first ratio is recorded
 /// back. Pass null (tests, gate-less callers) to apply everything in arrival order.
+/// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
 /// @note Should not be used by callers -- useful for testing. Callers should use
 /// apply_dynamic_filters_gated_view instead, which wraps this with a gate early-out and keep-ratio
 /// recording.
@@ -77,18 +80,21 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
   sirius::op::sirius_dynamic_filter_set const& filters,
   rmm::cuda_stream_view stream,
   dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::include_ast_row_masks,
-  dynamic_filter_gate* gate      = nullptr);
+  dynamic_filter_gate* gate      = nullptr,
+  int device_id                  = -1);
 
 /// @brief Apply dynamic filters with the scan-level gate.
 ///
-/// Returns nullptr when the gate declines or no filter contributed a mask. A mask-less apply still
-/// records keep ratio 1.0, so an unhelpful filter set disables itself until a later publish re-arms
-/// the gate.
+/// Returns nullptr when the gate declines or no compatible device-local filter contributed a mask.
+/// A mask-less apply does not train the gate: a GPU missing a best-effort replica must not disable
+/// useful replicas on other GPUs.
+/// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   cudf::table_view const& input,
   sirius::op::sirius_dynamic_filter_set const& filters,
   dynamic_filter_gate& gate,
   rmm::cuda_stream_view stream,
-  dynamic_filter_apply_mode mode);
+  dynamic_filter_apply_mode mode,
+  int device_id = -1);
 
 }  // namespace sirius::op::scan

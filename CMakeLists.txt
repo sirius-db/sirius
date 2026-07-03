@@ -358,6 +358,7 @@ string(APPEND CMAKE_CUDA_FLAGS
 
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
+    src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
     src/op/scan/equality_delete_mask.cu
@@ -463,6 +464,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # (cuCascade::cucascade) and cudf::cudf.
   target_link_libraries(
     ${_target}
+    CUDA::cuda_driver
     cudf::cudf
     rmm::rmm
     spdlog::spdlog
@@ -624,6 +626,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
+    test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp

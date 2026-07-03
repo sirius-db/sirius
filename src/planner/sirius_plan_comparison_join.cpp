@@ -265,6 +265,9 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Dynamic Filters
+//===----------------------------------------------------------------------===//
 namespace {
 
 /// Plan-time producer-side selectivity evidence for dynamic-filter wiring, gathered from the
@@ -311,6 +314,7 @@ build_side_filter_evidence inspect_build_side_for_dynamic_filters(duckdb::Logica
 }
 
 }  // namespace
+   //===----------------------------------------------------------------------===//
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
@@ -370,9 +374,54 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    const auto& op_params = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                              ->get_config()
-                              .get_operator_params();
+    auto sirius_context   = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    const auto& op_params = sirius_context->get_config().get_operator_params();
+
+    // Build the dynamic filter producer's immutable publication plan before moving DuckDB's pushdown metadata
+    // into the physical join. Routing and device placement are plan-time decisions; runtime code
+    // only consumes this value.
+    std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> filter_targets;
+    std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
+    if (op.filter_pushdown) {
+      if (!build_filter_evidence.subtree_filtered) {
+        SIRIUS_LOG_INFO(
+          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build subtree is "
+          "unfiltered (build est {} rows, key-domain ~{} rows).",
+          rhs_cardinality,
+          build_filter_evidence.domain_cardinality);
+      } else {
+        filter_targets.reserve(op.filter_pushdown->probe_info.size());
+        for (auto const& pi : op.filter_pushdown->probe_info) {
+          auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
+          if (!channel) { continue; }
+          channel->register_producer();
+          sirius::op::dynamic_filter_publish_plan::probe_target target{std::move(channel), {}};
+          target.probe_col_idx.reserve(pi.columns.size());
+          for (auto const& col : pi.columns) {
+            target.probe_col_idx.push_back(col.probe_column_index.column_index);
+          }
+          filter_targets.push_back(std::move(target));
+        }
+        if (!filter_targets.empty()) {
+          // Route all dynamic-filter replicas to all GPUs in the current context.
+          for (auto const* space : sirius_context->get_memory_manager().get_memory_spaces_for_tier(
+                 cucascade::memory::Tier::GPU)) {
+            filter_replica_spaces.emplace_back(*space);
+          }
+          SIRIUS_LOG_INFO(
+            "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
+            "target(s) (build est {} rows, key-domain ~{} rows).",
+            filter_targets.size(),
+            rhs_cardinality,
+            build_filter_evidence.domain_cardinality);
+        }
+      }
+    }
+    sirius::op::dynamic_filter_publish_plan filter_plan{std::move(filter_targets),
+                                                        op_params.enable_dynamic_zone_map_filter,
+                                                        build_filter_evidence.domain_cardinality,
+                                                        std::move(filter_replica_spaces)};
+
     auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,
       std::move(left),
@@ -384,54 +433,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       sirius::from_duckdb_vec(op.mark_types),
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
-      op_params.max_build_hash_table_bytes);
+      op_params.max_build_hash_table_bytes,
+      std::move(filter_plan));
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats                   = std::move(op.join_stats);
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
-
-    //===----------Wire dynamic-filter producer targets----------===//
-    // For each downstream scan DuckDB has paired with this join, look up the shared channel by
-    // the DynamicTableFilterSet pointer (the route key) and stash it along with the per-key
-    // consumer column indices on the join.
-    //
-    // Plan-time selectivity gate: an UNFILTERED build subtree is — for FK-shaped joins — the
-    // whole key domain, so its membership filter keeps every probe row by construction.
-    //
-    // DuckDB is the source of truth for whether dynamic filter pushdown is valid for this join
-    // type, gated here on the existence of a dynamic filter channel. See GenerateJoinFilters at
-    // join_filter_pushdown_optimizer.cpp.
-    if (hj.filter_pushdown) {
-      if (!build_filter_evidence.subtree_filtered) {
-        SIRIUS_LOG_INFO(
-          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build subtree is "
-          "unfiltered (build est {} rows, key-domain ~{} rows).",
-          rhs_cardinality,
-          build_filter_evidence.domain_cardinality);
-      } else {
-        hj.probe_targets.reserve(hj.filter_pushdown->probe_info.size());
-        for (auto const& pi : hj.filter_pushdown->probe_info) {
-          auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
-          if (!channel) { continue; }
-          channel->register_producer();
-          sirius::op::sirius_physical_hash_join::probe_target tgt{std::move(channel), {}};
-          tgt.probe_col_idx.reserve(pi.columns.size());
-          for (auto const& col : pi.columns) {
-            tgt.probe_col_idx.push_back(col.probe_column_index.column_index);
-          }
-          hj.probe_targets.push_back(std::move(tgt));
-        }
-        hj.emit_zone_map_filters        = op_params.enable_dynamic_zone_map_filter;
-        hj.build_key_domain_cardinality = build_filter_evidence.domain_cardinality;
-        if (!hj.probe_targets.empty()) {
-          SIRIUS_LOG_INFO(
-            "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
-            "target(s) (build est {} rows, key-domain ~{} rows).",
-            hj.probe_targets.size(),
-            rhs_cardinality,
-            build_filter_evidence.domain_cardinality);
-        }
-      }
-    }
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).

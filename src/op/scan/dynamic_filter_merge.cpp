@@ -22,6 +22,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <log/logging.hpp>
+#include <op/dynamic_filter_device.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 
 #include <algorithm>
@@ -35,8 +36,10 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
   cudf::ast::tree& tree,
   cudf::ast::expression const* existing_root,
   sirius::op::sirius_dynamic_filter_set const& filters,
-  scan_plan const& plan)
+  scan_plan const& plan,
+  int device_id)
 {
+  device_id        = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
   auto const* root = existing_root;
   for (auto const col_idx : filters.filtered_columns()) {
     if (col_idx >= plan.output_layout.size()) { continue; }
@@ -45,10 +48,11 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
     auto const& parquet_col_name = plan.data_columns[entry.idx].name;
 
     for (auto const& f : filters.filters_for_column(col_idx)) {
+      if (!f->is_available_on_device(device_id)) { continue; }
       auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(f.get());
       if (!lowerable) { continue; }
       auto const& col_ref  = tree.emplace<cudf::ast::column_name_reference>(parquet_col_name);
-      auto const& fragment = lowerable->to_ast(tree, col_ref);
+      auto const& fragment = lowerable->to_ast(tree, col_ref, device_id);
       root                 = root ? &tree.emplace<cudf::ast::operation>(
                       cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
                                   : &fragment;
@@ -62,11 +66,13 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   sirius::op::sirius_dynamic_filter_set const& filters,
   rmm::cuda_stream_view stream,
   dynamic_filter_apply_mode mode,
-  dynamic_filter_gate* gate)
+  dynamic_filter_gate* gate,
+  int device_id)
 {
   nvtx3::scoped_range nvtx_range{"dynfilter::apply_output"};
   if (input.num_rows() == 0 || input.num_columns() == 0) { return nullptr; }
 
+  device_id           = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
   auto const num_cols = static_cast<std::size_t>(input.num_columns());
   auto const mr       = cudf::get_current_device_resource_ref();
 
@@ -93,13 +99,14 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
       if (col_idx >= num_cols) { continue; }
       cudf::ast::expression const* col_ref = nullptr;
       for (auto const& f : filters.filters_for_column(col_idx)) {
+        if (!f->is_available_on_device(device_id)) { continue; }
         auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(f.get());
         if (!lowerable) { continue; }
         if (!col_ref) {
           col_ref =
             &tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(col_idx));
         }
-        auto const& fragment = lowerable->to_ast(tree, *col_ref);
+        auto const& fragment = lowerable->to_ast(tree, *col_ref, device_id);
         root                 = root ? &tree.emplace<cudf::ast::operation>(
                         cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
                                     : &fragment;
@@ -125,6 +132,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   for (auto const col_idx : filters.filtered_columns()) {
     if (col_idx >= num_cols) { continue; }
     for (auto const& f : filters.filters_for_column(col_idx)) {
+      if (!f->is_available_on_device(device_id)) { continue; }
       auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(f.get());
       if (!applicable) { continue; }
       auto recorded = gate ? gate->filter_keep_ratio(f.get()) : std::nullopt;
@@ -139,7 +147,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   for (auto const& e : entries) {
     if (current.num_rows() == 0) { break; }
     auto const& probe = current.column(static_cast<cudf::size_type>(e.col_idx));
-    auto const kept   = cascade_step(e.filter->compute_mask(probe, stream, mr));
+    auto const kept   = cascade_step(e.filter->compute_mask(probe, device_id, stream, mr));
     if (gate && !e.recorded) { gate->record_filter_keep_ratio(e.identity, kept); }
   }
 
@@ -147,7 +155,8 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   auto const* mode_name = mode == dynamic_filter_apply_mode::include_ast_row_masks
                             ? "include_ast_row_masks"
                             : "membership_masks_only";
-  SIRIUS_LOG_DEBUG("[apply_dynamic_filters] mode={} apply: {} -> {} rows.",
+  SIRIUS_LOG_DEBUG("[apply_dynamic_filters] device={} mode={} apply: {} -> {} rows.",
+                   device_id,
                    mode_name,
                    input.num_rows(),
                    owned->num_rows());
@@ -191,6 +200,11 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
 {
   constexpr double keep_threshold = 0.25;  // disable if a batch keeps > 25% of its rows
   if (rows_before == 0) { return; }
+
+  // Multiple GPU tasks can finish masks concurrently. Re-read both values while holding the slow
+  // decision-path lock: otherwise an older task can observe UNKNOWN, pause, and overwrite ACTIVE
+  // after a selective task has already committed it.
+  std::scoped_lock decision_lock(_decision_mu);
   auto const current = _state.load(std::memory_order_relaxed);
   if (current == state::active) { return; }  // proven useful — sticky
   if (current == state::disabled &&
@@ -211,17 +225,20 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   sirius::op::sirius_dynamic_filter_set const& filters,
   dynamic_filter_gate& gate,
   rmm::cuda_stream_view stream,
-  dynamic_filter_apply_mode mode)
+  dynamic_filter_apply_mode mode,
+  int device_id)
 {
   if (!gate.applicable(filters)) { return nullptr; }
   // Snapshot before computing the mask: a filter pushed mid-apply is not (reliably) in the mask,
   // so it must not be credited to this measurement — undercounting at worst re-arms once more.
   auto const observed_filters = filters.filter_count();
   auto const rows_before      = input.num_rows();
-  auto filtered               = apply_dynamic_filters_to_view(input, filters, stream, mode, &gate);
-  gate.record_keep_ratio(rows_before,
-                         filtered ? static_cast<std::size_t>(filtered->num_rows()) : rows_before,
-                         observed_filters);
+  auto filtered = apply_dynamic_filters_to_view(input, filters, stream, mode, &gate, device_id);
+  // nullptr means no compatible local filter produced a mask/AST. Do not train the shared gate on
+  // that no-op, or one GPU missing a best-effort replica could suppress useful replicas globally.
+  if (!filtered) { return nullptr; }
+  gate.record_keep_ratio(
+    rows_before, static_cast<std::size_t>(filtered->num_rows()), observed_filters);
   return filtered;
 }
 

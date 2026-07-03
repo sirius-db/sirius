@@ -38,7 +38,8 @@ namespace sirius::op::scan {
 /// Used by @ref apply_dynamic_filters_gated_view. The first applied non-empty batch decides:
 /// filters that keep more than 25% of rows are disabled for the scan; selective filters stay
 /// active. If more filters publish after a disable decision, the gate re-arms and measures once
-/// more. Concurrent batches may both measure during re-arm; that only costs redundant work.
+/// more. Concurrent batches may both measure during re-arm; decision recording is serialized so
+/// an older measurement cannot demote a gate that a selective batch already made active.
 class dynamic_filter_gate {
  public:
   /// True when a gated apply would do work now: at least one filter has published, and the gate is
@@ -90,6 +91,11 @@ class dynamic_filter_gate {
   /// Filter count observed by the apply whose ratio last decided @c _state. Read together with
   /// @c _state without joint atomicity: a torn read at worst causes one extra measurement.
   std::atomic<std::size_t> _decided_filter_count{0};
+
+  /// Serializes the rare decision update after a mask has already been computed. Applicability
+  /// remains lock-free; the lock only makes the state/count transition honor ACTIVE's terminal
+  /// contract when batches from different filter generations finish concurrently.
+  std::mutex _decision_mu;
 
   /// First-measured marginal keep ratio per filter. Mutex-guarded: touched once per (split,
   /// filter) on the apply slow path, never on the zero-copy fast path.

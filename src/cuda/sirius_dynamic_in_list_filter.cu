@@ -15,6 +15,9 @@
  */
 
 // sirius
+#include <log/logging.hpp>
+#include <op/dynamic_filter_device.hpp>
+#include <op/dynamic_filter_replica_transfer.hpp>
 #include <op/sirius_dynamic_filter.hpp>
 
 // cudf
@@ -31,10 +34,20 @@
 #include <cuda/std/limits>
 #include <cuda/stream_ref>
 
+// cucascade
+#include <cucascade/memory/memory_space.hpp>
+
+// rmm
+#include <rmm/cuda_device.hpp>
+
 // standard library
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace sirius::op {
 
@@ -62,12 +75,17 @@ using set_type = cuco::static_set<KeyT,
                                   set_alloc<KeyT>>;
 
 template <class KeyT>
-std::unique_ptr<set_type<KeyT>> build_set(cudf::column_view const& keys,
-                                          std::size_t capacity,
-                                          rmm::device_async_resource_ref mr,
-                                          cuda::stream_ref stream)
+using set_owner = std::unique_ptr<set_type<KeyT>>;
+
+// A live replica owns exactly one typed set; its active owner becomes null only during teardown.
+using set_storage = std::variant<set_owner<std::int32_t>, set_owner<std::int64_t>>;
+
+template <class KeyT>
+set_owner<KeyT> make_set(std::size_t capacity,
+                         rmm::device_async_resource_ref mr,
+                         cuda::stream_ref stream)
 {
-  std::unique_ptr<set_type<KeyT>> set(
+  return set_owner<KeyT>(
     new set_type<KeyT>{cuco::extent<std::size_t>{capacity},
                        cuco::empty_key<KeyT>{cuda::std::numeric_limits<KeyT>::min()},
                        {},
@@ -76,6 +94,15 @@ std::unique_ptr<set_type<KeyT>> build_set(cudf::column_view const& keys,
                        {},
                        set_alloc<KeyT>{mr},
                        stream});
+}
+
+template <class KeyT>
+set_owner<KeyT> build_set(cudf::column_view const& keys,
+                          std::size_t capacity,
+                          rmm::device_async_resource_ref mr,
+                          cuda::stream_ref stream)
+{
+  auto set = make_set<KeyT>(capacity, mr, stream);
   if (keys.size() > 0) {
     auto const* d = keys.data<KeyT>();
     set->insert_async(d, d + keys.size(), stream);
@@ -86,9 +113,7 @@ std::unique_ptr<set_type<KeyT>> build_set(cudf::column_view const& keys,
 template <class KeyT>
 struct equals_sentinel {
   __device__ __forceinline__ bool operator()(KeyT const& k) const noexcept
-  {
-    return k == cuda::std::numeric_limits<KeyT>::min();
-  }
+  { return k == cuda::std::numeric_limits<KeyT>::min(); }
 };
 
 template <class KeyT, class SetRef>
@@ -105,9 +130,49 @@ struct contains_or_sentinel {
 
 }  // namespace
 
+struct set_replica {
+  int device_id = -1;
+  set_storage set;
+  detail::replica_transfer transfer;
+
+  template <class KeyT>
+  set_replica(int device_id, set_owner<KeyT> owner)
+    : device_id{device_id}, set{std::in_place_type<set_owner<KeyT>>, std::move(owner)}
+  {
+  }
+
+  ~set_replica() noexcept
+  {
+    if (device_id < 0) { return; }
+    try {
+      transfer.wait();
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      std::visit([](auto& owner) { owner.reset(); }, set);
+    } catch (...) {
+      // A CUDA-context failure means these device-owned objects cannot be destroyed safely. Leak
+      // them rather than terminate from a destructor or deallocate them on the wrong device.
+      std::visit([](auto& owner) { (void)owner.release(); }, set);
+    }
+  }
+
+  [[nodiscard]] bool has_set() const noexcept
+  {
+    return std::visit([](auto const& owner) { return owner != nullptr; }, set);
+  }
+};
+
 struct sirius_dynamic_in_list_filter::set_impl {
-  std::unique_ptr<set_type<std::int32_t>> s32;
-  std::unique_ptr<set_type<std::int64_t>> s64;
+  int source_device = -1;
+  std::vector<std::unique_ptr<set_replica>> replicas;
+
+  [[nodiscard]] set_replica const* find(int device_id) const noexcept
+  {
+    auto const it =
+      std::find_if(replicas.begin(), replicas.end(), [device_id](auto const& replica) {
+        return replica->device_id == device_id;
+      });
+    return it == replicas.end() ? nullptr : it->get();
+  }
 };
 
 sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view const& keys,
@@ -123,11 +188,24 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
   cuda::stream_ref const s{stream.value()};
   auto const capacity = std::max<std::size_t>(kCapacityFactor * _num_keys, kMinCapacity);
   _set                = std::make_unique<set_impl>();
-  switch (_key_type.id()) {
-    case cudf::type_id::INT32: _set->s32 = build_set<std::int32_t>(keys, capacity, mr, s); break;
-    case cudf::type_id::INT64: _set->s64 = build_set<std::int64_t>(keys, capacity, mr, s); break;
-    default: break;  // unreachable: supports() gates the type
+  if (cudaGetDevice(&_set->source_device) != cudaSuccess) {
+    throw std::runtime_error("[sirius_dynamic_in_list_filter] failed to identify source device.");
   }
+  std::unique_ptr<set_replica> source;
+  switch (_key_type.id()) {
+    case cudf::type_id::INT32:
+      source = std::make_unique<set_replica>(_set->source_device,
+                                             build_set<std::int32_t>(keys, capacity, mr, s));
+      break;
+    case cudf::type_id::INT64:
+      source = std::make_unique<set_replica>(_set->source_device,
+                                             build_set<std::int64_t>(keys, capacity, mr, s));
+      break;
+    default:
+      throw std::logic_error(
+        "[sirius_dynamic_in_list_filter] supported key type changed during construction.");
+  }
+  _set->replicas.push_back(std::move(source));
 }
 
 bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noexcept
@@ -140,32 +218,120 @@ sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter() = default;
 
 bool sirius_dynamic_in_list_filter::has_persistent_set() const noexcept
 {
-  return _set && (_set->s32 || _set->s64);
+  return _set && std::any_of(_set->replicas.begin(), _set->replicas.end(), [](auto const& replica) {
+           return replica->has_set();
+         });
 }
+
+void sirius_dynamic_in_list_filter::replicate_to_devices(
+  std::span<dynamic_filter_replica_space const> spaces)
+{
+  if (!_set || _set->replicas.empty()) { return; }
+  auto const* source = _set->find(_set->source_device);
+  if (!source) { return; }
+
+  std::vector<std::unique_ptr<set_replica>> pending;
+  pending.reserve(spaces.size());
+  for (auto const& target : spaces) {
+    auto const& target_space = target.get();
+    auto const device_id     = target_space.get_device_id();
+    if (device_id == _set->source_device || _set->find(device_id)) { continue; }
+    try {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      auto const stream = target_space.acquire_stream();
+      auto const mr     = target_space.get_default_allocator();
+
+      std::size_t bytes = 0;
+      auto replica      = std::visit(
+        [&](auto const& source_set) {
+          if (!source_set) {
+            throw std::logic_error(
+              "[sirius_dynamic_in_list_filter] source replica has no persistent set.");
+          }
+          using owner_type = std::decay_t<decltype(source_set)>;
+          using key_type   = typename owner_type::element_type::key_type;
+
+          auto const capacity  = source_set->capacity();
+          auto destination_set = make_set<key_type>(capacity, mr, cuda::stream_ref{stream.value()});
+          if (destination_set->capacity() != capacity) {
+            throw std::runtime_error("destination static_set capacity changed during replication");
+          }
+          bytes             = capacity * sizeof(key_type);
+          auto result       = std::make_unique<set_replica>(device_id, std::move(destination_set));
+          auto& destination = *std::get<set_owner<key_type>>(result->set);
+          result->transfer =
+            detail::enqueue_replica_transfer(destination.data(),
+                                             rmm::cuda_device_id{device_id},
+                                             source_set->data(),
+                                             rmm::cuda_device_id{_set->source_device},
+                                             bytes,
+                                             stream);
+          return result;
+        },
+        source->set);
+      SIRIUS_LOG_DEBUG("[sirius_dynamic_in_list_filter] queued {}-byte replica GPU {} -> GPU {}.",
+                       bytes,
+                       _set->source_device,
+                       device_id);
+      pending.push_back(std::move(replica));
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
+        "That GPU will skip this optional filter.",
+        _set->source_device,
+        device_id,
+        e.what());
+    }
+  }
+
+  for (auto& replica : pending) {
+    auto const device_id = replica->device_id;
+    try {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      replica->transfer.wait();
+      _set->replicas.push_back(std::move(replica));
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_dynamic_in_list_filter] failed to finish replica on GPU {}: {}. "
+        "That GPU will skip this optional filter.",
+        device_id,
+        e.what());
+    }
+  }
+}
+
+bool sirius_dynamic_in_list_filter::is_available_on_device(int device_id) const noexcept
+{ return _set && _set->find(detail::resolve_dynamic_filter_device_id(device_id)) != nullptr; }
+
+std::size_t sirius_dynamic_in_list_filter::replica_count() const noexcept
+{ return _set ? _set->replicas.size() : 0; }
 
 std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   cudf::column_view const& probe,
+  int device_id,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
   if (probe.type() != _key_type) { return nullptr; }
+  auto const* replica =
+    _set ? _set->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
+  if (!replica) { return nullptr; }
 
   auto const n = probe.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
   auto* const outp = out->mutable_view().data<bool>();
 
-  if (_set->s32) {
-    auto const* d = probe.data<std::int32_t>();
-    auto ref      = _set->s32->ref(cuco::contains);
-    cub::DeviceFor::Bulk(
-      n, contains_or_sentinel<std::int32_t, decltype(ref)>{d, outp, ref}, stream.value());
-  } else {
-    auto const* d = probe.data<std::int64_t>();
-    auto ref      = _set->s64->ref(cuco::contains);
-    cub::DeviceFor::Bulk(
-      n, contains_or_sentinel<std::int64_t, decltype(ref)>{d, outp, ref}, stream.value());
-  }
+  std::visit(
+    [&](auto const& set) {
+      using owner_type = std::decay_t<decltype(set)>;
+      using key_type   = typename owner_type::element_type::key_type;
+      auto const* d    = probe.data<key_type>();
+      auto ref         = set->ref(cuco::contains);
+      cub::DeviceFor::Bulk(
+        n, contains_or_sentinel<key_type, decltype(ref)>{d, outp, ref}, stream.value());
+    },
+    replica->set);
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
   }
@@ -177,9 +343,10 @@ std::size_t sirius_dynamic_in_list_filter::size() const noexcept { return _num_k
 std::size_t sirius_dynamic_in_list_filter::estimated_set_bytes(std::size_t num_keys,
                                                                cudf::data_type key_type) noexcept
 {
-  std::size_t const slot = cudf::is_fixed_width(key_type)
-                             ? static_cast<std::size_t>(cudf::size_of(key_type))
-                             : sizeof(std::int64_t);  // variable-width keys hash to ~8B slots
+  std::size_t const slot =
+    cudf::is_fixed_width(key_type)
+      ? static_cast<std::size_t>(cudf::size_of(key_type))
+      : sizeof(std::int64_t);  // variable-width keys hash to ~8B slots [currently unreachable]
   return static_cast<std::size_t>(static_cast<double>(num_keys) * static_cast<double>(slot) /
                                   kLoadFactor);
 }

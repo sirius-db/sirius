@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "op/dynamic_filter_replica_space.hpp"
+
 // cudf
 #include <cudf/ast/ast_operator.hpp>
 #include <cudf/ast/expressions.hpp>
@@ -34,6 +36,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -70,6 +73,34 @@ class sirius_dynamic_filter {
 
   /// The kind of this filter.
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
+
+  /// True when this filter has a replica local to @p device_id. Consumers use this cheap guard
+  /// before lowering an AST; runtime-mask filters also validate the device in @ref compute_mask.
+  [[nodiscard]] virtual bool is_available_on_device(int /*device_id*/) const noexcept
+  {
+    return true;
+  }
+};
+
+/**
+ * @brief Producer-side capability for filters whose device-local representations must be
+ * materialized before publication.
+ *
+ * Replication is deliberately separate from @ref sirius_dynamic_filter: scan consumers only need
+ * filter semantics and availability, while the publisher alone owns this construction concern.
+ */
+class sirius_device_replicable {
+ public:
+  virtual ~sirius_device_replicable() = default;
+
+  /**
+   * @brief Materialize replicas in the supplied GPU memory spaces before publication.
+   *
+   * Each implementation borrows a stream and allocator from the same target space. The caller
+   * retains placement ownership; the completed replica retains only the allocator/stream views
+   * whose lifetime is governed by @ref dynamic_filter_replica_space.
+   */
+  virtual void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -95,10 +126,12 @@ class sirius_ast_lowerable {
    * @param tree        The consumer's AST tree; new nodes are emplaced into it.
    * @param column_ref  An AST expression naming or referencing the column this filter applies to,
    *                    already emplaced by the caller into @p tree.
+   * @param device_id   Device owning the consumer AST/scalars, or -1 for the current device.
    * @return            Reference to the fragment's root expression (BOOL), owned by @p tree.
    */
-  [[nodiscard]] virtual cudf::ast::expression const& to_ast(
-    cudf::ast::tree& tree, cudf::ast::expression const& column_ref) const = 0;
+  [[nodiscard]] virtual cudf::ast::expression const& to_ast(cudf::ast::tree& tree,
+                                                            cudf::ast::expression const& column_ref,
+                                                            int device_id = -1) const = 0;
 
   /**
    * @brief Construct a fresh AST tree containing only this filter's fragment.
@@ -143,7 +176,8 @@ struct zone_map_entry {
  * @throws std::invalid_argument if zones is empty or any zone has a null bound.
  */
 class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
-                                             public sirius_ast_lowerable {
+                                             public sirius_ast_lowerable,
+                                             public sirius_device_replicable {
  public:
   /**
    * @brief Construct a zone-map filter.
@@ -156,13 +190,19 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
                                           bool inclusive_min = true,
                                           bool inclusive_max = true);
 
+  ~sirius_dynamic_zone_map_filter() noexcept override;
+
   [[nodiscard]] sirius_dynamic_filter_kind kind() const override
   {
     return sirius_dynamic_filter_kind::ZONE_MAP;
   }
 
-  [[nodiscard]] cudf::ast::expression const& to_ast(
-    cudf::ast::tree& tree, cudf::ast::expression const& column_ref) const override;
+  [[nodiscard]] cudf::ast::expression const& to_ast(cudf::ast::tree& tree,
+                                                    cudf::ast::expression const& column_ref,
+                                                    int device_id = -1) const override;
+
+  void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t num_zones() const noexcept { return _zones.size(); }
   [[nodiscard]] std::vector<zone_map_entry> const& zones() const noexcept { return _zones; }
@@ -173,6 +213,10 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
   std::vector<zone_map_entry> _zones;
   bool _inclusive_min;
   bool _inclusive_max;
+  int _source_device = -1;
+
+  struct device_zones;
+  std::vector<std::unique_ptr<device_zones>> _replicas;
 };
 
 //===----------------------------------------------------------------------===//
@@ -194,6 +238,7 @@ class sirius_mask_applicable {
    * @brief Compute a BOOL8 keep-mask: @c true where @p probe's value passes this filter.
    *
    * @param probe  The materialized probe column to test (size == output rows).
+   * @param device_id Device owning @p probe and the selected filter replica.
    * @param stream Stream the work and result are ordered on.
    * @param mr     Allocator for the result.
    * @return A BOOL8 column of size @c probe.size() (true == keep the row), or @c nullptr if the
@@ -201,6 +246,7 @@ class sirius_mask_applicable {
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const = 0;
 };
@@ -219,7 +265,8 @@ class sirius_mask_applicable {
  *       probe set for sentinel values.
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
-                                            public sirius_mask_applicable {
+                                            public sirius_mask_applicable,
+                                            public sirius_device_replicable {
  public:
   /// @param keys   The build keys. The view only needs to remain valid for the constructor; the
   ///               filter eagerly builds its own persistent set and does not retain the view.
@@ -229,8 +276,8 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   /// @param mr     Device memory resource backing the structure.
   ///
   /// For supported keys (INT32 or INT64 with no nulls, the join-key common case) the constructor
-  /// builds a persistent @c cuco::static_set ONCE; every @ref compute_mask is then a single
-  /// read-only probe kernel.
+  /// builds a persistent @c cuco::static_set ; every @ref compute_mask is then a single read-only
+  /// probe kernel.
   sirius_dynamic_in_list_filter(cudf::column_view const& keys,
                                 rmm::cuda_stream_view stream,
                                 rmm::device_async_resource_ref mr);
@@ -244,8 +291,15 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
+
+  void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
+
+  /// Number of ready device-local replicas (exposed for focused multi-GPU tests/telemetry).
+  [[nodiscard]] std::size_t replica_count() const noexcept;
 
   /// Number of build keys backing the set.
   [[nodiscard]] std::size_t size() const noexcept;
@@ -285,7 +339,8 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
  * header stays compilable by the host toolchain; the definitions live in a @c .cu translation unit.
  */
 class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
-                                          public sirius_mask_applicable {
+                                          public sirius_mask_applicable,
+                                          public sirius_device_replicable {
  public:
   /// Build a Bloom filter over the build's join keys. @p keys must be of a @ref supports type.
   /// @throws std::invalid_argument if @c keys.type() is unsupported.
@@ -304,8 +359,15 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
+
+  void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
+
+  /// Number of ready device-local replicas (exposed for focused multi-GPU tests/telemetry).
+  [[nodiscard]] std::size_t replica_count() const noexcept;
 
   /// Whether a key/probe column of type @p t can back a Bloom filter (INT32 or INT64).
   [[nodiscard]] static bool supports(cudf::data_type t) noexcept;
@@ -390,7 +452,7 @@ class sirius_dynamic_filter_set {
   /// push_filter).
   void ignore_columns(std::vector<std::size_t> const& cols);
 
-  /// Install the consumer's column_ids → output-position translation applied by @ref push_filter.
+  /// Install the consumer's column_ids -> output-position translation applied by @ref push_filter.
   /// @p remap is indexed by column_ids position and yields the output-column position, or
   /// @c scan_plan::no_output_position for column_ids entries that produce no output. Typically the
   /// scan's @c scan_plan::output_position_by_column_id. Wiring-time setup — call before any

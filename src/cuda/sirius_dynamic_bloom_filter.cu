@@ -21,6 +21,9 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 
+// cucascade
+#include <rmm/cuda_device.hpp>
+
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuco/hash_functions.cuh>
@@ -28,12 +31,20 @@
 #include <cuda/std/cstddef>
 #include <cuda/stream_ref>
 
+#include <cucascade/memory/memory_space.hpp>
+#include <log/logging.hpp>
+#include <op/dynamic_filter_device.hpp>
+#include <op/dynamic_filter_replica_transfer.hpp>
 #include <op/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace sirius::op {
 
@@ -45,7 +56,7 @@ constexpr std::size_t kTargetBitsPerKey = 16;
 std::size_t blocks_for(std::size_t num_keys)
 {
   auto const bits   = std::max<std::size_t>(num_keys, 1) * kTargetBitsPerKey;
-  auto const blocks = (bits + kBitsPerBlock - 1) / kBitsPerBlock;
+  auto const blocks = cuda::ceil_div(bits, kBitsPerBlock);
   return std::max<std::size_t>(blocks, 1);
 }
 
@@ -61,43 +72,136 @@ using bloom_filter_for = cuco::
   bloom_filter<KeyT, cuco::extent<std::size_t>, cuda::thread_scope_device, Policy, bloom_alloc>;
 
 template <class KeyT>
-struct typed_bloom {
-  std::unique_ptr<bloom_filter_for<KeyT, arrow_policy<KeyT>>> arrow;
-  std::unique_ptr<bloom_filter_for<KeyT, default_policy<KeyT>>> standard;
+using arrow_bloom = bloom_filter_for<KeyT, arrow_policy<KeyT>>;
 
-  typed_bloom(std::size_t num_blocks, rmm::device_async_resource_ref mr, cuda::stream_ref stream)
-  {
-    if (num_blocks <= arrow_policy<KeyT>::max_filter_blocks) {
-      arrow.reset(new bloom_filter_for<KeyT, arrow_policy<KeyT>>{
-        cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
-    } else {
-      standard.reset(new bloom_filter_for<KeyT, default_policy<KeyT>>{
-        cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
-    }
-  }
+template <class KeyT>
+using standard_bloom = bloom_filter_for<KeyT, default_policy<KeyT>>;
 
-  template <class Fn>
-  void with(Fn&& fn)
-  {
-    if (arrow) {
-      fn(*arrow);
-    } else {
-      fn(*standard);
-    }
+template <class Filter>
+using bloom_owner = std::unique_ptr<Filter>;
+
+// The four legal key-width/policy combinations. A live replica owns exactly one alternative.
+using bloom_storage = std::variant<bloom_owner<arrow_bloom<std::int32_t>>,
+                                   bloom_owner<standard_bloom<std::int32_t>>,
+                                   bloom_owner<arrow_bloom<std::int64_t>>,
+                                   bloom_owner<standard_bloom<std::int64_t>>>;
+
+template <class Filter>
+bloom_owner<Filter> make_bloom(std::size_t num_blocks,
+                               rmm::device_async_resource_ref mr,
+                               cuda::stream_ref stream)
+{
+  return bloom_owner<Filter>(
+    new Filter{cuco::extent<std::size_t>{num_blocks}, {}, {}, bloom_alloc{mr}, stream});
+}
+
+template <class Filter>
+detail::replica_transfer copy_filter_storage(Filter const& source,
+                                             rmm::cuda_device_id source_device,
+                                             Filter& destination,
+                                             rmm::cuda_device_id destination_device,
+                                             rmm::cuda_stream_view stream,
+                                             std::size_t& bytes)
+{
+  auto const source_blocks = source.block_extent();
+  if (destination.block_extent() != source_blocks) {
+    throw std::runtime_error("destination Bloom block extent changed during replication");
   }
-};
+  bytes = source_blocks * Filter::words_per_block * sizeof(typename Filter::word_type);
+  return detail::enqueue_replica_transfer(
+    destination.data(), destination_device, source.data(), source_device, bytes, stream);
+}
+
+template <class Filter>
+bloom_owner<Filter> build_bloom(cudf::column_view const& keys,
+                                std::size_t num_blocks,
+                                rmm::device_async_resource_ref mr,
+                                cuda::stream_ref stream)
+{
+  using key_type = typename Filter::key_type;
+  auto result    = make_bloom<Filter>(num_blocks, mr, stream);
+  auto const* d  = keys.data<key_type>();
+  auto const n   = keys.size();
+  result->add_async(d, d + n, stream);
+  return result;
+}
+
+template <class KeyT>
+constexpr cudf::type_id key_type_id() noexcept
+{
+  static_assert(std::is_same_v<KeyT, std::int32_t> || std::is_same_v<KeyT, std::int64_t>);
+  if constexpr (std::is_same_v<KeyT, std::int32_t>) {
+    return cudf::type_id::INT32;
+  } else {
+    return cudf::type_id::INT64;
+  }
+}
 }  // namespace
 
-// Exactly one typed Bloom is populated, chosen by the key width.
+struct bloom_replica {
+  int device_id = -1;
+  bloom_storage bloom;
+  detail::replica_transfer transfer;
+
+  template <class Filter>
+  bloom_replica(int device_id, bloom_owner<Filter> owner)
+    : device_id{device_id}, bloom{std::in_place_type<bloom_owner<Filter>>, std::move(owner)}
+  {
+  }
+
+  ~bloom_replica() noexcept
+  {
+    if (device_id < 0) { return; }
+    try {
+      transfer.wait();
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      std::visit([](auto& owner) { owner.reset(); }, bloom);
+    } catch (...) {
+      // See set_replica: do not terminate or deallocate on an unknown current device.
+      std::visit([](auto& owner) { (void)owner.release(); }, bloom);
+    }
+  }
+
+  [[nodiscard]] bool has_bloom() const noexcept
+  {
+    return std::visit([](auto const& owner) { return owner != nullptr; }, bloom);
+  }
+};
+
+namespace {
+template <class KeyT>
+std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
+                                                   cudf::column_view const& keys,
+                                                   std::size_t num_blocks,
+                                                   rmm::device_async_resource_ref mr,
+                                                   cuda::stream_ref stream)
+{
+  if (num_blocks <= arrow_policy<KeyT>::max_filter_blocks) {
+    return std::make_unique<bloom_replica>(
+      device_id, build_bloom<arrow_bloom<KeyT>>(keys, num_blocks, mr, stream));
+  }
+  return std::make_unique<bloom_replica>(
+    device_id, build_bloom<standard_bloom<KeyT>>(keys, num_blocks, mr, stream));
+}
+}  // namespace
+
+// Owns the complete set of ready device-local Bloom replicas.
 struct sirius_dynamic_bloom_filter::impl {
-  std::unique_ptr<typed_bloom<std::int32_t>> b32;
-  std::unique_ptr<typed_bloom<std::int64_t>> b64;
+  int source_device = -1;
+  std::vector<std::unique_ptr<bloom_replica>> replicas;
+
+  [[nodiscard]] bloom_replica const* find(int device_id) const noexcept
+  {
+    auto const it =
+      std::find_if(replicas.begin(), replicas.end(), [device_id](auto const& replica) {
+        return replica->device_id == device_id;
+      });
+    return it == replicas.end() ? nullptr : it->get();
+  }
 };
 
 bool sirius_dynamic_bloom_filter::supports(cudf::data_type t) noexcept
-{
-  return t.id() == cudf::type_id::INT32 || t.id() == cudf::type_id::INT64;
-}
+{ return t.id() == cudf::type_id::INT32 || t.id() == cudf::type_id::INT64; }
 
 std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) noexcept
 {
@@ -113,59 +217,145 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     throw std::invalid_argument(
       "[sirius_dynamic_bloom_filter] unsupported key type (INT32 or INT64).");
   }
-  auto const n = static_cast<std::size_t>(keys.size());
+  auto const n = keys.size();
   cuda::stream_ref const s{stream.value()};
   auto const num_blocks = blocks_for(n);
   _impl                 = std::make_unique<impl>();
+  if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
+    throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
+  }
 
   // Insert every build key. Build keys are non-null (FK/PK); a null slot would only add a stray
   // fingerprint — a negligible false-positive bump, never a dropped match.
+  std::unique_ptr<bloom_replica> source;
   switch (keys.type().id()) {
-    case cudf::type_id::INT32: {
-      _impl->b32    = std::make_unique<typed_bloom<std::int32_t>>(num_blocks, mr, s);
-      auto const* d = keys.data<std::int32_t>();
-      _impl->b32->with([&](auto& f) { f.add(d, d + n, s); });
+    case cudf::type_id::INT32:
+      source = build_bloom_replica<std::int32_t>(_impl->source_device, keys, num_blocks, mr, s);
       break;
-    }
-    case cudf::type_id::INT64: {
-      _impl->b64    = std::make_unique<typed_bloom<std::int64_t>>(num_blocks, mr, s);
-      auto const* d = keys.data<std::int64_t>();
-      _impl->b64->with([&](auto& f) { f.add(d, d + n, s); });
+    case cudf::type_id::INT64:
+      source = build_bloom_replica<std::int64_t>(_impl->source_device, keys, num_blocks, mr, s);
       break;
-    }
-    default: break;  // unreachable: supports() gates the type
+    default:
+      throw std::logic_error(
+        "[sirius_dynamic_bloom_filter] supported key type changed during construction.");
   }
+  _impl->replicas.push_back(std::move(source));
 }
 
 sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter() = default;
 
+void sirius_dynamic_bloom_filter::replicate_to_devices(
+  std::span<dynamic_filter_replica_space const> spaces)
+{
+  if (!_impl || _impl->replicas.empty()) { return; }
+  auto const* source = _impl->find(_impl->source_device);
+  if (!source) { return; }
+
+  std::vector<std::unique_ptr<bloom_replica>> pending;
+  pending.reserve(spaces.size());
+  for (auto const& target : spaces) {
+    auto const& target_space = target.get();
+    auto const device_id     = target_space.get_device_id();
+    if (device_id == _impl->source_device || _impl->find(device_id)) { continue; }
+    try {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      auto const stream = target_space.acquire_stream();
+      auto const mr     = target_space.get_default_allocator();
+
+      std::size_t bytes = 0;
+      auto replica      = std::visit(
+        [&](auto const& source_bloom) {
+          if (!source_bloom) {
+            throw std::logic_error(
+              "[sirius_dynamic_bloom_filter] source replica has no Bloom filter.");
+          }
+          using owner_type  = std::decay_t<decltype(source_bloom)>;
+          using filter_type = typename owner_type::element_type;
+
+          auto destination_bloom = make_bloom<filter_type>(
+            source_bloom->block_extent(), mr, cuda::stream_ref{stream.value()});
+          auto result = std::make_unique<bloom_replica>(device_id, std::move(destination_bloom));
+          auto& destination = *std::get<bloom_owner<filter_type>>(result->bloom);
+          result->transfer  = copy_filter_storage(*source_bloom,
+                                                  rmm::cuda_device_id{_impl->source_device},
+                                                  destination,
+                                                  rmm::cuda_device_id{device_id},
+                                                  stream,
+                                                  bytes);
+          return result;
+        },
+        source->bloom);
+      SIRIUS_LOG_DEBUG("[sirius_dynamic_bloom_filter] queued {}-byte replica GPU {} -> GPU {}.",
+                       bytes,
+                       _impl->source_device,
+                       device_id);
+      pending.push_back(std::move(replica));
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
+        "That GPU will skip this optional filter.",
+        _impl->source_device,
+        device_id,
+        e.what());
+    }
+  }
+
+  for (auto& replica : pending) {
+    auto const device_id = replica->device_id;
+    try {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      replica->transfer.wait();
+      _impl->replicas.push_back(std::move(replica));
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_dynamic_bloom_filter] failed to finish replica on GPU {}: {}. "
+        "That GPU will skip this optional filter.",
+        device_id,
+        e.what());
+    }
+  }
+}
+
+bool sirius_dynamic_bloom_filter::is_available_on_device(int device_id) const noexcept
+{ return _impl && _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) != nullptr; }
+
+std::size_t sirius_dynamic_bloom_filter::replica_count() const noexcept
+{ return _impl ? _impl->replicas.size() : 0; }
+
 std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   cudf::column_view const& probe,
+  int device_id,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
   if (!supports(probe.type())) { return nullptr; }
+  auto const* replica =
+    _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
+  if (!replica || !replica->has_bloom()) { return nullptr; }
+
+  auto const matching_key_type = std::visit(
+    [&](auto const& bloom) {
+      using owner_type = std::decay_t<decltype(bloom)>;
+      using key_type   = typename owner_type::element_type::key_type;
+      return probe.type().id() == key_type_id<key_type>();
+    },
+    replica->bloom);
+  if (!matching_key_type) { return nullptr; }
+
   auto const n = probe.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
   cuda::stream_ref const s{stream.value()};
   auto* const outp = out->mutable_view().data<bool>();
 
-  switch (probe.type().id()) {
-    case cudf::type_id::INT32: {
-      if (!_impl->b32) { return nullptr; }
-      auto const* d = probe.data<std::int32_t>();
-      _impl->b32->with([&](auto& f) { f.contains(d, d + n, outp, s); });
-      break;
-    }
-    case cudf::type_id::INT64: {
-      if (!_impl->b64) { return nullptr; }
-      auto const* d = probe.data<std::int64_t>();
-      _impl->b64->with([&](auto& f) { f.contains(d, d + n, outp, s); });
-      break;
-    }
-    default: return nullptr;
-  }
+  std::visit(
+    [&](auto const& bloom) {
+      using owner_type = std::decay_t<decltype(bloom)>;
+      using key_type   = typename owner_type::element_type::key_type;
+      auto const* d    = probe.data<key_type>();
+      bloom->contains_async(d, d + n, outp, s);
+    },
+    replica->bloom);
 
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());

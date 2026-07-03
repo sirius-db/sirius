@@ -649,14 +649,18 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
       _sirius_dynamic_filters->has_filters()) {
     if (ast_expression) {
-      reader_filter_root = merge_dynamic_filters_into_ast(
-        ast_expression->tree, reader_filter_root, *_sirius_dynamic_filters, *split.plan);
+      reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
+                                                          reader_filter_root,
+                                                          *_sirius_dynamic_filters,
+                                                          *split.plan,
+                                                          mem_space.get_device_id());
     } else {
       dynamic_ast_expression.emplace();
       reader_filter_root = merge_dynamic_filters_into_ast(dynamic_ast_expression->tree,
                                                           /*existing_root=*/nullptr,
                                                           *_sirius_dynamic_filters,
-                                                          *split.plan);
+                                                          *split.plan,
+                                                          mem_space.get_device_id());
       if (!reader_filter_root) { dynamic_ast_expression.reset(); }
     }
   }

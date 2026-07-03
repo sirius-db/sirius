@@ -38,9 +38,12 @@
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_dynamic_filter.hpp>
 
+#include <barrier>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 using sirius::op::sirius_dynamic_filter;
@@ -742,6 +745,36 @@ TEST_CASE("dynamic_filter_gate disables after an unselective first split",
   REQUIRE(second == nullptr);  // gated out — no work
 }
 
+TEST_CASE("dynamic_filter_gate ignores a device with no local replica",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, make_in_list_prefix(2, stream));
+  auto table = make_int64_sequence_table(10, stream);
+
+  // The filter has only its current-device source replica. A consumer device with no local copy
+  // must skip without recording a synthetic 100% keep ratio in the scan-global gate.
+  auto unavailable = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(),
+    filters,
+    gate,
+    stream,
+    dynamic_filter_apply_mode::include_ast_row_masks,
+    /*device_id=*/12345);
+  REQUIRE(unavailable == nullptr);
+  REQUIRE(gate.applicable(filters));
+
+  auto local = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(local != nullptr);
+  REQUIRE(local->num_rows() == 2);
+  REQUIRE(gate.applicable(filters));
+}
+
 TEST_CASE("dynamic_filter_gate re-arms when a filter publishes after the disable decision",
           "[dynamic_filter][scan_merge]")
 {
@@ -792,6 +825,65 @@ TEST_CASE("dynamic_filter_gate stays active once a selective split proves the fi
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 2);      // cascade of both filters == their conjunction
   REQUIRE(gate.applicable(filters));  // still active
+}
+
+TEST_CASE("dynamic_filter_gate serializes concurrent stale and re-armed decisions",
+          "[dynamic_filter][scan_merge][concurrent]")
+{
+  // Model tasks that started on the old one-filter generation and finish alongside selective tasks
+  // that observed the newly-published second filter. Once any current-generation task commits
+  // ACTIVE, stale completions must not overwrite it with DISABLED.
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, std::make_shared<stub_runtime_only_filter>());
+  filters.push_filter(0, std::make_shared<stub_runtime_only_filter>());
+
+  constexpr std::size_t rounds          = 256;
+  constexpr std::size_t stale_workers   = 6;
+  constexpr std::size_t current_workers = 2;
+  constexpr std::size_t total_workers   = stale_workers + current_workers;
+  std::vector<std::unique_ptr<sirius::op::scan::dynamic_filter_gate>> gates;
+  gates.reserve(rounds);
+  for (std::size_t i = 0; i < rounds; ++i) {
+    gates.push_back(std::make_unique<sirius::op::scan::dynamic_filter_gate>());
+  }
+
+  std::barrier phase{static_cast<std::ptrdiff_t>(total_workers + 1)};
+  std::vector<std::thread> workers;
+  workers.reserve(total_workers);
+  auto record_all = [&](bool current_generation) {
+    for (auto const& gate : gates) {
+      phase.arrive_and_wait();
+      gate->record_keep_ratio(/*rows_before=*/100,
+                              /*rows_after=*/current_generation ? 10 : 100,
+                              /*observed_filter_count=*/current_generation ? 2 : 1);
+      phase.arrive_and_wait();
+    }
+  };
+  for (std::size_t i = 0; i < stale_workers; ++i) {
+    workers.emplace_back(record_all, false);
+  }
+  for (std::size_t i = 0; i < current_workers; ++i) {
+    workers.emplace_back(record_all, true);
+  }
+
+  bool all_stayed_active = true;
+  for (auto const& gate : gates) {
+    phase.arrive_and_wait();
+    phase.arrive_and_wait();
+
+    // If a stale completion overwrote ACTIVE with the old generation's DISABLED decision, this
+    // current-generation unselective result seals DISABLED and makes applicable() false. With the
+    // serialized transition, ACTIVE is terminal and this call is a no-op.
+    gate->record_keep_ratio(/*rows_before=*/100,
+                            /*rows_after=*/100,
+                            /*observed_filter_count=*/2);
+    all_stayed_active = all_stayed_active && gate->applicable(filters);
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+
+  REQUIRE(all_stayed_active);
 }
 
 TEST_CASE("cascaded membership filters produce the conjunction of all filters",
