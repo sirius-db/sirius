@@ -110,7 +110,8 @@ std::unique_ptr<cudf::table> compute_vss_top_k(
                       : raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
                           static_cast<float const*>(local_query.data()), int64_t{1}, pattern.dim);
 
-  auto knn = sirius::vss::brute_force_knn(dataset_view, query_view, keep, pattern.metric);
+  auto knn = sirius::vss::brute_force_knn(
+    dataset_view, query_view, keep, pattern.metric, stream, memory_resource);
 
   auto gathered = cudf::gather(
     input, knn.neighbors->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, memory_resource);
