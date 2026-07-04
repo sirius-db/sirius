@@ -267,6 +267,7 @@ struct sirius_memory_limits {
   std::optional<bool> enable_prefetch_cache;
   std::optional<std::size_t> rest_n_reactors;
   std::optional<std::size_t> rest_max_connections;
+  std::optional<bool> use_sirius_datasource;
   bool rest_perf_instrumentation{false};
 };
 
@@ -339,6 +340,10 @@ class sirius_config_env_guard {
            "    scan_manager:\n";
     if (limits.enable_prefetch_cache.has_value()) {
       out << "      enable_prefetch_cache: " << (*limits.enable_prefetch_cache ? "true" : "false")
+          << "\n";
+    }
+    if (limits.use_sirius_datasource.has_value()) {
+      out << "      use_sirius_datasource: " << (*limits.use_sirius_datasource ? "true" : "false")
           << "\n";
     }
     if (limits.rest_n_reactors.has_value()) {
@@ -457,6 +462,14 @@ std::string gpu_execution_sql(std::string const& inner_sql)
     escaped.push_back(c);
   }
   return "SELECT * FROM gpu_execution('" + escaped + "')";
+}
+
+void set_gpu_execution(duckdb::Connection& con, bool enabled)
+{
+  auto result = con.Query(std::string{"SET gpu_execution = "} + (enabled ? "true" : "false"));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
 }
 
 std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
@@ -1506,6 +1519,21 @@ void compare_s3_gpu_to_local_cpu(s3_sql_fixture& fixture,
   check_rows_equal_with_tolerant_columns(*s3_result, *local_result, tolerant_columns);
 }
 
+void compare_transparent_s3_gpu_to_local_cpu(
+  s3_sql_fixture& fixture,
+  std::string const& s3_query,
+  std::string const& local_query,
+  std::vector<duckdb::idx_t> const& tolerant_columns = {})
+{
+  auto s3_result = require_query_ok(fixture.con, s3_query);
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto local_result = require_query_ok(baseline_con, local_query);
+
+  check_rows_equal_with_tolerant_columns(*s3_result, *local_result, tolerant_columns);
+}
+
 }  // namespace
 
 TEST_CASE("internal sirius_read_parquet is registered as a one-argument table function",
@@ -1913,6 +1941,47 @@ TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
   }
 }
 
+TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
+          "[s3][integration][sql][gpu_execution][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto& rest     = require_rest_ioctx(fixture, uri);
+  CHECK(rest.type() == sirius::io::io_context_type::restful);
+
+  auto const s3_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
+                        s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
+                           local_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent read_parquet over S3 keeps REST routing when local Sirius datasource is off",
+          "[s3][integration][sql][gpu_execution][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.use_sirius_datasource = false;
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto& rest     = require_rest_ioctx(fixture, uri);
+  CHECK(rest.type() == sirius::io::io_context_type::restful);
+
+  auto result =
+    require_query_ok(fixture.con, "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")");
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
 TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
           "[s3][integration][sql][gpu_execution]")
 {
@@ -1988,16 +2057,17 @@ TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
                               {1});
 }
 
-TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
-          "[s3][integration][sql][gpu_execution][fallback]")
+TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
+          "[s3][integration][sql][gpu_execution][fallback][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
   s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
   auto const s3_query = "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn FROM " +
                         s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
-  auto result = fixture.con.Query(gpu_execution_sql(s3_query));
+  auto result = fixture.con.Query(s3_query);
   REQUIRE(result);
   REQUIRE(result->HasError());
   auto const error = result->GetError();
@@ -2009,20 +2079,52 @@ TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
   CHECK(error.find("no filesystem") == std::string::npos);
 }
 
-TEST_CASE("plain DuckDB read_parquet over s3 is not the Sirius SQL surface",
-          "[s3][integration][sql][gpu_execution]")
+TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU",
+          "[s3][integration][sql][gpu_execution][fallback][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
   s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  REQUIRE_FALSE(fixture.con
+                  .Query("CREATE VIEW v_s3_nation AS "
+                         "SELECT n_nationkey FROM " +
+                         s3_parquet_scan(*env, "nation"))
+                  ->HasError());
+
+  auto result = fixture.con.Query(
+    "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
+    "FROM v_s3_nation ORDER BY n_nationkey");
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  auto const error = result->GetError();
+  INFO(error);
+  CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK((error.find("window") != std::string::npos || error.find("Window") != std::string::npos ||
+         error.find("WINDOW") != std::string::npos));
+  CHECK(error.find("No filesystem") == std::string::npos);
+  CHECK(error.find("no filesystem") == std::string::npos);
+}
+
+TEST_CASE("S3 read_parquet is rejected when transparent GPU execution is disabled",
+          "[s3][integration][sql][gpu_execution][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, false);
   auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
   auto result    = fixture.con.Query("SELECT count(*) FROM read_parquet('" + uri + "')");
   REQUIRE(result);
   REQUIRE(result->HasError());
   auto const error = result->GetError();
   INFO(error);
-  CHECK((error.find("s3") != std::string::npos || error.find("S3") != std::string::npos));
+  CHECK(error.find("S3 is GPU-only") != std::string::npos);
+  CHECK(error.find("SET gpu_execution=true") != std::string::npos);
+  CHECK(error.find("No filesystem") == std::string::npos);
+  CHECK(error.find("no filesystem") == std::string::npos);
 }
 
 TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for cardinality",

@@ -216,6 +216,7 @@ set(EXTENSION_SOURCES
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
     src/io/s3/sigv4.cpp
+    src/io/s3/sirius_httpfs.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
@@ -553,6 +554,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
+    test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_parquet_helpers.cpp
