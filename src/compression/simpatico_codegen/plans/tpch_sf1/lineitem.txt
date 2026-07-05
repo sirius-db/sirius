@@ -1,0 +1,147 @@
+# column: 0  dtype: i64  ratio: 3.765x  depth: 5
+# comp: 5.29 GB/s  decomp: 106.58 GB/s
+input -> rle -> runs, values
+rle.values -> delta -> differences
+rle.values.differences -> lz4
+rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+rle.runs.chunk_min -> rle -> runs, values
+
+---
+# column: 1  dtype: i64  ratio: 3.531x  depth: 5
+# comp: 45.13 GB/s  decomp: 112.99 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_count -> rle -> runs, values
+bitpack.chunk_min.packed -> deflate
+bitpack.chunk_bits -> lz4
+
+---
+# column: 2  dtype: i64  ratio: 4.534x  depth: 5
+# comp: 56.18 GB/s  decomp: 133.98 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_count -> rle -> runs, values
+bitpack.chunk_bits -> lz4
+bitpack.chunk_min.packed -> deflate
+
+---
+# column: 3  dtype: i64  ratio: 13.673x  depth: 5
+# comp: 3.93 GB/s  decomp: 28.70 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_min -> rle -> runs, values
+bitpack.chunk_bits -> lz4
+bitpack.packed -> deflate
+bitpack.chunk_count -> rle -> runs, values
+
+---
+# column: 4  dtype: i64  ratio: 5.305x  depth: 5
+# comp: 10.00 GB/s  decomp: 28.09 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_count -> rle -> runs, values
+bitpack.packed -> deflate
+bitpack.chunk_min -> rle -> runs, values
+bitpack.chunk_bits -> lz4
+
+---
+# column: 5  dtype: f64  ratio: 1.126x  depth: 5
+# comp: 1.10 GB/s  decomp: 13.01 GB/s
+input -> alp -> integers, exceptions, exception_positions, metadata
+alp.integers -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+alp.exception_positions -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+alp.exceptions -> deflate
+alp.integers.packed -> deflate
+
+---
+# column: 6  dtype: f64  ratio: 8.413x  depth: 5
+# comp: 1.56 GB/s  decomp: 28.45 GB/s
+input -> alp -> integers, exceptions, exception_positions, metadata
+alp.integers -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+alp.integers.chunk_count -> rle -> runs, values
+alp.integers.chunk_min -> rle -> runs, values
+alp.integers.packed -> deflate
+
+---
+# column: 7  dtype: f64  ratio: 8.716x  depth: 5
+# comp: 1.57 GB/s  decomp: 28.52 GB/s
+input -> alp -> integers, exceptions, exception_positions, metadata
+alp.integers -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+alp.integers.chunk_count -> rle -> runs, values
+alp.integers.packed -> deflate
+alp.integers.chunk_min -> rle -> runs, values
+
+---
+# column: 8  dtype: str  ratio: 11.943x  depth: 5
+# comp: 3.49 GB/s  decomp: 12.54 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_min -> rle -> runs, values
+dictionary.indices.packed -> deflate
+dictionary.indices.chunk_count -> rle -> runs, values
+
+---
+# column: 9  dtype: str  ratio: 23.197x  depth: 5
+# comp: 3.87 GB/s  decomp: 12.75 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_min -> rle -> runs, values
+dictionary.indices.chunk_count -> rle -> runs, values
+dictionary.indices.packed -> deflate
+
+---
+# column: 10  dtype: str  ratio: 4.657x  depth: 5
+# comp: 10.88 GB/s  decomp: 36.19 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.packed -> deflate
+dictionary.indices.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_count -> rle -> runs, values
+
+---
+# column: 11  dtype: str  ratio: 4.659x  depth: 5
+# comp: 10.99 GB/s  decomp: 35.82 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_count -> rle -> runs, values
+dictionary.indices.packed -> deflate
+
+---
+# column: 12  dtype: str  ratio: 4.657x  depth: 5
+# comp: 10.87 GB/s  decomp: 36.17 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.packed -> deflate
+dictionary.indices.chunk_count -> rle -> runs, values
+dictionary.indices.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: 13  dtype: str  ratio: 61.806x  depth: 5
+# comp: 53.68 GB/s  decomp: 102.44 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_count -> rle -> runs, values
+dictionary.indices.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_bits -> lz4
+
+---
+# column: 14  dtype: str  ratio: 9.553x  depth: 5
+# comp: 8.70 GB/s  decomp: 23.87 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> zigzag -> zigzag
+dictionary.indices.zigzag -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.zigzag.packed -> deflate
+dictionary.indices.zigzag.chunk_count -> bitcomp
+
+---
+# column: 15  dtype: str  ratio: 2.917x  depth: 5
+# comp: 5.16 GB/s  decomp: 70.03 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.keys_offsets -> delta -> differences
+dictionary.keys_chars -> snappy
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.keys_offsets.differences -> ans
+
+---
+# column: 16  dtype: i8  ratio: 451.763x  depth: 1
+# comp: 92.57 GB/s  decomp: 119.68 GB/s
+input -> bitcomp

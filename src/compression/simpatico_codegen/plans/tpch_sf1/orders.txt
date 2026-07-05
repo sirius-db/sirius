@@ -1,0 +1,80 @@
+# column: 0  dtype: i64  ratio: 10.337x  depth: 5
+# comp: 16.44 GB/s  decomp: 75.71 GB/s
+input -> zigzag -> zigzag
+zigzag.zigzag -> delta -> differences
+zigzag.zigzag.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+zigzag.zigzag.differences.packed -> lz4
+zigzag.zigzag.differences.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: 1  dtype: i64  ratio: 3.533x  depth: 5
+# comp: 24.89 GB/s  decomp: 56.75 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_count -> rle -> runs, values
+bitpack.chunk_bits -> lz4
+bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_min.chunk_min -> rle -> runs, values
+
+---
+# column: 2  dtype: str  ratio: 12.171x  depth: 5
+# comp: 0.97 GB/s  decomp: 3.41 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.packed -> deflate
+dictionary.indices.chunk_count -> rle -> runs, values
+dictionary.indices.chunk_min -> rle -> runs, values
+
+---
+# column: 3  dtype: f64  ratio: 1.012x  depth: 5
+# comp: 0.74 GB/s  decomp: 7.02 GB/s
+input -> alp -> integers, exceptions, exception_positions, metadata
+alp.exceptions -> deflate
+alp.integers -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+alp.exception_positions -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+alp.integers.packed -> ans
+
+---
+# column: 4  dtype: str  ratio: 4.650x  depth: 5
+# comp: 2.46 GB/s  decomp: 10.52 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_count -> rle -> runs, values
+dictionary.keys_chars -> snappy
+dictionary.indices.packed -> deflate
+
+---
+# column: 5  dtype: str  ratio: 15.321x  depth: 5
+# comp: 3.13 GB/s  decomp: 9.13 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> zigzag -> zigzag
+dictionary.indices.zigzag -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.zigzag.packed -> deflate
+dictionary.indices.zigzag.chunk_min -> bitcomp
+
+---
+# column: 6  dtype: str  ratio: 15.034x  depth: 5
+# comp: 8.52 GB/s  decomp: 42.37 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_count -> rle -> runs, values
+dictionary.keys_chars -> deflate
+
+---
+# column: 7  dtype: i64  ratio: 167.110x  depth: 5
+# comp: 40.24 GB/s  decomp: 170.61 GB/s
+input -> zigzag -> zigzag
+zigzag.zigzag -> rle -> runs, values
+zigzag.zigzag.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+zigzag.zigzag.values -> rle -> runs, values
+zigzag.zigzag.values.values -> rle -> runs, values
+
+---
+# column: 8  dtype: str  ratio: 1.000x  depth: 0
+# comp: 1051.51 GB/s  decomp: 1654.29 GB/s
+input -> identity
+
+---
+# column: 9  dtype: i8  ratio: 443.262x  depth: 1
+# comp: 25.03 GB/s  decomp: 30.42 GB/s
+input -> bitcomp

@@ -1,0 +1,80 @@
+# column: 0  dtype: i64  ratio: 379.417x  depth: 5
+# comp: 6.09 GB/s  decomp: 11.53 GB/s
+input -> zigzag -> zigzag
+zigzag.zigzag -> delta -> differences
+zigzag.zigzag.differences -> rle -> runs, values
+zigzag.zigzag.differences.runs -> bitcomp
+zigzag.zigzag.differences.values -> lz4
+
+---
+# column: 1  dtype: str  ratio: 1.000x  depth: 0
+# comp: 159.95 GB/s  decomp: 317.70 GB/s
+input -> identity
+
+---
+# column: 2  dtype: str  ratio: 22.210x  depth: 5
+# comp: 0.64 GB/s  decomp: 1.87 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> zigzag -> zigzag
+dictionary.indices.zigzag -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.zigzag.packed -> deflate
+dictionary.indices.zigzag.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: 3  dtype: str  ratio: 9.564x  depth: 5
+# comp: 0.45 GB/s  decomp: 1.28 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.packed -> deflate
+dictionary.indices.chunk_count -> rle -> runs, values
+
+---
+# column: 4  dtype: str  ratio: 12.728x  depth: 5
+# comp: 0.86 GB/s  decomp: 2.60 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.keys_chars -> snappy
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_count -> rle -> runs, values
+dictionary.indices.packed -> deflate
+
+---
+# column: 5  dtype: i64  ratio: 5.298x  depth: 5
+# comp: 0.34 GB/s  decomp: 0.94 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_count -> rle -> runs, values
+bitpack.chunk_bits -> lz4
+bitpack.chunk_min -> rle -> runs, values
+bitpack.packed -> deflate
+
+---
+# column: 6  dtype: str  ratio: 7.796x  depth: 5
+# comp: 0.44 GB/s  decomp: 1.25 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices.chunk_min -> rle -> runs, values
+dictionary.indices.packed -> deflate
+dictionary.indices.chunk_count -> rle -> runs, values
+
+---
+# column: 7  dtype: f64  ratio: 100.851x  depth: 5
+# comp: 1.59 GB/s  decomp: 8.24 GB/s
+input -> zigzag -> zigzag
+zigzag.zigzag -> delta -> differences
+zigzag.zigzag.differences -> rle -> runs, values
+zigzag.zigzag.differences.values -> lz4
+zigzag.zigzag.differences.runs -> bitcomp
+
+---
+# column: 8  dtype: str  ratio: 2.491x  depth: 5
+# comp: 0.40 GB/s  decomp: 7.62 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.keys_offsets -> delta -> differences
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.keys_chars -> snappy
+dictionary.keys_offsets.differences -> ans
+
+---
+# column: 9  dtype: i8  ratio: 354.610x  depth: 1
+# comp: 3.32 GB/s  decomp: 3.93 GB/s
+input -> bitcomp

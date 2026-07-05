@@ -1,0 +1,43 @@
+# column: 0  dtype: i64  ratio: 29.421x  depth: 5
+# comp: 9.21 GB/s  decomp: 40.68 GB/s
+input -> zigzag -> zigzag
+zigzag.zigzag -> delta -> differences
+zigzag.zigzag.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+zigzag.zigzag.differences.packed -> lz4
+zigzag.zigzag.differences.chunk_min -> bitcomp
+
+---
+# column: 1  dtype: i64  ratio: 4.485x  depth: 5
+# comp: 7.93 GB/s  decomp: 32.19 GB/s
+input -> delta -> differences
+delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+delta.differences.packed -> lz4
+delta.differences.chunk_count -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+delta.differences.chunk_min -> bitcomp
+
+---
+# column: 2  dtype: i64  ratio: 4.536x  depth: 4
+# comp: 17.29 GB/s  decomp: 37.50 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+bitpack.chunk_count -> rle -> runs, values
+bitpack.chunk_bits -> lz4
+bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: 3  dtype: f64  ratio: 1.430x  depth: 5
+# comp: 0.48 GB/s  decomp: 4.41 GB/s
+input -> alp -> integers, exceptions, exception_positions, metadata
+alp.integers -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+alp.exceptions -> deflate
+alp.exception_positions -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+alp.integers.packed -> ans
+
+---
+# column: 4  dtype: str  ratio: 1.000x  depth: 0
+# comp: 1287.48 GB/s  decomp: 1891.15 GB/s
+input -> identity
+
+---
+# column: 5  dtype: i8  ratio: 427.350x  depth: 1
+# comp: 14.20 GB/s  decomp: 15.88 GB/s
+input -> bitcomp
