@@ -16,7 +16,6 @@
 // share the bitjoin/column-copy helpers and reconstruct_representation.
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
-#include "codegen/plan/column_copy.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
@@ -36,8 +35,8 @@
 
 // The C++-native JIT codegen encode entry points (``jit_encode_subtree``,
 // ``extract_fusable_subtree``) are declared in codegen_bridge.hpp above.
-// make_compressor (operator_registry.hpp), the bitjoin_layout helpers, and
-// copy_column_view{,_as_uint8} (column_copy.hpp) are shared with decode.
+// make_compressor (operator_registry.hpp), and the bitjoin_layout /
+// copy_column_view{,_as_uint8} helpers (bitjoin_layout.hpp) are shared with decode.
 
 namespace simpatico {
 namespace {
@@ -73,6 +72,47 @@ void place_rep_on_node(PlanTree& tree,
   tree.nodes[owner].channels.emplace(path, std::move(rep));
 }
 
+// Returns the DSL output path for `name` on `node` (output_paths[i] where
+// output_names[i] == name), or nullptr if `node` has no such output. Mirror of
+// decode's port_for_output_path (plan/decompress.cpp), which does the inverse
+// lookup.
+std::string const* output_path_for_name(PlanNode const& node, std::string const& name)
+{
+  for (std::size_t i = 0; i < node.output_names.size(); ++i) {
+    if (node.output_names[i] == name) return &node.output_paths[i];
+  }
+  return nullptr;
+}
+
+// Move each NodeId-keyed leaf rep produced by a jit_encode_subtree() call onto
+// its owning PlanTree node.
+void place_fused_leaves(PlanTree& tree, plan_compound_builder& builder)
+{
+  for (auto& [nodeid, rep] : builder.leaves) {
+    auto& nd    = tree.nodes[nodeid];
+    nd.rep      = std::move(rep);
+    nd.rep_path = nd.input_path;
+    nd.meta     = nd.rep->describe_meta();
+  }
+}
+
+// Dictionary keys_chars must round-trip as raw UINT8 bytes (see
+// representation_factory.cpp), so an identity leaf backing that path needs a
+// type-converting copy; every other path takes a plain same-type copy.
+bool is_keys_chars_path(std::string const& path)
+{
+  return path.find("keys_chars") != std::string::npos;
+}
+
+std::unique_ptr<cudf::column> copy_identity_leaf(cudf::column_view const& view,
+                                                 std::string const& path,
+                                                 rmm::cuda_stream_view stream,
+                                                 rmm::device_async_resource_ref mr)
+{
+  return is_keys_chars_path(path) ? copy_column_view_as_uint8(view, stream, mr)
+                                  : copy_column_view(view, stream, mr);
+}
+
 // Forward, pre-order recursion over the PlanTree keyed by column path. The
 // structural mirror of decode_node (which is post-order): given a path whose
 // column view is live in `columns`, find the node consuming it and run that op,
@@ -100,7 +140,6 @@ struct CompressWalk {
   std::vector<bool>& visited;
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
-  std::string const& canon_plan_dsl;
   std::string* error_out;
   bool failed = false;
 
@@ -250,13 +289,7 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
   std::string jit_err;
   CodegenHead head;
   if (!jit_encode_subtree(tree, n, col, stream, mr, builder, &jit_err, &head)) { return false; }
-  // Place NodeId-keyed reps directly onto their owning nodes.
-  for (auto& [nodeid, rep] : builder.leaves) {
-    auto& nd    = tree.nodes[nodeid];
-    nd.rep      = std::move(rep);
-    nd.rep_path = nd.input_path;
-    nd.meta     = nd.rep->describe_meta();
-  }
+  place_fused_leaves(tree, builder);
 
   // Build covered set early so the raw-passthrough loop can use it.
   std::unordered_set<NodeId> const covered(head.covered_nodes.begin(), head.covered_nodes.end());
@@ -275,15 +308,10 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
   //
   // When no downstream consumer exists (terminal): park the whole RawFused.
   for (auto& leaf : builder.raw_passthrough_leaves) {
-    auto& parent_nd = tree.nodes[leaf.parent_id];
-    std::string channel_output_path;
-    for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
-      if (parent_nd.output_names[i] == leaf.channel_name) {
-        channel_output_path = parent_nd.output_paths[i];
-        break;
-      }
-    }
-    if (channel_output_path.empty()) continue;  // shouldn't happen
+    auto& parent_nd    = tree.nodes[leaf.parent_id];
+    auto const* path_p = output_path_for_name(parent_nd, leaf.channel_name);
+    if (!path_p) continue;  // shouldn't happen
+    std::string const channel_output_path = *path_p;
 
     auto cit                  = consumer_by_input.find(channel_output_path);
     bool const has_downstream = (cit != consumer_by_input.end() && !covered.count(cit->second));
@@ -346,7 +374,7 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
         set_error("fused boundary: missing rep at node " + std::to_string(cn));
         return true;
       }
-      auto chans                    = rep->named_channels();
+      auto chans                    = rep->named_channels(stream);
       cudf::column_view const* view = nullptr;
       for (auto const& c : chans) {
         if (c.name == cnode.output_names[k]) {
@@ -385,7 +413,7 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   // For identity compressor on keys_chars, convert to UINT8 first.
   cudf::column_view col_to_compress = col;
   std::unique_ptr<cudf::column> temp_col;
-  if (node.op == "identity" && path.find("keys_chars") != std::string::npos) {
+  if (node.op == "identity" && is_keys_chars_path(path)) {
     temp_col = copy_column_view_as_uint8(col, stream, mr);
     if (!temp_col) {
       set_error("failed to convert keys_chars to UINT8");
@@ -415,7 +443,7 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
     return;
   }
 
-  auto outputs = repr->named_channels();
+  auto outputs = repr->named_channels(stream);
   std::unordered_map<std::string, cudf::column_view> output_by_name;
   output_by_name.reserve(outputs.size());
   for (auto const& output : outputs)
@@ -437,12 +465,7 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
     if (!consumer_by_input.count(output_path)) {
       // Terminal leaf — copy the channel into an identity leaf (reps stay whole
       // on the PlanTree; no release_output destructuring).
-      std::unique_ptr<cudf::column> leaf_col;
-      if (output_path.find("keys_chars") != std::string::npos) {
-        leaf_col = copy_column_view_as_uint8(out_it->second, stream, mr);
-      } else {
-        leaf_col = copy_column_view(out_it->second, stream, mr);
-      }
+      auto leaf_col = copy_identity_leaf(out_it->second, output_path, stream, mr);
       if (!leaf_col) {
         set_error("failed to get column for identity leaf '" + output_path + "'");
         return;
@@ -493,10 +516,7 @@ std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
     if (error_out) *error_out = parse_error;
     return nullptr;
   }
-  std::string canon_plan_dsl = render_plan_steps(steps);
-
-  auto compound      = std::make_unique<plan_compound>();
-  compound->plan_dsl = canon_plan_dsl;
+  auto compound = std::make_unique<plan_compound>();
   PlanPathMap path_map;
   {
     std::string tree_err;
@@ -520,106 +540,19 @@ std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
     }
   }
 
-  // Fast path: the whole plan fuses from "input" into one JIT kernel.  The
-  // head op is the consumer of "input"; if jit_encode_subtree succeeds AND
-  // every raw-passthrough channel is terminal (no downstream non-fused op), the
-  // compound is complete and we return early.  If any raw-passthrough channel
-  // has a downstream consumer (entropy-tail routing needed), the fast path is
-  // skipped so the general CompressWalk can handle it via emit_fused_node.
-  auto head_it = consumer_by_input.find("input");
-  if (head_it != consumer_by_input.end()) {
-    // Pre-check: inspect the fused region structure without running the GPU
-    // kernel.  If any Raw leaf has a downstream consumer, skip the fast path.
-    bool fast_path_ok = true;
-    {
-      auto maybe_built = build_fused_tree(tree,
-                                          head_it->second,
-                                          /*fixed_stride=*/true);
-      if (maybe_built) {
-        // Bail if any Raw passthrough leaf has a downstream consumer
-        // (entropy-tail routing needed — general walk handles it).
-        for (auto const& origin : maybe_built->preorder) {
-          if (!origin.is_raw_passthrough || origin.parent_channel.empty()) continue;
-          auto const& parent_nd = tree.nodes[origin.parent_rle];
-          for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
-            if (parent_nd.output_names[i] == origin.parent_channel) {
-              if (consumer_by_input.count(parent_nd.output_paths[i])) { fast_path_ok = false; }
-              break;
-            }
-          }
-          if (!fast_path_ok) break;
-        }
-
-        // Also bail if any covered node has a boundary output feeding a
-        // second codegen (JIT-fused) region.  The fast path's single
-        // jit_encode_subtree call covers only the primary region; the
-        // secondary region must be handled by the general CompressWalk.
-        if (fast_path_ok) {
-          std::unordered_set<NodeId> covered_set;
-          for (auto const& origin : maybe_built->preorder) {
-            if (!origin.is_raw_passthrough && origin.plan_node < tree.nodes.size()) {
-              covered_set.insert(origin.plan_node);
-            }
-          }
-          for (auto const& origin : maybe_built->preorder) {
-            if (origin.is_raw_passthrough || !fast_path_ok) continue;
-            if (origin.plan_node >= tree.nodes.size()) continue;
-            for (auto const& e : tree.nodes[origin.plan_node].children) {
-              if (!covered_set.count(e.child) && e.child < tree.nodes.size() &&
-                  is_codegen_compressor(tree.nodes[e.child].op)) {
-                fast_path_ok = false;
-                break;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (fast_path_ok) {
-      plan_compound_builder builder;
-      std::string jit_err;
-      if (jit_encode_subtree(tree, head_it->second, input, stream, mr, builder, &jit_err)) {
-        // Place NodeId-keyed reps directly onto their owning nodes.
-        for (auto& [nodeid, rep] : builder.leaves) {
-          auto& nd    = tree.nodes[nodeid];
-          nd.rep      = std::move(rep);
-          nd.rep_path = nd.input_path;
-          nd.meta     = nd.rep->describe_meta();
-        }
-        // All raw-passthrough reps are terminal: park in parent channels.
-        for (auto& leaf : builder.raw_passthrough_leaves) {
-          auto& parent_nd = tree.nodes[leaf.parent_id];
-          for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
-            if (parent_nd.output_names[i] == leaf.channel_name) {
-              parent_nd.channels.emplace(parent_nd.output_paths[i], std::move(leaf.rep));
-              break;
-            }
-          }
-        }
-        if (error_out) error_out->clear();
-        return compound;
-      }
-      if (!jit_err.empty() && error_out) *error_out = jit_err;
-    }
-  }
-
-  // General path: single recursive walk from "input", placing reps as it goes.
+  // Single recursive walk from "input", placing reps as it goes. When the
+  // whole plan fuses into one JIT kernel, emit_fused_node (called from
+  // emit_path via CompressWalk below) performs that single jit_encode_subtree
+  // call itself and handles both the all-terminal case and the entropy-tail
+  // case (a raw-passthrough or boundary channel with a downstream consumer)
+  // uniformly — so there is no separate fast path to maintain here.
   std::unordered_map<std::string, cudf::column_view> columns;
   columns.emplace("input", input);
   std::unordered_map<std::string, std::unique_ptr<compressed_representation>> reprs_by_input;
   std::vector<bool> visited(tree.nodes.size(), false);
 
-  CompressWalk walk{tree,
-                    consumer_by_input,
-                    columns,
-                    reprs_by_input,
-                    path_map,
-                    visited,
-                    stream,
-                    mr,
-                    canon_plan_dsl,
-                    error_out};
+  CompressWalk walk{
+    tree, consumer_by_input, columns, reprs_by_input, path_map, visited, stream, mr, error_out};
   walk.emit_path("input");
   if (walk.failed) return nullptr;
 
@@ -640,6 +573,207 @@ std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
 
   if (error_out) error_out->clear();
   return compound;
+}
+
+namespace {
+
+// Which output channels a fused preprocessing op MATERIALISES as Raw passthrough
+// streams (delta.differences, rle.runs/values, for.deltas) versus which live
+// directly on the op node's own rep as BOUNDARY outputs (for.references).
+// Empty for ops whose rep already exposes canonical channels (bitpack, zigzag).
+struct fused_op_channels {
+  std::vector<std::string> materialized;  // drained to an identity leaf to store
+  std::vector<std::string> boundary;      // already carried on the op node rep
+  bool empty() const { return materialized.empty() && boundary.empty(); }
+};
+
+fused_op_channels canonical_fused_channels(std::string const& op)
+{
+  if (op == "delta") return {{"differences"}, {}};
+  if (op == "rle") return {{"runs", "values"}, {}};
+  if (op == "for") return {{"deltas"}, {"references"}};
+  return {};  // bitpack / zigzag: rep->named_channels() are already canonical
+}
+
+// Trial result for a single fused op: exposes the op's canonical output channels
+// by their DSL names (so the explorer/sweep emit valid cascades and chain onto
+// the real transformed streams) while owning the whole compound so the channel
+// views stay valid and byte accounting stays complete.
+struct single_op_representation : compressed_representation {
+  std::unique_ptr<plan_compound> compound;
+  std::vector<compressible_output> chans;
+
+  single_op_representation(cudf::data_type t, cudf::size_type n) : compressed_representation(t, n)
+  {
+  }
+
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
+  {
+    return chans;
+  }
+
+  // Full stored size: every node rep + parked channel, so the op's aux buffers
+  // (delta_first / for references / rle run offsets) are counted too.
+  size_t compressed_size_bytes(rmm::cuda_stream_view stream) const override
+  {
+    size_t total = 0;
+    if (!compound) return total;
+    for (auto const& node : compound->tree.nodes) {
+      if (node.rep) total += node.rep->compressed_size_bytes(stream);
+      for (auto const& [path, rep] : node.channels) {
+        if (rep) total += rep->compressed_size_bytes(stream);
+      }
+    }
+    return total;
+  }
+
+  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view,
+                                           rmm::device_async_resource_ref) const override
+  {
+    // Not a standalone decodable leaf; callers use named_channels() /
+    // compressed_size_bytes() only.
+    return nullptr;
+  }
+};
+
+}  // namespace
+
+std::unique_ptr<compressed_representation> compress_single_op(std::string const& op_name,
+                                                              cudf::column_view input,
+                                                              rmm::cuda_stream_view stream,
+                                                              rmm::device_async_resource_ref mr,
+                                                              std::string* error_out)
+{
+  if (error_out) error_out->clear();
+
+  // Non-fused path: use the compressor factory directly.
+  if (!is_codegen_compressor(op_name)) {
+    auto comp = make_compressor(op_name);
+    if (!comp) {
+      if (error_out) *error_out = "compress_single_op: unknown op '" + op_name + "'";
+      return nullptr;
+    }
+    return comp->compress(input, stream, mr);
+  }
+
+  // Fused path.  A bare "input -> op" is not enough: for delta/rle/for the
+  // transformed output stream (differences / runs+values / deltas) is only
+  // MATERIALISED when the channel has a real downstream consumer — otherwise the
+  // op node keeps just its reconstruction aux (delta_first / run offsets /
+  // per-chunk references) on `rep`, which is NOT the canonical DSL channel the
+  // explorer/sweep must chain onto.  So we spell the canonical outputs
+  // explicitly and drain each materialised channel into an `identity` leaf (a
+  // real consumer — also required so rle's mandatory `runs` edge exists), then
+  // surface those stored streams under their canonical names.
+  auto const fused = canonical_fused_channels(op_name);
+
+  std::string dsl = "input -> " + op_name;
+  if (!fused.empty()) {
+    dsl += " -> ";
+    bool first = true;
+    for (auto const& c : fused.materialized) {
+      dsl += (first ? "" : ", ") + c;
+      first = false;
+    }
+    for (auto const& c : fused.boundary) {
+      dsl += (first ? "" : ", ") + c;
+      first = false;
+    }
+    for (auto const& c : fused.materialized)
+      dsl += "\n" + op_name + "." + c + " -> identity";
+  }
+
+  auto compound = compress_column(input, dsl, stream, mr, error_out);
+  if (!compound) return nullptr;
+
+  // Locate the op node (index 1 for a single-step plan).
+  PlanNode* op_node = nullptr;
+  for (std::size_t i = 1; i < compound->tree.nodes.size(); ++i) {
+    if (compound->tree.nodes[i].op == op_name) {
+      op_node = &compound->tree.nodes[i];
+      break;
+    }
+  }
+  if (!op_node) {
+    if (error_out && error_out->empty())
+      *error_out = "compress_single_op: op node '" + op_name + "' not found";
+    return nullptr;
+  }
+
+  // bitpack / zigzag: the op rep already exposes canonical channels — return it
+  // (or, defensively, the first parked channel rep) as before.
+  if (fused.empty()) {
+    if (op_node->rep) return std::move(op_node->rep);
+    for (auto& [path, ch_rep] : op_node->channels)
+      if (ch_rep) return std::move(ch_rep);
+    if (error_out && error_out->empty())
+      *error_out = "compress_single_op: no rep found for op '" + op_name + "'";
+    return nullptr;
+  }
+
+  // Resolve each canonical output (in canonical channel order — parse_plan_dsl's
+  // canonicalize_output_order() already made the DSL author's textual order
+  // irrelevant) to a transformed-stream view:
+  //   1) the identity leaf that stored a materialised stream, else
+  //   2) a boundary channel carried on the op node rep (e.g. for.references), else
+  //   3) a terminal Raw passthrough parked on the op node (its `data` buffer).
+  auto result = std::make_unique<single_op_representation>(input.type(), input.size());
+  for (std::size_t i = 0; i < op_node->output_names.size(); ++i) {
+    std::string const& chan_name = op_node->output_names[i];
+    std::string const& chan_path = op_node->output_paths[i];
+
+    bool found = false;
+
+    for (std::size_t j = 1; j < compound->tree.nodes.size() && !found; ++j) {
+      auto& nj = compound->tree.nodes[j];
+      if (nj.op != "identity" || nj.input_paths.empty()) continue;
+      if (nj.input_paths[0] != chan_path || !nj.rep) continue;
+      auto leaf_chans = nj.rep->named_channels(stream);
+      if (!leaf_chans.empty()) {
+        result->chans.push_back({chan_name, leaf_chans.front().view});
+        found = true;
+      }
+    }
+
+    if (!found && op_node->rep) {
+      for (auto const& c : op_node->rep->named_channels(stream)) {
+        if (c.name == chan_name) {
+          result->chans.push_back({chan_name, c.view});
+          found = true;
+          break;
+        }
+      }
+    }
+
+    if (!found) {
+      auto ch_it = op_node->channels.find(chan_path);
+      if (ch_it != op_node->channels.end() && ch_it->second) {
+        auto pch                   = ch_it->second->named_channels(stream);
+        cudf::column_view const* v = nullptr;
+        for (auto const& c : pch) {
+          if (c.name == "data") {
+            v = &c.view;
+            break;
+          }
+        }
+        if (!v && !pch.empty()) v = &pch.front().view;
+        if (v) {
+          result->chans.push_back({chan_name, *v});
+          found = true;
+        }
+      }
+    }
+
+    if (!found) {
+      if (error_out)
+        *error_out = "compress_single_op: canonical channel '" + chan_name + "' (" + chan_path +
+                     ") not produced for op '" + op_name + "'";
+      return nullptr;
+    }
+  }
+
+  result->compound = std::move(compound);
+  return result;
 }
 
 }  // namespace simpatico

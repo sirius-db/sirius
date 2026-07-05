@@ -1,29 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "api/simpatico_codegen.hpp"
 
-#include "api/compress_internals.hpp"
 #include "codegen/plan/representation.hpp"
+#include "compress_internals.hpp"
 
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
 namespace simpatico {
 
 namespace {
 
-leaf_desc make_leaf_desc(std::string path, PlanLeafKind kind, compressed_representation const* rep)
+leaf_desc make_leaf_desc(std::uint32_t node_index,
+                         std::int32_t slot,
+                         PlanLeafKind kind,
+                         compressed_representation const* rep,
+                         rmm::cuda_stream_view stream)
 {
   leaf_desc d;
-  d.path     = std::move(path);
-  d.kind     = kind;
-  d.type_tag = dtype_to_tag(rep->decoded_type());
-  d.meta     = rep->describe_meta();
-  for (auto const& ch : rep->named_channels()) {
+  d.node_index = node_index;
+  d.slot       = slot;
+  d.kind       = kind;
+  d.type_tag   = dtype_to_tag(rep->decoded_type());
+  d.meta       = rep->describe_meta();
+  for (auto const& ch : rep->named_channels(stream)) {
     leaf_buffer_desc bd;
-    bd.name       = ch.name;
-    bd.type_tag   = dtype_to_tag(ch.view.type());
-    bd.num_rows   = static_cast<std::uint64_t>(ch.view.size());
-    bd.size_bytes = static_cast<std::uint64_t>(ch.view.size()) *
-                    static_cast<std::uint64_t>(cudf::size_of(ch.view.type()));
+    bd.name     = ch.name;
+    bd.type_tag = dtype_to_tag(ch.view.type());
+    bd.num_rows = static_cast<std::uint64_t>(ch.view.size());
+    // cudf::size_of() only supports fixed-width types (e.g. dictionary's
+    // fast-mode "keys" channel is a raw STRING column) — account for
+    // offsets + chars directly instead of calling it on a STRING view.
+    if (ch.view.type().id() == cudf::type_id::STRING) {
+      cudf::strings_column_view scv(ch.view);
+      bd.size_bytes = static_cast<std::uint64_t>(ch.view.size() + 1) * sizeof(int32_t) +
+                      static_cast<std::uint64_t>(scv.chars_size(stream));
+    } else {
+      bd.size_bytes = static_cast<std::uint64_t>(ch.view.size()) *
+                      static_cast<std::uint64_t>(cudf::size_of(ch.view.type()));
+    }
     bd.device_ptr = ch.view.head<void>();
     d.buffers.push_back(std::move(bd));
   }
@@ -42,7 +57,7 @@ leaf_desc make_leaf_desc(std::string path, PlanLeafKind kind, compressed_represe
 // rep->kind() is used for all rep types including codegen_fused_representation,
 // which returns Delta/Rle/Identity for fused delta/rle/raw ops respectively.
 
-std::vector<std::vector<leaf_desc>> compressed_table::describe() const
+std::vector<std::vector<leaf_desc>> compressed_table::describe(rmm::cuda_stream_view stream) const
 {
   std::vector<std::vector<leaf_desc>> result;
   result.reserve(columns.size());
@@ -52,14 +67,17 @@ std::vector<std::vector<leaf_desc>> compressed_table::describe() const
       result.push_back({});
       continue;
     }
-    for (auto const& node : col.compound->tree.nodes) {
+    auto const& nodes = col.compound->tree.nodes;
+    for (std::uint32_t ni = 0; ni < nodes.size(); ++ni) {
+      auto const& node = nodes[ni];
       if (node.rep) {
-        descs.push_back(make_leaf_desc(node.rep_path, node.rep->kind(), node.rep.get()));
+        descs.push_back(make_leaf_desc(ni, kSelfRepSlot, node.rep->kind(), node.rep.get(), stream));
       }
-      for (auto const& out_path : node.output_paths) {
-        auto it = node.channels.find(out_path);
+      for (std::size_t k = 0; k < node.output_paths.size(); ++k) {
+        auto it = node.channels.find(node.output_paths[k]);
         if (it != node.channels.end() && it->second) {
-          descs.push_back(make_leaf_desc(out_path, it->second->kind(), it->second.get()));
+          descs.push_back(make_leaf_desc(
+            ni, static_cast<std::int32_t>(k), it->second->kind(), it->second.get(), stream));
         }
       }
     }

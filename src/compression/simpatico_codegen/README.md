@@ -1,132 +1,167 @@
 # simpatico_codegen
 
-GPU-accelerated columnar compression for cuDF tables. A compression plan
-describes a cascade of composable operators per column. Operators have one or
-more outputs (like values and run counts for RLE), that can be fed into next
-operators independently. Contiguous chains of fusable operators are compiled
-to a single JIT (NVRTC) CUDA kernel for both encode and decode, avoiding
-intermediate buffers between stages.
+GPU-accelerated columnar compression library and CLI for the `.hpln` file format.
 
-## Dependencies
+Compresses tabular data column-by-column using composable GPU codecs — delta, RLE, bitpack,
+Frame-of-Reference (FOR), zigzag, dictionary, ALP, ALP_RD, Snappy, LZ4, Deflate,
+nvcomp-Cascaded, bitcomp, ANS, bitextract — specified via a human-readable plan DSL.
 
-- NVIDIA GPU (sm_80+)
-- CUDA toolkit (nvcc, nvrtc)
-- [libcudf](https://github.com/rapidsai/cudf) + librmm
-- [nvcomp](https://github.com/NVIDIA/nvcomp) (ANS, Bitcomp, Cascaded managers)
-- C++20 compiler (g++ or clang++)
+## Requirements
 
-## Build & test
+- NVIDIA GPU (Turing or newer)
+- [pixi](https://prefix.dev/) (or conda)
+- CUDA 13.x driver
+
+## Quick start
 
 ```bash
-cmake -S simpatico_codegen -B simpatico_codegen/build \
-  -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build simpatico_codegen/build
-ctest --test-dir simpatico_codegen/build --output-on-failure
+# From the simpatico_codegen/ directory:
+pixi install          # install all C++ deps (libcudf, nvcomp, CUDA toolkit, cmake)
+pixi run build        # cmake configure + build
+pixi run test         # ctest
+pixi run simpatico -- --help   # show CLI help
 ```
 
-`CMAKE_CUDA_ARCHITECTURES` defaults to `native`, which detects your GPU
-automatically. Override with `-DCMAKE_CUDA_ARCHITECTURES=89` if needed.
-Set `CONDA_PREFIX` to the environment that provides the headers and libraries
-above.
+## Building manually (inside pixi shell)
 
-## API
-
-Public header `api/simpatico_codegen.hpp`, namespace `simpatico`. The
-low-level JIT codegen internals (the fused-tree IR, renderers, kernel cache,
-`OpKind`, etc.) live in namespace `codegen`.
-
-```cpp
-// One column plan per table column, plans separated by "---".
-simpatico::compressed_table ct =
-    simpatico::compress_with_plan(table_view, plan_dsl, stream, mr, column_names);
-
-std::unique_ptr<cudf::table> out = simpatico::decompress(ct, stream, mr);
-// or: ct.decompress(stream, mr);
+```bash
+pixi shell
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+cd build && ctest --output-on-failure
 ```
 
-The single-column building blocks `simpatico::compress_column` /
-`simpatico::decompress_column` (header `codegen/plan/plan_interpreter.hpp`)
-compress one column; the table-level `compress_with_plan` above fans them across
-columns.
-
-- `compress_with_plan(table_view, plan_dsl, ...)` — the base overload runs
-  sequentially on one stream. Two extra overloads parallelize **across columns**:
-  one takes `int column_threads` (builds an internal pool), the other a
-  caller-owned `simpatico::stream_pool&`. Per-column work is always single-stream.
-- `decompress(compressed_table, ...)` — matching stream / threads / pool
-  overloads; returns a `cudf::table`. A single-column overload taking a
-  `plan_compound` is also available.
-- `split_plan_dsl(plan_dsl)` — split a multi-column plan string into per-column
-  plans.
-
-`compressed_table` owns one `compressed_column` per column, each holding the
-plan and its compressed representations.
-
-### Plan DSL
-
-One plan per column (separated by `---`). Each line routes a node's named
-output channel into a downstream operator:
+## CLI: `simpatico`
 
 ```
+simpatico <mode> [options]
+
+Modes:
+  benchmark   Timed compress+decompress (Parquet/binary/CSV input, plan file)
+  explore     BFS cascade search for the best plan for a single column
+  compress    Compress input to a .hpln file
+  decompress  Decompress a .hpln file to Parquet
+  verify      Roundtrip equality check
+```
+
+Run `simpatico <mode> --help` for per-mode options.
+
+### Explore — find the best compression plan
+
+```bash
+# Find the best plan for column 0 of a Parquet file
+simpatico explore --input data.parquet --col 0
+
+# All columns of a TPC-H .tbl file (pipe-separated, no header)
+simpatico explore --input lineitem.tbl --beam-width 200 --max-depth 8
+
+# Binary i64 column
+simpatico explore --input prices.bin --dtype i64
+```
+
+Output is a plan DSL block per column, separated by `---`.
+
+### Compress
+
+```bash
+simpatico compress --input data.parquet --plan plans/example_plans.txt --out data.hpln
+```
+
+### Decompress
+
+```bash
+simpatico decompress --input data.hpln --out data_out.parquet
+```
+
+### Verify roundtrip
+
+```bash
+simpatico verify --input data.parquet --plan plans/example_plans.txt
+# or check an existing .hpln
+simpatico verify --input data.parquet --hpln data.hpln
+```
+
+### Benchmark
+
+```bash
+simpatico benchmark --input data.parquet --plan plans/intraday_balanced.txt \
+    --warmup 5 --iters 20
+
+# Full-table parallel mode (8 threads)
+simpatico benchmark --input data.parquet --plan plans/intraday_balanced.txt \
+    --mode full-table --threads 8 --csv-out results.csv
+```
+
+## Plan DSL
+
+Plans live in `plans/`. Each file contains one DSL block per column, separated by `---`.
+Lines beginning with `#` are comments.
+
+```
+# Single-column example — delta + RLE + bitpack
 input -> delta -> differences
 delta.differences -> rle -> values, runs
 delta.differences.values -> bitpack
 delta.differences.runs -> bitpack
 ```
 
-## Operators
+See `plans/example_plans.txt` for annotated multi-column examples.
 
-Operators come in two classes:
+## C++ library API
 
-**Fusable** — `delta`, `rle`, `bitpack`, `for` (plus `raw` as an RLE `runs`
-leaf). A contiguous chain of these is discovered as one region and compiled into
-a single fused JIT kernel for encode and decode, with no materialized buffers
-between stages.
+Include `api/simpatico_codegen.hpp` and link against `simpatico`:
 
-**Non-fusable** (each runs as its own operator/kernel) — `alp` / `alp_rd`
-(FLOAT32/FLOAT64), `ans`, `bitcomp` (and the `bitcomp_default` /
-`bitcomp_sparse` variants), `nvcomp_cascaded` (and the `nvcomp_cascaded_<N>D<M>R<K>B`
-parameterised form, e.g. `nvcomp_cascaded_1D0R1B`), `dictionary` (STRING),
-`bitextract_*` / `bitjoin_*`, and `identity`.
+```cpp
+#include "api/simpatico_codegen.hpp"
+#include "api/compressed_table_io.hpp"
 
-The fusable set can grow over time: teaching the encode and decode JIT renderers
-to emit a new operator and adding it to `is_codegen_compressor`
-(`codegen/plan/fusion.hpp`) brings that operator into the fused path, so chains
-that include it compile into one kernel instead of running standalone.
+// Compress
+auto ct = simpatico::compress_with_plan(table_view, plan_dsl, stream, mr);
+simpatico::write_compressed_table(ct, "out.hpln");
 
-### Multi-output operators and channel routing
+// Decompress
+auto ct2  = simpatico::read_compressed_table("out.hpln", stream, mr);
+auto out  = simpatico::decompress(ct2, stream, mr);
 
-Some operators produce more than one named output channel.  How those channels
-are handled depends on whether they are *fused inline* or *boundary*:
+// Explore
+#include "explore/compression_explorer.hpp"
+simpatico::exploration_config cfg;
+auto result = simpatico::explore_column_compression(col_view, cfg, stream, mr);
+// result.plan_dsl  — best cascade DSL
+// result.compression_ratio
+```
 
-**Fused (inline) channels** are written as a closed-form expression inside the
-kernel — no intermediary buffer is ever stored.  Examples:
-- `delta.differences` — the diff expression is spliced directly into the child's
-  scan input.
-- `for.deltas` — the residual `(value - chunk_min)` expression feeds the `deltas`
-  child (e.g. a bitpack) inside the same kernel.
+## Running tests
 
-**Boundary channels** are materialized into a buffer by the kernel and stored (or
-further compressed) outside the fused region.  They are exposed via
-`named_channels()` on the representation and routed by two existing mechanisms:
+```bash
+pixi run test          # full ctest
+cd build && ctest -R roundtrip   # run a specific test by name regex
+```
 
-1. **Encode boundary loop** (`emit_fused_node` in `compress.cpp`): if a fused
-   node's boundary channel has a downstream DSL consumer, the bytes are forwarded
-   to that consumer's op after the kernel completes; otherwise the channel is kept
-   in the rep and serialized directly.
+Key tests:
+- `compress_with_plan_roundtrip` — per-operator and multi-level cascade roundtrip
+- `operator_sweep` — exhaustive generated sweep of all operators × all dtypes (depth 2 by default, set `SIMPATICO_SWEEP_DEPTH=4` for thorough)
+- `shape_parity` — fused-operator tree shapes
+- `compressed_table_io` — .hpln read/write
 
-2. **Decode per-slot binder** (`bind_real_node_buffers` in `decompress.cpp`): for
-   each consumed slot declared by `consumed_slots()`, the binder resolves the bytes
-   either from the rep's named channel (terminal case) or from a downstream
-   entropy-tail rep that stored those bytes (e.g. `references -> snappy`).
+## Architecture
 
-Examples of boundary channels: `bitpack.chunk_min`, `bitpack.packed`,
-`for.references`.  All of these can be stored terminal (no further compression) or
-entropy-tailed (`-> identity/snappy/lz4/ans`), exactly as bitpack's channels can.
-
-**Current limitation:** a boundary channel cannot feed *another fused (codegen)
-region* — e.g. `for.references -> bitpack` or `bitpack.packed -> bitpack` are not
-supported.  This is a pre-existing global gap (not FOR-specific); the same
-restriction applies to all multi-output fusable operators.  Such channels can still
-be compressed by a non-fused op (e.g. `-> snappy`).  Lifting this restriction is
-tracked as a separate future work item (Phase 2).
+```
+include/
+  api/           simpatico_codegen.hpp, compressed_table_io.hpp
+  codegen/plan/  plan_interpreter, plan_tree, representation, leaf_desc, plan_dsl
+  codegen/jit/   nvrtc_compiler, kernel_cache
+  explore/       compression_explorer, operator_catalog
+src/
+  plan/          compress, decompress, plan_dsl, plan_tree, fusion, ...
+  bridge/        codegen_runtime, fused_tree_build
+  operators/     per-codec CUDA kernels (.cu)
+  jit/           NVRTC JIT compiler for fused kernels
+  explore/       BFS explorer + operator_catalog
+  api/           compressed_table_io
+  c_api/         simpatico_c_api (C ABI for FFI bindings)
+bench/           compress_with_plan_benchmark (legacy harness)
+cli/             driver_common.hpp, benchmark.hpp, simpatico_main.cpp
+tests/           gtest-based unit + integration tests
+plans/           example plan DSL files
+```

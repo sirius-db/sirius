@@ -64,6 +64,14 @@ std::size_t dtype_elem_size(const std::string& name)
   return 0;  // 0 => unsupported (caller throws)
 }
 
+// Same-width unsigned type name, for arithmetic that must wrap modulo 2^N
+// instead of relying on signed overflow (UB) -- must mirror the encode
+// side's subtraction exactly (see encode/jit/renderer.cpp).
+const char* unsigned_counterpart(std::size_t elem_size)
+{
+  return (elem_size == 8) ? "uint64_t" : "uint32_t";
+}
+
 // ---------------------------------------------------------------------
 // String utilities (lifted from the encode walker).
 // ---------------------------------------------------------------------
@@ -543,6 +551,11 @@ void Walker::emit_delta_producer(const ::codegen::jit::FusedTree& node,
           << "        __syncthreads();\n";
   }
 
+  // Reconstruction adds "first" (an arbitrary stored value) to a cumulative
+  // diff sum; the sum can exceed the signed range (see emit_delta on the
+  // encode side), so the add is done in the unsigned counterpart type to
+  // avoid relying on signed-overflow wraparound (UB).
+  const std::string dutype = unsigned_counterpart(esize);
   body_ << "        const " << elem_type << " " << first << " = " << p_first << "[chunk_id];\n"
         << "        if (tid == 0 && " << dlen << " > 0) (" << dst << ")[0] = " << first << ";\n"
         << "        #pragma unroll\n"
@@ -552,8 +565,9 @@ void Walker::emit_delta_producer(const ::codegen::jit::FusedTree& node,
   } else {
     body_ << "            const int32_t idx = tid * IPT + j;  // blocked global pos\n";
   }
-  body_ << "            if (idx + 1 < " << dlen << ") (" << dst << ")[idx + 1] = " << first << " + "
-        << items << "[j];\n"
+  body_ << "            if (idx + 1 < " << dlen << ") (" << dst << ")[idx + 1] = static_cast<"
+        << elem_type << ">(static_cast<" << dutype << ">(" << first << ") + static_cast<" << dutype
+        << ">(" << items << "[j]));\n"
         << "        }\n"
         << "        __syncthreads();\n"
         << "    }\n";
@@ -790,6 +804,11 @@ void Walker::emit_for_producer(const ::codegen::jit::FusedTree& node,
     (dit->second->op == ::codegen::OpKind::Bitpack && dit->second->children.empty()) ||
     (dit->second->op == ::codegen::OpKind::Raw && dit->second->children.empty());
 
+  // residual + reference can exceed the signed range (see emit_for on the
+  // encode side); add in the unsigned counterpart type instead of relying
+  // on signed-overflow wraparound (UB).
+  const std::string futype = unsigned_counterpart(esize);
+
   if (child_is_leaf) {
     // Closed-form path: get an inline read expression for the residuals,
     // then add the per-chunk reference in a single strided loop.
@@ -798,7 +817,8 @@ void Walker::emit_for_producer(const ::codegen::jit::FusedTree& node,
     body_ << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
           << ") {\n"
           << "        (" << dst << ")[i] = static_cast<" << elem_type << ">(\n"
-          << "            " << at_pos(child_vs.read_expr, "i") << " + " << v_ref << ");\n"
+          << "            static_cast<" << futype << ">(" << at_pos(child_vs.read_expr, "i")
+          << ") + static_cast<" << futype << ">(" << v_ref << "));\n"
           << "    }\n"
           << "    __syncthreads();\n";
     sm_.release_to(mark);
@@ -816,7 +836,8 @@ void Walker::emit_for_producer(const ::codegen::jit::FusedTree& node,
           << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
           << ") {\n"
           << "        (" << dst << ")[i] = static_cast<" << elem_type << ">(\n"
-          << "            " << slab << "[i] + " << v_ref << ");\n"
+          << "            static_cast<" << futype << ">(" << slab << "[i]) + static_cast<" << futype
+          << ">(" << v_ref << "));\n"
           << "    }\n"
           << "    __syncthreads();\n";
     sm_.release_to(mark);
@@ -872,7 +893,7 @@ ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& 
     throw RenderError("decode render: zigzag_value_source_inline: unsupported dtype '" + elem_type +
                       "'");
   }
-  const std::string utype  = (esize == 8) ? "uint64_t" : "uint32_t";
+  const std::string utype  = unsigned_counterpart(esize);
   const std::int32_t id    = id_of(node);
   const std::string idstr  = std::to_string(id);
   const std::string p_data = "zigzag_" + idstr;
@@ -928,7 +949,7 @@ void Walker::emit_zigzag_producer(const ::codegen::jit::FusedTree& node,
     if (esize == 0) {
       throw RenderError("decode render: Zigzag op-local dtype '" + elem_type + "' not supported");
     }
-    const std::string utype = (esize == 8) ? "uint64_t" : "uint32_t";
+    const std::string utype = unsigned_counterpart(esize);
     const std::int32_t id   = id_of(node);
     const std::string idstr = std::to_string(id);
 

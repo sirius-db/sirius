@@ -64,4 +64,11 @@ std::unique_ptr<cudf::column> lz4_compressor::decompress(compressed_representati
   return r->decompress(stream, mr);
 }
 
+namespace detail {
+void release_lz4_manager_scratch()
+{
+  if (tls_lz4_mgr.mgr) tls_lz4_mgr.mgr->deallocate_gpu_mem();
+}
+}  // namespace detail
+
 }  // namespace simpatico

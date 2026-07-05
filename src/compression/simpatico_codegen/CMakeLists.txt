@@ -45,9 +45,9 @@ link_directories("${CONDA_PREFIX}/lib")
 
 add_library(
   simpatico STATIC
-  # CUDA kernels: compact + operators + offsets
-  src/encode/compact.cu
+  # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
+  src/bridge/bitpack_compact.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -58,6 +58,7 @@ add_library(
   src/operators/deflate_compressor.cu
   src/operators/bitjoin_bitextract.cu
   src/operators/dictionary_compressor.cu
+  src/operators/nvcomp_scratch.cpp
   # Plain-CUDA JIT host
   src/jit/fused_tree.cpp
   src/jit/nvrtc_compiler.cpp
@@ -65,29 +66,29 @@ add_library(
   src/encode/jit/plain_compile.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
-  src/encode/compact.cpp
   # Runtime: plan executor + bridge + API + rep glue
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp
   src/plan/fusion.cpp
   src/plan/operator_registry.cpp
   src/plan/representation_factory.cpp
-  src/plan/column_copy.cpp
   src/plan/bitjoin_layout.cpp
   src/plan/compress.cpp
   src/plan/decompress.cpp
-  src/rep/compact/bitpack.cpp
   src/util/stream_pool.cpp
   src/util/isoc23_compat.c
   src/bridge/fused_tree_build.cpp
   src/bridge/codegen_runtime.cpp
   src/simpatico_codegen.cpp
-  src/api/compressed_table_io.cpp)
+  src/api/compressed_table_io.cpp
+  src/explore/operator_catalog.cpp
+  src/explore/compression_explorer.cpp)
 set_target_properties(simpatico PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(simpatico PUBLIC cxx_std_20)
 target_include_directories(
-  simpatico PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src "${CUDA_TOOLKIT_INCLUDE}"
-                    "${CUDA_CCCL_INCLUDE}")
+  simpatico
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
+          "${CUDA_TOOLKIT_INCLUDE}" "${CUDA_CCCL_INCLUDE}")
 target_compile_definitions(
   simpatico
   PRIVATE "CODEGEN_JIT_CUDA_INCLUDE=\"${CUDA_TOOLKIT_INCLUDE}\""
@@ -120,23 +121,6 @@ function(add_codegen_host_test name)
                       "-Wl,-rpath,${CONDA_PREFIX}/lib")
 endfunction()
 
-function(add_codegen_cuda_test name)
-  add_executable(${name} tests/${name}.cu)
-  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(
-    ${name}
-    PRIVATE simpatico
-            cudf
-            rmm
-            cudart
-            nvcomp
-            nvrtc
-            cuda
-            dl)
-  target_link_options(${name} PRIVATE -Wl,--defsym=__libc_single_threaded=0
-                      "-Wl,-rpath,${CONDA_PREFIX}/lib")
-endfunction()
-
 add_codegen_host_test(test_compress_with_plan_roundtrip)
 add_codegen_host_test(test_compressed_table_io)
 add_codegen_host_test(test_leaf_describe)
@@ -144,10 +128,10 @@ add_codegen_host_test(test_plan_tree)
 add_codegen_host_test(test_fused_tree_build)
 add_codegen_host_test(test_jit_kernel_cache_plain)
 add_codegen_host_test(test_jit_kernel_cache)
-add_codegen_host_test(test_shape_parity)
-add_codegen_cuda_test(test_encode_bitpack_compact)
+add_codegen_host_test(test_fused_operator_sweep)
+add_codegen_host_test(test_operator_sweep)
 
-# Benchmark harness (not registered as ctest)
+# Benchmark harness (not registered as ctest; kept during transition)
 add_executable(compress_with_plan_benchmark
                bench/compress_with_plan_benchmark.cpp)
 target_include_directories(compress_with_plan_benchmark
@@ -166,6 +150,27 @@ target_link_options(
   compress_with_plan_benchmark PRIVATE -Wl,--defsym=__libc_single_threaded=0
   "-Wl,-rpath,${CONDA_PREFIX}/lib")
 
+# simpatico multi-mode CLI (benchmark / explore / compress / decompress /
+# verify) CMake target is simpatico_cli to avoid collision with the static
+# library target; the installed binary is named 'simpatico'.
+add_executable(simpatico_cli cli/simpatico_main.cpp)
+set_target_properties(simpatico_cli PROPERTIES OUTPUT_NAME simpatico)
+target_include_directories(
+  simpatico_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                        ${CMAKE_CURRENT_SOURCE_DIR}/cli)
+target_link_libraries(
+  simpatico_cli
+  PRIVATE simpatico
+          cudf
+          rmm
+          cudart
+          nvcomp
+          nvrtc
+          cuda
+          dl)
+target_link_options(simpatico_cli PRIVATE -Wl,--defsym=__libc_single_threaded=0
+                    "-Wl,-rpath,${CONDA_PREFIX}/lib")
+
 enable_testing()
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
@@ -175,10 +180,5 @@ add_test(NAME plan_tree COMMAND test_plan_tree)
 add_test(NAME fused_tree_build COMMAND test_fused_tree_build)
 add_test(NAME jit_kernel_cache_plain COMMAND test_jit_kernel_cache_plain)
 add_test(NAME jit_kernel_cache COMMAND test_jit_kernel_cache)
-add_test(NAME shape_parity COMMAND test_shape_parity)
-# Keep the ctest fast: depth 3 (1+3+9 = 13 shapes) still exercises two-level
-# nesting of every op. Run the binary directly (or override the env var) for the
-# full depth-4 sweep.
-set_tests_properties(shape_parity PROPERTIES ENVIRONMENT
-                                             "SIMPATICO_PARITY_DEPTH=3")
-add_test(NAME encode_bitpack_compact COMMAND test_encode_bitpack_compact)
+add_test(NAME fused_operator_sweep COMMAND test_fused_operator_sweep)
+add_test(NAME operator_sweep COMMAND test_operator_sweep)

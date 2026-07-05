@@ -10,14 +10,12 @@
 // Architectural intent — read this if you are about to add a new op.
 // ====================================================================
 //
-// This is the entry point of the *forward-looking* encoder design
-// (see `.planning/` notes from the 2026-05-28 redesign).  The
-// constraint inherited from the Python renderer was that every op
-// had to expose a closed-form, lane-addressable C++ expression
-// (`prev_expr`) that its parent could splice inline.  That works for
-// Bitpack and Delta but breaks for Rle, whose output is at
-// data-dependent lane positions — Python therefore rejected shapes
-// like `Rle{Delta{Rle{Bp,Bp}}, Bp}` (the nvcomp-cascaded default).
+// A naive approach requires every op to expose a closed-form,
+// lane-addressable C++ expression (`prev_expr`) that its parent can
+// splice inline.  That works for Bitpack and Delta but breaks for
+// Rle, whose output is at data-dependent lane positions — it would
+// reject shapes like `Rle{Delta{Rle{Bp,Bp}}, Bp}` (the
+// nvcomp-cascaded default).
 //
 // We sidestep that by switching to STAGE DECOMPOSITION + SHARED-MEM
 // MATERIALISATION:
@@ -35,9 +33,9 @@
 //     chunk, separated by `__syncthreads()`.  No host orchestration,
 //     no inter-kernel sync.
 //
-// This lifts the Python-era composability restriction completely:
-// any tree the decode-side template library accepts becomes
-// encodable, including arbitrary RLE/Delta nesting.
+// This lifts the naive composability restriction completely: any
+// tree shape the decode side accepts becomes encodable, including
+// arbitrary RLE/Delta nesting.
 //
 // Supported shapes
 // ----------------
@@ -49,16 +47,24 @@
 //
 // Buffer layout contract
 // ----------------------
-// OverAllocate by default:
-//   * `bp_offsets` is NOT produced by the encoder (the decode side
-//     synthesises the per-chunk base arithmetically via
-//     `Bitpack<E, FixedStride=true>`).
+// The encode kernel always emits OverAllocate (`fixed_stride=true`):
+//   * `bp_offsets` is NOT produced by the encoder — it doesn't need
+//     one to write, since every chunk's packed words land at the
+//     fixed arithmetic offset `chunk_id * kStrideWords`.
 //   * `packed` is sized `num_chunks * kStrideWords` for every Bitpack
-//     node — deterministic, no host cumsum needed.
+//     node — deterministic, no host cumsum needed at encode time.
 //   * `live_words[c]` reports the actual bit-packed word count for
-//     chunk c.  Required by the `compact_into()` pass; ignored by
-//     the OverAllocate decode path.  Eliminating it for callers that
-//     only need decoded output is a future optimisation.
+//     chunk c.  Consumed only by `compact_in_place()`
+//     (src/bridge/bitpack_compact.cu), which runs once before publish to
+//     densify OverAllocate into the Compact layout that actually gets
+//     persisted to disk.
+//
+// Decode never sees OverAllocate: every persisted bitpack rep is
+// already Compact (dense), and the decode renderer reconstructs
+// `bp_offsets` itself at decode time via an on-device CUB exclusive
+// scan over the stored `chunk_bits`/`chunk_count` (see
+// `synthesize_decode_transients` in bridge/codegen_runtime.cpp) —
+// it never reads anything the encoder wrote for this purpose.
 
 #pragma once
 

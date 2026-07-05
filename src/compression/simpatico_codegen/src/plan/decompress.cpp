@@ -17,7 +17,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
-#include <unordered_set>
 
 // The C++-native JIT codegen decode entry point (``simpatico::decode_fused_subtree``,
 // defined in codegen_runtime.cpp) is declared in codegen_bridge.hpp above. One
@@ -28,8 +27,9 @@ namespace simpatico {
 // The compress driver (the recursive CompressWalk, compress_column) lives
 // in plan/compress.cpp.
 // This file owns the decode driver
-// (decompress_column). The two halves share the bitjoin_layout / column_copy
-// helpers and reconstruct_representation (plan/representation_factory.cpp).
+// (decompress_column). The two halves share the bitjoin_layout helpers
+// (including copy_column_view{,_as_uint8}) and reconstruct_representation
+// (plan/representation_factory.cpp).
 
 namespace {
 
@@ -87,52 +87,24 @@ std::vector<std::string> consumed_slots(std::string const& kind)
   return {};
 }
 
-// Recover the raw bytes of a channel that was entropy-tail-routed at compress
-// time (a fused parent's buffer slot dropped from its producing rep because a
-// downstream NON-codegen op further-compressed it, e.g.
-// ``delta.differences.values.packed -> snappy``).  *nid* is the tree node of
-// that downstream op (the parent's edge target for the slot's channel).
-// Returns a fresh column holding the decoded channel bytes (same layout the
-// producing rep's channel had), or nullptr on any failure.
-//
-//   * Single entropy op (the common case: identity / snappy / lz4 / …): its rep
-//     self-decodes to the raw channel bytes — ``node.rep->decompress()``.
-//   * Multi-step tail chain (e.g. ``…packed -> bitcomp -> output; …output ->
-//     ans``): rebuild this op from its outputs (each output is a downstream
-//     child to resolve first, or a terminal channel rep on this node), then
-//     decompress.  Outputs are walked structurally via the node's edges /
-//     channels — no DSL/path lookups.
-//
-// All work is enqueued on *stream*; the entropy reps' ``decompress`` sync the
-// stream internally, so the returned column is safe to read once this returns.
-struct TreeDecodeCtx {
-  plan_compound const& compound;
-  std::unordered_map<std::string, std::unique_ptr<cudf::column>> decompressed;
-  std::unordered_set<NodeId> skipped;
-  std::vector<std::unique_ptr<compressed_representation>> kept_reprs;
-  rmm::cuda_stream_view stream;
-  rmm::device_async_resource_ref mr;
+// Decode memoises each reconstructed value by its structural identity — the
+// (node, port) it is produced on, packed into a key. A value is computed once
+// and shared by every consumer (and by the codegen tail binders). `kept` holds
+// the reconstructed reps alive for the walk's duration.
+struct DecodeMemo {
+  std::unordered_map<std::uint64_t, std::unique_ptr<cudf::column>> values;
+  std::vector<std::unique_ptr<compressed_representation>> kept;
 };
+
+std::uint64_t value_key(ValueId v)
+{
+  return (static_cast<std::uint64_t>(v.node) << 16) | v.channel;
+}
 
 // Returns the rep for node nid, or nullptr if the node has none.
 compressed_representation const* node_rep(NodeId nid, PlanTree const& tree)
 {
   if (nid < tree.nodes.size()) return tree.nodes[nid].rep.get();
-  return nullptr;
-}
-
-// Finds the rep for a given output `path` owned by node `owner_nid`.
-// Checks `rep` (via `rep_path`) then `channels`.
-compressed_representation const* rep_at_path(std::string const& path,
-                                             NodeId owner_nid,
-                                             PlanTree const& tree)
-{
-  if (owner_nid < tree.nodes.size()) {
-    auto const& owner = tree.nodes[owner_nid];
-    if (owner.rep && owner.rep_path == path) return owner.rep.get();
-    auto cit = owner.channels.find(path);
-    if (cit != owner.channels.end() && cit->second) return cit->second.get();
-  }
   return nullptr;
 }
 
@@ -158,11 +130,15 @@ std::size_t elem_size_for_slot(std::string const& slot, std::size_t element_size
   return element_size;  // chunk_min, delta_first, data, rle_run_values
 }
 
-// Forward declaration.
-std::unique_ptr<cudf::column> resolve_channel_bytes_node(NodeId nid,
-                                                         PlanTree const& tree,
-                                                         rmm::cuda_stream_view stream,
-                                                         rmm::device_async_resource_ref mr);
+// Reconstructs node `nid`'s produced value into the shared memo and returns a
+// non-owning view the memo keeps alive. One resolver serves the top-level walk
+// and fused-region tail binding, so both share a single memo. Defined below.
+cudf::column const* materialize(NodeId nid,
+                                PlanTree const& tree,
+                                DecodeMemo& memo,
+                                rmm::cuda_stream_view stream,
+                                rmm::device_async_resource_ref mr,
+                                std::string* error_out);
 
 // Bind the ``data``/``offsets`` slots of a synthesized Raw passthrough leaf
 // at preorder *node_id*. The Raw leaf has no PlanTree op of its own; its
@@ -175,9 +151,9 @@ std::unique_ptr<cudf::column> resolve_channel_bytes_node(NodeId nid,
 //
 //   Entropy-tail (data was routed to a downstream non-fused op, e.g. ans):
 //   the RawFused rep holds only ``offsets``; ``data`` is resolved by calling
-//   resolve_channel_bytes_node on the downstream PlanTree child node (the
-//   non-fused op that compressed the raw bytes). The resolved column is parked
-//   in *tail_scratches_out* so its device buffer outlives the decode launch.
+//   materialize on the downstream PlanTree child node (the non-fused op that
+//   compressed the raw bytes). The result is a view into the shared memo, which
+//   owns it through the decode launch.
 //
 // Element size for the data slot:
 //   rle.runs  -> always sizeof(int32_t) (run counts are int32 regardless of
@@ -192,7 +168,7 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
                                   rmm::cuda_stream_view stream,
                                   rmm::device_async_resource_ref mr,
                                   codegen::jit::LabeledBuffers& labeled,
-                                  std::vector<std::unique_ptr<cudf::column>>& tail_scratches_out,
+                                  DecodeMemo& decompressed,
                                   std::string* error_out)
 {
   // Use the explicit channel name. Fall back to the old heuristic for
@@ -223,7 +199,7 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
     return false;
   }
 
-  std::vector<compressible_output> nb = rep->named_channels();
+  std::vector<compressible_output> nb = rep->named_channels(stream);
   std::unordered_map<std::string, cudf::column_view> by_name;
   for (auto const& o : nb)
     by_name.emplace(o.name, o.view);
@@ -252,9 +228,10 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
                        std::to_string(parent_id) + " for entropy-tail resolve";
         return false;
       }
-      auto resolved = resolve_channel_bytes_node(child_id, tree, stream, mr);
+      cudf::column const* resolved =
+        materialize(child_id, tree, decompressed, stream, mr, error_out);
       if (!resolved) {
-        if (error_out)
+        if (error_out && error_out->empty())
           *error_out = "codegen decode: entropy-tail resolve failed for RawFused channel '" +
                        channel_name + "'";
         return false;
@@ -262,7 +239,6 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
       cudf::column_view dv                               = resolved->view();
       labeled[codegen::jit::buffer_key(node_id, "data")] = {
         dv.head<void>(), static_cast<std::size_t>(dv.size()), data_elem_size};
-      tail_scratches_out.push_back(std::move(resolved));
       continue;
     }
     auto bit = by_name.find(slot);
@@ -283,25 +259,22 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
 // rep ``named_channels()`` in per-op CONSUMED-slot order (``consumed_slots``);
 // every rep is dense, so decode always uses the Compact gather.
 //
-// Entropy-tail-routed channels — a CONSUMED slot consumed downstream by a
-// NON-codegen op (e.g. ``…packed -> snappy``, ``…packed -> bitcomp -> ans``),
-// detected as an edge whose child op owns a rep — are RESOLVED here via
-// ``resolve_channel_bytes_node`` (the downstream child subtree), and the
-// scratch column parked in *tail_scratches_out* so its device buffer outlives
-// the (synchronous) decode launch. An identity NO-OP terminal
-// (``…chunk_min -> identity``) leaves the bytes inside THIS rep and is bound
-// directly.
-bool bind_real_node_buffers(
-  std::int32_t node_id,
-  NodeId plan_node,
-  PlanTree const& tree,
-  std::size_t element_size,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  codegen::jit::LabeledBuffers& labeled,
-  std::vector<std::unique_ptr<cudf::column>>& tail_scratches_out,
-  std::unordered_map<std::string, std::unique_ptr<cudf::column>> const& decompressed,
-  std::string* error_out)
+// Entropy-tail-routed channels — a CONSUMED slot consumed downstream by
+// another op (e.g. ``…packed -> snappy``, ``…packed -> bitcomp -> ans``, or a
+// codegen tail ``…chunk_min -> zigzag``), detected as a child edge — are
+// RESOLVED here via ``materialize`` (the downstream subtree), which returns a
+// view into the shared memo that owns it through the (synchronous) decode
+// launch. An identity NO-OP terminal (``…chunk_min -> identity``) leaves the
+// bytes inside THIS rep and is bound directly.
+bool bind_real_node_buffers(std::int32_t node_id,
+                            NodeId plan_node,
+                            PlanTree const& tree,
+                            std::size_t element_size,
+                            rmm::cuda_stream_view stream,
+                            rmm::device_async_resource_ref mr,
+                            codegen::jit::LabeledBuffers& labeled,
+                            DecodeMemo& decompressed,
+                            std::string* error_out)
 {
   PlanNode const& node                  = tree.nodes[plan_node];
   compressed_representation const* repr = node_rep(plan_node, tree);
@@ -318,7 +291,7 @@ bool bind_real_node_buffers(
     return false;
   }
 
-  std::vector<compressible_output> nb = repr->named_channels();
+  std::vector<compressible_output> nb = repr->named_channels(stream);
   std::unordered_map<std::string, cudf::column_view> by_name;
   by_name.reserve(nb.size());
   for (auto const& o : nb)
@@ -338,10 +311,6 @@ bool bind_real_node_buffers(
     auto eit                      = edge_by_channel.find(slot);
     const bool has_edge           = eit != edge_by_channel.end();
     const bool downstream_has_rep = has_edge && node_rep(eit->second, tree) != nullptr;
-    // A codegen downstream was decoded post-order and its output column is
-    // already in `decompressed`; calling decompress() on it would throw.
-    const bool downstream_is_codegen =
-      has_edge && !codegen_kind_for_compressor(tree.nodes[eit->second].op).empty();
 
     const void* ptr = nullptr;
     std::size_t len = 0;
@@ -350,37 +319,22 @@ bool bind_real_node_buffers(
       // Slot lives directly in this node's rep — bind it straight.
       ptr = bit->second.head<void>();
       len = static_cast<std::size_t>(bit->second.size());
-    } else if (downstream_is_codegen) {
-      // The downstream JIT region was decoded post-order before this node;
-      // its decompressed column is in `decompressed` keyed by the path it
-      // consumed (the downstream node's input_path, e.g. "for.references").
-      std::string const& downstream_path = tree.nodes[eit->second].input_path;
-      auto dit                           = decompressed.find(downstream_path);
-      if (dit == decompressed.end() || !dit->second) {
-        if (error_out)
-          *error_out = "codegen decode: pre-decoded column for '" + downstream_path +
-                       "' not found in decompressed map (post-order ordering issue)";
-        return false;
-      }
-      auto v = dit->second->view();
-      ptr    = v.head<void>();
-      len    = static_cast<std::size_t>(v.size());
-      // No tail_scratches_out push: the column is owned by decompressed map,
-      // which outlives the synchronous kernel launch below.
     } else if (has_edge) {
-      // Non-codegen entropy tail — resolve by decompressing the downstream rep.
-      auto col = resolve_channel_bytes_node(eit->second, tree, stream, mr);
+      // Tail-routed slot (a downstream codegen region OR non-codegen rep
+      // consumes it): materialize the downstream's output — a view into the
+      // shared memo, which owns it through the synchronous launch. One path for
+      // both, no empty-map special case (e.g. …bitpack -> chunk_min -> zigzag
+      // resolves the nested codegen tail through the same memo).
+      cudf::column const* col = materialize(eit->second, tree, decompressed, stream, mr, error_out);
       if (!col) {
-        if (error_out) {
-          *error_out = "codegen decode: failed to resolve tail-routed slot '" + slot +
-                       "' at node " + std::to_string(plan_node);
-        }
+        if (error_out && error_out->empty())
+          *error_out = "codegen decode: failed to resolve tail slot '" + slot + "' at node " +
+                       std::to_string(plan_node);
         return false;
       }
       auto v = col->view();
       ptr    = v.head<void>();
       len    = static_cast<std::size_t>(v.size());
-      tail_scratches_out.push_back(std::move(col));
     } else {
       if (error_out)
         *error_out = "codegen decode: missing buffer for slot '" + slot + "' at node " +
@@ -401,16 +355,14 @@ bool bind_real_node_buffers(
 // the per-node reps/buffers. Decode uses ``fixed_stride=false`` (Compact).
 //
 // Returns the built tree, or nullptr + *error_out on failure.
-std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
-  NodeId root_nid,
-  PlanTree const& tree,
-  std::size_t element_size,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  codegen::jit::LabeledBuffers& labeled,
-  std::vector<std::unique_ptr<cudf::column>>& tail_scratches_out,
-  std::unordered_map<std::string, std::unique_ptr<cudf::column>> const& decompressed,
-  std::string* error_out)
+std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(NodeId root_nid,
+                                                            PlanTree const& tree,
+                                                            std::size_t element_size,
+                                                            rmm::cuda_stream_view stream,
+                                                            rmm::device_async_resource_ref mr,
+                                                            codegen::jit::LabeledBuffers& labeled,
+                                                            DecodeMemo& decompressed,
+                                                            std::string* error_out)
 {
   auto built = build_fused_tree(tree, root_nid, /*fixed_stride=*/false);
   if (!built) {
@@ -439,7 +391,7 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
                                         stream,
                                         mr,
                                         labeled,
-                                        tail_scratches_out,
+                                        decompressed,
                                         error_out)) {
         return nullptr;
       }
@@ -451,7 +403,6 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
                                   stream,
                                   mr,
                                   labeled,
-                                  tail_scratches_out,
                                   decompressed,
                                   error_out)) {
         return nullptr;
@@ -473,13 +424,12 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(
 // fused preorder provides the decoded type and num_rows.
 //
 // Returns nullptr + *error_out on failure.
-std::unique_ptr<cudf::column> dispatch_codegen_subtree(
-  NodeId root_nid,
-  PlanTree const& tree,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  std::unordered_map<std::string, std::unique_ptr<cudf::column>> const& decompressed,
-  std::string* error_out)
+std::unique_ptr<cudf::column> dispatch_codegen_subtree(NodeId root_nid,
+                                                       PlanTree const& tree,
+                                                       rmm::cuda_stream_view stream,
+                                                       rmm::device_async_resource_ref mr,
+                                                       DecodeMemo& decompressed,
+                                                       std::string* error_out)
 {
   compressed_representation const* root_repr = node_rep(root_nid, tree);
   if (root_repr == nullptr) {
@@ -509,16 +459,14 @@ std::unique_ptr<cudf::column> dispatch_codegen_subtree(
   }
 
   // Build the FusedTree + bind the real device buffers (keyed by DFS-preorder
-  // node_id) directly from the node-owned reps.  Scratch columns holding bytes
-  // resolved for entropy-tail-routed channels must outlive the (synchronous)
-  // decode launch below — they live to end-of-function, so the device buffers
-  // are freed only after decode_fused_subtree returns.
-  std::vector<std::unique_ptr<cudf::column>> tail_scratches;
+  // node_id) directly from the node-owned reps.  Entropy-tail-routed channels
+  // are materialized into the shared `decompressed` memo, which owns them
+  // through the (synchronous) decode launch below.
   codegen::jit::LabeledBuffers labeled;
   const std::size_t element_size = static_cast<std::size_t>(cudf::size_of(root_type));
   std::string bind_err;
-  auto fused = bind_fused_subtree(
-    root_nid, tree, element_size, stream, mr, labeled, tail_scratches, decompressed, &bind_err);
+  auto fused =
+    bind_fused_subtree(root_nid, tree, element_size, stream, mr, labeled, decompressed, &bind_err);
   if (!fused) {
     if (error_out) {
       *error_out = bind_err.empty() ? "codegen decompress: incomplete fused subtree" : bind_err;
@@ -547,111 +495,73 @@ std::unique_ptr<cudf::column> dispatch_codegen_subtree(
   return out_col;
 }
 
-// Mark every descendant of *root* (inclusive) as handled after a fused-subtree
-// JIT dispatch at *root*.
-void mark_subtree_nodes_skipped(NodeId root,
-                                PlanTree const& tree,
-                                std::unordered_set<NodeId>& skipped)
+// Rep holding a bitjoin node's own (packed) output leaf: its node rep, or the
+// terminal channel parked for output port 0.
+compressed_representation const* bitjoin_packed_rep(PlanNode const& node)
 {
-  std::vector<NodeId> stack{root};
-  while (!stack.empty()) {
-    NodeId const n = stack.back();
-    stack.pop_back();
-    if (!skipped.insert(n).second) continue;
-    for (auto const& e : tree.nodes[n].children)
-      stack.push_back(e.child);
+  if (node.rep) return node.rep.get();
+  if (!node.output_paths.empty()) {
+    auto cit = node.channels.find(node.output_paths[0]);
+    if (cit != node.channels.end() && cit->second) return cit->second.get();
   }
+  return nullptr;
 }
 
-// Recover the output path produced by node `nid` on channel `channel`, reading
-// directly from the node's output_names/output_paths metadata. For the input
-// root (nid==0) the output is always "input" (the channel is "input" by
-// convention). For other nodes, output_names[i]==channel -> output_paths[i].
-std::string path_for_node_channel(NodeId nid, std::string const& channel, PlanTree const& tree)
+// Split a bitjoin node's packed leaf back into its input field values, keyed in
+// `memo` by each input's structural ValueId. Fields sharing a source value are
+// OR-ed into one column (a source may receive several bit ranges).
+bool decode_bitjoin(NodeId nid,
+                    PlanTree const& tree,
+                    DecodeMemo& memo,
+                    rmm::cuda_stream_view stream,
+                    rmm::device_async_resource_ref mr,
+                    std::string* error_out)
 {
-  if (nid == 0) return "input";
-  if (nid >= tree.nodes.size()) return {};
-  auto const& node = tree.nodes[nid];
-  for (std::size_t i = 0; i < node.output_names.size(); ++i) {
-    if (node.output_names[i] == channel) return node.output_paths[i];
-  }
-  return {};
-}
-
-NodeId consumer_of_path(std::string const& path, PlanTree const& tree)
-{
-  for (NodeId i = 1; i < tree.nodes.size(); ++i) {
-    if (tree.nodes[i].input_path == path) return i;
-  }
-  return static_cast<NodeId>(tree.nodes.size());
-}
-
-bool ensure_path_decoded(std::string const& path, TreeDecodeCtx& ctx, std::string* error_out);
-
-bool decode_bitjoin_node(NodeId nid, TreeDecodeCtx& ctx, std::string* error_out)
-{
-  PlanTree const& tree = ctx.compound.tree;
   PlanNode const& node = tree.nodes[nid];
   if (!node.attrs.bitjoin.has_value()) {
-    if (error_out) *error_out = "decode_bitjoin_node: missing bitjoin attrs";
-    return false;
-  }
-  if (node.output_paths.size() != 1) {
-    if (error_out) *error_out = "bitjoin decompression expects exactly 1 output path";
-    return false;
-  }
-  std::string const& packed_path = node.output_paths[0];
-  if (ctx.decompressed.find(packed_path) == ctx.decompressed.end()) {
-    auto const* repr = rep_at_path(packed_path, nid, tree);
-    if (!repr) repr = node_rep(nid, tree);
-    if (!repr) {
-      if (error_out) *error_out = "bitjoin decode: missing rep at '" + packed_path + "'";
-      return false;
-    }
-    auto col = repr->decompress(ctx.stream, ctx.mr);
-    if (!col) {
-      if (error_out) *error_out = "bitjoin decode: failed to decompress packed leaf";
-      return false;
-    }
-    ctx.decompressed.emplace(packed_path, std::move(col));
-  }
-
-  std::vector<std::string> input_paths;
-  std::vector<std::optional<bit_range>> input_ranges;
-  input_paths.reserve(node.attrs.bitjoin->inputs.size());
-  input_ranges.reserve(node.attrs.bitjoin->inputs.size());
-  for (auto const& ref : node.attrs.bitjoin->inputs) {
-    std::string path = path_for_node_channel(ref.node, ref.channel, tree);
-    if (path.empty()) {
-      if (error_out) *error_out = "bitjoin decode: unknown input channel";
-      return false;
-    }
-    input_paths.push_back(std::move(path));
-    input_ranges.push_back(ref.range);
-  }
-
-  bitjoin_layout layout;
-  if (!resolve_bitjoin_layout(node.op, input_paths, input_ranges, &layout, error_out)) {
+    if (error_out) *error_out = "decode_bitjoin: missing bitjoin attrs";
     return false;
   }
 
-  auto packed_it                = ctx.decompressed.find(packed_path);
-  cudf::column_view packed_view = packed_it->second->view();
+  compressed_representation const* repr = bitjoin_packed_rep(node);
+  if (!repr) {
+    if (error_out) *error_out = "bitjoin decode: missing packed rep at node " + std::to_string(nid);
+    return false;
+  }
+  auto packed = repr->decompress(stream, mr);
+  if (!packed) {
+    if (error_out) *error_out = "bitjoin decode: failed to decompress packed leaf";
+    return false;
+  }
+  cudf::column_view packed_view = packed->view();
   int64_t n_elements            = static_cast<int64_t>(packed_view.size());
 
+  std::vector<std::optional<bit_range>> input_ranges;
+  input_ranges.reserve(node.attrs.bitjoin->inputs.size());
+  for (auto const& ref : node.attrs.bitjoin->inputs)
+    input_ranges.push_back(ref.range);
+
+  bitjoin_layout layout;
+  if (!resolve_bitjoin_layout(node.op, node.input_paths, input_ranges, &layout, error_out)) {
+    return false;
+  }
+
+  // Group the fields by the source value each targets (a source may collect
+  // several bit ranges), keyed structurally by ValueId.
   struct field_ref {
     uint32_t width, src_lo, dst_lo;
   };
-  std::unordered_map<std::string, std::vector<field_ref>> by_input;
-  std::vector<std::string> input_order;
-  for (size_t fi = 0; fi < input_paths.size(); ++fi) {
-    auto& vec = by_input[input_paths[fi]];
-    if (vec.empty()) input_order.push_back(input_paths[fi]);
+  std::unordered_map<std::uint64_t, std::vector<field_ref>> by_src;
+  std::vector<ValueId> order;
+  for (size_t fi = 0; fi < node.input_sources.size(); ++fi) {
+    std::uint64_t const k = value_key(node.input_sources[fi]);
+    auto& vec             = by_src[k];
+    if (vec.empty()) order.push_back(node.input_sources[fi]);
     vec.push_back({layout.widths[fi], layout.src_los[fi], layout.dst_los[fi]});
   }
 
-  for (auto const& path : input_order) {
-    auto const& refs     = by_input.at(path);
+  for (auto const& src : order) {
+    auto const& refs     = by_src.at(value_key(src));
     uint32_t max_src_top = 0;
     for (auto const& r : refs) {
       uint32_t top = r.src_lo + r.width;
@@ -664,213 +574,104 @@ bool decode_bitjoin_node(NodeId nid, TreeDecodeCtx& ctx, std::string* error_out)
     auto field_col              = cudf::make_fixed_width_column(cudf::data_type(field_type_id),
                                                    static_cast<cudf::size_type>(n_elements),
                                                    cudf::mask_state::UNALLOCATED,
-                                                   ctx.stream,
-                                                   ctx.mr);
+                                                   stream,
+                                                   mr);
     cudaMemsetAsync(
       field_col->mutable_view().head<void>(),
       0,
       static_cast<size_t>(n_elements) * static_cast<size_t>(cudf::size_of(field_col->type())),
-      ctx.stream.value());
+      stream.value());
     for (auto const& r : refs) {
       launch_bitjoin_field(field_col->mutable_view(),
                            packed_view,
                            static_cast<int>(r.dst_lo),
                            static_cast<int>(r.src_lo),
                            r.width,
-                           ctx.stream.value());
+                           stream.value());
     }
-    ctx.decompressed[path] = std::move(field_col);
+    memo.values[value_key(src)] = std::move(field_col);
   }
-  cudaStreamSynchronize(ctx.stream.value());
-  ctx.decompressed.erase(packed_path);
+  cudaStreamSynchronize(stream.value());
   return true;
 }
 
-bool decode_node(NodeId nid, TreeDecodeCtx& ctx, std::string* error_out)
+// The single decode resolver. Reconstructs and memoises the value(s) node `nid`
+// produces on decode — its input_source(s) — and returns the primary one, keyed
+// by structural (node, port) identity so every consumer and the codegen tail
+// binders share one memo without matching path strings.
+cudf::column const* materialize(NodeId nid,
+                                PlanTree const& tree,
+                                DecodeMemo& memo,
+                                rmm::cuda_stream_view stream,
+                                rmm::device_async_resource_ref mr,
+                                std::string* error_out)
 {
-  if (ctx.skipped.count(nid)) return true;
+  PlanNode const& node  = tree.nodes[nid];
+  ValueId const primary = node.input_sources.empty() ? ValueId{nid, 0} : node.input_sources.front();
+  std::uint64_t const pk = value_key(primary);
+  if (auto it = memo.values.find(pk); it != memo.values.end() && it->second)
+    return it->second.get();
 
-  PlanTree const& tree = ctx.compound.tree;
-  PlanNode const& node = tree.nodes[nid];
-
-  for (auto const& e : node.children) {
-    if (!decode_node(e.child, ctx, error_out)) return false;
+  // bitjoin recovers all its input values from one packed leaf.
+  if (node.attrs.bitjoin.has_value()) {
+    if (!decode_bitjoin(nid, tree, memo, stream, mr, error_out)) return nullptr;
+    auto it = memo.values.find(pk);
+    return it != memo.values.end() ? it->second.get() : nullptr;
   }
 
-  if (node.attrs.bitjoin.has_value()) { return decode_bitjoin_node(nid, ctx, error_out); }
-
+  std::unique_ptr<cudf::column> col;
   if (is_codegen_compressor(node.op)) {
-    if (is_fusion_interior(nid, tree)) {
-      ctx.skipped.insert(nid);
-      return true;
-    }
-    std::string const& target = node.input_path;
-    if (target.empty()) {
-      if (error_out)
-        *error_out = "codegen decode: empty target path at node " + std::to_string(nid);
-      return false;
-    }
-    if (ctx.decompressed.find(target) != ctx.decompressed.end()) {
-      mark_subtree_nodes_skipped(nid, tree, ctx.skipped);
-      return true;
-    }
-    auto col = dispatch_codegen_subtree(nid, tree, ctx.stream, ctx.mr, ctx.decompressed, error_out);
-    if (!col) return false;
-    ctx.decompressed.emplace(target, std::move(col));
-    mark_subtree_nodes_skipped(nid, tree, ctx.skipped);
-    return true;
-  }
-
-  if (!node.output_paths.empty()) {
-    for (auto const& opath : node.output_paths) {
-      if (ctx.decompressed.find(opath) != ctx.decompressed.end()) continue;
-      auto chit = tree.nodes[nid].channels.find(opath);
-      if (chit != tree.nodes[nid].channels.end() && chit->second) {
-        auto col = chit->second->decompress(ctx.stream, ctx.mr);
-        if (!col) {
-          if (error_out) *error_out = "failed to decompress terminal channel '" + opath + "'";
-          return false;
+    // Fused op (bitpack/delta/rle/for/zigzag): one JIT kernel inverts the whole
+    // region (its rep's decompress() throws); tail slots resolve via materialize.
+    col = dispatch_codegen_subtree(nid, tree, stream, mr, memo, error_out);
+  } else if (node.rep) {
+    col = node.rep->decompress(stream, mr);
+  } else {
+    // Multi-output non-codegen op (alp/alp_rd/dictionary/bitextract): gather its
+    // outputs in port order (reconstruct matches by name). An output routed to a
+    // child edge is resolved and shared via the memo; a terminal output
+    // decompresses in place.
+    std::vector<std::string> names;
+    std::vector<std::unique_ptr<cudf::column>> outputs;
+    for (std::size_t i = 0; i < node.output_names.size(); ++i) {
+      std::string const& name = node.output_names[i];
+      auto child_it           = std::find_if(node.children.begin(),
+                                   node.children.end(),
+                                   [&](PlanEdge const& e) { return e.channel == name; });
+      if (child_it != node.children.end()) {
+        if (!materialize(child_it->child, tree, memo, stream, mr, error_out)) return nullptr;
+        auto it = memo.values.find(value_key(ValueId{nid, static_cast<ChannelId>(i)}));
+        if (it == memo.values.end() || !it->second) {
+          if (error_out && error_out->empty())
+            *error_out = "decode: output '" + name + "' unresolved at node " + std::to_string(nid);
+          return nullptr;
         }
-        ctx.decompressed.emplace(opath, std::move(col));
+        names.push_back(name);
+        outputs.push_back(std::make_unique<cudf::column>(it->second->view(), stream, mr));
         continue;
       }
-      if (!ensure_path_decoded(opath, ctx, error_out)) return false;
+      auto ch_it = node.channels.find(node.output_paths[i]);
+      if (ch_it == node.channels.end()) continue;  // not produced here
+      if (!ch_it->second) return nullptr;
+      auto c = ch_it->second->decompress(stream, mr);
+      if (!c) return nullptr;
+      names.push_back(name);
+      outputs.push_back(std::move(c));
     }
-
-    std::vector<std::unique_ptr<cudf::column>> outputs;
-    outputs.reserve(node.output_paths.size());
-    for (auto const& opath : node.output_paths) {
-      auto it = ctx.decompressed.find(opath);
-      if (it == ctx.decompressed.end()) {
-        if (error_out) *error_out = "missing decoded output '" + opath + "'";
-        return false;
-      }
-      outputs.push_back(std::move(it->second));
-      ctx.decompressed.erase(it);
+    std::string err;
+    auto rep =
+      reconstruct_representation(node.op, names, std::move(outputs), stream, mr, &err, node.meta);
+    if (!rep) {
+      if (error_out) *error_out = err;
+      return nullptr;
     }
-
-    std::unique_ptr<compressed_representation> repr;
-    {
-      nvtx3::scoped_range r_build{"build_repr:" + node.op};
-      repr = reconstruct_representation(
-        node.op, node.output_names, std::move(outputs), ctx.stream, ctx.mr, error_out, node.meta);
-    }
-    if (!repr) return false;
-
-    std::unique_ptr<cudf::column> col;
-    {
-      nvtx3::scoped_range r_final{"final_decompress:" + node.op};
-      col = repr->decompress(ctx.stream, ctx.mr);
-    }
-    ctx.kept_reprs.push_back(std::move(repr));
-    if (!col) {
-      if (error_out) *error_out = "failed to decompress '" + node.input_path + "'";
-      return false;
-    }
-    ctx.decompressed.emplace(node.input_path, std::move(col));
-    return true;
+    col = rep->decompress(stream, mr);
+    memo.kept.push_back(std::move(rep));
   }
-
-  if (auto const* repr = node_rep(nid, tree)) {
-    std::string out_path = node.rep_path.empty() ? node.input_path : node.rep_path;
-    if (ctx.decompressed.find(out_path) != ctx.decompressed.end()) return true;
-    std::unique_ptr<cudf::column> col;
-    {
-      nvtx3::scoped_range r_leaf{"leaf_decompress:" + out_path};
-      col = repr->decompress(ctx.stream, ctx.mr);
-    }
-    if (!col) {
-      if (error_out) *error_out = "failed to decompress leaf '" + out_path + "'";
-      return false;
-    }
-    ctx.decompressed.emplace(out_path, std::move(col));
-  }
-  return true;
-}
-
-bool ensure_path_decoded(std::string const& path, TreeDecodeCtx& ctx, std::string* error_out)
-{
-  if (ctx.decompressed.find(path) != ctx.decompressed.end()) return true;
-  PlanTree const& tree  = ctx.compound.tree;
-  NodeId const consumer = consumer_of_path(path, tree);
-  if (consumer < tree.nodes.size()) { return decode_node(consumer, ctx, error_out); }
-  // Path has no consumer in the tree — search all nodes for a direct rep.
-  for (NodeId nid = 0; nid < tree.nodes.size(); ++nid) {
-    auto const& tnode = tree.nodes[nid];
-    if (tnode.rep && tnode.rep_path == path) {
-      auto col = tnode.rep->decompress(ctx.stream, ctx.mr);
-      if (!col) {
-        if (error_out) *error_out = "failed to decompress leaf '" + path + "'";
-        return false;
-      }
-      ctx.decompressed.emplace(path, std::move(col));
-      return true;
-    }
-    auto cit = tnode.channels.find(path);
-    if (cit != tnode.channels.end() && cit->second) {
-      auto col = cit->second->decompress(ctx.stream, ctx.mr);
-      if (!col) {
-        if (error_out) *error_out = "failed to decompress leaf '" + path + "'";
-        return false;
-      }
-      ctx.decompressed.emplace(path, std::move(col));
-      return true;
-    }
-  }
-  if (error_out) *error_out = "decode: could not resolve path '" + path + "'";
-  return false;
-}
-
-bool decode_column_tree(TreeDecodeCtx& ctx, std::string* error_out)
-{
-  PlanTree const& tree = ctx.compound.tree;
-  if (!tree.nodes[0].children.empty()) {
-    for (auto const& e : tree.nodes[0].children) {
-      if (!decode_node(e.child, ctx, error_out)) return false;
-    }
-    return true;
-  }
-  // Fallback when structural edges are missing on the input root (the stored
-  // PlanTree from compress can be rep-only).  Seed decode from every op that
-  // consumes the column value directly.
-  bool progress = false;
-  for (NodeId i = 1; i < tree.nodes.size(); ++i) {
-    if (tree.nodes[i].input_path != "input") continue;
-    if (!decode_node(i, ctx, error_out)) return false;
-    progress = true;
-  }
-  if (!progress && error_out) { *error_out = "decompress: no op consumes path 'input'"; }
-  return progress;
-}
-
-// resolve_channel_bytes_node defined after all helpers it calls.
-std::unique_ptr<cudf::column> resolve_channel_bytes_node(NodeId nid,
-                                                         PlanTree const& tree,
-                                                         rmm::cuda_stream_view stream,
-                                                         rmm::device_async_resource_ref mr)
-{
-  PlanNode const& node = tree.nodes[nid];
-  if (node.rep) { return node.rep->decompress(stream, mr); }
-  std::vector<std::string> names;
-  std::vector<std::unique_ptr<cudf::column>> resolved;
-  for (auto const& e : node.children) {
-    auto col = resolve_channel_bytes_node(e.child, tree, stream, mr);
-    if (!col) return nullptr;
-    names.push_back(e.channel);
-    resolved.push_back(std::move(col));
-  }
-  for (auto const& [path, rep] : node.channels) {
-    if (!rep) return nullptr;
-    auto col = rep->decompress(stream, mr);
-    if (!col) return nullptr;
-    names.push_back(port_for_output_path(node, path));
-    resolved.push_back(std::move(col));
-  }
-  std::string err;
-  auto rep =
-    reconstruct_representation(node.op, names, std::move(resolved), stream, mr, &err, node.meta);
-  if (!rep) return nullptr;
-  return rep->decompress(stream, mr);
+  if (!col) return nullptr;
+  auto [it, inserted] = memo.values.emplace(pk, std::move(col));
+  (void)inserted;
+  return it->second.get();
 }
 
 }  // namespace
@@ -888,11 +689,26 @@ std::unique_ptr<cudf::column> decompress_column(plan_compound const& compound,
     return nullptr;
   }
 
-  TreeDecodeCtx ctx{compound, {}, {}, {}, stream, mr};
-  if (!decode_column_tree(ctx, error_out)) return nullptr;
+  // The result is the input value (node 0, port 0), produced by whichever op(s)
+  // consume it. Materialize those; fall back to a scan when the root carries no
+  // structural edges (a rep-only tree).
+  DecodeMemo memo;
+  std::uint64_t const input_key = value_key(ValueId{0, 0});
+  for (auto const& e : tree.nodes[0].children) {
+    if (memo.values.count(input_key)) break;
+    if (!materialize(e.child, tree, memo, stream, mr, error_out)) return nullptr;
+  }
+  if (!memo.values.count(input_key)) {
+    for (NodeId nid = 1; nid < tree.nodes.size() && !memo.values.count(input_key); ++nid) {
+      bool consumes_input = false;
+      for (auto const& src : tree.nodes[nid].input_sources)
+        if (src.node == 0 && src.channel == 0) consumes_input = true;
+      if (consumes_input && !materialize(nid, tree, memo, stream, mr, error_out)) return nullptr;
+    }
+  }
 
-  auto root_it = ctx.decompressed.find("input");
-  if (root_it == ctx.decompressed.end()) {
+  auto root_it = memo.values.find(input_key);
+  if (root_it == memo.values.end() || !root_it->second) {
     if (error_out) *error_out = "decompression completed but 'input' column not reconstructed";
     return nullptr;
   }
@@ -904,53 +720,4 @@ std::unique_ptr<cudf::column> decompress_column(plan_compound const& compound,
 
 // ---------------------------------------------------------------------------
 // plan_compound_from_leaves
-// ---------------------------------------------------------------------------
-// Reconstruct a plan_compound from a DSL string and a pre-built path→rep map.
-// Used by the IO read path after it has deserialized and allocated each rep.
-
-std::unique_ptr<plan_compound> plan_compound_from_leaves(
-  std::string plan_dsl,
-  std::unordered_map<std::string, std::unique_ptr<compressed_representation>> leaves,
-  std::string* error_out)
-{
-  auto compound      = std::make_unique<plan_compound>();
-  compound->plan_dsl = std::move(plan_dsl);
-
-  std::string err;
-  PlanPathMap path_map;
-  auto tree = plan_tree_from_dsl(compound->plan_dsl, &err, &path_map);
-  if (!tree) {
-    if (error_out) *error_out = "plan_compound_from_leaves: " + err;
-    return nullptr;
-  }
-  compound->tree = std::move(*tree);
-
-  // Assign each leaf to its owning node slot in two passes so that a path
-  // which is simultaneously an input_path of one node AND an output_path of
-  // its parent (e.g. "for.deltas" consumed by bitpack but listed in for's
-  // output_paths) is always claimed as node.rep of the consuming node first,
-  // rather than being stolen into the parent's channels.
-  //
-  // Pass 1: node.rep ← rep keyed by node.input_path (consuming path).
-  for (auto& node : compound->tree.nodes) {
-    auto it = leaves.find(node.input_path);
-    if (it != leaves.end() && it->second) {
-      node.rep      = std::move(it->second);
-      node.rep_path = node.input_path;
-      node.meta     = node.rep->describe_meta();
-    }
-  }
-  // Pass 2: node.channels ← reps keyed by output_paths (terminal leaves only;
-  // paths already claimed by a consuming node's rep are gone from the map).
-  for (auto& node : compound->tree.nodes) {
-    for (auto const& out_path : node.output_paths) {
-      auto ch_it = leaves.find(out_path);
-      if (ch_it != leaves.end() && ch_it->second) {
-        node.channels.emplace(out_path, std::move(ch_it->second));
-      }
-    }
-  }
-  return compound;
-}
-
 }  // namespace simpatico

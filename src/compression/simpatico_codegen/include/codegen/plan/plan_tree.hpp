@@ -3,6 +3,7 @@
 #define CODEGEN_PLAN_TREE_HPP
 
 #include "codegen/plan/leaf_desc.hpp"
+#include "codegen/plan/operator_registry.hpp"  // ChannelId
 #include "codegen/plan/plan_dsl.hpp"
 #include "codegen/plan/representation.hpp"
 
@@ -21,6 +22,14 @@ namespace simpatico {
 struct compressed_representation;
 
 using NodeId = std::uint32_t;
+
+// Structural identity of a dataflow value: the (producing node, output port) it
+// leaves on. Decode keys and resolves values by this, never by a path string.
+// Node 0 port 0 is the column input.
+struct ValueId {
+  NodeId node       = 0;
+  ChannelId channel = 0;
+};
 
 struct PlanEdge {
   std::string channel;
@@ -64,6 +73,11 @@ struct PlanNode {
   // list. Lets the forward compress walk run an op straight from its node.
   std::vector<std::string> input_paths;
   std::vector<std::optional<bit_range>> input_ranges;
+
+  // Structural identity of each value this op consumes, in input_paths order:
+  // the (node, port) each input is produced on. This is what decode resolves
+  // against, so it never has to match DSL path strings across nodes.
+  std::vector<ValueId> input_sources;
 
   // Node-owned compressed representations. Two storage slots cover every shape:
   //
@@ -111,7 +125,19 @@ std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps
                                              std::string* error_out = nullptr,
                                              PlanPathMap* path_map  = nullptr);
 
+// Populate every node's input_sources from the tree's edge wiring (and bitjoin
+// attrs, which carry input order). Called after the tree is built from the DSL
+// or deserialized, so decode has structural value identity without path
+// strings.
+void compute_input_sources(PlanTree& tree);
+
 std::string dotted_label(PlanTree const& tree, NodeId node);
+
+// Render a PlanTree back to plan DSL text (the inverse of plan_tree_from_dsl).
+// Paths are derived structurally from the edge wiring, so this works on a tree
+// deserialized from disk (which carries no DSL). Round-trips through
+// parse_plan_dsl to an equivalent tree.
+std::string render_plan_tree(PlanTree const& tree);
 
 }  // namespace simpatico
 

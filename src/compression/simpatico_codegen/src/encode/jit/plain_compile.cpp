@@ -82,7 +82,7 @@ CompiledKernel compile_plain_kernel(const std::string& source,
   NVRTC_OR_THROW(
     nvrtcCreateProgram(&prog, source.c_str(), "codegen_jit_encode.cu", 0, nullptr, nullptr));
 
-  // Plain CUDA — no tile flags, no -default-device, no _CODEGEN_CODEGEN_JIT.
+  // Plain CUDA — no -default-device, no _CODEGEN_CODEGEN_JIT.
   // The encode kernels include a small set of CUDA headers directly
   // (cstdint, climits, cuda_runtime.h) — we still pass the same -I
   // set so they can pull in cuda/std/* if a future helper wants to.
@@ -146,6 +146,15 @@ CompiledKernel compile_plain_kernel(const std::string& source,
     }
   }
 
+  return load_kernel_from_cubin(std::move(cubin), entry_symbol, source);
+}
+
+CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
+                                      const std::string& entry_symbol,
+                                      std::string rendered_source)
+{
+  if (cubin.empty()) { throw std::runtime_error("load_kernel_from_cubin: empty cubin"); }
+
   ::codegen::jit::ensure_cuda_context();
   CUlibrary lib = nullptr;
   CU_OR_THROW(cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
@@ -168,7 +177,7 @@ CompiledKernel compile_plain_kernel(const std::string& source,
   out.library         = lib;
   out.func            = fn;
   out.cubin           = std::move(cubin);
-  out.rendered_source = source;
+  out.rendered_source = std::move(rendered_source);
   return out;
 }
 

@@ -317,29 +317,32 @@ std::size_t table_input_bytes(cudf::table_view tv)
 
 // ── Compressed size ─────────────────────────────────────────────────────────────
 
-std::size_t rep_bytes(simpatico::compressed_representation const* rep)
+std::size_t rep_bytes(simpatico::compressed_representation const* rep,
+                      rmm::cuda_stream_view stream = cudf::get_default_stream())
 {
-  return rep ? rep->compressed_size_bytes() : 0;
+  return rep ? rep->compressed_size_bytes(stream) : 0;
 }
 
-std::size_t compound_compressed_bytes(plan_compound const& compound)
+std::size_t compound_compressed_bytes(plan_compound const& compound,
+                                      rmm::cuda_stream_view stream = cudf::get_default_stream())
 {
   std::size_t total = 0;
   for (auto const& node : compound.tree.nodes) {
-    total += rep_bytes(node.rep.get());
+    total += rep_bytes(node.rep.get(), stream);
     for (auto const& [path, rep] : node.channels) {
       (void)path;
-      total += rep_bytes(rep.get());
+      total += rep_bytes(rep.get(), stream);
     }
   }
   return total;
 }
 
-std::size_t compressed_table_bytes(compressed_table const& ct)
+std::size_t compressed_table_bytes(compressed_table const& ct,
+                                   rmm::cuda_stream_view stream = cudf::get_default_stream())
 {
   std::size_t total = 0;
   for (auto const& col : ct.columns) {
-    if (col.compound) total += compound_compressed_bytes(*col.compound);
+    if (col.compound) total += compound_compressed_bytes(*col.compound, stream);
   }
   return total;
 }

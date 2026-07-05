@@ -11,6 +11,7 @@
 #include "codegen/jit/nvrtc_compiler.hpp"  // for CompileOptions, CompileError, CompiledKernel
 
 #include <string>
+#include <vector>
 
 namespace codegen::encode::jit {
 
@@ -40,5 +41,16 @@ using ::codegen::jit::CompileOptions;
 CompiledKernel compile_plain_kernel(const std::string& source,
                                     const std::string& entry_symbol,
                                     const CompileOptions& opts = {});
+
+// Build a launchable CompiledKernel from an already-compiled cubin (skips
+// nvrtc). Used by the persistent kernel cache to load a cubin read from disk.
+// `rendered_source` is carried into the result only for diagnostics; it does
+// not have to be the exact source the cubin was compiled from.
+//
+// Throws std::runtime_error on any driver-API failure (bad/incompatible
+// cubin), so callers can catch and fall back to a fresh compile.
+CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
+                                      const std::string& entry_symbol,
+                                      std::string rendered_source = {});
 
 }  // namespace codegen::encode::jit

@@ -68,4 +68,11 @@ std::unique_ptr<cudf::column> snappy_compressor::decompress(compressed_represent
   return r->decompress(stream, mr);
 }
 
+namespace detail {
+void release_snappy_manager_scratch()
+{
+  if (tls_snappy_mgr.mgr) tls_snappy_mgr.mgr->deallocate_gpu_mem();
+}
+}  // namespace detail
+
 }  // namespace simpatico

@@ -72,4 +72,11 @@ std::unique_ptr<cudf::column> deflate_compressor::decompress(compressed_represen
   return r->decompress(stream, mr);
 }
 
+namespace detail {
+void release_deflate_manager_scratch()
+{
+  if (tls_deflate_mgr.mgr) tls_deflate_mgr.mgr->deallocate_gpu_mem();
+}
+}  // namespace detail
+
 }  // namespace simpatico

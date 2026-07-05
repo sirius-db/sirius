@@ -14,7 +14,7 @@
 // not a synthetic-string stand-in.
 //
 // We don't *launch* the kernels here — that's covered by the JIT
-// roundtrip tests (test_jit_roundtrip / test_shape_parity) and the
+// roundtrip tests (test_jit_roundtrip / test_fused_operator_sweep) and the
 // end-to-end cpp bridge tests on the simulator side.  This file's job
 // is to prove cache plumbing.
 

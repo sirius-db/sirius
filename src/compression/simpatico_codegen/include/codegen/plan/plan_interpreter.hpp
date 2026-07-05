@@ -20,11 +20,10 @@
 namespace simpatico {
 
 struct plan_compound {
-  std::string plan_dsl;
-
   // Canonical plan structure (one node per op, named-edge wiring). Owns every
   // compressed representation: each op's rep lives on its node
-  // (`PlanNode::rep` / `PlanNode::channels`).
+  // (`PlanNode::rep` / `PlanNode::channels`). Render back to DSL text on demand
+  // via render_plan_tree(tree).
   PlanTree tree;
 };
 
@@ -75,6 +74,23 @@ std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
                                                rmm::device_async_resource_ref mr,
                                                std::string* error_out);
 
+/// Compress a single column with ONE operator and return the resulting
+/// ``compressed_representation``.  A thin wrapper for the BFS explorer:
+///
+/// * Non-fused (identity, dictionary, alp, ans, snappy, lz4, …): delegates
+///   to ``make_compressor(op_name)->compress()``.
+/// * Fused (delta / rle / bitpack / for / zigzag): builds a single-node
+///   PlanTree and invokes ``jit_encode_subtree``.
+///
+/// Returns nullptr and sets ``*error_out`` on failure.  The caller can then
+/// use ``compressed_representation::named_channels()`` for BFS child outputs
+/// and ``compressed_representation::compressed_size_bytes()`` for scoring.
+std::unique_ptr<compressed_representation> compress_single_op(std::string const& op_name,
+                                                              cudf::column_view input,
+                                                              rmm::cuda_stream_view stream,
+                                                              rmm::device_async_resource_ref mr,
+                                                              std::string* error_out);
+
 /// Decompress a compound produced by compress_column.  A single post-order
 /// walk over the plan tree: each codegen-fused subtree root is inverted by one
 /// JIT-compiled kernel (``dispatch_codegen_subtree``) and every other step by
@@ -83,14 +99,6 @@ std::unique_ptr<cudf::column> decompress_column(plan_compound const& compound,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
                                                 std::string* error_out);
-
-/// Reconstruct a plan_compound from a DSL string and a pre-built map of
-/// path → compressed_representation leaves (as produced by the IO read path).
-/// Returns nullptr and sets *error_out on failure.
-std::unique_ptr<plan_compound> plan_compound_from_leaves(
-  std::string plan_dsl,
-  std::unordered_map<std::string, std::unique_ptr<compressed_representation>> leaves,
-  std::string* error_out = nullptr);
 
 /// Reconstruct a compressed_representation from named output columns. A thin
 /// dispatcher mapping the compressor name (or the ``bitextract_<spec>`` prefix)

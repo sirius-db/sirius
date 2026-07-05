@@ -10,9 +10,10 @@
 //   1. synthesize_decode_transients adds decode-only buffers the encoder does
 //      not store: Bitpack's bp_offsets cumsum (CUB ExclusiveSum + 1-thread tail
 //      patch, see offsets_cumsum.cu) and RLE scratch, into RMM-pool transients.
-//   2. KernelCache::get_or_compile resolves shape -> CUfunction (keyed on the
-//      rendered C++ type expression, so a shape hits the cache across compress
-//      and decompress). First touch pays the nvrtc compile; warm hits are cheap.
+//   2. KernelCache::get_or_compile_plain resolves shape -> CUfunction (keyed
+//      on a hash of the rendered CUDA source, so a shape hits the cache
+//      across compress and decompress). First touch pays the nvrtc compile;
+//      warm hits are cheap.
 //   3. cuLaunchKernel binds the labeled buffers as flat per-field device
 //      pointers in the kernel's parameter order, runs over the rendered
 //      __global__ kernel, syncs the stream, and frees the transients.
@@ -319,6 +320,12 @@ int run_rendered_decode(const jit::FusedTree& tree,
     return -1;
   }
   lap("render");
+  if (const char* dump = std::getenv("CODEGEN_JIT_DUMP_DECODE_SOURCE")) {
+    if (FILE* fp = std::fopen(dump, "w")) {
+      std::fwrite(spec.source.data(), 1, spec.source.size(), fp);
+      std::fclose(fp);
+    }
+  }
 
   jit::CompileOptions opts;
   opts.arch_cc = detect_arch_cc();
@@ -543,8 +550,8 @@ int decode_fused_subtree(codegen::jit::FusedTree const& tree,
 //                 for the sparse rep ctor.
 //   6. Construct the appropriate rep per node at its DSL path, move
 //      ownership of the rmm::device_buffers into the cudf::columns.
-//      Bitpack reps are constructed sparse; the writer / tail codecs
-//      get dense bytes lazily via ``packed_view_for_export()``.
+//      Bitpack reps are born sparse (OverAllocate) then eagerly
+//      compacted in place, so the writer / tail codecs see dense bytes.
 //   7. Reps land in ``builder.leaves`` (path-keyed). Entropy tails / chained
 //      steps on the region's boundary outputs are scheduled by the recursive
 //      compress walk (plan/compress.cpp), not here.
@@ -645,6 +652,12 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
     } catch (const cje::RenderError& e) {
       std::fprintf(stderr, "simpatico::codegen: cpp encode: render rejected shape: %s\n", e.what());
       return 0;  // walker can't emit this shape — try legacy
+    }
+    if (const char* dump = std::getenv("CODEGEN_JIT_DUMP_ENCODE_SOURCE")) {
+      if (FILE* fp = std::fopen(dump, "w")) {
+        std::fwrite(spec.source.data(), 1, spec.source.size(), fp);
+        std::fclose(fp);
+      }
     }
 
     // Compile via the shared in-process cache.  Cold path runs nvrtc
@@ -757,7 +770,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           // (128-byte stride keeps each shard on a separate L2 cache line).
           // DtoH only 16 × 32 × 4 = 2048 bytes (vs num_chunks × 4 bytes before).
           // The device buffer is NOT needed after this — live_packed_bytes is
-          // all the caller requires; the compact_into() pipeline reconstructs
+          // all the caller requires; the compact_in_place() pipeline reconstructs
           // per-chunk offsets from chunk_bits/chunk_count on demand.
           constexpr std::size_t kMaxBitsShards = 16;
           constexpr std::size_t kShardStride   = 32;
@@ -819,9 +832,8 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
 
           // Construct the OverAllocate (sparse) rep from the encode
           // kernel's output, then EAGERLY compact it so every fused
-          // subtree's bitpack output is born Compact (dense).  This
-          // retires the lazy packed_view_for_export() compaction and
-          // lets decode take the uniform Compact path: the binder leaves
+          // subtree's bitpack output is born Compact (dense).  This lets
+          // decode take the uniform Compact path: the binder leaves
           // node.fixed_stride=false (is_sparse() is now false) and
           // synthesize_decode_transients() rebuilds bp_offsets on-device
           // from chunk_count × chunk_bits.
@@ -830,7 +842,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           // doing a sync+scan partway through the encode to obtain the
           // per-chunk offsets + the exact output size, then packing tight
           // directly in the encode kernel, and measure whether that beats
-          // this post-encode compact_into scan+gather.
+          // this post-encode compact_in_place scan+gather.
           auto rep = std::make_unique<simpatico::bitpack_compressed_representation>(
             original_type,
             static_cast<cudf::size_type>(num_rows),
@@ -844,8 +856,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           // Compact bytes and reuses the meta columns (no clone).
           rep->compact_in_place(stream, mr);
           // compact_in_place() gathers on ``stream``; sync so the dense bytes
-          // are safe to read from any stream — the same guarantee the lazy
-          // packed_view_for_export() provided before exposing the pointer.
+          // are safe to read from any stream before the pointer is exposed.
           if (cudaError_t cr = cudaStreamSynchronize(stream.value()); cr != cudaSuccess) {
             std::fprintf(stderr,
                          "simpatico::codegen: cpp encode: bitpack eager-compact sync "
@@ -860,12 +871,23 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
 
         case cc::OpKind::Delta: {
           const auto i_first = find_buffer_idx(spec.buffers, node_id, "delta_first");
-          auto first_col     = std::make_unique<cudf::column>(original_type,
+          // delta_first's width follows the rendered buffer, not a blanket
+          // original_type — Delta may be nested under a channel with a
+          // different width than the column (e.g. rle's always-int32
+          // "runs"), same reasoning as the Raw-passthrough fix above.
+          const std::int32_t first_elem_size =
+            static_cast<std::int32_t>(spec.buffers[i_first].elem_size);
+          const cudf::data_type first_elem_type =
+            (first_elem_size == static_cast<std::int32_t>(cudf::size_of(original_type)))
+              ? original_type
+            : (first_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+                                     : cudf::data_type(cudf::type_id::INT32);
+          auto first_col = std::make_unique<cudf::column>(first_elem_type,
                                                           static_cast<cudf::size_type>(num_chunks),
                                                           std::move(bufs[i_first]),
                                                           rmm::device_buffer(0, stream),
                                                           0);
-          auto rep           = std::make_unique<simpatico::codegen_fused_representation>(
+          auto rep       = std::make_unique<simpatico::codegen_fused_representation>(
             "delta", original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("delta_first", std::move(first_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -928,15 +950,27 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
         }
 
         case cc::OpKind::For: {
-          // `references` holds num_chunks per-chunk minimums (same dtype as
-          // the column).  The buffer layout is flat: references[chunk_id].
+          // `references` holds num_chunks per-chunk minimums, normally the
+          // same dtype as the column — but its width follows the rendered
+          // buffer, not a blanket original_type, since For may be nested
+          // under a channel with a different width than the column (e.g.
+          // rle's always-int32 "runs"), same reasoning as the
+          // Raw-passthrough fix above. Buffer layout is flat:
+          // references[chunk_id].
           const auto i_refs = find_buffer_idx(spec.buffers, node_id, "references");
-          auto refs_col     = std::make_unique<cudf::column>(original_type,
+          const std::int32_t refs_elem_size =
+            static_cast<std::int32_t>(spec.buffers[i_refs].elem_size);
+          const cudf::data_type refs_elem_type =
+            (refs_elem_size == static_cast<std::int32_t>(cudf::size_of(original_type)))
+              ? original_type
+            : (refs_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+                                    : cudf::data_type(cudf::type_id::INT32);
+          auto refs_col = std::make_unique<cudf::column>(refs_elem_type,
                                                          static_cast<cudf::size_type>(num_chunks),
                                                          std::move(bufs[i_refs]),
                                                          rmm::device_buffer(0, stream),
                                                          0);
-          auto rep          = std::make_unique<simpatico::codegen_fused_representation>(
+          auto rep      = std::make_unique<simpatico::codegen_fused_representation>(
             "for", original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("references", std::move(refs_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -988,23 +1022,25 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           //     per-chunk start + total element count, so we scatter → compact
           //     via simpatico_compact_raw_values.
           //
-          // Element type:
-          //   rle.runs  → always INT32 (run counts).
-          //   all others → original_type.
+          // Element width/type follow the actual rendered buffer, not a
+          // blanket original_type derived from the outer column alone: this
+          // node's input may be a channel with a different width than the
+          // column (e.g. delta/for nested under rle's always-int32 "runs"
+          // channel renders 4-byte elements even when the column is i64/f64).
+          // The renderer already resolves each node's own dtype correctly —
+          // this mirrors the fix already applied to bitpack's chunk_min
+          // above (spec.buffers[i_min].elem_size) instead of re-deriving
+          // width from a "is this channel literally named 'runs'" special
+          // case plus original_type.
 
           const bool is_fixed_stride = (origin.parent_op == "for" || origin.parent_op == "delta");
 
-          // For rle.runs the kernel emits int32 counts; for every other channel
-          // the element type matches the column's original_type.
-          const bool is_runs_channel = (origin.parent_channel == "runs");
+          const auto i_data            = find_buffer_idx(spec.buffers, node_id, "data");
+          const std::int32_t elem_size = static_cast<std::int32_t>(spec.buffers[i_data].elem_size);
           const cudf::data_type data_elem_type =
-            is_runs_channel ? cudf::data_type(cudf::type_id::INT32) : original_type;
-          const std::int32_t elem_size =
-            static_cast<std::int32_t>(is_runs_channel                                ? 4
-                                      : (original_type.id() == cudf::type_id::INT64) ? 8
-                                                                                     : 4);
-
-          const auto i_data = find_buffer_idx(spec.buffers, node_id, "data");
+            (elem_size == static_cast<std::int32_t>(cudf::size_of(original_type))) ? original_type
+            : (elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+                               : cudf::data_type(cudf::type_id::INT32);
 
           if (is_fixed_stride) {
             // ─── Fixed-stride Raw (FOR deltas / Delta differences) ─────────

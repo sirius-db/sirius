@@ -68,16 +68,16 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
   }
 
   if (node.op == "rle") {
-    PlanEdge const* runs = find_edge(node, "runs");
-    if (runs == nullptr) return nullptr;  // runs child required
+    PlanEdge const* runs   = find_edge(node, "runs");
     PlanEdge const* values = find_edge(node, "values");
     auto t                 = jit::FusedTree::make(OpKind::Rle);
     out.preorder.push_back({t.get(), nid, false, 0});
     // Children appended in ascending child-key order: "runs" < "values".
 
     // runs — dual-mode: fuse a codegen child, or synthesize Raw passthrough.
+    // Like values, a missing edge (terminal run-count storage) is valid.
     std::shared_ptr<jit::FusedTree> runs_child;
-    if (is_codegen_compressor(tree.nodes[runs->child].op)) {
+    if (runs != nullptr && is_codegen_compressor(tree.nodes[runs->child].op)) {
       runs_child = build_rec(tree, runs->child, fixed_stride, out);
       if (!runs_child) return nullptr;
     } else {

@@ -7,6 +7,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -92,7 +93,10 @@ struct compressed_representation {
   /// serving both the compress/writer side (further-compress a channel, sum
   /// wire size) and the decode-side JIT gather.
   ///
-  virtual std::vector<compressible_output> named_channels() const { return {}; }
+  virtual std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const
+  {
+    return {};
+  }
   /// Release ownership of a named output. Returns nullptr if not supported or name not found.
   /// This avoids copying when the output is a leaf and the representation already owns the data.
   ///
@@ -108,12 +112,21 @@ struct compressed_representation {
   /// Wire size in bytes (tight Compact layout). Default sums each dense
   /// named_channels channel; override when actual size is tracked out-of-band
   /// (e.g. sparse BITPACK OverAllocate buffers).
-  virtual size_t compressed_size_bytes() const
+  virtual size_t compressed_size_bytes(rmm::cuda_stream_view stream) const
   {
     size_t total = 0;
-    for (auto const& o : named_channels()) {
-      total +=
-        static_cast<size_t>(o.view.size()) * static_cast<size_t>(cudf::size_of(o.view.type()));
+    for (auto const& o : named_channels(stream)) {
+      // cudf::size_of() only supports fixed-width types (e.g. dictionary's
+      // fast-mode "keys" channel is a raw STRING column) — account for
+      // offsets + chars directly instead of calling it on a STRING view.
+      if (o.view.type().id() == cudf::type_id::STRING) {
+        cudf::strings_column_view scv(o.view);
+        total += static_cast<size_t>(o.view.size() + 1) * sizeof(int32_t) +
+                 static_cast<size_t>(scv.chars_size(stream));
+      } else {
+        total +=
+          static_cast<size_t>(o.view.size()) * static_cast<size_t>(cudf::size_of(o.view.type()));
+      }
     }
     return total;
   }
@@ -149,7 +162,7 @@ struct identity_compressed_representation : compressed_representation {
     if (col == nullptr) return nullptr;
     return std::make_unique<cudf::column>(*col, stream, mr);
   }
-  std::vector<compressible_output> named_channels() const override
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
     if (col == nullptr) return {};
     return {{"data", col->view()}};
@@ -234,7 +247,7 @@ struct dictionary_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels() const override
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override
   {
     std::vector<compressible_output> outputs;
 
@@ -254,32 +267,24 @@ struct dictionary_compressed_representation : compressed_representation {
     // For keys_chars, we need to create a UINT8 column since chars are not a column child in modern
     // cuDF
     if (!keys_chars_copy) {
-      // Use a private non-blocking stream for this one-time D2D copy.
-      // The producing compress stream is always synced before named_channels()
-      // is called (see emit_generic_node), so the source data is coherent.
-      struct CudaStreamGuard {
-        cudaStream_t s = nullptr;
-        ~CudaStreamGuard()
-        {
-          if (s) cudaStreamDestroy(s);
-        }
-      } guard;
-      if (cudaStreamCreateWithFlags(&guard.s, cudaStreamNonBlocking) != cudaSuccess) return outputs;
-      rmm::cuda_stream_view sv(guard.s);
+      // The resulting column's device_buffer remembers ``stream`` for its own
+      // eventual deallocation, so the caller-supplied stream must stay valid
+      // for the column's lifetime (a private stream destroyed at the end of
+      // this scope would leave a dangling handle).
       auto mr                      = rmm::mr::get_current_device_resource_ref();
-      auto [chars_ptr, chars_size] = get_dictionary_keys_chars_info(dict_view, sv);
+      auto [chars_ptr, chars_size] = get_dictionary_keys_chars_info(dict_view, stream);
       if (chars_ptr != nullptr && chars_size > 0) {
         keys_chars_copy = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
                                                         static_cast<cudf::size_type>(chars_size),
                                                         cudf::mask_state::UNALLOCATED,
-                                                        sv,
+                                                        stream,
                                                         mr);
         cudaMemcpyAsync(keys_chars_copy->mutable_view().head<void>(),
                         chars_ptr,
                         chars_size,
                         cudaMemcpyDeviceToDevice,
-                        guard.s);
-        cudaStreamSynchronize(guard.s);
+                        stream.value());
+        cudaStreamSynchronize(stream.value());
       }
     }
     if (keys_chars_copy) { outputs.push_back({"keys_chars", keys_chars_copy->view()}); }
@@ -419,7 +424,7 @@ struct bitpack_compressed_representation : compressed_representation {
       "bitpack_compressed_representation: reconstruct via the codegen decode "
       "path, not C++ decompress()");
   }
-  std::vector<compressible_output> named_channels() const override
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
     std::vector<compressible_output> outs;
     outs.reserve(4);
@@ -431,7 +436,7 @@ struct bitpack_compressed_representation : compressed_representation {
     if (packed) { outs.push_back({"packed", packed->view()}); }
     return outs;
   }
-  size_t compressed_size_bytes() const override
+  size_t compressed_size_bytes(rmm::cuda_stream_view) const override
   {
     size_t total = 0;
     if (chunk_min) {
@@ -503,10 +508,10 @@ struct ans_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels() const override;
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override;
 
   // compressed_size is known at construction — no need to build the lazy column.
-  size_t compressed_size_bytes() const override { return compressed_size; }
+  size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
 
   std::unique_ptr<cudf::column> release_output(std::string const& name) override
   {
@@ -574,10 +579,10 @@ struct bitcomp_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels() const override;
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override;
 
   // compressed_size is known at construction — no need to build the lazy column.
-  size_t compressed_size_bytes() const override { return compressed_size; }
+  size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
 
   std::unique_ptr<cudf::column> release_output(std::string const& name) override
   {
@@ -666,9 +671,9 @@ struct cascaded_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels() const override;
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override;
 
-  size_t compressed_size_bytes() const override { return compressed_size; }
+  size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
 
   std::unique_ptr<cudf::column> release_output(std::string const& name) override
   {
@@ -735,7 +740,7 @@ struct nvcomp_simple_rep_base : compressed_representation {
   {
   }
 
-  size_t compressed_size_bytes() const override { return compressed_size; }
+  size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
 
   std::unique_ptr<cudf::column> release_output(std::string const& name) override
   {
@@ -750,32 +755,27 @@ struct nvcomp_simple_rep_base : compressed_representation {
 
   // named_channels() is identical for all simple nvcomp reps: lazy D2D copy
   // of the compressed payload into a UINT8 column.
-  std::vector<compressible_output> named_channels() const override
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override
   {
     if (!serialized_output) {
-      struct CudaStreamGuard {
-        cudaStream_t s = nullptr;
-        ~CudaStreamGuard()
-        {
-          if (s) cudaStreamDestroy(s);
-        }
-      } guard;
-      if (cudaStreamCreateWithFlags(&guard.s, cudaStreamNonBlocking) != cudaSuccess) return {};
-      rmm::cuda_stream_view sv(guard.s);
+      // The resulting column's device_buffer remembers ``stream`` for its own
+      // eventual deallocation, so the caller-supplied stream must stay valid
+      // for the column's lifetime (a private stream destroyed at the end of
+      // this scope would leave a dangling handle).
       auto mr  = rmm::mr::get_current_device_resource_ref();
       auto out = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
                                                static_cast<cudf::size_type>(compressed_size),
                                                cudf::mask_state::UNALLOCATED,
-                                               sv,
+                                               stream,
                                                mr);
       if (compressed_size > 0 && compressed_data) {
         cudaMemcpyAsync(out->mutable_view().head<uint8_t>(),
                         compressed_data->data(),
                         compressed_size,
                         cudaMemcpyDeviceToDevice,
-                        guard.s);
+                        stream.value());
       }
-      cudaStreamSynchronize(guard.s);
+      cudaStreamSynchronize(stream.value());
       serialized_output = std::move(out);
     }
     return {{"output", serialized_output->view()}};
@@ -886,7 +886,7 @@ struct alp_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels() const override
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
     return {
       {"integers", integers->view()},
@@ -954,7 +954,7 @@ struct alp_rd_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels() const override
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
     return {
       {"right_parts", right_parts->view()},
@@ -1097,7 +1097,7 @@ inline std::string bitextract_canonical_name(std::string const& compressor)
 {
   auto suffix = strip_bitextract_prefix(compressor);
   if (!suffix) return compressor;
-  if (*suffix == "f16" || *suffix == "f32" || *suffix == "f64") return compressor;
+  if (*suffix == "f32" || *suffix == "f64") return compressor;
   if (suffix->empty() || std::isdigit(static_cast<unsigned char>((*suffix)[0]))) {
     return compressor;  // generic form, no type prefix to strip
   }
@@ -1147,14 +1147,21 @@ inline std::vector<bitfield_spec> parse_bitfield_list(std::string_view fields_su
 }
 
 /// Parse a bitextract spec. Accepted forms:
-///   - alias              "f16" / "f32" / "f64"
+///   - alias              "f32" / "f64"
 ///   - generic            "3hi_5lo"                 (output type defaults to smallest uintN that
 ///   fits)
 ///   - typed              "i16_3hi_5lo" / "u32_4a_4b_24c"
 /// On failure returns a result with empty fields.
+///
+/// "f16" is deliberately not an accepted alias here (unlike parse_bitjoin_spec):
+/// cudf has no native FLOAT16 storage, so there is no genuine 16-bit-wide
+/// column to split — bitextract needs its input to actually be the width the
+/// spec assumes, which only holds for f32/f64.
 inline bitextract_spec_result parse_bitextract_spec(std::string_view suffix)
 {
-  if (auto alias = parse_float_alias(suffix)) return *alias;
+  if (suffix != "f16") {
+    if (auto alias = parse_float_alias(suffix)) return *alias;
+  }
 
   // Optional leading packed-type token: unambiguous because field tokens
   // always start with a digit (`<bits><name>`).
@@ -1245,7 +1252,7 @@ struct bitextract_compressed_representation : compressed_representation {
   {
   }
 
-  std::vector<compressible_output> named_channels() const override
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
     std::vector<compressible_output> out;
     out.reserve(spec.fields.size());
@@ -1320,7 +1327,7 @@ struct codegen_fused_representation : compressed_representation {
   }
 
   // File writer / codegen gather: expose all manifest buffers (all dense).
-  std::vector<compressible_output> named_channels() const override
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
     std::vector<compressible_output> out;
     out.reserve(buffers.size());

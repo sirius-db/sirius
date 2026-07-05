@@ -165,7 +165,7 @@ int simpatico_compute_rle_offsets_inclusive_scan(void* d_rle_offsets_v,  // int3
 // Compute per-chunk live word counts on-device:
 //   live_words[c] = (chunk_count[c] * chunk_bits[c] + 31) / 32
 //   live_words[c] = 1                                   when count[c] == 0
-// Used by compact_into() when the per-chunk live_words array is absent
+// Used by compact_in_place() when the per-chunk live_words array is absent
 // (e.g. the encoder used sharded atomics instead of a per-chunk write).
 //
 // The empty-chunk -> 1 sentinel MUST match both the encoder's lw_shards

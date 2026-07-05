@@ -10,6 +10,7 @@
 // ``bitextract_<spec>`` prefix) to the matching subclass factory. Every place
 // that has raw stored channels and needs a typed rep funnels through here.
 
+#include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 
@@ -597,9 +598,12 @@ std::unique_ptr<compressed_representation> deflate_compressed_representation::fr
 }
 
 // ── thin dispatcher ───────────────────────────────────────────────────────────
-// Maps a compressor name (or the ``bitextract_<spec>`` prefix) to the matching
-// rep subclass's ``from_outputs`` factory. External linkage (called by the
-// decode driver and the future file-read/deserialize path).
+// Resolves a compressor name to its OpId (via the operator registry, so all
+// parameterised suffix forms are handled uniformly) and dispatches to the
+// matching rep subclass's ``from_outputs`` factory. External linkage (called by
+// the decode driver and the file-read/deserialize path). The fused ops
+// (delta/rle/for/zigzag) have no standalone reconstruction — they are inverted
+// by the codegen decode path — and report ``unsupported`` here.
 std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,
@@ -609,63 +613,66 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string* error_out,
   leaf_meta_v const& meta)
 {
-  if (compressor_name == "identity")
-    return identity_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out);
-  if (compressor_name == "dictionary")
-    return dictionary_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out);
-  if (compressor_name == "bitpack")
-    return bitpack_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out);
-  if (compressor_name == "alp")
-    return alp_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out);
-  if (compressor_name == "alp_rd")
-    return alp_rd_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out);
-  if (auto suffix = strip_bitextract_prefix(compressor_name)) {
-    auto spec = parse_bitextract_spec(*suffix);
-    if (spec.fields.empty()) {
-      if (error_out) *error_out = "bitextract: bad spec in '" + compressor_name + "'";
-      return nullptr;
+  auto const unsupported = [&]() -> std::unique_ptr<compressed_representation> {
+    if (error_out) {
+      *error_out = "unsupported compressor '" + compressor_name + "' for reconstruction";
     }
-    return bitextract_compressed_representation::from_outputs(
-      std::move(spec), output_names, std::move(outputs), error_out);
-  }
-  if (compressor_name == "ans")
-    return ans_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out, meta);
-  if (compressor_name == "bitcomp")
-    return bitcomp_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out, meta);
+    return nullptr;
+  };
 
-  if (compressor_name == "snappy")
-    return snappy_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out, meta);
-  if (compressor_name == "lz4")
-    return lz4_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out, meta);
-  if (compressor_name == "deflate")
-    return deflate_compressed_representation::from_outputs(
-      output_names, std::move(outputs), stream, mr, error_out, meta);
+  auto id = op_id_from_name(compressor_name);
+  if (!id) return unsupported();
 
-  // `nvcomp_cascaded` and `nvcomp_cascaded_<N>D<M>R<K>B` share the same rep.
-  {
-    static constexpr std::string_view kCascadedPrefix = "nvcomp_cascaded";
-    if (compressor_name == "nvcomp_cascaded" ||
-        (compressor_name.size() > kCascadedPrefix.size() + 1 &&
-         compressor_name.compare(0, kCascadedPrefix.size(), kCascadedPrefix) == 0 &&
-         compressor_name[kCascadedPrefix.size()] == '_')) {
+  switch (*id) {
+    case OpId::Identity:
+      return identity_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out);
+    case OpId::Dictionary:
+      return dictionary_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out);
+    case OpId::Bitpack:
+      return bitpack_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out);
+    case OpId::Alp:
+      return alp_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out);
+    case OpId::AlpRd:
+      return alp_rd_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out);
+    case OpId::Bitextract: {
+      auto suffix = strip_bitextract_prefix(compressor_name);
+      auto spec   = parse_bitextract_spec(suffix ? *suffix : std::string_view{});
+      if (spec.fields.empty()) {
+        if (error_out) *error_out = "bitextract: bad spec in '" + compressor_name + "'";
+        return nullptr;
+      }
+      return bitextract_compressed_representation::from_outputs(
+        std::move(spec), output_names, std::move(outputs), error_out);
+    }
+    case OpId::Ans:
+      return ans_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Bitcomp:
+      return bitcomp_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Snappy:
+      return snappy_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Lz4:
+      return lz4_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Deflate:
+      return deflate_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Cascaded:
       return cascaded_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out, meta);
-    }
+    case OpId::Delta:
+    case OpId::Rle:
+    case OpId::For:
+    case OpId::Zigzag: return unsupported();
   }
-
-  if (error_out) {
-    *error_out = "unsupported compressor '" + compressor_name + "' for reconstruction";
-  }
-  return nullptr;
+  return unsupported();
 }
 
 }  // namespace simpatico

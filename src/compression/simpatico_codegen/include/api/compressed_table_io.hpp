@@ -1,42 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// C++-native .hpln v6 writer/reader for compressed_table.
+// C++-native .hpln v8 writer/reader for compressed_table.
 //
-// File layout (v6):
-//   [DSL section]  — human-readable DSL per column, separated by "---\n"
-//   \n---END-HEADERS-V6---\n
+// The plan tree is serialized structurally (a node array); the read path
+// rebuilds it directly and attaches each rep to its (node, slot). No DSL text
+// is stored — render it from the tree on demand with render_plan_tree.
+//
+// File layout (v8):
 //   [Binary header]
 //     "HPLN" (4 bytes)
-//     version = 6 (uint8)
+//     version = 8 (uint8)
 //     num_cols (uint16 LE)
 //     per column:
 //       name_len (uint16 LE) + name bytes   [0 = no name]
 //       dtype_tag (uint8)                   [decoded column type]
 //       num_rows (int64 LE)
-//       dsl_len (uint32 LE) + dsl bytes     [column's own plan DSL]
+//       num_nodes (uint16 LE)
+//       per node:
+//         op_len (uint16 LE) + op bytes
+//         is_bitjoin (uint8); if 1: output_tag (uint8), num_inputs (uint16 LE),
+//           per input: src_node (uint32 LE), channel (str16),
+//                      has_range (uint8) [+ hi (uint32 LE), lo (uint32 LE)]
+//         num_edges (uint16 LE), per edge: channel (str16) + child (uint32 LE)
+//         num_outputs (uint16 LE), per output: name (str16)
 //       num_leaves (uint16 LE)
 //       per leaf:
-//         path_len (uint16 LE) + path bytes
+//         node_index (uint32 LE)
+//         slot (int32 LE)                   [-1 = node's own rep, else output port]
 //         kind (uint8)                      [PlanLeafKind]
 //         type_tag (uint8)                  [decoded element type]
 //         meta_kind (uint8)  0=none 1=alp_rd 2=ans 3=bitcomp 4=cascaded 5=snappy 6=lz4 7=deflate
-//         meta bytes (variable per meta_kind):
-//           none:      (empty)
-//           alp_rd:    right_bw (uint8)
-//           ans:       uncompressed_size (uint64 LE) + original_type_id (int32 LE)
-//           bitcomp:   uncompressed_size (uint64 LE) + original_type_id (int32 LE) + algorithm
-//           (int32 LE) cascaded:  uncompressed_size (uint64) + original_type_id (int32) +
-//           num_deltas (int32) + num_RLEs (int32) + use_bp (int32) snappy:    uncompressed_size
-//           (uint64 LE) + original_type_id (int32 LE) lz4:       uncompressed_size (uint64 LE) +
-//           original_type_id (int32 LE) deflate:   uncompressed_size (uint64 LE) + original_type_id
-//           (int32 LE)
+//         meta bytes (variable per meta_kind; see push_meta)
 //         num_bufs (uint8)
 //         per buffer:
-//           name_len (uint16 LE) + name bytes
-//           buf_type_tag (uint8)
-//           size_bytes (uint64 LE)
-//           payload_offset (uint64 LE)
+//           name (str16) + buf_type_tag (uint8) + size_bytes (uint64 LE) + payload_offset (uint64
+//           LE)
 //   [Payload]  — all buffer bytes concatenated in write order, copied D→H
 
 #include "api/simpatico_codegen.hpp"
@@ -51,9 +50,11 @@ namespace simpatico {
 
 /// Write a compressed_table to *path*.
 /// Returns an empty string on success; a human-readable error message otherwise.
-std::string write_compressed_table(compressed_table const& table, std::string const& path);
+std::string write_compressed_table(compressed_table const& table,
+                                   std::string const& path,
+                                   rmm::cuda_stream_view stream = cudf::get_default_stream());
 
-/// Read a v6 compressed_table from *path*.
+/// Read a compressed_table from *path*.
 /// On failure writes an error to *error_out (if non-null) and returns an empty
 /// compressed_table.
 compressed_table read_compressed_table(

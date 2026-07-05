@@ -1,0 +1,664 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Beam-search compression explorer for simpatico_codegen.
+//
+// Uses:
+//   • `simpatico::make_compressor` for non-fused ops
+//   • `simpatico::compress_column` + `simpatico::decompress_column` for
+//     fused ops (delta / rle / bitpack / for / zigzag) and for the rerank pass.
+
+#include "explore/compression_explorer.hpp"
+
+#include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/representation.hpp"
+#include "codegen/util/nvcomp_scratch.hpp"
+#include "explore/operator_catalog.hpp"
+
+#include <cudf/copying.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/mr/per_device_resource.hpp>
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <sstream>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace simpatico {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+//
+// The operator catalog (`all_compressor_names`), the terminal/preprocessing
+// classification, `format_output_names`, and the single-op `try_operator`
+// primitive live in explore/operator_catalog.{hpp,cpp} so this explorer and the
+// operator-sweep test share one source of truth for operator applicability and
+// channel production.
+
+template <typename Fn>
+double time_cuda_ms(cudaStream_t stream, Fn&& fn)
+{
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventRecord(start, stream);
+  fn();
+  cudaEventRecord(stop, stream);
+  cudaEventSynchronize(stop);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, start, stop);
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  return static_cast<double>(ms);
+}
+
+inline bool weights_need_timing(double const w[3]) { return w[1] != 0.0 || w[2] != 0.0; }
+
+inline double weighted_score(double ratio, double comp, double decomp, double const w[3])
+{
+  return std::pow(std::max(ratio, 1e-12), w[0]) * std::pow(std::max(comp, 1e-12), w[1]) *
+         std::pow(std::max(decomp, 1e-12), w[2]);
+}
+
+// ---------------------------------------------------------------------------
+// BFS state types
+// ---------------------------------------------------------------------------
+
+struct pending_item {
+  std::string path;
+  cudf::column_view column;
+  size_t size_bytes;
+};
+
+struct bfs_step_record {
+  std::string dsl_line;
+  std::string primary_input_path;
+  std::vector<std::string> output_paths;
+  size_t input_size;
+  size_t output_size_total;
+  bool shrank() const { return output_size_total < input_size; }
+};
+
+/// A compression candidate in the BFS beam.
+struct bfs_candidate {
+  std::string dsl;
+  double compression_ratio = 1.0;
+  size_t total_leaf_bytes  = 0;
+
+  std::vector<pending_item> pending;
+  std::vector<pending_item> leaves;
+
+  // Owned reps — keep column_views from named_channels() valid
+  std::vector<std::shared_ptr<compressed_representation>> owned_reprs;
+
+  std::vector<bfs_step_record> steps;
+  std::unordered_map<std::string, size_t> path_size;
+};
+
+struct ranked_candidate {
+  std::string plan_dsl;
+  double compression_ratio;
+  size_t compressed_size_bytes;
+  double compress_throughput_gbps;
+  double decompress_throughput_gbps;
+};
+
+// ---------------------------------------------------------------------------
+// Round-trip timing for the rerank pass
+// ---------------------------------------------------------------------------
+
+// Sum of every stored leaf's compressed bytes — the same accounting
+// `benchmark`'s `compound_compressed_bytes` uses, so the two never drift.
+size_t compound_compressed_bytes(plan_compound const& compound, rmm::cuda_stream_view stream)
+{
+  size_t total = 0;
+  for (auto const& node : compound.tree.nodes) {
+    if (node.rep) total += node.rep->compressed_size_bytes(stream);
+    for (auto const& [path, rep] : node.channels) {
+      if (rep) total += rep->compressed_size_bytes(stream);
+    }
+  }
+  return total;
+}
+
+// One real (untimed) compress through the fused production path
+// (`compress_column`) — the only way to learn a cascade's true compressed
+// size. The BFS's own per-op `try_operator` estimate cannot substitute, and
+// the gap is NOT a bug: bitpack is chunked (kChunkSize elems/chunk) and a
+// fused region derives num_chunks = ceil(num_rows / kChunkSize) ONCE from the
+// region's ROOT input row count, which every node in the region inherits. So
+// a bitpack fused behind a row-count-changing op (rle/delta/for) chunks by the
+// ORIGINAL row count — e.g. rle->bitpack over 6M rows gives bitpack
+// ceil(6M/kChunkSize) chunks, one per original-row tile, each packing that
+// tile's local run-values. The same bitpack run standalone (what
+// `try_operator`/`compress_single_op` does) sees the already-materialized,
+// reduced values array and chunks it ceil(num_values / kChunkSize) ways. Same
+// values, different chunk partition => different per-chunk min/bit-width =>
+// different packed bytes (both roundtrip correctly; the fused layout is what
+// production stores). Chains of 2+ contiguous codegen ops can therefore have a
+// materially different true size than the BFS's unfused per-op sum suggests.
+bool measure_compressed_bytes(cudf::column_view input,
+                              std::string_view plan_dsl,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr,
+                              size_t& compressed_bytes_out,
+                              std::string* err_out)
+{
+  std::string err;
+  auto compound = compress_column(input, plan_dsl, stream, mr, &err);
+  if (!compound) {
+    if (err_out) *err_out = "compress_column: " + err;
+    return false;
+  }
+  compressed_bytes_out = compound_compressed_bytes(*compound, stream);
+  return true;
+}
+
+bool round_trip_time_rr(cudf::column_view input,
+                        std::string_view plan_dsl,
+                        rmm::cuda_stream_view stream,
+                        rmm::device_async_resource_ref mr,
+                        double& compress_ms_out,
+                        double& decompress_ms_out,
+                        size_t& compressed_bytes_out,
+                        std::string* err_out)
+{
+  std::unique_ptr<plan_compound> compound;
+  std::string err;
+  compress_ms_out = time_cuda_ms(
+    stream.value(), [&] { compound = compress_column(input, plan_dsl, stream, mr, &err); });
+  if (!compound) {
+    if (err_out) *err_out = "compress_column: " + err;
+    return false;
+  }
+  compressed_bytes_out = compound_compressed_bytes(*compound, stream);
+
+  std::unique_ptr<cudf::column> decompressed;
+  decompress_ms_out = time_cuda_ms(
+    stream.value(), [&] { decompressed = decompress_column(*compound, stream, mr, &err); });
+  if (!decompressed) {
+    if (err_out) *err_out = "decompress_column: " + err;
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Post-BFS dead-step trimming (verbatim from cudf-sys explorer)
+// ---------------------------------------------------------------------------
+
+void trim_trailing_dead_steps(bfs_candidate& c)
+{
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    std::unordered_set<std::string> consumed;
+    for (auto const& s : c.steps)
+      consumed.insert(s.primary_input_path);
+    for (size_t i = c.steps.size(); i-- > 0;) {
+      auto const& s = c.steps[i];
+      bool is_dead  = true;
+      for (auto const& op : s.output_paths)
+        if (consumed.count(op)) {
+          is_dead = false;
+          break;
+        }
+      if (is_dead && !s.shrank()) {
+        c.steps.erase(c.steps.begin() + (std::ptrdiff_t)i);
+        changed = true;
+        break;
+      }
+    }
+  }
+  // Rebuild DSL
+  std::ostringstream os;
+  for (size_t i = 0; i < c.steps.size(); ++i) {
+    if (i > 0) os << "\n";
+    os << c.steps[i].dsl_line;
+  }
+  c.dsl = os.str();
+  // Recompute total_leaf_bytes
+  std::unordered_set<std::string> consumed_paths, produced_paths;
+  for (auto const& s : c.steps) {
+    consumed_paths.insert(s.primary_input_path);
+    for (auto const& op : s.output_paths)
+      produced_paths.insert(op);
+  }
+  size_t total = 0;
+  auto add     = [&](std::string const& p) {
+    auto it = c.path_size.find(p);
+    if (it != c.path_size.end()) total += it->second;
+  };
+  if (!consumed_paths.count("input")) add("input");
+  for (auto const& p : produced_paths)
+    if (!consumed_paths.count(p)) add(p);
+  c.total_leaf_bytes  = total;
+  auto oit            = c.path_size.find("input");
+  size_t orig         = oit != c.path_size.end() ? oit->second : 0;
+  c.compression_ratio = (double)orig / std::max<size_t>(total, 1);
+}
+
+}  // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Public helpers
+// ---------------------------------------------------------------------------
+
+size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view stream)
+{
+  if (col.type().id() == cudf::type_id::STRING) {
+    cudf::strings_column_view scv(col);
+    return (size_t)(col.size() + 1) * sizeof(int32_t) + scv.chars_size(stream);
+  }
+  return (size_t)col.size() * cudf::size_of(col.type());
+}
+
+// ---------------------------------------------------------------------------
+// BFS Explorer
+// ---------------------------------------------------------------------------
+
+exploration_result explore_column_compression(cudf::column_view input,
+                                              exploration_config const& config,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  size_t const full_size = column_size_bytes_ex(input, stream);
+  // For large columns the ratio-guided BFS runs on a representative
+  // contiguous prefix (a single block preserves the local run/monotonicity
+  // structure order-sensitive codecs exploit — multiple far-apart blocks
+  // would inject fake jumps that wreck delta/rle). Finalists are re-measured
+  // on the full column below, so the reported numbers stay exact. Zero-copy.
+  bool const sampled =
+    config.sample_rows > 0 && static_cast<size_t>(input.size()) > config.sample_rows;
+  std::vector<cudf::column_view> sample_slice;
+  if (sampled)
+    sample_slice = cudf::slice(input, {0, static_cast<cudf::size_type>(config.sample_rows)});
+  cudf::column_view const bfs_input = sampled ? sample_slice[0] : input;
+  size_t original_size              = column_size_bytes_ex(bfs_input, stream);
+  size_t max_candidates             = config.beam_width > 0 ? config.beam_width : 100;
+
+  if (config.verbose)
+    std::cerr << "[explore] Input size: " << original_size
+              << " bytes, max_candidates=" << max_candidates << ", max_depth=" << config.max_depth
+              << "\n";
+
+  std::string best_dsl;
+  double best_ratio      = 1.0;
+  size_t best_leaf_bytes = original_size;
+  size_t best_depth      = 0;
+
+  auto const& all_ops = all_compressor_names();
+
+  // Initial beam
+  std::vector<std::unique_ptr<bfs_candidate>> beam;
+  {
+    auto init               = std::make_unique<bfs_candidate>();
+    init->dsl               = "";
+    init->compression_ratio = 1.0;
+    init->total_leaf_bytes  = original_size;
+    init->pending.push_back({"input", bfs_input, original_size});
+    init->path_size.emplace("input", original_size);
+    beam.push_back(std::move(init));
+  }
+
+  for (size_t depth = 0; depth < config.max_depth; ++depth) {
+    if (config.verbose)
+      std::cerr << "[explore] Depth " << depth << ": " << beam.size()
+                << " candidates, best=" << best_ratio << "\n";
+
+    std::vector<std::unique_ptr<bfs_candidate>> all_children;
+
+    for (auto& candidate : beam) {
+      if (candidate->pending.empty()) {
+        if (candidate->compression_ratio > best_ratio) {
+          best_ratio      = candidate->compression_ratio;
+          best_dsl        = candidate->dsl;
+          best_leaf_bytes = candidate->total_leaf_bytes;
+          best_depth      = depth;
+        }
+        continue;
+      }
+
+      for (size_t pi = 0; pi < candidate->pending.size(); ++pi) {
+        auto const& pend = candidate->pending[pi];
+
+        for (auto const& op_name : all_ops) {
+          auto trial = try_operator(op_name, pend.column, stream, mr);
+          if (!trial.success) continue;
+
+          if (config.verbose && depth == 0) {
+            double tr = (double)pend.size_bytes / std::max<size_t>(trial.output_bytes, 1);
+            std::cerr << "[explore]   " << op_name << ": " << trial.output_bytes << "/"
+                      << pend.size_bytes << " (" << std::fixed << std::setprecision(3) << tr
+                      << "x)\n";
+          }
+
+          bool is_pre = is_preprocessing_compressor(op_name);
+          if (trial.output_bytes >= pend.size_bytes && !is_pre) continue;
+
+          auto child = std::make_unique<bfs_candidate>();
+
+          auto output_names = format_output_names(trial.outputs);
+          std::ostringstream dsl_line;
+          dsl_line << pend.path << " -> " << op_name;
+          if (!output_names.empty() && !is_terminal_compressor(op_name))
+            dsl_line << " -> " << output_names;
+
+          child->dsl =
+            candidate->dsl.empty() ? dsl_line.str() : candidate->dsl + "\n" + dsl_line.str();
+          child->steps     = candidate->steps;
+          child->path_size = candidate->path_size;
+
+          for (size_t j = 0; j < candidate->pending.size(); ++j)
+            if (j != pi) child->pending.push_back(candidate->pending[j]);
+          child->leaves = candidate->leaves;
+
+          bool is_term = is_terminal_compressor(op_name);
+          std::vector<std::string> step_out_paths;
+          size_t step_out_total = 0;
+          for (auto const& out : trial.outputs) {
+            std::string out_path =
+              (pend.path == "input") ? op_name + "." + out.name : pend.path + "." + out.name;
+            size_t out_sz = column_size_bytes_ex(out.view, stream);
+            pending_item po{out_path, out.view, out_sz};
+            if (is_term)
+              child->leaves.push_back(po);
+            else
+              child->pending.push_back(po);
+            child->path_size[out_path] = out_sz;
+            step_out_paths.push_back(out_path);
+            step_out_total += out_sz;
+          }
+          child->steps.push_back({dsl_line.str(),
+                                  pend.path,
+                                  std::move(step_out_paths),
+                                  pend.size_bytes,
+                                  step_out_total});
+
+          if (trial.repr) child->owned_reprs.push_back(trial.repr);
+          for (auto const& r : candidate->owned_reprs)
+            child->owned_reprs.push_back(r);
+
+          child->total_leaf_bytes = 0;
+          for (auto const& l : child->leaves)
+            child->total_leaf_bytes += l.size_bytes;
+          for (auto const& p : child->pending)
+            child->total_leaf_bytes += p.size_bytes;
+          child->compression_ratio = (double)original_size / child->total_leaf_bytes;
+
+          if (child->compression_ratio > best_ratio) {
+            best_ratio      = child->compression_ratio;
+            best_dsl        = child->dsl;
+            best_leaf_bytes = child->total_leaf_bytes;
+            best_depth      = depth + 1;
+          }
+          all_children.push_back(std::move(child));
+        }
+      }
+    }
+
+    if (all_children.empty()) break;
+
+    std::sort(all_children.begin(), all_children.end(), [](auto const& a, auto const& b) {
+      return a->compression_ratio > b->compression_ratio;
+    });
+
+    cudaStreamSynchronize(stream.value());
+    beam.clear();
+    size_t keep = std::min(max_candidates, all_children.size());
+    for (size_t i = 0; i < keep; ++i)
+      beam.push_back(std::move(all_children[i]));
+    cudaStreamSynchronize(stream.value());
+    all_children.clear();
+
+    bool has_pending = false;
+    for (auto const& c2 : beam)
+      if (!c2->pending.empty()) {
+        has_pending = true;
+        break;
+      }
+    if (!has_pending) break;
+  }
+
+  // Trim dead steps
+  for (auto& c2 : beam)
+    if (c2) trim_trailing_dead_steps(*c2);
+  for (auto& c2 : beam) {
+    if (c2 && c2->compression_ratio > best_ratio) {
+      best_ratio      = c2->compression_ratio;
+      best_dsl        = c2->dsl;
+      best_leaf_bytes = c2->total_leaf_bytes;
+    }
+  }
+
+  // Collect finalists
+  struct ranked_candidate {
+    std::string plan_dsl;
+    double compression_ratio;
+    size_t compressed_size_bytes;
+    double compress_throughput_gbps;
+    double decompress_throughput_gbps;
+  };
+  std::vector<ranked_candidate> finalists;
+  auto add_finalist = [&](std::string dsl, double ratio, size_t bytes) {
+    if (dsl.empty()) return;
+    for (auto const& f : finalists)
+      if (f.plan_dsl == dsl) return;
+    finalists.push_back({std::move(dsl), ratio, bytes, 0.0, 0.0});
+  };
+  if (!best_dsl.empty()) add_finalist(best_dsl, best_ratio, best_leaf_bytes);
+  for (auto& c2 : beam)
+    if (c2) add_finalist(c2->dsl, c2->compression_ratio, c2->total_leaf_bytes);
+  if (best_ratio <= 1.0 || config.rerank_mode == score_mode::Pareto)
+    add_finalist("input -> identity", 1.0, original_size);
+  std::sort(finalists.begin(), finalists.end(), [](auto const& a, auto const& b) {
+    return a.compression_ratio > b.compression_ratio;
+  });
+
+  cudaStreamSynchronize(stream.value());
+  beam.clear();
+  cudaDeviceSynchronize();
+
+  size_t const rerank_top = config.rerank_top > 0 ? config.rerank_top : 8;
+  if (finalists.size() > rerank_top) {
+    auto id_it  = std::find_if(finalists.begin(), finalists.end(), [](auto const& f) {
+      return f.plan_dsl == "input -> identity";
+    });
+    bool had_id = id_it != finalists.end();
+    ranked_candidate id_kept;
+    if (had_id && id_it >= finalists.begin() + (std::ptrdiff_t)rerank_top) id_kept = *id_it;
+    finalists.resize(rerank_top);
+    if (had_id && std::none_of(finalists.begin(), finalists.end(), [](auto const& f) {
+          return f.plan_dsl == "input -> identity";
+        }))
+      finalists.back() = id_kept;
+  }
+
+  bool use_pareto      = config.rerank_mode == score_mode::Pareto;
+  bool need_throughput = use_pareto || weights_need_timing(config.rerank_weights);
+
+  // Always re-measure every finalist's compressed size through the real
+  // fused `compress_column` path — never report the BFS's own unfused
+  // byte estimate, which can be off by several x for cascades chaining 2+
+  // codegen ops (see measure_compressed_bytes). `sampled` no longer needs
+  // special-casing here: this runs regardless, on the full `input`.
+  if (!finalists.empty() && !need_throughput) {
+    double const orig = (double)full_size;
+    std::vector<ranked_candidate> sized;
+    for (auto const& f : finalists) {
+      size_t bytes = f.compressed_size_bytes;
+      if (!measure_compressed_bytes(input, f.plan_dsl, stream, mr, bytes, nullptr)) continue;
+      sized.push_back({f.plan_dsl, orig / std::max<size_t>(bytes, 1), bytes, 0.0, 0.0});
+    }
+    cudaDeviceSynchronize();
+    if (!sized.empty()) finalists = std::move(sized);
+  } else if (!finalists.empty()) {
+    {
+      double a, b;
+      size_t c2;
+      round_trip_time_rr(input, finalists.front().plan_dsl, stream, mr, a, b, c2, nullptr);
+      cudaDeviceSynchronize();
+    }
+
+    static constexpr size_t kPasses = 3;
+    struct acc_t {
+      std::string plan_dsl;
+      double best_comp_ms   = std::numeric_limits<double>::infinity();
+      double best_decomp_ms = std::numeric_limits<double>::infinity();
+      size_t bytes          = 0;
+      bool any_ok           = false;
+    };
+    std::vector<acc_t> accs;
+    for (auto const& f : finalists)
+      accs.push_back({f.plan_dsl,
+                      std::numeric_limits<double>::infinity(),
+                      std::numeric_limits<double>::infinity(),
+                      f.compressed_size_bytes,
+                      false});
+
+    for (size_t pass = 0; pass < kPasses; ++pass) {
+      for (size_t i = 0; i < finalists.size(); ++i) {
+        double comp_ms = 0, decomp_ms = 0;
+        size_t bytes = accs[i].bytes;
+        std::string err;
+        bool ok = round_trip_time_rr(
+          input, finalists[i].plan_dsl, stream, mr, comp_ms, decomp_ms, bytes, &err);
+        cudaDeviceSynchronize();
+        if (!ok) continue;
+        accs[i].any_ok = true;
+        accs[i].bytes  = bytes;
+        if (comp_ms < accs[i].best_comp_ms) accs[i].best_comp_ms = comp_ms;
+        if (decomp_ms < accs[i].best_decomp_ms) accs[i].best_decomp_ms = decomp_ms;
+      }
+    }
+    double const orig = (double)full_size;
+    std::vector<ranked_candidate> timed;
+    for (auto const& a : accs) {
+      if (!a.any_ok) continue;
+      timed.push_back({a.plan_dsl,
+                       orig / std::max<size_t>(a.bytes, 1),
+                       a.bytes,
+                       a.best_comp_ms > 0 ? orig / a.best_comp_ms / 1.0e6 : 0.0,
+                       a.best_decomp_ms > 0 ? orig / a.best_decomp_ms / 1.0e6 : 0.0});
+    }
+    if (!timed.empty()) finalists = std::move(timed);
+  }
+
+  // Pareto frontier
+  constexpr double kEps = 0.01;
+  auto ge_eps           = [](double a, double b) { return a >= b * (1.0 - kEps); };
+  auto gt_eps           = [](double a, double b) { return a > b * (1.0 + kEps); };
+  auto near_eq          = [](double a, double b) {
+    double d = std::max(std::abs(a), std::abs(b));
+    return d == 0.0 || std::abs(a - b) <= d * kEps;
+  };
+  std::vector<ranked_candidate> frontier;
+  if (use_pareto && need_throughput) {
+    for (auto const& c2 : finalists) {
+      bool dominated = false;
+      for (auto const& o : finalists) {
+        if (&o == &c2) continue;
+        bool ge = ge_eps(o.compression_ratio, c2.compression_ratio) &&
+                  ge_eps(o.compress_throughput_gbps, c2.compress_throughput_gbps) &&
+                  ge_eps(o.decompress_throughput_gbps, c2.decompress_throughput_gbps);
+        bool gt = gt_eps(o.compression_ratio, c2.compression_ratio) ||
+                  gt_eps(o.compress_throughput_gbps, c2.compress_throughput_gbps) ||
+                  gt_eps(o.decompress_throughput_gbps, c2.decompress_throughput_gbps);
+        if (ge && gt) {
+          dominated = true;
+          break;
+        }
+      }
+      if (dominated) continue;
+      bool dup = false;
+      for (auto const& f : frontier) {
+        if (near_eq(f.compression_ratio, c2.compression_ratio) &&
+            near_eq(f.compress_throughput_gbps, c2.compress_throughput_gbps) &&
+            near_eq(f.decompress_throughput_gbps, c2.decompress_throughput_gbps)) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) frontier.push_back(c2);
+    }
+  }
+  auto& pool = (use_pareto && need_throughput) ? frontier : finalists;
+
+  cudaDeviceSynchronize();
+
+  exploration_result result;
+  result.original_size_bytes = full_size;
+  result.cascade_depth       = best_depth;
+
+  if (pool.empty()) {
+    result.plan_dsl              = "input -> identity";
+    result.compression_ratio     = 1.0;
+    result.compressed_size_bytes = original_size;
+  } else {
+    auto pick_score = [&](ranked_candidate const& c2) -> double {
+      if (use_pareto && need_throughput) return c2.compression_ratio;
+      return weighted_score(c2.compression_ratio,
+                            c2.compress_throughput_gbps,
+                            c2.decompress_throughput_gbps,
+                            config.rerank_weights);
+    };
+    auto best_it = std::max_element(
+      pool.begin(), pool.end(), [&](ranked_candidate const& a, ranked_candidate const& b) {
+        return pick_score(a) < pick_score(b);
+      });
+    result.plan_dsl                   = best_it->plan_dsl;
+    result.compression_ratio          = best_it->compression_ratio;
+    result.compressed_size_bytes      = best_it->compressed_size_bytes;
+    result.compress_throughput_gbps   = best_it->compress_throughput_gbps;
+    result.decompress_throughput_gbps = best_it->decompress_throughput_gbps;
+    if (use_pareto && need_throughput) {
+      std::ostringstream os;
+      size_t alt_n = 0;
+      for (auto const& c2 : frontier)
+        if (c2.plan_dsl != result.plan_dsl) ++alt_n;
+      if (alt_n > 0) {
+        os << "\n=== Pareto alternates (" << alt_n << ") ===\n";
+        size_t idx = 0;
+        for (auto const& c2 : frontier) {
+          if (c2.plan_dsl == result.plan_dsl) continue;
+          os << "--- alt " << idx++ << " ---\n"
+             << "  ratio=" << std::fixed << std::setprecision(2) << c2.compression_ratio
+             << "x comp=" << c2.compress_throughput_gbps
+             << " GB/s decomp=" << c2.decompress_throughput_gbps << " GB/s\n";
+          std::istringstream is(c2.plan_dsl);
+          for (std::string line; std::getline(is, line);)
+            os << "  " << line << "\n";
+        }
+        result.pareto_alternates_summary = os.str();
+      }
+    }
+  }
+
+  if (config.verbose)
+    std::cerr << "[explore] Final: ratio=" << result.compression_ratio
+              << " depth=" << result.cascade_depth << "\nDSL:\n"
+              << result.plan_dsl << "\n";
+
+  // The BFS just tried every nvcomp-backed op (ans/bitcomp/cascaded/
+  // snappy/lz4/deflate) against this column and its intermediates, which
+  // grows each codec's thread-local Manager scratch to a high-water mark
+  // sized for the largest of those calls — memory nvcomp never shrinks
+  // back down on its own. Release it now so it doesn't sit pinned while
+  // exploring whatever column comes next.
+  release_nvcomp_manager_scratch();
+
+  return result;
+}
+
+}  // namespace simpatico

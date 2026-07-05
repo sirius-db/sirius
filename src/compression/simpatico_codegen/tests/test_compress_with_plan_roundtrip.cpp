@@ -27,9 +27,10 @@ using simpatico::decompress;
 using simpatico::split_plan_dsl;
 
 // Check: every compressed column must carry a natively-built PlanTree that
-// OWNS every compressed representation (node.rep + node.channels). Every
-// owned rep must also appear in the DSL-rebuilt tree's path map, confirming
-// that rep placement and structural wiring agree.
+// OWNS every compressed representation (node.rep + node.channels). Every owned
+// rep must also appear in the path map of the tree re-parsed from its own
+// rendered DSL, confirming rep placement, structural wiring, and the renderer's
+// paths all agree.
 void verify_plan_tree(compressed_table const& ct, char const* label)
 {
   for (auto const& col : ct.columns) {
@@ -40,9 +41,9 @@ void verify_plan_tree(compressed_table const& ct, char const* label)
     expect(tree.nodes[0].op == "input",
            (std::string(label) + ": PlanTree root is not 'input'").c_str());
     simpatico::PlanPathMap map;
-    auto rebuilt = simpatico::plan_tree_from_dsl(col.compound->plan_dsl, nullptr, &map);
+    auto rebuilt = simpatico::plan_tree_from_dsl(simpatico::render_plan_tree(tree), nullptr, &map);
     expect(rebuilt.has_value(),
-           (std::string(label) + ": stored DSL does not parse to a PlanTree").c_str());
+           (std::string(label) + ": rendered DSL does not parse to a PlanTree").c_str());
 
     // Collect every rep pointer the tree owns (node.rep + node.channels) and
     // verify each has a corresponding path in the DSL-rebuilt map.
@@ -445,6 +446,14 @@ int main()
         "delta.differences.zigzag -> bitpack\n";
       roundtrip_once(t->view(), dsl, 1, "jit_delta_zigzag_bitpack_int32");
       roundtrip_once(t->view(), dsl, 2, "jit_delta_zigzag_bitpack_int32_mt");
+
+      // Regression: delta over raw float32 bit patterns can produce a diff
+      // that overflows int32 (adjacent floats need not be numerically close
+      // as bit patterns, e.g. a sign flip). Delta/FOR's diff-then-reconstruct
+      // relies on wraparound, which must be done in unsigned arithmetic
+      // (signed overflow is UB) -- this shape is what surfaced it.
+      auto tf = make_f32_table(2, 4096, 3);
+      roundtrip_once(tf->view(), dsl, 1, "jit_delta_zigzag_bitpack_f32");
     }
 
     {
@@ -667,6 +676,22 @@ int main()
         "delta.differences.deltas -> bitpack\n"
         "delta.differences.references -> bitpack\n";
       roundtrip_once(t32->view(), dsl32, 1, "jit_delta_for_refs_bitpack_int32");
+    }
+
+    {
+      // Regression (operator-sweep depth 4): a fused-region channel
+      // (rle.values) is entropy-tail-routed to a NON-codegen op (alp) whose own
+      // output feeds a codegen op that has a further codegen tail
+      // (bitpack -> chunk_min -> zigzag). Reconstructing rle.values resolves the
+      // alp subtree, which must decode that nested bitpack->zigzag tail with an
+      // empty decompressed map. f32 so alp applies.
+      auto t = make_f32_table(1, 4096, 91);
+      std::string dsl =
+        "input -> rle -> runs, values\n"
+        "rle.values -> alp -> integers, exceptions, exception_positions, metadata\n"
+        "rle.values.integers -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+        "rle.values.integers.chunk_min -> zigzag -> zigzag\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_rle_alp_bitpack_zigzag_tail_f32");
     }
 
     std::printf("test_compress_with_plan_roundtrip: PASS\n");

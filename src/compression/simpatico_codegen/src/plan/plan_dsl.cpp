@@ -1,14 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/plan/plan_dsl.hpp"
 
-#include "codegen/plan/representation.hpp"  // bitextract_canonical_name, canonicalize_path
+#include "codegen/plan/operator_registry.hpp"  // op_id_from_name, canonical_channels
+#include "codegen/plan/representation.hpp"     // bitextract_canonical_name, canonicalize_path
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <sstream>
+#include <vector>
 
 namespace simpatico {
 namespace {
+
+// Fixed output-channel order per operator — the operator, not the DSL author,
+// owns the channel set/order. Sourced from the operator registry; nullptr for
+// variable-arity ops (bitextract's user-named fields, dictionary's mode-
+// dependent channels), which are left untouched.
+std::vector<std::string> const* canonical_output_channels(std::string const& op)
+{
+  auto id = op_id_from_name(op);
+  return id ? canonical_channels(*id) : nullptr;
+}
+
+// Reorder a step's outputs into canonical order (channels not in `canon` are
+// kept, appended in their original order). Pure reordering: decode matches
+// channels by name, so this only makes the DSL author's ordering irrelevant —
+// `rle -> values, runs` and `rle -> runs, values` build identical trees.
+void canonicalize_output_order(std::vector<std::string> const& canon, plan_step& step)
+{
+  std::vector<std::string> names;
+  std::vector<std::optional<bit_range>> ranges;
+  names.reserve(step.output_names.size());
+  ranges.reserve(step.output_names.size());
+  std::vector<bool> taken(step.output_names.size(), false);
+  for (auto const& c : canon) {
+    for (std::size_t i = 0; i < step.output_names.size(); ++i) {
+      if (!taken[i] && step.output_names[i] == c) {
+        names.push_back(step.output_names[i]);
+        ranges.push_back(step.output_ranges[i]);
+        taken[i] = true;
+      }
+    }
+  }
+  for (std::size_t i = 0; i < step.output_names.size(); ++i) {
+    if (!taken[i]) {
+      names.push_back(step.output_names[i]);
+      ranges.push_back(step.output_ranges[i]);
+    }
+  }
+  step.output_names  = std::move(names);
+  step.output_ranges = std::move(ranges);
+}
 
 bool parse_uint(std::string_view s, uint32_t* out)
 {
@@ -188,6 +231,9 @@ bool parse_plan_dsl(std::string_view dsl, std::vector<plan_step>* out, std::stri
           *error_out = "line " + std::to_string(line_num) + ": outputs section is empty";
         }
         return false;
+      }
+      if (auto const* canon = canonical_output_channels(step.compressor)) {
+        canonicalize_output_order(*canon, step);
       }
     }
 

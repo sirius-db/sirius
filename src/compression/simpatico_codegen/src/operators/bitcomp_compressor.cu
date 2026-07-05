@@ -82,29 +82,30 @@ bool parse_bitcomp_suffix(std::string_view suffix, int* algorithm)
   return false;
 }
 
-std::vector<compressible_output> bitcomp_compressed_representation::named_channels() const
+std::vector<compressible_output> bitcomp_compressed_representation::named_channels(
+  rmm::cuda_stream_view stream) const
 {
   if (!serialized_output) {
-    // Use a private non-blocking stream: the producing stream is always synced
-    // before named_channels() is called, so compressed_data is already coherent.
-    cudaStream_t s;
-    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-    rmm::cuda_stream_view sv(s);
+    // The resulting column's device_buffer remembers ``stream`` for its own
+    // eventual deallocation, so the caller-supplied stream must stay valid
+    // for the column's lifetime (a private stream destroyed at the end of
+    // this scope would leave a dangling handle). The producing stream is
+    // always synced before named_channels() is called, so compressed_data
+    // is already coherent.
     auto mr  = rmm::mr::get_current_device_resource_ref();
     auto out = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
                                              static_cast<cudf::size_type>(compressed_size),
                                              cudf::mask_state::UNALLOCATED,
-                                             sv,
+                                             stream,
                                              mr);
     if (compressed_size > 0 && compressed_data) {
       cudaMemcpyAsync(out->mutable_view().head<uint8_t>(),
                       compressed_data->data(),
                       compressed_size,
                       cudaMemcpyDeviceToDevice,
-                      s);
+                      stream.value());
     }
-    cudaStreamSynchronize(s);
-    cudaStreamDestroy(s);
+    cudaStreamSynchronize(stream.value());
     serialized_output = std::move(out);
   }
   return {{"output", serialized_output->view()}};
@@ -193,5 +194,12 @@ std::unique_ptr<cudf::column> bitcomp_compressor::decompress(
   if (bc_repr == nullptr) return nullptr;
   return bc_repr->decompress(stream, mr);
 }
+
+namespace detail {
+void release_bitcomp_manager_scratch()
+{
+  if (tls_bitcomp_mgr.mgr) tls_bitcomp_mgr.mgr->deallocate_gpu_mem();
+}
+}  // namespace detail
 
 }  // namespace simpatico

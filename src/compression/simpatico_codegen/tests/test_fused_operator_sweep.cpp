@@ -1,5 +1,7 @@
-// Shape-parity sweep: encode -> decode -> equality across every
-// decode-supported FusedTree shape up to a small depth bound.
+// Fused-operator sweep: encode -> decode -> equality across every
+// decode-supported FusedTree shape up to a small depth bound. (Companion to
+// test_operator_sweep, which sweeps the full operator catalog x dtypes via the
+// plan DSL; this one exhaustively sweeps the *fused* IR's tree shapes.)
 //
 // Why this exists
 // ---------------
@@ -16,7 +18,7 @@
 //     FusedTree -> gpu_encode_tree -> jit_decode_tree -> equality
 //
 // Any divergence between encode and decode coverage manifests as
-// either a `render_type` failure, a JIT compile error, a bind-time
+// either a renderer `RenderError`, a JIT compile error, a bind-time
 // dtype/size mismatch, or a decode-equality miss — all surfaced as
 // per-shape failures with the offending tag.
 //
@@ -31,7 +33,7 @@
 //
 // Counts up to d = 4: 1 + 3 + 9 + 27 = 40 shapes.  At ~400 ms cold
 // JIT compile per shape, full sweep is ~15-20 s.  Set the env var
-// SIMPATICO_PARITY_DEPTH to override (default 4).
+// SIMPATICO_FUSED_SWEEP_DEPTH to override (default 4).
 //
 // Fixture
 // -------
@@ -41,6 +43,7 @@
 // any Rle node use the RLE-friendly fixture.
 
 #include "codegen/jit/fused_tree.hpp"
+#include "codegen/jit/kernel_cache.hpp"
 #include "jit_decode.hpp"
 #include "test_utils.hpp"
 
@@ -82,7 +85,7 @@ std::string cu_err_str(CUresult r)
 
 // ---------------------------------------------------------------------
 // Synthetic data — identical to test_jit_roundtrip / test_encode_*
-// fixtures so a parity failure here is directly comparable.
+// fixtures so a mismatch here is directly comparable.
 // ---------------------------------------------------------------------
 std::vector<int32_t> synth_data(int64_t n)
 {
@@ -156,8 +159,8 @@ void set_fixed_stride(jit::FusedTree& t)
 }
 
 // Pretty-print a tree like "Rle{runs=Bp, values=Delta(Bp)}" — used
-// only as the per-shape diagnostic tag; the JIT cache keys on the
-// rendered C++ type expression, not this string.
+// only as the per-shape diagnostic tag; the JIT cache keys on a hash
+// of the rendered CUDA source, not this string.
 std::string tag(const jit::FusedTree& t)
 {
   auto short_name = [](OpKind k) -> const char* {
@@ -276,11 +279,11 @@ int run_one_shape(const jit::FusedTree& tree,
 
 int env_depth(int default_depth)
 {
-  if (const char* s = std::getenv("SIMPATICO_PARITY_DEPTH"); s != nullptr) {
+  if (const char* s = std::getenv("SIMPATICO_FUSED_SWEEP_DEPTH"); s != nullptr) {
     int v = std::atoi(s);
     if (v >= 1 && v <= 6) return v;  // cap at 6 — anything more is hours
     std::fprintf(stderr,
-                 "warn: SIMPATICO_PARITY_DEPTH='%s' out of [1,6]; using default %d\n",
+                 "warn: SIMPATICO_FUSED_SWEEP_DEPTH='%s' out of [1,6]; using default %d\n",
                  s,
                  default_depth);
   }
@@ -297,6 +300,9 @@ int main()
     std::fprintf(stderr, "FAIL: ensure_cuda_context: %s\n", e.what());
     return 1;
   }
+  // Single process, so clear at startup before any compile (see the sweep's
+  // orchestrator for the same option).
+  if (std::getenv("SIMPATICO_JIT_CACHE_CLEAR")) codegen::jit::clear_jit_disk_cache();
   const int arch      = detect_arch_cc();
   const int max_depth = env_depth(/*default=*/4);
   const int64_t n     = 4321;
@@ -306,7 +312,7 @@ int main()
   auto shapes = enumerate_shapes(max_depth);
   for (auto& t : extra_shapes())
     shapes.push_back(t);
-  std::printf("test_shape_parity: max_depth=%d shapes=%zu n=%lld\n",
+  std::printf("test_fused_operator_sweep: max_depth=%d shapes=%zu n=%lld\n",
               max_depth,
               shapes.size(),
               static_cast<long long>(n));
@@ -325,9 +331,9 @@ int main()
     }
   }
 
-  std::printf("test_shape_parity: %d/%zu passed\n", passed, shapes.size());
+  std::printf("test_fused_operator_sweep: %d/%zu passed\n", passed, shapes.size());
   if (!failures.empty()) {
-    std::fprintf(stderr, "test_shape_parity: %zu failures:\n", failures.size());
+    std::fprintf(stderr, "test_fused_operator_sweep: %zu failures:\n", failures.size());
     for (const auto& f : failures) {
       std::fprintf(stderr, "  - %s\n", f.c_str());
     }

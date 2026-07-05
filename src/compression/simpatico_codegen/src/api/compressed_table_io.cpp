@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// C++-native .hpln v6 write/read for compressed_table.
+// C++-native .hpln v8 write/read for compressed_table.
 // See compressed_table_io.hpp for the on-disk layout.
 
 #include "api/compressed_table_io.hpp"
@@ -59,11 +59,6 @@ static void push_i64le(std::vector<std::uint8_t>& v, std::int64_t x)
 static void push_str16(std::vector<std::uint8_t>& v, std::string const& s)
 {
   push_u16le(v, static_cast<std::uint16_t>(s.size()));
-  v.insert(v.end(), s.begin(), s.end());
-}
-static void push_str32(std::vector<std::uint8_t>& v, std::string const& s)
-{
-  push_u32le(v, static_cast<std::uint32_t>(s.size()));
   v.insert(v.end(), s.begin(), s.end());
 }
 
@@ -126,16 +121,6 @@ struct Reader {
   {
     std::uint16_t len;
     if (!read_u16le(len)) return false;
-    if (len > rem) return false;
-    s.assign(reinterpret_cast<const char*>(p), len);
-    p += len;
-    rem -= len;
-    return true;
-  }
-  bool read_str32(std::string& s)
-  {
-    std::uint32_t len;
-    if (!read_u32le(len)) return false;
     if (len > rem) return false;
     s.assign(reinterpret_cast<const char*>(p), len);
     p += len;
@@ -368,8 +353,88 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   return reconstruct_representation(cname, names, std::move(cols), stream, mr, err, ld.meta);
 }
 
-static constexpr char kEndMarker[]     = "\n---END-HEADERS-V6---\n";
-static constexpr std::uint8_t kVersion = 6;
+static constexpr std::uint8_t kVersion = 8;
+
+// Serialize one node's structure (op, bitjoin params, edges, output names).
+// Other ops carry their params in the op name, so only bitjoin needs attrs.
+static void push_node(std::vector<std::uint8_t>& hdr, PlanNode const& node)
+{
+  push_str16(hdr, node.op);
+  if (node.attrs.bitjoin.has_value()) {
+    auto const& bj = *node.attrs.bitjoin;
+    push_u8(hdr, 1);
+    push_u8(hdr, dtype_to_tag(bj.output_type));
+    push_u16le(hdr, static_cast<std::uint16_t>(bj.inputs.size()));
+    for (auto const& in : bj.inputs) {
+      push_u32le(hdr, in.node);
+      push_str16(hdr, in.channel);
+      push_u8(hdr, in.range.has_value() ? 1 : 0);
+      if (in.range.has_value()) {
+        push_u32le(hdr, in.range->first);
+        push_u32le(hdr, in.range->second);
+      }
+    }
+  } else {
+    push_u8(hdr, 0);
+  }
+  push_u16le(hdr, static_cast<std::uint16_t>(node.children.size()));
+  for (auto const& e : node.children) {
+    push_str16(hdr, e.channel);
+    push_u32le(hdr, e.child);
+  }
+  push_u16le(hdr, static_cast<std::uint16_t>(node.output_names.size()));
+  for (auto const& n : node.output_names)
+    push_str16(hdr, n);
+}
+
+// Inverse of push_node. output_paths mirror output_names as the node-local
+// channel key; bitjoin input arity/ranges are mirrored into input_paths/
+// input_ranges for layout resolution.
+static bool read_node(Reader& r, PlanNode& node)
+{
+  if (!r.read_str16(node.op)) return false;
+  std::uint8_t is_bitjoin;
+  if (!r.read_u8(is_bitjoin)) return false;
+  if (is_bitjoin) {
+    bitjoin_attrs bj;
+    std::uint8_t ot;
+    if (!r.read_u8(ot)) return false;
+    bj.output_type = tag_to_dtype(ot);
+    std::uint16_t nin;
+    if (!r.read_u16le(nin)) return false;
+    bj.inputs.resize(nin);
+    for (auto& in : bj.inputs) {
+      if (!r.read_u32le(in.node) || !r.read_str16(in.channel)) return false;
+      std::uint8_t has_range;
+      if (!r.read_u8(has_range)) return false;
+      if (has_range) {
+        std::uint32_t hi, lo;
+        if (!r.read_u32le(hi) || !r.read_u32le(lo)) return false;
+        in.range = bit_range{hi, lo};
+      }
+    }
+    for (auto const& in : bj.inputs) {
+      node.input_paths.push_back(in.channel);
+      node.input_ranges.push_back(in.range);
+    }
+    node.attrs.bitjoin = std::move(bj);
+  }
+  std::uint16_t ne;
+  if (!r.read_u16le(ne)) return false;
+  node.children.resize(ne);
+  for (auto& e : node.children) {
+    if (!r.read_str16(e.channel) || !r.read_u32le(e.child)) return false;
+  }
+  std::uint16_t no;
+  if (!r.read_u16le(no)) return false;
+  node.output_names.resize(no);
+  node.output_paths.resize(no);
+  for (std::uint16_t i = 0; i < no; ++i) {
+    if (!r.read_str16(node.output_names[i])) return false;
+    node.output_paths[i] = node.output_names[i];
+  }
+  return true;
+}
 
 }  // anonymous namespace
 
@@ -377,19 +442,11 @@ static constexpr std::uint8_t kVersion = 6;
 // Public API
 // ---------------------------------------------------------------------------
 
-std::string write_compressed_table(compressed_table const& table, std::string const& path)
+std::string write_compressed_table(compressed_table const& table,
+                                   std::string const& path,
+                                   rmm::cuda_stream_view stream)
 {
-  auto const all_descs = table.describe();
-
-  // Build human-readable DSL header.
-  std::string dsl_section;
-  for (std::size_t ci = 0; ci < table.columns.size(); ++ci) {
-    if (ci > 0) dsl_section += "---\n";
-    std::string const& dsl =
-      table.columns[ci].compound ? table.columns[ci].compound->plan_dsl : std::string{};
-    dsl_section += dsl;
-    if (!dsl.empty() && dsl.back() != '\n') dsl_section += '\n';
-  }
+  auto const all_descs = table.describe(stream);
 
   std::vector<std::uint8_t> hdr;
   hdr.push_back('H');
@@ -402,6 +459,7 @@ std::string write_compressed_table(compressed_table const& table, std::string co
   std::vector<std::uint8_t> payload;
   std::uint64_t payload_offset = 0;
 
+  static const PlanTree kEmptyTree;
   for (std::size_t ci = 0; ci < table.columns.size(); ++ci) {
     auto const& col   = table.columns[ci];
     auto const& descs = all_descs[ci];
@@ -409,12 +467,20 @@ std::string write_compressed_table(compressed_table const& table, std::string co
     push_str16(hdr, col.name.value_or(std::string{}));
     push_u8(hdr, dtype_to_tag(col.dtype));
     push_i64le(hdr, col.num_rows);
-    std::string const& dsl = col.compound ? col.compound->plan_dsl : std::string{};
-    push_str32(hdr, dsl);
-    push_u16le(hdr, static_cast<std::uint16_t>(descs.size()));
 
+    // Structural plan tree: the node array is the source of truth on read; the
+    // DSL can be rendered from it on demand (render_plan_tree).
+    PlanTree const& tree = col.compound ? col.compound->tree : kEmptyTree;
+    push_u16le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
+    for (auto const& node : tree.nodes)
+      push_node(hdr, node);
+
+    // Each rep, located by (node_index, slot); its channel buffers stream into
+    // the payload blob.
+    push_u16le(hdr, static_cast<std::uint16_t>(descs.size()));
     for (auto const& ld : descs) {
-      push_str16(hdr, ld.path);
+      push_u32le(hdr, ld.node_index);
+      push_i32le(hdr, ld.slot);
       push_u8(hdr, static_cast<std::uint8_t>(ld.kind));
       push_u8(hdr, ld.type_tag);
       push_meta(hdr, ld.meta);
@@ -445,8 +511,6 @@ std::string write_compressed_table(compressed_table const& table, std::string co
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) return "failed to open '" + path + "' for writing";
-  f.write(dsl_section.data(), static_cast<std::streamsize>(dsl_section.size()));
-  f.write(kEndMarker, static_cast<std::streamsize>(std::strlen(kEndMarker)));
   f.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
   f.write(reinterpret_cast<const char*>(payload.data()),
           static_cast<std::streamsize>(payload.size()));
@@ -472,20 +536,7 @@ compressed_table read_compressed_table(std::string const& path,
   f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(file_size));
   if (!f) return fail("read error on '" + path + "'");
 
-  std::size_t marker_len           = std::strlen(kEndMarker);
-  const std::uint8_t* marker_bytes = reinterpret_cast<const std::uint8_t*>(kEndMarker);
-  bool found_marker                = false;
-  std::size_t bin_start            = 0;
-  for (std::size_t i = 0; i + marker_len <= file_size; ++i) {
-    if (std::memcmp(raw.data() + i, marker_bytes, marker_len) == 0) {
-      bin_start    = i + marker_len;
-      found_marker = true;
-      break;
-    }
-  }
-  if (!found_marker) return fail("v6 end marker not found in '" + path + "'");
-
-  Reader r{raw.data() + bin_start, file_size - bin_start};
+  Reader r{raw.data(), file_size};
 
   std::uint8_t magic[4];
   if (!r.read(magic, 4)) return fail("truncated header");
@@ -493,7 +544,7 @@ compressed_table read_compressed_table(std::string const& path,
     return fail("not a HPLN file");
   std::uint8_t ver;
   if (!r.read_u8(ver)) return fail("truncated header");
-  if (ver != kVersion) return fail("unsupported version " + std::to_string(ver) + " (expected 6)");
+  if (ver != kVersion) return fail("unsupported version " + std::to_string(ver) + " (expected 8)");
 
   std::uint16_t num_cols;
   if (!r.read_u16le(num_cols)) return fail("truncated header");
@@ -502,7 +553,7 @@ compressed_table read_compressed_table(std::string const& path,
     std::string name;
     std::uint8_t dtype_tag = 0;
     std::int64_t num_rows  = 0;
-    std::string plan_dsl;
+    PlanTree tree;
     std::vector<leaf_desc> leaf_descs;
     std::vector<std::vector<std::uint64_t>> buf_offsets;
   };
@@ -513,7 +564,13 @@ compressed_table read_compressed_table(std::string const& path,
     if (!r.read_str16(cr.name)) return fail("truncated col name");
     if (!r.read_u8(cr.dtype_tag)) return fail("truncated col dtype");
     if (!r.read_i64le(cr.num_rows)) return fail("truncated col num_rows");
-    if (!r.read_str32(cr.plan_dsl)) return fail("truncated col plan_dsl");
+
+    std::uint16_t nn;
+    if (!r.read_u16le(nn)) return fail("truncated num_nodes");
+    cr.tree.nodes.resize(nn);
+    for (std::uint16_t ni = 0; ni < nn; ++ni) {
+      if (!read_node(r, cr.tree.nodes[ni])) return fail("truncated plan node");
+    }
 
     std::uint16_t nl;
     if (!r.read_u16le(nl)) return fail("truncated num_leaves");
@@ -522,7 +579,8 @@ compressed_table read_compressed_table(std::string const& path,
 
     for (std::uint16_t li = 0; li < nl; ++li) {
       auto& ld = cr.leaf_descs[li];
-      if (!r.read_str16(ld.path)) return fail("truncated leaf path");
+      if (!r.read_u32le(ld.node_index)) return fail("truncated leaf node_index");
+      if (!r.read_i32le(ld.slot)) return fail("truncated leaf slot");
       std::uint8_t k;
       if (!r.read_u8(k)) return fail("truncated leaf kind");
       ld.kind = static_cast<PlanLeafKind>(k);
@@ -557,20 +615,25 @@ compressed_table read_compressed_table(std::string const& path,
   result.columns.resize(num_cols);
 
   for (std::uint16_t ci = 0; ci < num_cols; ++ci) {
-    auto const& cr = col_records[ci];
-    auto& out_col  = result.columns[ci];
+    auto& cr      = col_records[ci];
+    auto& out_col = result.columns[ci];
 
     if (!cr.name.empty()) out_col.name = cr.name;
     out_col.dtype    = tag_to_dtype(cr.dtype_tag);
     out_col.num_rows = cr.num_rows;
 
-    if (cr.plan_dsl.empty()) continue;
+    if (cr.tree.nodes.empty()) continue;  // column stored without a plan
 
-    std::unordered_map<std::string, std::unique_ptr<compressed_representation>> leaves;
+    auto compound  = std::make_unique<plan_compound>();
+    compound->tree = std::move(cr.tree);
+    auto& nodes    = compound->tree.nodes;
 
+    // Reconstruct each rep and drop it into its structural slot on the tree.
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       auto const& ld    = cr.leaf_descs[li];
       auto const& boffs = cr.buf_offsets[li];
+      if (ld.node_index >= nodes.size())
+        return fail("leaf node_index out of range in col " + std::to_string(ci));
 
       std::vector<std::vector<std::uint8_t>> host_bufs(ld.buffers.size());
       for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
@@ -579,7 +642,7 @@ compressed_table read_compressed_table(std::string const& path,
         std::size_t sz    = static_cast<std::size_t>(bd.size_bytes);
         if (sz > 0) {
           if (off + sz > payload_total)
-            return fail("payload out of bounds for leaf '" + ld.path + "'");
+            return fail("payload out of bounds in col " + std::to_string(ci));
           host_bufs[bi].assign(payload_base + off, payload_base + off + sz);
         }
       }
@@ -587,16 +650,20 @@ compressed_table read_compressed_table(std::string const& path,
       std::string rep_err;
       auto rep = rep_from_leaf_desc(
         ld, static_cast<cudf::size_type>(cr.num_rows), host_bufs, stream, mr, &rep_err);
-      if (!rep) return fail("rep_from_leaf_desc '" + ld.path + "': " + rep_err);
+      if (!rep) return fail("rep_from_leaf_desc (col " + std::to_string(ci) + "): " + rep_err);
 
-      leaves.emplace(ld.path, std::move(rep));
+      PlanNode& node = nodes[ld.node_index];
+      if (ld.slot == kSelfRepSlot) {
+        node.meta = rep->describe_meta();
+        node.rep  = std::move(rep);
+      } else if (ld.slot >= 0 && static_cast<std::size_t>(ld.slot) < node.output_paths.size()) {
+        node.channels.emplace(node.output_paths[ld.slot], std::move(rep));
+      } else {
+        return fail("leaf slot out of range in col " + std::to_string(ci));
+      }
     }
 
-    std::string compound_err;
-    auto compound = plan_compound_from_leaves(cr.plan_dsl, std::move(leaves), &compound_err);
-    if (!compound)
-      return fail("plan_compound_from_leaves col " + std::to_string(ci) + ": " + compound_err);
-
+    compute_input_sources(compound->tree);
     out_col.compound = std::move(compound);
   }
 

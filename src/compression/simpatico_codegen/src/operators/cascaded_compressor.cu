@@ -20,6 +20,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -115,12 +116,14 @@ bool parse_nvcomp_cascaded_suffix(std::string_view suffix, int* deltas, int* rle
   return true;
 }
 
-std::vector<compressible_output> cascaded_compressed_representation::named_channels() const
+std::vector<compressible_output> cascaded_compressed_representation::named_channels(
+  rmm::cuda_stream_view stream) const
 {
   if (!serialized_output) {
-    cudaStream_t s;
-    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-    rmm::cuda_stream_view stream(s);
+    // The resulting column's device_buffer remembers ``stream`` for its own
+    // eventual deallocation, so the caller-supplied stream must stay valid
+    // for the column's lifetime (a private stream destroyed at the end of
+    // this scope would leave a dangling handle).
     auto mr  = rmm::mr::get_current_device_resource_ref();
     auto out = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
                                              static_cast<cudf::size_type>(compressed_size),
@@ -132,10 +135,9 @@ std::vector<compressible_output> cascaded_compressed_representation::named_chann
                       compressed_data->data(),
                       compressed_size,
                       cudaMemcpyDeviceToDevice,
-                      s);
+                      stream.value());
     }
-    cudaStreamSynchronize(s);
-    cudaStreamDestroy(s);
+    cudaStreamSynchronize(stream.value());
     serialized_output = std::move(out);
   }
   return {{"output", serialized_output->view()}};
@@ -238,5 +240,12 @@ std::unique_ptr<cudf::column> cascaded_compressor::decompress(
   if (repr == nullptr) return nullptr;
   return repr->decompress(stream, mr);
 }
+
+namespace detail {
+void release_cascaded_manager_scratch()
+{
+  if (tls_cascaded_mgr.mgr) tls_cascaded_mgr.mgr->deallocate_gpu_mem();
+}
+}  // namespace detail
 
 }  // namespace simpatico

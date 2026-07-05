@@ -2,8 +2,12 @@
 #pragma once
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -145,4 +149,94 @@ inline bool columns_equal(cudf::column_view a, cudf::column_view b)
 inline void expect(bool cond, char const* msg)
 {
   if (!cond) throw std::runtime_error(msg);
+}
+
+// ---------------------------------------------------------------------------
+// String helpers
+// ---------------------------------------------------------------------------
+
+// A STRING column with heavy repetition (dictionary/BWT/nvcomp friendly).
+inline std::unique_ptr<cudf::column> make_string_column(int num_rows, rmm::cuda_stream_view stream)
+{
+  static char const* const words[] = {
+    "apple", "banana", "cherry", "apple", "date", "banana", "apple", "elderberry", "fig", "banana"};
+  constexpr int kNumWords = 10;
+
+  std::vector<char> chars;
+  std::vector<std::int32_t> offsets(static_cast<std::size_t>(num_rows) + 1, 0);
+  for (int r = 0; r < num_rows; ++r) {
+    char const* w = words[r % kNumWords];
+    for (char const* p = w; *p; ++p)
+      chars.push_back(*p);
+    offsets[static_cast<std::size_t>(r) + 1] = static_cast<std::int32_t>(chars.size());
+  }
+
+  auto offsets_col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows + 1, cudf::mask_state::UNALLOCATED, stream);
+  if (cudaMemcpyAsync(offsets_col->mutable_view().head<std::int32_t>(),
+                      offsets.data(),
+                      offsets.size() * sizeof(std::int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream.value()) != cudaSuccess)
+    throw std::runtime_error("make_string_column: offsets copy failed");
+
+  rmm::device_buffer chars_buf(chars.size(), stream);
+  if (!chars.empty() &&
+      cudaMemcpyAsync(
+        chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.value()) !=
+        cudaSuccess)
+    throw std::runtime_error("make_string_column: chars copy failed");
+  stream.synchronize();
+
+  return cudf::make_strings_column(
+    num_rows, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+}
+
+// Single-column STRING table wrapping make_string_column.
+inline std::unique_ptr<cudf::table> make_string_table(int num_rows, rmm::cuda_stream_view stream)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(make_string_column(num_rows, stream));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+// Byte-exact STRING comparison (offsets + chars).
+inline bool strings_equal(cudf::column_view a, cudf::column_view b, rmm::cuda_stream_view stream)
+{
+  if (a.size() != b.size()) return false;
+  cudf::strings_column_view sa(a), sb(b);
+  auto const ca = sa.chars_size(stream);
+  auto const cb = sb.chars_size(stream);
+  if (ca != cb) return false;
+
+  std::size_t const n_off = static_cast<std::size_t>(a.size()) + 1;
+  std::vector<std::int32_t> oa(n_off), ob(n_off);
+  cudaMemcpy(oa.data(),
+             sa.offsets().head<std::int32_t>(),
+             n_off * sizeof(std::int32_t),
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(ob.data(),
+             sb.offsets().head<std::int32_t>(),
+             n_off * sizeof(std::int32_t),
+             cudaMemcpyDeviceToHost);
+  if (oa != ob) return false;
+
+  std::vector<std::uint8_t> pa(static_cast<std::size_t>(ca)), pb(static_cast<std::size_t>(cb));
+  if (ca > 0) {
+    cudaMemcpy(
+      pa.data(), sa.chars_begin(stream), static_cast<std::size_t>(ca), cudaMemcpyDeviceToHost);
+    cudaMemcpy(
+      pb.data(), sb.chars_begin(stream), static_cast<std::size_t>(cb), cudaMemcpyDeviceToHost);
+  }
+  return pa == pb;
+}
+
+// Equality for any supported column type (STRING or fixed-width).
+inline bool columns_equal_any(cudf::column_view a,
+                              cudf::column_view b,
+                              rmm::cuda_stream_view stream)
+{
+  if (a.type() != b.type() || a.size() != b.size()) return false;
+  if (a.type().id() == cudf::type_id::STRING) return strings_equal(a, b, stream);
+  return columns_equal(a, b);
 }

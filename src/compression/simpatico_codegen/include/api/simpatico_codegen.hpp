@@ -47,7 +47,8 @@ class compressed_table {
   /// column. The outer vector is indexed by column; the inner by leaf within
   /// that column. Leaf order follows PlanTree node order (node.rep before
   /// node.channels; channels in output_paths order where available).
-  std::vector<std::vector<simpatico::leaf_desc>> describe() const;
+  std::vector<std::vector<simpatico::leaf_desc>> describe(
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) const;
 
   /// Decompress on a single CUDA stream.
   ///

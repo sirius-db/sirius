@@ -29,7 +29,7 @@ struct CodegenHead {
   std::vector<FusedNodeOrigin> preorder;
 };
 
-/// Maximal {delta,rle,bitpack} subtree rooted at PlanTree node ``start_node``.
+/// Maximal {delta,rle,bitpack,FOR,zigzag} subtree rooted at PlanTree node ``start_node``.
 std::optional<CodegenHead> extract_fusable_subtree(PlanTree const& tree,
                                                    NodeId start_node,
                                                    std::string* err = nullptr);

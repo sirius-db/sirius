@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -108,53 +109,53 @@ struct leaf_buffer_desc {
   const void* device_ptr   = nullptr;
 };
 
-// Flat descriptor for one compressed leaf (one rep slot in the PlanTree).
-// Produced by compressed_table::describe(); consumed by the file writer and
-// by the IO read path to reconstruct reps.
+// `slot` value marking a leaf as its node's own rep (rather than a terminal
+// output-channel rep, which uses the output-port index).
+inline constexpr std::int32_t kSelfRepSlot = -1;
+
+// Descriptor for one compressed leaf (one rep slot in the PlanTree), located
+// structurally: `node_index` is its owning node, `slot` is kSelfRepSlot for the
+// node's own rep or an output-port index for a terminal channel rep. Produced
+// by compressed_table::describe(); consumed by the file writer and read path.
 struct leaf_desc {
-  std::string path;  // DSL dotted path keying this leaf
-  PlanLeafKind kind     = PlanLeafKind::Unknown;
-  std::uint8_t type_tag = 0;  // decoded column dtype tag
+  std::uint32_t node_index = 0;
+  std::int32_t slot        = kSelfRepSlot;
+  PlanLeafKind kind        = PlanLeafKind::Unknown;
+  std::uint8_t type_tag    = 0;  // decoded column dtype tag
   leaf_meta_v meta{leaf_meta::none{}};
   std::vector<leaf_buffer_desc> buffers;  // channel buffers in named_channels() order
 };
 
 // ---------------------------------------------------------------------------
-// Type-tag encoding — mirrors cudf_shim.cpp type_id_to_tag / type_id_from_tag.
+// Type-tag encoding. One table drives both directions; 255 = unsupported type.
 // ---------------------------------------------------------------------------
+
+inline constexpr std::pair<cudf::type_id, std::uint8_t> kTypeTags[] = {
+  {cudf::type_id::INT8, 0},
+  {cudf::type_id::INT16, 1},
+  {cudf::type_id::INT32, 2},
+  {cudf::type_id::INT64, 3},
+  {cudf::type_id::UINT8, 4},
+  {cudf::type_id::UINT16, 5},
+  {cudf::type_id::UINT32, 6},
+  {cudf::type_id::UINT64, 7},
+  {cudf::type_id::FLOAT32, 8},
+  {cudf::type_id::FLOAT64, 9},
+  {cudf::type_id::STRING, 10},
+};
 
 inline std::uint8_t dtype_to_tag(cudf::data_type dt) noexcept
 {
-  switch (dt.id()) {
-    case cudf::type_id::INT8: return 0;
-    case cudf::type_id::INT16: return 1;
-    case cudf::type_id::INT32: return 2;
-    case cudf::type_id::INT64: return 3;
-    case cudf::type_id::UINT8: return 4;
-    case cudf::type_id::UINT16: return 5;
-    case cudf::type_id::UINT32: return 6;
-    case cudf::type_id::UINT64: return 7;
-    case cudf::type_id::FLOAT32: return 8;
-    case cudf::type_id::FLOAT64: return 9;
-    default: return 255;
-  }
+  for (auto const& [id, tag] : kTypeTags)
+    if (id == dt.id()) return tag;
+  return 255;
 }
 
 inline cudf::data_type tag_to_dtype(std::uint8_t tag) noexcept
 {
-  switch (tag) {
-    case 0: return cudf::data_type{cudf::type_id::INT8};
-    case 1: return cudf::data_type{cudf::type_id::INT16};
-    case 2: return cudf::data_type{cudf::type_id::INT32};
-    case 3: return cudf::data_type{cudf::type_id::INT64};
-    case 4: return cudf::data_type{cudf::type_id::UINT8};
-    case 5: return cudf::data_type{cudf::type_id::UINT16};
-    case 6: return cudf::data_type{cudf::type_id::UINT32};
-    case 7: return cudf::data_type{cudf::type_id::UINT64};
-    case 8: return cudf::data_type{cudf::type_id::FLOAT32};
-    case 9: return cudf::data_type{cudf::type_id::FLOAT64};
-    default: return cudf::data_type{cudf::type_id::EMPTY};
-  }
+  for (auto const& [id, t] : kTypeTags)
+    if (t == tag) return cudf::data_type{id};
+  return cudf::data_type{cudf::type_id::EMPTY};
 }
 
 }  // namespace simpatico

@@ -31,6 +31,19 @@ struct ShapeKeyHash {
 std::string source_digest(const std::string& rendered_source);
 ShapeKey shape_key_from(const std::string& rendered_source, int arch_cc);
 
+// Persistent (on-disk) cubin cache. Compiled kernels are keyed by the same
+// (source, arch, cuda runtime, driver) tuple as the in-memory cache and stored
+// as <dir>/<hash>.cubin, so a shape compiled once is reused across processes
+// and across runs. Location resolves to $SIMPATICO_JIT_CACHE_DIR, else
+// ${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit; set SIMPATICO_JIT_CACHE_DIR
+// to "off" (or empty) to disable and fall back to in-memory only.
+//
+// jit_disk_cache_dir() returns the resolved directory, or "" when disabled.
+// clear_jit_disk_cache() removes every cached cubin (best-effort); call it
+// before any compilation happens (e.g. from a test's main / orchestrator).
+std::string jit_disk_cache_dir();
+void clear_jit_disk_cache();
+
 class KernelCache {
  public:
   static KernelCache& instance();

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 
 namespace simpatico {
 
 bool is_codegen_compressor(std::string const& op)
 {
-  return op == "delta" || op == "rle" || op == "bitpack" || op == "for" || op == "zigzag";
+  auto id = op_id_from_name(op);
+  return id && op_info(*id).codegen;
 }
 
 // Returns true iff `channel` is a JIT-recursive child channel of `parent_op`

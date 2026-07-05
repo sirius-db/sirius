@@ -105,6 +105,13 @@ const DtypeInfo* lookup_dtype(const std::string& name)
   return (it == table.end()) ? nullptr : &it->second;
 }
 
+// Same-width unsigned type name, for arithmetic that must wrap modulo 2^N
+// instead of relying on signed overflow (UB).
+const char* unsigned_counterpart(std::size_t elem_size)
+{
+  return (elem_size == 8) ? "uint64_t" : "uint32_t";
+}
+
 // ---------------------------------------------------------------------
 // String utilities.
 // ---------------------------------------------------------------------
@@ -505,15 +512,21 @@ void Walker::emit_delta(const ::codegen::jit::FusedTree& node, LaneInput in)
   // length shrinks by 1 (or 0 if the parent length was 0).
   //
   // Composability note: this is the inline path — read_expr is a
-  // closed-form C++ expression in __LANE__, exactly the case Python's
-  // prev_expr handles too.  Kept as long as register pressure is
-  // fine; the staged path flips to shared-mem materialisation when
-  // needed.
+  // closed-form C++ expression in __LANE__, spliced directly into the
+  // scan input.  Kept as long as register pressure is fine; the
+  // staged path flips to shared-mem materialisation when needed.
+  //
+  // The subtraction is done in the unsigned counterpart type: adjacent
+  // values can differ by more than the signed range holds (e.g. delta over
+  // raw float32 bit patterns), and the diff/reconstruct roundtrip relies on
+  // wraparound. Signed overflow is UB in C++; unsigned wraparound is
+  // well-defined, so this is not just cosmetic.
+  const std::string dutype = unsigned_counterpart(op_dt->elem_size);
   LaneInput out;
   out.kind      = LaneInput::Expr;
   out.elem_type = in.elem_type;
-  out.read_expr = "(static_cast<" + in.elem_type + ">(" + "(" +
-                  at_lane(in.read_expr, "(__LANE__) + 1") + ")" + " - " + "(" +
+  out.read_expr = "(static_cast<" + in.elem_type + ">(static_cast<" + dutype + ">(" +
+                  at_lane(in.read_expr, "(__LANE__) + 1") + ") - static_cast<" + dutype + ">(" +
                   at_lane(in.read_expr, "(__LANE__)") + ")))";
   out.length_expr = "((" + in.length_expr + ") > 0 ? " + "((" + in.length_expr + ") - 1) : 0)";
 
@@ -598,11 +611,18 @@ void Walker::emit_for(const ::codegen::jit::FusedTree& node, LaneInput in)
 
   // Rewrite LaneInput for the child: residual = parent_value - chunk_min.
   // Length is unchanged — FOR preserves the element count.
+  //
+  // Unsigned subtraction (see emit_delta): parent_value - chunk_min can
+  // exceed the signed range even though chunk_min IS the block minimum,
+  // when the values themselves span more than the signed range (e.g. raw
+  // float32 bit patterns).
+  const std::string futype = unsigned_counterpart(op_dt->elem_size);
   LaneInput out;
   out.kind      = LaneInput::Expr;
   out.elem_type = in.elem_type;
-  out.read_expr = "(static_cast<" + in.elem_type + ">(" + "(" +
-                  at_lane(in.read_expr, "(__LANE__)") + ")" + " - " + "(" + v_min + ")))";
+  out.read_expr = "(static_cast<" + in.elem_type + ">(static_cast<" + futype + ">(" +
+                  at_lane(in.read_expr, "(__LANE__)") + ") - static_cast<" + futype + ">(" + v_min +
+                  ")))";
   out.length_expr = in.length_expr;
 
   emit_node(*dit->second, std::move(out));
@@ -932,7 +952,7 @@ void Walker::emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in)
   }
 
   // Unsigned counterpart + sign-bit shift width, derived from element size.
-  const std::string utype = (op_dt->elem_size == 8) ? "uint64_t" : "uint32_t";
+  const std::string utype = unsigned_counterpart(op_dt->elem_size);
   const int shift         = static_cast<int>(op_dt->elem_size) * 8 - 1;
 
   // ---- Transformer mode: rewrite read_expr inline, recurse, store nothing.
@@ -1038,7 +1058,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
     throw RenderError(
       "render: Bitpack node must have fixed_stride=true "
       "(encoder produces OverAllocate layout); pass through "
-      "compact_into() to obtain Compact-layout buffers");
+      "compact_in_place() to obtain Compact-layout buffers");
   }
   // Per-op dtype lookup — the LaneInput is the source of truth.  A
   // Bitpack under Rle's `runs` subtree sees in.elem_type=int32_t
@@ -1101,7 +1121,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   add_buffer(id, "lw_shards", sizeof(std::uint32_t), kMaxBitsShards * kShardStride);
   // Note: no per-chunk live_words buffer — live_packed_bytes is derived
   // from lw_shards (DtoH only 2 KB instead of num_chunks×4 B).
-  // compact_into() reconstructs per-chunk offsets from chunk_bits+chunk_count.
+  // compact_in_place() reconstructs per-chunk offsets from chunk_bits+chunk_count.
 
   // Smem slab for use_smem path.
   // For runs (int32, bits ≤ 10):  322 words × 4 = 1288 bytes.

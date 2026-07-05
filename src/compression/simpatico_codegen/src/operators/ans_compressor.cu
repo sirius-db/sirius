@@ -12,6 +12,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -58,14 +59,16 @@ nvcomp::ANSManager* get_ans_manager(cudaStream_t s)
 }
 }  // namespace
 
-std::vector<compressible_output> ans_compressed_representation::named_channels() const
+std::vector<compressible_output> ans_compressed_representation::named_channels(
+  rmm::cuda_stream_view stream) const
 {
   if (!serialized_output) {
-    // Use a private non-blocking stream: the producing stream is always synced
-    // before named_channels() is called, so compressed_data is already coherent.
-    cudaStream_t s;
-    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-    rmm::cuda_stream_view stream(s);
+    // The resulting column's device_buffer remembers ``stream`` for its own
+    // eventual deallocation, so the caller-supplied stream must stay valid
+    // for the column's lifetime (a private stream destroyed at the end of
+    // this scope would leave a dangling handle). The producing stream is
+    // always synced before named_channels() is called, so compressed_data
+    // is already coherent.
     auto mr  = rmm::mr::get_current_device_resource_ref();
     auto out = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
                                              static_cast<cudf::size_type>(compressed_size),
@@ -79,8 +82,7 @@ std::vector<compressible_output> ans_compressed_representation::named_channels()
                       cudaMemcpyDeviceToDevice,
                       stream.value());
     }
-    cudaStreamSynchronize(s);
-    cudaStreamDestroy(s);
+    cudaStreamSynchronize(stream.value());
     serialized_output = std::move(out);
   }
   return {{"output", serialized_output->view()}};
@@ -171,5 +173,12 @@ std::unique_ptr<cudf::column> ans_compressor::decompress(
   if (ans_repr == nullptr) return nullptr;
   return ans_repr->decompress(stream, mr);
 }
+
+namespace detail {
+void release_ans_manager_scratch()
+{
+  if (tls_ans_mgr.mgr) tls_ans_mgr.mgr->deallocate_gpu_mem();
+}
+}  // namespace detail
 
 }  // namespace simpatico

@@ -1,24 +1,19 @@
-// Runtime FusedTree IR — mirror of the Python `kernels/tree.py`
-// dataclass.  Used by callers (beam-search explorer, DSL parser, Rust
-// FFI) to describe a compression-tree shape at runtime, which the JIT
-// pipeline then turns into a concrete codegen C++ kernel.
+// Runtime FusedTree IR.  Used by callers (beam-search explorer, DSL
+// parser, Rust FFI) to describe a compression-tree shape at runtime;
+// the encode/decode JIT renderers (`encode/jit/renderer.cpp`,
+// `decode/jit/renderer.cpp`) walk it and emit plain CUDA source text,
+// which is then compiled at runtime via NVRTC and cached by shape (see
+// `KernelCache`/`ShapeKey` in `kernel_cache.hpp`, keyed on a hash of
+// the rendered source).  The beam-search explorer enumerates hundreds
+// of thousands of candidate shapes, so this has to be a runtime value
+// rather than a compile-time template instantiation per shape.
 //
-// Why a runtime IR?  The compile-time template tree in `tree.hpp` is
-// great for known shapes (one cubin per shape, fully inlined), but the
-// beam-search explorer enumerates hundreds of thousands of candidate
-// shapes — we can't pre-instantiate them all.  The runtime IR feeds
-// `render_type()` which emits a single C++ type-expression string that
-// instantiates the compile-time templates inside an nvrtc-JITted
-// translation unit.  The decode-time inlining is the same in both
-// paths; what differs is *when* the compiler runs.
+// Determinism contract: `children` is `std::map` so iteration yields
+// lex-sorted key order.  Two structurally equal trees therefore
+// produce byte-identical rendered output, which is what the cubin
+// cache hashes on.
 //
-// Determinism contract (matches Python): `children` is `std::map` so
-// iteration yields lex-sorted key order.  Two structurally equal trees
-// therefore produce byte-identical rendered output, which is what the
-// cubin cache hashes on.
-//
-// Op tags reuse `codegen::OpKind` from `tree.hpp` so the runtime
-// IR and the compile-time IR share one source of truth.
+// Op tags reuse `codegen::OpKind` from `tree.hpp`.
 
 #pragma once
 
@@ -40,23 +35,30 @@ struct FusedTree {
 
   // Named child branches keyed by output-port name ("values", "runs").
   // Shared-ownership so callers can reuse subtrees across multiple
-  // FusedTrees without copying — matches Python's reference-graph
-  // semantics where the same dataclass can appear in two places.
+  // FusedTrees without copying (the same subtree can appear in more
+  // than one place).
   std::map<std::string, std::shared_ptr<FusedTree>> children;
 
-  // Per-node attribute: only meaningful for ``OpKind::Bitpack`` today.
-  // When true, the JIT'd kernel computes a Bitpack chunk's base word
-  // offset arithmetically (``chunk_id * STRIDE_WORDS``) instead of
-  // loading from the ``bp_offsets`` metadata buffer.  The OverAllocate
-  // encoder layout (Python's ``use_fixed_stride=True``) sizes the
-  // ``packed`` channel to ``num_chunks * STRIDE_WORDS`` words so the
-  // arithmetic offset is exact.  Setting it on a non-Bitpack node is
-  // a no-op (the renderer just won't emit the extra template arg).
+  // Per-node attribute: only meaningful for ``OpKind::Bitpack``, and
+  // only consulted by the ENCODE renderer, which requires it to be
+  // true (see the contract check in encode/jit/renderer.cpp).  Encode
+  // always emits OverAllocate: each chunk's packed words are written
+  // at the arithmetic offset ``chunk_id * STRIDE_WORDS``, so the
+  // kernel never needs a host cumsum before it can start writing.
   //
-  // The renderer hashes this into the kernel-cache key via the
-  // emitted type expression (e.g. ``Bitpack<int32_t, true>`` vs
-  // ``Bitpack<int32_t, false>``), so OverAllocate and Compact shapes
-  // get distinct compiled kernels and can co-exist in one process.
+  // The DECODE renderer ignores this field entirely (see
+  // `test_jit_kernel_cache.cpp`'s "fixed_stride is ignored here" for
+  // decode): every persisted bitpack rep has already been densified
+  // into the Compact layout by `compact_in_place()`
+  // (src/bridge/bitpack_compact.cu) before it's written to disk, and
+  // decode always reconstructs `bp_offsets` itself on-device via a CUB
+  // exclusive scan over the stored `chunk_bits`/`chunk_count` (see
+  // `synthesize_decode_transients` in bridge/codegen_runtime.cpp).
+  //
+  // Flipping this changes the CUDA source the encode renderer emits
+  // for the node, so it naturally lands in a different kernel-cache
+  // entry (the cache keys on a hash of the fully rendered source —
+  // see `ShapeKey` in `kernel_cache.hpp`).
   bool fixed_stride{false};
 
   bool is_leaf() const noexcept { return children.empty(); }
@@ -79,15 +81,13 @@ struct FusedTree {
 };
 
 // Effective dtype for a child branch.  Single source of truth for the
-// "RLE.runs is always int32" rule that the Python side enforces via
-// `tree.py::child_dtype` and that the renderer threads through every
-// recursive call.
+// "RLE.runs is always int32" rule, threaded through every recursive
+// call by the encode/decode renderers.
 std::string child_dtype(OpKind parent_op,
                         const std::string& child_key,
                         const std::string& parent_dtype);
 
-// Human-readable op tag for diagnostics / cache keys.  Not the same as
-// the rendered C++ type; this one is stable across releases.
+// Human-readable op tag for diagnostics (error messages).
 std::string op_kind_name(OpKind op);
 
 // ---------------------------------------------------------------------------

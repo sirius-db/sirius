@@ -23,15 +23,16 @@
 // Mixing note: device buffers come from the RMM async pool (runtime API);
 // the encode kernel is launched via the driver API (`cuLaunchKernel` — it's
 // a JIT'd `CUfunction`).  Both share device 0's primary context, so the
-// pointers are interchangeable with the runtime-API AOT `.cu` tests
-// (`<<<>>>` / `launch_decompress_tree_1d`).  The async allocs are stream-
-// ordered, so the helper syncs before the launch (see below).
+// pointers are interchangeable with anything else using that context. The
+// async allocs are stream-ordered, so the helper syncs before the launch
+// (see below).
 
 #pragma once
 
 #include "codegen/encode/jit/plain_compile.hpp"
 #include "codegen/encode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
+#include "codegen/jit/kernel_cache.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"  // CompileOptions
 
 #include <rmm/cuda_stream_view.hpp>
@@ -75,7 +76,7 @@ struct GpuEncoded {
   }
 };
 
-// Typed device-pointer accessor for the AOT decode path.  Throws if the
+// Typed device-pointer accessor for the JIT decode path.  Throws if the
 // (node_id, field) buffer is missing.
 template <typename T>
 inline const T* device_ptr(const GpuEncoded& enc, std::int32_t node_id, const std::string& field)
@@ -126,11 +127,14 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
   GpuEncoded out;
   out.num_chunks = cc::num_chunks_for(n);
 
-  // 1. Render + compile the encode kernel for this shape.
+  // 1. Render + compile the encode kernel for this shape. Route through the
+  //    shared KernelCache (same path the real pipeline and the operator sweep
+  //    use) so the on-disk cubin cache covers fused_operator_sweep's encode too.
   cje::EncodeKernelSpec spec = cje::render(tree, element_dtype, out.num_chunks);
   cje::CompileOptions opts;
-  opts.arch_cc               = arch_cc;
-  cje::CompiledKernel kernel = cje::compile_plain_kernel(spec.source, spec.entry_symbol, opts);
+  opts.arch_cc = arch_cc;
+  const cje::CompiledKernel* kernel =
+    jit::KernelCache::instance().get_or_compile_plain(spec.source, spec.entry_symbol, opts);
 
   // Reserve so the per-spec emplace_backs never reallocate `owned` (keeps
   // the captured d_flat / buf_ptrs raw pointers below trivially valid).
@@ -177,7 +181,7 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
   for (auto& p : buf_ptrs)
     args.push_back(&p);
 
-  cu_check(cuLaunchKernel(kernel.func,
+  cu_check(cuLaunchKernel(kernel->func,
                           static_cast<unsigned>(out.num_chunks),
                           1,
                           1,
@@ -243,7 +247,7 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
   //    (node 0); nullptr for every other RLE node (broadcast-compare
   //    fallback).  Any values child is allowed — the values child is
   //    decoded at contiguous run indices in Phase A, so Delta composes.
-  //    This lets the AOT/JIT roundtrips exercise both paths.
+  //    This lets the JIT roundtrips exercise both paths.
   const bool root_rle_variant_c     = (tree.op == cc::OpKind::Rle);
   const std::size_t rle_scratch_len = static_cast<std::size_t>(out.num_chunks) * cc::kChunkSize;
   for (const auto& b : spec.buffers) {

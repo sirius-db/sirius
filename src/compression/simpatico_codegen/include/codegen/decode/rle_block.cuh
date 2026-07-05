@@ -9,9 +9,14 @@
 
 #include <cub/block/block_scan.cuh>
 
-// Block-collective RLE decode primitives (plain CUDA + CUB, no JIT codegen), shared
-// by the AOT and JIT decode paths.  The bitpack and delta block primitives live
-// in their own decode headers (decode/bitpack.cuh, decode/delta.cuh).
+// Block-collective RLE decode primitives (plain CUDA + CUB, no JIT codegen).
+// `#include`d directly into the NVRTC-compiled kernel source emitted by
+// decode/jit/renderer.cpp (see its kPrelude), which calls these templates
+// instead of re-emitting the run-length scan/scatter/binary-search dispatch
+// as generated text on every occurrence.  Bitpack and Delta decode don't
+// need an equivalent header: Bitpack is a closed-form per-element
+// expression and Delta is a single `cub::BlockScan`, both simple enough
+// that the renderer splices them inline as text instead.
 
 namespace codegen {
 

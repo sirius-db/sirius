@@ -100,13 +100,10 @@ void io_roundtrip(char const* label,
     expect(c1.num_rows == c2.num_rows,
            (std::string(label) + ": num_rows col " + std::to_string(i)).c_str());
     expect(c1.name == c2.name, (std::string(label) + ": name col " + std::to_string(i)).c_str());
-    bool dsl1_empty = !c1.compound || c1.compound->plan_dsl.empty();
-    bool dsl2_empty = !c2.compound || c2.compound->plan_dsl.empty();
-    expect(dsl1_empty == dsl2_empty,
-           (std::string(label) + ": dsl emptiness col " + std::to_string(i)).c_str());
-    if (!dsl1_empty)
-      expect(c1.compound->plan_dsl == c2.compound->plan_dsl,
-             (std::string(label) + ": plan_dsl col " + std::to_string(i)).c_str());
+    // The plan is persisted structurally (node array), not as DSL text, so the
+    // compound's presence round-trips even though plan_dsl is not restored.
+    expect((c1.compound != nullptr) == (c2.compound != nullptr),
+           (std::string(label) + ": compound presence col " + std::to_string(i)).c_str());
   }
 
   // Leaf structure survives (same kinds and buffer names).
@@ -121,7 +118,7 @@ void io_roundtrip(char const* label,
   expect(out->num_columns() == input.num_columns(),
          (std::string(label) + ": decompressed column count").c_str());
   for (int i = 0; i < input.num_columns(); ++i)
-    expect(columns_equal(input.column(i), out->view().column(i)),
+    expect(columns_equal_any(input.column(i), out->view().column(i), stream),
            (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
 }
 
@@ -184,8 +181,44 @@ void test_alp_f32()
   io_roundtrip("alp_f32", t->view(), "input -> alp\n");
 }
 
+// Bitextract: multi-output op whose planes are terminal channel leaves,
+// exercising per-node output_names + terminal-slot attachment on read.
+void test_bitextract_f32()
+{
+  auto t = make_f32_table(1, 4096, 29);
+  io_roundtrip(
+    "bitextract_f32", t->view(), "input -> bitextract_f32 -> sign, exponent, mantissa\n");
+}
+
+// Bitjoin DAG: the reconvergent node carries structured attrs (input node refs
+// + channels) that must survive the structural node serialization.
+void test_bitjoin_f32()
+{
+  auto t = make_f32_table(1, 4096, 31);
+  io_roundtrip("bitjoin_f32",
+               t->view(),
+               "input -> bitextract_f32 -> sign, exponent, mantissa\n"
+               "bitextract_f32.sign, bitextract_f32.exponent, bitextract_f32.mantissa "
+               "-> bitjoin_f32 -> rejoined\n");
+}
+
+// ALP-RD (f64): six output channels + right_bw carried in a channel.
+void test_alp_rd_f64()
+{
+  auto t = make_f64_table(1, 4096, 37);
+  io_roundtrip("alp_rd_f64", t->view(), "input -> alp_rd\n");
+}
+
+// Dictionary (STRING): variable channel set on a STRING column, exercising the
+// STRING column dtype tag and keys_offsets/keys_chars/indices channels.
+void test_dictionary()
+{
+  auto t = make_string_table(4096, cudf::get_default_stream());
+  io_roundtrip("dictionary", t->view(), "input -> dictionary\n");
+}
+
 // 5. Multi-column: three columns with three different plans in one file.
-//    Verifies the column loop in write/read and that per-column DSLs don't bleed.
+//    Verifies the column loop in write/read and that per-column plans don't bleed.
 void test_multi_column()
 {
   auto t = make_int32_table(3, 2048, 21);
@@ -239,8 +272,8 @@ void test_error_not_found()
   expect(ct.columns.empty(), "error_not_found: expected empty result");
 }
 
-// 9. Error: file exists but contains no end-marker (totally corrupt data).
-void test_error_no_marker()
+// Error: a non-HPLN file (garbage) is rejected rather than crashing.
+void test_error_garbage()
 {
   TmpFile tmp;
   {
@@ -250,21 +283,17 @@ void test_error_no_marker()
   std::string err;
   auto ct = simpatico::read_compressed_table(
     tmp.path, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref(), &err);
-  expect(!err.empty(), "error_no_marker: expected non-empty error");
-  expect(ct.columns.empty(), "error_no_marker: expected empty result");
+  expect(!err.empty(), "error_garbage: expected non-empty error");
+  expect(ct.columns.empty(), "error_garbage: expected empty result");
 }
 
-// 10. Error: end-marker present but binary header has wrong magic bytes.
+// Error: wrong magic bytes.
 void test_error_bad_magic()
 {
   TmpFile tmp;
   {
     std::ofstream f(tmp.path, std::ios::binary);
-    // DSL section + end marker
-    std::string header = "\n---END-HEADERS-V6---\n";
-    f.write(header.data(), static_cast<std::streamsize>(header.size()));
-    // Wrong magic
-    char bad[] = {'X', 'X', 'X', 'X', 6, 0, 0};
+    char bad[] = {'X', 'X', 'X', 'X', 8, 0, 0};
     f.write(bad, sizeof(bad));
   }
   std::string err;
@@ -273,14 +302,12 @@ void test_error_bad_magic()
   expect(!err.empty(), "error_bad_magic: expected non-empty error");
 }
 
-// 11. Error: correct magic but unsupported version number.
+// Error: correct magic but unsupported version number.
 void test_error_bad_version()
 {
   TmpFile tmp;
   {
     std::ofstream f(tmp.path, std::ios::binary);
-    std::string header = "\n---END-HEADERS-V6---\n";
-    f.write(header.data(), static_cast<std::streamsize>(header.size()));
     char data[] = {'H', 'P', 'L', 'N', 99, 0, 0};  // version 99
     f.write(data, sizeof(data));
   }
@@ -310,11 +337,15 @@ int main()
     {"for_only", test_for_only},
     {"zigzag", test_zigzag},
     {"alp_f32", test_alp_f32},
+    {"bitextract_f32", test_bitextract_f32},
+    {"bitjoin_f32", test_bitjoin_f32},
+    {"alp_rd_f64", test_alp_rd_f64},
+    {"dictionary", test_dictionary},
     {"multi_column", test_multi_column},
     {"column_names_survive", test_column_names_survive},
     {"zero_rows", test_zero_rows},
     {"error_not_found", test_error_not_found},
-    {"error_no_marker", test_error_no_marker},
+    {"error_garbage", test_error_garbage},
     {"error_bad_magic", test_error_bad_magic},
     {"error_bad_version", test_error_bad_version},
   };
