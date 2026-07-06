@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/s3/s3_request_authorizer.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
@@ -148,9 +149,23 @@ scan_manager_config make_fake_rest_config(std::string endpoint)
   return cfg;
 }
 
+std::filesystem::path project_root()
+{
+#ifdef SIRIUS_PROJECT_ROOT
+  return std::filesystem::path{SIRIUS_PROJECT_ROOT};
+#else
+  return std::filesystem::current_path();
+#endif
+}
+
 std::filesystem::path local_fixture_path(std::string const& key)
 {
   return std::filesystem::path{require_env("SIRIUS_TEST_S3_LOCAL_DIR")} / key;
+}
+
+std::filesystem::path committed_parquet_fixture(std::string const& name)
+{
+  return project_root() / "test" / "cpp" / "integration" / "data" / "parquet" / name;
 }
 
 std::vector<std::uint8_t> read_binary_file(std::filesystem::path const& path)
@@ -198,11 +213,48 @@ rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> co
   return rest_ctx;
 }
 
+std::uint32_t read_le32(std::span<std::uint8_t const> bytes)
+{
+  REQUIRE(bytes.size() >= 4);
+  return static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8U) |
+         (static_cast<std::uint32_t>(bytes[2]) << 16U) |
+         (static_cast<std::uint32_t>(bytes[3]) << 24U);
+}
+
+std::uint32_t parquet_footer_len(std::span<std::uint8_t const> parquet)
+{
+  REQUIRE(parquet.size() >= 8);
+  CHECK(parquet[parquet.size() - 4] == static_cast<std::uint8_t>('P'));
+  CHECK(parquet[parquet.size() - 3] == static_cast<std::uint8_t>('A'));
+  CHECK(parquet[parquet.size() - 2] == static_cast<std::uint8_t>('R'));
+  CHECK(parquet[parquet.size() - 1] == static_cast<std::uint8_t>('1'));
+  return read_le32(parquet.subspan(parquet.size() - 8, 4));
+}
+
 struct range_fault_policy {
   std::size_t fail_first_gets{0};
   bool fail_all_gets{false};
   int fail_status{503};
   std::chrono::milliseconds response_delay{0};
+  bool omit_content_range{false};
+  bool unknown_content_range_total{false};
+  bool ignore_range_with_200{false};
+  bool fail_suffix_with_416{false};
+};
+
+class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer {
+ public:
+  explicit fixed_url_authorizer(std::string endpoint) : _endpoint(std::move(endpoint)) {}
+
+  sirius::io::s3::s3_authorized_request authorize(sirius::io::s3::s3_object_ref const& obj,
+                                                  sirius::io::s3::s3_request_method /*method*/,
+                                                  std::chrono::seconds /*timeout*/) override
+  {
+    return {_endpoint + "/" + obj.bucket + "/" + obj.key, {}};
+  }
+
+ private:
+  std::string _endpoint;
 };
 
 class range_http_server {
@@ -256,7 +308,9 @@ class range_http_server {
   range_http_server& operator=(range_http_server const&) = delete;
 
   [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
+  [[nodiscard]] std::size_t head_count() const noexcept { return _head_count.load(); }
   [[nodiscard]] std::size_t get_count() const noexcept { return _get_count.load(); }
+  [[nodiscard]] std::size_t body_bytes_sent() const noexcept { return _body_bytes_sent.load(); }
   [[nodiscard]] int peak_active_gets() const noexcept { return _peak_active_gets.load(); }
 
  private:
@@ -305,6 +359,7 @@ class range_http_server {
     bool const is_head = request.rfind("HEAD ", 0) == 0;
     bool const is_get  = request.rfind("GET ", 0) == 0;
     if (is_head) {
+      _head_count.fetch_add(1, std::memory_order_relaxed);
       std::string response =
         "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
         "\r\nConnection: close\r\n\r\n";
@@ -331,35 +386,68 @@ class range_http_server {
 
     if (auto range = parse_range(request)) {
       auto const [start, end] = *range;
-      auto const len          = end - start + 1;
+      if (_fault.fail_suffix_with_416 && is_suffix_range(request)) {
+        send_all(fd,
+                 "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: "
+                 "close\r\n\r\n");
+        return;
+      }
+      if (_fault.ignore_range_with_200 && is_suffix_range(request)) {
+        std::string response =
+          "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
+          "\r\nConnection: close\r\n\r\n";
+        send_all(fd, response);
+        send_body(fd, _object.data(), _object.size());
+        return;
+      }
+      auto const len = end - start + 1;
       std::string response =
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len) +
-        "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" +
-        std::to_string(_object.size()) + "\r\nConnection: close\r\n\r\n";
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len);
+      if (!_fault.omit_content_range) {
+        response +=
+          "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" +
+          (_fault.unknown_content_range_total ? std::string{"*"} : std::to_string(_object.size()));
+      }
+      response += "\r\nConnection: close\r\n\r\n";
       send_all(fd, response);
-      send_all(fd, _object.data() + start, len);
+      send_body(fd, _object.data() + start, len);
       return;
     }
 
     std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
                            "\r\nConnection: close\r\n\r\n";
     send_all(fd, response);
-    send_all(fd, _object.data(), _object.size());
+    send_body(fd, _object.data(), _object.size());
+  }
+
+  [[nodiscard]] static bool is_suffix_range(std::string const& request)
+  {
+    std::string lower = request;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return lower.find("range: bytes=-") != std::string::npos;
+  }
+
+  void send_body(int fd, std::uint8_t const* bytes, std::size_t size)
+  {
+    _body_bytes_sent.fetch_add(send_all(fd, bytes, size), std::memory_order_relaxed);
   }
 
   static void send_all(int fd, std::string_view bytes)
   {
-    send_all(fd, reinterpret_cast<std::uint8_t const*>(bytes.data()), bytes.size());
+    (void)send_all(fd, reinterpret_cast<std::uint8_t const*>(bytes.data()), bytes.size());
   }
 
-  static void send_all(int fd, std::uint8_t const* bytes, std::size_t size)
+  static std::size_t send_all(int fd, std::uint8_t const* bytes, std::size_t size)
   {
     std::size_t sent = 0;
     while (sent < size) {
       ssize_t n = ::send(fd, bytes + sent, size - sent, MSG_NOSIGNAL);
-      if (n <= 0) { return; }
+      if (n <= 0) { return sent; }
       sent += static_cast<std::size_t>(n);
     }
+    return sent;
   }
 
   [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> parse_range(
@@ -379,9 +467,16 @@ class range_http_server {
     auto const dash    = spec.find('-');
     if (dash == std::string::npos) { return std::nullopt; }
     try {
-      std::size_t start = static_cast<std::size_t>(std::stoull(spec.substr(0, dash)));
+      std::size_t start = 0;
       std::size_t end   = _object.size() - 1;
-      if (dash + 1 < spec.size()) {
+      if (dash == 0) {
+        auto const suffix = static_cast<std::size_t>(std::stoull(spec.substr(1)));
+        if (suffix == 0) { return std::nullopt; }
+        start = suffix >= _object.size() ? 0 : _object.size() - suffix;
+      } else {
+        start = static_cast<std::size_t>(std::stoull(spec.substr(0, dash)));
+      }
+      if (dash != 0 && dash + 1 < spec.size()) {
         end = static_cast<std::size_t>(std::stoull(spec.substr(dash + 1)));
       }
       if (start >= _object.size()) { return std::nullopt; }
@@ -398,14 +493,299 @@ class range_http_server {
   std::vector<std::uint8_t> _object;
   range_fault_policy _fault;
   std::atomic<bool> _stop{false};
+  std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
+  std::atomic<std::size_t> _body_bytes_sent{0};
   std::atomic<int> _active_gets{0};
   std::atomic<int> _peak_active_gets{0};
   std::thread _thread;
   std::vector<std::thread> _workers;
 };
 
+std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
+{
+  sirius::io::rest::config cfg{};
+  cfg.request_timeout_s       = 5;
+  cfg.max_connections         = 4;
+  cfg.max_retry_attempts      = 2;
+  cfg.max_auth_retry_attempts = 1;
+  cfg.retry_backoff_base      = std::chrono::milliseconds{1};
+  cfg.retry_jitter            = std::chrono::milliseconds{0};
+  cfg.honor_retry_after       = false;
+  auto authorizer             = std::make_shared<fixed_url_authorizer>(std::move(endpoint));
+  auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+    cfg, std::move(authorizer), nullptr);
+  auto ioctx = std::make_shared<rest_ioctx>(1, std::move(ctx));
+  ioctx->start();
+  return ioctx;
+}
+
 }  // namespace
+
+TEST_CASE("rest footer suffix parses Content-Range totals", "[s3][integration][rest][footerbind]")
+{
+  using sirius::io::rest::content_range_total;
+
+  CHECK(content_range_total("bytes 42-99/12345") == std::optional<std::size_t>{12345});
+  CHECK(content_range_total("Bytes 0-7/8") == std::optional<std::size_t>{8});
+  CHECK_FALSE(content_range_total("bytes 42-99/*").has_value());
+  CHECK_FALSE(content_range_total("bytes */12345").has_value());
+  CHECK_FALSE(content_range_total("not-a-content-range").has_value());
+}
+
+TEST_CASE("rest footer suffix probe discovers size without HEAD",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
+  range_http_server server(parquet);
+  auto authorizer = std::make_shared<fixed_url_authorizer>(server.endpoint());
+  sirius::io::rest::config cfg{};
+  cfg.request_timeout_s       = 5;
+  cfg.max_retry_attempts      = 1;
+  cfg.max_auth_retry_attempts = 1;
+  auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+    cfg, std::move(authorizer), nullptr);
+  sirius::io::rest::rest_reactor reactor(ctx, "footer-suffix-test");
+
+  auto probe = reactor.fetch_footer_suffix("footer-bucket", "nation.parquet", 1UL << 20);
+
+  CHECK(probe.object_size == parquet.size());
+  CHECK(probe.window_lo == 0);
+  REQUIRE(probe.bytes != nullptr);
+  CHECK(probe.bytes->size() == parquet.size());
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("parquet footer bind is served by one suffix GET and then the stash",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const parquet    = read_binary_file(committed_parquet_fixture("nation.parquet"));
+  auto const footer_len = static_cast<std::size_t>(parquet_footer_len(parquet));
+  auto const footer_off = parquet.size() - 8 - footer_len;
+  range_http_server server(parquet);
+  auto ioctx = make_direct_rest_ioctx(server.endpoint());
+
+  auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                           sirius::io::open_hint::parquet_footer_probe);
+
+  REQUIRE(datasource != nullptr);
+  CHECK(datasource->size() == parquet.size());
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 1);
+
+  std::array<std::uint8_t, 8> trailer{};
+  REQUIRE(datasource->host_read(parquet.size() - trailer.size(), trailer.size(), trailer.data()) ==
+          trailer.size());
+  require_bytes_equal(trailer,
+                      std::span<std::uint8_t const>(parquet.data() + parquet.size() - 8, 8));
+
+  std::vector<std::uint8_t> footer(footer_len);
+  REQUIRE(datasource->host_read(footer_off, footer.size(), footer.data()) == footer.size());
+  require_bytes_equal(footer,
+                      std::span<std::uint8_t const>(parquet.data() + footer_off, footer_len));
+
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("footer outside the suffix window falls back to one body GET",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const parquet             = read_binary_file(committed_parquet_fixture("nation.parquet"));
+  auto const footer_len          = static_cast<std::size_t>(parquet_footer_len(parquet));
+  auto const footer_off          = parquet.size() - 8 - footer_len;
+  std::size_t const suffix_bytes = 8;
+  REQUIRE(footer_len + 8 > suffix_bytes);
+  range_http_server server(parquet);
+  auto authorizer = std::make_shared<fixed_url_authorizer>(server.endpoint());
+  sirius::io::rest::config cfg{};
+  cfg.request_timeout_s       = 5;
+  cfg.max_retry_attempts      = 1;
+  cfg.max_auth_retry_attempts = 1;
+  auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+    cfg, std::move(authorizer), nullptr);
+  sirius::io::rest::rest_reactor reactor(ctx, "footer-window-test");
+  reactor.start();
+
+  auto probe = reactor.fetch_footer_suffix("footer-bucket", "nation.parquet", suffix_bytes);
+  CHECK(probe.object_size == parquet.size());
+  CHECK(probe.window_lo == parquet.size() - suffix_bytes);
+  REQUIRE(probe.bytes != nullptr);
+
+  sirius::io::rest::rest_io_object object("s3://footer-bucket/nation.parquet",
+                                          "footer-bucket",
+                                          "nation.parquet",
+                                          probe.object_size,
+                                          probe.window_lo,
+                                          probe.bytes);
+  CHECK(server.get_count() == 1);
+
+  std::vector<std::uint8_t> footer(footer_len);
+  REQUIRE(reactor.host_read(object, footer_off, footer.size(), footer.data()) == footer.size());
+  require_bytes_equal(footer,
+                      std::span<std::uint8_t const>(parquet.data() + footer_off, footer_len));
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 2);
+}
+
+TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
+  range_http_server server(parquet);
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{
+    make_fake_rest_config(server.endpoint()), *fixture.memory, fixture.topology};
+
+  auto result = manager.describe_parquet("s3://footer-bucket/nation.parquet");
+
+  CHECK(result.object_size == parquet.size());
+  CHECK(result.total_num_rows == 25);
+  REQUIRE(result.names.size() == 4);
+  CHECK(result.names[0] == "n_nationkey");
+  CHECK(result.names[1] == "n_name");
+  CHECK(result.names[2] == "n_regionkey");
+  CHECK(result.names[3] == "n_comment");
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 1);
+
+  auto second = manager.describe_parquet("s3://footer-bucket/nation.parquet");
+  CHECK(second.object_size == result.object_size);
+  CHECK(second.total_num_rows == result.total_num_rows);
+  CHECK(second.names == result.names);
+  CHECK(server.head_count() == 1);
+  CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
+
+  SECTION("missing Content-Range")
+  {
+    range_fault_policy fault{};
+    fault.omit_content_range = true;
+    range_http_server server(parquet, fault);
+    auto ioctx      = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+    CHECK(datasource->size() == parquet.size());
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() >= 1);
+  }
+
+  SECTION("unknown Content-Range total")
+  {
+    range_fault_policy fault{};
+    fault.unknown_content_range_total = true;
+    range_http_server server(parquet, fault);
+    auto ioctx      = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+    CHECK(datasource->size() == parquet.size());
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() >= 1);
+  }
+
+  SECTION("server ignores Range with 200 full-body")
+  {
+    range_fault_policy fault{};
+    fault.ignore_range_with_200 = true;
+    range_http_server server(parquet, fault);
+    auto ioctx      = make_direct_rest_ioctx(server.endpoint());
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+    CHECK(datasource->size() == parquet.size());
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() >= 1);
+  }
+
+  SECTION("server ignores Range with 200 full-body on a large object")
+  {
+    auto payload = deterministic_payload(8 * 1024 * 1024);
+    range_fault_policy fault{};
+    fault.ignore_range_with_200 = true;
+    range_http_server server(payload, fault);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/large.bin",
+                                             sirius::io::open_hint::parquet_footer_probe);
+
+    REQUIRE(datasource != nullptr);
+    CHECK(datasource->size() == payload.size());
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 1);
+    CHECK(server.body_bytes_sent() < payload.size());
+  }
+
+  SECTION("suffix 416 falls back to HEAD")
+  {
+    range_fault_policy fault{};
+    fault.fail_suffix_with_416 = true;
+    range_http_server server(parquet, fault);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+
+    REQUIRE(datasource != nullptr);
+    CHECK(datasource->size() == parquet.size());
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 1);
+  }
+}
+
+TEST_CASE("small objects can be resolved by one suffix probe",
+          "[s3][integration][rest][footerbind]")
+{
+  auto payload = deterministic_payload(512);
+  range_http_server server(payload);
+  auto authorizer = std::make_shared<fixed_url_authorizer>(server.endpoint());
+  sirius::io::rest::config cfg{};
+  cfg.request_timeout_s       = 5;
+  cfg.max_retry_attempts      = 1;
+  cfg.max_auth_retry_attempts = 1;
+  auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+    cfg, std::move(authorizer), nullptr);
+  sirius::io::rest::rest_reactor reactor(ctx, "small-footer-suffix-test");
+
+  auto probe = reactor.fetch_footer_suffix("footer-bucket", "small.bin", 1UL << 20);
+
+  CHECK(probe.object_size == payload.size());
+  CHECK(probe.window_lo == 0);
+  REQUIRE(probe.bytes != nullptr);
+  CHECK(probe.bytes->size() == payload.size());
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("concurrent footer probes each get an object-local suffix stash",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
+  range_http_server server(parquet);
+  auto ioctx            = make_direct_rest_ioctx(server.endpoint());
+  std::string const uri = "s3://footer-bucket/nation.parquet";
+
+  std::vector<std::future<std::size_t>> futures;
+  for (int i = 0; i < 8; ++i) {
+    futures.push_back(std::async(std::launch::async, [ioctx, uri] {
+      auto datasource = ioctx->open_datasource(uri, sirius::io::open_hint::parquet_footer_probe);
+      return datasource->size();
+    }));
+  }
+
+  for (auto& f : futures) {
+    CHECK(f.get() == parquet.size());
+  }
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == futures.size());
+}
 
 TEST_CASE("rest_ioctx reads the MinIO hello fixture through scan_manager create_datasource",
           "[s3][integration][rest]")
