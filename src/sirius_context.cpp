@@ -279,8 +279,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
-  config_            = config;
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(config_.get_telemetry_config());
+  config_ = config;
+  // Declare one telemetry device group per GPU so thread/queue telemetry can
+  // nest under its device instead of piling up flat under the engine.
+  std::vector<int> telemetry_gpu_ids;
+  for (auto const& gpu : config_.get_hw_topology().gpus) {
+    telemetry_gpu_ids.push_back(gpu.id);
+  }
+  telemetry_context_ =
+    sirius::telemetry::telemetry_context::create(config_.get_telemetry_config(), telemetry_gpu_ids);
 
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.

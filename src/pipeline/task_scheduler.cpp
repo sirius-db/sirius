@@ -47,7 +47,7 @@ task_scheduler::task_scheduler(
   : _task_queue(task_queue_ordering), _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
-    *_telemetry_context, "task-scheduler-gpu-queue");
+    *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
 
   // Self-publisher: schedule() uses this to wake management_eventloop when a
   // new task is pushed, so the loop can re-run the matcher against any device
@@ -281,8 +281,8 @@ void task_scheduler::wait_for_completion()
 
 void task_scheduler::management_eventloop()
 {
-  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{*_telemetry_context,
-                                                                         "task-scheduler-thread"};
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
+    *_telemetry_context, "task-scheduler-thread", _telemetry_context->shared_group_id()};
 
   // Pull-signal scheduler. The loop blocks on _task_request_channel for two
   // event kinds:

@@ -49,7 +49,8 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
   sirius::parallel::downgrade_executor* downgrade_executor,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
-  : sirius::parallel::itask_executor(config, std::move(telemetry_context)),
+  : sirius::parallel::itask_executor(
+      config, std::move(telemetry_context), mem_space->get_device_id()),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
@@ -70,7 +71,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
           thread_id_counter]() mutable noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
     telemetry::thread_local_executor_thread_telemtry_init(
-      *telemetry_context, fmt::format("{}-gpu_exec-{}", thread_prefix, thread_id));
+      *telemetry_context,
+      fmt::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
+      telemetry_context->executor_thread_group_id(device_id));
 
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
@@ -91,7 +94,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 void gpu_pipeline_executor::manager_loop()
 {
   telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
-    *_telemetry_context, fmt::format("gpu-{}-exec-manager", _memory_space->get_device_id())};
+    *_telemetry_context,
+    fmt::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
+    _telemetry_context->manager_thread_group_id(_memory_space->get_device_id())};
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
