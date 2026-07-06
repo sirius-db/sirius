@@ -120,7 +120,7 @@ struct host_pin_result {
 struct compression_pin_config {
   bool enabled{false};
   std::string plan_dsl;
-  std::size_t min_chunk_bytes{0};
+  std::size_t min_batch_size_bytes{0};
   std::vector<std::string> column_names;
 };
 

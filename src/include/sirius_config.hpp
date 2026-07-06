@@ -113,7 +113,7 @@ struct compression_config {
 
   /// Minimum chunk size (uncompressed bytes) below which compression is
   /// skipped and the chunk is stored uncompressed.  0 = no threshold.
-  std::size_t min_chunk_bytes{1ULL * 1024 * 1024};  // 1 MiB
+  std::size_t min_batch_size_bytes{1ULL * 1024 * 1024};  // 1 MiB
 
   /// Directory containing per-table Simpatico plan files for input-table
   /// compression.  Each file is named "<table_name>.<ext>" (any extension);

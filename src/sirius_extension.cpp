@@ -1191,10 +1191,20 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
-      pin_comp.enabled         = true;
-      pin_comp.plan_dsl        = std::move(*plan_dsl);
-      pin_comp.min_chunk_bytes = comp_cfg.min_chunk_bytes;
-      pin_comp.column_names    = cache_info.column_names();
+      pin_comp.enabled              = true;
+      pin_comp.plan_dsl             = std::move(*plan_dsl);
+      pin_comp.min_batch_size_bytes = comp_cfg.min_batch_size_bytes;
+      pin_comp.column_names         = cache_info.column_names();
+      SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
+                      data.args.name,
+                      data.args.tier,
+                      pin_comp.column_names.size());
+    } else {
+      SIRIUS_LOG_WARN(
+        "[pin_table] '{}': pin_table_compression is enabled but no plan file was found in '{}'; "
+        "pinning uncompressed",
+        data.args.name,
+        comp_cfg.input_plan_dir);
     }
   }
 
@@ -1696,15 +1706,15 @@ static void SetPinTableInputCompressionPlanDir(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_input_compression_plan_dir");
 }
 
-static void SetPinTableCompressionMinChunkBytes(ClientContext& context,
-                                                SetScope scope,
-                                                Value& parameter)
+static void SetPinTableCompressionMinBatchSizeBytes(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().min_chunk_bytes =
+  sirius_ctx->get_config().get_compression_config().min_batch_size_bytes =
     static_cast<std::size_t>(UBigIntValue::Get(parameter));
-  SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_chunk_bytes");
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_batch_size_bytes");
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -1912,11 +1922,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetPinTableInputCompressionPlanDir);
 
   config.AddExtensionOption(
-    "pin_table_compression_min_chunk_bytes",
-    "Minimum uncompressed chunk size in bytes below which pin_table compression is skipped",
+    "pin_table_compression_min_batch_size_bytes",
+    "Minimum uncompressed batch size in bytes below which pin_table compression is skipped",
     LogicalType::UBIGINT,
     Value::UBIGINT(1ULL * 1024 * 1024),
-    SetPinTableCompressionMinChunkBytes);
+    SetPinTableCompressionMinBatchSizeBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

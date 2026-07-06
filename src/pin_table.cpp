@@ -292,7 +292,7 @@ host_pin_result materialize_pin_to_host_with_compression(
                 static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
             }
           }
-          if (uncompressed_bytes >= compression.min_chunk_bytes) {
+          if (uncompressed_bytes >= compression.min_batch_size_bytes) {
             auto ct = simpatico::compress_with_plan(tbl->view(),
                                                     compression.plan_dsl,
                                                     stream,
@@ -391,7 +391,7 @@ device_pin_result materialize_pin_to_device_with_compression(
                 static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
             }
           }
-          if (uncompressed_bytes >= compression.min_chunk_bytes) {
+          if (uncompressed_bytes >= compression.min_batch_size_bytes) {
             auto ct = simpatico::compress_with_plan(tbl->view(),
                                                     compression.plan_dsl,
                                                     stream,

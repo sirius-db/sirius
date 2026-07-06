@@ -216,7 +216,7 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
   REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 0;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
 
   // Write a plan file for the table that matches the parquet glob name
   auto plan_dir = tmp / "plans";
@@ -270,7 +270,7 @@ TEST_CASE("pin_table compression - device tier result equality vs uncompressed p
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
   REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 0;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
 
   auto plan_dir = tmp / "plans";
   write_plan_file(
@@ -323,7 +323,7 @@ TEST_CASE("pin_table compression - device tier column-subset projection correctn
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
   REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 0;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
 
   auto plan_dir = tmp / "plans";
   write_plan_file(plan_dir,
@@ -377,7 +377,7 @@ TEST_CASE("pin_table compression - column-subset projection correctness",
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
   REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 0;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
 
   auto plan_dir = tmp / "plans";
   write_plan_file(plan_dir,
@@ -457,7 +457,7 @@ TEST_CASE("pin_table compression - fallback when no plan file for table",
   fs::remove_all(tmp);
 }
 
-TEST_CASE("pin_table compression - fallback when chunk is below min_chunk_bytes threshold",
+TEST_CASE("pin_table compression - fallback when batch is below min_batch_size_bytes threshold",
           "[compression][pin_table][isolated_context]")
 {
   if (!has_gpu()) {
@@ -490,7 +490,8 @@ TEST_CASE("pin_table compression - fallback when chunk is below min_chunk_bytes 
     con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
       ->HasError());
   // Threshold (1 GiB) far above the tiny chunk (~800 B) — forces fallback
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 1000000000;")->HasError());
+  REQUIRE_FALSE(
+    con.Query("SET pin_table_compression_min_batch_size_bytes = 1000000000;")->HasError());
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_threshold');");
   REQUIRE(pin);
