@@ -2049,7 +2049,6 @@ TEST_CASE("S3 pushdown all-pruned filter completes with an empty result",
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
   auto fixture        = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query = "SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation") +
                         " WHERE n_regionkey = 99 ORDER BY n_nationkey";
@@ -2069,7 +2068,6 @@ TEST_CASE("S3 pushdown all-pruned aggregate returns zero rows counted",
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query =
     "SELECT count(*) AS c FROM " + s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
@@ -2089,7 +2087,6 @@ TEST_CASE("S3 pushdown zero-input ungrouped count emits the aggregate identity r
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query =
     "SELECT count(*) AS c FROM " + s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
@@ -2109,7 +2106,6 @@ TEST_CASE("S3 pushdown zero-input ungrouped aggregates emit SQL identity and nul
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query =
     "SELECT count(*) AS c_all, count(n_name) AS c_name, sum(n_nationkey) AS sum_key, "
@@ -2133,7 +2129,6 @@ TEST_CASE("S3 pushdown zero-input grouped aggregate still emits no groups",
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
   auto fixture        = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query = "SELECT n_regionkey, count(*) AS c FROM " +
                         s3_parquet_scan(*env, "nation") +
@@ -2152,7 +2147,6 @@ TEST_CASE("S3 pushdown non-pruned aggregate still matches the local parquet orac
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query =
     "SELECT count(*) AS c, min(o_orderdate) AS min_date, max(o_orderdate) AS max_date FROM " +
@@ -2180,7 +2174,6 @@ TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
   // A partially pruned scan must still avoid premature completion and match the oracle.
   auto fixture     = std::make_shared<s3_sql_fixture>(*env);
   auto const shape = std::string{
@@ -2218,7 +2211,6 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
 
   auto make_scans = [&](bool use_s3) {
