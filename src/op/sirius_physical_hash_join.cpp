@@ -1741,8 +1741,8 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 
   // Leave the state OPEN when the delivered batch is not GPU-resident; execute may later claim it
   // from the migrated/execution-ready GPU representation. This is defense-in-depth: normal
-  // build-side CONCAT delivery is GPU-resident and completes publication here before probe data
-  // scan scheduling.
+  // build-side CONCAT delivery is GPU-resident and completes publication here before this join's
+  // immediate probe data scan is scheduled. A scan target below an intervening join can run sooner.
   auto ro  = batch->to_read_only();
   auto* ms = ro.get_data() ? ro.get_memory_space() : nullptr;
   if (!ms || ro.get_current_tier() != ::cucascade::memory::Tier::GPU) { return; }

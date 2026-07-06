@@ -40,6 +40,7 @@
 #include "sirius_context.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace sirius::planner {
 
@@ -392,7 +393,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           rhs_cardinality,
           build_filter_evidence.domain_cardinality);
       } else {
-        auto const& memory_manager = sirius_context->get_memory_manager();
+        auto& memory_manager = sirius_context->get_memory_manager();
         auto const gpu_spaces =
           memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
         auto const host_spaces =
@@ -431,7 +432,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                 });
               auto const* host_space =
                 local_host == host_spaces.end() ? host_spaces.front() : *local_host;
-              filter_replica_spaces.emplace_back(*gpu_space, *host_space);
+              auto* mutable_gpu_space =
+                memory_manager.get_memory_space(cucascade::memory::Tier::GPU, gpu_id);
+              if (mutable_gpu_space == nullptr) {
+                throw std::logic_error(
+                  "[sirius_plan_comparison_join] Dynamic-filter GPU space disappeared during "
+                  "plan construction");
+              }
+              filter_replica_spaces.emplace_back(*mutable_gpu_space, *host_space);
             }
             SIRIUS_LOG_INFO(
               "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "

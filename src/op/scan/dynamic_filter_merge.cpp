@@ -188,9 +188,9 @@ bool dynamic_filter_gate::applicable(sirius::op::sirius_dynamic_filter_set const
 {
   if (!filters.has_filters()) { return false; }
   if (_state.load(std::memory_order_relaxed) != state::disabled) { return true; }
-  // The generic channel is append-only and may have multiple producers. If it grew beyond the
-  // snapshot that disabled the gate, the combined mask deserves one fresh measurement. Normal
-  // Phase 1 BUILD_PROBE publication is complete before its probe scan starts.
+  // The channel is append-only and may grow after a transitive target's earlier split snapshots it.
+  // If it grew beyond the snapshot that disabled the gate, the combined mask deserves one fresh
+  // measurement. An immediate Phase 1 probe normally starts after the complete fan-out.
   return filters.filter_count() > _decided_filter_count.load(std::memory_order_relaxed);
 }
 
@@ -229,10 +229,9 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   int device_id)
 {
   if (!gate.applicable(filters)) { return nullptr; }
-  // Attribute the measurement to the filter-count snapshot used to begin this apply. The generic
-  // append-only/multi-producer API may grow beyond that snapshot; the count change then re-arms the
-  // gate once without crediting a mask that did not include the larger snapshot. Normal Phase 1
-  // BUILD_PROBE publication is complete before probe execution.
+  // Attribute the measurement to the filter-count snapshot used to begin this apply. A transitive
+  // target or another producer may grow the append-only channel beyond that snapshot; the count
+  // change then re-arms the gate once without crediting a mask that omitted the larger snapshot.
   auto const observed_filters = filters.filter_count();
   auto const rows_before      = input.num_rows();
   auto filtered = apply_dynamic_filters_to_view(input, filters, stream, mode, &gate, device_id);

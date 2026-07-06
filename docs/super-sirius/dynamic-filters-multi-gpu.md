@@ -31,8 +31,13 @@ filter; failures outside that policy propagate.
 
 The publication and application contracts are distinct:
 
-- In the normal `BUILD_PROBE` path, build-side CONCAT synchronously completes
-  the publication attempt before probe data-scan execution begins.
+- For the producing join's immediate probe input, build-side CONCAT
+  synchronously completes the publication attempt before its probe data-scan
+  execution begins.
+- A base scan reached transitively through an intervening join can execute
+  earlier. It snapshots whatever fully ready filters are visible at its
+  reader and post-decode checkpoints; soft build-subtree task priority improves
+  the coverage of later splits without imposing a barrier.
 - A scan never waits for a dynamic filter and never assumes one was emitted.
 - An empty or policy-gated publication and an allocation-unavailable local
   replica are safe pass-through cases; the authoritative join guarantees
@@ -42,9 +47,12 @@ The publication and application contracts are distinct:
   current zone-map target-clone path instead catches, logs, and omits a failed
   target replica.
 
-Probe metadata parsing and prefetch preparation may happen earlier, but the
-actual `read_parquet`/decode task consumes the channel only after the ordered
-build-port publication attempt has returned.
+Probe metadata parsing and prefetch preparation are independent of publication.
+For an immediate probe, the actual `read_parquet`/decode task starts after the
+ordered build-port publication attempt has returned. A transitive target may
+start sooner: it selects zone maps immediately before `read_parquet` and selects
+membership filters in the following post-decode operator. See
+[Transitive scan targets and build-task priority](dynamic-filters.md#transitive-scan-targets-and-build-task-priority).
 
 ## Reproduction and diagnosis
 
@@ -287,12 +295,14 @@ the same immutable logical filter into the planned channels. Consumers can
 therefore remain lock-light and never observe an in-flight replica as available.
 
 Publishing the source replica before remote replicas was deliberately rejected.
-It would not advance normal probe execution—the synchronous build-port hook
-must still return first—and it would expose a logical filter whose replica set
-is still mutating. A generic early caller on another GPU would safely pass
-through and would not train the gate, but it could miss optional pruning. The
-ready-snapshot rule keeps channel contents immutable and avoids per-device
-publication generations for no normal-path benefit.
+It would not advance an immediate probe—the synchronous build-port hook must
+still return first—and, although it could help an already-running transitive
+split on the source GPU, it would expose a logical filter whose replica set was
+still mutating. A caller on another GPU would safely pass through and would not
+train the gate, but it could miss optional pruning. The per-filter ready-snapshot
+rule keeps each published object immutable and avoids per-device publication
+generations. A transitive target may still race the producer's successive
+`push_filter` calls and observe a safe subset of the fully ready filters.
 
 ### 7. Select locally at the consumer
 
@@ -322,20 +332,24 @@ entirely device-local: the exact set is selected to fit the smallest active L2
 where possible, and the Bloom stays the compact fallback. No key column is
 retained, no scan is pinned to the build GPU, and scan parallelism is unchanged.
 
-The copy happens on the ordered producer path. Direct copies to all
+The copy happens on the producer's publication path. Direct copies to all
 peer-capable targets are enqueued before the completion pass, allowing their DMA
-legs to overlap on three or more GPUs. Publication completion is upstream of
-probe data-scan execution, so replica latency is on the publication path rather
-than hidden behind unfiltered probe work. The representations are compact and
-copied rather than rebuilt; for a two-GPU query this is one remote replica per
-emitted filter.
+legs to overlap on three or more GPUs. For an immediate probe, publication
+completion is upstream of data-scan execution, so replica latency is on the
+probe-start critical path. For a transitive target, earlier work may proceed
+unfiltered while replication is in progress; replica latency instead delays
+filter availability and reduces the number of splits it can prune. Soft
+build-subtree priority minimizes that window. The representations are compact
+and copied rather than rebuilt; for a two-GPU query this is one remote replica
+per emitted filter.
 
 `memory_space::acquire_stream()` may return a pooled stream that already has
 work queued, so the publication wait can occasionally include earlier work on
 that stream. This is a cold-path head-of-line tradeoff: it can delay publication
-and therefore the ordered probe start, while the managed pool avoids per-filter
-stream creation/destruction. It is not a consumer-side wait or a correctness
-hazard. The end-to-end A/B below includes this behavior.
+and therefore the ordered immediate-probe start or the coverage of a transitive
+target, while the managed pool avoids per-filter stream creation/destruction. It
+is not a consumer-side wait or a correctness hazard. The end-to-end A/B below
+includes this behavior.
 
 ## Validation
 

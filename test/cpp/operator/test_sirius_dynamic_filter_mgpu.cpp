@@ -32,6 +32,7 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -40,6 +41,7 @@
 #include <catch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <algorithm>
 #include <array>
@@ -123,7 +125,7 @@ void replicate_to_both_devices(
 
 template <typename MemoryManager>
 std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
-  MemoryManager const& memory_manager, std::size_t expected_device_count = kReplicaDevices.size())
+  MemoryManager& memory_manager, std::size_t expected_device_count = kReplicaDevices.size())
 {
   auto const gpu_spaces  = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   auto const host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -132,7 +134,10 @@ std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
 
   std::vector<sirius::op::dynamic_filter_replica_space> result;
   result.reserve(gpu_spaces.size());
-  for (auto const* gpu_space : gpu_spaces) {
+  for (auto const* gpu_space_view : gpu_spaces) {
+    auto* gpu_space = memory_manager.get_memory_space(cucascade::memory::Tier::GPU,
+                                                      gpu_space_view->get_device_id());
+    REQUIRE(gpu_space != nullptr);
     auto const local_host =
       std::find_if(host_spaces.begin(), host_spaces.end(), [gpu_space](auto const* host_space) {
         return host_space->get_device_id() == gpu_space->get_device_id();
@@ -158,6 +163,13 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(2);
   auto replica_spaces = get_replica_spaces(*memory_manager);
+  auto& target_space  = replica_spaces.back().get_gpu_space();
+  auto* target_mr =
+    target_space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(target_mr != nullptr);
+  auto const target_reserved_before  = target_space.get_total_reserved_memory();
+  auto const target_active_before    = target_space.get_active_reservation_count();
+  auto const target_allocated_before = target_mr->get_total_allocated_bytes();
   std::unique_ptr<sirius::op::sirius_dynamic_in_list_filter> filter;
   {
     rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
@@ -187,6 +199,9 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
 
     replicate_to_both_devices(*filter, replica_spaces);
     REQUIRE(filter->replica_count() == kReplicaDevices.size());
+    REQUIRE(target_space.get_total_reserved_memory() == target_reserved_before);
+    REQUIRE(target_space.get_active_reservation_count() == target_active_before);
+    REQUIRE(target_mr->get_total_allocated_bytes() > target_allocated_before);
   }
 
   {
@@ -202,6 +217,62 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
 
   rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
   filter.reset();
+  REQUIRE(target_mr->get_total_allocated_bytes() == target_allocated_before);
+}
+
+TEST_CASE("dynamic-filter replicas require destination reservation admission",
+          "[dynamic_filter][mgpu][replica][reservation]")
+{
+  if (!require_two_gpus()) { return; }
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto replica_spaces = get_replica_spaces(*memory_manager);
+  auto& target_space  = replica_spaces.back().get_gpu_space();
+  auto* target_mr =
+    target_space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(target_mr != nullptr);
+
+  auto const allocated_before = target_mr->get_total_allocated_bytes();
+  REQUIRE(allocated_before < target_space.get_max_memory());
+  auto reservation_pressure =
+    target_space.make_reservation_or_null(target_space.get_max_memory() - allocated_before);
+  REQUIRE(reservation_pressure != nullptr);
+  REQUIRE(target_space.get_available_memory() > (1U << 20));
+  REQUIRE(target_space.make_reservation_or_null(rmm::CUDA_ALLOCATION_ALIGNMENT) == nullptr);
+
+  auto require_omitted = [&](auto& filter) {
+    auto const target_allocated = target_mr->get_total_allocated_bytes();
+    filter.replicate_to_devices(replica_spaces);
+    REQUIRE(filter.is_available_on_device(kBuildDevice));
+    REQUIRE_FALSE(filter.is_available_on_device(kProbeDevice));
+    REQUIRE(target_mr->get_total_allocated_bytes() == target_allocated);
+  };
+
+  rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
+  auto& build_space = replica_spaces.front().get_gpu_space();
+  auto const stream = build_space.acquire_stream();
+
+  SECTION("IN-list")
+  {
+    auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
+    sirius::op::sirius_dynamic_in_list_filter filter(
+      keys->view(), stream, build_space.get_default_allocator());
+    stream.synchronize();
+    require_omitted(filter);
+  }
+
+  SECTION("Bloom")
+  {
+    auto keys = cudf::sequence(1024,
+                               cudf::numeric_scalar<std::int64_t>(0, true, stream),
+                               cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                               stream,
+                               build_space.get_default_allocator());
+    sirius::op::sirius_dynamic_bloom_filter filter(
+      keys->view(), stream, build_space.get_default_allocator());
+    stream.synchronize();
+    require_omitted(filter);
+  }
 }
 
 TEST_CASE("IN-list peer copies fan out to three GPUs before publication",

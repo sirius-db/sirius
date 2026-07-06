@@ -37,11 +37,11 @@ namespace sirius::op::scan {
 ///
 /// Used by @ref apply_dynamic_filters_gated_view. The first applied non-empty batch decides:
 /// filters that keep more than 25% of rows are disabled for the scan; selective filters stay
-/// active. For the generic append-only/multi-producer channel contract, growth beyond the snapshot
-/// that produced a disable decision re-arms the gate for one measurement. Normal Phase 1
-/// BUILD_PROBE publication supplies its complete snapshot before the probe scan starts. Concurrent
-/// scan batches may both measure; decision recording is serialized so an older measurement cannot
-/// demote a gate that a selective batch already made active.
+/// active. Growth beyond the snapshot that produced a disable decision re-arms the gate for one
+/// measurement. An immediate Phase 1 probe normally sees the complete publication, while a scan
+/// target reached through an intervening join may observe additional filters on later splits.
+/// Concurrent scan batches may both measure; decision recording is serialized so an older
+/// measurement cannot demote a gate that a selective batch already made active.
 class dynamic_filter_gate {
  public:
   /// True when a gated apply would do work now: at least one filter exists, and the gate is active

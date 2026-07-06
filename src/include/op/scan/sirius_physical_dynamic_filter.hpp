@@ -36,8 +36,9 @@ namespace sirius::op::scan {
 /// Filters arrive on a @ref sirius_dynamic_filter_set the producing hash-join build publishes into.
 /// The @ref dynamic_filter_gate decides per scan whether filtering earns its cost, and a batch
 /// passes through unchanged when the publication attempt emitted no applicable membership filter,
-/// no device-local replica exists, or the gate declines. Normal @c BUILD_PROBE scheduling completes
-/// build-port publication before this probe data-scan pipeline runs.
+/// no device-local replica exists, or the gate declines. A producing join's immediate probe edge is
+/// ordered after build-port publication; this operator can run earlier when its scan is a
+/// transitive target below an intervening join, so each execution uses the filters then visible.
 class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DYNAMIC_FILTER;

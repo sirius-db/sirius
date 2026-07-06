@@ -157,9 +157,10 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
 namespace {
 
 /// Collect the pipelines that transitively feed a plan-wired dynamic-filter join's build input.
-/// The management loop dispatches their tasks ahead of others so an eligible BUILD_PROBE join can
-/// complete publication before its consuming probe data scan begins. The walk follows build-input
-/// edges backward from each wired join, passing through any intervening joins.
+/// The management loop gives queued tasks from these pipelines soft dispatch priority, improving
+/// the chance that later splits of a transitive scan target observe the published filter. A join's
+/// immediate probe edge is already ordered independently. The walk follows build-input edges
+/// backward from each wired join, passing through any intervening joins.
 std::unordered_set<const sirius_pipeline*> collect_filter_build_pipelines(
   planner::query const& query)
 {
@@ -396,9 +397,10 @@ void task_scheduler::management_eventloop()
       const int device_id = *it;
       std::unique_ptr<sirius::parallel::itask> task;
 
-      // Prefer tasks feeding a plan-wired dynamic-filter join's build input, so an eligible
-      // BUILD_PROBE join can complete publication before its consuming probe data scan begins.
-      // Falls through to normal dispatch when none are queued, so it never starves other work.
+      // Prefer queued tasks feeding a plan-wired dynamic-filter join's build input. This can make
+      // the filter available to later splits of a transitive scan target; an immediate probe is
+      // already ordered after publication by the join hint. Fall through to normal dispatch when
+      // no compatible build task is queued, so the preference never starves other work.
       if (!_filter_build_pipelines.empty()) {
         task = _task_queue.pop_if(
           [this, device_id](const sirius::parallel::itask& t) -> bool {

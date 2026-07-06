@@ -17,6 +17,7 @@
 // sirius
 #include <log/logging.hpp>
 #include <op/dynamic_filter_device.hpp>
+#include <op/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter_replica_transfer.hpp>
 #include <op/sirius_dynamic_filter.hpp>
 
@@ -249,7 +250,6 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       auto const stream = target_space.acquire_stream();
-      auto const mr     = target_space.get_default_allocator();
 
       auto replica = std::visit(
         [&](auto const& source_set) {
@@ -260,12 +260,20 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
           using owner_type = std::decay_t<decltype(source_set)>;
           using key_type   = typename owner_type::element_type::key_type;
 
-          auto const capacity  = source_set->capacity();
-          auto destination_set = make_set<key_type>(capacity, mr, cuda::stream_ref{stream.value()});
+          auto const capacity = source_set->capacity();
+          bytes               = capacity * sizeof(key_type);
+          // Cover cuco's allocator-side alignment slot without depending on its private layout.
+          auto const reservation_bytes =
+            detail::tracked_replica_allocation_bytes(bytes) + rmm::CUDA_ALLOCATION_ALIGNMENT;
+          auto reservation =
+            detail::scoped_replica_reservation::try_acquire(target, reservation_bytes, stream);
+          if (!reservation) { return std::unique_ptr<set_replica>{}; }
+
+          auto destination_set = make_set<key_type>(
+            capacity, reservation->allocator(), cuda::stream_ref{stream.value()});
           if (destination_set->capacity() != capacity) {
             throw std::runtime_error("destination static_set capacity changed during replication");
           }
-          bytes             = capacity * sizeof(key_type);
           auto result       = std::make_unique<set_replica>(device_id, std::move(destination_set));
           auto& destination = *std::get<set_owner<key_type>>(result->set);
           detail::enqueue_replica_copy(destination.data(),
@@ -278,6 +286,15 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
           return result;
         },
         source->set);
+      if (!replica) {
+        SIRIUS_LOG_WARN(
+          "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} skipped: destination "
+          "reservation for {} bytes unavailable.",
+          _set->source_device,
+          device_id,
+          bytes);
+        continue;
+      }
       pending.emplace_back(std::move(replica), stream);
     } catch (std::bad_alloc const& e) {
       SIRIUS_LOG_WARN(

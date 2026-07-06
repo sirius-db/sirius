@@ -96,9 +96,10 @@ class sirius_device_replicable {
   /**
    * @brief Materialize replicas in the supplied GPU memory spaces before publication.
    *
-   * Each implementation borrows a stream and allocator from the same target space. The caller
-   * retains placement ownership; the completed replica retains only the allocator/stream views
-   * whose lifetime is governed by @ref dynamic_filter_replica_space.
+   * Each implementation constructs the replica with the target space's stream and allocator.
+   * Membership filters reserve destination capacity for construction; after unused capacity is
+   * returned, their completed allocations remain accounted. Replicas retain only allocator/stream
+   * views whose lifetime is governed by @ref dynamic_filter_replica_space.
    */
   virtual void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) = 0;
 };
@@ -400,15 +401,20 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
  *
  * In the normal @c BUILD_PROBE path, build-side @c CONCAT synchronously delivers the complete build
  * batch to the join's publication hook. Construction, device replication, and channel fan-out all
- * complete before that push returns, and downstream task creation reaches the probe data scan only
- * afterwards. Metadata preparation and prefetch may occur earlier, but probe read/decode does not
- * race this normal build-port publication.
+ * complete before that push returns, and downstream task creation reaches that join's immediate
+ * probe producer only afterwards.
+ *
+ * DuckDB may also route the channel through an intervening join to a deeper base scan. That
+ * transitive target is not gated by the producing join's immediate probe edge and can race
+ * publication. Every individual filter has finished constructing all usable replicas and is
+ * immutable before @c push_filter makes it visible, but fan-out is a sequence of append operations
+ * rather than an atomic snapshot, so a racing target may observe none, a subset, or all filters.
  *
  * Consumption is nevertheless opportunistic: there is no readiness wait in this channel API. A
  * consumer snapshots the filters that exist, selects device-local representations, and safely
  * passes data through when publication intentionally emitted nothing or no applicable local filter
- * exists. The append-only/multi-producer behavior also keeps the channel useful outside that normal
- * ordered path; it must not be read as evidence that normal probe scans precede publication.
+ * exists. Metadata preparation and prefetch do not snapshot the channel; reader and post-decode
+ * consumers take their own per-split snapshots.
  */
 class sirius_dynamic_filter_set {
  public:

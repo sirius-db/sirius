@@ -324,7 +324,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// this hook deliberately leaves publication @c OPEN; @ref execute may then claim publication
   /// from the execution-ready GPU batch at its @c BUILT transition. That site is defense-in-depth,
   /// not the normal scan-pushdown schedule: build-side CONCAT normally delivers a GPU-resident
-  /// batch and this synchronous hook completes before the probe data scan is scheduled.
+  /// batch and this synchronous hook completes before this join's immediate probe producer is
+  /// scheduled. A scan target reached through an intervening join is not gated by that edge.
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;

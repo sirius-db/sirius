@@ -30,6 +30,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter_device.hpp>
+#include <op/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter_replica_transfer.hpp>
 #include <op/sirius_dynamic_filter.hpp>
 
@@ -271,7 +272,6 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       auto const stream = target_space.acquire_stream();
-      auto const mr     = target_space.get_default_allocator();
 
       auto replica = std::visit(
         [&](auto const& source_bloom) {
@@ -282,8 +282,15 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
           using owner_type  = std::decay_t<decltype(source_bloom)>;
           using filter_type = typename owner_type::element_type;
 
-          auto destination_bloom = make_bloom<filter_type>(
-            source_bloom->block_extent(), mr, cuda::stream_ref{stream.value()});
+          bytes = source_bloom->block_extent() * filter_type::words_per_block *
+                  sizeof(typename filter_type::word_type);
+          auto reservation = detail::scoped_replica_reservation::try_acquire(
+            target, detail::tracked_replica_allocation_bytes(bytes), stream);
+          if (!reservation) { return std::unique_ptr<bloom_replica>{}; }
+
+          auto destination_bloom = make_bloom<filter_type>(source_bloom->block_extent(),
+                                                           reservation->allocator(),
+                                                           cuda::stream_ref{stream.value()});
           auto result = std::make_unique<bloom_replica>(device_id, std::move(destination_bloom));
           auto& destination = *std::get<bloom_owner<filter_type>>(result->bloom);
           copy_filter_storage(*source_bloom,
@@ -296,6 +303,15 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
           return result;
         },
         source->bloom);
+      if (!replica) {
+        SIRIUS_LOG_WARN(
+          "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} skipped: destination "
+          "reservation for {} bytes unavailable.",
+          _impl->source_device,
+          device_id,
+          bytes);
+        continue;
+      }
       pending.emplace_back(std::move(replica), stream);
     } catch (std::bad_alloc const& e) {
       SIRIUS_LOG_WARN(
