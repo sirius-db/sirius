@@ -81,6 +81,38 @@ bool check_outputs(const char* op,
   return true;
 }
 
+// Validate a single "output" UINT8 channel and copy it into a device_buffer.
+// The shared payload-copy for the byte-stream codecs (ans/bitcomp/snappy/lz4/
+// deflate). Returns nullptr and sets *error_out on validation failure; on
+// success sets *out_size to the payload byte count.
+std::unique_ptr<rmm::device_buffer> copy_output_payload(
+  const char* codec,
+  std::vector<std::string> const& output_names,
+  std::vector<std::unique_ptr<cudf::column>> const& outputs,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out,
+  std::size_t* out_size)
+{
+  if (!check_outputs(codec, output_names, outputs, {"output"}, error_out)) return nullptr;
+  auto const& payload_col = outputs[0];
+  if (payload_col->type().id() != cudf::type_id::UINT8) {
+    if (error_out) *error_out = std::string(codec) + " 'output' must be UINT8";
+    return nullptr;
+  }
+  std::size_t const comp = static_cast<std::size_t>(payload_col->size());
+  auto payload           = std::make_unique<rmm::device_buffer>(comp, stream, mr);
+  if (comp > 0) {
+    cudaMemcpyAsync(payload->data(),
+                    payload_col->view().head<uint8_t>(),
+                    comp,
+                    cudaMemcpyDeviceToDevice,
+                    stream.value());
+  }
+  if (out_size) *out_size = comp;
+  return payload;
+}
+
 // Rebuild a string-typed ANS/bitcomp rep from its single concatenated payload
 // column plus the string_extras carried in the leaf meta. `make_rep` constructs
 // the codec-specific rep from (orig_type, num_rows, payload, comp_size, uncomp).
@@ -96,21 +128,9 @@ std::unique_ptr<compressed_representation> string_rep_from_outputs(
   std::string* error_out,
   MakeRep&& make_rep)
 {
-  if (!check_outputs(codec, output_names, outputs, {"output"}, error_out)) return nullptr;
-  auto const& payload_col = outputs[0];
-  if (payload_col->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = std::string(codec) + " 'output' must be UINT8";
-    return nullptr;
-  }
-  size_t const comp = static_cast<size_t>(payload_col->size());
-  auto payload      = std::make_unique<rmm::device_buffer>(comp, stream, mr);
-  if (comp > 0) {
-    cudaMemcpyAsync(payload->data(),
-                    payload_col->view().head<uint8_t>(),
-                    comp,
-                    cudaMemcpyDeviceToDevice,
-                    stream.value());
-  }
+  std::size_t comp = 0;
+  auto payload = copy_output_payload(codec, output_names, outputs, stream, mr, error_out, &comp);
+  if (!payload) return nullptr;
   auto rep                       = make_rep(cudf::data_type{cudf::type_id::STRING},
                       static_cast<cudf::size_type>(s.num_rows),
                       std::move(payload),
@@ -479,12 +499,10 @@ std::unique_ptr<compressed_representation> bitcomp_compressed_representation::fr
       });
   }
 
-  if (!check_outputs("bitcomp", output_names, outputs, {"output"}, error_out)) return nullptr;
-  auto const& payload_col = outputs[0];
-  if (payload_col->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = "bitcomp 'output' must be UINT8";
-    return nullptr;
-  }
+  std::size_t comp = 0;
+  auto payload =
+    copy_output_payload("bitcomp", output_names, outputs, stream, mr, error_out, &comp);
+  if (!payload) return nullptr;
   auto const* bc_meta = std::get_if<leaf_meta::bitcomp>(&meta);
   if (!bc_meta) {
     if (error_out)
@@ -494,19 +512,10 @@ std::unique_ptr<compressed_representation> bitcomp_compressed_representation::fr
   }
   cudf::data_type const orig_type{static_cast<cudf::type_id>(bc_meta->original_type_id)};
   size_t const uncomp = bc_meta->uncompressed_size;
-  size_t const comp   = static_cast<size_t>(payload_col->size());
   cudf::size_type const n_rows =
     (uncomp > 0 && cudf::is_fixed_width(orig_type))
       ? static_cast<cudf::size_type>(uncomp / static_cast<size_t>(cudf::size_of(orig_type)))
       : 0;
-  auto payload = std::make_unique<rmm::device_buffer>(comp, stream, mr);
-  if (comp > 0) {
-    cudaMemcpyAsync(payload->data(),
-                    payload_col->view().head<uint8_t>(),
-                    comp,
-                    cudaMemcpyDeviceToDevice,
-                    stream.value());
-  }
   return std::make_unique<bitcomp_compressed_representation>(
     orig_type, n_rows, std::move(payload), comp, uncomp, bc_meta->algorithm);
 }
@@ -522,13 +531,10 @@ std::unique_ptr<compressed_representation> cascaded_compressed_representation::f
   std::string* error_out,
   leaf_meta_v const& meta)
 {
-  if (!check_outputs("nvcomp_cascaded", output_names, outputs, {"output"}, error_out))
-    return nullptr;
-  auto const& payload_col = outputs[0];
-  if (payload_col->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = "nvcomp_cascaded 'output' must be UINT8";
-    return nullptr;
-  }
+  std::size_t comp = 0;
+  auto payload =
+    copy_output_payload("nvcomp_cascaded", output_names, outputs, stream, mr, error_out, &comp);
+  if (!payload) return nullptr;
   auto const* casc_meta = std::get_if<leaf_meta::nvcomp_cascaded>(&meta);
   if (!casc_meta) {
     if (error_out)
@@ -539,19 +545,10 @@ std::unique_ptr<compressed_representation> cascaded_compressed_representation::f
   }
   cudf::data_type const orig_type{static_cast<cudf::type_id>(casc_meta->original_type_id)};
   size_t const uncomp = casc_meta->uncompressed_size;
-  size_t const comp   = static_cast<size_t>(payload_col->size());
   cudf::size_type const n_rows =
     (uncomp > 0 && cudf::is_fixed_width(orig_type))
       ? static_cast<cudf::size_type>(uncomp / static_cast<size_t>(cudf::size_of(orig_type)))
       : 0;
-  auto payload = std::make_unique<rmm::device_buffer>(comp, stream, mr);
-  if (comp > 0) {
-    cudaMemcpyAsync(payload->data(),
-                    payload_col->view().head<uint8_t>(),
-                    comp,
-                    cudaMemcpyDeviceToDevice,
-                    stream.value());
-  }
   return std::make_unique<cascaded_compressed_representation>(orig_type,
                                                               n_rows,
                                                               std::move(payload),
@@ -578,12 +575,10 @@ std::unique_ptr<compressed_representation> nvcomp_simple_from_outputs(
   leaf_meta_v const& meta)
 {
   std::string codec(codec_name);
-  if (!check_outputs(codec.c_str(), output_names, outputs, {"output"}, error_out)) return nullptr;
-  auto const& payload_col = outputs[0];
-  if (payload_col->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = codec + " 'output' must be UINT8";
-    return nullptr;
-  }
+  std::size_t comp = 0;
+  auto payload =
+    copy_output_payload(codec.c_str(), output_names, outputs, stream, mr, error_out, &comp);
+  if (!payload) return nullptr;
   auto const* m = std::get_if<MetaT>(&meta);
   if (!m) {
     if (error_out)
@@ -592,19 +587,10 @@ std::unique_ptr<compressed_representation> nvcomp_simple_from_outputs(
   }
   cudf::data_type const orig_type{static_cast<cudf::type_id>(m->original_type_id)};
   size_t const uncomp = m->uncompressed_size;
-  size_t const comp   = static_cast<size_t>(payload_col->size());
   cudf::size_type const n_rows =
     (uncomp > 0 && cudf::is_fixed_width(orig_type))
       ? static_cast<cudf::size_type>(uncomp / static_cast<size_t>(cudf::size_of(orig_type)))
       : 0;
-  auto payload = std::make_unique<rmm::device_buffer>(comp, stream, mr);
-  if (comp > 0) {
-    cudaMemcpyAsync(payload->data(),
-                    payload_col->view().head<uint8_t>(),
-                    comp,
-                    cudaMemcpyDeviceToDevice,
-                    stream.value());
-  }
   return std::make_unique<RepT>(orig_type, n_rows, std::move(payload), comp, uncomp);
 }
 }  // anonymous namespace

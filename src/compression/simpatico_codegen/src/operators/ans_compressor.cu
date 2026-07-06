@@ -8,6 +8,7 @@
 // change.
 
 #include "codegen/plan/representation.hpp"
+#include "nvcomp_simple_compressor.hpp"
 #include "nvcomp_string_support.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -97,9 +98,7 @@ std::unique_ptr<cudf::column> ans_compressed_representation::decompress(
   if (original_type.id() == cudf::type_id::STRING) {
     auto decompress_bytes =
       [&](void const* comp, std::size_t /*comp_size*/, void* out, std::size_t /*out_bytes*/) {
-        auto* mgr    = get_ans_manager(stream.value());
-        auto dconfig = mgr->configure_decompression(static_cast<uint8_t const*>(comp));
-        mgr->decompress(static_cast<uint8_t*>(out), static_cast<uint8_t const*>(comp), dconfig);
+        detail::nvcomp_decompress_bytes(get_ans_manager(stream.value()), comp, out, stream);
       };
     auto col = detail::rebuild_string_column(compressed_data ? compressed_data->data() : nullptr,
                                              compressed_size,
@@ -153,23 +152,8 @@ std::unique_ptr<compressed_representation> ans_compressor::compress(
   // STRING: compress the offsets and chars streams independently with ANS and
   // store them concatenated in the rep's payload.
   if (dt.id() == cudf::type_id::STRING) {
-    auto compress_bytes =
-      [&](void const* ptr,
-          std::size_t bytes) -> std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> {
-      auto* mgr    = get_ans_manager(stream.value());
-      auto cconfig = mgr->configure_compression(bytes);
-      auto buf =
-        std::make_unique<rmm::device_buffer>(cconfig.max_compressed_buffer_size, stream, mr);
-      rmm::device_buffer size_dev(sizeof(size_t), stream, mr);
-      mgr->compress(static_cast<uint8_t const*>(ptr),
-                    static_cast<uint8_t*>(buf->data()),
-                    cconfig,
-                    static_cast<size_t*>(size_dev.data()));
-      size_t actual = 0;
-      cudaMemcpyAsync(
-        &actual, size_dev.data(), sizeof(size_t), cudaMemcpyDeviceToHost, stream.value());
-      cudaStreamSynchronize(stream.value());
-      return {std::move(buf), actual};
+    auto compress_bytes = [&](void const* ptr, std::size_t bytes) {
+      return detail::nvcomp_compress_bytes(get_ans_manager(stream.value()), ptr, bytes, stream, mr);
     };
 
     auto cs  = detail::compress_string_column(column_to_compress, compress_bytes, stream, mr);
