@@ -488,6 +488,12 @@ struct ans_compressed_representation : compressed_representation {
   size_t uncompressed_size;
   std::unique_ptr<rmm::device_buffer> compressed_data;  // worst-case sized
   size_t compressed_size;                               // actual bytes used
+  // STRING path (original_type == STRING): compressed_data holds the offsets
+  // codec stream (first `offsets_compressed_size` bytes) followed by the chars
+  // stream; `uncompressed_size` is the chars byte count. Zero for fixed-width.
+  size_t offsets_compressed_size   = 0;
+  size_t offsets_uncompressed_size = 0;
+  cudf::data_type offsets_type{cudf::type_id::INT32};
   // Lazily built UINT8 column of exactly compressed_size bytes (trimmed
   // payload, no header), exposed via named_channels() for downstream
   // chaining (e.g. `ans.output -> bitcomp`).
@@ -521,7 +527,14 @@ struct ans_compressed_representation : compressed_representation {
   PlanLeafKind kind() const override { return PlanLeafKind::Ans; }
   leaf_meta_v describe_meta() const override
   {
-    return leaf_meta::ans{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
+    leaf_meta::ans a{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
+    if (original_type.id() == cudf::type_id::STRING) {
+      a.strings = {offsets_compressed_size,
+                   offsets_uncompressed_size,
+                   static_cast<std::int32_t>(offsets_type.id()),
+                   num_rows};
+    }
+    return a;
   }
 };
 
@@ -557,6 +570,12 @@ struct bitcomp_compressed_representation : compressed_representation {
   // Algorithm used at compress time so decompress hits the same
   // Manager cache slot.
   int compress_algorithm;
+  // STRING path (original_type == STRING): compressed_data holds the offsets
+  // codec stream (first `offsets_compressed_size` bytes) then the chars stream;
+  // `uncompressed_size` is the chars byte count. Zero for fixed-width.
+  size_t offsets_compressed_size   = 0;
+  size_t offsets_uncompressed_size = 0;
+  cudf::data_type offsets_type{cudf::type_id::INT32};
   // Lazily built UINT8 column of exactly compressed_size bytes (trimmed
   // payload, no header), exposed via named_channels() for downstream
   // chaining (e.g. `bitcomp.output -> ans`).
@@ -592,8 +611,15 @@ struct bitcomp_compressed_representation : compressed_representation {
   PlanLeafKind kind() const override { return PlanLeafKind::Bitcomp; }
   leaf_meta_v describe_meta() const override
   {
-    return leaf_meta::bitcomp{
+    leaf_meta::bitcomp b{
       uncompressed_size, static_cast<std::int32_t>(original_type.id()), compress_algorithm};
+    if (original_type.id() == cudf::type_id::STRING) {
+      b.strings = {offsets_compressed_size,
+                   offsets_uncompressed_size,
+                   static_cast<std::int32_t>(offsets_type.id()),
+                   num_rows};
+    }
+    return b;
   }
 };
 

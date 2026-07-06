@@ -14,6 +14,7 @@
 // reuses the same Manager cache slot.
 
 #include "codegen/plan/representation.hpp"
+#include "nvcomp_string_support.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -114,6 +115,30 @@ std::vector<compressible_output> bitcomp_compressed_representation::named_channe
 std::unique_ptr<cudf::column> bitcomp_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
+  // STRING: split the payload into the offsets and chars codec streams,
+  // decompress each, and rebuild the strings column.
+  if (original_type.id() == cudf::type_id::STRING) {
+    int const algorithm = compress_algorithm;
+    auto decompress_bytes =
+      [&](void const* comp, std::size_t /*comp_size*/, void* out, std::size_t /*out_bytes*/) {
+        auto* mgr    = get_bitcomp_manager(stream.value(), algorithm);
+        auto dconfig = mgr->configure_decompression(static_cast<uint8_t const*>(comp));
+        mgr->decompress(static_cast<uint8_t*>(out), static_cast<uint8_t const*>(comp), dconfig);
+      };
+    auto col = detail::rebuild_string_column(compressed_data ? compressed_data->data() : nullptr,
+                                             compressed_size,
+                                             offsets_compressed_size,
+                                             offsets_uncompressed_size,
+                                             uncompressed_size,
+                                             offsets_type,
+                                             num_rows,
+                                             decompress_bytes,
+                                             stream,
+                                             mr);
+    if (cudaStreamSynchronize(stream.value()) != cudaSuccess) return nullptr;
+    return col;
+  }
+
   if (num_rows == 0 || compressed_data == nullptr || compressed_size == 0) {
     return cudf::make_fixed_width_column(
       original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
@@ -150,6 +175,42 @@ std::unique_ptr<compressed_representation> bitcomp_compressor::compress(
       /*uncomp_size=*/0,
       algorithm_);
   }
+  // STRING: compress the offsets and chars streams independently with bitcomp
+  // and store them concatenated in the rep's payload.
+  if (dt.id() == cudf::type_id::STRING) {
+    int const algorithm = algorithm_;
+    auto compress_bytes =
+      [&](void const* ptr,
+          std::size_t bytes) -> std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> {
+      auto* mgr    = get_bitcomp_manager(stream.value(), algorithm);
+      auto cconfig = mgr->configure_compression(bytes);
+      auto buf =
+        std::make_unique<rmm::device_buffer>(cconfig.max_compressed_buffer_size, stream, mr);
+      rmm::device_buffer size_dev(sizeof(size_t), stream, mr);
+      mgr->compress(static_cast<uint8_t const*>(ptr),
+                    static_cast<uint8_t*>(buf->data()),
+                    cconfig,
+                    static_cast<size_t*>(size_dev.data()));
+      size_t actual = 0;
+      cudaMemcpyAsync(
+        &actual, size_dev.data(), sizeof(size_t), cudaMemcpyDeviceToHost, stream.value());
+      cudaStreamSynchronize(stream.value());
+      return {std::move(buf), actual};
+    };
+
+    auto cs  = detail::compress_string_column(column_to_compress, compress_bytes, stream, mr);
+    auto rep = std::make_unique<bitcomp_compressed_representation>(dt,
+                                                                   cs.num_rows,
+                                                                   std::move(cs.payload),
+                                                                   cs.total_compressed_size,
+                                                                   cs.chars_uncompressed_size,
+                                                                   algorithm_);
+    rep->offsets_compressed_size   = cs.offsets_compressed_size;
+    rep->offsets_uncompressed_size = cs.offsets_uncompressed_size;
+    rep->offsets_type              = cs.offsets_type;
+    return rep;
+  }
+
   if (!cudf::is_fixed_width(dt)) {
     throw std::runtime_error("bitcomp_compressor: only fixed-width columns supported");
   }

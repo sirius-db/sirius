@@ -284,14 +284,9 @@ host_pin_result materialize_pin_to_host_with_compression(
 
       if (compression.enabled && tbl && tbl->num_columns() > 0 && !compression.plan_dsl.empty()) {
         try {
-          std::size_t uncompressed_bytes = 0;
-          for (int ci = 0; ci < tbl->num_columns(); ++ci) {
-            auto const& col = tbl->view().column(ci);
-            if (cudf::is_fixed_width(col.type())) {
-              uncompressed_bytes +=
-                static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
-            }
-          }
+          // Total device footprint of the batch (includes string chars/offsets
+          // and null masks), so string columns count toward the threshold.
+          std::size_t uncompressed_bytes = tbl->alloc_size();
           if (uncompressed_bytes >= compression.min_batch_size_bytes) {
             auto ct = simpatico::compress_with_plan(tbl->view(),
                                                     compression.plan_dsl,
@@ -400,14 +395,9 @@ device_pin_result materialize_pin_to_device_with_compression(
 
       if (compression.enabled && tbl && tbl->num_columns() > 0 && !compression.plan_dsl.empty()) {
         try {
-          std::size_t uncompressed_bytes = 0;
-          for (int ci = 0; ci < tbl->num_columns(); ++ci) {
-            auto const& col = tbl->view().column(ci);
-            if (cudf::is_fixed_width(col.type())) {
-              uncompressed_bytes +=
-                static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
-            }
-          }
+          // Total device footprint of the batch (includes string chars/offsets
+          // and null masks), so string columns count toward the threshold.
+          std::size_t uncompressed_bytes = tbl->alloc_size();
           if (uncompressed_bytes >= compression.min_batch_size_bytes) {
             auto ct = simpatico::compress_with_plan(tbl->view(),
                                                     compression.plan_dsl,

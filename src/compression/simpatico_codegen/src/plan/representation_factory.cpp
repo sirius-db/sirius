@@ -81,6 +81,47 @@ bool check_outputs(const char* op,
   return true;
 }
 
+// Rebuild a string-typed ANS/bitcomp rep from its single concatenated payload
+// column plus the string_extras carried in the leaf meta. `make_rep` constructs
+// the codec-specific rep from (orig_type, num_rows, payload, comp_size, uncomp).
+template <class RepT, class MakeRep>
+std::unique_ptr<compressed_representation> string_rep_from_outputs(
+  const char* codec,
+  std::vector<std::string> const& output_names,
+  std::vector<std::unique_ptr<cudf::column>>& outputs,
+  leaf_meta::string_extras const& s,
+  std::uint64_t chars_uncompressed,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out,
+  MakeRep&& make_rep)
+{
+  if (!check_outputs(codec, output_names, outputs, {"output"}, error_out)) return nullptr;
+  auto const& payload_col = outputs[0];
+  if (payload_col->type().id() != cudf::type_id::UINT8) {
+    if (error_out) *error_out = std::string(codec) + " 'output' must be UINT8";
+    return nullptr;
+  }
+  size_t const comp = static_cast<size_t>(payload_col->size());
+  auto payload      = std::make_unique<rmm::device_buffer>(comp, stream, mr);
+  if (comp > 0) {
+    cudaMemcpyAsync(payload->data(),
+                    payload_col->view().head<uint8_t>(),
+                    comp,
+                    cudaMemcpyDeviceToDevice,
+                    stream.value());
+  }
+  auto rep                       = make_rep(cudf::data_type{cudf::type_id::STRING},
+                      static_cast<cudf::size_type>(s.num_rows),
+                      std::move(payload),
+                      comp,
+                      static_cast<size_t>(chars_uncompressed));
+  rep->offsets_compressed_size   = s.offsets_compressed_size;
+  rep->offsets_uncompressed_size = s.offsets_uncompressed_size;
+  rep->offsets_type              = cudf::data_type{static_cast<cudf::type_id>(s.offsets_type_id)};
+  return rep;
+}
+
 }  // namespace
 
 std::unique_ptr<compressed_representation> identity_compressed_representation::from_outputs(
@@ -416,6 +457,28 @@ std::unique_ptr<compressed_representation> bitcomp_compressed_representation::fr
   std::string* error_out,
   leaf_meta_v const& meta)
 {
+  if (auto const* m = std::get_if<leaf_meta::bitcomp>(&meta);
+      m && m->original_type_id == static_cast<std::int32_t>(cudf::type_id::STRING)) {
+    int const algorithm = m->algorithm;
+    return string_rep_from_outputs<bitcomp_compressed_representation>(
+      "bitcomp",
+      output_names,
+      outputs,
+      m->strings,
+      m->uncompressed_size,
+      stream,
+      mr,
+      error_out,
+      [algorithm](cudf::data_type t,
+                  cudf::size_type n,
+                  std::unique_ptr<rmm::device_buffer> p,
+                  size_t c,
+                  size_t u) {
+        return std::make_unique<bitcomp_compressed_representation>(
+          t, n, std::move(p), c, u, algorithm);
+      });
+  }
+
   if (!check_outputs("bitcomp", output_names, outputs, {"output"}, error_out)) return nullptr;
   auto const& payload_col = outputs[0];
   if (payload_col->type().id() != cudf::type_id::UINT8) {
@@ -557,6 +620,25 @@ std::unique_ptr<compressed_representation> ans_compressed_representation::from_o
   std::string* error_out,
   leaf_meta_v const& meta)
 {
+  if (auto const* m = std::get_if<leaf_meta::ans>(&meta);
+      m && m->original_type_id == static_cast<std::int32_t>(cudf::type_id::STRING)) {
+    return string_rep_from_outputs<ans_compressed_representation>(
+      "ans",
+      output_names,
+      outputs,
+      m->strings,
+      m->uncompressed_size,
+      stream,
+      mr,
+      error_out,
+      [](cudf::data_type t,
+         cudf::size_type n,
+         std::unique_ptr<rmm::device_buffer> p,
+         size_t c,
+         size_t u) {
+        return std::make_unique<ans_compressed_representation>(t, n, std::move(p), c, u);
+      });
+  }
   return nvcomp_simple_from_outputs<ans_compressed_representation, leaf_meta::ans>(
     "ans", output_names, std::move(outputs), stream, mr, error_out, meta);
 }
