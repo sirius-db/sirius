@@ -664,3 +664,123 @@ TEST_CASE("pin_table compression - fallback when batch is below min_batch_size_b
 
   fs::remove_all(tmp);
 }
+
+TEST_CASE("pin_table compression - fallback when compression saves too little",
+          "[compression][pin_table][isolated_context]")
+{
+  if (!has_gpu()) {
+    WARN("Compression test requires a GPU — skipping");
+    return;
+  }
+
+  auto tmp = make_comp_tmp("ratio");
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+  auto yaml_path = tmp / "comp.yaml";
+  write_compression_yaml(yaml_path);
+
+  // A well-compressing plan on well-compressing data, but an impossibly strict
+  // max-compressed-fraction (1%) forces the compressed form to be discarded and
+  // the batch pinned uncompressed. Result must still be correct.
+  // SUM(k) = 0+1+...+999 = 499500
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir, "t_ratio", "input -> delta -> differences\n");
+
+  sirius::test::mgpu::generate_parquet_surface(tmp, "SELECT range AS k FROM range(1000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+  REQUIRE_FALSE(
+    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
+      ->HasError());
+  // Require a 99% saving — no realistic plan meets this, so the compressed form
+  // is discarded and the batch is pinned uncompressed.
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_max_compressed_fraction = 0.01;")->HasError());
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_ratio');");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(499500LL));
+
+  REQUIRE_FALSE(con.Query("CALL unpin_table('t_ratio');")->HasError());
+
+  fs::remove_all(tmp);
+}
+
+// Shared body for the string-column codec tests: pin a single VARCHAR column
+// compressed with @p codec, then filter on a string value through the cache.
+static void run_string_codec_test(const std::string& codec, const std::string& tag)
+{
+  if (!has_gpu()) {
+    WARN("Compression test requires a GPU — skipping");
+    return;
+  }
+
+  auto tmp = make_comp_tmp(tag);
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+  auto yaml_path = tmp / "comp.yaml";
+  write_compression_yaml(yaml_path);
+
+  // 1000 rows, s = 'v' || (range % 50): 50 distinct values, each appearing 20×.
+  // Rows with s = 'v7' are range % 50 == 7 → {7,57,...,957} → 20 rows.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT 'v' || (range % 50)::VARCHAR AS s FROM range(1000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+
+  const std::string table = "t_" + tag;
+  auto plan_dir           = tmp / "plans";
+  write_plan_file(plan_dir, table, "input -> " + codec + "\n");
+  REQUIRE_FALSE(
+    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
+      ->HasError());
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='" + table + "');");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  // Filtering on the string value forces the compressed strings column to be
+  // decompressed and materialized from the cache.
+  const std::string select_sql = "SELECT COUNT(*) FROM read_parquet('" + glob + "') WHERE s = 'v7'";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(20LL));
+
+  REQUIRE_FALSE(con.Query("CALL unpin_table('" + table + "');")->HasError());
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - ANS on string column",
+          "[compression][pin_table][isolated_context]")
+{
+  run_string_codec_test("ans", "ansstr");
+}
+
+TEST_CASE("pin_table compression - bitcomp on string column",
+          "[compression][pin_table][isolated_context]")
+{
+  run_string_codec_test("bitcomp", "bcstr");
+}

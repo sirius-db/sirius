@@ -97,7 +97,9 @@ class compressed_host_representation : public cucascade::idata_representation {
    * @param blob                Pinned compressed chunk (header + payload).
    * @param column_names        All column names stored in the chunk, in column order.
    * @param compressed_bytes    Compressed footprint in bytes.
-   * @param uncompressed_bytes  Logical uncompressed size (sum of raw column bytes).
+   * @param uncompressed_bytes  Original device footprint of the chunk
+   *                            (cudf::table::alloc_size: data + null masks +
+   *                            padding + string offsets/chars).
    * @param num_rows            Row count.
    */
   compressed_host_representation(cucascade::memory::memory_space& memory_space,

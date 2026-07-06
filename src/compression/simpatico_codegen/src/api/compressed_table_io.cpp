@@ -144,6 +144,21 @@ enum : std::uint8_t {
   META_DEFLATE  = 7,
 };
 
+// String extras appended to ANS/bitcomp meta (all-zero for fixed-width columns).
+static void push_string_extras(std::vector<std::uint8_t>& v, leaf_meta::string_extras const& s)
+{
+  push_u64le(v, s.offsets_compressed_size);
+  push_u64le(v, s.offsets_uncompressed_size);
+  push_i32le(v, s.offsets_type_id);
+  push_i64le(v, s.num_rows);
+}
+
+static bool read_string_extras(Reader& r, leaf_meta::string_extras& s)
+{
+  return r.read_u64le(s.offsets_compressed_size) && r.read_u64le(s.offsets_uncompressed_size) &&
+         r.read_i32le(s.offsets_type_id) && r.read_i64le(s.num_rows);
+}
+
 static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
 {
   struct Visitor {
@@ -159,6 +174,7 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
       push_u8(v, META_ANS);
       push_u64le(v, a.uncompressed_size);
       push_i32le(v, a.original_type_id);
+      push_string_extras(v, a.strings);
     }
     void operator()(leaf_meta::bitcomp const& b)
     {
@@ -166,6 +182,7 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
       push_u64le(v, b.uncompressed_size);
       push_i32le(v, b.original_type_id);
       push_i32le(v, b.algorithm);
+      push_string_extras(v, b.strings);
     }
     void operator()(leaf_meta::nvcomp_cascaded const& c)
     {
@@ -211,17 +228,19 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
       return true;
     }
     case META_ANS: {
-      std::uint64_t us;
-      std::int32_t ti;
-      if (!r.read_u64le(us) || !r.read_i32le(ti)) return false;
-      out = leaf_meta::ans{us, ti};
+      leaf_meta::ans a;
+      if (!r.read_u64le(a.uncompressed_size) || !r.read_i32le(a.original_type_id) ||
+          !read_string_extras(r, a.strings))
+        return false;
+      out = a;
       return true;
     }
     case META_BITCOMP: {
-      std::uint64_t us;
-      std::int32_t ti, alg;
-      if (!r.read_u64le(us) || !r.read_i32le(ti) || !r.read_i32le(alg)) return false;
-      out = leaf_meta::bitcomp{us, ti, alg};
+      leaf_meta::bitcomp b;
+      if (!r.read_u64le(b.uncompressed_size) || !r.read_i32le(b.original_type_id) ||
+          !r.read_i32le(b.algorithm) || !read_string_extras(r, b.strings))
+        return false;
+      out = b;
       return true;
     }
     case META_CASCADED: {
@@ -355,7 +374,10 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   return reconstruct_representation(cname, names, std::move(cols), stream, mr, err, ld.meta);
 }
 
-static constexpr std::uint8_t kVersion = 9;
+// v10 combines the per-column fixed-point scale (decimal support) with the
+// ANS/bitcomp string-extras meta; both landed independently as "v9" on separate
+// branches, so the merged format takes a fresh number.
+static constexpr std::uint8_t kVersion = 10;
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -466,7 +488,9 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     return bad("not a HPLN file");
   std::uint8_t ver;
   if (!r.read_u8(ver)) return bad("truncated header");
-  if (ver != kVersion) return bad("unsupported version " + std::to_string(ver) + " (expected 9)");
+  if (ver != kVersion)
+    return bad("unsupported version " + std::to_string(ver) + " (expected " +
+               std::to_string(kVersion) + ")");
 
   std::uint16_t num_cols;
   if (!r.read_u16le(num_cols)) return bad("truncated header");
