@@ -52,8 +52,3 @@ dictionary.indices.zigzag.chunk_count -> lz4
 # column: 7  dtype: str  ratio: 1.000x  depth: 0
 # comp: 244.96 GB/s  decomp: 491.95 GB/s
 input -> identity
-
----
-# column: 8  dtype: i8  ratio: 337.838x  depth: 1
-# comp: 2.55 GB/s  decomp: 3.09 GB/s
-input -> bitcomp

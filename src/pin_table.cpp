@@ -285,8 +285,11 @@ host_pin_result materialize_pin_to_host_with_compression(
       if (compression.enabled && tbl && tbl->num_columns() > 0 && !compression.plan_dsl.empty()) {
         try {
           std::size_t uncompressed_bytes = 0;
-          for (int ci = 0; ci < tbl->num_columns(); ++ci) {
-            auto const& col = tbl->view().column(ci);
+          // Keep the table_view alive: table::view() returns a temporary and
+          // table_view::column() returns a reference into it (else `col` dangles).
+          cudf::table_view const tv = tbl->view();
+          for (int ci = 0; ci < tv.num_columns(); ++ci) {
+            auto const& col = tv.column(ci);
             if (cudf::is_fixed_width(col.type())) {
               uncompressed_bytes +=
                 static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
@@ -384,8 +387,11 @@ device_pin_result materialize_pin_to_device_with_compression(
       if (compression.enabled && tbl && tbl->num_columns() > 0 && !compression.plan_dsl.empty()) {
         try {
           std::size_t uncompressed_bytes = 0;
-          for (int ci = 0; ci < tbl->num_columns(); ++ci) {
-            auto const& col = tbl->view().column(ci);
+          // Keep the table_view alive: table::view() returns a temporary and
+          // table_view::column() returns a reference into it (else `col` dangles).
+          cudf::table_view const tv = tbl->view();
+          for (int ci = 0; ci < tv.num_columns(); ++ci) {
+            auto const& col = tv.column(ci);
             if (cudf::is_fixed_width(col.type())) {
               uncompressed_bytes +=
                 static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());

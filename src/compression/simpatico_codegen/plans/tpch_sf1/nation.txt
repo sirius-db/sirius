@@ -16,8 +16,3 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 # column: 3  dtype: str  ratio: 1.000x  depth: 0
 # comp: 0.05 GB/s  decomp: 0.09 GB/s
 input -> identity
-
----
-# column: 4  dtype: i8  ratio: 1.000x  depth: 0
-# comp: 0.00 GB/s  decomp: 0.00 GB/s
-input -> identity

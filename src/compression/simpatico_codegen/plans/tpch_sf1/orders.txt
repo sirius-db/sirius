@@ -73,8 +73,3 @@ zigzag.zigzag.values.values -> rle -> runs, values
 # column: 8  dtype: str  ratio: 1.000x  depth: 0
 # comp: 1051.51 GB/s  decomp: 1654.29 GB/s
 input -> identity
-
----
-# column: 9  dtype: i8  ratio: 443.262x  depth: 1
-# comp: 25.03 GB/s  decomp: 30.42 GB/s
-input -> bitcomp

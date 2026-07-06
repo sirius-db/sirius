@@ -140,8 +140,3 @@ dictionary.keys_offsets -> delta -> differences
 dictionary.keys_chars -> snappy
 dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 dictionary.keys_offsets.differences -> ans
-
----
-# column: 16  dtype: i8  ratio: 451.763x  depth: 1
-# comp: 92.57 GB/s  decomp: 119.68 GB/s
-input -> bitcomp

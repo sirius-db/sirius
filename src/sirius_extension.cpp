@@ -1191,14 +1191,30 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
-      pin_comp.enabled              = true;
-      pin_comp.plan_dsl             = std::move(*plan_dsl);
-      pin_comp.min_batch_size_bytes = comp_cfg.min_batch_size_bytes;
-      pin_comp.column_names         = cache_info.column_names();
-      SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
-                      data.args.name,
-                      data.args.tier,
-                      pin_comp.column_names.size());
+      // The plan file carries one block per full-table column (schema order). A pin
+      // may cache only a subset, so select the blocks for the pinned columns by their
+      // full-table index (cache_info.column_ids, in pinned order) — the result lines
+      // up 1:1 with the pinned table that compress_with_plan sees.
+      std::vector<std::size_t> col_indices;
+      col_indices.reserve(cache_info.column_ids.size());
+      for (auto const& cid : cache_info.column_ids) {
+        col_indices.push_back(static_cast<std::size_t>(cid.GetPrimaryIndex()));
+      }
+      auto selected = sirius::compression::select_plan_blocks(*plan_dsl, col_indices);
+      if (selected.has_value()) {
+        pin_comp.enabled              = true;
+        pin_comp.plan_dsl             = std::move(*selected);
+        pin_comp.min_batch_size_bytes = comp_cfg.min_batch_size_bytes;
+        pin_comp.column_names         = cache_info.column_names();
+        SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
+                        data.args.name,
+                        data.args.tier,
+                        pin_comp.column_names.size());
+      } else {
+        SIRIUS_LOG_WARN(
+          "[pin_table] '{}': plan file does not cover all pinned columns; pinning uncompressed",
+          data.args.name);
+      }
     } else {
       SIRIUS_LOG_WARN(
         "[pin_table] '{}': pin_table_compression is enabled but no plan file was found in '{}'; "

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -80,5 +81,18 @@ class plan_register {
   std::unordered_map<std::string, std::string> _table_plans;  // table_name → full multi-col DSL
   std::unordered_map<std::string, std::string> _col_plans;    // "table::column" → single-col DSL
 };
+
+/**
+ * @brief Select the plan blocks for a pinned column subset.
+ *
+ * A whole-table plan DSL has one "---"-separated block per full-table column, in
+ * schema order. When a pin caches only some columns, @p column_indices gives the
+ * full-table index of each pinned column (in the pinned/materialized order); this
+ * returns a DSL with just those blocks, in that order, so it lines up 1:1 with the
+ * pinned table for compress_with_plan. Returns nullopt if any index is out of
+ * range (the plan does not cover a pinned column), so the caller pins uncompressed.
+ */
+[[nodiscard]] std::optional<std::string> select_plan_blocks(
+  const std::string& full_plan_dsl, const std::vector<std::size_t>& column_indices);
 
 }  // namespace sirius::compression

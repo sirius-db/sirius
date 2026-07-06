@@ -11,8 +11,3 @@ input -> identity
 # column: 2  dtype: str  ratio: 1.000x  depth: 0
 # comp: 0.01 GB/s  decomp: 0.02 GB/s
 input -> identity
-
----
-# column: 3  dtype: i8  ratio: 1.000x  depth: 0
-# comp: 0.00 GB/s  decomp: 0.00 GB/s
-input -> identity

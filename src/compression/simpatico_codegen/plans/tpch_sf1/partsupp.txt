@@ -36,8 +36,3 @@ alp.integers.packed -> ans
 # column: 4  dtype: str  ratio: 1.000x  depth: 0
 # comp: 1287.48 GB/s  decomp: 1891.15 GB/s
 input -> identity
-
----
-# column: 5  dtype: i8  ratio: 427.350x  depth: 1
-# comp: 14.20 GB/s  decomp: 15.88 GB/s
-input -> bitcomp

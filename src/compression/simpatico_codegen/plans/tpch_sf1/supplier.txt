@@ -41,8 +41,3 @@ alp.exception_positions.differences -> bitpack -> chunk_min, chunk_count, chunk_
 # column: 6  dtype: str  ratio: 1.000x  depth: 0
 # comp: 15.03 GB/s  decomp: 29.98 GB/s
 input -> identity
-
----
-# column: 7  dtype: i8  ratio: 69.444x  depth: 1
-# comp: 0.21 GB/s  decomp: 0.24 GB/s
-input -> bitcomp

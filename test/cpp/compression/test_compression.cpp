@@ -103,6 +103,39 @@ TEST_CASE("plan_register - per-column plans are independent from table plans",
   reg.clear_all();
 }
 
+TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order",
+          "[compression][plan_register]")
+{
+  using sirius::compression::select_plan_blocks;
+  // Four full-table columns, one block each. select_plan_blocks re-joins the
+  // selected blocks with "\n---\n" (blocks are trimmed on split).
+  const std::string full =
+    "input -> lz4\n---\ninput -> snappy\n---\ninput -> deflate\n---\ninput "
+    "-> bitcomp";
+
+  SECTION("subset preserves the requested (pinned) order")
+  {
+    // Pin columns [2, 0] (full-table indices), in that pinned order.
+    auto s = select_plan_blocks(full, {2, 0});
+    REQUIRE(s.has_value());
+    REQUIRE(*s == "input -> deflate\n---\ninput -> lz4");
+  }
+
+  SECTION("identity over all columns returns every block in order")
+  {
+    auto s = select_plan_blocks(full, {0, 1, 2, 3});
+    REQUIRE(s.has_value());
+    REQUIRE(*s ==
+            "input -> lz4\n---\ninput -> snappy\n---\ninput -> deflate\n---\ninput -> bitcomp");
+  }
+
+  SECTION("out-of-range index yields nullopt (plan does not cover the column)")
+  {
+    REQUIRE_FALSE(select_plan_blocks(full, {4}).has_value());
+    REQUIRE_FALSE(select_plan_blocks(full, {0, 9}).has_value());
+  }
+}
+
 // ─── End-to-end SQL tests require a GPU (Simpatico JIT) ─────────────────────
 //
 // These tests gate on GPU availability and use an isolated DuckDB with a
@@ -404,6 +437,69 @@ TEST_CASE("pin_table compression - column-subset projection correctness",
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
 
   REQUIRE_FALSE(con.Query("CALL unpin_table('t_proj');")->HasError());
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - pinned column subset selects matching plan blocks",
+          "[compression][pin_table][isolated_context]")
+{
+  if (!has_gpu()) {
+    WARN("Compression test requires a GPU — skipping");
+    return;
+  }
+
+  auto tmp = make_comp_tmp("subset");
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+  auto yaml_path = tmp / "comp.yaml";
+  write_compression_yaml(yaml_path);
+
+  // Four full-table columns; the plan file has one block per column (schema order).
+  //   SUM(a) = 0+1+...+4999               = 12497500
+  //   SUM(c) = 3*(0+1+...+4999)           = 37492500
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT range AS a, range * 2 AS b, range * 3 AS c, range * 4 AS d FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+
+  // Distinct op per column so a wrong block↔column mapping would compress with the
+  // wrong plan; all ops are valid for INT64 so a correct mapping round-trips cleanly.
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir,
+                  "t_sub",
+                  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n"
+                  "input -> rle -> runs, values\n---\n"
+                  "input -> delta -> differences\n---\n"
+                  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  REQUIRE_FALSE(
+    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
+      ->HasError());
+
+  // Pin a reordered subset [c, a] (full-table indices 2, 0) — exercises per-column
+  // block selection (blocks 2 and 0, in that order).
+  auto pin =
+    con.Query("CALL pin_table('" + glob + "', tier='host', name='t_sub', cols=['c','a']);");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  const std::string select_sql = "SELECT SUM(c), SUM(a) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(37492500LL));
+  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(12497500LL));
+
+  REQUIRE_FALSE(con.Query("CALL unpin_table('t_sub');")->HasError());
 
   fs::remove_all(tmp);
 }

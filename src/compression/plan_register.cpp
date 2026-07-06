@@ -16,8 +16,11 @@
 
 #include "plan_register.hpp"
 
+#include <api/simpatico_codegen.hpp>
+
 #include <mutex>
 #include <shared_mutex>
+#include <utility>
 
 namespace sirius::compression {
 
@@ -66,6 +69,20 @@ void plan_register::clear_all()
   std::unique_lock lock(_mutex);
   _table_plans.clear();
   _col_plans.clear();
+}
+
+std::optional<std::string> select_plan_blocks(const std::string& full_plan_dsl,
+                                              const std::vector<std::size_t>& column_indices)
+{
+  auto blocks = simpatico::split_plan_dsl(full_plan_dsl);
+  std::string out;
+  for (std::size_t k = 0; k < column_indices.size(); ++k) {
+    std::size_t const idx = column_indices[k];
+    if (idx >= blocks.size()) { return std::nullopt; }
+    if (k != 0) { out += "\n---\n"; }
+    out += blocks[idx];
+  }
+  return out;
 }
 
 }  // namespace sirius::compression
