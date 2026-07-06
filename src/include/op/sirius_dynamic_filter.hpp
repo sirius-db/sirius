@@ -46,8 +46,8 @@ namespace sirius::op {
 /**
  * @brief Kind tag for @ref sirius_dynamic_filter subtypes.
  *
- * Extend this enum as new filter kinds (bloom, IN-list, etc.) are added in later phases.
- * See @c docs/super-sirius/dynamic-filters.md for the staged rollout.
+ * Keep this enum in sync with the concrete zone-map, IN-list, and Bloom implementations.
+ * See @c docs/super-sirius/dynamic-filters.md for their consumer capabilities.
  */
 enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
 
@@ -61,11 +61,11 @@ enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
  * consumer (e.g., a parquet scan) through a @ref sirius_dynamic_filter_set.
  *
  * Concrete filters expose their consumer-side capabilities by inheriting from one or more
- * capability mixins (today: @ref sirius_ast_lowerable; future: a runtime-apply mixin). The base
- * class carries only the kind tag because not every filter kind supports every lowering path —
- * for example, a bloom filter cannot produce a cuDF AST fragment. Consumers @c dynamic_cast a
- * @ref sirius_dynamic_filter pointer to the capability they need; a failed cast means the filter
- * does not support that path.
+ * capability mixins: @ref sirius_ast_lowerable for reader/AST predicates and @ref
+ * sirius_mask_applicable for post-decode masks. The base class carries only the kind tag because
+ * not every filter kind supports every application path — for example, a Bloom filter cannot
+ * produce a cuDF AST fragment. Consumers @c dynamic_cast a @ref sirius_dynamic_filter pointer to
+ * the capability they need; a failed cast means the filter does not support that path.
  */
 class sirius_dynamic_filter {
  public:
@@ -110,7 +110,7 @@ class sirius_device_replicable {
  * @brief Capability mixin: filter can lower itself to a cuDF AST fragment.
  *
  * Filters inheriting from this interface support consumer paths that build a @c cudf::ast::tree
- * (e.g., parquet reader @c set_filter, expression executor).
+ * (e.g., parquet reader @c set_filter, expression evaluator).
  */
 class sirius_ast_lowerable {
  public:
@@ -166,9 +166,9 @@ struct zone_map_entry {
  *
  * Lowers to @c OR_i ( min_i ≤ col AND col ≤ max_i ) (or strict variants based on @c inclusive_*).
  *
- * @note A degenerate single-zone (N=1) filter is the simplest case and is equivalent to a
- *       global min/max range. Multi-zone (N>1) filters retain per-block bounds and prune
- *       more aggressively when build values cluster.
+ * @note A degenerate single-zone (N=1) filter is the simplest case and is equivalent to a global
+ *       min/max range. The representation can retain multiple independently supplied ranges, but
+ *       the current hash-join publisher supplies one global zone per key.
  *
  * @pre  At least one zone must be supplied; every zone's @c min and @c max must be non-null
  *       and share the same @ref cudf::data_type as the column being filtered.
@@ -321,8 +321,8 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   cudf::data_type _key_type{cudf::type_id::EMPTY};
   std::size_t _num_keys = 0;
 
-  /// Persistent cuco::static_set over INT64 keys; PIMPL'd so cuCollections device code stays in
-  /// the .cu translation unit.
+  /// Persistent cuco::static_set over INT32 or INT64 keys; PIMPL'd so cuCollections device code
+  /// stays in the .cu translation unit.
   struct set_impl;
   std::unique_ptr<set_impl> _set;
 };
@@ -398,12 +398,17 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
  *
  * ## Filter availability
  *
- * In Sirius the consumer (probe scan) executes *concurrently* with the producer (hash-join build):
- * injected partition/concat pipelines decouple the probe scan from the join's build dependency, so
- * a scan task may run before, during, or after the producing build finalizes. Consumption is
- * opportunistic: a consumer cheaply tests whether any filter has arrived yet (@ref has_filters) and
- * applies whatever is present when each split runs. A filter that publishes after a split was read
- * simply does not prune it.
+ * In the normal @c BUILD_PROBE path, build-side @c CONCAT synchronously delivers the complete build
+ * batch to the join's publication hook. Construction, device replication, and channel fan-out all
+ * complete before that push returns, and downstream task creation reaches the probe data scan only
+ * afterwards. Metadata preparation and prefetch may occur earlier, but probe read/decode does not
+ * race this normal build-port publication.
+ *
+ * Consumption is nevertheless opportunistic: there is no readiness wait in this channel API. A
+ * consumer snapshots the filters that exist, selects device-local representations, and safely
+ * passes data through when publication intentionally emitted nothing or no applicable local filter
+ * exists. The append-only/multi-producer behavior also keeps the channel useful outside that normal
+ * ordered path; it must not be read as evidence that normal probe scans precede publication.
  */
 class sirius_dynamic_filter_set {
  public:
@@ -489,9 +494,9 @@ class sirius_dynamic_filter_set {
     return _filter_count.load(std::memory_order_acquire) > 0;
   }
 
-  /// Lock-free count of filters pushed so far, across all columns. Monotonically
-  /// non-decreasing; @ref dynamic_filter_gate uses it to detect filters that published
-  /// after a disable decision and re-arm itself.
+  /// Lock-free count of filters pushed so far, across all columns. Monotonically non-decreasing;
+  /// @ref dynamic_filter_gate uses it to detect that a generic append-only channel grew beyond the
+  /// snapshot on which a disable decision was based.
   [[nodiscard]] std::size_t filter_count() const noexcept
   {
     return _filter_count.load(std::memory_order_acquire);
@@ -515,7 +520,8 @@ class sirius_dynamic_filter_set {
   /// Number of plan-time producers wired to this channel; zero means the consumer can be elided.
   std::atomic<std::size_t> _producer_count{0};
 
-  /// False once the consumer has drained. Producers use this to skip late filter construction.
+  /// False once the consumer has drained. Producers use this to skip construction that no future
+  /// consumer can use.
   std::atomic<bool> _accepting_filters{true};
 };
 

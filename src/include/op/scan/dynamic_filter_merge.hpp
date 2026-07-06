@@ -70,7 +70,7 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
 /// most-selective-first CASCADE: each filter's mask is computed only over the rows surviving the
 /// filters before it. When @p gate is non-null it supplies per-filter marginal keep ratios:
 /// measured-useless filters are dropped from the cascade, and each filter's first ratio is recorded
-/// back. Pass null (tests, gate-less callers) to apply everything in arrival order.
+/// back. Pass null (tests, gate-less callers) to apply everything in channel insertion order.
 /// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
 /// @note Should not be used by callers -- useful for testing. Callers should use
 /// apply_dynamic_filters_gated_view instead, which wraps this with a gate early-out and keep-ratio

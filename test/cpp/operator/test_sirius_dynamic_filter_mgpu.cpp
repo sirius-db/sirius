@@ -173,8 +173,8 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
     REQUIRE(filter->is_available_on_device(kBuildDevice));
     REQUIRE_FALSE(filter->is_available_on_device(kProbeDevice));
 
-    // Replica publication is opportunistic: a consumer scheduled on GPU 1 before its local copy
-    // is ready must skip the optional filter, never touch GPU 0's set or wait for it.
+    // Exercise the low-level availability contract independently of production scheduling: before
+    // explicit replication, a GPU 1 caller skips the optional filter and never touches GPU 0's set.
     {
       rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
       auto const probe_stream = cudf::get_default_stream();

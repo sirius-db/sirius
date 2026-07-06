@@ -1,10 +1,11 @@
 # Dynamic Filters — Multi-GPU Publication
 
-> **Status: implemented and validated on 2026-07-02.** Dynamic filters remain
-> opportunistic and are now safe on multiple GPUs. The producer builds each
-> filter once, attempts to copy its compact finalized representation to every
-> active probe GPU, and publishes one immutable logical filter only after every
-> successful device-local replica is ready. TPC-H Q2 passes on physical GPUs 1
+> **Status: implemented and revalidated on 2026-07-06.** Dynamic-filter
+> consumers remain nonblocking and are safe on multiple GPUs. The producer builds each
+> filter once, materializes its compact representation on every active probe GPU
+> (copying finalized membership storage or reconstructing exact zone scalars),
+> and publishes one immutable logical filter only after every successful
+> device-local replica is ready. TPC-H Q2 passes on physical GPUs 1
 > and 2. In the final pinned-host SF300 Q1-Q22 A/B, the sum of warm per-query
 > medians fell from **13.7013505 s to 8.2939465 s: 39.466212% faster
 > (1.651970x)**. All 22 result files were byte-identical.
@@ -24,16 +25,26 @@ copy_if failed on 2nd step: cudaErrorIllegalAddress
 
 The fix gives every filter explicit device identity and records which
 device-local replicas are ready. Consumers select by their memory-space device
-ID; they never dereference remote filter storage. If a replica could not be
-created, that GPU skips the optional filter.
+ID; they never dereference remote filter storage. When the filter kind's
+best-effort policy permits a target omission, that GPU skips the optional
+filter; failures outside that policy propagate.
 
-The publication contract is still opportunistic:
+The publication and application contracts are distinct:
 
-- A scan never waits for a dynamic filter.
-- Splits that run before publication continue without it.
-- Splits that run after publication use their local replica.
-- A failed replica is skipped on that GPU; the authoritative join still
-  guarantees correctness.
+- In the normal `BUILD_PROBE` path, build-side CONCAT synchronously completes
+  the publication attempt before probe data-scan execution begins.
+- A scan never waits for a dynamic filter and never assumes one was emitted.
+- An empty or policy-gated publication and an allocation-unavailable local
+  replica are safe pass-through cases; the authoritative join guarantees
+  correctness.
+- For IN-list/Bloom replicas, serious CUDA construction, transfer, or
+  synchronization failures propagate and fail the producing task/query. The
+  current zone-map target-clone path instead catches, logs, and omits a failed
+  target replica.
+
+Probe metadata parsing and prefetch preparation may happen earlier, but the
+actual `read_parquet`/decode task consumes the channel only after the ordered
+build-port publication attempt has returned.
 
 ## Reproduction and diagnosis
 
@@ -47,8 +58,8 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2 \
 
 Before the fix, the two-GPU section failed with `cudaErrorIllegalAddress`; the
 single-GPU section passed. Q2 is a reliable trigger because its selective join
-builds publish membership filters while probe scan tasks are dispatched to both
-logical devices.
+publishes membership filters consumed by probe scan tasks on both logical
+devices.
 
 The unsafe ownership was:
 
@@ -88,9 +99,11 @@ physical hash join. It contains:
 - the build-key-domain estimate used by the publication gates; and
 - non-owning placement handles for the context's active GPU memory spaces.
 
-Each `dynamic_filter_replica_space` is a non-null reference to one CuCascade
-`memory_space`; the plan validates the GPU tier and sorts/deduplicates by its
-actual device ID. The completed plan is moved into the hash join's
+Each `dynamic_filter_replica_space` pairs a non-null CuCascade GPU
+`memory_space` with the NUMA-selected CuCascade HOST `memory_space` used for
+staging when peer DMA is unavailable. The plan validates both tiers and
+sorts/deduplicates placements by the GPU's actual device ID. The completed plan
+is moved into the hash join's
 `const _dynamic_filter_plan`. Runtime publication can observe that a channel has
 drained, but it cannot add targets, rediscover devices, or change policy. This
 also avoids assuming that active devices are numbered `0..N-1`, which matters
@@ -104,8 +117,10 @@ replicas' non-owning RMM allocator references. Carrying the memory space makes
 the allocator-and-stream lifetime contract explicit in the placement type.
 
 The exact-set/Bloom choice uses the minimum L2 size across the planned devices.
-A single replicated filter kind therefore fits the least-capable probe GPU
-rather than inheriting whichever GPU first queried `cudaDevAttrL2CacheSize`.
+The exact IN-list is selected only when it fits the least-capable probe GPU;
+otherwise the publisher selects the much smaller Bloom, which may itself exceed
+L2 for a sufficiently large build. The decision never inherits whichever GPU
+first queried `cudaDevAttrL2CacheSize`.
 
 ### 2. Keep publication local and exactly once
 
@@ -124,7 +139,7 @@ They arbitrate through a publication state machine independent of the hash-table
 build state:
 
 ```text
-OPEN --claim--> PUBLISHING --success--> PUBLISHED
+OPEN --claim--> PUBLISHING --success--> FINISHED
                          `--exception--> FAILED
 OPEN --finalize without a claim-------> CLOSED
 ```
@@ -157,10 +172,12 @@ silent cross-device publication. Scan consumers never invoke it or know how a
 representation is copied.
 
 The publisher synchronizes the construction stream, invokes the capability for
-each built filter, and only then calls `push_filter`. A per-device replication
-failure is caught by the concrete filter and leaves that device unavailable;
-successful replicas may still be published. This preserves best-effort pruning
-without weakening the authoritative join.
+each built filter, and only then calls `push_filter`. IN-list and Bloom treat
+`std::bad_alloc` for an individual target as best-effort replica unavailability;
+CUDA, device-selection, invariant, and stream-synchronization failures
+propagate. Zone-map replication currently logs and omits a target that cannot
+clone its scalars. Successful replicas are published without weakening the
+authoritative join.
 
 ### 4. Build once, copy finalized storage
 
@@ -181,12 +198,52 @@ memory space (falling back to the first Sirius HOST space when topology is
 unknown). Replication selects the GPU and obtains both `acquire_stream()` and
 `get_default_allocator()` from that GPU space. The stream is a non-owning view
 into the space's managed stream pool; no persistent private stream is created.
-Local and peer-DMA copies are submitted to every target before the publisher
-waits on any target stream, so transfers to three or more GPUs can overlap. The
-publisher retains each destination object through this completion pass and adds
-it to the ready set only after its stream completes. Replica destruction selects
-the owning CUDA device and releases cuCO/scalar objects while both documented
-memory spaces are still alive.
+The source representation is already the source GPU's ready local replica; no
+same-device copy is submitted for it. Peer-DMA copies to remote targets are
+submitted before the publisher waits on any target stream, so transfers to
+three or more GPUs can overlap. The publisher retains each destination object
+through this completion pass and adds it to the ready set only after its stream
+completes. Replica destruction selects the owning CUDA device and releases
+cuCO/scalar objects while both documented memory spaces are still alive.
+
+```mermaid
+flowchart LR
+    subgraph SOURCE["Source GPU"]
+        KEYS["Build keys"]
+        FILTER["One finalized filter<br/>source representation is the local replica"]
+        KEYS --> FILTER
+    end
+
+    REPLICATE["sirius_device_replicable<br/>replicate_to_devices"]
+    PEER["Peer-capable target GPU<br/>cudaMemcpyPeerAsync<br/>enqueue only"]
+    HOST["Target's CuCascade<br/>fixed_size_host_memory_resource<br/>borrowed pinned blocks"]
+    STAGED["Non-peer target GPU<br/>batched D2H → H2D"]
+    ZONE["Zone-map target GPU<br/>exact typed target-owned scalars"]
+    SKIP["Best-effort target failure<br/>optional replica omitted"]
+    FAIL["IN-list / Bloom CUDA or invariant failure<br/>propagate and fail publication"]
+    COMPLETE["Completion pass<br/>synchronize target streams"]
+    CHANNEL["push one immutable logical filter<br/>into target channels"]
+    CONSUMER["Each scan supplies its memory-space device ID<br/>and selects only the local replica"]
+
+    FILTER --> REPLICATE
+    FILTER -->|"ready source replica"| COMPLETE
+    REPLICATE -->|"IN-list / Bloom<br/>verified peer route"| PEER
+    REPLICATE -->|"IN-list / Bloom<br/>peer route unavailable"| HOST
+    HOST --> STAGED
+    REPLICATE -->|"zone map"| ZONE
+    REPLICATE -.->|"membership std::bad_alloc"| SKIP
+    ZONE -.->|"target clone exception"| SKIP
+    REPLICATE -.->|"membership serious failure"| FAIL
+    PEER --> COMPLETE
+    STAGED --> COMPLETE
+    ZONE --> COMPLETE
+    COMPLETE --> CHANNEL --> CONSUMER
+```
+
+Copies to different peer-capable targets are enqueued before the completion
+pass, so three-or-more-GPU fan-out can overlap. HOST staging remains synchronous
+inside the copy helper because the borrowed blocks must not return to their pool
+while DMA is still using them.
 
 ### 5. Use the Sirius-owned replica-transfer path
 
@@ -219,8 +276,9 @@ called. Local and peer-DMA routes return after enqueue; the concrete filter
 retains those replicas and synchronizes all target streams only after fan-out
 submission is complete. HOST staging completes inside the helper because its
 borrowed blocks cannot return to the pool while H2D DMA is in flight. Host-pool
-exhaustion or any transfer error omits only that optional device replica; the
-authoritative join remains unchanged.
+exhaustion is allocation unavailability and may omit that optional replica.
+CUDA enqueue/synchronization and invariant failures propagate; they do not
+silently change routes or allow probing against uncertain replica state.
 
 ### 6. Publish one ready immutable snapshot
 
@@ -229,10 +287,12 @@ the same immutable logical filter into the planned channels. Consumers can
 therefore remain lock-light and never observe an in-flight replica as available.
 
 Publishing the source replica before remote replicas was deliberately rejected.
-It would save only the short compact-copy interval while introducing channel
-generations or per-device gate state: a scan on another GPU could otherwise
-observe the filter identity, find no local representation, and incorrectly
-train its opportunistic selectivity gate on a no-op.
+It would not advance normal probe execution—the synchronous build-port hook
+must still return first—and it would expose a logical filter whose replica set
+is still mutating. A generic early caller on another GPU would safely pass
+through and would not train the gate, but it could miss optional pruning. The
+ready-snapshot rule keeps channel contents immutable and avoids per-device
+publication generations for no normal-path benefit.
 
 ### 7. Select locally at the consumer
 
@@ -246,33 +306,36 @@ mask computation:
 There is no remote kernel dereference and no consumer-side synchronization with
 the producer.
 
-The shared selectivity gate remains lock-free on `applicable()`. Only the rare
-post-mask decision update takes a small mutex and re-reads its state under that
-lock. This makes `ACTIVE` terminal: a stale unselective task from an older filter
-generation cannot race a selective task on another GPU and disable a filter
-already proven useful.
+The scan-level `applicable()` fast path is lock-free. On an actual membership
+apply, per-filter keep-ratio lookups/first-record updates use the ratio-map
+mutex, and the post-mask scan-level decision uses a separate small mutex while
+re-reading its state. This makes `ACTIVE` terminal: a stale unselective task
+from an older filter generation cannot race a selective task on another GPU and
+disable a filter already proven useful.
 
 ## Why this is performant
 
 Publication adds `O(filter_size * (GPU_count - 1))` transfer work per join, not
 one rehash/rebuild per GPU. A verified pair uses one direct peer-DMA leg; only an
-unusable pair pays the portable D2H/H2D fallback. The steady-state probe remains
+unusable pair pays the HOST-staged D2H/H2D fallback. The steady-state probe remains
 entirely device-local: the exact set is selected to fit the smallest active L2
 where possible, and the Bloom stays the compact fallback. No key column is
 retained, no scan is pinned to the build GPU, and scan parallelism is unchanged.
 
-The copy happens on the producer path while probe scans remain free to run
-unfiltered. Direct copies to all peer-capable targets are enqueued before the
-completion pass, allowing their DMA legs to overlap on three or more GPUs.
-Waiting for replicas delays only publication, never scan execution. For a
-two-GPU query this is one remote replica per emitted filter.
+The copy happens on the ordered producer path. Direct copies to all
+peer-capable targets are enqueued before the completion pass, allowing their DMA
+legs to overlap on three or more GPUs. Publication completion is upstream of
+probe data-scan execution, so replica latency is on the publication path rather
+than hidden behind unfiltered probe work. The representations are compact and
+copied rather than rebuilt; for a two-GPU query this is one remote replica per
+emitted filter.
 
 `memory_space::acquire_stream()` may return a pooled stream that already has
 work queued, so the publication wait can occasionally include earlier work on
-that stream. This is a cold-path head-of-line tradeoff, not a correctness or
-consumer-side barrier: the managed pool avoids per-filter stream
-creation/destruction, and scans continue opportunistically while publication is
-pending. The end-to-end A/B below includes this behavior.
+that stream. This is a cold-path head-of-line tradeoff: it can delay publication
+and therefore the ordered probe start, while the managed pool avoids per-filter
+stream creation/destruction. It is not a consumer-side wait or a correctness
+hazard. The end-to-end A/B below includes this behavior.
 
 ## Validation
 
@@ -281,16 +344,18 @@ pending. The end-to-end A/B below includes this behavior.
 On physical NVIDIA GB200 GPUs 1 and 2 (`CUDA_VISIBLE_DEVICES=1,2`, exposed as
 logical devices 0 and 1):
 
-- Full dynamic-filter suite: **242 assertions in 66 test cases, all passed**.
+- Full dynamic-filter suite: **242 assertions in 67 test cases, all passed**.
   This includes IN-list, Bloom, and zone-map remote replicas, the forced
   fixed-HOST-pool route, and the concurrent sticky-ACTIVE gate regression.
 - Original TPC-H Q2 integration reproducer: **831 assertions, all passed**.
 - The release loadable extension and unit-test targets build successfully.
 
-The focused tests also verify that a pre-replication consumer on the remote GPU
-gets no mask (opportunistic skip), that replicas survive destruction of the
-borrowed build-key column, that Bloom replication has no false negatives, and
-that the explicit pinned-host fallback transfers the exact bytes. Their source
+One focused low-level test verifies that a filter object without a replica for a
+requested device returns no mask; this exercises API safety and is not a model
+of production scheduling, because production publishes only after replication.
+The tests also verify that replicas survive destruction of the borrowed
+build-key column, that Bloom replication has no false negatives, and that the
+explicit pinned-host fallback transfers the exact bytes. Their source
 and destination allocations use streams and allocators from a two-GPU Sirius
 memory manager, which is deliberately declared before—and destroyed after—the
 filters to exercise the documented pool-lifetime contract.

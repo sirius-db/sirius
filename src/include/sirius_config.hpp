@@ -95,10 +95,10 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// Wire dynamic table-filter pushdown: a hash-join build publishes a runtime membership filter
-  /// (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan, which applies it
-  /// post-decode to drop non-matching rows before the join. On by default; the master switch for
-  /// the feature.
+  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a
+  /// runtime membership filter (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan,
+  /// which applies it post-decode to drop non-matching rows before the join. On by default; the
+  /// master switch for the feature.
   bool enable_dynamic_filter_pushdown = true;
 
   /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,

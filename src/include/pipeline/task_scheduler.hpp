@@ -221,10 +221,10 @@ class task_scheduler {
   std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
 
-  /// Pipelines that transitively feed a dynamic-filter-producing join's build input. The
-  /// management loop dispatches their tasks ahead of others so the filter publishes before the
-  /// consuming scans drain. Set once in prepare_for_query, before the management loop runs;
-  /// read-only thereafter.
+  /// Pipelines that transitively feed a plan-wired dynamic-filter join's build input. The
+  /// management loop dispatches their tasks ahead of others so an eligible BUILD_PROBE join can
+  /// complete publication before its consuming probe data scan begins. Set once in
+  /// prepare_for_query, before the management loop runs; read-only thereafter.
   std::unordered_set<const sirius_pipeline*> _filter_build_pipelines;
 
   exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks

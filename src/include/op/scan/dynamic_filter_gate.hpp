@@ -37,20 +37,22 @@ namespace sirius::op::scan {
 ///
 /// Used by @ref apply_dynamic_filters_gated_view. The first applied non-empty batch decides:
 /// filters that keep more than 25% of rows are disabled for the scan; selective filters stay
-/// active. If more filters publish after a disable decision, the gate re-arms and measures once
-/// more. Concurrent batches may both measure during re-arm; decision recording is serialized so
-/// an older measurement cannot demote a gate that a selective batch already made active.
+/// active. For the generic append-only/multi-producer channel contract, growth beyond the snapshot
+/// that produced a disable decision re-arms the gate for one measurement. Normal Phase 1
+/// BUILD_PROBE publication supplies its complete snapshot before the probe scan starts. Concurrent
+/// scan batches may both measure; decision recording is serialized so an older measurement cannot
+/// demote a gate that a selective batch already made active.
 class dynamic_filter_gate {
  public:
-  /// True when a gated apply would do work now: at least one filter has published, and the gate is
-  /// active or re-armed by a later publish after disable.
+  /// True when a gated apply would do work now: at least one filter exists, and the gate is active
+  /// or the append-only filter count has grown beyond the snapshot that disabled it.
   [[nodiscard]] bool applicable(sirius::op::sirius_dynamic_filter_set const& filters) const;
 
   /// Record one split's keep ratio (@p rows_after / @p rows_before) for an apply that observed
-  /// @p observed_filter_count published filters (snapshot taken before computing the mask, so a
-  /// concurrent publish at worst triggers one extra re-measurement). Empty splits are no-ops;
-  /// an active gate never demotes; a disabled gate re-decides only when the apply saw more
-  /// filters than the disabling one did.
+  /// @p observed_filter_count filters (snapshot taken before computing the mask). If a generic
+  /// multi-producer caller extends the channel concurrently, the count change causes at most one
+  /// extra re-measurement. Empty splits are no-ops; an active gate never demotes; a disabled gate
+  /// re-decides only when the apply saw more filters than the disabling one did.
   void record_keep_ratio(std::size_t rows_before,
                          std::size_t rows_after,
                          std::size_t observed_filter_count);

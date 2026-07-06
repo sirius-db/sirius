@@ -297,7 +297,7 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
 2. **Reader-level filter pushdown:** the cuDF AST is set on `parquet_reader_options` via `set_filter()`, so cuDF applies the filter inside `read_parquet`. When the reader applies the row filter, `materialize_table` reports `ROW_FILTERED` (or `ROW_FILTERED_AND_PROJECTED` once hive partitions are assembled), so the scan operator skips a redundant post-decode filter.
 
-Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `gpu_expression_executor` on the decoded batch in `post_filter_and_project`.
+Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
 **Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER`, `IS_NOT_NULL`, and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree.
 
@@ -307,7 +307,7 @@ The DuckDB-native scan prunes row groups using DuckDB's own statistics machinery
 
 This runs entirely from `PartitionRowGroup` statistics — no segment metadata is needed — so a pruned row group is skipped **before its segments are walked, staged, copied to the GPU, or decoded**. If every row group is pruned, the native path refuses up front and the query falls back to DuckDB CPU before the async scan starts.
 
-Only statically-known filters participate: `DYNAMIC_FILTER` table filters are excluded, because their bounds come from a runtime source (e.g. a hash-join build) that is not populated at metadata-walk time. The payoff is data-clustering-dependent — it costs almost nothing when statistics can't help and is multiplicative when the table is ordered such that a filter eliminates most row groups.
+Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native metadata walk. DuckDB `DYNAMIC_FILTER` entries are excluded because Sirius runtime dynamic filters use a separate `sirius_dynamic_filter_set` channel and the parquet reader/post-decode consumer paths described in [Dynamic Filters](dynamic-filters.md); they are not translated through this static `TableFilterSet` path. This is an architectural separation, not a claim that probe data scans run before build-side publication. The payoff from the static statistics walk is data-clustering-dependent — it costs almost nothing when statistics cannot help and is multiplicative when the table is ordered such that a filter eliminates most row groups.
 
 ## Sirius IO Subsystem
 

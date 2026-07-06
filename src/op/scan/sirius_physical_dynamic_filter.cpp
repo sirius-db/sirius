@@ -49,10 +49,10 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   nvtx3::scoped_range nvtx_range{"sirius_physical_dynamic_filter::execute"};
   auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
 
-  // If no filter has published by the time this task runs, or the gate has already proven the
-  // current filter set unhelpful, preserve the opportunistic semantics and pass the task through
-  // without taking read-only locks or building table views. The gate re-arms automatically if
-  // a later producer publishes a new filter.
+  // Normal BUILD_PROBE scheduling completes the publication attempt before this task. Keep the
+  // no-filter fast path because that attempt may intentionally emit no membership filter, while
+  // the gate fast path handles a filter set already proven unhelpful. The generic append-only
+  // channel remains filter-count-aware if another producer extends it.
   if (!_filters || !_gate.applicable(*_filters)) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
