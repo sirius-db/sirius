@@ -19,6 +19,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <optional>
@@ -171,6 +172,118 @@ bi: "1.5Gi")");
     std::uint64_t size = 0;
     yaml::reader r(node);
     REQUIRE_THROWS_AS(r.optional("size", size), std::runtime_error);
+  }
+}
+
+TEST_CASE("parse_duration time suffix parsing", "[config_opt][duration]")
+{
+  using namespace std::chrono_literals;
+
+  SECTION("all supported units")
+  {
+    REQUIRE(yaml::parse_duration("500ns") == 500ns);
+    REQUIRE(yaml::parse_duration("500us") == 500us);
+    REQUIRE(yaml::parse_duration("10ms") == 10ms);
+    REQUIRE(yaml::parse_duration("2s") == 2s);
+    REQUIRE(yaml::parse_duration("3min") == 3min);
+    REQUIRE(yaml::parse_duration("1h") == 1h);
+  }
+
+  SECTION("long-form and alias suffixes")
+  {
+    REQUIRE(yaml::parse_duration("500nsec") == 500ns);
+    REQUIRE(yaml::parse_duration("500usec") == 500us);
+    REQUIRE(yaml::parse_duration("10msec") == 10ms);
+    REQUIRE(yaml::parse_duration("2sec") == 2s);
+    REQUIRE(yaml::parse_duration("2seconds") == 2s);
+    REQUIRE(yaml::parse_duration("3m") == 3min);
+    REQUIRE(yaml::parse_duration("3minutes") == 3min);
+    REQUIRE(yaml::parse_duration("1hr") == 1h);
+    REQUIRE(yaml::parse_duration("1hours") == 1h);
+  }
+
+  SECTION("case-insensitive suffixes")
+  {
+    REQUIRE(yaml::parse_duration("10MS") == 10ms);
+    REQUIRE(yaml::parse_duration("2S") == 2s);
+    REQUIRE(yaml::parse_duration("1H") == 1h);
+  }
+
+  SECTION("whitespace between number and unit") { REQUIRE(yaml::parse_duration("10 ms") == 10ms); }
+
+  SECTION("fractional values round down to nanoseconds")
+  {
+    REQUIRE(yaml::parse_duration("1.5s") == 1500ms);
+    REQUIRE(yaml::parse_duration("2.5ms") == 2500us);
+  }
+
+  SECTION("bare numbers are rejected")
+  {
+    REQUIRE_THROWS_AS(yaml::parse_duration("10"), std::runtime_error);
+  }
+
+  SECTION("empty value is rejected")
+  {
+    REQUIRE_THROWS_AS(yaml::parse_duration(""), std::runtime_error);
+  }
+
+  SECTION("unknown suffix is rejected")
+  {
+    REQUIRE_THROWS_AS(yaml::parse_duration("10years"), std::runtime_error);
+  }
+}
+
+TEST_CASE("yaml reader duration parsing", "[config_opt][duration]")
+{
+  using namespace std::chrono_literals;
+
+  SECTION("reads a suffixed string into a milliseconds field")
+  {
+    auto node = YAML::Load(R"(period: "250ms")");
+    std::chrono::milliseconds period{0};
+    yaml::reader r(node);
+    r.optional("period", period);
+    REQUIRE(period == 250ms);
+  }
+
+  SECTION("converts units to the target duration type")
+  {
+    auto node = YAML::Load(R"(period: "2s")");
+    std::chrono::milliseconds period{0};
+    yaml::reader r(node);
+    r.optional("period", period);
+    REQUIRE(period == 2000ms);
+  }
+
+  SECTION("finer-grained input truncates to target resolution")
+  {
+    auto node = YAML::Load(R"(period: "1500us")");
+    std::chrono::milliseconds period{0};
+    yaml::reader r(node);
+    r.optional("period", period);
+    REQUIRE(period == 1ms);  // 1500us -> 1ms after duration_cast truncation
+  }
+
+  SECTION("missing optional field leaves default untouched")
+  {
+    auto node = YAML::Load(R"(other: 5)");
+    std::chrono::milliseconds period{10};
+    yaml::reader r(node);
+    r.optional("period", period);
+    REQUIRE(period == 10ms);
+  }
+
+  SECTION("bare number is interpreted in the field's native unit")
+  {
+    auto node = YAML::Load(R"(period: 10)");
+    std::chrono::milliseconds ms_period{0};
+    std::chrono::seconds s_period{0};
+    yaml::reader r(node);
+    r.optional("period", ms_period);
+    REQUIRE(ms_period == 10ms);
+    yaml::reader r2(node);
+    r2.optional("period", s_period);
+    REQUIRE(s_period == 10s);
   }
 }
 
