@@ -115,6 +115,13 @@ struct compression_config {
   /// skipped and the chunk is stored uncompressed.  0 = no threshold.
   std::size_t min_batch_size_bytes{1ULL * 1024 * 1024};  // 1 MiB
 
+  /// Maximum compressed footprint, as a fraction of the batch's original device
+  /// size, for the compressed form to be kept.  When the compressed header +
+  /// payload exceeds this fraction of the original (i.e. compression saved too
+  /// little), the compressed data is discarded and the batch is pinned
+  /// uncompressed.  Default 0.95 (require at least a 5% saving).
+  double max_compressed_fraction{0.95};
+
   /// Directory containing per-table Simpatico plan files for input-table
   /// compression.  Each file is named "<table_name>.<ext>" (any extension);
   /// its contents are the multi-column plan DSL (columns separated by "---"

@@ -188,6 +188,7 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   yaml::reader r(node, "compression");
   r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
   r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
+  r.optional("max_compressed_fraction", opt.max_compressed_fraction);
   r.optional("input_plan_dir", opt.input_plan_dir);
   r.reject_unknown();
 }

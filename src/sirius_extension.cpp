@@ -1191,10 +1191,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
-      pin_comp.enabled              = true;
-      pin_comp.plan_dsl             = std::move(*plan_dsl);
-      pin_comp.min_batch_size_bytes = comp_cfg.min_batch_size_bytes;
-      pin_comp.column_names         = cache_info.column_names();
+      pin_comp.enabled                 = true;
+      pin_comp.plan_dsl                = std::move(*plan_dsl);
+      pin_comp.min_batch_size_bytes    = comp_cfg.min_batch_size_bytes;
+      pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
+      pin_comp.column_names            = cache_info.column_names();
       SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
                       data.args.name,
                       data.args.tier,
@@ -1717,6 +1718,17 @@ static void SetPinTableCompressionMinBatchSizeBytes(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_batch_size_bytes");
 }
 
+static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
+                                                        SetScope scope,
+                                                        Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  sirius_ctx->get_config().get_compression_config().max_compressed_fraction =
+    DoubleValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1927,6 +1939,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::UBIGINT,
     Value::UBIGINT(1ULL * 1024 * 1024),
     SetPinTableCompressionMinBatchSizeBytes);
+
+  config.AddExtensionOption(
+    "pin_table_compression_max_compressed_fraction",
+    "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
+    "fraction of the batch's original size (i.e. compression saved too little)",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(0.95),
+    SetPinTableCompressionMaxCompressedFraction);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

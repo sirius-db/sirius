@@ -121,6 +121,10 @@ struct compression_pin_config {
   bool enabled{false};
   std::string plan_dsl;
   std::size_t min_batch_size_bytes{0};
+  /// Keep the compressed form only if header+payload <= this fraction of the
+  /// batch's original device size; otherwise pin uncompressed. See
+  /// compression_config::max_compressed_fraction.
+  double max_compressed_fraction{0.95};
   std::vector<std::string> column_names;
 };
 
