@@ -64,6 +64,7 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<sirius::logi
   _parent_op       = parent_op;
   _is_build        = is_build;
   get_partition_keys_and_type(parent_op, is_build);
+  _drives_partition_count = _is_build;
 }
 
 std::string sirius_physical_partition::get_name() const { return "PARTITION"; }
@@ -243,7 +244,9 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
       if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
     }
   }
-  int num_partitions = static_cast<int>(std::max(uint64_t{1}, total_bytes / s_partition_size));
+  int num_partitions = static_cast<int>(std::max(
+    uint64_t{1},
+    total_bytes / s_partition_size + static_cast<uint64_t>(total_bytes % s_partition_size != 0)));
   // Multi-GPU floor: if the input is big enough to justify using the second
   // GPU, force at least num_gpus partitions so partition-based operators
   // (hash_join, merge_group_by) get work on every GPU. Below the small-table
@@ -264,12 +267,13 @@ void sirius_physical_partition::set_num_partitions(int num_partitions)
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
 {
   std::lock_guard<std::mutex> guard(lock);
-  if (!_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
-    // If this is a probe partition and we haven't determined the number of partitions yet, we
-    // should wait for the build sibling to determine it. This is because the build side will drive
-    // the partitioning and the probe side needs to know the number of partitions to create the
-    // correct number of tasks.
-    return _sibling_partition_op->get_next_task_hint();
+  if (!_num_partitions.has_value() && !_drives_partition_count &&
+      _sibling_partition_op != nullptr) {
+    // Prefer scheduling the side that sizes the sibling pair. If that side is complete but empty,
+    // schedule this side so it can elect one partition from the empty sizing input.
+    auto driver_hint = _sibling_partition_op->get_next_task_hint();
+    if (driver_hint.has_value()) { return driver_hint; }
+    return sirius_physical_operator::get_next_task_hint();
   } else if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
     // If this is part of a join and its on the probe side, and we have determined the number of
     // partitions, we have this behave as a pipeline operator and just schedule tasks
@@ -300,7 +304,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     auto& sibling = _sibling_partition_op->Cast<sirius_physical_partition>();
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
-      auto [num_parts, total_bytes] = determine_num_partitions();
+      auto& sizing_partition        = _drives_partition_count ? *this : sibling;
+      auto [num_parts, total_bytes] = sizing_partition.determine_num_partitions();
       auto& hash_join               = _hash_join_op->Cast<sirius_physical_hash_join>();
       // BUILD_PROBE mode requires the build side to deliver exactly one
       // batch at runtime. The only mechanism that guarantees that is the
@@ -319,7 +324,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         return false;
       };
       bool const build_foldable = has_build_concat(*this) || has_build_concat(sibling);
-      hash_join.update_join_exec_mode(num_parts, total_bytes, build_foldable);
+      if (sizing_partition._is_build) {
+        hash_join.update_join_exec_mode(num_parts, total_bytes, build_foldable);
+      }
       if (_hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
           hash_join.is_build_probe_mode()) {
         // Either sibling may run this block first; configure the build-side CONCAT only.
@@ -336,14 +343,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       _num_partitions         = num_parts;
       sibling._num_partitions = num_parts;
       SIRIUS_LOG_DEBUG(
-        "sirius_physical_partition id {} determined {} partitions from {} bytes on sibling id {} "
-        "and {} build "
-        "side",
+        "sirius_physical_partition id {} determined {} partitions from {} bytes on sizing id {} "
+        "({} side), sibling id {}",
         this->get_operator_id(),
         _num_partitions.value(),
         total_bytes,
-        _sibling_partition_op->get_operator_id(),
-        (_is_build ? "is" : "is not"));
+        sizing_partition.get_operator_id(),
+        (sizing_partition._is_build ? "build" : "probe"),
+        _sibling_partition_op->get_operator_id());
     }
   } else {
     std::lock_guard<std::mutex> guard(lock);

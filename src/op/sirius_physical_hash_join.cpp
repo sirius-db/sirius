@@ -418,8 +418,7 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
   // require the persistent table on the left plus cross-batch accumulation, incompatible with the
   // build-on-right / stream-left model.
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      build_foldable_to_single_batch && join_type != duckdb::JoinType::RIGHT_SEMI &&
-      join_type != duckdb::JoinType::RIGHT_ANTI && join_type != duckdb::JoinType::RIGHT &&
+      build_foldable_to_single_batch && !is_right_family() &&
       _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
     // Switch to a more efficient join strategy for small datasets. The
     // build_foldable_to_single_batch gate matches the runtime invariant in

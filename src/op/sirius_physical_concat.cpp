@@ -46,9 +46,7 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
       // if the join type is left or anti, then we need to concat all the batches into one batch for
       // the build side
       _concat_all = is_build;
-    } else if (hash_join->join_type == duckdb::JoinType::RIGHT ||
-               hash_join->join_type == duckdb::JoinType::RIGHT_ANTI ||
-               hash_join->join_type == duckdb::JoinType::RIGHT_SEMI) {
+    } else if (hash_join->is_right_family()) {
       // if the join type is right or right anti, then we need to concat all the batches into one
       // batch for the probe side
       _concat_all = !is_build;
