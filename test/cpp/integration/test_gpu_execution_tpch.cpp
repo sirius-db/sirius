@@ -34,6 +34,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -3487,6 +3488,196 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "select l.l_orderkey, l.l_linestatus, o.o_custkey from lineitem l inner join orders o on "
     "l.l_orderkey = o.o_orderkey where l.l_orderkey > 10000 and o.o_orderkey < 10000 order by "
     "l.l_orderkey, o.o_custkey;");
+}
+
+//===----------------------------------------------------------------------===//
+// All-pruned scan and empty-side join queries
+//
+// Local (parquet + duckdb-native) port of the empty-result coverage from the S3
+// pushdown suite (test_s3_sql_surface.cpp, "S3 pushdown ..." cases). A predicate
+// like `n_regionkey = 99` matches no rows; with reader-side filter pushdown (on
+// by default for local read_parquet) it prunes every row group, producing the
+// all-pruned scan this exercises. Each query must still complete on the GPU and
+// emit join-type-correct / aggregate-identity output against the surviving side.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+struct labeled_query {
+  std::string label;
+  std::string sql;
+};
+
+// Programmatic port of "S3 pushdown shape-C zero-side joins match the local
+// parquet oracle": every supported join type crossed with which side is pruned
+// to empty. `nation`/`region` are the full tables; the parenthesized subqueries
+// prune one side to zero rows. Includes a both-sides-alive MARK control and a
+// both-sides-pruned case. Sirius must match the CPU oracle for each.
+std::vector<labeled_query> build_empty_side_join_matrix()
+{
+  const std::string nation        = "nation";
+  const std::string region        = "region";
+  const std::string pruned_nation = "(select * from nation where n_regionkey = 99)";
+  const std::string pruned_region = "(select * from region where r_regionkey = 99)";
+  return {
+    {"hash inner dead left",
+     "select n.n_nationkey, r.r_name from " + pruned_nation + " n inner join " + region +
+       " r on n.n_regionkey = r.r_regionkey order by r.r_regionkey, n.n_nationkey;"},
+    {"hash inner dead right",
+     "select n.n_nationkey, r.r_name from " + nation + " n inner join " + pruned_region +
+       " r on n.n_regionkey = r.r_regionkey order by n.n_nationkey, r.r_regionkey;"},
+    {"hash left dead left",
+     "select n.n_nationkey, r.r_name from " + pruned_nation + " n left join " + region +
+       " r on n.n_regionkey = r.r_regionkey order by r.r_regionkey, n.n_nationkey;"},
+    {"hash left dead right",
+     "select n.n_nationkey, r.r_name from " + nation + " n left join " + pruned_region +
+       " r on n.n_regionkey = r.r_regionkey order by n.n_nationkey, r.r_regionkey;"},
+    {"hash right dead left",
+     "select n.n_nationkey, r.r_name from " + pruned_nation + " n right join " + region +
+       " r on n.n_regionkey = r.r_regionkey order by r.r_regionkey, n.n_nationkey;"},
+    {"hash right dead right",
+     "select n.n_nationkey, r.r_name from " + nation + " n right join " + pruned_region +
+       " r on n.n_regionkey = r.r_regionkey order by n.n_nationkey, r.r_regionkey;"},
+    {"hash full outer dead left",
+     "select n.n_nationkey, r.r_name from " + pruned_nation + " n full outer join " + region +
+       " r on n.n_regionkey = r.r_regionkey order by r.r_regionkey, n.n_nationkey;"},
+    {"hash full outer dead right",
+     "select n.n_nationkey, r.r_name from " + nation + " n full outer join " + pruned_region +
+       " r on n.n_regionkey = r.r_regionkey order by n.n_nationkey, r.r_regionkey;"},
+    {"hash not exists dead inner",
+     "select n.n_nationkey from " + nation + " n where not exists (select 1 from " + pruned_region +
+       " r where r.r_regionkey = n.n_regionkey) order by n.n_nationkey;"},
+    {"hash in mark dead inner",
+     "select n.n_nationkey, n.n_regionkey in (select r_regionkey from " + pruned_region +
+       ") as in_pruned from " + nation + " n order by n.n_nationkey;"},
+    {"hash exists dead inner",
+     "select n.n_nationkey from " + nation + " n where exists (select 1 from " + pruned_region +
+       " r where r.r_regionkey = n.n_regionkey) order by n.n_nationkey;"},
+    {"hash count over zero-side join",
+     "select count(*) from " + pruned_nation + " n inner join " + region +
+       " r on n.n_regionkey = r.r_regionkey;"},
+    {"hash both sides pruned",
+     "select n.n_nationkey, r.r_name from " + pruned_nation + " n inner join " + pruned_region +
+       " r on n.n_regionkey = r.r_regionkey order by n.n_nationkey, r.r_regionkey;"},
+    {"nlj left dead right",
+     "select n.n_nationkey, r.r_regionkey from " + nation + " n left join " + pruned_region +
+       " r on n.n_regionkey < r.r_regionkey order by n.n_nationkey, r.r_regionkey;"},
+    {"nlj right dead left",
+     "select n.n_nationkey, r.r_regionkey from " + pruned_nation + " n right join " + region +
+       " r on n.n_regionkey < r.r_regionkey order by r.r_regionkey, n.n_nationkey;"},
+    {"nlj full outer dead left",
+     "select n.n_nationkey, r.r_regionkey from " + pruned_nation + " n full outer join " + region +
+       " r on n.n_regionkey < r.r_regionkey order by r.r_regionkey, n.n_nationkey;"},
+    {"nlj full outer dead right",
+     "select n.n_nationkey, r.r_regionkey from " + nation + " n full outer join " + pruned_region +
+       " r on n.n_regionkey < r.r_regionkey order by n.n_nationkey, r.r_regionkey;"},
+    {"nlj anti dead right",
+     "select n.n_nationkey from " + nation + " n anti join " + pruned_region +
+       " r on n.n_regionkey < r.r_regionkey order by n.n_nationkey;"},
+    {"nlj inner dead left",
+     "select n.n_nationkey, r.r_regionkey from " + pruned_nation + " n inner join " + region +
+       " r on n.n_regionkey < r.r_regionkey order by r.r_regionkey, n.n_nationkey;"},
+    {"nlj inner dead right",
+     "select n.n_nationkey, r.r_regionkey from " + nation + " n inner join " + pruned_region +
+       " r on n.n_regionkey < r.r_regionkey order by n.n_nationkey, r.r_regionkey;"},
+    {"nlj mark both alive",
+     "select n.n_nationkey, n.n_regionkey < any (select r_regionkey from " + region +
+       ") as lt_any_region from " + nation + " n order by n.n_nationkey;"},
+    {"nlj mark dead right",
+     "select n.n_nationkey, n.n_regionkey < any (select r_regionkey from " + pruned_region +
+       ") as lt_any_region from " + nation + " n order by n.n_nationkey;"},
+    {"nlj mark dead left",
+     "select n.n_nationkey, n.n_regionkey < any (select r_regionkey from " + region +
+       ") as lt_any_region from " + pruned_nation + " n order by n.n_nationkey;"},
+  };
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - all-pruned empty filter",
+                 "[integration][gpu_execution][empty_result][all_pruned]")
+{
+  compare_gpu_vs_cpu("select n_nationkey from nation where n_regionkey = 99 order by n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - all-pruned empty filter parquet",
+                 "[integration][gpu_execution][parquet][empty_result][all_pruned]")
+{
+  compare_gpu_vs_cpu("select n_nationkey from nation where n_regionkey = 99 order by n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - all-pruned ungrouped count identity",
+                 "[integration][gpu_execution][empty_result][all_pruned]")
+{
+  compare_gpu_vs_cpu("select count(*) as c from nation where n_regionkey = 99;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - all-pruned ungrouped count identity parquet",
+                 "[integration][gpu_execution][parquet][empty_result][all_pruned]")
+{
+  compare_gpu_vs_cpu("select count(*) as c from nation where n_regionkey = 99;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - all-pruned ungrouped aggregates identity and nulls",
+                 "[integration][gpu_execution][empty_result][all_pruned]")
+{
+  compare_gpu_vs_cpu(
+    "select count(*) as c_all, count(n_name) as c_name, sum(n_nationkey) as sum_key, "
+    "min(n_name) as min_name, max(n_name) as max_name, avg(n_nationkey) as avg_key, "
+    "first(n_name) as first_name from nation where n_regionkey = 99;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - all-pruned ungrouped aggregates identity and nulls parquet",
+                 "[integration][gpu_execution][parquet][empty_result][all_pruned]")
+{
+  compare_gpu_vs_cpu(
+    "select count(*) as c_all, count(n_name) as c_name, sum(n_nationkey) as sum_key, "
+    "min(n_name) as min_name, max(n_name) as max_name, avg(n_nationkey) as avg_key, "
+    "first(n_name) as first_name from nation where n_regionkey = 99;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - all-pruned grouped aggregate emits no groups",
+                 "[integration][gpu_execution][empty_result][all_pruned]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(*) as c from nation where n_regionkey = 99 group "
+    "by n_regionkey order by n_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - all-pruned grouped aggregate emits no groups parquet",
+                 "[integration][gpu_execution][parquet][empty_result][all_pruned]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(*) as c from nation where n_regionkey = 99 group "
+    "by n_regionkey order by n_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty-side join matrix",
+                 "[integration][gpu_execution][empty_result][all_pruned]")
+{
+  for (auto const& q : build_empty_side_join_matrix()) {
+    INFO("empty-side join case: " << q.label);
+    compare_gpu_vs_cpu(q.sql);
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - empty-side join matrix parquet",
+                 "[integration][gpu_execution][parquet][empty_result][all_pruned]")
+{
+  for (auto const& q : build_empty_side_join_matrix()) {
+    INFO("empty-side join case: " << q.label);
+    compare_gpu_vs_cpu(q.sql);
+  }
 }
 
 //===----------------------------------------------------------------------===//
