@@ -29,6 +29,8 @@
 // cudf
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -93,6 +95,52 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
 
   return cudf::make_lists_column(
     n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
+}
+
+// Same as make_fixed_size_float_list but with a row-level null mask on the
+// parent list. Null rows keep their dim value slots (contents are don't-care).
+std::unique_ptr<cudf::column> make_nullable_fixed_size_float_list(
+  std::vector<float> const& values,
+  cudf::size_type n_rows,
+  cudf::size_type dim,
+  std::vector<bool> const& row_valid)
+{
+  auto child = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT32}, n_rows * dim, cudf::mask_state::UNALLOCATED);
+  cudaMemcpy(child->mutable_view().data<float>(),
+             values.data(),
+             sizeof(float) * values.size(),
+             cudaMemcpyHostToDevice);
+
+  std::vector<int32_t> offsets(n_rows + 1);
+  for (cudf::size_type i = 0; i <= n_rows; ++i) {
+    offsets[i] = i * dim;
+  }
+  auto offsets_col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, n_rows + 1, cudf::mask_state::UNALLOCATED);
+  cudaMemcpy(offsets_col->mutable_view().data<int32_t>(),
+             offsets.data(),
+             sizeof(int32_t) * offsets.size(),
+             cudaMemcpyHostToDevice);
+
+  std::vector<cudf::bitmask_type> host_mask(cudf::num_bitmask_words(n_rows), 0);
+  cudf::size_type null_count = 0;
+  for (cudf::size_type i = 0; i < n_rows; ++i) {
+    if (row_valid[i]) {
+      host_mask[i / 32] |= (cudf::bitmask_type{1} << (i % 32));
+    } else {
+      ++null_count;
+    }
+  }
+  rmm::device_buffer null_mask(cudf::bitmask_allocation_size_bytes(n_rows),
+                               cudf::get_default_stream());
+  cudaMemcpy(null_mask.data(),
+             host_mask.data(),
+             sizeof(cudf::bitmask_type) * host_mask.size(),
+             cudaMemcpyHostToDevice);
+
+  return cudf::make_lists_column(
+    n_rows, std::move(offsets_col), std::move(child), null_count, std::move(null_mask));
 }
 
 std::vector<int32_t> to_host_i32(cudf::column_view const& col)
@@ -192,6 +240,108 @@ TEST_CASE("compute_vss_top_k gathers passthrough columns with their distances", 
     REQUIRE(out->num_columns() == 2);
     REQUIRE(out->num_rows() == 0);
   }
+}
+
+TEST_CASE("compute_vss_top_k drops null rows before the search", "[vss]")
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = cudf::get_current_device_resource_ref();
+
+  // Row 2 is NULL (its value slots are don't-care). DuckDB would sort the NULL
+  // distance last and drop it from the top-k; we drop it up front, same result.
+  auto ids = make_int32_column({10, 11, 99, 12, 13});
+  auto vec = make_nullable_fixed_size_float_list(
+    {
+      3.0f,
+      4.0f,  // id 10 -> 5
+      1.0f,
+      0.0f,  // id 11 -> 1
+      -1.0f,
+      -1.0f,  // id 99 -> NULL row (don't-care)
+      0.0f,
+      0.0f,  // id 12 -> 0
+      0.0f,
+      2.0f,  // id 13 -> 2
+    },
+    /*n_rows=*/5,
+    /*dim=*/2,
+    /*row_valid=*/{true, true, false, true, true});
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(ids));
+  cols.push_back(std::move(vec));
+  cudf::table input{std::move(cols)};
+  auto pattern = make_id_distance_pattern({0.0f, 0.0f});
+
+  SECTION("nearest rows never include the null row")
+  {
+    auto out =
+      sirius::op::compute_vss_top_k(input.view(), pattern, /*limit=*/3, /*offset=*/0, stream, mr);
+    stream.synchronize();
+
+    REQUIRE(out->num_rows() == 3);
+    REQUIRE(to_host_i32(out->view().column(0)) == std::vector<int32_t>{12, 11, 13});
+    auto dist = to_host_f(out->view().column(1));
+    REQUIRE(dist[0] == Approx(0.0f));
+    REQUIRE(dist[1] == Approx(1.0f));
+    REQUIRE(dist[2] == Approx(2.0f));
+  }
+
+  SECTION("fewer non-null rows than the limit returns only the non-null rows")
+  {
+    // 4 non-null rows but limit=10: we return 4, not 10. DuckDB would pad the
+    // tail with the NULL-distance row; dropping it diverges only in this
+    // almost-all-null case, which we accept.
+    auto out =
+      sirius::op::compute_vss_top_k(input.view(), pattern, /*limit=*/10, /*offset=*/0, stream, mr);
+    stream.synchronize();
+
+    REQUIRE(out->num_rows() == 4);
+    REQUIRE(to_host_i32(out->view().column(0)) == std::vector<int32_t>{12, 11, 13, 10});
+  }
+}
+
+TEST_CASE("compute_vss_top_k handles a sliced (non-zero offset) input", "[vss]")
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = cudf::get_current_device_resource_ref();
+
+  // Row 0 is a decoy we slice away; the search must see only rows 1..4. A
+  // non-zero offset can't be zero-copy reinterpreted, so the operator compacts.
+  auto ids = make_int32_column({77, 10, 11, 12, 13});
+  auto vec = make_fixed_size_float_list(
+    {
+      9.0f,
+      9.0f,  // id 77 -> decoy, sliced off
+      3.0f,
+      4.0f,  // id 10 -> 5
+      1.0f,
+      0.0f,  // id 11 -> 1
+      0.0f,
+      0.0f,  // id 12 -> 0
+      0.0f,
+      2.0f,  // id 13 -> 2
+    },
+    /*n_rows=*/5,
+    /*dim=*/2);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(ids));
+  cols.push_back(std::move(vec));
+  cudf::table input{std::move(cols)};
+
+  auto sliced = cudf::slice(input.view(), {1, 5}).front();  // offset = 1 on every column
+  REQUIRE(sliced.column(1).offset() != 0);
+
+  auto pattern = make_id_distance_pattern({0.0f, 0.0f});
+  auto out = sirius::op::compute_vss_top_k(sliced, pattern, /*limit=*/2, /*offset=*/0, stream, mr);
+  stream.synchronize();
+
+  REQUIRE(out->num_rows() == 2);
+  REQUIRE(to_host_i32(out->view().column(0)) == std::vector<int32_t>{12, 11});
+  auto dist = to_host_f(out->view().column(1));
+  REQUIRE(dist[0] == Approx(0.0f));
+  REQUIRE(dist[1] == Approx(1.0f));
 }
 
 TEST_CASE("merge_vss_top_k consolidates per-batch candidates by distance", "[vss]")

@@ -17,6 +17,7 @@
 #include "op/sirius_physical_vss.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/sirius_physical_vss_merge.hpp"
 #include "op/vss_top_k.hpp"
 #include "sirius/exception.hpp"
@@ -30,7 +31,9 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <raft/core/device_mdspan.hpp>
@@ -83,13 +86,26 @@ std::unique_ptr<cudf::table> compute_vss_top_k(
 {
   if (limit == 0 || input.num_rows() == 0) { return make_empty_vss_output(input, pattern); }
 
-  auto const keep = std::min<int64_t>(input.num_rows(), static_cast<int64_t>(offset + limit));
-  if (keep == 0) { return make_empty_vss_output(input, pattern); }
-
   auto const col_idx = pattern.vector_column_index;
   if (col_idx < 0 || col_idx >= input.num_columns()) {
     throw internal_exception("VSS vector column index out of range");
   }
+
+  // A nullable or sliced vector column can't be zero-copy reinterpreted as a
+  // RAFT matrix as it's raw-blob read and no null/offset awareness. Compact the
+  // table to drop null rows and reset the offset, keeping passthrough columns
+  // row-aligned so neighbor indices map straight into the compacted rows.
+  // Element-level nulls survive this and are rejected in list_column_as_dataset_view.
+  std::unique_ptr<cudf::table> compacted;
+  if (auto const& vec = input.column(col_idx); vec.offset() != 0 || vec.null_count() != 0) {
+    auto valid_mask = cudf::is_valid(vec, stream, memory_resource);
+    compacted       = cudf::apply_boolean_mask(input, valid_mask->view(), stream, memory_resource);
+    input           = compacted->view();
+    if (input.num_rows() == 0) { return make_empty_vss_output(input, pattern); }
+  }
+
+  auto const keep = std::min<int64_t>(input.num_rows(), static_cast<int64_t>(offset + limit));
+  if (keep == 0) { return make_empty_vss_output(input, pattern); }
 
   // Zero-copy reinterpretation from cudf LIST column into a matrix view
   auto dataset_view = sirius::vss::list_column_as_dataset_view(input.column(col_idx), pattern.dim);
