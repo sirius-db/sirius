@@ -141,10 +141,10 @@ std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
     result.emplace_back(*gpu_space, *host_space);
   }
   std::sort(result.begin(), result.end(), [](auto const& lhs, auto const& rhs) {
-    return lhs.gpu_space().get_device_id() < rhs.gpu_space().get_device_id();
+    return lhs.get_gpu_space().get_device_id() < rhs.get_gpu_space().get_device_id();
   });
   for (std::size_t i = 0; i < result.size(); ++i) {
-    REQUIRE(result[i].gpu_space().get_device_id() == static_cast<int>(i));
+    REQUIRE(result[i].get_gpu_space().get_device_id() == static_cast<int>(i));
   }
   return result;
 }
@@ -161,7 +161,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
   std::unique_ptr<sirius::op::sirius_dynamic_in_list_filter> filter;
   {
     rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
-    auto const& build_space = replica_spaces.front().gpu_space();
+    auto const& build_space = replica_spaces.front().get_gpu_space();
     auto const stream       = build_space.acquire_stream();
     auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
     filter    = std::make_unique<sirius::op::sirius_dynamic_in_list_filter>(
@@ -223,7 +223,7 @@ TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
 
   {
     rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
-    auto const& build_space = replica_spaces.front().gpu_space();
+    auto const& build_space = replica_spaces.front().get_gpu_space();
     auto const stream       = build_space.acquire_stream();
     auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
     filter    = std::make_unique<sirius::op::sirius_dynamic_in_list_filter>(
@@ -236,7 +236,7 @@ TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
 
   for (int device_id = 1; device_id < static_cast<int>(device_count); ++device_id) {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{device_id}};
-    auto const& probe_space = replica_spaces[static_cast<std::size_t>(device_id)].gpu_space();
+    auto const& probe_space = replica_spaces[static_cast<std::size_t>(device_id)].get_gpu_space();
     auto const stream       = probe_space.acquire_stream();
     REQUIRE(filter->is_available_on_device(device_id));
     auto probe =
@@ -258,9 +258,9 @@ TEST_CASE("dynamic-filter replica transfer borrows fixed blocks from a Sirius HO
 
   auto memory_manager      = sirius::test::operator_utils::initialize_memory_manager(2);
   auto replica_spaces      = get_replica_spaces(*memory_manager);
-  auto const& source_space = replica_spaces.front().gpu_space();
+  auto const& source_space = replica_spaces.front().get_gpu_space();
   auto const& target       = replica_spaces.back();
-  auto const& target_space = target.gpu_space();
+  auto const& target_space = target.get_gpu_space();
   auto* const host_resource =
     target.get_host_staging_space()
       .get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
@@ -333,7 +333,7 @@ TEST_CASE("Bloom replica built on GPU 0 has no false negatives on GPU 1",
   std::unique_ptr<sirius::op::sirius_dynamic_bloom_filter> filter;
   {
     rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
-    auto const& build_space = replica_spaces.front().gpu_space();
+    auto const& build_space = replica_spaces.front().get_gpu_space();
     auto const stream       = build_space.acquire_stream();
     auto keys               = cudf::sequence(1024,
                                              cudf::numeric_scalar<std::int64_t>(0, true, stream),
@@ -383,7 +383,7 @@ TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
   std::unique_ptr<sirius::op::sirius_dynamic_zone_map_filter> filter;
   {
     rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
-    auto const& build_space = replica_spaces.front().gpu_space();
+    auto const& build_space = replica_spaces.front().get_gpu_space();
     auto const stream       = build_space.acquire_stream();
     std::vector<sirius::op::zone_map_entry> zones;
     zones.push_back({std::make_unique<cudf::numeric_scalar<std::int64_t>>(

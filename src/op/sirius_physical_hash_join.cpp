@@ -79,7 +79,7 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
       "GPU memory space");
   }
   for (auto const& target : _replica_spaces) {
-    if (target.gpu_space().get_tier() != cucascade::memory::Tier::GPU) {
+    if (target.get_gpu_space().get_tier() != cucascade::memory::Tier::GPU) {
       throw std::invalid_argument(
         "[dynamic_filter_publish_plan] A dynamic-filter replica target must be a GPU memory space");
     }
@@ -89,10 +89,10 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
     }
   }
   auto const device_less = [](auto const& lhs, auto const& rhs) {
-    return lhs.gpu_space().get_device_id() < rhs.gpu_space().get_device_id();
+    return lhs.get_gpu_space().get_device_id() < rhs.get_gpu_space().get_device_id();
   };
   auto const same_device = [](auto const& lhs, auto const& rhs) {
-    return lhs.gpu_space().get_device_id() == rhs.gpu_space().get_device_id();
+    return lhs.get_gpu_space().get_device_id() == rhs.get_gpu_space().get_device_id();
   };
   // Ensure no duplicated device ids
   std::sort(_replica_spaces.begin(), _replica_spaces.end(), device_less);
@@ -1375,7 +1375,7 @@ std::size_t device_l2_cache_bytes(
 
   std::size_t minimum = std::numeric_limits<std::size_t>::max();
   for (auto const& target : replica_spaces) {
-    auto const device_id = target.gpu_space().get_device_id();
+    auto const device_id = target.get_gpu_space().get_device_id();
     int l2               = 0;
     if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device_id) != cudaSuccess || l2 <= 0) {
       return 0;
@@ -1459,14 +1459,14 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     std::find_if(_plan.replica_spaces().begin(),
                  _plan.replica_spaces().end(),
                  [source_device](auto const& target) {
-                   return target.gpu_space().get_device_id() == source_device;
+                   return target.get_gpu_space().get_device_id() == source_device;
                  });
   if (source_space == _plan.replica_spaces().end()) {
     throw std::logic_error(
       "[dynamic_filter_publisher::publish] Dynamic-filter source GPU is absent from the immutable "
       "publish plan");
   }
-  auto const allocator_ref = source_space->gpu_space().get_default_allocator();
+  auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(_plan.replica_spaces());
 

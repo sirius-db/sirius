@@ -352,7 +352,7 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
   if (spaces.empty()) { return; }
 
   auto const source = std::find_if(spaces.begin(), spaces.end(), [this](auto const& target) {
-    return target.gpu_space().get_device_id() == _source_device;
+    return target.get_gpu_space().get_device_id() == _source_device;
   });
   if (source == spaces.end()) {
     SIRIUS_LOG_WARN(
@@ -365,10 +365,10 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
   // Read exact source values through the source memory space's durable stream pool. The producer
   // has already synchronized construction before entering this method.
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{_source_device}};
-  auto const source_stream = source->gpu_space().acquire_stream();
+  auto const source_stream = source->get_gpu_space().acquire_stream();
 
   for (auto const& target : spaces) {
-    auto const& target_space = target.gpu_space();
+    auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
     if (is_available_on_device(device_id)) { continue; }
     try {
