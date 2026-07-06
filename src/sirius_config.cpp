@@ -189,7 +189,6 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
   r.optional("min_chunk_bytes", yaml::bytes(opt.min_chunk_bytes));
   r.optional("input_plan_dir", opt.input_plan_dir);
-  r.optional("temp_dir", opt.temp_dir);
   r.reject_unknown();
 }
 

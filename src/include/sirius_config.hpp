@@ -122,11 +122,6 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
-
-  /// Directory used for temporary .hpln files. On Linux, /dev/shm is a
-  /// RAM-backed tmpfs; falls back to std::filesystem::temp_directory_path()
-  /// when not available.
-  std::string temp_dir{"/dev/shm"};
 };
 
 struct sirius_config {

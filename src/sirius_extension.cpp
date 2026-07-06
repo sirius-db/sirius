@@ -1194,7 +1194,6 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       pin_comp.enabled         = true;
       pin_comp.plan_dsl        = std::move(*plan_dsl);
       pin_comp.min_chunk_bytes = comp_cfg.min_chunk_bytes;
-      pin_comp.temp_dir        = comp_cfg.temp_dir;
       pin_comp.column_names    = cache_info.column_names();
     }
   }

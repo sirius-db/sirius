@@ -121,7 +121,6 @@ struct compression_pin_config {
   bool enabled{false};
   std::string plan_dsl;
   std::size_t min_chunk_bytes{0};
-  std::string temp_dir{"/dev/shm"};
   std::vector<std::string> column_names;
 };
 
