@@ -42,32 +42,6 @@ class sirius_meta_pipeline;
 
 namespace op {
 
-/**
- * @brief Marker input for a zero-side nested-loop-join task
- *.
- *
- * Handed out by sirius_physical_nested_loop_join::get_next_task_input_data when exactly one
- * join input side died (its source pipeline finished without ever delivering a batch) while
- * the other FULL port still holds data. Carries the ONE surviving batch popped from the live
- * port plus which side died; execute() recognizes it and emits the join-type-correct output
- * for that batch (NULL padding, pass-through, or empty) without evaluating the join
- * condition. Plain pipelineable data, matching the operator's regular task inputs.
- */
-class nested_loop_join_zero_side_input : public pipelineable_operator_data {
- public:
-  enum class side : uint8_t { PROBE, BUILD };
-
-  nested_loop_join_zero_side_input(std::shared_ptr<::cucascade::data_batch> surviving_batch,
-                                   side dead_side)
-    : pipelineable_operator_data(
-        std::vector<std::shared_ptr<::cucascade::data_batch>>{std::move(surviving_batch)}),
-      dead_side(dead_side)
-  {
-  }
-
-  side dead_side;
-};
-
 //! sirius_physical_nested_loop_join represents a nested loop join between two tables
 class sirius_physical_nested_loop_join : public sirius_physical_partition_consumer_operator {
  public:
@@ -153,24 +127,13 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  std::optional<task_creation_hint> get_next_task_hint() override;
-
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  /// @brief Emit the join-type-correct output for one surviving batch whose other input side
-  /// died. Builds gather maps on the task stream
-  /// (iota for keep-all, -1 padding for the NULLed dead side, empty for empty-correct cells)
-  /// and publishes through the same output path as a normal join task. The join condition is
-  /// never evaluated.
-  std::unique_ptr<operator_data> execute_zero_side(const nested_loop_join_zero_side_input& input,
-                                                   rmm::cuda_stream_view stream);
-
-  /// @brief Join-type-correct output when one input side has no rows. Shared by the zero-side
-  /// task (dead side synthesized as a 0-row table) and the regular execute path receiving a
-  /// real 0-row batch (e.g. an all-pruned scan under the empty-split fallback): the preserved
-  /// side's rows are padded, kept, or marked false per join type; only the condition
-  /// evaluation is skipped.
+  /// @brief Join-type-correct output when one input side has no rows. Invoked by the regular
+  /// execute path when it receives a real 0-row batch (e.g. an all-pruned scan under the
+  /// empty-split fallback): the preserved side's rows are padded, kept, or marked false per
+  /// join type; only the condition evaluation is skipped.
   std::unique_ptr<operator_data> emit_one_side_empty_result(const cudf::table_view& left,
                                                             const cudf::table_view& right,
                                                             bool left_side_empty,
@@ -188,18 +151,6 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
-
-  //! Set under batches_to_processed_mutex exactly where the port snapshot observes batches on
-  //! each input side. A side whose flag never flips while every source pipeline finishes is
-  //! "dead"; zero_side_pending_locked() then offers the zero-side task for the surviving
-  //! port's batches.
-  bool _saw_probe_input = false;
-  bool _saw_build_input = false;
-
-  //! True when exactly one input side is dead (never saw input, port empty, source pipeline
-  //! finished), the other FULL port still holds data, and BOTH source pipelines finished.
-  //! Caller must hold batches_to_processed_mutex.
-  bool zero_side_pending_locked();
 };
 
 }  // namespace op

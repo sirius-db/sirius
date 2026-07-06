@@ -51,34 +51,6 @@ namespace op {
 enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
 enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
 
-/**
- * @brief Marker input for a zero-side join task.
- *
- * Handed out by sirius_physical_hash_join::get_next_task_input_data when exactly one join
- * input side died (its source pipeline finished without ever delivering a batch) while the
- * other FULL port still holds data. Carries the ONE surviving batch popped from the live
- * port plus which side died; execute() recognizes it and emits the join-type-correct output
- * for that batch (NULL padding, pass-through, mark=false, or empty) without any cudf join
- * call or hash table. The memory space flows exactly as for a normal join task: from the
- * real batch, locked by the base prepare_for_processing into the task's reservation.
- */
-class hash_join_zero_side_input : public partitioned_operator_data {
- public:
-  enum class side : uint8_t { PROBE, BUILD };
-
-  hash_join_zero_side_input(std::shared_ptr<::cucascade::data_batch> surviving_batch,
-                            std::size_t partition_idx,
-                            side dead_side)
-    : partitioned_operator_data(
-        std::vector<std::shared_ptr<::cucascade::data_batch>>{std::move(surviving_batch)},
-        partition_idx),
-      dead_side(dead_side)
-  {
-  }
-
-  side dead_side;
-};
-
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
@@ -184,14 +156,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  /// @brief Emit the join-type-correct output for one surviving batch whose other input side
-  /// died. Builds gather index vectors on the task
-  /// stream (iota for keep-all, -1 padding for the NULLed dead side, empty for empty-correct
-  /// cells) and publishes through the same output path as a normal join task. No cudf join
-  /// call, no hash table.
-  std::unique_ptr<operator_data> execute_zero_side(const hash_join_zero_side_input& input,
-                                                   rmm::cuda_stream_view stream);
-
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
@@ -207,19 +171,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
-
-  //! Set under op_state_mutex exactly where batches leave (or are snapshotted from) each
-  //! input port. A side whose flag never flips while every source pipeline finishes is
-  //! "dead"; zero_side_pending_locked() then offers the zero-side task for the surviving
-  //! port's batches. Any real batch — including a
-  //! fallback-ON empty one — suppresses the zero-side path for its side.
-  bool _saw_probe_input = false;
-  bool _saw_build_input = false;
-
-  //! True when exactly one input side is dead (never saw input, port empty, source pipeline
-  //! finished), the other FULL port still holds data, and BOTH source pipelines finished.
-  //! Caller must hold op_state_mutex.
-  bool zero_side_pending_locked();
 
   bool is_all_inequality_join = true;
 

@@ -277,62 +277,11 @@ void sirius_physical_nested_loop_join::build_pipelines(
   sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this);
 }
 
-bool sirius_physical_nested_loop_join::zero_side_pending_locked()
-{
-  auto* probe_port = get_port("default");
-  auto* build_port = get_port("build");
-  if (!probe_port || !probe_port->repo || !build_port || !build_port->repo) { return false; }
-  if (!is_source_pipeline_finished()) { return false; }
-  bool const probe_dead = !_saw_probe_input && probe_port->repo->total_size() == 0;
-  bool const build_dead = !_saw_build_input && build_port->repo->total_size() == 0;
-  // Exactly one dead side: both-dead completes through the normal protocol today, and
-  // no-dead is the regular join path.
-  if (probe_dead == build_dead) { return false; }
-  auto* surviving_port = probe_dead ? build_port : probe_port;
-  return surviving_port->repo->total_size() > 0;
-}
-
-std::optional<task_creation_hint> sirius_physical_nested_loop_join::get_next_task_hint()
-{
-  {
-    std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
-    // Zero-side join: exactly one input side died
-    // while the other port still holds data. Offer the zero-side task ahead of the base
-    // hint, which would otherwise wait forever on the finished dead-side pipeline.
-    if (zero_side_pending_locked()) { return task_creation_hint{TaskCreationHint::READY, this}; }
-  }
-  return sirius_physical_operator::get_next_task_hint();
-}
-
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()
 {
   // Hold the mutex for the entire operation to prevent concurrent pop/get races.
   // A pop on one thread must not remove a batch that another thread's get expects to find.
-  //
-  // Lock order: the task creator calls this under the pipeline's task creation lock
-  // (_status_mutex), so the order is always _status_mutex -> batches_to_processed_mutex —
-  // never inverted.
   std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
-
-  // Zero-side join: pop ONE surviving batch per call
-  // and hand out the marker. The task creator's drain loop keeps calling until the surviving
-  // port is empty; the pop and the task's mark_task_created happen under the same
-  // _status_mutex hold, so the pipeline-finish guard can never observe "ports empty ∧
-  // counters balanced" mid-window.
-  if (zero_side_pending_locked()) {
-    bool const probe_dead = !_saw_probe_input && get_port("default")->repo->total_size() == 0;
-    auto* surviving_port  = probe_dead ? get_port("build") : get_port("default");
-    auto const dead_side  = probe_dead ? nested_loop_join_zero_side_input::side::PROBE
-                                       : nested_loop_join_zero_side_input::side::BUILD;
-    for (std::size_t partition_idx = 0; partition_idx < surviving_port->repo->num_partitions();
-         partition_idx++) {
-      if (surviving_port->repo->size(partition_idx) == 0) { continue; }
-      auto batch = surviving_port->repo->pop_next_data_batch(partition_idx);
-      if (!batch) { continue; }
-      return std::make_unique<nested_loop_join_zero_side_input>(std::move(batch), dead_side);
-    }
-    return nullptr;
-  }
 
   // One-time initialization: snapshot all batch IDs from both ports.
   if (left_batch_ids.empty() && right_batch_ids.empty()) {
@@ -351,8 +300,6 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
     for (size_t i = 0; i < default_port->repo->num_partitions(); i++) {
       left_batch_ids.push_back(default_port->repo->get_batch_ids(i));
       right_batch_ids.push_back(build_port->repo->get_batch_ids(i));
-      if (!left_batch_ids.back().empty()) { _saw_probe_input = true; }
-      if (!right_batch_ids.back().empty()) { _saw_build_input = true; }
       num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
     }
   }
@@ -495,48 +442,6 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
       make_data_batch(std::move(output_table), space, stream)});
 }
 
-std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute_zero_side(
-  const nested_loop_join_zero_side_input& input, rmm::cuda_stream_view stream)
-{
-  nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute_zero_side"};
-  const auto& input_batches = input.get_read_only_batches();
-  if (input_batches.size() != 1) {
-    throw internal_exception(
-      "sirius_physical_nested_loop_join::execute_zero_side: expected exactly 1 surviving batch, "
-      "got " +
-      std::to_string(input_batches.size()));
-  }
-  auto const& surviving_batch = input_batches[0];
-  auto* space                 = surviving_batch.get_memory_space();
-  if (space == nullptr) {
-    throw internal_exception(
-      "sirius_physical_nested_loop_join::execute_zero_side: surviving batch carries no memory "
-      "space");
-  }
-  bool const probe_dead = input.dead_side == nested_loop_join_zero_side_input::side::PROBE;
-
-  // The dead side never delivered a batch — represent it as a 0-row cudf table over the dead
-  // child's output types so the projection maps and gather NULLIFY policies apply unchanged.
-  auto const& dead_types = probe_dead ? children[0]->get_types() : children[1]->get_types();
-  std::vector<std::unique_ptr<cudf::column>> dead_cols;
-  dead_cols.reserve(dead_types.size());
-  for (auto const& dead_type : dead_types) {
-    if (dead_type.id() == type_id::STRUCT || dead_type.id() == type_id::LIST) {
-      throw not_implemented_exception(
-        "sirius_physical_nested_loop_join::execute_zero_side: nested type " +
-        dead_type.to_string() + " is not supported on the dead join side");
-    }
-    dead_cols.push_back(cudf::make_empty_column(get_cudf_type(dead_type)));
-  }
-  cudf::table dead_table(std::move(dead_cols), stream);
-
-  cudf::table_view surviving = get_cudf_table_view(surviving_batch);
-  cudf::table_view left      = probe_dead ? dead_table.view() : surviving;
-  cudf::table_view right     = probe_dead ? surviving : dead_table.view();
-
-  return emit_one_side_empty_result(left, right, probe_dead, *space, stream);
-}
-
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_empty_result(
   const cudf::table_view& left,
   const cudf::table_view& right,
@@ -640,11 +545,6 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
-  // The zero-side marker carries one batch instead of a (left, right) pair, so it must be
-  // dispatched before the two-batch handling below.
-  if (auto const* zero_side = dynamic_cast<const nested_loop_join_zero_side_input*>(&input_data)) {
-    return execute_zero_side(*zero_side, stream);
-  }
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   size_t pipeline_id = (this->get_pipeline() != nullptr) ? this->get_pipeline()->get_pipeline_id()

@@ -433,57 +433,6 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
-  // Zero-input identity task: the marker is
-  // not pipelineable, so this branch must precede the pipelineable cast below. Emits the
-  // FINAL output row per build_aggregate_layout: COUNT/COUNT_STAR -> INT64 0 (valid),
-  // everything else -> 1-row all-null column of the aggregate's return type.
-  if (auto const* zero_input =
-        dynamic_cast<const ungrouped_aggregate_zero_input_data*>(&input_data)) {
-    auto* space = zero_input->gpu_memory_space;
-    if (space == nullptr) {
-      // Loud failure (plan §7.6): prepare_for_processing must have captured the task's
-      // reserved memory space; silently returning empty would drop the identity row.
-      throw internal_exception(
-        "sirius_physical_ungrouped_aggregate_merge::execute: zero-input marker carries no "
-        "memory space (prepare_for_processing was not run with a reservation)");
-    }
-    auto layout = build_aggregate_layout(aggregates);
-    std::vector<std::unique_ptr<cudf::column>> output_cols;
-    output_cols.reserve(layout.aggregates.size());
-    for (auto const& spec : layout.aggregates) {
-      switch (spec.kind) {
-        case aggregate_kind::COUNT:
-        case aggregate_kind::COUNT_STAR: {
-          auto zero = make_numeric_scalar_with_value<int64_t>(
-            cudf::data_type{cudf::type_id::INT64}, int64_t{0}, stream);
-          output_cols.push_back(cudf::make_column_from_scalar(*zero, 1, stream));
-          break;
-        }
-        case aggregate_kind::SUM:
-        case aggregate_kind::MIN:
-        case aggregate_kind::MAX:
-        case aggregate_kind::AVG:
-        case aggregate_kind::FIRST: {
-          auto null_scalar =
-            cudf::make_default_constructed_scalar(ToCudfType(spec.return_type), stream);
-          null_scalar->set_valid_async(false, stream);
-          output_cols.push_back(cudf::make_column_from_scalar(*null_scalar, 1, stream));
-          break;
-        }
-      }
-    }
-    auto out_table = std::make_unique<cudf::table>(std::move(output_cols), stream);
-    // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote on `stream`;
-    // the constructor records the writer event for downstream cross-device readers.
-    auto out_repr =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
-    std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
-    auto const batch_id                                          = ::sirius::get_next_batch_id();
-    auto output_batch = cucascade::data_batch::make(batch_id, std::move(output_data));
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
-  }
-
   auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
@@ -554,9 +503,6 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
 {
   // we need to lock, then pull all the batches from one partition and return them, and increment
   // the partition index
-  //
-  // Lock order: the task creator calls this under the pipeline's task creation lock
-  // (_status_mutex), so the order is always _status_mutex -> `lock` — never inverted.
   std::lock_guard<std::mutex> lg(lock);
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   bool found_batch = true;
@@ -568,56 +514,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
       found_batch = false;
     }
   }
-  if (input_batch.empty()) {
-    // Zero-input identity: upstream finished
-    // without ever producing a partial — hand out the marker so one normal merge task emits
-    // the identity row. The flag flips under _status_mutex + `lock`, and the task ctor's
-    // mark_task_created runs before the creation lock is released, so the pipeline-finish
-    // guard can never observe "nothing pending" in between (plan §2).
-    if (needs_zero_input_task_locked()) {
-      _zero_input_task_created = true;
-      return std::make_unique<ungrouped_aggregate_zero_input_data>();
-    }
-    return nullptr;
-  }
-  // Plan §7.1: _saw_input flips exactly at the port pop — the only point where a partial
-  // batch leaves the FULL port — so a fallback-ON empty partial also suppresses the
-  // identity task (no double emit).
-  _saw_input = true;
+  if (input_batch.empty()) { return nullptr; }
   return std::make_unique<pipelineable_operator_data>(input_batch);
-}
-
-bool sirius_physical_ungrouped_aggregate_merge::needs_zero_input_task_locked()
-{
-  // !aggregates.empty(): an aggregate-less merge produces empty output on the normal path,
-  // so no identity task is ever created for it — without this conjunct all_ports_empty()
-  // would stay false forever and wedge the pipeline.
-  return !_saw_input && !_zero_input_task_created && !aggregates.empty() &&
-         is_source_pipeline_finished();
-}
-
-std::optional<task_creation_hint> sirius_physical_ungrouped_aggregate_merge::get_next_task_hint()
-{
-  {
-    std::lock_guard<std::mutex> lg(lock);
-    // Plan §7.2: without this hint the identity task is never created — all_ports_empty()
-    // keeps the pipeline alive but the base hint would return nullopt (empty FULL port).
-    if (needs_zero_input_task_locked()) {
-      return task_creation_hint{TaskCreationHint::READY, this};
-    }
-  }
-  return sirius_physical_operator::get_next_task_hint();
-}
-
-bool sirius_physical_ungrouped_aggregate_merge::all_ports_empty()
-{
-  std::lock_guard<std::mutex> lg(lock);
-  // Plan §7.2 hard contract: report non-empty while the identity task still needs creating.
-  // The pipeline-finish guard (sirius_pipeline::update_pipeline_status) queries this same
-  // operator as both source and first_node; returning true here before the marker is handed
-  // out would let the pipeline finish with zero tasks and drop the identity row.
-  if (needs_zero_input_task_locked()) { return false; }
-  return sirius_physical_operator::all_ports_empty();
 }
 
 }  // namespace op

@@ -55,7 +55,6 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -68,18 +67,6 @@ namespace sirius::op::scan {
 namespace {
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
-
-/// Escape hatch for the legacy all-pruned empty-split fallback. Default OFF:
-/// the zero-task completion protocol finishes zero-split scans and downstream
-/// operators emit their zero-input semantics directly (identity aggregates,
-/// zero-side joins). SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK=1 restores the
-/// synthetic empty split. Read per-flush so tests can toggle it within one
-/// process.
-bool empty_split_fallback_enabled()
-{
-  auto* val = std::getenv("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK");
-  return val != nullptr && std::string(val) == "1";
-}
 
 //===----------------------------------------------------------------------===//
 // parquet_batch_coalescer
@@ -191,9 +178,9 @@ class parquet_batch_coalescer : public batch_coalescer {
     // with a single zero-row-group slice so the scan still creates one task
     // (materialize_metadata_to_table short-circuits it to a schema-correct
     // empty table). Partial prunes never reach here — any surviving slice sets
-    // _produced_any. Gated by SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK
-    // (empty_split_fallback_enabled above).
-    if (!_produced_any && _empty_split_fallback && empty_split_fallback_enabled()) {
+    // _produced_any. Zero splits would mean zero tasks, and pipeline-completion
+    // accounting only fires from task completion, hanging the query.
+    if (!_produced_any && _empty_split_fallback) {
       _slices.emplace_back(_empty_split_fallback->file_metadata,
                            _empty_split_fallback->file_path,
                            std::vector<cudf::size_type>{},

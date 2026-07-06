@@ -34,12 +34,6 @@ enum class task_request_kind {
   // event loop so it re-runs the matcher against currently-ready devices.
   // device_id is unused.
   task_available,
-  // The RESULT_COLLECTOR pipeline's completion listener fired (level-triggered).
-  // Wakes the management event loop to
-  // re-validate the current query's RC pipeline and signal the completion
-  // handler — the path a zero-task query needs, since it has no completing
-  // task to drive the executor-side signaler. device_id is unused.
-  query_finished,
 };
 
 struct task_request {

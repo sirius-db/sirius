@@ -325,11 +325,6 @@ bool sirius_pipeline::is_pipeline_finished() const
 
 void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
 
-void sirius_pipeline::set_completion_listener(std::function<void()> listener)
-{
-  _completion_listener = std::move(listener);
-}
-
 void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
   // If this pipeline's sink is the RESULT_COLLECTOR, it is the terminal
@@ -337,11 +332,6 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // no parent pipeline whose status needs updating. Returning early avoids
   // racing with engine teardown after mark_completed() signals the future.
   if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    // Level-triggered completion signal:
-    // every (re-)notification of the finished RC pipeline fires the listener,
-    // so a query_finished event the consumer discarded as stale gets
-    // re-delivered by the next re-evaluation.
-    if (_completion_listener) { _completion_listener(); }
     return;
   }
 

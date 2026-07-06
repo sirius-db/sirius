@@ -2050,10 +2050,6 @@ TEST_CASE("S3 pushdown all-pruned filter completes with an empty result",
   if (should_skip_s3_env(env)) { return; }
 
   scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
-  // Post-env-gate contract: this is a no-op until production consumes the env.
-  // Once the gate lands, this disables the tactical empty-split fallback so the
-  // zero-task protocol itself must complete the all-pruned query.
-  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
   auto fixture        = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query = "SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation") +
                         " WHERE n_regionkey = 99 ORDER BY n_nationkey";
@@ -2094,7 +2090,6 @@ TEST_CASE("S3 pushdown zero-input ungrouped count emits the aggregate identity r
   if (should_skip_s3_env(env)) { return; }
 
   scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
-  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query =
     "SELECT count(*) AS c FROM " + s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
@@ -2115,7 +2110,6 @@ TEST_CASE("S3 pushdown zero-input ungrouped aggregates emit SQL identity and nul
   if (should_skip_s3_env(env)) { return; }
 
   scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
-  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query =
     "SELECT count(*) AS c_all, count(n_name) AS c_name, sum(n_nationkey) AS sum_key, "
@@ -2140,7 +2134,6 @@ TEST_CASE("S3 pushdown zero-input grouped aggregate still emits no groups",
   if (should_skip_s3_env(env)) { return; }
 
   scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
-  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
   auto fixture        = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query = "SELECT n_regionkey, count(*) AS c FROM " +
                         s3_parquet_scan(*env, "nation") +
@@ -2160,7 +2153,6 @@ TEST_CASE("S3 pushdown non-pruned aggregate still matches the local parquet orac
   if (should_skip_s3_env(env)) { return; }
 
   scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
-  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
   auto const s3_query =
     "SELECT count(*) AS c, min(o_orderdate) AS min_date, max(o_orderdate) AS max_date FROM " +
@@ -2189,9 +2181,7 @@ TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
   if (should_skip_s3_env(env)) { return; }
 
   scoped_env_var pushdown("SIRIUS_PARQUET_PUSHDOWN", "1");
-  // Post-env-gate contract: with the tactical fallback disabled, a partially
-  // pruned scan must still avoid premature completion and match the oracle.
-  scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
+  // A partially pruned scan must still avoid premature completion and match the oracle.
   auto fixture     = std::make_shared<s3_sql_fixture>(*env);
   auto const shape = std::string{
     "SELECT l_returnflag, count(*) AS c FROM %s "
@@ -2413,7 +2403,6 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
 
   SECTION("hash fallback empty-batch pins")
   {
-    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "1");
     compare_selected_cases("hash fallback empty-batch pins",
                            empty_batch_s3_queries,
                            empty_batch_local_queries,
@@ -2426,11 +2415,10 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
                            });
   }
 
-  SECTION("true zero-side hash and non-MARK NLJ pins")
+  SECTION("all-pruned-side hash and non-MARK NLJ joins")
   {
-    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
     compare_selected_cases(
-      "true zero-side hash and non-MARK NLJ pins",
+      "all-pruned-side hash and non-MARK NLJ joins",
       zero_side_s3_queries,
       zero_side_local_queries,
       {
@@ -2446,7 +2434,6 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
 
   SECTION("AC-R1 NLJ fallback empty-batch cells")
   {
-    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "1");
     compare_selected_cases("AC-R1 NLJ fallback empty-batch cells",
                            empty_batch_s3_queries,
                            empty_batch_local_queries,
@@ -2461,7 +2448,6 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
 
   SECTION("AC-R2 MARK NLJ both sides alive")
   {
-    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
     compare_selected_cases("AC-R2 MARK NLJ both sides alive",
                            zero_side_s3_queries,
                            zero_side_local_queries,
@@ -2470,7 +2456,6 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
 
   SECTION("AC-R2 MARK NLJ dead build side")
   {
-    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
     compare_selected_cases("AC-R2 MARK NLJ dead build side",
                            zero_side_s3_queries,
                            zero_side_local_queries,
@@ -2479,7 +2464,6 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
 
   SECTION("AC-R2 MARK NLJ dead probe side")
   {
-    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "0");
     compare_selected_cases("AC-R2 MARK NLJ dead probe side",
                            zero_side_s3_queries,
                            zero_side_local_queries,
@@ -2488,31 +2472,12 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
 
   SECTION("AC-R2 MARK NLJ fallback dead build side")
   {
-    scoped_env_var empty_split_fallback("SIRIUS_PARQUET_EMPTY_SPLIT_FALLBACK", "1");
     compare_selected_cases("AC-R2 MARK NLJ fallback dead build side",
                            empty_batch_s3_queries,
                            empty_batch_local_queries,
                            {"nlj fallback mark dead right"});
   }
 }
-
-// Protocol follow-up sketch: the tactical fix for this PR is parquet-scoped empty-split emission.
-// The long-term contract should make a zero-task source complete the pipeline without requiring
-// every source to fabricate an empty unit of work. Keep this disabled until that protocol seam
-// exists, then turn it into an active regression test. Keep this disabled rather
-// than [!mayfail]: a known hanging protocol limitation must never run a long
-// watchdog in normal or opt-in suites.
-#if 0
-TEST_CASE("zero-task scan source completes the pipeline",
-          "[.][s3][pushdown][zero-task-protocol]")
-{
-  auto source = make_zero_task_scan_source();
-  auto query = make_single_source_query(source);
-  auto pipeline = run_pipeline(query);
-  CHECK(pipeline.completed());
-  CHECK(pipeline.output_rows() == 0);
-}
-#endif
 
 TEST_CASE("gpu_execution S3 SQL surface counts every uploaded TPCH parquet table",
           "[s3][integration][sql][gpu_execution]")

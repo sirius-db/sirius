@@ -39,9 +39,6 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
-#include <cudf/filling.hpp>
-#include <cudf/utilities/error.hpp>
-
 #include <nvtx3/nvtx3.hpp>
 
 #include <cstdio>
@@ -445,29 +442,9 @@ bool sirius_physical_hash_join::is_build_probe_mode()
   return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
 }
 
-bool sirius_physical_hash_join::zero_side_pending_locked()
-{
-  auto* probe_port = get_port("default");
-  auto* build_port = get_port("build");
-  if (!probe_port || !probe_port->repo || !build_port || !build_port->repo) { return false; }
-  if (!is_source_pipeline_finished()) { return false; }
-  bool const probe_dead = !_saw_probe_input && probe_port->repo->total_size() == 0;
-  bool const build_dead = !_saw_build_input && build_port->repo->total_size() == 0;
-  // Exactly one dead side: both-dead completes through the normal protocol today, and
-  // no-dead is the regular join path.
-  if (probe_dead == build_dead) { return false; }
-  auto* surviving_port = probe_dead ? build_port : probe_port;
-  return surviving_port->repo->total_size() > 0;
-}
-
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
-  // Zero-side join: exactly one input side died while
-  // the other port still holds data. Offer the zero-side task ahead of any mode-specific
-  // logic — both the BUILD_PROBE branch and the base hint would otherwise wait forever on
-  // the finished dead-side pipeline.
-  if (zero_side_pending_locked()) { return task_creation_hint{TaskCreationHint::READY, this}; }
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     // In build-probe mode, we want the first task to be with one batch from either side.
     // In the first batch we will build the hash table, then we only need batches from the probe
@@ -540,8 +517,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     auto probe_batch = probe_port->repo->pop_next_data_batch();
     auto build_batch = build_port->repo->pop_next_data_batch();
-    _saw_probe_input = true;
-    _saw_build_input = true;
     input_batch.push_back(std::move(probe_batch));
     input_batch.push_back(std::move(build_batch));
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
@@ -564,7 +539,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     auto batch = probe_port->repo->pop_next_data_batch();
     if (batch) {
-      _saw_probe_input = true;
       input_batch.push_back(std::move(batch));
     } else {
       SIRIUS_LOG_WARN(
@@ -590,31 +564,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
 {
   // Hold the mutex for the entire operation to prevent concurrent pop/get races.
   // A pop on one thread must not remove a batch that another thread's get expects to find.
-  //
-  // Lock order: the task creator calls this under the pipeline's task creation lock
-  // (_status_mutex), so the order is always _status_mutex -> op_state_mutex — never inverted.
   std::lock_guard<std::mutex> lg(op_state_mutex);
-
-  // Zero-side join: pop ONE surviving batch per call,
-  // preserving its partition affinity, and hand out the marker. The task creator's drain loop
-  // keeps calling until the surviving port is empty; the pop and the task's
-  // mark_task_created happen under the same _status_mutex hold, so the pipeline-finish guard
-  // can never observe "ports empty ∧ counters balanced" mid-window.
-  if (zero_side_pending_locked()) {
-    bool const probe_dead = !_saw_probe_input && get_port("default")->repo->total_size() == 0;
-    auto* surviving_port  = probe_dead ? get_port("build") : get_port("default");
-    auto const dead_side =
-      probe_dead ? hash_join_zero_side_input::side::PROBE : hash_join_zero_side_input::side::BUILD;
-    for (std::size_t partition_idx = 0; partition_idx < surviving_port->repo->num_partitions();
-         partition_idx++) {
-      if (surviving_port->repo->size(partition_idx) == 0) { continue; }
-      auto batch = surviving_port->repo->pop_next_data_batch(partition_idx);
-      if (!batch) { continue; }
-      return std::make_unique<hash_join_zero_side_input>(
-        std::move(batch), partition_idx, dead_side);
-    }
-    return nullptr;
-  }
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     return get_next_task_input_data_for_build_probe();
@@ -634,8 +584,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
       left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
       right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
-      if (!left_batch_ids.back().empty()) { _saw_probe_input = true; }
-      if (!right_batch_ids.back().empty()) { _saw_build_input = true; }
       num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
     }
   }
@@ -934,145 +882,10 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
       make_data_batch(std::move(output_cudf_table), *left_batch.get_memory_space(), stream)});
 }
 
-/// Zero-side gather-map builders. Both fill on the
-/// task stream; this TU is host-compiled, so libcudf's device fill (cudf::sequence) stands in
-/// for a raw thrust::sequence, and the -1 padding uses the all-0xFF byte pattern of two's
-/// complement directly.
-static std::unique_ptr<rmm::device_uvector<cudf::size_type>> make_zero_side_iota_indices(
-  cudf::size_type num_rows, rmm::cuda_stream_view stream)
-{
-  auto indices = std::make_unique<rmm::device_uvector<cudf::size_type>>(num_rows, stream);
-  if (num_rows == 0) { return indices; }
-  cudf::numeric_scalar<cudf::size_type> init(0, true, stream);
-  auto sequence_col = cudf::sequence(num_rows, init, stream);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(indices->data(),
-                                sequence_col->view().data<cudf::size_type>(),
-                                sizeof(cudf::size_type) * num_rows,
-                                cudaMemcpyDeviceToDevice,
-                                stream.value()));
-  return indices;
-}
-
-static std::unique_ptr<rmm::device_uvector<cudf::size_type>> make_zero_side_null_pad_indices(
-  cudf::size_type num_rows, rmm::cuda_stream_view stream)
-{
-  auto indices = std::make_unique<rmm::device_uvector<cudf::size_type>>(num_rows, stream);
-  if (num_rows == 0) { return indices; }
-  // -1 is every byte 0xFF; gather's NULLIFY policy turns it into NULL rows when gathering
-  // from the 0-row dead-side table.
-  CUDF_CUDA_TRY(
-    cudaMemsetAsync(indices->data(), 0xFF, sizeof(cudf::size_type) * num_rows, stream.value()));
-  return indices;
-}
-
-std::unique_ptr<operator_data> sirius_physical_hash_join::execute_zero_side(
-  const hash_join_zero_side_input& input, rmm::cuda_stream_view stream)
-{
-  nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute_zero_side"};
-  const auto& input_batches = input.get_read_only_batches();
-  if (input_batches.size() != 1) {
-    throw internal_exception(
-      "sirius_physical_hash_join::execute_zero_side: expected exactly 1 surviving batch, got " +
-      std::to_string(input_batches.size()) + " in operator " +
-      std::to_string(this->get_operator_id()));
-  }
-  auto const& surviving_batch = input_batches[0];
-  auto* memory_space          = surviving_batch.get_memory_space();
-  if (memory_space == nullptr) {
-    throw internal_exception(
-      "sirius_physical_hash_join::execute_zero_side: surviving batch carries no memory space "
-      "in operator " +
-      std::to_string(this->get_operator_id()));
-  }
-
-  bool const probe_dead = input.dead_side == hash_join_zero_side_input::side::PROBE;
-
-  // The dead side never delivered a batch — represent it as a 0-row cudf table over the dead
-  // child's output types so the projection maps and gather NULLIFY policies apply unchanged.
-  auto const& dead_types = probe_dead ? children[0]->get_types() : children[1]->get_types();
-  std::vector<std::unique_ptr<cudf::column>> dead_cols;
-  dead_cols.reserve(dead_types.size());
-  for (auto const& dead_type : dead_types) {
-    if (dead_type.id() == type_id::STRUCT || dead_type.id() == type_id::LIST) {
-      throw not_implemented_exception("sirius_physical_hash_join::execute_zero_side: nested type " +
-                                      dead_type.to_string() +
-                                      " is not supported on the dead join side");
-    }
-    dead_cols.push_back(cudf::make_empty_column(get_cudf_type(dead_type)));
-  }
-  cudf::table dead_table(std::move(dead_cols), stream);
-
-  cudf::table_view surviving_full = get_cudf_table_view(surviving_batch);
-  cudf::table_view left_full      = probe_dead ? dead_table.view() : surviving_full;
-  cudf::table_view right_full     = probe_dead ? surviving_full : dead_table.view();
-  auto const num_surviving_rows   = surviving_full.num_rows();
-
-  if (join_type == duckdb::JoinType::MARK) {
-    // §3: probe-dead MARK -> 0 probe rows (empty output, correct schema); build-dead MARK ->
-    // every probe row with mark=false. Both are "no matches": an empty semi-indices vector.
-    rmm::device_uvector<cudf::size_type> no_matches(0, stream);
-    return resolve_mark_join_result(
-      no_matches, left_full, lhs_output_columns.col_idxs, surviving_batch, stream);
-  }
-
-  auto iota = [&] { return make_zero_side_iota_indices(num_surviving_rows, stream); };
-  auto pad  = [&] { return make_zero_side_null_pad_indices(num_surviving_rows, stream); };
-  auto none = [&] { return std::make_unique<rmm::device_uvector<cudf::size_type>>(0, stream); };
-
-  // Index vectors per the §3 semantics table. Cells not listed as output-required emit a
-  // 0-row batch with the correct schema through the same task.
-  std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
-  switch (join_type) {
-    case duckdb::JoinType::LEFT:
-      left_indices  = probe_dead ? none() : iota();
-      right_indices = probe_dead ? none() : pad();
-      break;
-    case duckdb::JoinType::RIGHT:
-      left_indices  = probe_dead ? pad() : none();
-      right_indices = probe_dead ? iota() : none();
-      break;
-    case duckdb::JoinType::OUTER:
-      left_indices  = probe_dead ? pad() : iota();
-      right_indices = probe_dead ? iota() : pad();
-      break;
-    case duckdb::JoinType::ANTI:
-      left_indices  = probe_dead ? none() : iota();
-      right_indices = none();
-      break;
-    case duckdb::JoinType::RIGHT_ANTI:
-      left_indices  = none();
-      right_indices = probe_dead ? iota() : none();
-      break;
-    case duckdb::JoinType::INNER:
-    case duckdb::JoinType::SEMI:
-    case duckdb::JoinType::RIGHT_SEMI:
-      left_indices  = none();
-      right_indices = none();
-      break;
-    default:
-      throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
-  }
-
-  return gather_join_output(join_type,
-                            left_full,
-                            right_full,
-                            lhs_output_columns.col_idxs,
-                            rhs_output_columns.col_idxs,
-                            std::move(left_indices),
-                            std::move(right_indices),
-                            *memory_space,
-                            stream);
-}
-
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
-  // The zero-side marker carries one batch instead of a (probe, build) pair, so it must be
-  // dispatched before any of the mode-specific handling below.
-  if (auto const* zero_side = dynamic_cast<const hash_join_zero_side_input*>(&input_data)) {
-    return execute_zero_side(*zero_side, stream);
-  }
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
