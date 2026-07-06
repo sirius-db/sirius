@@ -109,7 +109,7 @@ struct cached_databatch_provider : public databatch_provider {
       const auto& chunk = _entry.compressed_host_chunks.at(index);
       if (!chunk) { return nullptr; }
       auto projected = chunk->select_columns(_column_indices);
-      return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(projected));
+      return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
     }
     if (index >= _entry.host_chunks.size()) { return nullptr; }
     const auto& chunk = _entry.host_chunks.at(index);
