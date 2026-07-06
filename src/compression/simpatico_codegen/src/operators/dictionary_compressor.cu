@@ -8,6 +8,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/types.hpp>
@@ -30,7 +31,10 @@ namespace {
 constexpr size_t MAX_INDICES = 1 << 28;  // 256M rows (sanity bound)
 
 std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
-  cudf::column_view const& col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view const& col,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  bool fast)
 {
   if (col.type().id() != cudf::type_id::STRING) {
     throw std::runtime_error("dictionary_compressor: column must be STRING, got '" +
@@ -42,12 +46,30 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
     throw std::runtime_error("dictionary_compressor: column size exceeds maximum");
   }
   if (n == 0) {
+    if (fast) {
+      // Empty fast rep exposes the {keys, indices} channels the fast plan expects.
+      return std::make_unique<dictionary_compressed_representation>(
+        cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING)),
+        cudf::make_empty_column(cudf::data_type(cudf::type_id::INT32)));
+    }
     auto empty_dict = cudf::make_empty_column(cudf::data_type(cudf::type_id::DICTIONARY32));
     return std::make_unique<dictionary_compressed_representation>(std::move(empty_dict));
   }
 
   auto dict_col = cudf::dictionary::encode(col, cudf::data_type(cudf::type_id::INT32), stream, mr);
   cudaStreamSynchronize(stream.value());
+  if (fast) {
+    // Fast mode: split the encoded dictionary into an owned keys (STRING) column and
+    // an owned indices column carrying the parent null mask (get_indices_annotated), so
+    // validity survives make_dictionary_column + decode. Leaner in-memory footprint than
+    // the 3-buffer keys_offsets/keys_chars/indices form.
+    cudf::dictionary_column_view dv(dict_col->view());
+    auto keys    = std::make_unique<cudf::column>(dv.keys(), stream, mr);
+    auto indices = std::make_unique<cudf::column>(dv.get_indices_annotated(), stream, mr);
+    cudaStreamSynchronize(stream.value());
+    return std::make_unique<dictionary_compressed_representation>(std::move(keys),
+                                                                  std::move(indices));
+  }
   return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
 }
 
@@ -83,7 +105,7 @@ std::unique_ptr<compressed_representation> dictionary_compressor::compress(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
-  return dictionary_compress_impl(column_to_compress, stream, mr);
+  return dictionary_compress_impl(column_to_compress, stream, mr, fast_);
 }
 
 std::unique_ptr<cudf::column> dictionary_compressor::decompress(

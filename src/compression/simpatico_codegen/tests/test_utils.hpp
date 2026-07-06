@@ -2,6 +2,7 @@
 #pragma once
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
@@ -239,4 +240,69 @@ inline bool columns_equal_any(cudf::column_view a,
   if (a.type() != b.type() || a.size() != b.size()) return false;
   if (a.type().id() == cudf::type_id::STRING) return strings_equal(a, b, stream);
   return columns_equal(a, b);
+}
+
+// STRING column from explicit values, with optional per-row validity (false = null).
+// A null row contributes an empty slice to the chars buffer. The null mask is padded
+// to cuDF's bitmask allocation size (an undersized mask makes kernels read OOB).
+inline std::unique_ptr<cudf::column> make_strings_column(std::vector<std::string> const& values,
+                                                         std::vector<bool> const& valid,
+                                                         rmm::cuda_stream_view stream)
+{
+  int const n          = static_cast<int>(values.size());
+  bool const has_nulls = !valid.empty();
+  std::vector<char> chars;
+  std::vector<std::int32_t> offsets(static_cast<std::size_t>(n) + 1, 0);
+  for (int r = 0; r < n; ++r) {
+    if (!has_nulls || valid[static_cast<std::size_t>(r)])
+      for (char c : values[static_cast<std::size_t>(r)])
+        chars.push_back(c);
+    offsets[static_cast<std::size_t>(r) + 1] = static_cast<std::int32_t>(chars.size());
+  }
+  auto offsets_col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, n + 1, cudf::mask_state::UNALLOCATED, stream);
+  cudaMemcpyAsync(offsets_col->mutable_view().head<std::int32_t>(),
+                  offsets.data(),
+                  offsets.size() * sizeof(std::int32_t),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  rmm::device_buffer chars_buf(chars.size(), stream);
+  if (!chars.empty())
+    cudaMemcpyAsync(
+      chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.value());
+
+  if (!has_nulls) {
+    stream.synchronize();
+    return cudf::make_strings_column(
+      n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+  }
+  std::size_t const mask_bytes = cudf::bitmask_allocation_size_bytes(n);
+  std::vector<std::uint32_t> words(static_cast<std::size_t>((n + 31) / 32), 0u);
+  int nulls = 0;
+  for (int r = 0; r < n; ++r) {
+    if (valid[static_cast<std::size_t>(r)])
+      words[static_cast<std::size_t>(r / 32)] |= (1u << (r % 32));
+    else
+      ++nulls;
+  }
+  rmm::device_buffer mask_buf(mask_bytes, stream);
+  cudaMemsetAsync(mask_buf.data(), 0, mask_bytes, stream.value());
+  cudaMemcpyAsync(mask_buf.data(),
+                  words.data(),
+                  words.size() * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  stream.synchronize();
+  return cudf::make_strings_column(
+    n, std::move(offsets_col), std::move(chars_buf), nulls, std::move(mask_buf));
+}
+
+// Single-column STRING table from explicit values (+ optional validity).
+inline std::unique_ptr<cudf::table> make_strings_table(std::vector<std::string> const& values,
+                                                       std::vector<bool> const& valid,
+                                                       rmm::cuda_stream_view stream)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(make_strings_column(values, valid, stream));
+  return std::make_unique<cudf::table>(std::move(cols));
 }

@@ -97,6 +97,12 @@ struct compressed_representation {
   {
     return {};
   }
+
+  /// Channels that MUST be routed by the plan, else the driver errors -- preventing silent data
+  /// loss. Default: none. str_split returns {"null_mask"} for a nullable input so a plan can never
+  /// silently drop validity.
+  virtual std::vector<std::string> required_channels() const { return {}; }
+
   /// Release ownership of a named output. Returns nullptr if not supported or name not found.
   /// This avoids copying when the output is a leaf and the representation already owns the data.
   ///
@@ -306,8 +312,83 @@ struct dictionary_compressed_representation : compressed_representation {
 };
 
 /// Dictionary compressor: STRING column only. Encodes via cudf dictionary encode; stores keys
-/// buffer + offsets + indices.
+/// buffer + offsets + indices. `fast` selects the 2-buffer keys+indices in-memory representation
+/// (DSL name "dictionary_fast") instead of the 3-buffer keys_offsets/keys_chars/indices form.
 struct dictionary_compressor : compressor {
+  explicit dictionary_compressor(bool fast = false) : fast_(fast) {}
+
+  std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr) override;
+  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
+                                           rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr) override;
+
+  bool fast_;
+};
+
+// -----------------------------------------------------------------------------
+// str_split: decompose a STRING column into {offsets, chars, null_mask} channels.
+// Structural (non-codegen) operator -- byte compression is delegated to the
+// channel codecs (offsets -> delta -> bitpack; chars -> lz4). Modeled on the
+// ALP rep (dedicated struct + from_outputs); decode reassembles via
+// cudf::make_strings_column. Conditional arity: a non-null column exposes
+// {offsets, chars}; a nullable column also exposes null_mask, which is marked
+// required() so the driver errors if the plan fails to route it.
+// -----------------------------------------------------------------------------
+struct str_split_compressed_representation : compressed_representation {
+  static std::unique_ptr<compressed_representation> from_outputs(
+    std::vector<std::string> const& output_names,
+    std::vector<std::unique_ptr<cudf::column>> outputs,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    std::string* error_out);
+
+  // The decomposed channels. mutable: decompress() moves them into make_strings_column.
+  mutable std::unique_ptr<cudf::column> offsets_;    // INT32, size num_rows+1
+  mutable std::unique_ptr<cudf::column> chars_;      // UINT8, total byte count
+  mutable std::unique_ptr<cudf::column> null_mask_;  // UINT8 bitmask bytes, or null (no nulls)
+
+  str_split_compressed_representation(cudf::size_type n_rows,
+                                      std::unique_ptr<cudf::column> offsets,
+                                      std::unique_ptr<cudf::column> chars,
+                                      std::unique_ptr<cudf::column> null_mask)
+    : compressed_representation(cudf::data_type{cudf::type_id::STRING}, n_rows),
+      offsets_(std::move(offsets)),
+      chars_(std::move(chars)),
+      null_mask_(std::move(null_mask))
+  {
+  }
+
+  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr) const override;
+
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view /*stream*/) const override
+  {
+    std::vector<compressible_output> out;
+    out.push_back({"offsets", offsets_->view()});
+    out.push_back({"chars", chars_->view()});
+    if (null_mask_) out.push_back({"null_mask", null_mask_->view()});  // 2- or 3-channel
+    return out;
+  }
+
+  std::vector<std::string> required_channels() const override
+  {
+    if (null_mask_) return {"null_mask"};
+    return {};
+  }
+
+  std::unique_ptr<cudf::column> release_output(std::string const& name) override
+  {
+    if (name == "offsets" && offsets_) return std::move(offsets_);
+    if (name == "chars" && chars_) return std::move(chars_);
+    if (name == "null_mask" && null_mask_) return std::move(null_mask_);
+    return nullptr;
+  }
+  // kind() defaults to Unknown -- only the deferred .hpln path reads it.
+};
+
+struct str_split_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;

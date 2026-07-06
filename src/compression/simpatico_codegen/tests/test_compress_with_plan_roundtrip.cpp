@@ -101,7 +101,7 @@ compressed_table roundtrip_once(cudf::table_view input,
   expect(out != nullptr, "decompress returned null");
   expect(out->num_columns() == input.num_columns(), "column count");
   for (int i = 0; i < input.num_columns(); ++i) {
-    expect(columns_equal(input.column(i), out->view().column(i)),
+    expect(columns_equal_any(input.column(i), out->view().column(i), cudf::get_default_stream()),
            (std::string(label) + ": column data mismatch at index " + std::to_string(i)).c_str());
   }
   verify_plan_tree(ct, label);
@@ -692,6 +692,67 @@ int main()
         "rle.values.integers -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
         "rle.values.integers.chunk_min -> zigzag -> zigzag\n";
       roundtrip_once(t->view(), dsl, 1, "jit_rle_alp_bitpack_zigzag_tail_f32");
+    }
+
+    {
+      // str_split: decompose STRING into offsets/chars[/null_mask], compress each
+      // channel independently (offsets -> delta -> bitpack fused; chars -> lz4),
+      // reassemble via make_strings_column. Conditional arity: a non-null column
+      // uses a 2-channel plan; a nullable column MUST route null_mask (guarded).
+      // NOTE the nested path str_split.offsets.differences (offsets is non-root).
+      auto stream                   = cudf::get_default_stream();
+      std::vector<std::string> vals = {
+        "apple", "banana", "apple", "cherry", "elderberry", "fig", "grape", "honeydew"};
+
+      std::string const dsl2 =
+        "input -> str_split -> offsets, chars\n"
+        "str_split.offsets -> delta -> differences\n"
+        "str_split.offsets.differences -> bitpack\n"
+        "str_split.chars -> lz4\n";
+      auto t = make_strings_table(vals, {}, stream);
+      roundtrip_once(t->view(), dsl2, 1, "str_split");
+      roundtrip_once(t->view(), dsl2, 2, "str_split_mt");
+
+      // Nullable: 3-channel plan carries the mask (null_mask declared on line 1).
+      std::string const dsl3 =
+        "input -> str_split -> offsets, chars, null_mask\n"
+        "str_split.offsets -> delta -> differences\n"
+        "str_split.offsets.differences -> bitpack\n"
+        "str_split.chars -> lz4\n"
+        "str_split.null_mask -> identity\n";
+      std::vector<bool> valid = {true, false, true, true, false, true, true, false};  // 3 nulls
+      auto tn                 = make_strings_table(vals, valid, stream);
+      auto ct                 = roundtrip_once(tn->view(), dsl3, 1, "str_split_nulls");
+      // strings_equal ignores validity, so assert null preservation explicitly.
+      auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
+      expect(decoded->view().column(0).null_count() == 3, "str_split_nulls: null_count preserved");
+
+      // Guard: nullable column + 2-channel plan must ERROR, not drop nulls silently.
+      bool threw = false;
+      try {
+        compress_with_plan(tn->view(), dsl2, stream, rmm::mr::get_current_device_resource_ref());
+      } catch (std::runtime_error const&) {
+        threw = true;
+      }
+      expect(threw, "str_split: nullable input without null_mask must throw");
+    }
+
+    {
+      // dictionary_fast: the 2-buffer (keys+indices) in-memory dictionary variant.
+      // Roundtrips like `dictionary`, including nulls.
+      auto stream                   = cudf::get_default_stream();
+      std::vector<std::string> vals = {
+        "apple", "banana", "apple", "cherry", "banana", "apple", "date", "cherry"};
+      auto t = make_strings_table(vals, {}, stream);
+      roundtrip_once(t->view(), "input -> dictionary_fast\n", 1, "dictionary_fast");
+      roundtrip_once(t->view(), "input -> dictionary_fast\n", 2, "dictionary_fast_mt");
+
+      std::vector<bool> valid = {true, false, true, true, false, true, true, false};
+      auto tn                 = make_strings_table(vals, valid, stream);
+      auto ct =
+        roundtrip_once(tn->view(), "input -> dictionary_fast\n", 1, "dictionary_fast_nulls");
+      auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
+      expect(decoded->view().column(0).null_count() == 3, "dictionary_fast_nulls: null_count");
     }
 
     std::printf("test_compress_with_plan_roundtrip: PASS\n");

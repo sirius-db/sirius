@@ -58,6 +58,7 @@ add_library(
   src/operators/deflate_compressor.cu
   src/operators/bitjoin_bitextract.cu
   src/operators/dictionary_compressor.cu
+  src/operators/str_split_compressor.cu
   src/operators/nvcomp_scratch.cpp
   # Plain-CUDA JIT host
   src/jit/fused_tree.cpp

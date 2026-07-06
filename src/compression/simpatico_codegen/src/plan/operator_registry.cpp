@@ -68,6 +68,9 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Bitextract, "bitextract", {}, {"bitextract_f32", "bitextract_f64"}, false, true, false},
     {OpId::Identity, "identity", {"data"}, {}, false, false, false},
     {OpId::Cascaded, "nvcomp_cascaded", {"output"}, {}, false, false, false},
+    // Variable arity (2 or 3: offsets, chars[, null_mask]) -> empty channels, like Dictionary.
+    // catalog_names={} excludes it from the explorer (STRING-only, opt-in via explicit DSL).
+    {OpId::StrSplit, "str_split", {}, {}, false, true, false},
   };
   return kTable;
 }
@@ -90,6 +93,10 @@ std::optional<OpId> op_id_from_name(std::string const& name)
   for (auto const& e : operator_registry()) {
     if (name == e.name) return e.id;
   }
+
+  // "dictionary_fast" is an alias for the dictionary op (same rep/OpId), selecting
+  // the 2-buffer keys+indices form via a compressor flag rather than a distinct op.
+  if (name == "dictionary_fast") return OpId::Dictionary;
 
   // Parameterised suffix families sharing a bare-name entry above.
   if (after_prefix(name, "bitcomp")) return OpId::Bitcomp;
@@ -122,7 +129,9 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
   if (!id) return nullptr;
   switch (*id) {
     case OpId::Identity: return std::make_unique<identity_compressor>();
-    case OpId::Dictionary: return std::make_unique<dictionary_compressor>();
+    case OpId::Dictionary:
+      return std::make_unique<dictionary_compressor>(name == "dictionary_fast");
+    case OpId::StrSplit: return std::make_unique<str_split_compressor>();
     case OpId::Alp: return std::make_unique<alp_compressor>();
     case OpId::AlpRd: return std::make_unique<alp_rd_compressor>();
     case OpId::Ans: return std::make_unique<ans_compressor>();

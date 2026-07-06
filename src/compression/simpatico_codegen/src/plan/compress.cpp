@@ -449,6 +449,25 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   for (auto const& output : outputs)
     output_by_name.emplace(output.name, output.view);
 
+  // Guard: every channel the rep marks required must be routed by the plan, or
+  // data (e.g. a nullable column's validity via str_split's null_mask) would be
+  // silently dropped. Runs only when some outputs are declared (a bare terminal
+  // `input -> str_split` stored the whole rep above and is safe).
+  for (auto const& req : repr->required_channels()) {
+    bool declared = false;
+    for (auto const& out_name : node.output_names) {
+      if (req == out_name) {
+        declared = true;
+        break;
+      }
+    }
+    if (!declared) {
+      set_error("compressor '" + node.op + "' requires output '" + req +
+                "' to be routed by the plan (nullable input)");
+      return;
+    }
+  }
+
   size_t pending = 0;
   std::vector<std::string> to_recurse;
   std::string const repr_key = path;

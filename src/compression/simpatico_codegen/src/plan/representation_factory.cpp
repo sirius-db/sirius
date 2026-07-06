@@ -443,6 +443,41 @@ std::unique_ptr<compressed_representation> alp_rd_compressed_representation::fro
                                                             std::move(exception_positions));
 }
 
+std::unique_ptr<compressed_representation> str_split_compressed_representation::from_outputs(
+  std::vector<std::string> const& output_names,
+  std::vector<std::unique_ptr<cudf::column>> outputs,
+  rmm::cuda_stream_view,
+  rmm::device_async_resource_ref,
+  std::string* error_out)
+{
+  // Variable arity: {offsets, chars} or {offsets, chars, null_mask}.
+  bool const has_mask = outputs.size() == 3;
+  if (outputs.size() != 2 && outputs.size() != 3) {
+    if (error_out) *error_out = "str_split expects 2 (offsets, chars) or 3 (+ null_mask) outputs";
+    return nullptr;
+  }
+  if (output_names[0] != "offsets" || output_names[1] != "chars" ||
+      (has_mask && output_names[2] != "null_mask")) {
+    if (error_out) *error_out = "str_split outputs must be 'offsets, chars[, null_mask]'";
+    return nullptr;
+  }
+  auto offsets   = std::move(outputs[0]);
+  auto chars     = std::move(outputs[1]);
+  auto null_mask = has_mask ? std::move(outputs[2]) : nullptr;
+  if (offsets->type().id() != cudf::type_id::INT32) {
+    if (error_out) *error_out = "str_split offsets must be INT32";
+    return nullptr;
+  }
+  if (chars->type().id() != cudf::type_id::UINT8 ||
+      (null_mask && null_mask->type().id() != cudf::type_id::UINT8)) {
+    if (error_out) *error_out = "str_split chars/null_mask must be UINT8";
+    return nullptr;
+  }
+  cudf::size_type const n = offsets->size() > 0 ? offsets->size() - 1 : 0;
+  return std::make_unique<str_split_compressed_representation>(
+    n, std::move(offsets), std::move(chars), std::move(null_mask));
+}
+
 std::unique_ptr<compressed_representation> bitextract_compressed_representation::from_outputs(
   bitextract_spec_result spec,
   std::vector<std::string> const& output_names,
@@ -735,6 +770,9 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
     case OpId::Cascaded:
       return cascaded_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::StrSplit:
+      return str_split_compressed_representation::from_outputs(
+        output_names, std::move(outputs), stream, mr, error_out);
     case OpId::Delta:
     case OpId::Rle:
     case OpId::For:

@@ -31,6 +31,7 @@ enum class OpId : std::uint8_t {
   Bitextract,
   Identity,
   Cascaded,
+  StrSplit,
 };
 
 // Canonical position of a channel within its operator's fixed channel set.
