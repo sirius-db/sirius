@@ -75,10 +75,12 @@ struct cached_databatch_provider : public databatch_provider {
     });
 
     if (_entry.tier == cucascade::memory::Tier::GPU) {
-      if (_entry.data_batches_by_column.empty()) {
-        _n_chunks = 0;
-      } else {
+      if (!_entry.compressed_device_chunks.empty()) {
+        _n_chunks = _entry.compressed_device_chunks.size();
+      } else if (!_entry.data_batches_by_column.empty()) {
         _n_chunks = _entry.data_batches_by_column.begin()->second.size();
+      } else {
+        _n_chunks = 0;
       }
     } else if (_entry.tier == cucascade::memory::Tier::HOST) {
       if (!_entry.compressed_host_chunks.empty()) {
@@ -120,6 +122,15 @@ struct cached_databatch_provider : public databatch_provider {
 
   std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
   {
+    // GPU-tier compressed: hand out the projected compressed chunk; the batch is
+    // decompressed on demand by scan_operator_input::prepare_for_processing.
+    if (!_entry.compressed_device_chunks.empty()) {
+      if (index >= _entry.compressed_device_chunks.size()) { return nullptr; }
+      const auto& chunk = _entry.compressed_device_chunks.at(index);
+      if (!chunk) { return nullptr; }
+      auto projected = chunk->select_columns(_column_indices);
+      return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
+    }
     if (index >= _entry.chunk_memory_spaces.size()) { return nullptr; }
     std::vector<std::shared_ptr<cudf::column>> columns;
     std::vector<cudf::column_view> column_views;
@@ -715,6 +726,33 @@ void sirius_scan_manager::insert_pinned_entry_host_compressed(
     "[sirius_scan_manager::insert_pinned_entry_host_compressed] '{}' chunks={} rows={}",
     name,
     entry.compressed_host_chunks.size(),
+    new_num_rows);
+
+  _pinned_entries[name] = std::move(entry);
+}
+
+void sirius_scan_manager::insert_pinned_entry_device_compressed(
+  const std::string& name,
+  cache_entry_info cache_info,
+  std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks,
+  cucascade::memory::memory_space& memory_space)
+{
+  std::size_t new_num_rows = 0;
+  for (auto const& chunk : compressed_chunks) {
+    if (chunk) { new_num_rows += static_cast<std::size_t>(chunk->num_rows()); }
+  }
+
+  pinned_entry entry;
+  entry.cache_info               = std::move(cache_info);
+  entry.tier                     = cucascade::memory::Tier::GPU;
+  entry.memory_space             = &memory_space;
+  entry.num_rows                 = new_num_rows;
+  entry.compressed_device_chunks = std::move(compressed_chunks);
+
+  SIRIUS_LOG_DEBUG(
+    "[sirius_scan_manager::insert_pinned_entry_device_compressed] '{}' chunks={} rows={}",
+    name,
+    entry.compressed_device_chunks.size(),
     new_num_rows);
 
   _pinned_entries[name] = std::move(entry);

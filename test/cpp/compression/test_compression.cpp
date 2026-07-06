@@ -246,6 +246,112 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
   fs::remove_all(tmp);
 }
 
+TEST_CASE("pin_table compression - device tier result equality vs uncompressed pin",
+          "[compression][pin_table][isolated_context]")
+{
+  if (!has_gpu()) {
+    WARN("Compression test requires a GPU — skipping");
+    return;
+  }
+
+  auto tmp = make_comp_tmp("eqdev");
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+  auto yaml_path = tmp / "comp.yaml";
+  write_compression_yaml(yaml_path);
+
+  // Same surface as the host case: SUM(k)=49995000, SUM(v)=149985000.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT range AS k, range * 3 AS v FROM range(10000)", /*num_files=*/1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 0;")->HasError());
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(
+    plan_dir, "t_comp_dev", "input -> delta -> differences\n---\ninput -> delta -> differences\n");
+  REQUIRE_FALSE(
+    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
+      ->HasError());
+
+  // tier='gpu' → compressed payload kept in device memory, decompressed on query.
+  auto pin_comp = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_comp_dev');");
+  REQUIRE(pin_comp);
+  if (pin_comp->HasError()) { UNSCOPED_INFO("pin_comp error: " << pin_comp->GetError()); }
+  REQUIRE_FALSE(pin_comp->HasError());
+
+  const std::string select_sql = "SELECT SUM(k), SUM(v) FROM read_parquet('" + glob + "')";
+  auto sum_comp                = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  REQUIRE(sum_comp);
+  if (sum_comp->HasError()) { UNSCOPED_INFO("sum_comp error: " << sum_comp->GetError()); }
+  REQUIRE_FALSE(sum_comp->HasError());
+  REQUIRE(sum_comp->RowCount() == 1);
+  REQUIRE(sum_comp->GetValue(0, 0) == duckdb::Value::BIGINT(49995000LL));
+  REQUIRE(sum_comp->GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
+
+  REQUIRE_FALSE(con.Query("CALL unpin_table('t_comp_dev');")->HasError());
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - device tier column-subset projection correctness",
+          "[compression][pin_table][isolated_context]")
+{
+  if (!has_gpu()) {
+    WARN("Compression test requires a GPU — skipping");
+    return;
+  }
+
+  auto tmp = make_comp_tmp("projdev");
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+  auto yaml_path = tmp / "comp.yaml";
+  write_compression_yaml(yaml_path);
+
+  // SUM(b) = 2*(0+1+...+4999) = 24995000.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT range AS a, range * 2 AS b, range * 3 AS c FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_chunk_bytes = 0;")->HasError());
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir,
+                  "t_proj_dev",
+                  "input -> delta -> differences\n---\ninput -> delta -> differences\n---\ninput "
+                  "-> delta -> differences\n");
+  REQUIRE_FALSE(
+    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
+      ->HasError());
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_proj_dev');");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  const std::string select_sql = "SELECT SUM(b) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
+
+  REQUIRE_FALSE(con.Query("CALL unpin_table('t_proj_dev');")->HasError());
+
+  fs::remove_all(tmp);
+}
+
 TEST_CASE("pin_table compression - column-subset projection correctness",
           "[compression][pin_table][isolated_context]")
 {

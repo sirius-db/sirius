@@ -66,6 +66,7 @@ class host_data_representation;
 
 namespace sirius {
 class compressed_host_representation;
+class compressed_device_representation;
 }  // namespace sirius
 
 namespace cucascade::memory {
@@ -114,7 +115,8 @@ struct host_pin_result {
   std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks;
 };
 
-/// Optional compression settings for @ref materialize_pin_to_host_with_compression.
+/// Optional compression settings for @ref materialize_pin_to_host_with_compression
+/// and @ref materialize_pin_to_device_with_compression.
 struct compression_pin_config {
   bool enabled{false};
   std::string plan_dsl;
@@ -123,12 +125,34 @@ struct compression_pin_config {
   std::vector<std::string> column_names;
 };
 
+/// Result of driving a GPU-tier pin with optional Simpatico compression.
+/// When every batch compresses successfully, @c compressed_chunks is non-empty
+/// and @c tables is empty; otherwise the uncompressed GPU tables (with their
+/// per-chunk placement) land in @c tables / @c chunk_memory_spaces for the plain
+/// insert_pinned_entry path.
+struct device_pin_result {
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks;
+};
+
 /// Drive @p ingestible to completion like @ref materialize_pin_to_host, optionally
 /// compressing each batch with Simpatico before storing it in host memory.
 host_pin_result materialize_pin_to_host_with_compression(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
+  io::sirius_ioctx& io_ctx,
+  compression_pin_config const& compression);
+
+/// Drive @p ingestible to completion like @ref materialize_all_batches, optionally
+/// compressing each batch with Simpatico and keeping the compressed payload in GPU
+/// (device) memory. When compression is disabled or a batch does not qualify, the
+/// uncompressed GPU table is retained instead (in @c device_pin_result::tables), so
+/// the caller can fall back to the plain GPU pin.
+device_pin_result materialize_pin_to_device_with_compression(
+  op::scan::gpu_ingestible& ingestible,
+  std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
   compression_pin_config const& compression);
 

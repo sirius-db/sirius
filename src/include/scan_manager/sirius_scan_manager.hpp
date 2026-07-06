@@ -144,6 +144,11 @@ struct pinned_entry {
   /// @ref insert_pinned_entry_host_compressed. Takes priority over host_chunks
   /// when non-empty (the ingestible factory checks this first).
   std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_host_chunks;
+  /// GPU-tier compressed storage: one compressed_device_representation per chunk,
+  /// each holding all pinned columns compressed in device memory. Populated by
+  /// @ref insert_pinned_entry_device_compressed. Takes priority over
+  /// data_batches_by_column when non-empty.
+  std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_device_chunks;
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which cached_split_provider variant @ref create_provider_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
@@ -302,6 +307,23 @@ class sirius_scan_manager {
     const std::string& name,
     cache_entry_info cache_info,
     std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
+    cucascade::memory::memory_space& memory_space);
+
+  /// \brief Pin the entry for a table on the GPU tier using Simpatico-compressed chunks.
+  ///
+  /// Each entry in @p compressed_chunks holds all pinned columns compressed in device
+  /// memory. The cached provider prefers this over @c data_batches_by_column when
+  /// non-empty; the batch is decompressed on demand by prepare_for_processing.
+  ///
+  /// \param name                Table name key.
+  /// \param cache_info          Cache identity plus the cached columns and their
+  ///                            @c column_ids-aligned names.
+  /// \param compressed_chunks   One compressed_device_representation per batch.
+  /// \param memory_space        Representative GPU memory space (metadata only).
+  void insert_pinned_entry_device_compressed(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks,
     cucascade::memory::memory_space& memory_space);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.

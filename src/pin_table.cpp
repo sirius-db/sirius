@@ -28,6 +28,9 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime.h>
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
@@ -355,6 +358,101 @@ host_pin_result materialize_pin_to_host_with_compression(
           gpu_repr, target_host_space, stream);
         stream.synchronize();
         out.host_chunks.emplace_back(std::move(host_repr));
+      }
+    });
+
+  return out;
+}
+
+device_pin_result materialize_pin_to_device_with_compression(
+  op::scan::gpu_ingestible& ingestible,
+  std::span<cucascade::memory::memory_space* const> gpu_spaces,
+  io::sirius_ioctx& io_ctx,
+  compression_pin_config const& compression)
+{
+  device_pin_result out;
+
+  materialize_pin_batches(
+    ingestible,
+    gpu_spaces,
+    io_ctx,
+    [&](std::unique_ptr<cudf::table> tbl,
+        cucascade::memory::memory_space* src_space,
+        rmm::cuda_stream_view stream) {
+      bool compressed_this_chunk = false;
+
+      if (compression.enabled && tbl && tbl->num_columns() > 0 && !compression.plan_dsl.empty()) {
+        try {
+          std::size_t uncompressed_bytes = 0;
+          for (int ci = 0; ci < tbl->num_columns(); ++ci) {
+            auto const& col = tbl->view().column(ci);
+            if (cudf::is_fixed_width(col.type())) {
+              uncompressed_bytes +=
+                static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
+            }
+          }
+          if (uncompressed_bytes >= compression.min_chunk_bytes) {
+            auto ct = simpatico::compress_with_plan(tbl->view(),
+                                                    compression.plan_dsl,
+                                                    stream,
+                                                    rmm::mr::get_current_device_resource_ref(),
+                                                    compression.column_names);
+
+            std::vector<std::uint8_t> header;
+            std::vector<simpatico::payload_buffer_ref> buffers;
+            std::uint64_t payload_bytes = 0;
+            const std::string hdr_err =
+              simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+            if (!hdr_err.empty()) {
+              throw std::runtime_error("build_compressed_table_header: " + hdr_err);
+            }
+
+            // Keep the compressed payload in one contiguous device buffer on the
+            // source GPU; copy each compressed leaf buffer device->device, then
+            // sync before `ct` (owning the source device buffers) leaves scope.
+            rmm::device_buffer payload(
+              static_cast<std::size_t>(payload_bytes), stream, src_space->get_default_allocator());
+            for (auto const& b : buffers) {
+              if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+                cudaMemcpyAsync(static_cast<std::byte*>(payload.data()) + b.offset,
+                                b.device_ptr,
+                                static_cast<std::size_t>(b.size_bytes),
+                                cudaMemcpyDeviceToDevice,
+                                stream.value());
+              }
+            }
+            stream.synchronize();
+
+            auto blob           = std::make_shared<sirius::device_compressed_blob>();
+            blob->header        = std::move(header);
+            blob->payload       = std::move(payload);
+            blob->payload_bytes = payload_bytes;
+
+            out.compressed_chunks.emplace_back(
+              std::make_shared<sirius::compressed_device_representation>(
+                *src_space,
+                std::move(blob),
+                compression.column_names,
+                static_cast<std::size_t>(payload_bytes),
+                uncompressed_bytes,
+                static_cast<int64_t>(tbl->num_rows())));
+            compressed_this_chunk = true;
+          }
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_WARN(
+            "[materialize_pin_to_device_with_compression] compression failed: {}; "
+            "falling back to uncompressed for this chunk",
+            e.what());
+        }
+      }
+
+      if (!compressed_this_chunk) {
+        // Retain the uncompressed GPU table in place (device pin holds all
+        // chunks on the GPU by definition). Sync so the table is fully resident
+        // before it is stored (its writer stream is not tracked downstream).
+        stream.synchronize();
+        out.tables.emplace_back(std::move(tbl));
+        out.chunk_memory_spaces.push_back(src_space);
       }
     });
 

@@ -170,4 +170,104 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
     std::move(absolute)));
 }
 
+// ── compressed_device_representation ─────────────────────────────────────────
+
+namespace {
+
+// Resolve caller-relative column indices to absolute indices into the chunk's
+// full column list, honoring any projection already applied. Shared by the host
+// and device select_columns() implementations.
+std::vector<std::size_t> resolve_absolute_indices(
+  std::span<const std::size_t> indices,
+  const std::optional<std::vector<std::size_t>>& existing_selection,
+  std::size_t num_all_columns)
+{
+  std::vector<std::size_t> absolute;
+  absolute.reserve(indices.size());
+  for (auto idx : indices) {
+    if (existing_selection.has_value()) {
+      if (idx >= existing_selection->size()) {
+        throw std::out_of_range(
+          "[compressed_device_representation::select_columns] index out of range");
+      }
+      absolute.push_back((*existing_selection)[idx]);
+    } else {
+      if (idx >= num_all_columns) {
+        throw std::out_of_range(
+          "[compressed_device_representation::select_columns] index out of range");
+      }
+      absolute.push_back(idx);
+    }
+  }
+  return absolute;
+}
+
+}  // namespace
+
+compressed_device_representation::compressed_device_representation(
+  cucascade::memory::memory_space& memory_space,
+  std::shared_ptr<device_compressed_blob> blob,
+  std::vector<std::string> column_names,
+  std::size_t compressed_bytes,
+  std::size_t uncompressed_bytes,
+  std::int64_t num_rows)
+  : cucascade::idata_representation(memory_space),
+    _blob(std::move(blob)),
+    _column_names(std::move(column_names)),
+    _compressed_bytes(compressed_bytes),
+    _uncompressed_bytes(uncompressed_bytes),
+    _num_rows(num_rows)
+{
+}
+
+compressed_device_representation::compressed_device_representation(
+  cucascade::memory::memory_space& memory_space,
+  std::shared_ptr<device_compressed_blob> blob,
+  std::vector<std::string> column_names,
+  std::size_t compressed_bytes,
+  std::size_t uncompressed_bytes,
+  std::int64_t num_rows,
+  std::optional<std::vector<std::size_t>> selected_indices)
+  : cucascade::idata_representation(memory_space),
+    _blob(std::move(blob)),
+    _column_names(std::move(column_names)),
+    _compressed_bytes(compressed_bytes),
+    _uncompressed_bytes(uncompressed_bytes),
+    _num_rows(num_rows),
+    _selected_indices(std::move(selected_indices))
+{
+}
+
+std::unique_ptr<cucascade::idata_representation> compressed_device_representation::clone(
+  rmm::cuda_stream_view /*stream*/)
+{
+  // Share the same backing blob — no byte copy needed.
+  return std::unique_ptr<compressed_device_representation>(
+    new compressed_device_representation(get_memory_space(),
+                                         _blob,
+                                         _column_names,
+                                         _compressed_bytes,
+                                         _uncompressed_bytes,
+                                         _num_rows,
+                                         _selected_indices));
+}
+
+std::unique_ptr<compressed_device_representation> compressed_device_representation::select_columns(
+  std::span<const std::size_t> indices) const
+{
+  auto absolute = resolve_absolute_indices(indices, _selected_indices, _column_names.size());
+
+  // const_cast is safe: select_columns is logically const (it creates a
+  // projection sharing the same blob) but the base-class constructor requires
+  // a non-const memory_space& — the underlying object is non-const.
+  return std::unique_ptr<compressed_device_representation>(new compressed_device_representation(
+    const_cast<cucascade::memory::memory_space&>(get_memory_space()),
+    _blob,
+    _column_names,
+    _compressed_bytes,
+    _uncompressed_bytes,
+    _num_rows,
+    std::move(absolute)));
+}
+
 }  // namespace sirius

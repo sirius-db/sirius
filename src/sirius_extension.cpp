@@ -1156,48 +1156,50 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // ingestible_table_info and drives later cache-hit matching + the gather.
   auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
 
-  if (data.args.tier == "host") {
-    // Compression: load the per-table plan DSL from the plan directory (if configured).
-    const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
-    const bool comp_globally_enabled =
-      comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
-    if (comp_globally_enabled) {
-      namespace fs     = std::filesystem;
-      const auto& name = data.args.name;
-      if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
-        std::error_code ec;
-        for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
-          if (!entry.is_regular_file()) { continue; }
-          if (entry.path().stem() == name) {
-            std::ifstream f(entry.path());
-            std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            if (!dsl.empty()) {
-              sirius::compression::plan_register::global().set_table_plan(name, std::move(dsl));
-            }
-            break;
+  // Compression config (tier-agnostic): load the per-table plan DSL from the plan
+  // directory (if configured), then resolve it into a compression_pin_config. Both
+  // the host and GPU pin paths compress with this when enabled.
+  const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
+  const bool comp_globally_enabled =
+    comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
+  if (comp_globally_enabled) {
+    namespace fs     = std::filesystem;
+    const auto& name = data.args.name;
+    if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
+      std::error_code ec;
+      for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
+        if (!entry.is_regular_file()) { continue; }
+        if (entry.path().stem() == name) {
+          std::ifstream f(entry.path());
+          std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+          if (!dsl.empty()) {
+            sirius::compression::plan_register::global().set_table_plan(name, std::move(dsl));
           }
-        }
-        if (ec) {
-          SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
-                          comp_cfg.input_plan_dir,
-                          ec.message());
+          break;
         }
       }
-    }
-
-    sirius::compression_pin_config pin_comp{};
-    if (comp_globally_enabled) {
-      if (auto plan_dsl =
-            sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
-          plan_dsl.has_value()) {
-        pin_comp.enabled         = true;
-        pin_comp.plan_dsl        = std::move(*plan_dsl);
-        pin_comp.min_chunk_bytes = comp_cfg.min_chunk_bytes;
-        pin_comp.temp_dir        = comp_cfg.temp_dir;
-        pin_comp.column_names    = cache_info.column_names();
+      if (ec) {
+        SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
+                        comp_cfg.input_plan_dir,
+                        ec.message());
       }
     }
+  }
 
+  sirius::compression_pin_config pin_comp{};
+  if (comp_globally_enabled) {
+    if (auto plan_dsl =
+          sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
+        plan_dsl.has_value()) {
+      pin_comp.enabled         = true;
+      pin_comp.plan_dsl        = std::move(*plan_dsl);
+      pin_comp.min_chunk_bytes = comp_cfg.min_chunk_bytes;
+      pin_comp.temp_dir        = comp_cfg.temp_dir;
+      pin_comp.column_names    = cache_info.column_names();
+    }
+  }
+
+  if (data.args.tier == "host") {
     auto host_result = sirius::materialize_pin_to_host_with_compression(
       *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx(), pin_comp);
 
@@ -1215,9 +1217,27 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                         std::move(host_result.host_chunks),
                                         *representative_host_space);
     }
+  } else if (pin_comp.enabled) {
+    // GPU tier, compressed: materialize each batch, compress it, and keep the
+    // compressed payload in device memory. Falls back to a plain GPU pin if no
+    // chunk qualified for compression.
+    auto dev_result = sirius::materialize_pin_to_device_with_compression(
+      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
+
+    if (!dev_result.compressed_chunks.empty() && dev_result.tables.empty()) {
+      scan_mgr.insert_pinned_entry_device_compressed(data.args.name,
+                                                     std::move(cache_info),
+                                                     std::move(dev_result.compressed_chunks),
+                                                     *gpu_spaces_mut[0]);
+    } else {
+      scan_mgr.insert_pinned_entry(data.args.name,
+                                   std::move(cache_info),
+                                   std::move(dev_result.tables),
+                                   std::move(dev_result.chunk_memory_spaces));
+    }
   } else {
-    // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
-    // placement) and pin them in place.
+    // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
+    // (with its GPU placement) and pin them in place.
     auto mat = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),

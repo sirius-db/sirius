@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
@@ -33,8 +34,15 @@ void scan_operator_input::prepare_for_processing(
   if (batch && requested_memory_space) {
     bool needs_upload = false;
     {
-      auto ro      = batch->to_read_only();
-      needs_upload = ro.get_data() && ro.get_current_tier() != ::cucascade::memory::Tier::GPU;
+      auto ro          = batch->to_read_only();
+      auto const* data = ro.get_data();
+      // Convert when the data is not on the GPU tier, OR when it is on the GPU
+      // tier but not already a plain gpu_table_representation (e.g. a
+      // compressed_device_representation, which must be decompressed in place).
+      const bool is_gpu_table =
+        dynamic_cast<const ::cucascade::gpu_table_representation*>(data) != nullptr;
+      needs_upload = data != nullptr &&
+                     (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table);
     }
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();

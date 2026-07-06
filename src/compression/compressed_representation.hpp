@@ -17,6 +17,7 @@
 #pragma once
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -178,6 +179,102 @@ class compressed_host_representation : public cucascade::idata_representation {
                                  std::optional<std::vector<std::size_t>> selected_indices);
 
   std::shared_ptr<pinned_compressed_blob> _blob;
+  std::vector<std::string> _column_names;
+  std::size_t _compressed_bytes;
+  std::size_t _uncompressed_bytes;
+  std::int64_t _num_rows;
+  std::optional<std::vector<std::size_t>> _selected_indices;
+};
+
+/// A Simpatico-compressed chunk resident in GPU (device) memory.
+///
+/// The device analog of @ref pinned_compressed_blob: the structural header is a
+/// flat host byte vector, while the payload — every compressed leaf buffer,
+/// concatenated — lives in a single contiguous rmm::device_buffer (device
+/// allocations are contiguous, so no multi-block handling is needed). Pinning a
+/// table to the GPU tier compressed keeps its device footprint small; the data
+/// is decompressed on demand when a query materializes it.
+///
+/// Shared (via shared_ptr) among all representations that alias the same chunk
+/// (e.g. after select_columns() or clone()); the device buffer is freed when the
+/// last owner drops.
+struct device_compressed_blob {
+  std::vector<std::uint8_t> header;
+  rmm::device_buffer payload;
+  std::uint64_t payload_bytes = 0;
+};
+
+/**
+ * @brief GPU-tier idata_representation backed by a compressed chunk in device memory.
+ *
+ * Holds a shared @ref device_compressed_blob plus schema metadata and an optional
+ * column projection. The converter compressed_device_representation →
+ * gpu_table_representation rebuilds the compressed_table from the blob
+ * (read_compressed_table_from_memory with a device→device fetch), projects to the
+ * selected columns (if any), then decompresses to a cudf::table. It is registered
+ * by register_compression_converters() and fired by
+ * scan_operator_input::prepare_for_processing when a GPU-tier batch's data is not
+ * already a gpu_table_representation.
+ */
+class compressed_device_representation : public cucascade::idata_representation {
+ public:
+  compressed_device_representation(cucascade::memory::memory_space& memory_space,
+                                   std::shared_ptr<device_compressed_blob> blob,
+                                   std::vector<std::string> column_names,
+                                   std::size_t compressed_bytes,
+                                   std::size_t uncompressed_bytes,
+                                   std::int64_t num_rows);
+
+  ~compressed_device_representation() override = default;
+
+  compressed_device_representation(const compressed_device_representation&)            = delete;
+  compressed_device_representation& operator=(const compressed_device_representation&) = delete;
+  compressed_device_representation(compressed_device_representation&&)                 = delete;
+  compressed_device_representation& operator=(compressed_device_representation&&)      = delete;
+
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return _compressed_bytes; }
+
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    return _uncompressed_bytes;
+  }
+
+  /// Clone shares the same backing blob (increments shared ownership).
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
+    rmm::cuda_stream_view stream) override;
+
+  /// Projection sharing the same backing blob (see compressed_host_representation).
+  [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
+    std::span<const std::size_t> indices) const;
+
+  /// The structural header bytes (fed to read_compressed_table_from_memory).
+  [[nodiscard]] std::span<const std::uint8_t> header() const noexcept { return _blob->header; }
+
+  /// Base pointer of the contiguous device payload holding every leaf buffer.
+  [[nodiscard]] const void* payload_device_ptr() const noexcept { return _blob->payload.data(); }
+  [[nodiscard]] std::uint64_t payload_bytes() const noexcept { return _blob->payload_bytes; }
+
+  [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
+  {
+    return _column_names;
+  }
+  [[nodiscard]] std::int64_t num_rows() const noexcept { return _num_rows; }
+
+  [[nodiscard]] const std::optional<std::vector<std::size_t>>& selected_indices() const noexcept
+  {
+    return _selected_indices;
+  }
+
+ private:
+  compressed_device_representation(cucascade::memory::memory_space& memory_space,
+                                   std::shared_ptr<device_compressed_blob> blob,
+                                   std::vector<std::string> column_names,
+                                   std::size_t compressed_bytes,
+                                   std::size_t uncompressed_bytes,
+                                   std::int64_t num_rows,
+                                   std::optional<std::vector<std::size_t>> selected_indices);
+
+  std::shared_ptr<device_compressed_blob> _blob;
   std::vector<std::string> _column_names;
   std::size_t _compressed_bytes;
   std::size_t _uncompressed_bytes;
