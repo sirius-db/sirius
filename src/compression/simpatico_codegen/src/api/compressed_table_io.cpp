@@ -286,29 +286,31 @@ static const char* leaf_kind_to_compressor(PlanLeafKind k)
 // ---------------------------------------------------------------------------
 // rep_from_leaf_desc: per-kind rep factory
 // ---------------------------------------------------------------------------
+// `fill(i, dst_device, size, stream)` copies buffer i's `size` bytes into the
+// pre-allocated device pointer `dst_device`. It abstracts the byte source so the
+// same reconstruction serves both the file reader (contiguous host payload) and
+// the in-memory reader (a caller-owned, possibly multi-block pinned payload).
+using leaf_buffer_fill =
+  std::function<void(std::size_t i, void* dst_device, std::size_t size, rmm::cuda_stream_view)>;
+
 static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   leaf_desc const& ld,
   cudf::size_type col_num_rows,
-  std::vector<std::vector<std::uint8_t>> const& payloads,
+  leaf_buffer_fill const& fill,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   std::string* err)
 {
   auto const& bufs = ld.buffers;
 
-  // Helper: allocate a device column from the i-th payload host blob.
+  // Helper: allocate a device column and fill it from the i-th payload buffer.
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
-    auto const& data   = payloads[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
     auto col           = cudf::make_numeric_column(
       dt, static_cast<cudf::size_type>(bd.num_rows), cudf::mask_state::UNALLOCATED, stream);
-    if (!data.empty()) {
-      cudaMemcpyAsync(col->mutable_view().head<void>(),
-                      data.data(),
-                      data.size(),
-                      cudaMemcpyHostToDevice,
-                      stream.value());
+    if (bd.size_bytes > 0) {
+      fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
     return col;
   };
@@ -436,6 +438,155 @@ static bool read_node(Reader& r, PlanNode& node)
   return true;
 }
 
+// Per-column parsed structure (header only; buffer bytes live in the payload
+// region and are pulled in separately during reconstruction).
+struct ColRecord {
+  std::string name;
+  std::uint8_t dtype_tag = 0;
+  std::int64_t num_rows  = 0;
+  PlanTree tree;
+  std::vector<leaf_desc> leaf_descs;
+  std::vector<std::vector<std::uint64_t>> buf_offsets;  // [leaf][buffer] -> payload offset
+};
+
+// Parse the .hpln v8 header from `r` into one ColRecord per column. On success
+// `r` is left pointing just past the header (i.e. at the payload region for the
+// concatenated file layout). Returns false and sets *err on any structural error.
+static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::string* err)
+{
+  auto bad = [&](std::string const& m) {
+    if (err) *err = m;
+    return false;
+  };
+
+  std::uint8_t magic[4];
+  if (!r.read(magic, 4)) return bad("truncated header");
+  if (magic[0] != 'H' || magic[1] != 'P' || magic[2] != 'L' || magic[3] != 'N')
+    return bad("not a HPLN file");
+  std::uint8_t ver;
+  if (!r.read_u8(ver)) return bad("truncated header");
+  if (ver != kVersion) return bad("unsupported version " + std::to_string(ver) + " (expected 8)");
+
+  std::uint16_t num_cols;
+  if (!r.read_u16le(num_cols)) return bad("truncated header");
+  out.clear();
+  out.resize(num_cols);
+
+  for (std::uint16_t ci = 0; ci < num_cols; ++ci) {
+    auto& cr = out[ci];
+    if (!r.read_str16(cr.name)) return bad("truncated col name");
+    if (!r.read_u8(cr.dtype_tag)) return bad("truncated col dtype");
+    if (!r.read_i64le(cr.num_rows)) return bad("truncated col num_rows");
+
+    std::uint16_t nn;
+    if (!r.read_u16le(nn)) return bad("truncated num_nodes");
+    cr.tree.nodes.resize(nn);
+    for (std::uint16_t ni = 0; ni < nn; ++ni) {
+      if (!read_node(r, cr.tree.nodes[ni])) return bad("truncated plan node");
+    }
+
+    std::uint16_t nl;
+    if (!r.read_u16le(nl)) return bad("truncated num_leaves");
+    cr.leaf_descs.resize(nl);
+    cr.buf_offsets.resize(nl);
+
+    for (std::uint16_t li = 0; li < nl; ++li) {
+      auto& ld = cr.leaf_descs[li];
+      if (!r.read_u32le(ld.node_index)) return bad("truncated leaf node_index");
+      if (!r.read_i32le(ld.slot)) return bad("truncated leaf slot");
+      std::uint8_t k;
+      if (!r.read_u8(k)) return bad("truncated leaf kind");
+      ld.kind = static_cast<PlanLeafKind>(k);
+      if (!r.read_u8(ld.type_tag)) return bad("truncated leaf type_tag");
+      if (!read_meta(r, ld.meta)) return bad("truncated/unknown leaf meta");
+
+      std::uint8_t nb;
+      if (!r.read_u8(nb)) return bad("truncated num_bufs");
+      ld.buffers.resize(nb);
+      cr.buf_offsets[li].resize(nb);
+
+      for (std::uint8_t bi = 0; bi < nb; ++bi) {
+        auto& bd = ld.buffers[bi];
+        if (!r.read_str16(bd.name)) return bad("truncated buf name");
+        if (!r.read_u8(bd.type_tag)) return bad("truncated buf type_tag");
+        if (!r.read_u64le(bd.size_bytes)) return bad("truncated buf size_bytes");
+        std::uint64_t poff;
+        if (!r.read_u64le(poff)) return bad("truncated buf payload_offset");
+        cr.buf_offsets[li][bi] = poff;
+        bd.num_rows =
+          (bd.size_bytes > 0 && bd.type_tag < 255)
+            ? bd.size_bytes / static_cast<std::uint64_t>(cudf::size_of(tag_to_dtype(bd.type_tag)))
+            : 0;
+      }
+    }
+  }
+  return true;
+}
+
+// Reconstruct a compressed_table from parsed column records, pulling each leaf
+// buffer's bytes into device memory via `fetch(offset, size, dst_device, stream)`.
+// `recs` is consumed (plan trees are moved into the result).
+static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
+                                                 payload_fetch_fn const& fetch,
+                                                 rmm::cuda_stream_view stream,
+                                                 rmm::device_async_resource_ref mr,
+                                                 std::string* err)
+{
+  auto fail = [&](std::string const& m) -> compressed_table {
+    if (err) *err = m;
+    return {};
+  };
+
+  compressed_table result;
+  result.columns.resize(recs.size());
+
+  for (std::size_t ci = 0; ci < recs.size(); ++ci) {
+    auto& cr      = recs[ci];
+    auto& out_col = result.columns[ci];
+
+    if (!cr.name.empty()) out_col.name = cr.name;
+    out_col.dtype    = tag_to_dtype(cr.dtype_tag);
+    out_col.num_rows = cr.num_rows;
+
+    if (cr.tree.nodes.empty()) continue;  // column stored without a plan
+
+    auto compound  = std::make_unique<plan_compound>();
+    compound->tree = std::move(cr.tree);
+    auto& nodes    = compound->tree.nodes;
+
+    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+      auto const& ld    = cr.leaf_descs[li];
+      auto const& boffs = cr.buf_offsets[li];
+      if (ld.node_index >= nodes.size())
+        return fail("leaf node_index out of range in col " + std::to_string(ci));
+
+      auto fill = [&](std::size_t bi, void* dst, std::size_t sz, rmm::cuda_stream_view s) {
+        fetch(boffs[bi], sz, dst, s);
+      };
+
+      std::string rep_err;
+      auto rep = rep_from_leaf_desc(
+        ld, static_cast<cudf::size_type>(cr.num_rows), fill, stream, mr, &rep_err);
+      if (!rep) return fail("rep_from_leaf_desc (col " + std::to_string(ci) + "): " + rep_err);
+
+      PlanNode& node = nodes[ld.node_index];
+      if (ld.slot == kSelfRepSlot) {
+        node.meta = rep->describe_meta();
+        node.rep  = std::move(rep);
+      } else if (ld.slot >= 0 && static_cast<std::size_t>(ld.slot) < node.output_paths.size()) {
+        node.channels.emplace(node.output_paths[ld.slot], std::move(rep));
+      } else {
+        return fail("leaf slot out of range in col " + std::to_string(ci));
+      }
+    }
+
+    compute_input_sources(compound->tree);
+    out_col.compound = std::move(compound);
+  }
+
+  return result;
+}
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -446,68 +597,25 @@ std::string write_compressed_table(compressed_table const& table,
                                    std::string const& path,
                                    rmm::cuda_stream_view stream)
 {
-  auto const all_descs = table.describe(stream);
-
+  // Build the header + payload buffer list once (shared with the in-memory
+  // writer), then gather the payload into one contiguous blob for the file.
   std::vector<std::uint8_t> hdr;
-  hdr.push_back('H');
-  hdr.push_back('P');
-  hdr.push_back('L');
-  hdr.push_back('N');
-  push_u8(hdr, kVersion);
-  push_u16le(hdr, static_cast<std::uint16_t>(table.columns.size()));
+  std::vector<payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  std::string err = build_compressed_table_header(table, hdr, buffers, payload_bytes, stream);
+  if (!err.empty()) return err;
 
-  std::vector<std::uint8_t> payload;
-  std::uint64_t payload_offset = 0;
-
-  static const PlanTree kEmptyTree;
-  for (std::size_t ci = 0; ci < table.columns.size(); ++ci) {
-    auto const& col   = table.columns[ci];
-    auto const& descs = all_descs[ci];
-
-    push_str16(hdr, col.name.value_or(std::string{}));
-    push_u8(hdr, dtype_to_tag(col.dtype));
-    push_i64le(hdr, col.num_rows);
-
-    // Structural plan tree: the node array is the source of truth on read; the
-    // DSL can be rendered from it on demand (render_plan_tree).
-    PlanTree const& tree = col.compound ? col.compound->tree : kEmptyTree;
-    push_u16le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
-    for (auto const& node : tree.nodes)
-      push_node(hdr, node);
-
-    // Each rep, located by (node_index, slot); its channel buffers stream into
-    // the payload blob.
-    push_u16le(hdr, static_cast<std::uint16_t>(descs.size()));
-    for (auto const& ld : descs) {
-      push_u32le(hdr, ld.node_index);
-      push_i32le(hdr, ld.slot);
-      push_u8(hdr, static_cast<std::uint8_t>(ld.kind));
-      push_u8(hdr, ld.type_tag);
-      push_meta(hdr, ld.meta);
-      push_u8(hdr, static_cast<std::uint8_t>(ld.buffers.size()));
-
-      for (auto const& bd : ld.buffers) {
-        push_str16(hdr, bd.name);
-        push_u8(hdr, bd.type_tag);
-        push_u64le(hdr, bd.size_bytes);
-        push_u64le(hdr, payload_offset);
-
-        std::size_t old_sz = payload.size();
-        payload.resize(old_sz + static_cast<std::size_t>(bd.size_bytes));
-        if (bd.size_bytes > 0 && bd.device_ptr) {
-          cudaMemcpyAsync(payload.data() + old_sz,
-                          bd.device_ptr,
-                          static_cast<std::size_t>(bd.size_bytes),
-                          cudaMemcpyDeviceToHost,
-                          cudaStreamDefault);
-        }
-        payload_offset += bd.size_bytes;
-      }
+  std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
+  for (auto const& b : buffers) {
+    if (b.size_bytes > 0 && b.device_ptr) {
+      cudaMemcpyAsync(payload.data() + b.offset,
+                      b.device_ptr,
+                      static_cast<std::size_t>(b.size_bytes),
+                      cudaMemcpyDeviceToHost,
+                      stream.value());
     }
   }
-
-  // All async D→H copies above used cudaStreamDefault; sync before writing.
-  cudaStreamSynchronize(cudaStreamDefault);
+  stream.synchronize();  // D→H copies must complete before the file write
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) return "failed to open '" + path + "' for writing";
@@ -537,137 +645,109 @@ compressed_table read_compressed_table(std::string const& path,
   if (!f) return fail("read error on '" + path + "'");
 
   Reader r{raw.data(), file_size};
+  std::vector<ColRecord> col_records;
+  if (!parse_hpln_header(r, col_records, error_out)) return {};
 
-  std::uint8_t magic[4];
-  if (!r.read(magic, 4)) return fail("truncated header");
-  if (magic[0] != 'H' || magic[1] != 'P' || magic[2] != 'L' || magic[3] != 'N')
-    return fail("not a HPLN file");
-  std::uint8_t ver;
-  if (!r.read_u8(ver)) return fail("truncated header");
-  if (ver != kVersion) return fail("unsupported version " + std::to_string(ver) + " (expected 8)");
-
-  std::uint16_t num_cols;
-  if (!r.read_u16le(num_cols)) return fail("truncated header");
-
-  struct ColRecord {
-    std::string name;
-    std::uint8_t dtype_tag = 0;
-    std::int64_t num_rows  = 0;
-    PlanTree tree;
-    std::vector<leaf_desc> leaf_descs;
-    std::vector<std::vector<std::uint64_t>> buf_offsets;
-  };
-  std::vector<ColRecord> col_records(num_cols);
-
-  for (std::uint16_t ci = 0; ci < num_cols; ++ci) {
-    auto& cr = col_records[ci];
-    if (!r.read_str16(cr.name)) return fail("truncated col name");
-    if (!r.read_u8(cr.dtype_tag)) return fail("truncated col dtype");
-    if (!r.read_i64le(cr.num_rows)) return fail("truncated col num_rows");
-
-    std::uint16_t nn;
-    if (!r.read_u16le(nn)) return fail("truncated num_nodes");
-    cr.tree.nodes.resize(nn);
-    for (std::uint16_t ni = 0; ni < nn; ++ni) {
-      if (!read_node(r, cr.tree.nodes[ni])) return fail("truncated plan node");
-    }
-
-    std::uint16_t nl;
-    if (!r.read_u16le(nl)) return fail("truncated num_leaves");
-    cr.leaf_descs.resize(nl);
-    cr.buf_offsets.resize(nl);
-
-    for (std::uint16_t li = 0; li < nl; ++li) {
-      auto& ld = cr.leaf_descs[li];
-      if (!r.read_u32le(ld.node_index)) return fail("truncated leaf node_index");
-      if (!r.read_i32le(ld.slot)) return fail("truncated leaf slot");
-      std::uint8_t k;
-      if (!r.read_u8(k)) return fail("truncated leaf kind");
-      ld.kind = static_cast<PlanLeafKind>(k);
-      if (!r.read_u8(ld.type_tag)) return fail("truncated leaf type_tag");
-      if (!read_meta(r, ld.meta)) return fail("truncated/unknown leaf meta");
-
-      std::uint8_t nb;
-      if (!r.read_u8(nb)) return fail("truncated num_bufs");
-      ld.buffers.resize(nb);
-      cr.buf_offsets[li].resize(nb);
-
-      for (std::uint8_t bi = 0; bi < nb; ++bi) {
-        auto& bd = ld.buffers[bi];
-        if (!r.read_str16(bd.name)) return fail("truncated buf name");
-        if (!r.read_u8(bd.type_tag)) return fail("truncated buf type_tag");
-        if (!r.read_u64le(bd.size_bytes)) return fail("truncated buf size_bytes");
-        std::uint64_t poff;
-        if (!r.read_u64le(poff)) return fail("truncated buf payload_offset");
-        cr.buf_offsets[li][bi] = poff;
-        bd.num_rows =
-          (bd.size_bytes > 0 && bd.type_tag < 255)
-            ? bd.size_bytes / static_cast<std::uint64_t>(cudf::size_of(tag_to_dtype(bd.type_tag)))
-            : 0;
-      }
-    }
-  }
-
+  // The payload region is whatever follows the header in the file.
   const std::uint8_t* payload_base = r.p;
-  std::size_t payload_total        = r.rem;
+  const std::size_t payload_total  = r.rem;
 
-  compressed_table result;
-  result.columns.resize(num_cols);
-
-  for (std::uint16_t ci = 0; ci < num_cols; ++ci) {
-    auto& cr      = col_records[ci];
-    auto& out_col = result.columns[ci];
-
-    if (!cr.name.empty()) out_col.name = cr.name;
-    out_col.dtype    = tag_to_dtype(cr.dtype_tag);
-    out_col.num_rows = cr.num_rows;
-
-    if (cr.tree.nodes.empty()) continue;  // column stored without a plan
-
-    auto compound  = std::make_unique<plan_compound>();
-    compound->tree = std::move(cr.tree);
-    auto& nodes    = compound->tree.nodes;
-
-    // Reconstruct each rep and drop it into its structural slot on the tree.
+  // Bounds-check every buffer up front so a truncated file is reported here
+  // rather than faulting mid-copy, then copy each buffer straight to device.
+  for (auto const& cr : col_records) {
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
-      auto const& ld    = cr.leaf_descs[li];
-      auto const& boffs = cr.buf_offsets[li];
-      if (ld.node_index >= nodes.size())
-        return fail("leaf node_index out of range in col " + std::to_string(ci));
-
-      std::vector<std::vector<std::uint8_t>> host_bufs(ld.buffers.size());
-      for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
-        auto const& bd    = ld.buffers[bi];
-        std::uint64_t off = boffs[bi];
-        std::size_t sz    = static_cast<std::size_t>(bd.size_bytes);
-        if (sz > 0) {
-          if (off + sz > payload_total)
-            return fail("payload out of bounds in col " + std::to_string(ci));
-          host_bufs[bi].assign(payload_base + off, payload_base + off + sz);
-        }
-      }
-
-      std::string rep_err;
-      auto rep = rep_from_leaf_desc(
-        ld, static_cast<cudf::size_type>(cr.num_rows), host_bufs, stream, mr, &rep_err);
-      if (!rep) return fail("rep_from_leaf_desc (col " + std::to_string(ci) + "): " + rep_err);
-
-      PlanNode& node = nodes[ld.node_index];
-      if (ld.slot == kSelfRepSlot) {
-        node.meta = rep->describe_meta();
-        node.rep  = std::move(rep);
-      } else if (ld.slot >= 0 && static_cast<std::size_t>(ld.slot) < node.output_paths.size()) {
-        node.channels.emplace(node.output_paths[ld.slot], std::move(rep));
-      } else {
-        return fail("leaf slot out of range in col " + std::to_string(ci));
+      for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
+        std::size_t sz = static_cast<std::size_t>(cr.leaf_descs[li].buffers[bi].size_bytes);
+        if (sz > 0 && cr.buf_offsets[li][bi] + sz > payload_total)
+          return fail("payload out of bounds");
       }
     }
-
-    compute_input_sources(compound->tree);
-    out_col.compound = std::move(compound);
   }
 
-  return result;
+  payload_fetch_fn fetch =
+    [&](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+      cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyHostToDevice, s.value());
+    };
+
+  return reconstruct_from_records(col_records, fetch, stream, mr, error_out);
+}
+
+// ─── In-memory (pinned host) serialization ──────────────────────────────────
+
+std::string build_compressed_table_header(compressed_table const& table,
+                                          std::vector<std::uint8_t>& out_header,
+                                          std::vector<payload_buffer_ref>& out_buffers,
+                                          std::uint64_t& out_payload_bytes,
+                                          rmm::cuda_stream_view stream)
+{
+  auto const all_descs = table.describe(stream);
+
+  out_header.clear();
+  out_buffers.clear();
+
+  auto& hdr = out_header;
+  hdr.push_back('H');
+  hdr.push_back('P');
+  hdr.push_back('L');
+  hdr.push_back('N');
+  push_u8(hdr, kVersion);
+  push_u16le(hdr, static_cast<std::uint16_t>(table.columns.size()));
+
+  std::uint64_t payload_offset = 0;
+
+  static const PlanTree kEmptyTree;
+  for (std::size_t ci = 0; ci < table.columns.size(); ++ci) {
+    auto const& col   = table.columns[ci];
+    auto const& descs = all_descs[ci];
+
+    push_str16(hdr, col.name.value_or(std::string{}));
+    push_u8(hdr, dtype_to_tag(col.dtype));
+    push_i64le(hdr, col.num_rows);
+
+    // Structural plan tree (identical layout to the file header, so the same
+    // parser reconstructs it): the node array is the source of truth on read.
+    PlanTree const& tree = col.compound ? col.compound->tree : kEmptyTree;
+    push_u16le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
+    for (auto const& node : tree.nodes)
+      push_node(hdr, node);
+
+    push_u16le(hdr, static_cast<std::uint16_t>(descs.size()));
+    for (auto const& ld : descs) {
+      push_u32le(hdr, ld.node_index);
+      push_i32le(hdr, ld.slot);
+      push_u8(hdr, static_cast<std::uint8_t>(ld.kind));
+      push_u8(hdr, ld.type_tag);
+      push_meta(hdr, ld.meta);
+      push_u8(hdr, static_cast<std::uint8_t>(ld.buffers.size()));
+
+      for (auto const& bd : ld.buffers) {
+        push_str16(hdr, bd.name);
+        push_u8(hdr, bd.type_tag);
+        push_u64le(hdr, bd.size_bytes);
+        push_u64le(hdr, payload_offset);
+
+        // Record the buffer for the caller to stage out of device memory; no
+        // bytes are copied here.
+        out_buffers.push_back(payload_buffer_ref{payload_offset, bd.device_ptr, bd.size_bytes});
+        payload_offset += bd.size_bytes;
+      }
+    }
+  }
+
+  out_payload_bytes = payload_offset;
+  return {};
+}
+
+compressed_table read_compressed_table_from_memory(std::span<const std::uint8_t> header,
+                                                   payload_fetch_fn const& fetch,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr,
+                                                   std::string* error_out)
+{
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> col_records;
+  if (!parse_hpln_header(r, col_records, error_out)) return {};
+  return reconstruct_from_records(col_records, fetch, stream, mr, error_out);
 }
 
 }  // namespace simpatico

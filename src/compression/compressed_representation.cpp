@@ -16,26 +16,80 @@
 
 #include "compressed_representation.hpp"
 
-#include <log/logging.hpp>
+#include <cuda_runtime.h>
 
-#include <cstdio>
+#include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 #include <utility>
 
 namespace sirius {
 
+// ── Block-aware pinned copies ────────────────────────────────────────────────
+
+void copy_device_to_pinned_blocks(
+  const void* src_device,
+  cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& dst,
+  std::uint64_t dst_offset,
+  std::size_t size,
+  rmm::cuda_stream_view stream)
+{
+  if (size == 0) return;
+  const std::size_t bs = dst.block_size();
+  std::size_t d_idx    = dst_offset / bs;
+  std::size_t d_off    = dst_offset % bs;
+  const auto* src      = static_cast<const std::byte*>(src_device);
+  std::size_t copied   = 0;
+  while (copied < size) {
+    const std::size_t chunk = std::min(size - copied, bs - d_off);
+    cudaMemcpyAsync(
+      dst.at(d_idx).data() + d_off, src + copied, chunk, cudaMemcpyDeviceToHost, stream.value());
+    copied += chunk;
+    d_off += chunk;
+    if (d_off == bs) {
+      ++d_idx;
+      d_off = 0;
+    }
+  }
+}
+
+void copy_pinned_blocks_to_device(
+  const cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& src,
+  std::uint64_t src_offset,
+  void* dst_device,
+  std::size_t size,
+  rmm::cuda_stream_view stream)
+{
+  if (size == 0) return;
+  const std::size_t bs = src.block_size();
+  std::size_t s_idx    = src_offset / bs;
+  std::size_t s_off    = src_offset % bs;
+  auto* dst            = static_cast<std::byte*>(dst_device);
+  std::size_t copied   = 0;
+  while (copied < size) {
+    const std::size_t chunk = std::min(size - copied, bs - s_off);
+    cudaMemcpyAsync(
+      dst + copied, src.at(s_idx).data() + s_off, chunk, cudaMemcpyHostToDevice, stream.value());
+    copied += chunk;
+    s_off += chunk;
+    if (s_off == bs) {
+      ++s_idx;
+      s_off = 0;
+    }
+  }
+}
+
 // ── Owning constructor ───────────────────────────────────────────────────────
 
 compressed_host_representation::compressed_host_representation(
   cucascade::memory::memory_space& memory_space,
-  std::string path,
+  std::shared_ptr<pinned_compressed_blob> blob,
   std::vector<std::string> column_names,
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows)
   : cucascade::idata_representation(memory_space),
-    _path(std::make_shared<std::string>(std::move(path))),
-    _owns_file(std::make_shared<bool>(true)),
+    _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
@@ -47,16 +101,14 @@ compressed_host_representation::compressed_host_representation(
 
 compressed_host_representation::compressed_host_representation(
   cucascade::memory::memory_space& memory_space,
-  std::shared_ptr<std::string> shared_path,
-  std::shared_ptr<bool> owns_file,
+  std::shared_ptr<pinned_compressed_blob> blob,
   std::vector<std::string> column_names,
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
   std::optional<std::vector<std::size_t>> selected_indices)
   : cucascade::idata_representation(memory_space),
-    _path(std::move(shared_path)),
-    _owns_file(std::move(owns_file)),
+    _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
@@ -65,28 +117,15 @@ compressed_host_representation::compressed_host_representation(
 {
 }
 
-// ── Destructor ───────────────────────────────────────────────────────────────
-
-compressed_host_representation::~compressed_host_representation()
-{
-  // Unlink the file when this is the last owner.
-  if (_owns_file && _owns_file.use_count() == 1 && *_owns_file && _path) {
-    if (std::remove(_path->c_str()) != 0) {
-      SIRIUS_LOG_WARN("[compressed_host_representation] failed to unlink temp file '{}'", *_path);
-    }
-  }
-}
-
 // ── idata_representation interface ───────────────────────────────────────────
 
 std::unique_ptr<cucascade::idata_representation> compressed_host_representation::clone(
   rmm::cuda_stream_view /*stream*/)
 {
-  // Share the same backing file — no byte copy needed.
+  // Share the same backing blob — no byte copy needed.
   return std::unique_ptr<compressed_host_representation>(
     new compressed_host_representation(get_memory_space(),
-                                       _path,
-                                       _owns_file,
+                                       _blob,
                                        _column_names,
                                        _compressed_bytes,
                                        _uncompressed_bytes,
@@ -119,12 +158,11 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
   }
 
   // const_cast is safe: select_columns is logically const (it creates a
-  // projection sharing the same file) but the base-class constructor requires
+  // projection sharing the same blob) but the base-class constructor requires
   // a non-const memory_space& — the underlying object is non-const.
   return std::unique_ptr<compressed_host_representation>(new compressed_host_representation(
     const_cast<cucascade::memory::memory_space&>(get_memory_space()),
-    _path,
-    _owns_file,
+    _blob,
     _column_names,
     _compressed_bytes,
     _uncompressed_bytes,

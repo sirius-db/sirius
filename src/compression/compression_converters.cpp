@@ -41,12 +41,20 @@ std::unique_ptr<cucascade::idata_representation> decompress_to_gpu(
 {
   auto& rep = source.cast<compressed_host_representation>();
 
+  // Pull each compressed leaf buffer straight from the pinned host payload into
+  // device memory (block-aware, since the payload is a multi-block allocation).
+  auto const& payload = rep.payload();
+  simpatico::payload_fetch_fn fetch =
+    [&payload](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+      copy_pinned_blocks_to_device(payload, off, dst, sz, s);
+    };
+
   std::string read_error;
-  simpatico::compressed_table ct = simpatico::read_compressed_table(
-    rep.path(), stream, rmm::mr::get_current_device_resource_ref(), &read_error);
+  simpatico::compressed_table ct = simpatico::read_compressed_table_from_memory(
+    rep.header(), fetch, stream, rmm::mr::get_current_device_resource_ref(), &read_error);
   if (!read_error.empty()) {
-    throw std::runtime_error("[compression_converters] read_compressed_table failed for '" +
-                             rep.path() + "': " + read_error);
+    throw std::runtime_error("[compression_converters] read_compressed_table_from_memory failed: " +
+                             read_error);
   }
 
   // Project to the selected columns before decompressing to avoid
@@ -72,8 +80,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_to_gpu(
   const cucascade::memory::memory_space* space =
     (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
 
-  SIRIUS_LOG_DEBUG("[compression_converters] decompressed '{}' cols={} rows={} → GPU device={}",
-                   rep.path(),
+  SIRIUS_LOG_DEBUG("[compression_converters] decompressed cols={} rows={} → GPU device={}",
                    decompressed->num_columns(),
                    decompressed->num_rows(),
                    space->get_device_id());

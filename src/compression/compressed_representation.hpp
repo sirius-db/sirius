@@ -19,9 +19,11 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/data/common.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
@@ -30,44 +32,81 @@
 
 namespace sirius {
 
+/// A Simpatico-compressed chunk resident in pinned host memory.
+///
+/// The (small) structural header is a flat byte vector; the (large) payload —
+/// every compressed leaf buffer, concatenated — lives in a cuCascade pinned
+/// multi-block allocation drawn from the host tier's fixed_size_host_memory_resource
+/// (the same pool the uncompressed pin path uses, so both share one tracked host
+/// budget). Reconstruction re-parses the header (a compact binary node array —
+/// cheap) and copies the payload straight back to the GPU.
+///
+/// Shared (via shared_ptr) among all representations that alias the same chunk
+/// (e.g. after select_columns() or clone()); the pinned blocks are returned to
+/// the pool when the last owner drops.
+struct pinned_compressed_blob {
+  std::vector<std::uint8_t> header;
+  cucascade::memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation payload;
+  std::uint64_t payload_bytes = 0;
+};
+
+// ── Block-aware copies over a cuCascade multi-block pinned allocation ─────────
+//
+// A single compressed buffer may straddle fixed-size block boundaries, so copies
+// to/from the pinned payload are chunked at those boundaries (mirroring
+// cuCascade's own host_data_representation::copy_between_blocks).
+
+/// Copy @p size bytes from device @p src_device into the pinned payload at
+/// logical byte offset @p dst_offset, enqueued on @p stream (device→host).
+void copy_device_to_pinned_blocks(
+  const void* src_device,
+  cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& dst,
+  std::uint64_t dst_offset,
+  std::size_t size,
+  rmm::cuda_stream_view stream);
+
+/// Copy @p size bytes from the pinned payload at logical byte offset @p src_offset
+/// into device @p dst_device, enqueued on @p stream (host→device).
+void copy_pinned_blocks_to_device(
+  const cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& src,
+  std::uint64_t src_offset,
+  void* dst_device,
+  std::size_t size,
+  rmm::cuda_stream_view stream);
+
 /**
- * @brief HOST-tier idata_representation backed by a Simpatico-compressed .hpln file.
+ * @brief HOST-tier idata_representation backed by a pinned Simpatico-compressed chunk.
  *
- * A chunk compressed with simpatico::compress_with_plan is serialised to a file
- * (typically on /dev/shm for near-RAM bandwidth) via write_compressed_table.
- * This representation stores the path, schema metadata, and an optional column
- * projection; the actual bytes live on the filesystem until the last shared owner
- * is destroyed, at which point the file is unlinked.
- *
- * Multiple compressed_host_representation objects may share the same underlying
- * file (e.g. after select_columns() or clone()). The file is unlinked when the
- * last owner's destructor fires.
- *
- * The converter compressed_host_representation → gpu_table_representation reads
- * the file with read_compressed_table, projects to the selected columns (if any),
+ * Holds a shared @ref pinned_compressed_blob plus schema metadata and an optional
+ * column projection. The converter compressed_host_representation →
+ * gpu_table_representation rebuilds the compressed_table from the blob
+ * (read_compressed_table_from_memory), projects to the selected columns (if any),
  * then decompresses to a cudf::table. It is registered by
  * register_compression_converters().
+ *
+ * Multiple compressed_host_representation objects may share the same underlying
+ * blob (e.g. after select_columns() or clone()).
  */
 class compressed_host_representation : public cucascade::idata_representation {
  public:
   /**
-   * @brief Construct a compressed_host_representation that owns the backing file.
+   * @brief Construct a compressed_host_representation owning a share of @p blob.
    *
    * @param memory_space        Host memory space this data is logically associated with.
-   * @param path                Absolute path to the serialised .hpln file.
-   * @param column_names        All column names stored in the file, in column order.
-   * @param compressed_bytes    File size (compressed footprint in bytes).
+   * @param blob                Pinned compressed chunk (header + payload).
+   * @param column_names        All column names stored in the chunk, in column order.
+   * @param compressed_bytes    Compressed footprint in bytes.
    * @param uncompressed_bytes  Logical uncompressed size (sum of raw column bytes).
    * @param num_rows            Row count.
    */
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
-                                 std::string path,
+                                 std::shared_ptr<pinned_compressed_blob> blob,
                                  std::vector<std::string> column_names,
                                  std::size_t compressed_bytes,
                                  std::size_t uncompressed_bytes,
                                  std::int64_t num_rows);
 
-  ~compressed_host_representation() override;
+  ~compressed_host_representation() override = default;
 
   // Non-copyable (shared ownership uses shared_ptr)
   compressed_host_representation(const compressed_host_representation&)            = delete;
@@ -77,7 +116,7 @@ class compressed_host_representation : public cucascade::idata_representation {
 
   // ── idata_representation interface ──────────────────────────────────────────
 
-  /// Returns the on-disk (compressed) file size.
+  /// Returns the compressed (payload) size.
   [[nodiscard]] std::size_t get_size_in_bytes() const override { return _compressed_bytes; }
 
   /// Returns the logical (uncompressed) data size.
@@ -86,7 +125,7 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _uncompressed_bytes;
   }
 
-  /// Clone shares the same backing file (increments shared ownership).
+  /// Clone shares the same backing blob (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
     rmm::cuda_stream_view stream) override;
 
@@ -95,8 +134,8 @@ class compressed_host_representation : public cucascade::idata_representation {
   /**
    * @brief Return a projection that exposes only the requested column indices.
    *
-   * The returned representation shares the same backing file.  The converter
-   * will read all columns but decompress only the selected subset.
+   * The returned representation shares the same backing blob. The converter
+   * will reconstruct all columns but decompress only the selected subset.
    *
    * @param indices  Indices into column_names() to expose (must be valid).
    */
@@ -105,7 +144,17 @@ class compressed_host_representation : public cucascade::idata_representation {
 
   // ── Accessors ───────────────────────────────────────────────────────────────
 
-  [[nodiscard]] const std::string& path() const noexcept { return *_path; }
+  /// The structural header bytes (fed to read_compressed_table_from_memory).
+  [[nodiscard]] std::span<const std::uint8_t> header() const noexcept { return _blob->header; }
+
+  /// The pinned payload holding every compressed leaf buffer, concatenated.
+  [[nodiscard]] const cucascade::memory::fixed_size_host_memory_resource::
+    multiple_blocks_allocation&
+    payload() const noexcept
+  {
+    return *_blob->payload;
+  }
+
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
   {
     return _column_names;
@@ -119,21 +168,16 @@ class compressed_host_representation : public cucascade::idata_representation {
   }
 
  private:
-  /// Construct a projection sharing the same backing file.
+  /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
-                                 std::shared_ptr<std::string> shared_path,
-                                 std::shared_ptr<bool> owns_file,
+                                 std::shared_ptr<pinned_compressed_blob> blob,
                                  std::vector<std::string> column_names,
                                  std::size_t compressed_bytes,
                                  std::size_t uncompressed_bytes,
                                  std::int64_t num_rows,
                                  std::optional<std::vector<std::size_t>> selected_indices);
 
-  std::shared_ptr<std::string> _path;
-  /// Tracks whether the file should be unlinked on destruction.
-  /// Shared among all representations that alias the same file; only the
-  /// last one resets the flag to false before unlinking.
-  std::shared_ptr<bool> _owns_file;
+  std::shared_ptr<pinned_compressed_blob> _blob;
   std::vector<std::string> _column_names;
   std::size_t _compressed_bytes;
   std::size_t _uncompressed_bytes;

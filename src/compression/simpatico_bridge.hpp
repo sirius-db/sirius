@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <string>
-
 namespace sirius::compression {
 
 /**
@@ -29,16 +27,5 @@ namespace sirius::compression {
  * initialised.
  */
 void initialize_simpatico_jit();
-
-/**
- * @brief Generate a unique temp path for a serialized compressed table.
- *
- * Returns a path in @p temp_dir (default "/dev/shm") of the form
- * "<temp_dir>/sirius_comp_<random_hex>.hpln". The caller is responsible for
- * writing to this path and eventually removing it.
- *
- * @param temp_dir  Directory to place the temp file (must be writeable).
- */
-std::string make_compressed_temp_path(const std::string& temp_dir = "/dev/shm");
 
 }  // namespace sirius::compression

@@ -18,22 +18,8 @@
 
 #include <codegen/jit/nvrtc_compiler.hpp>
 
-#include <random>
-#include <sstream>
-#include <string>
-
 namespace sirius::compression {
 
 void initialize_simpatico_jit() { codegen::jit::ensure_cuda_context(); }
-
-std::string make_compressed_temp_path(const std::string& temp_dir)
-{
-  std::random_device rd;
-  std::mt19937_64 gen(rd());
-  std::uniform_int_distribution<uint64_t> dist;
-  std::ostringstream oss;
-  oss << temp_dir << "/sirius_comp_" << std::hex << dist(gen) << ".hpln";
-  return oss.str();
-}
 
 }  // namespace sirius::compression

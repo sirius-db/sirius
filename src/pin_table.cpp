@@ -17,7 +17,6 @@
 #include "pin_table.hpp"
 
 #include "compression/compressed_representation.hpp"
-#include "compression/simpatico_bridge.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "io/io_context.hpp"
 #include "log/logging.hpp"
@@ -34,9 +33,10 @@
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <filesystem>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -295,21 +295,48 @@ host_pin_result materialize_pin_to_host_with_compression(
                                                     stream,
                                                     rmm::mr::get_current_device_resource_ref(),
                                                     compression.column_names);
-            stream.synchronize();
-            const std::string temp_path =
-              sirius::compression::make_compressed_temp_path(compression.temp_dir);
-            const std::string write_err = simpatico::write_compressed_table(ct, temp_path);
-            if (!write_err.empty()) {
-              throw std::runtime_error("write_compressed_table: " + write_err);
+
+            // Build the structural header and enumerate the payload buffers
+            // (no bytes copied yet).
+            std::vector<std::uint8_t> header;
+            std::vector<simpatico::payload_buffer_ref> buffers;
+            std::uint64_t payload_bytes = 0;
+            const std::string hdr_err =
+              simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+            if (!hdr_err.empty()) {
+              throw std::runtime_error("build_compressed_table_header: " + hdr_err);
             }
-            const std::size_t compressed_bytes =
-              static_cast<std::size_t>(std::filesystem::file_size(temp_path));
+
+            // Allocate the pinned payload from the target host space's chunked
+            // pool (the same tracked pool the uncompressed path uses) and stage
+            // every compressed buffer device->pinned. Sync before `ct` (which
+            // owns the device buffers) leaves scope.
+            auto* host_mr =
+              target_host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+            if (host_mr == nullptr) {
+              throw std::runtime_error("target host space has no fixed_size_host_memory_resource");
+            }
+            auto blob           = std::make_shared<sirius::pinned_compressed_blob>();
+            blob->header        = std::move(header);
+            blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes);
+            blob->payload_bytes = payload_bytes;
+            for (auto const& b : buffers) {
+              if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+                sirius::copy_device_to_pinned_blocks(b.device_ptr,
+                                                     *blob->payload,
+                                                     b.offset,
+                                                     static_cast<std::size_t>(b.size_bytes),
+                                                     stream);
+              }
+            }
+            stream.synchronize();
+
             out.compressed_chunks.emplace_back(
               std::make_shared<sirius::compressed_host_representation>(
                 *target_host_space,
-                temp_path,
+                std::move(blob),
                 compression.column_names,
-                compressed_bytes,
+                static_cast<std::size_t>(payload_bytes),
                 uncompressed_bytes,
                 static_cast<int64_t>(tbl->num_rows())));
             compressed_this_chunk = true;
