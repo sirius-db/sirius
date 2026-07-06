@@ -46,16 +46,12 @@ namespace {
 cudf::ast::expression const& and_join(cudf::ast::tree& tree,
                                       cudf::ast::expression const& lhs,
                                       cudf::ast::expression const& rhs)
-{
-  return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_AND, lhs, rhs);
-}
+{ return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_AND, lhs, rhs); }
 
 cudf::ast::expression const& or_join(cudf::ast::tree& tree,
                                      cudf::ast::expression const& lhs,
                                      cudf::ast::expression const& rhs)
-{
-  return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_OR, lhs, rhs);
-}
+{ return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_OR, lhs, rhs); }
 
 template <typename ScalarT>
 auto scalar_value_to_host(cudf::scalar const& source,
@@ -356,7 +352,7 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
   if (spaces.empty()) { return; }
 
   auto const source = std::find_if(spaces.begin(), spaces.end(), [this](auto const& target) {
-    return target.get().get_device_id() == _source_device;
+    return target.gpu_space().get_device_id() == _source_device;
   });
   if (source == spaces.end()) {
     SIRIUS_LOG_WARN(
@@ -369,10 +365,10 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
   // Read exact source values through the source memory space's durable stream pool. The producer
   // has already synchronized construction before entering this method.
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{_source_device}};
-  auto const source_stream = source->get().acquire_stream();
+  auto const source_stream = source->gpu_space().acquire_stream();
 
   for (auto const& target : spaces) {
-    auto const& target_space = target.get();
+    auto const& target_space = target.gpu_space();
     auto const device_id     = target_space.get_device_id();
     if (is_available_on_device(device_id)) { continue; }
     try {
@@ -485,9 +481,7 @@ void sirius_dynamic_filter_set::set_consumer_column_remap(std::vector<std::size_
 }
 
 void sirius_dynamic_filter_set::register_producer()
-{
-  _producer_count.fetch_add(1, std::memory_order_release);
-}
+{ _producer_count.fetch_add(1, std::memory_order_release); }
 
 void sirius_dynamic_filter_set::close_for_new_filters()
 {

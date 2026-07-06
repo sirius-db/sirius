@@ -21,79 +21,52 @@
 
 #include <cstddef>
 
+namespace cucascade::memory {
+class memory_space;
+}
+
 namespace sirius::op::detail {
 
-/// The route selected for a dynamic-filter replica transfer.
-enum class replica_transfer_route { none, local, peer_dma, portable_host };
-
-/// Route policy. The forced mode exists for deterministic fallback validation.
-enum class replica_transfer_policy { automatic, force_portable_host };
-
-/**
- * Owns completion of one dynamic-filter replica transfer.
- *
- * The transfer may still be queued on the destination stream when this object is returned. Calling
- * wait() makes the destination bytes visible to other streams and releases any portable pinned-host
- * staging storage. Destruction provides a no-throw completion backstop, but publishers should call
- * wait() explicitly so failures prevent publication of that replica.
- */
-class replica_transfer final {
- public:
-  replica_transfer() noexcept = default;
-  ~replica_transfer() noexcept;
-
-  replica_transfer(replica_transfer const&)            = delete;
-  replica_transfer& operator=(replica_transfer const&) = delete;
-  replica_transfer(replica_transfer&& other) noexcept;
-  replica_transfer& operator=(replica_transfer&& other) noexcept;
-
-  /** Wait for completion. Idempotent. Throws if CUDA reports a transfer failure. */
-  void wait();
-
-  [[nodiscard]] bool complete() const noexcept { return _complete; }
-  [[nodiscard]] replica_transfer_route route() const noexcept { return _route; }
-
- private:
-  friend replica_transfer enqueue_replica_transfer(void*,
-                                                   rmm::cuda_device_id,
-                                                   void const*,
-                                                   rmm::cuda_device_id,
-                                                   std::size_t,
-                                                   rmm::cuda_stream_view,
-                                                   replica_transfer_policy);
-
-  replica_transfer(replica_transfer_route route,
-                   rmm::cuda_device_id destination_device,
-                   rmm::cuda_stream_view destination_stream,
-                   void* portable_staging) noexcept;
-
-  void wait_no_throw() noexcept;
-
-  replica_transfer_route _route{replica_transfer_route::none};
-  rmm::cuda_device_id _destination_device{-1};
-  rmm::cuda_stream_view _destination_stream{};
-  void* _portable_staging{nullptr};
-  bool _complete{true};
+/// @brief The route selected for a dynamic-filter replica transfer.
+/// @note This is currently only used for testing and logging.
+enum class replica_transfer_route {
+  none,
+  local,        ///< Same-device copy
+  peer_dma,     ///< GPU-to-GPU copy via peer DMA
+  host_staging  ///< Copy through the target's Sirius HOST memory space
 };
 
-/**
- * Enqueue a byte-for-byte copy of finalized dynamic-filter storage.
- *
- * The caller must make all source writes complete before calling; this function deliberately does
- * not infer or synchronize the source's producer stream. The destination allocation and stream must
- * belong to @p destination_device. Directionally verified peer DMA is preferred. If its probe,
- * source-pool access grant, or individual enqueue fails, the source is copied synchronously into
- * Sirius-owned portable pinned memory and the host-to-device leg is queued on
- * @p destination_stream. In either case the returned token owns the precise completion contract and
- * must outlive the queued copy.
- */
-[[nodiscard]] replica_transfer enqueue_replica_transfer(
+/// @brief The transfer policy.
+/// @note This is currently only used for testing.
+enum class replica_transfer_policy {
+  automatic,
+  force_host_staging  ///< For deterministic host-fallback testing
+};
+
+/// @brief Submit a copy of finalized dynamic-filter storage and return the selected route.
+///
+/// The caller must make all source writes complete before calling; this function deliberately does
+/// not infer or synchronize the source's producer stream. @p source_space must be the Sirius GPU
+/// memory space that owns @p source; the staged fallback acquires a source-bound pooled stream from
+/// it. The destination allocation and stream must belong to @p destination_device. Following
+/// CuCascade's GPU-to-GPU converter, directionally verified peer DMA is preferred. If the probe
+/// rejects peer DMA, the source is copied through fixed pinned blocks borrowed from
+/// @p host_staging_space.
+///
+/// Local and peer-DMA copies are only enqueued on @p destination_stream; the caller must keep both
+/// allocations alive and synchronize that stream before publishing the replica. HOST staging
+/// completes both dependent legs before returning so its borrowed blocks can immediately return to
+/// the pool. An enqueue or synchronization failure propagates.
+///
+/// @return The selected transfer route (currently only used for testing and logging).
+replica_transfer_route enqueue_replica_copy(
   void* destination,
   rmm::cuda_device_id destination_device,
   void const* source,
-  rmm::cuda_device_id source_device,
+  cucascade::memory::memory_space const& source_space,
   std::size_t bytes,
   rmm::cuda_stream_view destination_stream,
+  cucascade::memory::memory_space const& host_staging_space,
   replica_transfer_policy policy = replica_transfer_policy::automatic);
 
 }  // namespace sirius::op::detail

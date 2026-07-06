@@ -24,29 +24,27 @@ class memory_space;
 
 namespace sirius::op {
 
-/**
- * @brief Non-owning placement handle for one device-local dynamic-filter replica.
- *
- * The referenced GPU memory space supplies both the replica allocator and its pooled CUDA stream.
- * The Sirius memory manager that owns the space (and therefore its allocator and stream pool) must
- * outlive every publication plan containing this handle and every filter replica materialized from
- * it. All GPU uses of a filter must finish before that filter is destroyed, and all such filters
- * must be destroyed before the owning Sirius context tears down its memory manager.
- *
- * This lifetime dependency is also required by the device allocations themselves; this handle
- * makes it explicit and non-null without transferring ownership.
- */
+/// @brief Non-owning placement handle for one device-local dynamic-filter replica.
+///
+/// The GPU memory space supplies the replica allocator and pooled CUDA stream. The paired HOST
+/// memory space supplies NUMA-local, pre-pinned fixed blocks when direct peer DMA is unavailable.
 class dynamic_filter_replica_space final {
  public:
-  explicit dynamic_filter_replica_space(cucascade::memory::memory_space const& space) noexcept
-    : _space{space}
+  dynamic_filter_replica_space(cucascade::memory::memory_space const& gpu_space,
+                               cucascade::memory::memory_space const& host_staging_space) noexcept
+    : _gpu_space{gpu_space}, _host_staging_space{host_staging_space}
   {
   }
 
-  [[nodiscard]] cucascade::memory::memory_space const& get() const noexcept { return _space.get(); }
+  [[nodiscard]] cucascade::memory::memory_space const& get_gpu_space() const noexcept
+  { return _gpu_space.get(); }
+
+  [[nodiscard]] cucascade::memory::memory_space const& get_host_staging_space() const noexcept
+  { return _host_staging_space.get(); }
 
  private:
-  std::reference_wrapper<cucascade::memory::memory_space const> _space;
+  std::reference_wrapper<cucascade::memory::memory_space const> _gpu_space;
+  std::reference_wrapper<cucascade::memory::memory_space const> _host_staging_space;
 };
 
 }  // namespace sirius::op

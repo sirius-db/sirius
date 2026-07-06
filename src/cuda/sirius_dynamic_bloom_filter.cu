@@ -14,10 +14,6 @@
  * limitations under the License.
  */
 
-// GPU Bloom-filter backing for sirius_dynamic_bloom_filter. Kept in a .cu (compiled by nvcc) so the
-// cuCollections device code never reaches host translation units — the class is PIMPL'd in the
-// header.
-
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 
@@ -40,6 +36,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -96,20 +93,26 @@ bloom_owner<Filter> make_bloom(std::size_t num_blocks,
 }
 
 template <class Filter>
-detail::replica_transfer copy_filter_storage(Filter const& source,
-                                             rmm::cuda_device_id source_device,
-                                             Filter& destination,
-                                             rmm::cuda_device_id destination_device,
-                                             rmm::cuda_stream_view stream,
-                                             std::size_t& bytes)
+void copy_filter_storage(Filter const& source,
+                         cucascade::memory::memory_space const& source_space,
+                         Filter& destination,
+                         rmm::cuda_device_id destination_device,
+                         rmm::cuda_stream_view stream,
+                         cucascade::memory::memory_space const& host_staging_space,
+                         std::size_t& bytes)
 {
   auto const source_blocks = source.block_extent();
   if (destination.block_extent() != source_blocks) {
     throw std::runtime_error("destination Bloom block extent changed during replication");
   }
   bytes = source_blocks * Filter::words_per_block * sizeof(typename Filter::word_type);
-  return detail::enqueue_replica_transfer(
-    destination.data(), destination_device, source.data(), source_device, bytes, stream);
+  detail::enqueue_replica_copy(destination.data(),
+                               destination_device,
+                               source.data(),
+                               source_space,
+                               bytes,
+                               stream,
+                               host_staging_space);
 }
 
 template <class Filter>
@@ -141,7 +144,6 @@ constexpr cudf::type_id key_type_id() noexcept
 struct bloom_replica {
   int device_id = -1;
   bloom_storage bloom;
-  detail::replica_transfer transfer;
 
   template <class Filter>
   bloom_replica(int device_id, bloom_owner<Filter> owner)
@@ -152,14 +154,8 @@ struct bloom_replica {
   ~bloom_replica() noexcept
   {
     if (device_id < 0) { return; }
-    try {
-      transfer.wait();
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      std::visit([](auto& owner) { owner.reset(); }, bloom);
-    } catch (...) {
-      // See set_replica: do not terminate or deallocate on an unknown current device.
-      std::visit([](auto& owner) { (void)owner.release(); }, bloom);
-    }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+    std::visit([](auto& owner) { owner.reset(); }, bloom);
   }
 
   [[nodiscard]] bool has_bloom() const noexcept
@@ -225,8 +221,6 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
   }
 
-  // Insert every build key. Build keys are non-null (FK/PK); a null slot would only add a stray
-  // fingerprint — a negligible false-positive bump, never a dropped match.
   std::unique_ptr<bloom_replica> source;
   switch (keys.type().id()) {
     case cudf::type_id::INT32:
@@ -250,20 +244,34 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   if (!_impl || _impl->replicas.empty()) { return; }
   auto const* source = _impl->find(_impl->source_device);
   if (!source) { return; }
+  auto const source_target = std::find_if(spaces.begin(), spaces.end(), [this](auto const& target) {
+    return target.get_gpu_space().get_device_id() == _impl->source_device;
+  });
+  if (source_target == spaces.end()) {
+    SIRIUS_LOG_WARN(
+      "[sirius_dynamic_bloom_filter] source GPU {} has no replica memory space; remote GPUs "
+      "will skip this optional filter.",
+      _impl->source_device);
+    return;
+  }
+  auto const& source_space = source_target->get_gpu_space();
 
-  std::vector<std::unique_ptr<bloom_replica>> pending;
+  // Retain all destination objects and streams until direct peer copies have been submitted to
+  // every target. The completion pass then waits on transfers already running in parallel.
+  std::vector<std::pair<std::unique_ptr<bloom_replica>, rmm::cuda_stream_view>> pending;
   pending.reserve(spaces.size());
+  _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
-    auto const& target_space = target.get();
+    auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
     if (device_id == _impl->source_device || _impl->find(device_id)) { continue; }
+    std::size_t bytes = 0;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       auto const stream = target_space.acquire_stream();
       auto const mr     = target_space.get_default_allocator();
 
-      std::size_t bytes = 0;
-      auto replica      = std::visit(
+      auto replica = std::visit(
         [&](auto const& source_bloom) {
           if (!source_bloom) {
             throw std::logic_error(
@@ -276,43 +284,37 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
             source_bloom->block_extent(), mr, cuda::stream_ref{stream.value()});
           auto result = std::make_unique<bloom_replica>(device_id, std::move(destination_bloom));
           auto& destination = *std::get<bloom_owner<filter_type>>(result->bloom);
-          result->transfer  = copy_filter_storage(*source_bloom,
-                                                  rmm::cuda_device_id{_impl->source_device},
-                                                  destination,
-                                                  rmm::cuda_device_id{device_id},
-                                                  stream,
-                                                  bytes);
+          copy_filter_storage(*source_bloom,
+                              source_space,
+                              destination,
+                              rmm::cuda_device_id{device_id},
+                              stream,
+                              target.get_host_staging_space(),
+                              bytes);
           return result;
         },
         source->bloom);
-      SIRIUS_LOG_DEBUG("[sirius_dynamic_bloom_filter] queued {}-byte replica GPU {} -> GPU {}.",
-                       bytes,
-                       _impl->source_device,
-                       device_id);
-      pending.push_back(std::move(replica));
-    } catch (std::exception const& e) {
+      pending.emplace_back(std::move(replica), stream);
+    } catch (std::bad_alloc const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
         "That GPU will skip this optional filter.",
         _impl->source_device,
         device_id,
         e.what());
+      continue;
     }
+    SIRIUS_LOG_DEBUG("[sirius_dynamic_bloom_filter] queued {}-byte replica GPU {} -> GPU {}.",
+                     bytes,
+                     _impl->source_device,
+                     device_id);
   }
 
-  for (auto& replica : pending) {
+  for (auto& [replica, stream] : pending) {
     auto const device_id = replica->device_id;
-    try {
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      replica->transfer.wait();
-      _impl->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_bloom_filter] failed to finish replica on GPU {}: {}. "
-        "That GPU will skip this optional filter.",
-        device_id,
-        e.what());
-    }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+    stream.synchronize();
+    _impl->replicas.push_back(std::move(replica));
   }
 }
 

@@ -39,6 +39,8 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 
+#include <algorithm>
+
 namespace sirius::planner {
 
 /// Returns a set of output column indices proven to form a unique key for the
@@ -377,9 +379,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto sirius_context   = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     const auto& op_params = sirius_context->get_config().get_operator_params();
 
-    // Build the dynamic filter producer's immutable publication plan before moving DuckDB's pushdown metadata
-    // into the physical join. Routing and device placement are plan-time decisions; runtime code
-    // only consumes this value.
+    // Build the dynamic filter producer's immutable publication plan before moving DuckDB's
+    // pushdown metadata into the physical join. Routing and device placement are plan-time
+    // decisions; runtime code only consumes this value.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> filter_targets;
     std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
     if (op.filter_pushdown) {
@@ -390,30 +392,54 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           rhs_cardinality,
           build_filter_evidence.domain_cardinality);
       } else {
-        filter_targets.reserve(op.filter_pushdown->probe_info.size());
-        for (auto const& pi : op.filter_pushdown->probe_info) {
-          auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
-          if (!channel) { continue; }
-          channel->register_producer();
-          sirius::op::dynamic_filter_publish_plan::probe_target target{std::move(channel), {}};
-          target.probe_col_idx.reserve(pi.columns.size());
-          for (auto const& col : pi.columns) {
-            target.probe_col_idx.push_back(col.probe_column_index.column_index);
-          }
-          filter_targets.push_back(std::move(target));
-        }
-        if (!filter_targets.empty()) {
-          // Route all dynamic-filter replicas to all GPUs in the current context.
-          for (auto const* space : sirius_context->get_memory_manager().get_memory_spaces_for_tier(
-                 cucascade::memory::Tier::GPU)) {
-            filter_replica_spaces.emplace_back(*space);
-          }
+        auto const& memory_manager = sirius_context->get_memory_manager();
+        auto const gpu_spaces =
+          memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+        auto const host_spaces =
+          memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+        if (gpu_spaces.empty() || host_spaces.empty()) {
           SIRIUS_LOG_INFO(
-            "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
-            "target(s) (build est {} rows, key-domain ~{} rows).",
-            filter_targets.size(),
-            rhs_cardinality,
-            build_filter_evidence.domain_cardinality);
+            "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
+            "memory space are required for device-local replicas.");
+        } else {
+          filter_targets.reserve(op.filter_pushdown->probe_info.size());
+          for (auto const& pi : op.filter_pushdown->probe_info) {
+            auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
+            if (!channel) { continue; }
+            channel->register_producer();
+            sirius::op::dynamic_filter_publish_plan::probe_target target{std::move(channel), {}};
+            target.probe_col_idx.reserve(pi.columns.size());
+            for (auto const& col : pi.columns) {
+              target.probe_col_idx.push_back(col.probe_column_index.column_index);
+            }
+            filter_targets.push_back(std::move(target));
+          }
+          if (!filter_targets.empty()) {
+            // Resolve each replica's NUMA-local Sirius HOST space once at plan time. The transfer
+            // path borrows fixed pinned blocks from that explicit space if peer DMA is unavailable.
+            auto const& topology = sirius_context->get_config().get_hw_topology();
+            for (auto const* gpu_space : gpu_spaces) {
+              auto const gpu_id = gpu_space->get_device_id();
+              auto const gpu_info =
+                std::find_if(topology.gpus.begin(), topology.gpus.end(), [gpu_id](auto const& gpu) {
+                  return static_cast<int>(gpu.id) == gpu_id;
+                });
+              auto const numa_node = gpu_info == topology.gpus.end() ? -1 : gpu_info->numa_node;
+              auto const local_host =
+                std::find_if(host_spaces.begin(), host_spaces.end(), [numa_node](auto const* host) {
+                  return numa_node >= 0 && host->get_device_id() == numa_node;
+                });
+              auto const* host_space =
+                local_host == host_spaces.end() ? host_spaces.front() : *local_host;
+              filter_replica_spaces.emplace_back(*gpu_space, *host_space);
+            }
+            SIRIUS_LOG_INFO(
+              "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
+              "target(s) (build est {} rows, key-domain ~{} rows).",
+              filter_targets.size(),
+              rhs_cardinality,
+              build_filter_evidence.domain_cardinality);
+          }
         }
       }
     }

@@ -58,9 +58,9 @@ class sirius_dynamic_filter_set;
 /// @brief Immutable plan-time description of one hash join's dynamic-filter publication.
 ///
 /// The planner owns routing and placement decisions. The runtime publisher consumes this value but
-/// cannot mutate its targets, policy, or device set after operator construction. Replica spaces are
-/// the active GPU spaces from the Sirius context, including the GPU on which the build may execute;
-/// their owner follows the lifetime contract on @ref dynamic_filter_replica_space.
+/// cannot mutate its targets, policy, or device set after operator construction. Replica placements
+/// pair every active GPU space (including the possible build GPU) with its planned HOST staging
+/// space; their owner follows the lifetime contract on @ref dynamic_filter_replica_space.
 class dynamic_filter_publish_plan final {
  public:
   struct probe_target {
@@ -76,18 +76,12 @@ class dynamic_filter_publish_plan final {
 
   [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
   [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
-  {
-    return _probe_targets;
-  }
+  { return _probe_targets; }
   [[nodiscard]] bool emit_zone_map_filters() const noexcept { return _emit_zone_map_filters; }
   [[nodiscard]] std::size_t build_key_domain_cardinality() const noexcept
-  {
-    return _build_key_domain_cardinality;
-  }
+  { return _build_key_domain_cardinality; }
   [[nodiscard]] std::vector<dynamic_filter_replica_space> const& replica_spaces() const noexcept
-  {
-    return _replica_spaces;
-  }
+  { return _replica_spaces; }
 
   /// Fraction of the key-domain proxy a build may cover and still publish.
   static constexpr double k_domain_coverage_threshold = 0.5;
@@ -96,7 +90,8 @@ class dynamic_filter_publish_plan final {
   std::vector<probe_target> _probe_targets;
   bool _emit_zone_map_filters               = false;
   std::size_t _build_key_domain_cardinality = 0;
-  /// Non-owning GPU placements. See @ref dynamic_filter_replica_space for the lifetime contract.
+  /// Non-owning GPU/HOST placements. See @ref dynamic_filter_replica_space for the lifetime
+  /// contract.
   std::vector<dynamic_filter_replica_space> _replica_spaces;
 };
 //===----------------------------------------------------------------------===//
@@ -211,9 +206,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   /// @brief True when plan construction wired at least one dynamic-filter consumer.
   [[nodiscard]] bool publishes_dynamic_filters() const noexcept
-  {
-    return _dynamic_filter_plan.enabled();
-  }
+  { return _dynamic_filter_plan.enabled(); }
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
@@ -310,7 +303,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //===----------------------------------------------------------------------===//
 
  public:
-  /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch if possible / applicable.
+  /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch if
+  /// possible / applicable.
   ///
   /// Every batch is first routed exactly as in the base partition consumer. For the @c build port
   /// of a wired @c BUILD_PROBE join, a non-null, GPU-resident, single concat-folded batch is the

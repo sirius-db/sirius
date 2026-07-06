@@ -43,6 +43,7 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
+#include <new>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -133,7 +134,6 @@ struct contains_or_sentinel {
 struct set_replica {
   int device_id = -1;
   set_storage set;
-  detail::replica_transfer transfer;
 
   template <class KeyT>
   set_replica(int device_id, set_owner<KeyT> owner)
@@ -144,15 +144,8 @@ struct set_replica {
   ~set_replica() noexcept
   {
     if (device_id < 0) { return; }
-    try {
-      transfer.wait();
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      std::visit([](auto& owner) { owner.reset(); }, set);
-    } catch (...) {
-      // A CUDA-context failure means these device-owned objects cannot be destroyed safely. Leak
-      // them rather than terminate from a destructor or deallocate them on the wrong device.
-      std::visit([](auto& owner) { (void)owner.release(); }, set);
-    }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+    std::visit([](auto& owner) { owner.reset(); }, set);
   }
 
   [[nodiscard]] bool has_set() const noexcept
@@ -229,20 +222,34 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
   if (!_set || _set->replicas.empty()) { return; }
   auto const* source = _set->find(_set->source_device);
   if (!source) { return; }
+  auto const source_target = std::find_if(spaces.begin(), spaces.end(), [this](auto const& target) {
+    return target.get_gpu_space().get_device_id() == _set->source_device;
+  });
+  if (source_target == spaces.end()) {
+    SIRIUS_LOG_WARN(
+      "[sirius_dynamic_in_list_filter] source GPU {} has no replica memory space; remote GPUs "
+      "will skip this optional filter.",
+      _set->source_device);
+    return;
+  }
+  auto const& source_space = source_target->get_gpu_space();
 
-  std::vector<std::unique_ptr<set_replica>> pending;
+  // Retain every destination and pooled stream while direct peer copies are submitted. Waiting
+  // only after this loop lets different destination GPUs transfer concurrently.
+  std::vector<std::pair<std::unique_ptr<set_replica>, rmm::cuda_stream_view>> pending;
   pending.reserve(spaces.size());
+  _set->replicas.reserve(_set->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
-    auto const& target_space = target.get();
+    auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
     if (device_id == _set->source_device || _set->find(device_id)) { continue; }
+    std::size_t bytes = 0;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       auto const stream = target_space.acquire_stream();
       auto const mr     = target_space.get_default_allocator();
 
-      std::size_t bytes = 0;
-      auto replica      = std::visit(
+      auto replica = std::visit(
         [&](auto const& source_set) {
           if (!source_set) {
             throw std::logic_error(
@@ -259,44 +266,37 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
           bytes             = capacity * sizeof(key_type);
           auto result       = std::make_unique<set_replica>(device_id, std::move(destination_set));
           auto& destination = *std::get<set_owner<key_type>>(result->set);
-          result->transfer =
-            detail::enqueue_replica_transfer(destination.data(),
-                                             rmm::cuda_device_id{device_id},
-                                             source_set->data(),
-                                             rmm::cuda_device_id{_set->source_device},
-                                             bytes,
-                                             stream);
+          detail::enqueue_replica_copy(destination.data(),
+                                       rmm::cuda_device_id{device_id},
+                                       source_set->data(),
+                                       source_space,
+                                       bytes,
+                                       stream,
+                                       target.get_host_staging_space());
           return result;
         },
         source->set);
-      SIRIUS_LOG_DEBUG("[sirius_dynamic_in_list_filter] queued {}-byte replica GPU {} -> GPU {}.",
-                       bytes,
-                       _set->source_device,
-                       device_id);
-      pending.push_back(std::move(replica));
-    } catch (std::exception const& e) {
+      pending.emplace_back(std::move(replica), stream);
+    } catch (std::bad_alloc const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
         "That GPU will skip this optional filter.",
         _set->source_device,
         device_id,
         e.what());
+      continue;
     }
+    SIRIUS_LOG_DEBUG("[sirius_dynamic_in_list_filter] queued {}-byte replica GPU {} -> GPU {}.",
+                     bytes,
+                     _set->source_device,
+                     device_id);
   }
 
-  for (auto& replica : pending) {
+  for (auto& [replica, stream] : pending) {
     auto const device_id = replica->device_id;
-    try {
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      replica->transfer.wait();
-      _set->replicas.push_back(std::move(replica));
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_in_list_filter] failed to finish replica on GPU {}: {}. "
-        "That GPU will skip this optional filter.",
-        device_id,
-        e.what());
-    }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+    stream.synchronize();
+    _set->replicas.push_back(std::move(replica));
   }
 }
 

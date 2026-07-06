@@ -1,205 +1,368 @@
-# Dynamic Filters — Multi-GPU Cross-Device Hazard
+# Dynamic Filters — Multi-GPU Publication
 
-> **Status: KNOWN BUG, fix pending a decision.** Dynamic table-filter pushdown
-> (Phase 1) is correct on a single GPU but triggers an illegal memory access on
-> multi-GPU (`num_gpus > 1`). This document records the root cause, the failing
-> repro, and the fix options so the work can be finished and validated on a
-> multi-GPU machine. See [dynamic-filters.md](dynamic-filters.md) for the feature
-> itself.
+> **Status: implemented and validated on 2026-07-02.** Dynamic filters remain
+> opportunistic and are now safe on multiple GPUs. The producer builds each
+> filter once, attempts to copy its compact finalized representation to every
+> active probe GPU, and publishes one immutable logical filter only after every
+> successful device-local replica is ready. TPC-H Q2 passes on physical GPUs 1
+> and 2. In the final pinned-host SF300 Q1-Q22 A/B, the sum of warm per-query
+> medians fell from **13.7013505 s to 8.2939465 s: 39.466212% faster
+> (1.651970x)**. All 22 result files were byte-identical.
+> See [dynamic-filters.md](dynamic-filters.md) for the general feature.
 
-## TL;DR
+## Summary
 
-The runtime membership/zone-map filter structures (`cuco::static_set`,
-`cuco::bloom_filter`, zone-map `cudf::scalar` bounds) are built on the **hash-join
-build side's GPU** and carry **no device identity**. On one GPU the build and the
-probe-side scans that consume the filter always share that device, so it works. On
-multiple GPUs, the scan subsystem's load balancer distributes probe scans across
-**all** active GPUs; a scan running on GPU 1 then evaluates `set.contains(key)` (or
-reads a zone-map device scalar) against storage that lives on GPU 0 → a
-cross-device dereference → `cudaErrorIllegalAddress`.
+The crash was a device-ownership bug, not a cuDF filtering bug. The hash-join
+build created a `cuco::static_set`, `cuco::bloom_filter`, or zone-map
+`cudf::scalar` on its GPU and published a device-agnostic `shared_ptr`. Probe
+scans are load-balanced across all active GPUs, so another GPU could dereference
+the producer's device pointer. The asynchronous fault surfaced later as:
 
-The filter code did **not** change in the dev merge; dev's new load-balancing scan
-distribution merely **exposed** a latent single-GPU assumption.
-
-## Symptom / repro
-
-CI `Test` job, self-hosted **2-GPU** runner, `num_gpus := 2`:
-
-```
-gpu_execution - TPC-H Query 2 parquet
-test/cpp/integration/test_gpu_execution_tpch.cpp:229: FAILED:
-  REQUIRE_FALSE( gpu_result->HasError() )
-with messages:
-  num_gpus := 2
-  transparent GPU execution error: INTERNAL Error: Sirius GPU execution failed:
-  Invalid Error: copy_if failed on 2nd step: cudaErrorIllegalAddress: an
-  illegal memory access was encountered
+```text
+copy_if failed on 2nd step: cudaErrorIllegalAddress
 ```
 
-- Fails on Q2 (min-cost-supplier: `part ⋈ partsupp ⋈ supplier ⋈ nation ⋈ region`),
-  which builds selective IN-list membership filters that are pushed into probe scans.
-- Dynamic filters are **on by default** (`0c7ca1d4`), so the integration suite
-  exercises them.
-- **Attribution:** the pre-merge feature tip passed this multi-GPU `Test` job
-  (CI run `27307838188`, 2026-06-10, success). The post-merge branch fails it
-  (run `28545289166`). The filter `.cu`/`.cpp` sources are byte-identical across
-  the merge (`git diff 318cf9a6 HEAD -- src/cuda/sirius_dynamic_in_list_filter.cu
-  src/op/sirius_dynamic_filter.cpp src/op/scan/dynamic_filter_merge.cpp` is empty),
-  so this is a latent bug newly surfaced by the merged scan-distribution changes,
-  not a broken merge resolution.
-- **Not reproducible on a single-GPU box** (e.g. the GB10 dev machine): with one
-  active GPU, build and probe always share a device. A multi-GPU machine is
-  required to reproduce and to validate any fix.
+The fix gives every filter explicit device identity and records which
+device-local replicas are ready. Consumers select by their memory-space device
+ID; they never dereference remote filter storage. If a replica could not be
+created, that GPU skips the optional filter.
 
-### Where the illegal access surfaces
+The publication contract is still opportunistic:
 
-The CUDA error is asynchronous: the illegal read happens inside the cuco `contains`
-kernel launched by `compute_mask`, but is not detected until the next synchronizing
-call — the stream-compaction that applies the mask:
+- A scan never waits for a dynamic filter.
+- Splits that run before publication continue without it.
+- Splits that run after publication use their local replica.
+- A failed replica is skipped on that GPU; the authoritative join still
+  guarantees correctness.
 
-- `src/op/scan/dynamic_filter_merge.cpp:142` — `e.filter->compute_mask(probe, stream, mr)`
-  launches the cross-device `contains` kernel.
-- `src/op/scan/dynamic_filter_merge.cpp:80` — `cudf::apply_boolean_mask(current, mask->view(), stream, mr)`
-  (internally `cudf::copy_if`) is the sync point that reports `copy_if failed on 2nd step`.
+## Reproduction and diagnosis
 
-## Root cause
+The original integration reproducer was run with physical GPUs 1 and 2:
 
-The filter structures are device-local with no device tag:
-
-| Filter kind | Backing structure | Built where | Consumed where |
-|---|---|---|---|
-| IN-list (`sirius_dynamic_in_list_filter`) | `cuco::static_set` | build stream's GPU (`build_set`, `src/cuda/sirius_dynamic_in_list_filter.cu:65`) | `compute_mask` on the probe scan's stream/GPU (`...cu:146`, `set.ref(cuco::contains)` at `:160/:165`) |
-| Bloom (`sirius_dynamic_bloom_filter`) | `cuco::bloom_filter` | build stream's GPU (`src/cuda/sirius_dynamic_bloom_filter.cu`) | `compute_mask` on the probe scan's stream/GPU |
-| Zone-map (`sirius_dynamic_zone_map_filter`) | `cudf::scalar` min/max device bounds (`zone_map_entry`, `src/include/op/sirius_dynamic_filter.hpp:121`) | build side | referenced by the reader-side AST evaluated on the probe scan's GPU |
-
-Key facts that make this unfixable without device awareness:
-
-1. `sirius_mask_applicable::compute_mask(probe, stream, mr)`
-   (`src/include/op/sirius_dynamic_filter.hpp:202`) has **no device parameter** — the
-   device is only implicit in `stream`. Nothing checks that the set's device matches
-   `stream`'s device.
-2. The IN-list filter **does not retain the build keys** — it "builds its own
-   persistent set and does not retain the view" (`sirius_dynamic_filter.hpp:224`). So a
-   per-device set cannot be rebuilt from the filter alone as written.
-3. The filter is a single device-agnostic `shared_ptr<sirius_dynamic_filter const>`
-   in the channel (`sirius_dynamic_filter_set`, `sirius_dynamic_filter.hpp:346`), fanned
-   out to consumers on any device.
-
-### Why #996 does not cover it
-
-`e57c6d7a fix(mgpu): enforce partition device pin for cuco-backed operators (#996)`
-pins every **partition task** of a join (its build + probe) to the same real GPU via
-`preferred_device_id`, indexing the active-executor set (`task_creator::_active_gpu_ids`,
-`src/include/creator/task_creator.hpp:213`). That keeps a join's *own* cuco table on one
-device. But a dynamic filter is published by the build and consumed by **probe-side scan
-tasks**, which are *not* part of the join's partition and are distributed across GPUs by
-the scan load balancer. The build set therefore still gets touched cross-device.
-
-## Fix options
-
-### Option A — Disable dynamic filters when `num_gpus > 1` (recommended stopgap)
-
-Gate the feature off whenever more than one GPU is active. Correctness-safe (the join
-is authoritative; a dropped filter only forgoes pruning), tiny, and unblocks CI
-immediately. Cost: no dynamic-filter benefit on multi-GPU until Option B lands.
-
-Cleanest gate point — the plan-gen enable check, which already has `config` in scope
-and disables the whole feature (producer wiring + operator injection) before any set is
-built:
-
-- `src/planner/sirius_physical_plan_generator.cpp` — `dynamic_filter_pushdown_enabled(context)`
-  returns `state->get_config().get_operator_params().enable_dynamic_filter_pushdown`. Add
-  `&& state->get_config().get_hw_topology().num_gpus <= 1`. Do the same for the zone-map
-  enable check (`enable_dynamic_zone_map_filter`), since zone-map bounds have the same
-  cross-device hazard.
-
-```cpp
-bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
-{
-  auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!state) { return false; }
-  auto const& cfg = state->get_config();
-  // Phase-1 filters are device-local (cuco set / zone-map scalars built on the build
-  // GPU); on multi-GPU a probe scan on another device would dereference them
-  // cross-device. Disable until per-device replication (Option B) lands.
-  if (cfg.get_hw_topology().num_gpus > 1) { return false; }
-  return cfg.get_operator_params().enable_dynamic_filter_pushdown;
-}
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2 \
+  build/release/extension/sirius/test/cpp/sirius_unittest \
+  "gpu_execution - TPC-H Query 2 parquet"
 ```
 
-Confirm `get_hw_topology().num_gpus` reflects the **effective/active** GPU count used by
-execution (align with what `task_creator::_active_gpu_ids.size()` sees). A belt-and-suspenders
-runtime guard can also early-return from `sirius_physical_hash_join::push_build_side_dynamic_filters`
-(`src/op/sirius_physical_hash_join.cpp:1321`) once the active-GPU count is plumbed there.
+Before the fix, the two-GPU section failed with `cudaErrorIllegalAddress`; the
+single-GPU section passed. Q2 is a reliable trigger because its selective join
+builds publish membership filters while probe scan tasks are dispatched to both
+logical devices.
 
-### Option B — Per-device replication (the real multi-GPU fix; Phase 2)
+The unsafe ownership was:
 
-Keep the benefit on multi-GPU by making each filter hold one structure per active GPU
-and having `compute_mask` pick the one matching the probe stream's device.
+| Filter | Source storage | Pre-fix failure |
+|---|---|---|
+| IN-list | `cuco::static_set` slots | `contains` on GPU B read GPU A's slots |
+| Bloom | `cuco::bloom_filter` words | `contains` on GPU B read GPU A's words |
+| Zone map | min/max `cudf::scalar`s | GPU B's AST literal referenced GPU A storage |
 
-Design sketch:
+The error is reported by `cudf::apply_boolean_mask`/`copy_if`, but that is only
+the next synchronizing operation. The invalid access originates in the earlier
+membership or AST kernel.
 
-1. **Retain the source, not just the structure.** IN-list retains the build-key column
-   (small — bounded by the build cardinality, ≤ a few 100k INT keys). Bloom retains its
-   bit array (or the keys). Zone-map already retains host-derivable bounds; keep host
-   copies of min/max.
-2. **Per-device structure cache** inside each filter: `unordered_map<int device_id, structure>`
-   guarded by a `std::mutex`. Populate either
-   - **eagerly at publish** (`push_build_side_dynamic_filters`): loop over
-     `task_creator::_active_gpu_ids`, `cudaSetDevice`, copy the source to that device,
-     build the structure. The publish path already synchronizes before fan-out, so no
-     consumer observes a half-built map. Preferred — avoids lazy-build concurrency.
-   - or **lazily** on first `compute_mask` for a device, under the mutex.
-3. **`compute_mask` selects by current device**: read the device from `stream` (or
-   `cudaGetDevice`), look up (or build) that device's structure, then run the probe
-   kernel. Zone-map's `to_ast` similarly emits device scalars resident on the consumer's
-   device.
-4. Files: `src/cuda/sirius_dynamic_in_list_filter.cu`, `src/cuda/sirius_dynamic_bloom_filter.cu`,
-   the zone-map path in `src/op/sirius_dynamic_filter.cpp` + `...hpp` (add device-keyed
-   storage), and the publish path in `src/op/sirius_physical_hash_join.cpp`.
+### Hash-join broadcast research
 
-Estimated ~200–300 lines plus concurrency care. **Must be developed and validated on a
-multi-GPU machine** — the per-device path cannot be exercised on a single GPU.
+The current `BUILD_PROBE` implementation does **not** broadcast one cuco hash
+table to every GPU. Its build and probe tasks are pinned to one real GPU; other
+join modes distribute partitions and migrate/co-locate their data batches. A
+cuco hash table cannot be copied as an opaque object because its wrapper contains
+device pointers and allocator/stream state.
 
-### Option C — Pin filtered probe scans to the build GPU (not recommended)
+The useful pattern is the same one used when broadcasting other GPU state: copy
+a flat, finalized representation and reconstruct the pointer-bearing owner on
+the destination. Dynamic filters implement that pattern entirely in Sirius.
+They do not copy a cuco wrapper and do not call or modify CuCascade's
+representation-transfer code.
 
-Force scan tasks that consume a dynamic filter onto the build set's device. Preserves a
-single set, but serializes the probe scan of filtered tables onto one GPU (loses
-multi-GPU scan parallelism) and needs new scan-affinity wiring keyed on filter presence.
+## Implemented design
 
-## Reproduce & validate on a multi-GPU machine
+### 1. Freeze routing and placement in an immutable publish plan
 
-1. Config `num_gpus: 2` (integration suite uses `test/cpp/integration/integration.yaml`;
-   the failing case sets `num_gpus := 2`).
-2. Build and run the integration TPC-H target; Q2 is the reliable trigger:
-   ```bash
-   pixi run build/release/extension/sirius/test/cpp/sirius_unittest \
-     "gpu_execution - TPC-H Query 2 parquet"
-   ```
-   Before a fix: `copy_if failed on 2nd step: cudaErrorIllegalAddress`.
-   With Option A: filters disabled, query passes (verify via debug log that no
-   `Pushed N dynamic filter(s)` line appears when `num_gpus > 1`).
-   With Option B: query passes **and** debug logs still show `Pushed …` +
-   `apply_dynamic_filters … apply: X -> Y rows` with real pruning across both GPUs.
-3. Add a focused regression modeled on
-   `test/cpp/operator/test_partition_memspace_mgpu.cpp` (from #996): a small selective
-   build + large probe over ≥2 partitions, dynamic filters on, `num_gpus = 2`, asserting
-   GPU result == CPU reference. A pre-fix run illegal-accesses (aborts the binary); the
-   single-GPU control passes.
-4. Single-GPU A/B correctness gate for the feature itself (unaffected by this bug) is in
-   the memory note `tpch-ab-correctness-gate`.
+The planner creates a `dynamic_filter_publish_plan` before constructing the
+physical hash join. It contains:
 
-## References
+- every probe channel and its probe-column mapping;
+- whether zone maps may be emitted;
+- the build-key-domain estimate used by the publication gates; and
+- non-owning placement handles for the context's active GPU memory spaces.
 
-- Feature doc: [dynamic-filters.md](dynamic-filters.md); multi-GPU model:
-  [multi-gpu-architecture.md](multi-gpu-architecture.md).
-- Filters: `src/cuda/sirius_dynamic_in_list_filter.cu`,
-  `src/cuda/sirius_dynamic_bloom_filter.cu`,
-  `src/include/op/sirius_dynamic_filter.hpp`,
-  `src/op/scan/dynamic_filter_merge.cpp` (apply at `:80` / `:142`).
-- Publish path: `src/op/sirius_physical_hash_join.cpp:1321`
-  (`push_build_side_dynamic_filters`).
-- Device pinning precedent: `e57c6d7a` (#996); `task_creator::_active_gpu_ids`.
-- Enable gate: `src/planner/sirius_physical_plan_generator.cpp`
-  (`dynamic_filter_pushdown_enabled`).
-- CI: fail `28545289166` (post-merge, `num_gpus=2`); last green `27307838188` (pre-merge).
+Each `dynamic_filter_replica_space` is a non-null reference to one CuCascade
+`memory_space`; the plan validates the GPU tier and sorts/deduplicates by its
+actual device ID. The completed plan is moved into the hash join's
+`const _dynamic_filter_plan`. Runtime publication can observe that a channel has
+drained, but it cannot add targets, rediscover devices, or change policy. This
+also avoids assuming that active devices are numbered `0..N-1`, which matters
+with explicit GPU selections and `CUDA_VISIBLE_DEVICES` remapping.
+
+The handle is deliberately non-owning. The Sirius memory manager owns each
+space, its default allocator, and its CUDA stream pool. That manager must outlive
+the publish plan and every filter replica materialized from it; all GPU filter
+uses must finish before filter destruction. This was already required by the
+replicas' non-owning RMM allocator references. Carrying the memory space makes
+the allocator-and-stream lifetime contract explicit in the placement type.
+
+The exact-set/Bloom choice uses the minimum L2 size across the planned devices.
+A single replicated filter kind therefore fits the least-capable probe GPU
+rather than inheriting whichever GPU first queried `cudaDevAttrL2CacheSize`.
+
+### 2. Keep publication local and exactly once
+
+`dynamic_filter_publisher` is a translation-unit-local helper in
+`sirius_physical_hash_join.cpp`. It consumes the immutable plan, the join's key
+metadata, and one materialized build view; it is not a shared scheduler service
+or a mutable routing registry.
+
+Two data-bearing sites may offer that view:
+
+1. the build-port hook, as soon as the single concat-folded `BUILD_PROBE` build
+   batch arrives; and
+2. the hash-table `BUILT` transition, as a fallback.
+
+They arbitrate through a publication state machine independent of the hash-table
+build state:
+
+```text
+OPEN --claim--> PUBLISHING --success--> PUBLISHED
+                         `--exception--> FAILED
+OPEN --finalize without a claim-------> CLOSED
+```
+
+Only an `OPEN -> PUBLISHING` compare/exchange may claim the work. Finalization
+only closes an unclaimed window; it never manufactures a filter from released
+state. `op_state_mutex` protects the short eligibility/finalization checks, but
+is never held while reducing keys, building filters, copying replicas, or
+synchronizing CUDA work.
+
+At the early build-port site, a stream borrowed from the build memory space
+first waits on the build representation's writer event. The fallback also
+switches from the worker stream to a stream from that same durable pool after
+the hash-table build is drained. Persistent cuDF/cuCO filter storage may retain
+its allocation stream for eventual asynchronous deallocation, so it must not
+retain a worker stream whose executor can be torn down earlier. Publication
+remains independent of a probe batch and preserves the existing join task state
+machine.
+
+### 3. Expose replication as a producer-only capability
+
+Consumer semantics remain on `sirius_dynamic_filter`: kind, availability, AST
+lowering, and/or mask application. Device materialization is a separate
+`sirius_device_replicable` capability with
+`replicate_to_devices(span<dynamic_filter_replica_space const>)`. The local
+publisher passes the immutable plan's placements after construction and before
+channel fan-out; concrete filters retain completed replicas, not a second copy
+of routing policy. A missing capability is an invariant failure rather than a
+silent cross-device publication. Scan consumers never invoke it or know how a
+representation is copied.
+
+The publisher synchronizes the construction stream, invokes the capability for
+each built filter, and only then calls `push_filter`. A per-device replication
+failure is caught by the concrete filter and leaves that device unavailable;
+successful replicas may still be published. This preserves best-effort pruning
+without weakening the authoritative join.
+
+### 4. Build once, copy finalized storage
+
+The producer builds the source filter normally and synchronizes its construction
+stream once. It does not retain the build-key column and does not rebuild or
+rehash keys on every GPU.
+
+- **IN-list:** create an identical target `cuco::static_set`, verify its
+  capacity, then copy `capacity * sizeof(KeyT)` bytes from `static_set::data()`.
+- **Bloom:** create the same policy and block extent on the target, verify the
+  extent, then copy `block_extent * words_per_block * sizeof(word_type)` bytes.
+- **Zone map:** read each bound as its exact host type and construct target-owned
+  scalars. This preserves `INT64`, timestamp, decimal, and string semantics; it
+  does not round bounds through `double`.
+
+For every target, the planner pairs its GPU memory space with a NUMA-local HOST
+memory space (falling back to the first Sirius HOST space when topology is
+unknown). Replication selects the GPU and obtains both `acquire_stream()` and
+`get_default_allocator()` from that GPU space. The stream is a non-owning view
+into the space's managed stream pool; no persistent private stream is created.
+Local and peer-DMA copies are submitted to every target before the publisher
+waits on any target stream, so transfers to three or more GPUs can overlap. The
+publisher retains each destination object through this completion pass and adds
+it to the ready set only after its stream completes. Replica destruction selects
+the owning CUDA device and releases cuCO/scalar objects while both documented
+memory spaces are still alive.
+
+### 5. Use the Sirius-owned replica-transfer path
+
+`detail::enqueue_replica_copy` in
+`src/cuda/dynamic_filter_replica_transfer.cu` owns the byte-copy policy and
+returns the selected route:
+
+1. Sirius calls CuCascade's shared, cached empirical peer-DMA probe for the
+   ordered `(source, destination)` pair instead of maintaining a second probe.
+2. Matching CuCascade's established GPU-to-GPU converter, a verified pair uses
+   `cudaMemcpyPeerAsync` directly on the destination replica stream. Sirius
+   enables ordinary peer access once during context initialization; neither
+   converter performs a per-allocation memory-pool permission query. An
+   unexpected enqueue failure propagates instead of changing routes.
+3. Otherwise the adapter borrows the minimum number of pre-pinned fixed blocks
+   from the target's planned CuCascade
+   `fixed_size_host_memory_resource`. Because the blocks are noncontiguous, it
+   emits one copy descriptor per block but submits them as two driver batches:
+   D2H on a pooled stream acquired from the source GPU space, one source-stream
+   completion barrier, then H2D on the destination replica stream followed by a
+   destination-stream completion barrier. The two dependent legs cannot share
+   one CUDA batch. On toolkits before CUDA 12.8 the same descriptors fall back
+   to individual asynchronous copies. The borrowed blocks return to the pool
+   before the helper returns, matching CuCascade's converter lifetime policy.
+
+The dynamic-filter code never calls `cudaHostAlloc`/`cudaFreeHost` and does not
+modify CuCascade; it uses CuCascade's public probe and existing Sirius-owned HOST
+memory-space resource. Source writes are already complete before the helper is
+called. Local and peer-DMA routes return after enqueue; the concrete filter
+retains those replicas and synchronizes all target streams only after fan-out
+submission is complete. HOST staging completes inside the helper because its
+borrowed blocks cannot return to the pool while H2D DMA is in flight. Host-pool
+exhaustion or any transfer error omits only that optional device replica; the
+authoritative join remains unchanged.
+
+### 6. Publish one ready immutable snapshot
+
+The claimed publisher constructs and completes all possible replicas, then fans
+the same immutable logical filter into the planned channels. Consumers can
+therefore remain lock-light and never observe an in-flight replica as available.
+
+Publishing the source replica before remote replicas was deliberately rejected.
+It would save only the short compact-copy interval while introducing channel
+generations or per-device gate state: a scan on another GPU could otherwise
+observe the filter identity, find no local representation, and incorrectly
+train its opportunistic selectivity gate on a no-op.
+
+### 7. Select locally at the consumer
+
+The scan paths pass their memory-space device ID into dynamic-filter lowering and
+mask computation:
+
+- parquet AST merge selects device-local zone-map scalars;
+- post-decode membership apply selects the local static set/Bloom;
+- `is_available_on_device` is checked before either path.
+
+There is no remote kernel dereference and no consumer-side synchronization with
+the producer.
+
+The shared selectivity gate remains lock-free on `applicable()`. Only the rare
+post-mask decision update takes a small mutex and re-reads its state under that
+lock. This makes `ACTIVE` terminal: a stale unselective task from an older filter
+generation cannot race a selective task on another GPU and disable a filter
+already proven useful.
+
+## Why this is performant
+
+Publication adds `O(filter_size * (GPU_count - 1))` transfer work per join, not
+one rehash/rebuild per GPU. A verified pair uses one direct peer-DMA leg; only an
+unusable pair pays the portable D2H/H2D fallback. The steady-state probe remains
+entirely device-local: the exact set is selected to fit the smallest active L2
+where possible, and the Bloom stays the compact fallback. No key column is
+retained, no scan is pinned to the build GPU, and scan parallelism is unchanged.
+
+The copy happens on the producer path while probe scans remain free to run
+unfiltered. Direct copies to all peer-capable targets are enqueued before the
+completion pass, allowing their DMA legs to overlap on three or more GPUs.
+Waiting for replicas delays only publication, never scan execution. For a
+two-GPU query this is one remote replica per emitted filter.
+
+`memory_space::acquire_stream()` may return a pooled stream that already has
+work queued, so the publication wait can occasionally include earlier work on
+that stream. This is a cold-path head-of-line tradeoff, not a correctness or
+consumer-side barrier: the managed pool avoids per-filter stream
+creation/destruction, and scans continue opportunistically while publication is
+pending. The end-to-end A/B below includes this behavior.
+
+## Validation
+
+### Correctness and device ownership
+
+On physical NVIDIA GB200 GPUs 1 and 2 (`CUDA_VISIBLE_DEVICES=1,2`, exposed as
+logical devices 0 and 1):
+
+- Full dynamic-filter suite: **242 assertions in 66 test cases, all passed**.
+  This includes IN-list, Bloom, and zone-map remote replicas, the forced
+  fixed-HOST-pool route, and the concurrent sticky-ACTIVE gate regression.
+- Original TPC-H Q2 integration reproducer: **831 assertions, all passed**.
+- The release loadable extension and unit-test targets build successfully.
+
+The focused tests also verify that a pre-replication consumer on the remote GPU
+gets no mask (opportunistic skip), that replicas survive destruction of the
+borrowed build-key column, that Bloom replication has no false negatives, and
+that the explicit pinned-host fallback transfers the exact bytes. Their source
+and destination allocations use streams and allocators from a two-GPU Sirius
+memory manager, which is deliberately declared before—and destroyed after—the
+filters to exercise the documented pool-lifetime contract.
+
+### Performance
+
+The final measurement used SF300 parquet, grouped mode, physical GPUs 1 and 2,
+five iterations per query, and `--pin host`. Host pinning occurs outside the
+timed region. Zone maps were disabled, so this isolates membership-filter
+publication and application. The OFF and ON configurations differ materially
+only in `enable_dynamic_filter_pushdown` and their output paths.
+
+For each query, iteration 0 was discarded and the median of iterations 1-4 was
+taken. The global TPC-H metric is the sum of those 22 medians:
+
+| Two-GPU pinned-host SF300 | Dynamic filters off | Dynamic filters on | Improvement | Speedup |
+|---|---:|---:|---:|---:|
+| Sum of Q1-Q22 warm medians | 13.7013505 s | 8.2939465 s | **39.466212%** | **1.651970x** |
+
+Per-query medians:
+
+| Query | Off (s) | On (s) | Improvement |
+|---|---:|---:|---:|
+| Q1 | 0.5032265 | 0.4830505 | +4.009% |
+| Q2 | 0.3523525 | 0.1512455 | +57.076% |
+| Q3 | 0.6793430 | 0.5083335 | +25.173% |
+| Q4 | 0.3422540 | 0.2919185 | +14.707% |
+| Q5 | 0.7750700 | 0.4428915 | +42.858% |
+| Q6 | 0.2415565 | 0.2214595 | +8.320% |
+| Q7 | 0.8857810 | 0.4226995 | +52.279% |
+| Q8 | 0.9209665 | 0.5385575 | +41.523% |
+| Q9 | 1.6049180 | 0.5737445 | +64.251% |
+| Q10 | 0.8152175 | 0.5586015 | +31.478% |
+| Q11 | 0.2668315 | 0.1410555 | +47.137% |
+| Q12 | 0.4276590 | 0.3572310 | +16.468% |
+| Q13 | 0.3523750 | 0.3220650 | +8.602% |
+| Q14 | 0.2516855 | 0.2315255 | +8.010% |
+| Q15 | 0.2416645 | 0.2215090 | +8.340% |
+| Q16 | 0.2728810 | 0.2426490 | +11.079% |
+| Q17 | 1.4642370 | 0.4680155 | +68.037% |
+| Q18 | 0.9712030 | 0.4177245 | +56.989% |
+| Q19 | 0.5283170 | 0.5334245 | -0.967% |
+| Q20 | 0.3545820 | 0.2753625 | +22.342% |
+| Q21 | 1.2680195 | 0.7196875 | +43.243% |
+| Q22 | 0.1812100 | 0.1711950 | +5.527% |
+
+Both runs contain exactly 110 timing rows, and every ON/OFF `result.txt` pair is
+byte-identical. The requested global multi-GPU `>=10%` gate is exceeded by
+29.47 percentage points. This is an ON-vs-OFF result at a fixed two-GPU count in
+the warm pinned-host regime; it is not a one-to-two-GPU scaling or cold-storage
+claim. Q19 regresses 1.0%, so the gain is global rather than universal per query.
+
+## Code map
+
+- Filter API and device-aware ownership:
+  `src/include/op/sirius_dynamic_filter.hpp`
+- IN-list/Bloom storage replication:
+  `src/cuda/sirius_dynamic_in_list_filter.cu`,
+  `src/cuda/sirius_dynamic_bloom_filter.cu`
+- Exact typed zone-map replication:
+  `src/op/sirius_dynamic_filter.cpp`
+- Producer device discovery and publication:
+  `src/planner/sirius_plan_comparison_join.cpp`,
+  `src/op/sirius_physical_hash_join.cpp`
+- Consumer device selection:
+  `src/include/op/scan/dynamic_filter_gate.hpp`,
+  `src/op/scan/dynamic_filter_merge.cpp`,
+  `src/op/scan/parquet_gpu_ingestible.cpp`,
+  `src/op/scan/sirius_physical_dynamic_filter.cpp`
+- Sirius-owned replica-transfer policy:
+  `src/include/op/dynamic_filter_replica_transfer.hpp`,
+  `src/cuda/dynamic_filter_replica_transfer.cu`
+- Focused regression:
+  `test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp`,
+  `test/cpp/scan/test_dynamic_filter_merge.cpp`
