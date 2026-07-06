@@ -17,6 +17,7 @@ model! {
         task::TaskManagerLoopThread,
         task::ExecutorThread,
     },
+    analyzer: "sirius-telemetry-analyzer",
 }
 
 instrumentation!(Sirius);

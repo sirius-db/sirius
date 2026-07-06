@@ -339,7 +339,7 @@ One `gpu_pipeline_executor` exists per GPU device. It manages a thread pool for 
 
 ### Executor Class Hierarchy
 
-All executors (`gpu_pipeline_executor`, `downgrade_executor`, `duckdb_scan_executor`) inherit from `itask_executor`, which provides shared infrastructure: thread pool, task queue, `_running` flag, and `start/stop/schedule/drain_and_wait` lifecycle methods. Subclasses implement `manager_loop()` (required) and optional hooks `get_per_thread_init`, `on_start`, `on_stop`.
+`gpu_pipeline_executor` inherits from `itask_executor`, which provides shared infrastructure: thread pool, task queue, `_running` flag, and `start/stop/schedule/drain_and_wait` lifecycle methods. Subclasses implement `manager_loop()` (required) and optional hooks `get_per_thread_init`, `on_start`, `on_stop`.
 
 Concurrency is managed via `exec::bounded_thread_pool`, which uses a two-phase `reserve() -> pool.dispatch(slot, fn)` model with RAII slot release.
 
@@ -363,16 +363,19 @@ while running:
     1. thread_pool.reserve()              -- block until a worker slot is available (RAII)
     2. task_request_publisher.send()      -- tell pipeline executor we can accept work
     3. task_queue.pop()                   -- block until a task is available
-    4. memory_space.make_reservation()    -- reserve GPU memory for the task
-    5. task.set_reservation(reservation)  -- attach reservation to task
-    6. stream_pool.acquire_stream()       -- get a CUDA stream
-    7. thread_pool.dispatch(slot, lambda): -- dispatch to worker (slot released on completion)
+    4. clamp request to get_max_memory()  -- bound the history-based estimate by the space limit
+    5. memory_space.make_reservation()    -- reserve GPU memory for the task
+    6. task.set_reservation(reservation)  -- attach reservation to task
+    7. stream_pool.acquire_stream()       -- get a CUDA stream
+    8. thread_pool.dispatch(slot, lambda): -- dispatch to worker (slot released on completion)
          a. task.execute(stream)
          b. On OOM: retry (see below)
          c. On success: check query completion
          d. Schedule downstream consumers via task_creator
          e. Or: completion_handler.mark_completed()
 ```
+
+The reservation request size comes from the task's memory-history estimate (`peak_memory_estimate + bytes_to_materialize_input`). Before reserving, the manager loop clamps this request to the memory space's reservation limit (`memory_space::get_max_memory()`). The estimate can extrapolate far past GPU capacity — a small input that once drove a near-capacity peak yields a large `peak/estimated` ratio. An unclamped over-limit request would receive only a partial reservation from `make_reservation()`, while the predicate-based downgrade that follows requires reserving the **full** requested size, which the space can never grant — livelocking the task through the OOM-reschedule loop until the retry cap trips. Clamping to `get_max_memory()` loses no reservable memory (`make_reservation()` already caps there) and keeps both the reservation and the downgrade target achievable; per-batch overflow during execution is still handled by the OOM-reschedule + tiering path.
 
 ### Downstream Scheduling
 

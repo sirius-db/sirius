@@ -187,7 +187,8 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   };
 
   while (!ingestible.has_processed_all_metadata()) {
-    auto task = ingestible.next_split_provider(io_ctx_sp);
+    // A pin reads its fixed ingestible on the one ioctx it was given; route every file to it.
+    auto task = ingestible.next_split_provider([io_ctx_sp](std::string_view) { return io_ctx_sp; });
     if (!task) { continue; }
     auto info = task();
     if (!info) { continue; }

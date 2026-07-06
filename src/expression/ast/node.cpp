@@ -73,6 +73,11 @@ std::size_t node::cudf_ast_op_count() const
   return std::visit([](auto const& alt) { return alt.cudf_ast_op_count(); }, v);
 }
 
+logical_type node::return_type() const
+{
+  return std::visit([](auto const& alt) -> logical_type { return alt.return_type(); }, v);
+}
+
 reference const& require_reference(node const* n, std::string_view context)
 {
   if (n == nullptr) { throw_wrong_node_type(context, "non-null reference node"); }

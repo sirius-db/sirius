@@ -19,8 +19,8 @@
 #include "op/scan/owning_table_view.hpp"
 
 #include <expression/ast/from_duckdb.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
-#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
@@ -268,11 +268,15 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
 {
   auto const& bind = static_cast<parquet_ingestible_table_info const&>(table_info());
 
-  // Any non-trivial scan shape — reader-side projection, filter pushdown, or hive-partition
-  // injection — needs column names. Matches parquet_split_provider's ctor invariant.
+  // Any non-trivial scan shape — reader-side projection (incl. a pruned/reordered
+  // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
+  // case), filter pushdown, or hive-partition injection — needs column names.
+  // Matches parquet_split_provider's ctor invariant and build_scan_plan's
+  // needs_reader_projection trigger.
   bool const needs_names = !bind.projection_ids.empty() ||
                            (bind.table_filters && !bind.table_filters->filters.empty()) ||
-                           !bind.partition_indices.empty();
+                           !bind.partition_indices.empty() ||
+                           column_ids_need_reader_projection(bind.column_ids, bind.names.size());
   if (needs_names && bind.names.empty()) {
     throw sirius::internal_exception(
       "[parquet_gpu_ingestible] Projection, filter pushdown, or hive partitions "
@@ -329,18 +333,22 @@ bool parquet_gpu_ingestible::has_processed_all_metadata() const
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
-  std::shared_ptr<io::sirius_ioctx> io_ctx)
+  io::ioctx_resolver resolve)
 {
-  if (io_ctx == nullptr) {
-    throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired.");
-  }
+  if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
 
-  // One metadata-scan task per file. Row-group chunking and file bundling happen
-  // downstream in parquet_batch_coalescer.
-  return [this, file_path = _file_paths[idx], io_ctx = std::move(io_ctx)]()
-           -> std::unique_ptr<scan_info> { return build_file_scan_info(file_path, io_ctx); };
+  // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
+  // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
+  // per file; row-group chunking and file bundling happen downstream in
+  // parquet_batch_coalescer.
+  auto const& file_path = _file_paths[idx];
+  // The resolver returns a valid ioctx or throws if no backend supports the path.
+  auto io_ctx = resolve(file_path);
+  return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(file_path, io_ctx);
+  };
 }
 
 //===----------------------------------------------------------------------===//
@@ -632,12 +640,12 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // post_filter info. Apply the row filter first when pushdown did not, then
   // inject the partition columns and project to the output layout, so the
   // result is fully ROW_FILTERED_AND_PROJECTED and post_filter_and_project is
-  // skipped. `sirius_filter_ast` must outlive `exec` — the executor borrows it.
+  // skipped. `sirius_filter_ast` must outlive `exec` — the evaluator borrows it.
   if (_plan->has_partitions()) {
     owning_table_view view{std::move(table)};
     if (!ast_expression.has_value() && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-      sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
       auto const data_positions = output_data_positions(*_plan);
       view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
                                     : owning_table_view{exec.select(view.view(), data_positions)};
@@ -669,12 +677,12 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   // Apply the row filter post-decode when materialization did not — reader-side
   // pushdown was disabled (FLBA-decimal file) or AST translation failed. A
   // ROW_FILTERED / ROW_FILTERED_AND_PROJECTED state means the reader already
-  // applied it. `sirius_filter_ast` must outlive `exec` — the executor only
+  // applied it. `sirius_filter_ast` must outlive `exec` — the evaluator only
   // borrows the AST.
   if (input.state != filter_state::ROW_FILTERED &&
       input.state != filter_state::ROW_FILTERED_AND_PROJECTED && _duckdb_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-    sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
+    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
     auto const data_positions = output_data_positions(*_plan);
     auto filtered             = data_positions.empty() ? exec.select(input.table.view())
                                                        : exec.select(input.table.view(), data_positions);
