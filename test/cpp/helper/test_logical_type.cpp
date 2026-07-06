@@ -24,6 +24,7 @@
 #include "helper/logical_type.hpp"
 #include "helper/type_conversions.hpp"
 
+#include <duckdb/common/optional_idx.hpp>
 #include <duckdb/common/types.hpp>
 
 #include <stdexcept>
@@ -43,7 +44,7 @@ static const std::vector<type_id> k_all_type_ids = {
   type_id::UINTEGER,  type_id::UBIGINT,      type_id::UHUGEINT,      type_id::FLOAT,
   type_id::DOUBLE,    type_id::DATE,         type_id::TIMESTAMP_SEC, type_id::TIMESTAMP_MS,
   type_id::TIMESTAMP, type_id::TIMESTAMP_NS, type_id::VARCHAR,       type_id::STRUCT,
-  type_id::LIST,      type_id::SQLNULL,      type_id::INVALID,
+  type_id::LIST,      type_id::ARRAY,        type_id::SQLNULL,       type_id::INVALID,
   // DECIMAL tested separately via make_decimal()
 };
 
@@ -339,6 +340,115 @@ TEST_CASE("logical_type - operator== and operator!=", "[logical_type]")
 }
 
 // ============================================================================
+// ARRAY type (fixed-size list)
+// ============================================================================
+
+TEST_CASE("logical_type - make_array() stores child type and size", "[logical_type]")
+{
+  auto arr = logical_type::make_array(logical_type::make(type_id::INTEGER), 3);
+  REQUIRE(arr.id() == type_id::ARRAY);
+  REQUIRE(arr.is_array());
+  REQUIRE(arr.has_child());
+  REQUIRE(arr.array_size() == 3);
+  REQUIRE(arr.array_child() == logical_type::make(type_id::INTEGER));
+}
+
+TEST_CASE("logical_type - make_array() with size 0 means any size", "[logical_type]")
+{
+  // size 0 is the "any size" sentinel and must be stored verbatim, not rejected.
+  auto arr = logical_type::make_array(logical_type::make(type_id::DOUBLE), 0);
+  REQUIRE(arr.is_array());
+  REQUIRE(arr.array_size() == 0);
+  REQUIRE(arr.array_child() == logical_type::make(type_id::DOUBLE));
+}
+
+TEST_CASE("logical_type - make_array() supports nesting", "[logical_type]")
+{
+  // ARRAY of ARRAYs of INTEGER: the child is itself an array.
+  auto inner = logical_type::make_array(logical_type::make(type_id::INTEGER), 2);
+  auto outer = logical_type::make_array(inner, 4);
+  REQUIRE(outer.is_array());
+  REQUIRE(outer.array_size() == 4);
+  REQUIRE(outer.array_child().is_array());
+  REQUIRE(outer.array_child().array_size() == 2);
+  REQUIRE(outer.array_child().array_child() == logical_type::make(type_id::INTEGER));
+}
+
+TEST_CASE("logical_type - is_array() is false for every non-array type", "[logical_type]")
+{
+  for (auto id : k_all_type_ids) {
+    if (id == type_id::ARRAY) continue;  // Skip ARRAY itself
+    REQUIRE_FALSE(logical_type::make(id).is_array());
+  }
+  REQUIRE_FALSE(logical_type::make_decimal(10, 2).is_array());
+}
+
+TEST_CASE("logical_type - ARRAY is not fixed-width", "[logical_type]")
+{
+  REQUIRE_FALSE(logical_type::make_array(logical_type::make(type_id::INTEGER), 3).is_fixed_width());
+  REQUIRE_FALSE(logical_type::make(type_id::ARRAY).is_fixed_width());
+}
+
+TEST_CASE("logical_type - fixed_width_byte_size() throws for ARRAY", "[logical_type]")
+{
+  REQUIRE_THROWS(
+    logical_type::make_array(logical_type::make(type_id::INTEGER), 3).fixed_width_byte_size());
+}
+
+TEST_CASE("logical_type - array_child() throws when ARRAY has no child metadata", "[logical_type]")
+{
+  // An ARRAY built without make_array() (e.g. via make()) has no child and must throw
+  REQUIRE_FALSE(logical_type::make(type_id::ARRAY).has_child());
+  REQUIRE_THROWS(logical_type::make(type_id::ARRAY).array_child());
+}
+
+TEST_CASE("logical_type - to_string() formats ARRAY with size and child", "[logical_type]")
+{
+  REQUIRE(logical_type::make_array(logical_type::make(type_id::INTEGER), 3).to_string() ==
+          "INTEGER[3]");
+  // size 0 is DuckDB's unsized array form
+  REQUIRE(logical_type::make_array(logical_type::make(type_id::DOUBLE), 0).to_string() ==
+          "DOUBLE[ANY]");
+  // Nested arrays recurse through the child's to_string()
+  auto nested =
+    logical_type::make_array(logical_type::make_array(logical_type::make(type_id::BIGINT), 2), 4);
+  REQUIRE(nested.to_string() == "BIGINT[2][4]");
+}
+
+TEST_CASE("logical_type - ARRAY equality compares size and child recursively", "[logical_type]")
+{
+  auto int3 = logical_type::make_array(logical_type::make(type_id::INTEGER), 3);
+
+  // Identical arrays compare equal
+  REQUIRE(int3 == logical_type::make_array(logical_type::make(type_id::INTEGER), 3));
+
+  // Different size compares unequal
+  REQUIRE(int3 != logical_type::make_array(logical_type::make(type_id::INTEGER), 4));
+
+  // Different child type compares unequal
+  REQUIRE(int3 != logical_type::make_array(logical_type::make(type_id::BIGINT), 3));
+
+  // Nested arrays compare equal element-by-element
+  auto nested_a =
+    logical_type::make_array(logical_type::make_array(logical_type::make(type_id::INTEGER), 2), 4);
+  auto nested_b =
+    logical_type::make_array(logical_type::make_array(logical_type::make(type_id::INTEGER), 2), 4);
+  REQUIRE(nested_a == nested_b);
+
+  // Mismatch in the nested child size propagates to inequality.
+  auto nested_c =
+    logical_type::make_array(logical_type::make_array(logical_type::make(type_id::INTEGER), 5), 4);
+  REQUIRE(nested_a != nested_c);
+
+  // One side has child metadata, the other does not.
+  REQUIRE(int3 != logical_type::make(type_id::ARRAY));
+  REQUIRE(logical_type::make(type_id::ARRAY) != int3);
+
+  // ARRAY vs unrelated type.
+  REQUIRE(int3 != logical_type::make(type_id::INTEGER));
+}
+
+// ============================================================================
 // DuckDB boundary conversions
 // ============================================================================
 
@@ -440,4 +550,37 @@ TEST_CASE("type_conversions - from_duckdb_vec / to_duckdb_vec round-trip", "[log
 
   REQUIRE(recovered_types[0] == duckdb::LogicalType::INTEGER);
   REQUIRE(recovered_types[3] == duckdb::LogicalType::TIMESTAMP);
+}
+
+TEST_CASE("type_conversions - from_duckdb maps ARRAY to sirius ARRAY", "[logical_type]")
+{
+  using duckdb::LogicalType;
+
+  auto arr = sirius::from_duckdb(LogicalType::ARRAY(LogicalType::INTEGER, duckdb::optional_idx(3)));
+  REQUIRE(arr.id() == type_id::ARRAY);
+  REQUIRE(arr.array_size() == 3);
+  REQUIRE(arr.array_child().id() == type_id::INTEGER);
+}
+
+TEST_CASE("type_conversions - ARRAY round-trips through to_duckdb / from_duckdb", "[logical_type]")
+{
+  const std::vector<logical_type> array_types = {
+    logical_type::make_array(logical_type::make(type_id::INTEGER), 3),
+    logical_type::make_array(logical_type::make(type_id::DOUBLE), 1),
+    logical_type::make_array(logical_type::make(type_id::BIGINT), 16),
+    // Nested ARRAY of ARRAY.
+    logical_type::make_array(logical_type::make_array(logical_type::make(type_id::INTEGER), 2), 4),
+  };
+
+  for (const auto& t : array_types) {
+    auto duckdb_type   = sirius::to_duckdb(t);
+    auto round_tripped = sirius::from_duckdb(duckdb_type);
+    REQUIRE(round_tripped == t);
+  }
+}
+
+TEST_CASE("type_conversions - to_duckdb throws for ARRAY without child metadata", "[logical_type]")
+{
+  // An ARRAY missing its child type cannot be lowered back to DuckDB.
+  REQUIRE_THROWS(sirius::to_duckdb(logical_type::make(type_id::ARRAY)));
 }

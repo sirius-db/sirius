@@ -87,21 +87,15 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
   : context(context),
     sirius_iface(sirius_iface),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
-    query_group_uuid_(uuid::now_v7()),
-    query_group_observer_(quent::query_group::create_observer(telemetry_context_->context())),
     query_handle_(
       quent::query::create(telemetry_context_->context(),
                            quent::query::Init{
                              .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
-                             .query_group_id = query_group_uuid_,
+                             .query_group_id = telemetry_context_->query_group_id(),
                            }))
 {
-  // Declare the query group under this engine
-  query_group_observer_->declaration(query_group_uuid_,
-                                     quent::query_group::Declaration{
-                                       .instance_name = "default_group",
-                                       .engine_id     = telemetry_context_->engine_id(),
-                                     });
+  // The query group is session-scoped and owned by telemetry_context; every query in this
+  // context is reported under it (see telemetry_context::query_group_id).
 }
 
 sirius_engine::~sirius_engine() { query_handle_->exit(); }

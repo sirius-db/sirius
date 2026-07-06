@@ -18,7 +18,7 @@
 #include "op/scan/owning_table_view.hpp"
 
 #include <expression/ast/from_duckdb.hpp>
-#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/utils.hpp>
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
@@ -34,6 +34,7 @@
 
 // cudf
 #include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
@@ -245,7 +246,7 @@ bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 }
 
 duckdb_native_gpu_ingestible::metadata_scan_task_t
-duckdb_native_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioctx> io_ctx)
+duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 {
   auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _num_ranges) { return nullptr; }  // lost the race for the final range
@@ -253,6 +254,9 @@ duckdb_native_gpu_ingestible::next_split_provider(std::shared_ptr<io::sirius_ioc
   auto const rg_begin = idx * _chunk_row_groups;
   auto const rg_end   = std::min(rg_begin + _chunk_row_groups, _plan.n_row_groups);
 
+  // All ranges read the one `.duckdb` file; the resolver returns a valid ioctx or
+  // throws if no backend supports the path.
+  auto io_ctx = resolve(_info->db_path);
   // Runs on a scan-manager dispatcher thread:
   return [this, rg_begin, rg_end, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
     auto range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
@@ -329,13 +333,24 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   owning_table_view final_table;
   if (_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
-    sirius::gpu_expression_executor exec(sirius_filter_ast.get(), mr_ref, stream);
-    final_table = owning_table_view{exec.select(input.table.view())};
+    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+    if (projection_required) {
+      // Fold the projection into the filter gather so pure-filter columns are never materialized.
+      std::vector<cudf::size_type> output_indices(output_arity);
+      std::iota(output_indices.begin(), output_indices.end(), cudf::size_type{0});
+      final_table = owning_table_view{exec.select(input.table.view(), output_indices)};
+    } else {
+      // Nothing to project away, or output_arity == 0 (count(*)) — keep all columns.
+      final_table = owning_table_view{exec.select(input.table.view())};
+    }
   } else {
     final_table = std::move(input.table);
   }
 
   //===----------Projection----------===//
+  // No filter was applied, but pure-filter columns may still have been decoded (e.g. a pinned
+  // column-superset scan): drop the trailing columns. This is a no-op after the folded filter
+  // gather above, which already produced exactly output_arity columns.
   if (projection_required &&
       static_cast<std::size_t>(final_table.view().num_columns()) > output_arity) {
     std::vector<size_t> selected_cols(output_arity);

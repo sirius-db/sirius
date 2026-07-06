@@ -16,6 +16,10 @@
 
 #pragma once
 
+// sirius
+#include "helper/logical_type.hpp"  // sirius::logical_type
+#include "sirius/exception.hpp"     // sirius::not_implemented_exception, sirius::internal_exception
+
 // standard library
 #include <cstdint>
 #include <memory>
@@ -51,6 +55,23 @@ struct unary_op {
 
   kind op{kind::invalid};
   std::unique_ptr<node> child;
+
+  /// All supported unary operators (NOT, IS NULL, IS NOT NULL) produce a
+  /// BOOLEAN. op_try has no defined lowering yet, mirroring cudf_ast_op_count().
+  [[nodiscard]] sirius::logical_type return_type() const
+  {
+    switch (op) {
+      case kind::op_not:
+      case kind::op_is_null:
+      case kind::op_is_not_null: return sirius::logical_type::make(sirius::type_id::BOOLEAN);
+      case kind::op_try:
+        throw not_implemented_exception(
+          "[ast::unary_op::return_type] TRY operator is not implemented.");
+      default:
+        throw internal_exception("[ast::unary_op::return_type] unknown kind: {}",
+                                 static_cast<int>(op));
+    }
+  }
 
   std::size_t cudf_ast_op_count() const;
 };

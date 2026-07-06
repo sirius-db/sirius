@@ -110,18 +110,7 @@ pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
-# cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
-# as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
-# in the vcpkg installed lib dir, which isn't on the default linker search path.
-# Create an imported target so CMake resolves the bare name to the full path
-# instead of emitting -lnuma.
-if(VCPKG_BUILD)
-  add_library(numa STATIC IMPORTED)
-  set_target_properties(
-    numa
-    PROPERTIES IMPORTED_LOCATION
-               "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libnuma.a")
-endif()
+# cuCascade - GPU Memory Reservation Library (submodule)
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
@@ -195,6 +184,7 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
+    src/helper/list_offset_fixup.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
@@ -209,20 +199,20 @@ set(EXTENSION_SOURCES
     src/expression/join_condition.cpp
     src/expression/to_duckdb.cpp
     src/expression/value.cpp
-    src/expression_executor/expression_executor_strategy.cpp
-    src/expression_executor/ast_op_counter.cpp
-    src/expression_executor/gpu_expression_executor.cpp
-    src/expression_executor/gpu_expression_translator.cpp
-    src/expression_executor/regex/regex_playground.cpp
-    src/expression_executor/specializations/gpu_execute_between.cpp
-    src/expression_executor/specializations/gpu_execute_case.cpp
-    src/expression_executor/specializations/gpu_execute_cast.cpp
-    src/expression_executor/specializations/gpu_execute_comparison.cpp
-    src/expression_executor/specializations/gpu_execute_conjunction.cpp
-    src/expression_executor/specializations/gpu_execute_constant.cpp
-    src/expression_executor/specializations/gpu_execute_function.cpp
-    src/expression_executor/specializations/gpu_execute_operator.cpp
-    src/expression_executor/specializations/gpu_execute_reference.cpp
+    src/expression_evaluator/expression_evaluator_strategy.cpp
+    src/expression_evaluator/ast_op_counter.cpp
+    src/expression_evaluator/expression_evaluator.cpp
+    src/expression_evaluator/gpu_expression_translator.cpp
+    src/expression_evaluator/regex/regex_playground.cpp
+    src/expression_evaluator/specializations/between.cpp
+    src/expression_evaluator/specializations/case.cpp
+    src/expression_evaluator/specializations/cast.cpp
+    src/expression_evaluator/specializations/comparison.cpp
+    src/expression_evaluator/specializations/conjunction.cpp
+    src/expression_evaluator/specializations/constant.cpp
+    src/expression_evaluator/specializations/function.cpp
+    src/expression_evaluator/specializations/operator.cpp
+    src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
@@ -265,6 +255,7 @@ set(EXTENSION_SOURCES
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
+    src/op/scan/cpu_source_task.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/sirius_gpu_scan_operator_data.cpp
     src/op/scan/gpu_ingestible.cpp
@@ -477,14 +468,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(
-  sirius_extension
-  PkgConfig::NUMA
-  PkgConfig::LIBURING
-  PkgConfig::CURL
-  OpenSSL::Crypto
-  yaml-cpp::yaml-cpp
-  absl::any_invocable)
+target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
+                      PkgConfig::CURL OpenSSL::Crypto absl::any_invocable)
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto)
@@ -565,6 +550,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/exec/test_semi_future.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
@@ -574,13 +560,14 @@ set(TEST_SOURCES
     test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp
-    test/cpp/expression_executor/test_gpu_expression_executor.cpp
-    test/cpp/expression_executor/test_gpu_expression_executor_ast_equivalence.cpp
-    test/cpp/expression_executor/test_gpu_expression_translator.cpp
-    test/cpp/expression_executor/test_nonduckdb_frontend_proof.cpp
+    test/cpp/expression_evaluator/test_expression_evaluator.cpp
+    test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
+    test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
+    test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
+    test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -597,6 +584,7 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
@@ -643,7 +631,6 @@ set(TEST_SOURCES
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
-    # test/cpp/scan/test_duckdb_native_gpu_ingestible.cpp  # stale against redesigned gpu_ingestible interface and removed s3 ioctx
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
@@ -668,7 +655,13 @@ endif()
 # The testcontainers-backed S3 harness only compiles when its dependency is
 # built; unittest.cpp guards its use behind SIRIUS_HAVE_TESTCONTAINERS.
 if(SIRIUS_BUILD_S3_TESTS)
-  list(APPEND TEST_SOURCES test/cpp/utils/s3_container.cpp)
+  list(
+    APPEND
+    TEST_SOURCES
+    test/cpp/utils/s3_container.cpp
+    test/cpp/io/rest/test_rest_ioctx_integration.cpp
+    test/cpp/scan_manager/test_describe_parquet_s3.cpp
+    test/cpp/integration/test_s3_sql_surface.cpp)
 endif()
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are

@@ -64,6 +64,13 @@ struct duckdb_segment_descriptor {
   std::size_t bytes_size = 0;
 };
 
+/// Side note of metadata for ARRAY type
+/// data_segments:                 holds array-level validity segments (path [col, 0])
+/// validity_segments:             unused for ARRAY
+/// array_child_data_segments:     holds ARRAY child data segments (path [col, 1])
+///                                empty for non-ARRAY columns
+/// array_child_validity_segments: holds ARRAY child validity segments (path [col, 1, 0])
+///                                empty for non-ARRAY columns
 struct duckdb_column_metadata {
   duckdb::idx_t column_id;
   /// Sorted by `segment_start` ascending. Empty when `is_rowid`.
@@ -71,7 +78,10 @@ struct duckdb_column_metadata {
   /// Sorted by `segment_start` ascending. Empty when there is no validity
   /// column or when `is_rowid`.
   std::vector<duckdb_segment_descriptor> validity_segments;
+  std::vector<duckdb_segment_descriptor> array_child_data_segments;
+  std::vector<duckdb_segment_descriptor> array_child_validity_segments;
   bool is_rowid = false;
+  bool is_array = false;
 };
 
 struct duckdb_row_group_metadata {

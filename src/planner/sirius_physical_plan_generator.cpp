@@ -16,6 +16,7 @@
 
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -143,6 +144,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
                    duckdb::LogicalOperatorToString(op.type));
   op.estimated_cardinality                                      = op.EstimateCardinality(context);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = nullptr;
+
+  // SQLNULL-typed columns (e.g. an uncast NULL in VALUES) have no cuDF
+  // representation — get_cudf_type() / fixed_width_byte_size() reject them at
+  // execution time, after the GPU plan is already running. Reject the plan
+  // here instead so transparent execution falls back to DuckDB CPU.
+  for (const auto& type : op.types) {
+    if (duckdb::TypeVisitor::Contains(type, duckdb::LogicalTypeId::SQLNULL)) {
+      throw duckdb::NotImplementedException("SQLNULL-typed column not supported");
+    }
+  }
 
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET:

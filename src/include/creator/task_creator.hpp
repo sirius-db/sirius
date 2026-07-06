@@ -133,6 +133,15 @@ class task_creator {
   void drain_pending_tasks();
 
   /**
+   * @brief Signal query completion without draining.
+   *
+   * Safe to call from inside a pool thread (unlike drain_pending_tasks). Used by
+   * notify_downstream_pipelines when a terminal RESULT_COLLECTOR pipeline finishes
+   * with zero tasks — the normal gpu_pipeline_executor path is never reached.
+   */
+  void signal_query_complete();
+
+  /**
    * @brief Schedule a task creation info for processing.
    *
    * @param info The task creation info to schedule.
