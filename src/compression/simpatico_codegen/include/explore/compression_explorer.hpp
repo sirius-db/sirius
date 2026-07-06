@@ -10,7 +10,7 @@
 #include <cudf/column/column_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <string>
 #include <vector>
