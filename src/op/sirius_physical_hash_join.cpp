@@ -113,7 +113,9 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
 }
 
 static bool is_equality(sirius::comparison_type c)
-{ return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from; }
+{
+  return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
+}
 
 static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
                                                     rmm::cuda_stream_view stream)
@@ -461,7 +463,9 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
 
 void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& current,
                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
-{ sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this); }
+{
+  sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
+}
 
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
                                                       uint64_t build_side_bytes,
@@ -966,11 +970,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       }
       auto const& build_batch_ro  = input_batches[1];
       auto build_keys_result      = prepare_join_keys(build_batch_ro,
-                                                      right_key_col_indices,
-                                                      cast_necessary,
-                                                      key_casts,
-                                                      /*is_left_side=*/false,
-                                                      stream);
+                                                 right_key_col_indices,
+                                                 cast_necessary,
+                                                 key_casts,
+                                                 /*is_left_side=*/false,
+                                                 stream);
       cudf::table_view build_keys = build_keys_result.keys;
       {
         std::lock_guard<std::mutex> lg(op_state_mutex);
@@ -1015,11 +1019,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       // Hash table is built, we can process probe batches. The probe-side keys will be processed in
       // the same way as the mixed join path, but with an equality-only predicate.
       auto probe_keys_result      = prepare_join_keys(input_batches[0],
-                                                      left_key_col_indices,
-                                                      cast_necessary,
-                                                      key_casts,
-                                                      /*is_left_side=*/true,
-                                                      stream);
+                                                 left_key_col_indices,
+                                                 cast_necessary,
+                                                 key_casts,
+                                                 /*is_left_side=*/true,
+                                                 stream);
       cudf::table_view probe_keys = probe_keys_result.keys;
 
       left_full = get_cudf_table_view(input_batches[0]);
@@ -1101,17 +1105,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     // Mixed join: equality conditions drive the hash table; inequality conditions are evaluated
     // via a cuDF AST binary predicate on the full input tables.
     auto left_keys_result     = prepare_join_keys(input_batches[0],
-                                                  left_key_col_indices,
-                                                  cast_necessary,
-                                                  key_casts,
-                                                  /*is_left_side=*/true,
-                                                  stream);
+                                              left_key_col_indices,
+                                              cast_necessary,
+                                              key_casts,
+                                              /*is_left_side=*/true,
+                                              stream);
     auto right_keys_result    = prepare_join_keys(input_batches[1],
-                                                  right_key_col_indices,
-                                                  cast_necessary,
-                                                  key_casts,
-                                                  /*is_left_side=*/false,
-                                                  stream);
+                                               right_key_col_indices,
+                                               cast_necessary,
+                                               key_casts,
+                                               /*is_left_side=*/false,
+                                               stream);
     cudf::table_view left_eq  = left_keys_result.keys;
     cudf::table_view right_eq = right_keys_result.keys;
 
@@ -1136,24 +1140,24 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
     } else if (join_type == duckdb::JoinType::INNER) {
       auto result   = cudf::mixed_inner_join(left_eq,
-                                             right_eq,
-                                             left_full,
-                                             right_full,
-                                             pred->back(),
-                                             cudf::null_equality::UNEQUAL,
+                                           right_eq,
+                                           left_full,
+                                           right_full,
+                                           pred->back(),
+                                           cudf::null_equality::UNEQUAL,
                                              {},
-                                             stream);
+                                           stream);
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
     } else if (join_type == duckdb::JoinType::LEFT) {
       auto result   = cudf::mixed_left_join(left_eq,
-                                            right_eq,
-                                            left_full,
-                                            right_full,
-                                            pred->back(),
-                                            cudf::null_equality::UNEQUAL,
+                                          right_eq,
+                                          left_full,
+                                          right_full,
+                                          pred->back(),
+                                          cudf::null_equality::UNEQUAL,
                                             {},
-                                            stream);
+                                          stream);
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
     } else if (join_type == duckdb::JoinType::RIGHT) {
@@ -1167,24 +1171,24 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           "join");
       }
       auto result   = cudf::mixed_left_join(right_eq,
-                                            left_eq,
-                                            right_full,
-                                            left_full,
-                                            swapped_pred->back(),
-                                            cudf::null_equality::UNEQUAL,
+                                          left_eq,
+                                          right_full,
+                                          left_full,
+                                          swapped_pred->back(),
+                                          cudf::null_equality::UNEQUAL,
                                             {},
-                                            stream);
+                                          stream);
       right_indices = std::move(result.first);
       left_indices  = std::move(result.second);
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto result   = cudf::mixed_full_join(left_eq,
-                                            right_eq,
-                                            left_full,
-                                            right_full,
-                                            pred->back(),
-                                            cudf::null_equality::UNEQUAL,
+                                          right_eq,
+                                          left_full,
+                                          right_full,
+                                          pred->back(),
+                                          cudf::null_equality::UNEQUAL,
                                             {},
-                                            stream);
+                                          stream);
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
     } else if (join_type == duckdb::JoinType::SEMI) {
@@ -1245,17 +1249,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     left_full                   = get_cudf_table_view(input_batches[0]);
     right_full                  = get_cudf_table_view(input_batches[1]);
     auto left_keys_result       = prepare_join_keys(input_batches[0],
-                                                    left_key_col_indices,
-                                                    cast_necessary,
-                                                    key_casts,
-                                                    /*is_left_side=*/true,
-                                                    stream);
+                                              left_key_col_indices,
+                                              cast_necessary,
+                                              key_casts,
+                                              /*is_left_side=*/true,
+                                              stream);
     auto right_keys_result      = prepare_join_keys(input_batches[1],
-                                                    right_key_col_indices,
-                                                    cast_necessary,
-                                                    key_casts,
-                                                    /*is_left_side=*/false,
-                                                    stream);
+                                               right_key_col_indices,
+                                               cast_necessary,
+                                               key_casts,
+                                               /*is_left_side=*/false,
+                                               stream);
     cudf::table_view left_keys  = left_keys_result.keys;
     cudf::table_view right_keys = right_keys_result.keys;
 

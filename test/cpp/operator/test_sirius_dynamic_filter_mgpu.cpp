@@ -82,10 +82,10 @@ std::unique_ptr<cudf::column> make_values(std::vector<T> const& values,
                                           rmm::cuda_stream_view stream)
 {
   auto col       = cudf::make_numeric_column(type,
-                                             static_cast<cudf::size_type>(values.size()),
-                                             cudf::mask_state::UNALLOCATED,
-                                             stream,
-                                             cudf::get_current_device_resource_ref());
+                                       static_cast<cudf::size_type>(values.size()),
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       cudf::get_current_device_resource_ref());
   auto const err = cudaMemcpyAsync(col->mutable_view().data<T>(),
                                    values.data(),
                                    values.size() * sizeof(T),
@@ -336,10 +336,10 @@ TEST_CASE("Bloom replica built on GPU 0 has no false negatives on GPU 1",
     auto const& build_space = replica_spaces.front().get_gpu_space();
     auto const stream       = build_space.acquire_stream();
     auto keys               = cudf::sequence(1024,
-                                             cudf::numeric_scalar<std::int64_t>(0, true, stream),
-                                             cudf::numeric_scalar<std::int64_t>(1, true, stream),
-                                             stream,
-                                             build_space.get_default_allocator());
+                               cudf::numeric_scalar<std::int64_t>(0, true, stream),
+                               cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                               stream,
+                               build_space.get_default_allocator());
     filter                  = std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(
       keys->view(), stream, build_space.get_default_allocator());
     stream.synchronize();
@@ -404,10 +404,10 @@ TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
     auto const stream = cudf::get_default_stream();
     auto probe        = cudf::sequence(10,
-                                       cudf::numeric_scalar<std::int64_t>(0, true, stream),
-                                       cudf::numeric_scalar<std::int64_t>(1, true, stream),
-                                       stream,
-                                       cudf::get_current_device_resource_ref());
+                                cudf::numeric_scalar<std::int64_t>(0, true, stream),
+                                cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                                stream,
+                                cudf::get_current_device_resource_ref());
     std::vector<cudf::column_view> columns{probe->view()};
     cudf::table_view input{columns};
 

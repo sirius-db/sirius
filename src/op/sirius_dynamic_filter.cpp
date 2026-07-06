@@ -46,12 +46,16 @@ namespace {
 cudf::ast::expression const& and_join(cudf::ast::tree& tree,
                                       cudf::ast::expression const& lhs,
                                       cudf::ast::expression const& rhs)
-{ return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_AND, lhs, rhs); }
+{
+  return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_AND, lhs, rhs);
+}
 
 cudf::ast::expression const& or_join(cudf::ast::tree& tree,
                                      cudf::ast::expression const& lhs,
                                      cudf::ast::expression const& rhs)
-{ return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_OR, lhs, rhs); }
+{
+  return tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_OR, lhs, rhs);
+}
 
 template <typename ScalarT>
 auto scalar_value_to_host(cudf::scalar const& source,
@@ -481,7 +485,9 @@ void sirius_dynamic_filter_set::set_consumer_column_remap(std::vector<std::size_
 }
 
 void sirius_dynamic_filter_set::register_producer()
-{ _producer_count.fetch_add(1, std::memory_order_release); }
+{
+  _producer_count.fetch_add(1, std::memory_order_release);
+}
 
 void sirius_dynamic_filter_set::close_for_new_filters()
 {

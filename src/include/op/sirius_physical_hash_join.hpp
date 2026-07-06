@@ -76,12 +76,18 @@ class dynamic_filter_publish_plan final {
 
   [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
   [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
-  { return _probe_targets; }
+  {
+    return _probe_targets;
+  }
   [[nodiscard]] bool emit_zone_map_filters() const noexcept { return _emit_zone_map_filters; }
   [[nodiscard]] std::size_t build_key_domain_cardinality() const noexcept
-  { return _build_key_domain_cardinality; }
+  {
+    return _build_key_domain_cardinality;
+  }
   [[nodiscard]] std::vector<dynamic_filter_replica_space> const& replica_spaces() const noexcept
-  { return _replica_spaces; }
+  {
+    return _replica_spaces;
+  }
 
   /// Fraction of the key-domain proxy a build may cover and still publish.
   static constexpr double k_domain_coverage_threshold = 0.5;
@@ -206,7 +212,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   /// @brief True when plan construction wired at least one dynamic-filter consumer.
   [[nodiscard]] bool publishes_dynamic_filters() const noexcept
-  { return _dynamic_filter_plan.enabled(); }
+  {
+    return _dynamic_filter_plan.enabled();
+  }
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;

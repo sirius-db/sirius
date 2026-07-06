@@ -37,10 +37,14 @@ class dynamic_filter_replica_space final {
   }
 
   [[nodiscard]] cucascade::memory::memory_space const& get_gpu_space() const noexcept
-  { return _gpu_space.get(); }
+  {
+    return _gpu_space.get();
+  }
 
   [[nodiscard]] cucascade::memory::memory_space const& get_host_staging_space() const noexcept
-  { return _host_staging_space.get(); }
+  {
+    return _host_staging_space.get();
+  }
 
  private:
   std::reference_wrapper<cucascade::memory::memory_space const> _gpu_space;

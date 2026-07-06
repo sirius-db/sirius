@@ -197,7 +197,9 @@ struct sirius_dynamic_bloom_filter::impl {
 };
 
 bool sirius_dynamic_bloom_filter::supports(cudf::data_type t) noexcept
-{ return t.id() == cudf::type_id::INT32 || t.id() == cudf::type_id::INT64; }
+{
+  return t.id() == cudf::type_id::INT32 || t.id() == cudf::type_id::INT64;
+}
 
 std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) noexcept
 {
@@ -319,10 +321,14 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
 }
 
 bool sirius_dynamic_bloom_filter::is_available_on_device(int device_id) const noexcept
-{ return _impl && _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) != nullptr; }
+{
+  return _impl && _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) != nullptr;
+}
 
 std::size_t sirius_dynamic_bloom_filter::replica_count() const noexcept
-{ return _impl ? _impl->replicas.size() : 0; }
+{
+  return _impl ? _impl->replicas.size() : 0;
+}
 
 std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   cudf::column_view const& probe,

@@ -114,7 +114,9 @@ set_owner<KeyT> build_set(cudf::column_view const& keys,
 template <class KeyT>
 struct equals_sentinel {
   __device__ __forceinline__ bool operator()(KeyT const& k) const noexcept
-  { return k == cuda::std::numeric_limits<KeyT>::min(); }
+  {
+    return k == cuda::std::numeric_limits<KeyT>::min();
+  }
 };
 
 template <class KeyT, class SetRef>
@@ -301,10 +303,14 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
 }
 
 bool sirius_dynamic_in_list_filter::is_available_on_device(int device_id) const noexcept
-{ return _set && _set->find(detail::resolve_dynamic_filter_device_id(device_id)) != nullptr; }
+{
+  return _set && _set->find(detail::resolve_dynamic_filter_device_id(device_id)) != nullptr;
+}
 
 std::size_t sirius_dynamic_in_list_filter::replica_count() const noexcept
-{ return _set ? _set->replicas.size() : 0; }
+{
+  return _set ? _set->replicas.size() : 0;
+}
 
 std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   cudf::column_view const& probe,
