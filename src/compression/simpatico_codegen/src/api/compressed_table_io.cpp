@@ -355,7 +355,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   return reconstruct_representation(cname, names, std::move(cols), stream, mr, err, ld.meta);
 }
 
-static constexpr std::uint8_t kVersion = 8;
+static constexpr std::uint8_t kVersion = 9;
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -443,6 +443,7 @@ static bool read_node(Reader& r, PlanNode& node)
 struct ColRecord {
   std::string name;
   std::uint8_t dtype_tag = 0;
+  std::int32_t scale     = 0;  // fixed-point scale for the column dtype (0 otherwise)
   std::int64_t num_rows  = 0;
   PlanTree tree;
   std::vector<leaf_desc> leaf_descs;
@@ -465,7 +466,7 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     return bad("not a HPLN file");
   std::uint8_t ver;
   if (!r.read_u8(ver)) return bad("truncated header");
-  if (ver != kVersion) return bad("unsupported version " + std::to_string(ver) + " (expected 8)");
+  if (ver != kVersion) return bad("unsupported version " + std::to_string(ver) + " (expected 9)");
 
   std::uint16_t num_cols;
   if (!r.read_u16le(num_cols)) return bad("truncated header");
@@ -476,6 +477,7 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     auto& cr = out[ci];
     if (!r.read_str16(cr.name)) return bad("truncated col name");
     if (!r.read_u8(cr.dtype_tag)) return bad("truncated col dtype");
+    if (!r.read_i32le(cr.scale)) return bad("truncated col scale");
     if (!r.read_i64le(cr.num_rows)) return bad("truncated col num_rows");
 
     std::uint16_t nn;
@@ -545,7 +547,11 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
     auto& out_col = result.columns[ci];
 
     if (!cr.name.empty()) out_col.name = cr.name;
-    out_col.dtype    = tag_to_dtype(cr.dtype_tag);
+    auto const dtype_id = tag_to_dtype(cr.dtype_tag).id();
+    out_col.dtype = (dtype_id == cudf::type_id::DECIMAL32 || dtype_id == cudf::type_id::DECIMAL64 ||
+                     dtype_id == cudf::type_id::DECIMAL128)
+                      ? cudf::data_type{dtype_id, cr.scale}
+                      : cudf::data_type{dtype_id};
     out_col.num_rows = cr.num_rows;
 
     if (cr.tree.nodes.empty()) continue;  // column stored without a plan
@@ -702,6 +708,7 @@ std::string build_compressed_table_header(compressed_table const& table,
 
     push_str16(hdr, col.name.value_or(std::string{}));
     push_u8(hdr, dtype_to_tag(col.dtype));
+    push_i32le(hdr, col.dtype.scale());  // fixed-point scale (0 for non-decimal)
     push_i64le(hdr, col.num_rows);
 
     // Structural plan tree (identical layout to the file header, so the same

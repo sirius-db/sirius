@@ -7,6 +7,11 @@
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/util/stream_pool.hpp"
 
+#include <cudf/column/column.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <rmm/device_buffer.hpp>
+
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -162,6 +167,29 @@ inline compressed_table compress_columns_parallel(cudf::table_view table,
   return out;
 }
 
+// Restore a decoded column's logical type when it differs from the stored column
+// dtype only in interpretation of identical bits (same physical width) — e.g. the
+// INT64 storage a codec produced for a DECIMAL64 column back to DECIMAL64 with its
+// scale. The codecs run on the underlying integer storage of fixed-point columns,
+// so the bytes are already correct; this only re-tags the column. A no-op when the
+// types already match.
+inline std::unique_ptr<cudf::column> apply_stored_dtype(std::unique_ptr<cudf::column> col,
+                                                        cudf::data_type stored)
+{
+  if (!col || col->type() == stored) return col;
+  if (!cudf::is_fixed_width(col->type()) || !cudf::is_fixed_width(stored) ||
+      cudf::size_of(col->type()) != cudf::size_of(stored)) {
+    return col;
+  }
+  auto const n  = col->size();
+  auto const nc = col->null_count();
+  auto contents = col->release();
+  rmm::device_buffer null_mask =
+    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
+  return std::make_unique<cudf::column>(
+    stored, n, std::move(*contents.data), std::move(null_mask), nc, std::move(contents.children));
+}
+
 inline std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const& table,
                                                                 simpatico::stream_pool& pool,
                                                                 rmm::device_async_resource_ref mr)
@@ -190,7 +218,7 @@ inline std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table
           if (!failed.exchange(true)) err_msg = err;
           continue;
         }
-        cols[i] = std::move(col);
+        cols[i] = apply_stored_dtype(std::move(col), table.columns[i].dtype);
       }
     });
   }

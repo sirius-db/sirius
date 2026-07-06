@@ -504,6 +504,65 @@ TEST_CASE("pin_table compression - pinned column subset selects matching plan bl
   fs::remove_all(tmp);
 }
 
+TEST_CASE("pin_table compression - decimal columns round-trip with scale restored",
+          "[compression][pin_table][isolated_context]")
+{
+  if (!has_gpu()) {
+    WARN("Compression test requires a GPU — skipping");
+    return;
+  }
+
+  auto tmp = make_comp_tmp("decimal");
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+  auto yaml_path = tmp / "comp.yaml";
+  write_compression_yaml(yaml_path);
+
+  // A DECIMAL(15,2) column is physically INT64 (unscaled) + scale; the integer
+  // codecs compress that storage losslessly and the scale is restored on decode.
+  //   SUM(k) = 0+1+...+4999                       = 12497500
+  //   d      = (range % 100) * 0.25 (2 d.p.)      -> SUM(d) = 50*4950*0.25 = 61875.00
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT range AS k, ((range % 100) * 0.25)::DECIMAL(15,2) AS d FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+
+  // Integer codegen ops — valid for INT64 and, via storage reinterpret, for DECIMAL64.
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir,
+                  "t_dec",
+                  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n"
+                  "input -> delta -> differences\n");
+  REQUIRE_FALSE(
+    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
+      ->HasError());
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_dec');");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  const std::string select_sql = "SELECT SUM(k), SUM(d) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
+  // The decimal sum must come back with the correct scale (61875.00, not 6187500).
+  REQUIRE(res->GetValue(1, 0).ToString() == "61875.00");
+
+  REQUIRE_FALSE(con.Query("CALL unpin_table('t_dec');")->HasError());
+
+  fs::remove_all(tmp);
+}
+
 TEST_CASE("pin_table compression - fallback when no plan file for table",
           "[compression][pin_table][isolated_context]")
 {

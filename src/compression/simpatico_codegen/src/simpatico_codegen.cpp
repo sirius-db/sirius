@@ -188,7 +188,8 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
   cols.reserve(table.num_columns());
   for (auto const& col : table.columns) {
     if (!col.compound) throw plan_error("compressed_table column missing compound");
-    cols.push_back(simpatico::decompress(*col.compound, stream, mr));
+    cols.push_back(
+      detail::apply_stored_dtype(simpatico::decompress(*col.compound, stream, mr), col.dtype));
   }
   return std::make_unique<cudf::table>(std::move(cols));
 }

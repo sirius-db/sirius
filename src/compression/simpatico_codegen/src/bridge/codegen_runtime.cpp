@@ -1247,17 +1247,30 @@ bool jit_encode_subtree(PlanTree const& tree,
                         std::string* error_out,
                         CodegenHead* head_out)
 {
-  const char* dtype = nullptr;
+  // Fixed-point columns are physically their storage integer (DECIMAL32 -> INT32,
+  // DECIMAL64 -> INT64); the codecs run losslessly on those bits. We encode/decode
+  // as the storage integer and restore the DECIMAL type (and scale) from the stored
+  // column dtype at the end of decompress (see apply_stored_dtype).
+  const char* dtype             = nullptr;
+  cudf::type_id storage_type_id = input_col.type().id();
   switch (input_col.type().id()) {
     case cudf::type_id::INT32: dtype = "int32"; break;
     case cudf::type_id::INT64: dtype = "int64"; break;
     case cudf::type_id::FLOAT32: dtype = "float32"; break;
     case cudf::type_id::FLOAT64: dtype = "float64"; break;
+    case cudf::type_id::DECIMAL32:
+      dtype           = "int32";
+      storage_type_id = cudf::type_id::INT32;
+      break;
+    case cudf::type_id::DECIMAL64:
+      dtype           = "int64";
+      storage_type_id = cudf::type_id::INT64;
+      break;
     default: return false;  // non-fusable type
   }
   const char* cxx_dtype = dtype_to_cxx(dtype);
   if (cxx_dtype == nullptr) return false;  // shouldn't happen, but guard
-  const cudf::data_type original_type{input_col.type().id()};
+  const cudf::data_type original_type{storage_type_id};
 
   if (start_node >= tree.nodes.size()) return false;
 

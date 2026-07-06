@@ -142,6 +142,11 @@ inline constexpr std::pair<cudf::type_id, std::uint8_t> kTypeTags[] = {
   {cudf::type_id::FLOAT32, 8},
   {cudf::type_id::FLOAT64, 9},
   {cudf::type_id::STRING, 10},
+  // Fixed-point types. Their scale is not captured by the tag alone (it is
+  // serialized alongside the column dtype); tag_to_dtype returns scale 0.
+  {cudf::type_id::DECIMAL32, 11},
+  {cudf::type_id::DECIMAL64, 12},
+  {cudf::type_id::DECIMAL128, 13},
 };
 
 inline std::uint8_t dtype_to_tag(cudf::data_type dt) noexcept
