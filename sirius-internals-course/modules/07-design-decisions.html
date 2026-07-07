@@ -1,7 +1,7 @@
-<section class="module" id="module-6" style="background: var(--color-bg-warm)">
+<section class="module" id="module-7" style="background: var(--color-bg-warm)">
   <div class="module-content">
     <header class="module-header animate-in">
-      <span class="module-number">06</span>
+      <span class="module-number">07</span>
       <h1 class="module-title">Design Decisions</h1>
       <p class="module-subtitle">Half of Sirius's design looks over-engineered until you learn which outage or rewrite produced it. Here are the receipts.</p>
     </header>
@@ -164,16 +164,10 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/sirius_pipeline.cpp · L427-436</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/sirius_pipeline.cpp#L427-L436" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp · L427-436 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-line"><span class="code-keyword">void</span> sirius_pipeline::<span class="code-function">mark_task_completed</span>()</span>
 <span class="code-line">{</span>
-<span class="code-line">  <span class="code-comment">// Sanity check: a task is completing here, which means this pipeline was still</span></span>
-<span class="code-line">  <span class="code-comment">// running work. If the pipeline was already marked finished, or any of its</span></span>
-<span class="code-line">  <span class="code-comment">// operators were already finalized, then we declared the pipeline done too</span></span>
-<span class="code-line">  <span class="code-comment">// early — i.e. a task was still in flight when we considered the pipeline</span></span>
-<span class="code-line">  <span class="code-comment">// complete. That mismatch can make the whole query look done while work is</span></span>
-<span class="code-line">  <span class="code-comment">// still running, so surface it loudly.</span></span>
+<span class="code-doc"><span class="doc-p">Sanity check: a task is completing here, which means this pipeline was still running work. If the pipeline was already marked finished, or any of its operators were already finalized, then we declared the pipeline done too early — i.e. a task was still in flight when we considered the pipeline complete. That mismatch can make the whole query look done while work is still running, so surface it loudly.</span></span>
 <span class="code-line">  <span class="code-keyword">const</span> <span class="code-keyword">bool</span> pipeline_was_finished = pipeline_finished.<span class="code-function">load</span>();</span>
 <span class="code-line">  std::string finalized_ops;</span>
             </code></pre>

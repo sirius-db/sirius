@@ -1,0 +1,280 @@
+<section class="module" id="module-4" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">04</span>
+      <h1 class="module-title">Where Data Comes From</h1>
+      <p class="module-subtitle">Module 3 hand-waved a whole subsystem: &ldquo;the scan executor produces batches.&rdquo; Produced from <em>what</em>? Here&rsquo;s the machinery between a file path and a GPU-resident batch.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: Hero — path to batch ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The quarry that feeds the crusher</h2>
+        <p>Think of a quarry: surveyors mark the seams (metadata walk &rarr; <span class="term" data-definition="One schedulable unit of scan work — e.g. a batch of parquet row groups, or byte ranges of a .duckdb file. Created by a split provider on a CPU thread; consumed one at a time by scan operator tasks.">splits</span>), a blasting schedule decides load sizes (split providers), and a conveyor with a buffer bin (the IO framework) keeps the crusher — GPU decode — fed. The design goal of everything below: <strong>the crusher never waits on the quarry.</strong></p>
+
+        <div style="border: 1px dashed var(--color-border); border-radius: 12px; padding: 14px 16px; margin: var(--space-4) 0 0;">
+          <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">Storage / IO zone</div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="Where table bytes live before Sirius touches them: local parquet, native .duckdb storage, or s3:// objects. (Iceberg support landed in #521 but its GPU scan path is currently non-functional — see its card below.) Everything below exists to turn these into cudf tables without stalling the GPU."><strong>Storage</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);">parquet &middot; .duckdb &middot; s3://</span>
+          </div>
+          <div style="text-align: center; color: var(--color-text-muted); padding: 6px 0;">&darr; &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); color: var(--color-accent); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono);">&#11044; byte ranges</span></div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="The byte-serving layer: a datasource abstracts one storage backend (local file, S3 object), and the IO framework underneath overlaps reads with decode — io_uring reactor threads submit async reads, a pinned-host prefetching cache stages ranges ahead of the decoder, and admission control caps in-flight I/O. Owned by src/io/."><strong>datasource + IO framework</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="Linux's async I/O interface. The reactor (src/io/uring/uring_reactor.cpp) submits and completes reads on dedicated threads — no thread-per-file, no blocking read() in the scan path.">io_uring reactor</span> &middot; <span class="term" data-definition="A pinned-host-memory cache (src/io/cache/prefetching_cache.cpp) that reads ahead of the decoder, so GPU decode finds its bytes already staged in DMA-ready host memory.">pinned prefetch cache</span> &middot; <span class="term" data-definition="The gate that limits how much I/O may be in flight at once, so aggressive prefetching can't exhaust pinned memory or drown the reactor.">admission control</span></span>
+            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/io">src/io/ &#8599;</a></div>
+          </div>
+        </div>
+
+        <div style="text-align: center; color: var(--color-text-muted); padding: 6px 0;">&darr; <span style="font-size: 12px;">metadata walk (control)</span></div>
+
+        <div style="background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: 14px 16px;">
+          <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">CPU zone</div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="The CPU-side coordinator (src/scan_manager/sirius_scan_manager.cpp) that owns split providers and connectors, and balances splits across consumers/GPUs. Runs on CPU producer threads — never touches device memory."><strong>Scan Manager</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="Per-format planner (src/scan_manager/split_provider.cpp) that walks storage metadata and pushes splits into the connector. The 'blasting schedule': it decides the size and shape of each unit of scan work.">split provider</span> &rarr; <span class="term" data-definition="The bounded queue (src/scan_manager/split_connector.cpp) between providers and the scan operator, with close-then-drain EOS semantics and exception carrying. The contract you're about to read.">split_connector</span></span> &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono); color: var(--color-text-secondary);">&#8779; streams</span>
+            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager">src/scan_manager/ &#8599;</a></div>
+          </div>
+        </div>
+
+        <div style="text-align: center; color: var(--color-text-muted); padding: 6px 0;">&darr; &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); color: var(--color-accent); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono);">&#11044; split</span></div>
+
+        <div style="background: var(--color-accent-light); border: 1px solid var(--color-accent-muted); border-radius: 12px; padding: 14px 16px;">
+          <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">GPU zone</div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="The one scan operator (src/op/scan/sirius_gpu_scan_operator.cpp). Its tasks pull splits from the connector and hand each to a gpu_ingestible decoder, which produces a cudf table on the GPU."><strong>scan operator</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="The pluggable decoder interface (src/op/scan/gpu_ingestible.cpp): given one split, produce one cudf table on device. The parquet and DuckDB-native decoders implement it (#871) — the scan operator doesn't know which. S3 plugs in one layer below as a datasource; Iceberg landed as its own ICEBERG_SCAN operator on the parquet machinery, but that path is currently non-functional (stale against the new IO interface).">gpu_ingestible</span> decode</span> &nbsp;<span class="term" data-definition="get_next_split() blocks the scan task's CPU thread until a split is available or the connector is closed and drained — the consumer side waits on the producer side here."><span style="display: inline-block; border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono); color: var(--color-text-secondary);">&#9114; sync</span></span>
+            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/op/scan">src/op/scan/ &#8599;</a></div>
+          </div>
+        </div>
+
+        <div style="text-align: center; color: var(--color-text-muted); padding: 6px 0;">&darr; &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); color: var(--color-accent); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono);">&#11044; batch handle</span></div>
+
+        <div style="background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: 14px 16px;">
+          <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">CPU zone (edge)</div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="The shared_data_repository behind the scan's outgoing port: decoded batches park here as idle, spillable handles until the consumer's barrier releases them. Module 5's subject."><strong>repository</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);">idle batches</span>
+            <div style="font-size: 12px; color: var(--color-text-muted); margin-top: 4px;">data never travels by function return — it goes through repositories</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: Splits & the connector ───────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The connector&rsquo;s contract: close, then drain</h2>
+        <p>A split is one schedulable unit of scan work — a batch of parquet <span class="term" data-definition="Parquet's unit of horizontal partitioning inside a file: a self-contained chunk of rows with its own column statistics. The natural granularity for pruning and for splits.">row groups</span>, or byte ranges of a <code>.duckdb</code> file. The connector between providers and the operator is small enough to memorize, and its three semantics are exactly the ones people get wrong:</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/scan_manager/split_connector.hpp#L60-L78" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/scan_manager/split_connector.hpp &middot; L60-78 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
+<span class="code-doc"><span class="doc-p">Mark the connector as closed: no more splits will be pushed. Idempotent. Wakes all waiting consumers.</span><span class="doc-p"><span class="doc-tag">param exception</span>Optional exception captured by the producer. The first non-null exception passed across all close() calls is stored and rethrown by get_next_split() once the queue has been drained. Subsequent close() calls do not overwrite an already-stored exception.</span></span>
+<span class="code-line">  <span class="code-keyword">void</span> <span class="code-function">close</span>(std::exception_ptr <span class="code-keyword">const</span>&amp; exception = <span class="code-keyword">nullptr</span>);</span>
+<span class="code-line"></span>
+<span class="code-doc"><span class="doc-p">Pull the next split, blocking until one is available or the connector is closed and drained.</span><span class="doc-p"><span class="doc-tag">returns</span>std::nullopt when closed and drained without error; the next split otherwise.</span><span class="doc-p"><span class="doc-tag">throws</span>The exception passed to close() (if any) once the queue is drained.</span></span>
+<span class="code-line">  std::optional&lt;std::unique_ptr&lt;op::operator_data&gt;&gt; <span class="code-function">get_next_split</span>();</span>
+<span class="code-line"></span>
+<span class="code-doc"><span class="doc-p">True iff close() has been called and the queue is drained.</span></span>
+<span class="code-line">  [[<span class="code-property">nodiscard</span>]] <span class="code-keyword">bool</span> <span class="code-function">is_closed</span>() <span class="code-keyword">const</span>;</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">The producer&rsquo;s last word. <code>close()</code> is idempotent and wakes every blocked consumer — the <em>close</em> half of close-then-drain.</p>
+              <p class="tl">Errors ride the connector itself: the first non-null exception wins, and later <code>close()</code> calls cannot overwrite it.</p>
+              <p class="tl">And it is rethrown only <em>after the queue drains</em> — consumers still receive every split that made it in before the failure.</p>
+              <p class="tl">The consumer&rsquo;s entire API: block until a split arrives or the stream is over.</p>
+              <p class="tl"><code>nullopt</code> &ne; error. It is the clean end-of-stream; failure arrives as a throw, on this same call, post-drain.</p>
+              <p class="tl"><code>is_closed</code> = closed <strong>AND</strong> drained. A closed connector with splits still queued has work left to hand out.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128204;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Memorize this contract</strong>
+            <p>Your <code>exchange_channel</code> (<a href="https://github.com/sirius-db/sirius/pull/836">#836</a>) is its network twin — same EOS semantics, batches instead of splits. Module 8&rsquo;s design decisions fall out of this page.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: Pluggable ingestion ──────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Four sources, one scan machinery</h2>
+        <p>The parquet and DuckDB-native paths sit behind <code>gpu_ingestible</code> since the unification (<a href="https://github.com/sirius-db/sirius/pull/871">#871</a>): one scan operator, pluggable decoders (<a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/gpu_ingestible.cpp"><code>src/op/scan/gpu_ingestible.cpp</code> &#8599;</a>). The other two <em>compose</em> with that machinery instead of reimplementing it: S3 is a <span class="term" data-definition="An IO-layer backend that serves byte ranges (src/io/). The parquet decoder reads through it without knowing whether bytes come from local disk or object storage.">datasource</span> feeding the parquet decoder from below, and Iceberg landed as its own <code>ICEBERG_SCAN</code> operator layered on the parquet machinery — though that path is currently non-functional (see the card below). &ldquo;Add a storage format&rdquo; stays a bounded problem — a decoder + split provider for a new file format; just a datasource for a new place bytes live.</p>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">&#129704; Parquet — the workhorse columnar path <span style="margin-left: auto; font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono);">&#9656; details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <p style="margin: 0 0 8px;">Splits are row-group batches; pruning happens before a split is even born. Filter pushdown skips row groups by statistics (<a href="https://github.com/sirius-db/sirius/pull/363">#363</a>); one split can span multiple files (<a href="https://github.com/sirius-db/sirius/pull/738">#738</a>).</p>
+            <p style="margin: 0; font-size: 13px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/parquet_gpu_ingestible.cpp">src/op/scan/parquet_gpu_ingestible.cpp &#8599;</a></p>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">&#129689; DuckDB-native — decode <code>.duckdb</code> straight to the GPU <span style="margin-left: auto; font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono);">&#9656; details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <p style="margin: 0 0 8px;">DuckDB&rsquo;s own storage blocks decode directly to cudf tables — no round-trip through DuckDB&rsquo;s CPU scan. Landed as a decoder (<a href="https://github.com/sirius-db/sirius/pull/736">#736</a>) and matured into the native path (<a href="https://github.com/sirius-db/sirius/pull/792">#792</a>).</p>
+            <p style="margin: 0; font-size: 13px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/duckdb_native_gpu_ingestible.cpp">src/op/scan/duckdb_native_gpu_ingestible.cpp &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/duckdb_native_decoder.cpp">duckdb_native_decoder.cpp &#8599;</a></p>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">&#9729;&#65039; S3 — object storage as &ldquo;just another datasource&rdquo; <span style="margin-left: auto; font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono);">&#9656; details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <p style="margin: 0 0 8px;">Not a new scan path — a new <span class="term" data-definition="The byte-serving abstraction over one storage backend (src/io/sirius_datasource.cpp, built via src/io/datasource_factory.cpp). The IO framework reads through it; S3 plugs in here instead of adding a parallel scan path.">datasource</span>. The lineage: datasource foundation (<a href="https://github.com/sirius-db/sirius/pull/746">#746</a>) &rarr; SigV4 credentials (<a href="https://github.com/sirius-db/sirius/pull/758">#758</a>) &rarr; S3 backend (<a href="https://github.com/sirius-db/sirius/pull/784">#784</a>) &rarr; SQL surface (<a href="https://github.com/sirius-db/sirius/pull/805">#805</a>). <code>s3://</code> URIs route through the same scan manager as local files.</p>
+            <p style="margin: 0; font-size: 13px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/tree/dev/src/io/s3">src/io/s3/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/io/sirius_datasource.cpp">src/io/sirius_datasource.cpp &#8599;</a></p>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">&#129482; Iceberg — landed in #521, currently non-functional <span style="margin-left: auto; font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono);">&#9656; details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <p style="margin: 0 0 8px;">What landed (<a href="https://github.com/sirius-db/sirius/pull/521">#521</a>): V1/V2 table scans where the metadata reader walked manifests into splits and positional/equality deletes ran as GPU filter kernels rather than CPU-side row rewrites.</p>
+            <p style="margin: 0 0 8px;"><strong>Current status — the GPU Iceberg path is non-functional in this tree.</strong> It went stale during the IO-framework transition (<a href="https://github.com/sirius-db/sirius/pull/997">#997</a>): <code>iceberg_metadata_reader.cpp</code> and <code>iceberg_scan_task.cpp</code> are excluded from the build, neither the scan manager nor the task creator has any <code>ICEBERG_SCAN</code> handling, and delete-data reading is stubbed out with a runtime warning (<code>prefetch_iceberg_delete_data</code>, <a href="https://github.com/sirius-db/sirius/blob/dev/src/sirius_engine.cpp"><code>src/sirius_engine.cpp</code> &#8599;</a>). The plan generator still accepts <code>iceberg_scan</code>, but nothing downstream can execute it — don&rsquo;t rely on GPU Iceberg scans today.</p>
+            <p style="margin: 0; font-size: 13px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/iceberg_metadata_reader.cpp">src/op/scan/iceberg_metadata_reader.cpp &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/iceberg_scan_task.cpp">iceberg_scan_task.cpp &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/iceberg_delete_pipeline.cpp">iceberg_delete_pipeline.cpp &#8599;</a></p>
+          </div>
+        </details>
+      </section>
+
+      <!-- ── Screen 4: The IO framework underneath ──────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The conveyor and the buffer bin</h2>
+        <p>Why a whole framework? Scan throughput was gated on synchronous file I/O — the framework overlaps I/O with decode, and gave S3 a place to plug in as just another datasource.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#9881;&#65039;</div>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/pull/675">#675</a> — the framework lands</h4>
+            <p class="pattern-desc">The May 2026 milestone: io_uring reactor, pinned prefetching cache, buffer pool, admission control — a global-milestone-grade landing, in one PR.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">&#128268;</div>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/pull/740">#740</a> — switched on</h4>
+            <p class="pattern-desc">Wired into the scan manager — the point the stack started serving real scans instead of benchmarks of itself.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">&#128260;</div>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/pull/997">#997</a> — the redesign</h4>
+            <p class="pattern-desc">Partial cache reads, <span class="term" data-definition="Post-#997 policy: the cache is populated from normal read traffic, not only by the prefetcher — a partially-cached range serves the cached part and fetches the rest.">cache-on-read</span>, multi-GPU batch coalescing. The framework you&rsquo;ll actually read today.</p>
+          </div>
+        </div>
+
+        <p>Separately, a second cache line runs above the IO layer — caching <em>scan outputs</em>, not bytes:</p>
+
+        <div class="flow-steps">
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p><a href="https://github.com/sirius-db/sirius/pull/340">#340</a> — cache scan outputs so repeat scans reuse decoded data</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p><a href="https://github.com/sirius-db/sirius/pull/455">#455</a> — on a cache hit, skip file I/O entirely</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">3</div>
+            <p>Second scan of the same table: zero disk reads, decode starts immediately</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 5: Quiz + hand-off ──────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three scenarios</h2>
+        <p>Apply the machinery, don&rsquo;t recall it.</p>
+
+        <div class="quiz-container" id="quiz-m4-ingest">
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Two independent caches stack: scan-output caching (#340, #455) answers repeat scans with zero file I/O, and the IO framework's pinned prefetching cache stages byte ranges ahead of the decoder so decode starts without waiting on a read. Neither is the OS page cache, and nothing decoded stays resident on the GPU between queries."
+               data-explanation-wrong="Decoded tables don't survive between queries as GPU residents, and neither the reactor nor the split provider deduplicates work across queries. Ask which two layers explicitly advertise 'skip file I/O on hit' and 'bytes staged before the decoder asks'.">
+            <h3 class="quiz-question">The same table is scanned twice; the second query does zero disk reads and starts decoding immediately. Which two mechanisms?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The GPU keeps query 1&rsquo;s decoded cudf tables resident, so query 2 skips the scan entirely</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Scan-output caching serves the repeat scan with zero file I/O, and the IO framework&rsquo;s prefetching cache has ranges staged before the decoder asks</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The io_uring reactor deduplicates identical reads across queries</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The split provider re-emits query 1&rsquo;s splits with the data inlined in each split</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="That is the point of the #871 unification: a format is a gpu_ingestible decoder (split → cudf table) plus a split provider (metadata → splits). The scan operator, task creator and pipelines never learn your format exists — they consume splits and produce batches, same as always."
+               data-explanation-wrong="Anything that touches the scan operator or the pipeline layer means the unification failed for your format. The seam is deliberately lower: one class that makes splits, one class that decodes a split.">
+            <h3 class="quiz-question">You&rsquo;re adding a new columnar file format. What do you implement — and what do you NOT touch?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A new scan operator subclass, plus a branch in the physical plan generator</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A gpu_ingestible decoder, plus a new task creator that schedules format-specific tasks</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A gpu_ingestible decoder and a split provider — the scan operator, task creator and pipelines stay untouched</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A datasource backend in src/io/ — formats are handled at the byte layer</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Overlap is owned below the operator: the reactor and the prefetcher (plus admission control) decide how far network I/O runs ahead of decode. The scan operator is deliberately dumb — it blocks on get_next_split() and decodes what it's handed. If the GPU idles between bursts, the conveyor is underfeeding the crusher; tune the IO layer, not the consumer."
+               data-explanation-wrong="The operator has no lever to pull: it consumes splits and decodes — it cannot start reads early or deepen the read-ahead. Ask which layer owns 'how many bytes are in flight while the GPU decodes'.">
+            <h3 class="quiz-question">An S3 scan is slow and the GPU sits idle between decode bursts. Which layer owns fixing the overlap — the scan operator or the IO framework — and why?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The scan operator — it should issue its own reads earlier, before pulling the next split</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The IO framework — the reactor and prefetcher own network/decode overlap; the operator just consumes splits</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Neither — the split provider should cut smaller splits so decode bursts pack tighter</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The scan operator — it should hold multiple splits and decode them concurrently on one stream</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-m4-ingest')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-m4-ingest')">Try Again</button>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">&#10145;&#65039;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Next: The Data Plane</strong>
+            <p>Splits became batches sitting idle in repositories. Next: the rules those repositories play by — ports, barriers, and why data never travels by function return.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</section>

@@ -1,7 +1,7 @@
-<section class="module" id="module-4" style="background: var(--color-bg-warm)">
+<section class="module" id="module-5" style="background: var(--color-bg-warm)">
   <div class="module-content">
     <header class="module-header animate-in">
-      <span class="module-number">04</span>
+      <span class="module-number">05</span>
       <h1 class="module-title">The Data Plane</h1>
       <p class="module-subtitle">In Sirius, no operator ever returns data to its caller. Ever. Here's why that one decision buys spilling, backpressure, and multi-GPU almost for free.</p>
     </header>
@@ -15,19 +15,14 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/include/op/sirius_physical_operator.hpp · L459-472</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/op/sirius_physical_operator.hpp#L459-L472" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/op/sirius_physical_operator.hpp · L459-472 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-line">  <span class="code-keyword">struct</span> port {</span>
 <span class="code-line">    MemoryBarrierType <span class="code-property">type</span>;</span>
-<span class="code-line">    <span class="code-comment">/// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").</span></span>
-<span class="code-line">    <span class="code-comment">/// Null repos are treated as "empty, not data-gating" by the base-class port handling methods</span></span>
-<span class="code-line">    <span class="code-comment">/// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).</span></span>
+<span class="code-doc"><span class="doc-p">May be NULL for dependency-only ports that carry no data flow (e.g., "dependency"). Null repos are treated as "empty, not data-gating" by the base-class port handling methods (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).</span></span>
 <span class="code-line">    ::cucascade::shared_data_repository* <span class="code-property">repo</span>;</span>
 <span class="code-line">    duckdb::shared_ptr&lt;pipeline::sirius_pipeline&gt; <span class="code-property">src_pipeline</span>;</span>
 <span class="code-line">    duckdb::shared_ptr&lt;pipeline::sirius_pipeline&gt; <span class="code-property">dest_pipeline</span>;</span>
-<span class="code-line">    <span class="code-comment">//! A UUID for a port on an operator at the beginning of a</span></span>
-<span class="code-line">    <span class="code-comment">// pipeline. This port receives data from a prior pipeline,</span></span>
-<span class="code-line">    <span class="code-comment">// forming an incoming edge from that pipeline.</span></span>
+<span class="code-doc"><span class="doc-p">A UUID for a port on an operator at the beginning of a pipeline. This port receives data from a prior pipeline, forming an incoming edge from that pipeline.</span></span>
 <span class="code-line">    uuid::UUID <span class="code-property">source_port_uuid</span>{uuid::<span class="code-function">now_v7</span>()};</span>
 <span class="code-line">  };</span>
             </code></pre>
@@ -63,8 +58,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/op/sirius_physical_operator.cpp · L238-246</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_operator.cpp#L238-L246" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/op/sirius_physical_operator.cpp · L238-246 &#8599;</a></span><pre><code>
 <span class="code-line"><span class="code-keyword">void</span> sirius_physical_operator::<span class="code-function">sink</span>(<span class="code-keyword">const</span> operator_data&amp; output_data, rmm::cuda_stream_view stream)</span>
 <span class="code-line">{</span>
 <span class="code-line">  <span class="code-keyword">auto</span>&amp; pipelineable_output = <span class="code-keyword">dynamic_cast</span>&lt;<span class="code-keyword">const</span> pipelineable_operator_data&amp;&gt;(output_data);</span>
@@ -201,7 +195,7 @@
           <div class="callout-icon">⚠️</div>
           <div class="callout-content">
             <strong class="callout-title">How you cause an OOM</strong>
-            <p>Park batches in a private queue, or sit on locks "for later" — either way they're invisible to the downgrade executor and the query dies under pressure instead of spilling. Module 7's streaming design exists to dodge exactly this: ownership stays in repositories, and only <code>{batch_id, size}</code> handles travel through channels.</p>
+            <p>Park batches in a private queue, or sit on locks "for later" — either way they're invisible to the downgrade executor and the query dies under pressure instead of spilling. Module 8's streaming design exists to dodge exactly this: ownership stays in repositories, and only <code>{batch_id, size}</code> handles travel through channels.</p>
           </div>
         </div>
 

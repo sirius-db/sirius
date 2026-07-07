@@ -15,8 +15,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/include/sirius_context.hpp</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/sirius_context.hpp" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/sirius_context.hpp &#8599;</a></span><pre><code>
 <span class="code-line">  std::shared_ptr&lt;<span class="code-keyword">const</span> sirius::telemetry::telemetry_context&gt; <span class="code-property">telemetry_context_</span>;</span>
 <span class="code-line">  std::unique_ptr&lt;cucascade::shared_data_repository_manager&gt; <span class="code-property">data_repository_manager_</span>;</span>
 <span class="code-line">  std::unique_ptr&lt;sirius::pipeline::task_scheduler&gt; <span class="code-property">task_scheduler_</span>;</span>
@@ -92,12 +91,140 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code" style="grid-column: 1 / -1">
-            <span class="translation-label">the defaults, straight from sirius_config.hpp</span>
-            <pre><code>
+            <span class="translation-label">the defaults, straight from sirius_config.hpp</span><pre><code>
 <span class="code-line">  exec::thread_pool_config <span class="code-property">_task_creator_config</span>{.num_threads        = <span class="code-number">2</span>,</span>
 <span class="code-line">  exec::thread_pool_config <span class="code-property">_gpu_pipeline_executor_config</span>{.num_threads        = <span class="code-number">4</span>,</span>
             </code></pre>
           </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2b: Package ownership map ──────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Who owns which directory</h2>
+        <p>The consoles map one-to-one onto the source tree. Click a directory to expand or collapse it, hover an owner chip to recall its job — every row links to the real code.</p>
+
+        <div class="repo-tree">
+          <div style="padding: 2px 8px; font-weight: 700;"><a href="https://github.com/sirius-db/sirius/tree/dev" target="_blank" rel="noopener" style="color: var(--color-text);"><code>sirius/</code> ↗</a> <span class="rt-hint">— click a directory to expand or collapse it</span></div>
+
+          <details open>
+            <summary><code>src/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/src" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a> <span class="rt-role">the engine — everything below runs inside the DuckDB process</span></summary>
+            <div class="rt-kids">
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/transparent" target="_blank" rel="noopener"><code>transparent/</code> ↗</a>
+                <span style="color: var(--color-text-muted);">+</span>
+                <a href="https://github.com/sirius-db/sirius/blob/dev/src/sirius_extension.cpp" target="_blank" rel="noopener"><code>sirius_extension.cpp</code> ↗</a>
+                <span class="term" data-definition="The extension entry point and interception layer. It registers SiriusContext as ClientContextState and swaps DuckDB's physical plan for a GPU one — the reason no special syntax is needed." style="font-size: var(--text-xs); color: var(--color-actor-4); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">sirius_engine</span>
+                <span class="rt-role">interception &amp; extension entry</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/planner" target="_blank" rel="noopener"><code>planner/</code> ↗</a>
+                <span style="color: var(--color-text-muted);">·</span>
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/expression" target="_blank" rel="noopener"><code>expression/</code> ↗</a>
+                <span style="color: var(--color-text-muted);">·</span>
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/expression_executor" target="_blank" rel="noopener"><code>expression_executor/</code> ↗</a>
+                <span class="term" data-definition="Mission planning: sirius_physical_plan_generator.cpp translates DuckDB's plan into GPU pipelines, once, on the DuckDB query thread — before any executor wakes up." style="font-size: var(--text-xs); color: var(--color-actor-4); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">plan generator</span>
+                <span class="rt-role">DuckDB plan → GPU pipelines &amp; expressions</span>
+              </div>
+
+              <details open>
+                <summary><code>op/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/src/op" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a>
+                  <span class="term" data-definition="The per-GPU execution engine (src/pipeline/): its 4 pinned worker threads are what actually run the code in src/op/." style="font-size: var(--text-xs); color: var(--color-actor-2); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap; font-weight: 400;">gpu_pipeline_executor</span>
+                  <span class="rt-role" style="font-weight: 400;">physical operators</span>
+                  <span style="font-size: var(--text-xs); color: var(--color-accent); border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 0 8px; white-space: nowrap; font-weight: 400;">★ your new operator goes here</span>
+                </summary>
+                <div class="rt-kids">
+                  <div class="rt-leaf">
+                    <a href="https://github.com/sirius-db/sirius/tree/dev/src/op/scan" target="_blank" rel="noopener"><code>scan/</code> ↗</a>
+                    <span class="rt-role">scan operators &amp; decoders (gpu_ingestible, cpu_source_task, …)</span>
+                  </div>
+                  <div class="rt-leaf">
+                    <a href="https://github.com/sirius-db/sirius/tree/dev/src/op/aggregate" target="_blank" rel="noopener"><code>aggregate/</code> ↗</a>
+                    <span style="color: var(--color-text-muted);">·</span>
+                    <a href="https://github.com/sirius-db/sirius/tree/dev/src/op/result" target="_blank" rel="noopener"><code>result/</code> ↗</a>
+                    <span class="rt-role">aggregation helpers &amp; result collection</span>
+                  </div>
+                </div>
+              </details>
+
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/cuda" target="_blank" rel="noopener"><code>cuda/</code> ↗</a>
+                <span class="term" data-definition="Runs on GPU worker threads' CUDA streams — the hand-written kernels operators call when cuDF doesn't have the primitive." style="font-size: var(--text-xs); color: var(--color-actor-2); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">gpu workers</span>
+                <span class="rt-role">hand-written CUDA kernels behind the operators</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/creator" target="_blank" rel="noopener"><code>creator/</code> ↗</a>
+                <span class="term" data-definition="The decision-maker: 2 threads walk each pipeline's hint chain and turn READY hints into tasks. Decides, never executes." style="font-size: var(--text-xs); color: var(--color-actor-3); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">task_creator</span>
+                <span class="rt-role">decides what runs next</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager" target="_blank" rel="noopener"><code>scan_manager/</code> ↗</a>
+                <span class="term" data-definition="Ground stations: splits base tables into scan splits and feeds the ingest that starts every pipeline." style="font-size: var(--text-xs); color: var(--color-actor-4); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">scan_manager</span>
+                <span class="rt-role">table splits &amp; ingest</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/pipeline" target="_blank" rel="noopener"><code>pipeline/</code> ↗</a>
+                <span style="color: var(--color-text-muted);">·</span>
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/parallel" target="_blank" rel="noopener"><code>parallel/</code> ↗</a>
+                <span class="term" data-definition="The Flight Director (task_scheduler's management loop) plus the per-GPU executors it dispatches to — the thread pools of Screen 3 live here." style="font-size: var(--text-xs); color: var(--color-actor-1); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">task_scheduler</span>
+                <span class="rt-role">scheduler loop &amp; executors</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/downgrade" target="_blank" rel="noopener"><code>downgrade/</code> ↗</a>
+                <span class="term" data-definition="Life support: one monitor per memory space spills victim batches downhill (GPU → host → disk) so queries degrade instead of OOMing." style="font-size: var(--text-xs); color: var(--color-actor-5); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">downgrade_executor</span>
+                <span class="rt-role">memory-pressure spilling</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/memory" target="_blank" rel="noopener"><code>memory/</code> ↗</a>
+                <span class="term" data-definition="cuCascade component where ALL inter-operator data lives: operators publish batches into shared repositories, downstream operators pull — data never travels by function return." style="font-size: var(--text-xs); color: var(--color-actor-3); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">shared_data_repository_manager</span>
+                <span class="rt-role">memory spaces &amp; repositories (built on the <a href="https://github.com/NVIDIA/cuCascade" target="_blank" rel="noopener"><code>cucascade/</code> ↗</a> submodule)</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/io" target="_blank" rel="noopener"><code>io/</code> ↗</a>
+                <span class="term" data-definition="The IO framework the scan path uses to read local files and object storage on the way to the GPU." style="font-size: var(--text-xs); color: var(--color-actor-4); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">scan executors</span>
+                <span class="rt-role">IO framework (files, object storage)</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/blob/dev/src/include/sirius_ffi.hpp" target="_blank" rel="noopener"><code>include/sirius_ffi.hpp</code> ↗</a>
+                <span class="rt-role">the public C FFI — the embedding surface everything external goes through</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/legacy" target="_blank" rel="noopener"><code>legacy/</code> ↗</a>
+                <span style="font-size: var(--text-xs); color: var(--color-error); border: 1px solid var(--color-error); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">⛔ dead code — never modify</span>
+              </div>
+            </div>
+          </details>
+
+          <details>
+            <summary><code>cucascade/</code> <a href="https://github.com/NVIDIA/cuCascade" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a> <span class="rt-role">submodule → NVIDIA/cuCascade — memory tiers, data batches, repositories</span></summary>
+            <div class="rt-kids">
+              <div class="rt-leaf"><span class="rt-role">engine-agnostic substrate: reservations, memory spaces, <code>data_batch</code>, <code>shared_data_repository</code> — extracted from Sirius in Dec 2025</span></div>
+            </div>
+          </details>
+
+          <details>
+            <summary><code>test/cpp/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a>
+              <span style="font-size: var(--text-xs); color: var(--color-accent); border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 0 8px; white-space: nowrap; font-weight: 400;">★ your tests go here</span>
+            </summary>
+            <div class="rt-kids">
+              <div class="rt-leaf"><span class="rt-role">Catch2 unit tests by area (<a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp/pipeline" target="_blank" rel="noopener"><code>pipeline/</code> ↗</a> · <a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp/scan" target="_blank" rel="noopener"><code>scan/</code> ↗</a> · <a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp/scan_manager" target="_blank" rel="noopener"><code>scan_manager/</code> ↗</a>)</span></div>
+              <div class="rt-leaf"><span class="rt-role">new files must be added to <code>TEST_SOURCES</code> in <a href="https://github.com/sirius-db/sirius/blob/dev/CMakeLists.txt" target="_blank" rel="noopener"><code>CMakeLists.txt</code> ↗</a>; the <code>check-orphan-tests</code> pre-commit hook catches forgotten ones</span></div>
+            </div>
+          </details>
+
+          <details>
+            <summary><code>experimental/starrocks/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/experimental/starrocks" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a> <span class="rt-role">the StarRocks CN integration (Rust)</span></summary>
+            <div class="rt-kids">
+              <div class="rt-leaf"><span class="rt-role">Sirius embedded outside DuckDB: a Rust compute-node process speaking StarRocks' thrift/BRPC protocols</span></div>
+            </div>
+          </details>
+
+          <details>
+            <summary><code>rust/crates/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/rust/crates" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a> <span class="rt-role">Rust bindings over the FFI (<code>sirius-sys</code> · <code>sirius</code>)</span></summary>
+            <div class="rt-kids">
+              <div class="rt-leaf"><span class="rt-role">with <code>src/include/sirius_ffi.hpp</code>, this is the public / embedding surface — everything else above is internal implementation, reachable only through the extension</span></div>
+            </div>
+          </details>
         </div>
       </section>
 

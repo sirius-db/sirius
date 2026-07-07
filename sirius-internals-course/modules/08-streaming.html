@@ -1,7 +1,7 @@
-<section class="module" id="module-7">
+<section class="module" id="module-8">
   <div class="module-content">
     <header class="module-header animate-in">
-      <span class="module-number">07</span>
+      <span class="module-number">08</span>
       <h1 class="module-title">The Streaming Frontier</h1>
       <p class="module-subtitle">Your sprint: <a href="https://github.com/sirius-db/sirius/issues/836">#836</a> (streaming source) and <a href="https://github.com/sirius-db/sirius/issues/837">#837</a> (streaming sink) — and the two hangs an edge-triggered engine had waiting for them.</p>
     </header>
@@ -15,16 +15,15 @@
         <p>Everything in modules 1&ndash;6 assumed data comes from disk. Your job (#836/#837) is to teach the engine that data can come from — and leave to — another machine, so Sirius can run as a StarRocks compute node inside a <span class="term" data-definition="StarRocks&rsquo; unit of distributed execution: one slice of a query plan running on one compute node, wired to other fragments by exchanges. Your source sits at a fragment&rsquo;s bottom edge; your sink at its top.">fragment</span>. The engine&rsquo;s loop barely changes. Its <em>assumptions</em> do.</p>
 
         <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
-          <span class="translation-label">the same trace, new leaf</span>
-          <pre><code><span class="code-line"><span class="code-property">Module 3:</span>    SCAN(orders)              → FILTER → COUNT sink</span>
+          <span class="translation-label">the same trace, new leaf</span><pre><code><span class="code-line"><span class="code-property">Module 3:</span>    SCAN(orders)              → FILTER → COUNT sink</span>
 <span class="code-line"><span class="code-property">Your #836:</span>   STREAMING_SOURCE(channel) → FILTER → COUNT sink</span>
-<span class="code-line"><span class="code-comment">                                          └── everything downstream: untouched</span></span></code></pre>
+<span class="code-line"><span class="code-comment">└── everything downstream: untouched</span></span></code></pre>
         </div>
 
         <div class="pattern-cards stagger-children">
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
             <div class="pattern-icon" style="background: var(--color-actor-4)">📥</div>
-            <h4 class="pattern-title">GPU scan (Module 3)</h4>
+            <h4 class="pattern-title">GPU scan (Modules 3&ndash;4 — M4 covers the scan subsystem in depth)</h4>
             <p class="pattern-desc">Pulls splits from the <span class="term" data-definition="The scan-side feed of splits that gpu_scan pulls from. Its is_closed() already means closed AND drained — the exact predicate shape the exchange_channel copies for its EOS."><code>split_connector</code></span>. While data remains, every poll yields a split, every split a task — the machine feeds itself.</p>
           </div>
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
@@ -48,6 +47,70 @@
             <p class="pattern-desc">A <span class="term" data-definition="An operator that heads its own pipeline with is_source() AND is_sink() both true — like CONCAT. It creates its own tasks, which gives it a hint to gate on. A pure terminal sink has neither.">boundary operator</span>: <code>is_source() &amp;&amp; is_sink()</code>, heading its own pipeline. <span class="term" data-definition="Slowing a producer when the consumer cannot keep up. In Sirius it must surface as fewer tasks created — never as a blocked worker thread.">Backpressure</span> becomes a <em>task-creation condition</em>: full channel → no sink tasks → upstream port repos fill with idle, spillable batches → the engine throttles itself. No worker ever blocks.</p>
           </div>
         </div>
+      </section>
+
+      <!-- ── SCREEN 1B: TOPOLOGY — WHERE SIRIUS SITS ────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Zoom out: where Sirius sits in the larger system</h2>
+
+        <p>One level up from your operators. StarRocks does <em>all</em> the distributed thinking; Sirius only ever sees one fragment at a time. Hover each box for who owns it.</p>
+
+        <div style="display: flex; flex-direction: column; gap: var(--space-2); margin: var(--space-6) 0;">
+
+          <!-- CPU zone: StarRocks FE -->
+          <div style="background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: var(--space-2);">CPU zone — StarRocks cluster</div>
+            <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow-sm);">
+              <span class="term" data-definition="The StarRocks frontend — Java, completely unmodified by this project. It owns everything distributed: SQL parsing, plan optimization, splitting the plan into fragments, and routing each fragment to a compute node."><strong style="font-weight: 600;">StarRocks FE</strong></span>
+              <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 2px;">Java, unmodified — SQL parsing · planning · fragment routing</div>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: var(--space-3); padding-left: var(--space-8); color: var(--color-text-muted);">
+            <span>↓</span>
+            <span style="font-size: 12px; font-family: var(--font-mono);">thrift heartbeat + BRPC exec_plan_fragment</span>
+          </div>
+
+          <!-- CPU zone: Rust CN wrapper -->
+          <div style="background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: var(--space-2);">CPU zone — Rust CN process (one per GPU, in principle)</div>
+            <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow-sm);">
+              <span class="term" data-definition="The Rust compute-node wrapper. It speaks StarRocks&rsquo; protocols upward (heartbeat, exec_plan_fragment) and Sirius&rsquo; FFI downward — and it owns the CN&harr;CN exchange. It runs on host threads; one process per GPU in principle."><strong style="font-weight: 600;">sirius-starrocks-cn</strong></span>
+              <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/experimental/starrocks">experimental/starrocks/&nbsp;↗</a> — registers as a CN, translates fragments</div>
+            </div>
+            <div style="display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3);">
+              <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-accent); border: 1px solid var(--color-accent-muted); border-radius: var(--radius-full); padding: 2px 10px;">⬤ batches ⇄ <span class="term" data-definition="NVIDIA&rsquo;s transfer library for moving data between nodes (GPU&harr;GPU where possible). In the PR #914 design, the Rust wrappers use it for the CN&harr;CN exchange that feeds your streaming sources and drains your streaming sinks. Owned by the Rust wrapper — the engine only ever sees the exchange_channel.">nixl</span> CN&harr;CN exchange</span>
+              <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px;">planned — <a href="https://github.com/sirius-db/sirius/pull/914" style="color: inherit;">PR #914</a> design</span>
+              <span style="font-size: 12px; color: var(--color-text-muted);">feeds streaming sources · drains streaming sinks</span>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: var(--space-3); padding-left: var(--space-8); color: var(--color-text-muted);">
+            <span>↓</span>
+            <span style="font-size: 12px; font-family: var(--font-mono);">FFI — <a href="https://github.com/sirius-db/sirius/blob/dev/src/include/sirius_ffi.hpp">src/include/sirius_ffi.hpp&nbsp;↗</a> + <a href="https://github.com/sirius-db/sirius/tree/dev/rust/crates/sirius">rust/crates/sirius&nbsp;↗</a></span>
+          </div>
+
+          <!-- GPU zone: the engine -->
+          <div style="background: var(--color-accent-light); border: 1px solid var(--color-accent-muted); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: var(--space-2);">GPU zone — the engine (Modules 1&ndash;7)</div>
+            <div style="display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2);">
+              <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 8px 12px; box-shadow: var(--shadow-sm);">
+                <span class="term" data-definition="The engine&rsquo;s entry point. Sirius owns per-fragment execution ONLY — it receives one fragment&rsquo;s plan through the FFI, builds pipelines, runs them, and hands batches back. It never knows about other fragments, other nodes, or the cluster."><strong style="font-weight: 600;">SiriusContext</strong></span>
+              </div>
+              <span style="color: var(--color-text-muted);">→</span>
+              <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 8px 12px; box-shadow: var(--shadow-sm);">
+                <span class="term" data-definition="Module 3&rsquo;s machinery: task creator, hints, port repositories. Your streaming source and sink are just two more operators inside these pipelines — the engine&rsquo;s loop is unchanged."><strong style="font-weight: 600;">pipelines</strong></span>
+              </div>
+              <span style="color: var(--color-text-muted);">→</span>
+              <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 8px 12px; box-shadow: var(--shadow-sm);">
+                <span class="term" data-definition="Module 5&rsquo;s per-GPU task executors, fed by the scheduler under the reservation system. Sirius&rsquo; ownership ends here — anything that leaves this box for another machine goes back up through the Rust wrapper&rsquo;s exchange."><strong style="font-weight: 600;">per-GPU executors</strong></span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <p>The division of labor to keep in your head while reviewing your own PRs: <strong>StarRocks FE</strong> owns distributed planning and routing; the <strong>Rust wrapper</strong> owns the exchange; <strong>Sirius</strong> owns per-fragment execution and nothing else. Your #836/#837 operators are the seam where the last two meet.</p>
       </section>
 
       <!-- ── SCREEN 2: THE CHANNEL CONTRACT ─────────────────────── -->
@@ -83,7 +146,7 @@
           </div>
         </div>
 
-        <p>Why handles? Module 4&rsquo;s law: a batch idle in a repository is a spill candidate. Trace one batch across the boundary:</p>
+        <p>Why handles? Module 5&rsquo;s law: a batch idle in a repository is a spill candidate. Trace one batch across the boundary:</p>
 
         <div class="step-cards stagger-children">
           <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
@@ -113,7 +176,7 @@
           <div class="callout-icon">⚖️</div>
           <div class="callout-content">
             <strong class="callout-title">The channel must never own memory</strong>
-            <p>A <code>shared_ptr&lt;data_batch&gt;</code> in the queue would make the channel a hidden owner of GPU memory — invisible to the downgrade executor, Module 5&rsquo;s cardinal sin. Handles keep every queued batch idle-in-repo until the moment a task claims it.</p>
+            <p>A <code>shared_ptr&lt;data_batch&gt;</code> in the queue would make the channel a hidden owner of GPU memory — invisible to the downgrade executor, Module 6&rsquo;s cardinal sin. Handles keep every queued batch idle-in-repo until the moment a task claims it.</p>
           </div>
         </div>
       </section>
@@ -243,9 +306,8 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/sirius_pipeline.cpp:389</span>
-            <pre><code><span class="code-line">      <span class="code-keyword">if</span> (limit_exhausted ||</span>
-<span class="code-line">          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>()) ) {</span>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/sirius_pipeline.cpp#L389" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp:389 &#8599;</a></span><pre><code><span class="code-line">      <span class="code-keyword">if</span> (limit_exhausted ||</span>
+<span class="code-line">          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>())) {</span>
 <span class="code-line">        <span class="code-keyword">if</span> (tasks_created.<span class="code-function">load</span>() == tasks_completed.<span class="code-function">load</span>()) {</span>
 <span class="code-line">          pipeline_finished.<span class="code-function">store</span>(<span class="code-keyword">true</span>);</span>
 <span class="code-line">          <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; op : <span class="code-function">get_operators</span>()) {</span>
@@ -336,6 +398,47 @@
             <p>Operators plus unit tests, no compute-node wiring — <code>exchange_channel</code> + source as PR&nbsp;1, sink as PR&nbsp;2. The CN integration lands only after both stand alone in the tree.</p>
           </div>
         </div>
+
+        <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: var(--space-10) 0 var(--space-2);">The extension path #836/#837 will walk</h3>
+        <p>Every new operator enters the engine the same five-rung way. Rungs 1&ndash;4 are one standalone PR; rung 5 is deliberately its own.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
+            <div class="step-num" style="background: var(--color-actor-1)">1</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">enum</span><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/op/sirius_physical_operator_type.hpp"><code>src/include/op/sirius_physical_operator_type.hpp</code>&nbsp;↗</a></strong>
+              <p>Add the enum value — and its name to the <code>ToString</code> switch in <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_operator_type.cpp"><code>src/op/sirius_physical_operator_type.cpp</code>&nbsp;↗</a>, or every log line says <code>UNKNOWN</code>.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
+            <div class="step-num" style="background: var(--color-actor-1)">2</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">code</span><a href="https://github.com/sirius-db/sirius/tree/dev/src/op"><code>src/op/</code>&nbsp;↗</a> + <a href="https://github.com/sirius-db/sirius/tree/dev/src/include/op"><code>src/include/op/</code>&nbsp;↗</a></strong>
+              <p>Header + implementation, next to the operators you studied in Modules 3&ndash;4.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
+            <div class="step-num" style="background: var(--color-actor-1)">3</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">build</span><a href="https://github.com/sirius-db/sirius/blob/dev/CMakeLists.txt"><code>CMakeLists.txt</code>&nbsp;↗</a> (root)</strong>
+              <p>Register your <code>.cpp</code> files in <code>EXTENSION_SOURCES</code> and your tests in <code>TEST_SOURCES</code> — unlisted files silently don&rsquo;t build.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
+            <div class="step-num" style="background: var(--color-actor-1)">4</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">test</span><a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp"><code>test/cpp/</code>&nbsp;↗</a></strong>
+              <p>Catch2 unit tests, runnable by tag: <code>pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"</code></p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">5</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-actor-2); color: var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">later, deliberate</span><a href="https://github.com/sirius-db/sirius/blob/dev/src/planner/sirius_physical_plan_generator.cpp"><code>src/planner/sirius_physical_plan_generator.cpp</code>&nbsp;↗</a></strong>
+              <p>Plan-generator wiring. <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px;">standalone PR first</span> — unwired = the operator simply never runs (silent CPU fallback).</p>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- ── SCREEN 6: QUIZ + COURSE CLOSE ──────────────────────── -->
@@ -347,7 +450,7 @@
         <div class="quiz-container" id="quiz-module7">
           <div class="quiz-question-block"
                data-correct="q1-b"
-               data-explanation-right="Right — backpressure is a task-creation condition. The hint answers WAITING, no sink tasks are built, and upstream output parks in port repositories as idle batches — exactly the spillable population Module 4&rsquo;s downgrade executor knows how to relieve. Every worker stays free."
+               data-explanation-right="Right — backpressure is a task-creation condition. The hint answers WAITING, no sink tasks are built, and upstream output parks in port repositories as idle batches — exactly the spillable population Module 5&rsquo;s downgrade executor knows how to relieve. Every worker stays free."
                data-explanation-wrong="Not quite. The engine side is try_push only — a worker never blocks on the channel, and nothing is dropped or failed. A full channel simply stops sink task creation; pressure surfaces as idle batches in port repos, which are spill candidates, not casualties.">
             <h3 class="quiz-question">1. The streaming sink&rsquo;s channel is full and stays full for 30&nbsp;s. What is the CORRECT observable behavior inside the engine?</h3>
             <div class="quiz-options">
@@ -426,7 +529,7 @@
           <div class="quiz-question-block"
                data-correct="q4-c"
                data-explanation-right="That&rsquo;s the review answer. The repository stays the single owner, so a queued batch remains idle-in-repo — visible and spillable to the downgrade executor — and the channel can never pin GPU memory. The consumer resolves the id via pop_data_batch_by_id at task-creation time."
-               data-explanation-wrong="Not quite. Message size and ref-count mechanics are noise here — ownership is the point. A shared_ptr in the channel would make the channel a hidden owner of GPU memory, invisible to the downgrade executor (Module 5&rsquo;s cardinal sin). Handles keep batches idle-in-repo, spillable until a task claims them.">
+               data-explanation-wrong="Not quite. Message size and ref-count mechanics are noise here — ownership is the point. A shared_ptr in the channel would make the channel a hidden owner of GPU memory, invisible to the downgrade executor (Module 6&rsquo;s cardinal sin). Handles keep batches idle-in-repo, spillable until a task claims them.">
             <h3 class="quiz-question">4. Your reviewer asks: &ldquo;why does the channel carry <code>{batch_id, size}</code> instead of <code>shared_ptr&lt;data_batch&gt;</code>?&rdquo; Best answer?</h3>
             <div class="quiz-options">
               <button class="quiz-option" data-value="q4-a" onclick="selectOption(this)">

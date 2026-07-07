@@ -1,8 +1,8 @@
-<section class="module" id="module-5">
+<section class="module" id="module-6">
   <div class="module-content">
 
     <header class="module-header animate-in">
-      <span class="module-number">05</span>
+      <span class="module-number">06</span>
       <h1 class="module-title">Memory &amp; Multi-GPU</h1>
       <p class="module-subtitle">GPU memory is the scarcest thing in this engine. Sirius&rsquo;s answer: nothing runs without a reservation, and pressure triggers relocation &mdash; not a crash.</p>
     </header>
@@ -32,7 +32,22 @@
           </div>
         </div>
 
-        <p>All three tiers are managed by <code>sirius_memory_reservation_manager</code> (cuCascade). Before the GPU executor&rsquo;s manager thread dispatches a task, it makes a <span class="term" data-definition="A pre-granted memory budget from sirius_memory_reservation_manager, sized from the pipeline&rsquo;s memory history and attached to a task before dispatch. Operators allocate inside it; it is released at task end. No reservation, no execution.">reservation</span> sized from the pipeline&rsquo;s <span class="term" data-definition="A per-pipeline record of observed memory peaks &mdash; including peaks from failed attempts. It sizes future reservations, so a pipeline that OOMed once reserves more the next time.">memory history</span>.</p>
+        <div class="animate-in" style="display:flex; flex-direction:column; gap:8px; margin:16px 0; padding:12px 16px; border:1px solid var(--color-border); border-radius:12px; background:var(--color-bg-warm);">
+          <div style="display:flex; gap:12px; align-items:baseline; flex-wrap:wrap;">
+            <span style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); min-width:120px; font-weight:600;">Who allocates</span>
+            <span style="font-size:13px; flex:1; min-width:240px;">All device memory flows through the <span class="term" data-definition="sirius_memory_reservation_manager (src/memory/, built on cuCascade, RMM underneath): the single gatekeeper for all three tiers. Every device allocation goes through it &mdash; operators never call the allocator directly.">reservation manager</span>; operators allocate inside their task&rsquo;s reservation, never around it.</span>
+          </div>
+          <div style="display:flex; gap:12px; align-items:baseline; flex-wrap:wrap;">
+            <span style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); min-width:120px; font-weight:600;">Lifetime</span>
+            <span style="font-size:13px; flex:1; min-width:240px;">A reservation is <span class="term" data-definition="The reservation&rsquo;s lifetime equals the task&rsquo;s: the executor&rsquo;s manager thread makes it before dispatch, the task&rsquo;s operators allocate inside it, and it is released automatically at task end &mdash; freeing budget for the next blocked task.">task-scoped</span>: booked by the executor manager thread before dispatch, released at task end.</span>
+          </div>
+          <div style="display:flex; gap:12px; align-items:baseline; flex-wrap:wrap;">
+            <span style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); min-width:120px; font-weight:600;">Where copies happen</span>
+            <span style="font-size:13px; flex:1; min-width:240px;"><span class="term" data-definition="Host-to-device copy. Happens in prepare_for_processing when a task&rsquo;s input batches aren&rsquo;t already resident on the reservation&rsquo;s GPU &mdash; every input is colocated before any operator runs.">H2D</span> on <code>prepare_for_processing</code> when inputs aren&rsquo;t GPU-resident <span class="term" style="display:inline-block; border:1px solid var(--color-accent-muted); border-radius:6px; padding:0 6px; font-size:11px; color:var(--color-accent);" data-definition="Sync point: the task waits for its input batches to finish copying onto the reservation&rsquo;s device before any operator runs.">&#9114; sync</span>; <span class="term" data-definition="Device-to-host copy. Happens when the downgrade executor relieves pressure by migrating idle victim batches from GPU device memory down to pinned host (and onward to disk).">D2H</span> when the downgrade executor migrates idle batches down.</span>
+          </div>
+        </div>
+
+        <p>This tier substrate lives in <a href="https://github.com/NVIDIA/cuCascade">cuCascade</a>, wired into Sirius under <a href="https://github.com/sirius-db/sirius/tree/dev/src/memory"><code>src/memory/</code> &#8599;</a>. All three tiers are managed by <code>sirius_memory_reservation_manager</code> (cuCascade). Before the GPU executor&rsquo;s manager thread dispatches a task, it makes a <span class="term" data-definition="A pre-granted memory budget from sirius_memory_reservation_manager, sized from the pipeline&rsquo;s memory history and attached to a task before dispatch. Operators allocate inside it; it is released at task end. No reservation, no execution.">reservation</span> sized from the pipeline&rsquo;s <span class="term" data-definition="A per-pipeline record of observed memory peaks &mdash; including peaks from failed attempts. It sizes future reservations, so a pipeline that OOMed once reserves more the next time.">memory history</span>.</p>
 
         <div class="step-cards stagger-children">
           <div class="step-card animate-in">
@@ -126,8 +141,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/gpu_pipeline_task.cpp:326-331</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_task.cpp#L327-L330" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_task.cpp:327-330 &#8599;</a></span><pre><code>
 <span class="code-line">      <span class="code-keyword">throw</span> <span class="code-function">oom_reschedule_exception</span>(</span>
 <span class="code-line">        std::<span class="code-function">move</span>(operator_input_output_data),</span>
 <span class="code-line">        i,</span>
@@ -135,7 +149,7 @@
             </code></pre>
           </div>
           <div class="translation-english">
-            <span class="translation-label">Plain English</span>
+            <span class="translation-label">Plain English <span class="rm-chip">reader mode</span></span>
             <div class="translation-lines">
               <p class="tl">The graceful surrender: not a crash, but a thrown value that <em>is</em> the reschedule plan.</p>
               <p class="tl">The intermediate results move out with the exception &mdash; operators that already finished never re-run.</p>
@@ -149,12 +163,8 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/gpu_pipeline_executor.cpp:330-343</span>
-            <pre><code>
-<span class="code-line"><span class="code-comment">          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far</span></span>
-<span class="code-line"><span class="code-comment">          // too short. With 100 retries × 50 ms backoff (~5 s) the probe</span></span>
-<span class="code-line"><span class="code-comment">          // tasks get enough patience to clear the contention window while</span></span>
-<span class="code-line"><span class="code-comment">          // still bailing out on truly wedged queries.</span></span>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_executor.cpp#L330-L343" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_executor.cpp:330-343 &#8599;</a></span><pre><code>
+<span class="code-doc"><span class="doc-p">SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far too short. With 100 retries × 50 ms backoff (~5 s) the probe tasks get enough patience to clear the contention window while still bailing out on truly wedged queries.</span></span>
 <span class="code-line">          <span class="code-keyword">static constexpr</span> <span class="code-keyword">uint32_t</span> MAX_OOM_RETRIES = <span class="code-number">100</span>;</span>
 <span class="code-line">          <span class="code-keyword">if</span> (next_retry_count &gt; MAX_OOM_RETRIES) {</span>
 <span class="code-line">            <span class="code-function">SIRIUS_LOG_ERROR</span>(</span>

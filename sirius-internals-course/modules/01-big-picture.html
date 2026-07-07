@@ -82,16 +82,13 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/transparent/sirius_optimizer_extension.cpp</span>
-            <pre><code>
-<span class="code-line"><span class="code-comment">  // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this</span></span>
-<span class="code-line"><span class="code-comment">  // copy — that's the single source of truth for GPU support. If the plan contains</span></span>
-<span class="code-line"><span class="code-comment">  // unsupported operators, create_plan() throws and we fall back to CPU.</span></span>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/transparent/sirius_optimizer_extension.cpp" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/transparent/sirius_optimizer_extension.cpp &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
+<span class="code-doc"><span class="doc-p">Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this copy — that's the single source of truth for GPU support. If the plan contains unsupported operators, create_plan() throws and we fall back to CPU.</span></span>
 <span class="code-line">  <span class="code-keyword">try</span> {</span>
 <span class="code-line">    <span class="code-keyword">auto</span> plan_copy = plan-&gt;<span class="code-function">Copy</span>(context);</span>
 <span class="code-line">    ctx-&gt;<span class="code-function">set_captured_logical_plan</span>(std::<span class="code-function">move</span>(plan_copy));</span>
 <span class="code-line">  } <span class="code-keyword">catch</span> (duckdb::NotImplementedException&amp;) {</span>
-<span class="code-line"><span class="code-comment">    // Plan not serializable — skip GPU.</span></span>
+<span class="code-doc"><span class="doc-p">Plan not serializable — skip GPU.</span></span>
 <span class="code-line">  } <span class="code-keyword">catch</span> (std::exception&amp; e) {</span>
 <span class="code-line">    spdlog::<span class="code-function">debug</span>(<span class="code-string">"Transparent execution: failed to copy logical plan: {}"</span>, e.what());</span>
 <span class="code-line">  }</span>
@@ -140,12 +137,12 @@
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
             <div class="pattern-icon" style="background: var(--color-actor-3)">&#127959;&#65039;</div>
             <h4 class="pattern-title">Dec 2025&ndash;Feb 2026 · <span class="term" data-definition="The current, live engine: namespace sirius, source under src/op/, src/planner/, src/pipeline/, src/cuda/. A ground-up rewrite on cuCascade with pipelines, repositories, ports, and a task scheduler.">Super Sirius</span></h4>
-            <p class="pattern-desc">Ground-up rewrite on cuCascade: <a href="https://github.com/sirius-db/sirius/pull/96">#96</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/134">#134</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/198">#198</a>, first end-to-end query in <a href="https://github.com/sirius-db/sirius/pull/206">#206</a>.</p>
+            <p class="pattern-desc">Ground-up rewrite on cuCascade: <a href="https://github.com/sirius-db/sirius/pull/96">#96</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/134">#134</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/198">#198</a>, first end-to-end query in <a href="https://github.com/sirius-db/sirius/pull/206">#206</a>. <a href="https://github.com/sirius-db/sirius/pull/267">#267</a> wired TPC-H into the integration tests &mdash; ever since, that's how the project knows a change is correct.</p>
           </div>
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
             <div class="pattern-icon" style="background: var(--color-actor-1)">&#127917;</div>
             <h4 class="pattern-title">Apr 2026 · <span class="term" data-definition="The contract that plain SQL needs no changes: Sirius hooks DuckDB's planning, swaps in a GPU plan when supported, and silently falls back to CPU when not.">Transparent interception</span></h4>
-            <p class="pattern-desc"><a href="https://github.com/sirius-db/sirius/pull/518">#518</a>: load the extension and plain SQL just runs on GPU. No special syntax — the interpreter enters the booth.</p>
+            <p class="pattern-desc"><a href="https://github.com/sirius-db/sirius/pull/518">#518</a>: load the extension and plain SQL just runs on GPU. No special syntax — the interpreter enters the booth. The old engine was walled off in the same push: gated behind an <code>ENABLE_LEGACY_SIRIUS</code> build flag (<a href="https://github.com/sirius-db/sirius/pull/509">#509</a>, Mar 2026), then relocated under <code>src/legacy/</code> (<a href="https://github.com/sirius-db/sirius/pull/692">#692</a>, Apr 2026).</p>
           </div>
         </div>
 
@@ -157,59 +154,92 @@
         </div>
       </section>
 
-      <!-- ── Screen 4: The flow strip (hero visual) ───────────── -->
+      <!-- ── Screen 4: Layered system architecture (hero visual) ── -->
       <section class="screen animate-in">
-        <h2 class="screen-heading">The whole machine on one strip</h2>
+        <h2 class="screen-heading">The whole machine, layer by layer</h2>
 
-        <p>This is the map for the rest of the course — every later module zooms into one or two boxes on this strip.</p>
+        <p>This is the map for the rest of the course — every later module zooms into one layer of this stack. Hover any layer for who owns it and which thread runs it; every path is a real link into the repo.</p>
 
-        <div class="flow-steps animate-in">
-          <div class="flow-step">
-            <div class="flow-step-num">1</div>
-            <p>SQL query arrives</p>
+        <div class="animate-in" style="display:flex; flex-direction:column; gap:0; margin:1.5rem 0;">
+
+          <!-- CPU zone: control plane -->
+          <div style="background:var(--color-bg-warm); border:1px solid var(--color-border); border-radius:12px; padding:14px;">
+            <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); display:flex; justify-content:space-between; margin-bottom:10px;">
+              <span>CPU zone &mdash; control plane</span>
+              <span>&darr; control path: the plan flows down</span>
+            </div>
+
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="DuckDB's unmodified frontend: parse, bind, optimize. Runs on the CPU in the user's connection thread. Sirius changes nothing here — it only listens downstream.">Client / SQL &mdash; DuckDB frontend (unmodified)</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;">duckdb/ (submodule) &mdash; parse &rarr; bind &rarr; optimize</div>
+            </div>
+            <div style="text-align:center; color:var(--color-text-muted); line-height:1.2;">&darr;</div>
+
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="The optimizer hook copies the optimized plan; OnFinalizePrepare then runs the create_plan() gate — the one GPU-vs-CPU decision. Runs on the CPU during query prepare. Owned by src/transparent/ and src/sirius_extension.cpp.">Interception &mdash; optimizer hook + <code>create_plan()</code> gate</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/transparent">src/transparent/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/sirius_extension.cpp">src/sirius_extension.cpp &#8599;</a></div>
+            </div>
+            <div style="text-align:center; color:var(--color-text-muted); line-height:1.2;">&darr;</div>
+
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="Walks the captured DuckDB logical plan and builds Sirius physical operators and expression trees — or throws at the first unsupported node. CPU, prepare phase. Owned by src/planner/ and src/expression/.">Plan conversion &mdash; logical plan &rarr; Sirius operators</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/planner">src/planner/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/expression">src/expression/ &#8599;</a></div>
+            </div>
+            <div style="text-align:center; color:var(--color-text-muted); line-height:1.2;">&darr;</div>
+
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="Task creators pair 'operator + available input' into runnable tasks; scan managers slice base-table scans into chunks of work. CPU manager threads. Owned by src/creator/ and src/scan_manager/.">Task creation &amp; scan management &mdash; operator + input &rarr; tasks</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/creator">src/creator/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager">src/scan_manager/ &#8599;</a></div>
+            </div>
           </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">2</div>
-            <p>Interception (plan captured)</p>
+
+          <div style="text-align:center; color:var(--color-text-muted); line-height:1.4;">&darr;</div>
+
+          <!-- Execution layer: straddles CPU and GPU -->
+          <div style="border:1px solid var(--color-border); border-radius:12px; padding:14px;">
+            <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); margin-bottom:10px;">Scheduling &amp; execution &mdash; straddles both zones</div>
+            <div style="display:flex; gap:10px; align-items:stretch; flex-wrap:wrap;">
+              <div style="flex:1 1 240px; background:var(--color-bg-warm); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px;">
+                <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted);">CPU zone</div>
+                <strong><span class="term" data-definition="Per-GPU executors: CPU manager threads pick ready tasks, reserve memory, and launch GPU work. The downgrade executor takes over when memory pressure forces an operator to run on the CPU instead. Owned by src/pipeline/, src/parallel/, src/downgrade/.">Per-GPU executors &mdash; manager threads</span></strong>
+                <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/pipeline">src/pipeline/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/parallel">src/parallel/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/downgrade">src/downgrade/ &#8599;</a></div>
+              </div>
+              <div style="align-self:center; text-align:center;">
+                <span class="term" data-definition="Sync point: a CPU manager thread launches cudf work on a stream, then waits for the GPU to finish before publishing the result batch to a repository." style="border:1px solid var(--color-accent-muted); border-radius:9999px; padding:2px 10px; font-size:12px; color:var(--color-accent);">&#9114; sync</span>
+              </div>
+              <div style="flex:1 1 240px; background:var(--color-accent-light); border:1px solid var(--color-accent-muted); border-radius:8px; padding:10px 14px;">
+                <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted);">GPU zone</div>
+                <strong><span class="term" data-definition="The actual compute: each task's work runs as libcudf calls (joins, filters, aggregations) on the GPU device. No hand-written kernels in the hot path — operators compose cudf. Operator code lives in src/op/ and src/cuda/.">Kernels &mdash; cudf calls on device</span></strong>
+                <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/op">src/op/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/cuda">src/cuda/ &#8599;</a></div>
+              </div>
+            </div>
           </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">3</div>
-            <p>Plan conversion <code>create_plan()</code></p>
+
+          <div style="text-align:center; line-height:1.4;"><span style="border:1px solid var(--color-accent-muted); border-radius:9999px; padding:2px 10px; font-size:12px; color:var(--color-accent); background:var(--color-surface);">&#11044; batch handle &mdash; data never travels by function return; it goes through repositories</span></div>
+
+          <!-- Memory & data substrate -->
+          <div style="background:var(--color-accent-light); border:1px solid var(--color-accent-muted); border-radius:12px; padding:14px; margin-top:4px;">
+            <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); margin-bottom:10px;">GPU zone &mdash; data plane (spills to host &amp; disk tiers)</div>
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="The data substrate: memory reservations, tiers (GPU / host / disk), and the repositories where operators publish result batches — ports tell each operator where its input lives. Provided by the cuCascade submodule plus src/memory/. Module 6 goes deep here.">Memory &amp; data substrate &mdash; reservations, tiers, repositories</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/NVIDIA/cuCascade">cucascade/ (submodule) &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/memory">src/memory/ &#8599;</a></div>
+            </div>
           </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">4</div>
-            <p>Sirius physical operators</p>
+
+          <div style="text-align:center; color:var(--color-text-muted); line-height:1.4;">&darr;</div>
+
+          <!-- Storage / IO zone -->
+          <div style="border:1px dashed var(--color-border); border-radius:12px; padding:14px;">
+            <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); margin-bottom:10px;">Storage / IO zone</div>
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="The IO framework: readers and writers that feed scans and receive spills. Handles parquet files, .duckdb databases, and s3:// object storage. (Iceberg support landed in #521 but its GPU scan path is currently non-functional.) Owned by src/io/.">Storage &amp; IO &mdash; parquet, .duckdb, s3://</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/io">src/io/ &#8599;</a></div>
+            </div>
           </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">5</div>
-            <p>Pipelines &amp; ports</p>
-          </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">6</div>
-            <p><code>task_creator</code>: operator + input &rarr; tasks</p>
-          </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">7</div>
-            <p><code>task_scheduler</code> runs them on GPU</p>
-          </div>
+
         </div>
 
-        <div class="badge-list">
-          <div class="badge-item">
-            <code class="badge-code">repositories</code>
-            <span class="badge-desc">Underneath the strip: data never travels as function returns — operators publish results into repositories, and ports tell each operator where its input lives.</span>
-          </div>
-          <div class="badge-item">
-            <code class="badge-code">memory tiers</code>
-            <span class="badge-desc">Beneath everything: buffers live in tiers (GPU, host, disk), so plans bigger than VRAM can still finish. Module 5 goes deep here.</span>
-          </div>
-        </div>
+        <p>Read it as two journeys: the <strong>control path</strong> flows top-down — a plan becomes operators, operators become tasks. The <strong>data path</strong> never rides along: batches live in the substrate, and each layer only passes handles to where the data sits.</p>
       </section>
 
       <!-- ── Screen 5: Quiz ───────────────────────────────────── -->

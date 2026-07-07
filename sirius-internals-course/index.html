@@ -19,6 +19,120 @@
       --color-accent-light: #E4F2F7;
       --color-accent-muted: #5A9DB8;
     }
+
+    /* ── Responsive width overrides ─────────────────────────────
+       The stock sheet caps content at 800px, which squeezes the
+       code | Plain-English panels into ~350px columns. Make the
+       content column fluid and let the panels breathe. */
+    :root {
+      --content-width:      min(1120px, 94vw);
+      --content-width-wide: min(1280px, 96vw);
+    }
+
+    /* Code panel is denser than the English panel — give it more room,
+       and use minmax(0,·) so pre-wrap can actually wrap inside the grid
+       (default min-width:auto lets long tokens blow the column out). */
+    .translation-block {
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+    }
+    .translation-code, .translation-english { min-width: 0; }
+    .translation-code pre,
+    .translation-code code {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .translation-english { overflow-wrap: break-word; }
+
+    /* Stack the panels while columns would still be cramped —
+       the stock sheet only stacks below 768px, far too late. */
+    @media (max-width: 1000px) {
+      .translation-block { grid-template-columns: 1fr; }
+      .translation-english { border-left: none; border-top: 3px solid var(--color-accent); }
+    }
+
+    /* Keep prose comfortably readable inside the wider column:
+       cap paragraph measure without constraining diagrams/panels. */
+    .screen > p, .module-content > p { max-width: 70ch; }
+
+    /* ── Interactive repo tree (Module 2's ownership map) ─────── */
+    .repo-tree {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      font-family: var(--font-mono);
+      font-size: var(--text-sm);
+      line-height: 1.55;
+    }
+    .repo-tree details { margin: 0; }
+    .repo-tree summary {
+      cursor: pointer; list-style: none;
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+      padding: 4px 8px; border-radius: 6px; font-weight: 600;
+    }
+    .repo-tree summary::-webkit-details-marker { display: none; }
+    .repo-tree summary::before {
+      content: '\25B8'; /* ▸ */
+      color: var(--color-text-muted); width: 1em; flex: none;
+      transition: transform .15s ease; display: inline-block;
+    }
+    .repo-tree details[open] > summary::before { transform: rotate(90deg); }
+    .repo-tree summary:hover, .repo-tree .rt-leaf:hover { background: var(--color-accent-light); }
+    .repo-tree .rt-kids {
+      margin-left: 11px; padding-left: 16px;
+      border-left: 1px solid var(--color-border);
+    }
+    .repo-tree .rt-leaf {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+      padding: 3px 8px; border-radius: 6px;
+    }
+    .repo-tree .rt-leaf::before { content: '\00B7'; color: var(--color-text-muted); width: 1em; flex: none; }
+    .repo-tree a { color: var(--color-accent); text-decoration: none; }
+    .repo-tree a:hover { text-decoration: underline; }
+    .repo-tree .rt-role { font-family: var(--font-body); color: var(--color-text-secondary); }
+    .repo-tree .rt-hint { font-family: var(--font-body); font-size: var(--text-xs); color: var(--color-text-muted); }
+
+    /* ── Doc-comment reader mode (JetBrains-style) ──────────────
+       Full-line comment runs inside code panels render as flowing
+       prose instead of hard-wrapped ///-prefixed lines. */
+    .code-doc {
+      display: block;
+      font-family: var(--font-body);
+      font-size: 0.92em;
+      font-style: italic;
+      color: #A6ADC8;
+      background: rgba(255,255,255,0.05);
+      border-left: 2px solid rgba(203,166,247,0.45);
+      border-radius: 0 6px 6px 0;
+      padding: 8px 12px;
+      margin: 6px 0;
+      line-height: 1.55;
+      white-space: normal;
+    }
+    .code-doc .doc-p { display: block; margin: 0 0 6px; }
+    .code-doc .doc-p:last-child { margin-bottom: 0; }
+    .code-doc .doc-tag {
+      font-family: var(--font-mono);
+      font-style: normal;
+      font-size: 11px;
+      color: #CBA6F7;
+      border: 1px solid rgba(203,166,247,0.35);
+      border-radius: 9999px;
+      padding: 0 8px;
+      margin-right: 6px;
+      white-space: nowrap;
+    }
+    .code-doc code { font-style: normal; color: #CDD6F4; font-size: 0.95em; }
+    .translation-label .rm-chip {
+      font-style: normal;
+      font-size: 10px;
+      color: #CBA6F7;
+      border: 1px solid rgba(203,166,247,0.35);
+      border-radius: 9999px;
+      padding: 0 7px;
+      margin-left: 8px;
+      vertical-align: middle;
+    }
   </style>
 
   <script src="main.js" defer></script>
@@ -33,10 +147,11 @@
         <button class="nav-dot" data-target="module-1" data-tooltip="The Big Picture" role="tab" aria-label="Module 1: The Big Picture"></button>
         <button class="nav-dot" data-target="module-2" data-tooltip="Meet the Actors" role="tab" aria-label="Module 2: Meet the Actors"></button>
         <button class="nav-dot" data-target="module-3" data-tooltip="Life of a Query" role="tab" aria-label="Module 3: Life of a Query"></button>
-        <button class="nav-dot" data-target="module-4" data-tooltip="The Data Plane" role="tab" aria-label="Module 4: The Data Plane"></button>
-        <button class="nav-dot" data-target="module-5" data-tooltip="Memory & Multi-GPU" role="tab" aria-label="Module 5: Memory and Multi-GPU"></button>
-        <button class="nav-dot" data-target="module-6" data-tooltip="Design Decisions" role="tab" aria-label="Module 6: Design Decisions"></button>
-        <button class="nav-dot" data-target="module-7" data-tooltip="The Streaming Frontier" role="tab" aria-label="Module 7: The Streaming Frontier"></button>
+        <button class="nav-dot" data-target="module-4" data-tooltip="Where Data Comes From" role="tab" aria-label="Module 4: Where Data Comes From"></button>
+        <button class="nav-dot" data-target="module-5" data-tooltip="The Data Plane" role="tab" aria-label="Module 5: The Data Plane"></button>
+        <button class="nav-dot" data-target="module-6" data-tooltip="Memory & Multi-GPU" role="tab" aria-label="Module 6: Memory and Multi-GPU"></button>
+        <button class="nav-dot" data-target="module-7" data-tooltip="Design Decisions" role="tab" aria-label="Module 7: Design Decisions"></button>
+        <button class="nav-dot" data-target="module-8" data-tooltip="The Streaming Frontier" role="tab" aria-label="Module 8: The Streaming Frontier"></button>
       </div>
     </div>
   </nav>
@@ -127,16 +242,13 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/transparent/sirius_optimizer_extension.cpp</span>
-            <pre><code>
-<span class="code-line"><span class="code-comment">  // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this</span></span>
-<span class="code-line"><span class="code-comment">  // copy — that's the single source of truth for GPU support. If the plan contains</span></span>
-<span class="code-line"><span class="code-comment">  // unsupported operators, create_plan() throws and we fall back to CPU.</span></span>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/transparent/sirius_optimizer_extension.cpp" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/transparent/sirius_optimizer_extension.cpp &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
+<span class="code-doc"><span class="doc-p">Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this copy — that's the single source of truth for GPU support. If the plan contains unsupported operators, create_plan() throws and we fall back to CPU.</span></span>
 <span class="code-line">  <span class="code-keyword">try</span> {</span>
 <span class="code-line">    <span class="code-keyword">auto</span> plan_copy = plan-&gt;<span class="code-function">Copy</span>(context);</span>
 <span class="code-line">    ctx-&gt;<span class="code-function">set_captured_logical_plan</span>(std::<span class="code-function">move</span>(plan_copy));</span>
 <span class="code-line">  } <span class="code-keyword">catch</span> (duckdb::NotImplementedException&amp;) {</span>
-<span class="code-line"><span class="code-comment">    // Plan not serializable — skip GPU.</span></span>
+<span class="code-doc"><span class="doc-p">Plan not serializable — skip GPU.</span></span>
 <span class="code-line">  } <span class="code-keyword">catch</span> (std::exception&amp; e) {</span>
 <span class="code-line">    spdlog::<span class="code-function">debug</span>(<span class="code-string">"Transparent execution: failed to copy logical plan: {}"</span>, e.what());</span>
 <span class="code-line">  }</span>
@@ -185,12 +297,12 @@
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
             <div class="pattern-icon" style="background: var(--color-actor-3)">&#127959;&#65039;</div>
             <h4 class="pattern-title">Dec 2025&ndash;Feb 2026 · <span class="term" data-definition="The current, live engine: namespace sirius, source under src/op/, src/planner/, src/pipeline/, src/cuda/. A ground-up rewrite on cuCascade with pipelines, repositories, ports, and a task scheduler.">Super Sirius</span></h4>
-            <p class="pattern-desc">Ground-up rewrite on cuCascade: <a href="https://github.com/sirius-db/sirius/pull/96">#96</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/134">#134</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/198">#198</a>, first end-to-end query in <a href="https://github.com/sirius-db/sirius/pull/206">#206</a>.</p>
+            <p class="pattern-desc">Ground-up rewrite on cuCascade: <a href="https://github.com/sirius-db/sirius/pull/96">#96</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/134">#134</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/198">#198</a>, first end-to-end query in <a href="https://github.com/sirius-db/sirius/pull/206">#206</a>. <a href="https://github.com/sirius-db/sirius/pull/267">#267</a> wired TPC-H into the integration tests &mdash; ever since, that's how the project knows a change is correct.</p>
           </div>
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
             <div class="pattern-icon" style="background: var(--color-actor-1)">&#127917;</div>
             <h4 class="pattern-title">Apr 2026 · <span class="term" data-definition="The contract that plain SQL needs no changes: Sirius hooks DuckDB's planning, swaps in a GPU plan when supported, and silently falls back to CPU when not.">Transparent interception</span></h4>
-            <p class="pattern-desc"><a href="https://github.com/sirius-db/sirius/pull/518">#518</a>: load the extension and plain SQL just runs on GPU. No special syntax — the interpreter enters the booth.</p>
+            <p class="pattern-desc"><a href="https://github.com/sirius-db/sirius/pull/518">#518</a>: load the extension and plain SQL just runs on GPU. No special syntax — the interpreter enters the booth. The old engine was walled off in the same push: gated behind an <code>ENABLE_LEGACY_SIRIUS</code> build flag (<a href="https://github.com/sirius-db/sirius/pull/509">#509</a>, Mar 2026), then relocated under <code>src/legacy/</code> (<a href="https://github.com/sirius-db/sirius/pull/692">#692</a>, Apr 2026).</p>
           </div>
         </div>
 
@@ -202,59 +314,92 @@
         </div>
       </section>
 
-      <!-- ── Screen 4: The flow strip (hero visual) ───────────── -->
+      <!-- ── Screen 4: Layered system architecture (hero visual) ── -->
       <section class="screen animate-in">
-        <h2 class="screen-heading">The whole machine on one strip</h2>
+        <h2 class="screen-heading">The whole machine, layer by layer</h2>
 
-        <p>This is the map for the rest of the course — every later module zooms into one or two boxes on this strip.</p>
+        <p>This is the map for the rest of the course — every later module zooms into one layer of this stack. Hover any layer for who owns it and which thread runs it; every path is a real link into the repo.</p>
 
-        <div class="flow-steps animate-in">
-          <div class="flow-step">
-            <div class="flow-step-num">1</div>
-            <p>SQL query arrives</p>
+        <div class="animate-in" style="display:flex; flex-direction:column; gap:0; margin:1.5rem 0;">
+
+          <!-- CPU zone: control plane -->
+          <div style="background:var(--color-bg-warm); border:1px solid var(--color-border); border-radius:12px; padding:14px;">
+            <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); display:flex; justify-content:space-between; margin-bottom:10px;">
+              <span>CPU zone &mdash; control plane</span>
+              <span>&darr; control path: the plan flows down</span>
+            </div>
+
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="DuckDB's unmodified frontend: parse, bind, optimize. Runs on the CPU in the user's connection thread. Sirius changes nothing here — it only listens downstream.">Client / SQL &mdash; DuckDB frontend (unmodified)</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;">duckdb/ (submodule) &mdash; parse &rarr; bind &rarr; optimize</div>
+            </div>
+            <div style="text-align:center; color:var(--color-text-muted); line-height:1.2;">&darr;</div>
+
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="The optimizer hook copies the optimized plan; OnFinalizePrepare then runs the create_plan() gate — the one GPU-vs-CPU decision. Runs on the CPU during query prepare. Owned by src/transparent/ and src/sirius_extension.cpp.">Interception &mdash; optimizer hook + <code>create_plan()</code> gate</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/transparent">src/transparent/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/sirius_extension.cpp">src/sirius_extension.cpp &#8599;</a></div>
+            </div>
+            <div style="text-align:center; color:var(--color-text-muted); line-height:1.2;">&darr;</div>
+
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="Walks the captured DuckDB logical plan and builds Sirius physical operators and expression trees — or throws at the first unsupported node. CPU, prepare phase. Owned by src/planner/ and src/expression/.">Plan conversion &mdash; logical plan &rarr; Sirius operators</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/planner">src/planner/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/expression">src/expression/ &#8599;</a></div>
+            </div>
+            <div style="text-align:center; color:var(--color-text-muted); line-height:1.2;">&darr;</div>
+
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="Task creators pair 'operator + available input' into runnable tasks; scan managers slice base-table scans into chunks of work. CPU manager threads. Owned by src/creator/ and src/scan_manager/.">Task creation &amp; scan management &mdash; operator + input &rarr; tasks</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/creator">src/creator/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager">src/scan_manager/ &#8599;</a></div>
+            </div>
           </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">2</div>
-            <p>Interception (plan captured)</p>
+
+          <div style="text-align:center; color:var(--color-text-muted); line-height:1.4;">&darr;</div>
+
+          <!-- Execution layer: straddles CPU and GPU -->
+          <div style="border:1px solid var(--color-border); border-radius:12px; padding:14px;">
+            <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); margin-bottom:10px;">Scheduling &amp; execution &mdash; straddles both zones</div>
+            <div style="display:flex; gap:10px; align-items:stretch; flex-wrap:wrap;">
+              <div style="flex:1 1 240px; background:var(--color-bg-warm); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px;">
+                <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted);">CPU zone</div>
+                <strong><span class="term" data-definition="Per-GPU executors: CPU manager threads pick ready tasks, reserve memory, and launch GPU work. The downgrade executor takes over when memory pressure forces an operator to run on the CPU instead. Owned by src/pipeline/, src/parallel/, src/downgrade/.">Per-GPU executors &mdash; manager threads</span></strong>
+                <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/pipeline">src/pipeline/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/parallel">src/parallel/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/downgrade">src/downgrade/ &#8599;</a></div>
+              </div>
+              <div style="align-self:center; text-align:center;">
+                <span class="term" data-definition="Sync point: a CPU manager thread launches cudf work on a stream, then waits for the GPU to finish before publishing the result batch to a repository." style="border:1px solid var(--color-accent-muted); border-radius:9999px; padding:2px 10px; font-size:12px; color:var(--color-accent);">&#9114; sync</span>
+              </div>
+              <div style="flex:1 1 240px; background:var(--color-accent-light); border:1px solid var(--color-accent-muted); border-radius:8px; padding:10px 14px;">
+                <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted);">GPU zone</div>
+                <strong><span class="term" data-definition="The actual compute: each task's work runs as libcudf calls (joins, filters, aggregations) on the GPU device. No hand-written kernels in the hot path — operators compose cudf. Operator code lives in src/op/ and src/cuda/.">Kernels &mdash; cudf calls on device</span></strong>
+                <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/op">src/op/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/cuda">src/cuda/ &#8599;</a></div>
+              </div>
+            </div>
           </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">3</div>
-            <p>Plan conversion <code>create_plan()</code></p>
+
+          <div style="text-align:center; line-height:1.4;"><span style="border:1px solid var(--color-accent-muted); border-radius:9999px; padding:2px 10px; font-size:12px; color:var(--color-accent); background:var(--color-surface);">&#11044; batch handle &mdash; data never travels by function return; it goes through repositories</span></div>
+
+          <!-- Memory & data substrate -->
+          <div style="background:var(--color-accent-light); border:1px solid var(--color-accent-muted); border-radius:12px; padding:14px; margin-top:4px;">
+            <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); margin-bottom:10px;">GPU zone &mdash; data plane (spills to host &amp; disk tiers)</div>
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="The data substrate: memory reservations, tiers (GPU / host / disk), and the repositories where operators publish result batches — ports tell each operator where its input lives. Provided by the cuCascade submodule plus src/memory/. Module 6 goes deep here.">Memory &amp; data substrate &mdash; reservations, tiers, repositories</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/NVIDIA/cuCascade">cucascade/ (submodule) &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/tree/dev/src/memory">src/memory/ &#8599;</a></div>
+            </div>
           </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">4</div>
-            <p>Sirius physical operators</p>
+
+          <div style="text-align:center; color:var(--color-text-muted); line-height:1.4;">&darr;</div>
+
+          <!-- Storage / IO zone -->
+          <div style="border:1px dashed var(--color-border); border-radius:12px; padding:14px;">
+            <div style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); margin-bottom:10px;">Storage / IO zone</div>
+            <div style="background:var(--color-surface); border:1px solid var(--color-border); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow-sm);">
+              <strong><span class="term" data-definition="The IO framework: readers and writers that feed scans and receive spills. Handles parquet files, .duckdb databases, and s3:// object storage. (Iceberg support landed in #521 but its GPU scan path is currently non-functional.) Owned by src/io/.">Storage &amp; IO &mdash; parquet, .duckdb, s3://</span></strong>
+              <div style="font-size:12px; color:var(--color-text-muted); font-family:var(--font-mono); margin-top:2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/io">src/io/ &#8599;</a></div>
+            </div>
           </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">5</div>
-            <p>Pipelines &amp; ports</p>
-          </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">6</div>
-            <p><code>task_creator</code>: operator + input &rarr; tasks</p>
-          </div>
-          <div class="flow-arrow">&rarr;</div>
-          <div class="flow-step">
-            <div class="flow-step-num">7</div>
-            <p><code>task_scheduler</code> runs them on GPU</p>
-          </div>
+
         </div>
 
-        <div class="badge-list">
-          <div class="badge-item">
-            <code class="badge-code">repositories</code>
-            <span class="badge-desc">Underneath the strip: data never travels as function returns — operators publish results into repositories, and ports tell each operator where its input lives.</span>
-          </div>
-          <div class="badge-item">
-            <code class="badge-code">memory tiers</code>
-            <span class="badge-desc">Beneath everything: buffers live in tiers (GPU, host, disk), so plans bigger than VRAM can still finish. Module 5 goes deep here.</span>
-          </div>
-        </div>
+        <p>Read it as two journeys: the <strong>control path</strong> flows top-down — a plan becomes operators, operators become tasks. The <strong>data path</strong> never rides along: batches live in the substrate, and each layer only passes handles to where the data sits.</p>
       </section>
 
       <!-- ── Screen 5: Quiz ───────────────────────────────────── -->
@@ -356,8 +501,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/include/sirius_context.hpp</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/sirius_context.hpp" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/sirius_context.hpp &#8599;</a></span><pre><code>
 <span class="code-line">  std::shared_ptr&lt;<span class="code-keyword">const</span> sirius::telemetry::telemetry_context&gt; <span class="code-property">telemetry_context_</span>;</span>
 <span class="code-line">  std::unique_ptr&lt;cucascade::shared_data_repository_manager&gt; <span class="code-property">data_repository_manager_</span>;</span>
 <span class="code-line">  std::unique_ptr&lt;sirius::pipeline::task_scheduler&gt; <span class="code-property">task_scheduler_</span>;</span>
@@ -433,12 +577,140 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code" style="grid-column: 1 / -1">
-            <span class="translation-label">the defaults, straight from sirius_config.hpp</span>
-            <pre><code>
+            <span class="translation-label">the defaults, straight from sirius_config.hpp</span><pre><code>
 <span class="code-line">  exec::thread_pool_config <span class="code-property">_task_creator_config</span>{.num_threads        = <span class="code-number">2</span>,</span>
 <span class="code-line">  exec::thread_pool_config <span class="code-property">_gpu_pipeline_executor_config</span>{.num_threads        = <span class="code-number">4</span>,</span>
             </code></pre>
           </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2b: Package ownership map ──────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Who owns which directory</h2>
+        <p>The consoles map one-to-one onto the source tree. Click a directory to expand or collapse it, hover an owner chip to recall its job — every row links to the real code.</p>
+
+        <div class="repo-tree">
+          <div style="padding: 2px 8px; font-weight: 700;"><a href="https://github.com/sirius-db/sirius/tree/dev" target="_blank" rel="noopener" style="color: var(--color-text);"><code>sirius/</code> ↗</a> <span class="rt-hint">— click a directory to expand or collapse it</span></div>
+
+          <details open>
+            <summary><code>src/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/src" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a> <span class="rt-role">the engine — everything below runs inside the DuckDB process</span></summary>
+            <div class="rt-kids">
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/transparent" target="_blank" rel="noopener"><code>transparent/</code> ↗</a>
+                <span style="color: var(--color-text-muted);">+</span>
+                <a href="https://github.com/sirius-db/sirius/blob/dev/src/sirius_extension.cpp" target="_blank" rel="noopener"><code>sirius_extension.cpp</code> ↗</a>
+                <span class="term" data-definition="The extension entry point and interception layer. It registers SiriusContext as ClientContextState and swaps DuckDB's physical plan for a GPU one — the reason no special syntax is needed." style="font-size: var(--text-xs); color: var(--color-actor-4); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">sirius_engine</span>
+                <span class="rt-role">interception &amp; extension entry</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/planner" target="_blank" rel="noopener"><code>planner/</code> ↗</a>
+                <span style="color: var(--color-text-muted);">·</span>
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/expression" target="_blank" rel="noopener"><code>expression/</code> ↗</a>
+                <span style="color: var(--color-text-muted);">·</span>
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/expression_executor" target="_blank" rel="noopener"><code>expression_executor/</code> ↗</a>
+                <span class="term" data-definition="Mission planning: sirius_physical_plan_generator.cpp translates DuckDB's plan into GPU pipelines, once, on the DuckDB query thread — before any executor wakes up." style="font-size: var(--text-xs); color: var(--color-actor-4); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">plan generator</span>
+                <span class="rt-role">DuckDB plan → GPU pipelines &amp; expressions</span>
+              </div>
+
+              <details open>
+                <summary><code>op/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/src/op" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a>
+                  <span class="term" data-definition="The per-GPU execution engine (src/pipeline/): its 4 pinned worker threads are what actually run the code in src/op/." style="font-size: var(--text-xs); color: var(--color-actor-2); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap; font-weight: 400;">gpu_pipeline_executor</span>
+                  <span class="rt-role" style="font-weight: 400;">physical operators</span>
+                  <span style="font-size: var(--text-xs); color: var(--color-accent); border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 0 8px; white-space: nowrap; font-weight: 400;">★ your new operator goes here</span>
+                </summary>
+                <div class="rt-kids">
+                  <div class="rt-leaf">
+                    <a href="https://github.com/sirius-db/sirius/tree/dev/src/op/scan" target="_blank" rel="noopener"><code>scan/</code> ↗</a>
+                    <span class="rt-role">scan operators &amp; decoders (gpu_ingestible, cpu_source_task, …)</span>
+                  </div>
+                  <div class="rt-leaf">
+                    <a href="https://github.com/sirius-db/sirius/tree/dev/src/op/aggregate" target="_blank" rel="noopener"><code>aggregate/</code> ↗</a>
+                    <span style="color: var(--color-text-muted);">·</span>
+                    <a href="https://github.com/sirius-db/sirius/tree/dev/src/op/result" target="_blank" rel="noopener"><code>result/</code> ↗</a>
+                    <span class="rt-role">aggregation helpers &amp; result collection</span>
+                  </div>
+                </div>
+              </details>
+
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/cuda" target="_blank" rel="noopener"><code>cuda/</code> ↗</a>
+                <span class="term" data-definition="Runs on GPU worker threads' CUDA streams — the hand-written kernels operators call when cuDF doesn't have the primitive." style="font-size: var(--text-xs); color: var(--color-actor-2); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">gpu workers</span>
+                <span class="rt-role">hand-written CUDA kernels behind the operators</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/creator" target="_blank" rel="noopener"><code>creator/</code> ↗</a>
+                <span class="term" data-definition="The decision-maker: 2 threads walk each pipeline's hint chain and turn READY hints into tasks. Decides, never executes." style="font-size: var(--text-xs); color: var(--color-actor-3); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">task_creator</span>
+                <span class="rt-role">decides what runs next</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager" target="_blank" rel="noopener"><code>scan_manager/</code> ↗</a>
+                <span class="term" data-definition="Ground stations: splits base tables into scan splits and feeds the ingest that starts every pipeline." style="font-size: var(--text-xs); color: var(--color-actor-4); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">scan_manager</span>
+                <span class="rt-role">table splits &amp; ingest</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/pipeline" target="_blank" rel="noopener"><code>pipeline/</code> ↗</a>
+                <span style="color: var(--color-text-muted);">·</span>
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/parallel" target="_blank" rel="noopener"><code>parallel/</code> ↗</a>
+                <span class="term" data-definition="The Flight Director (task_scheduler's management loop) plus the per-GPU executors it dispatches to — the thread pools of Screen 3 live here." style="font-size: var(--text-xs); color: var(--color-actor-1); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">task_scheduler</span>
+                <span class="rt-role">scheduler loop &amp; executors</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/downgrade" target="_blank" rel="noopener"><code>downgrade/</code> ↗</a>
+                <span class="term" data-definition="Life support: one monitor per memory space spills victim batches downhill (GPU → host → disk) so queries degrade instead of OOMing." style="font-size: var(--text-xs); color: var(--color-actor-5); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">downgrade_executor</span>
+                <span class="rt-role">memory-pressure spilling</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/memory" target="_blank" rel="noopener"><code>memory/</code> ↗</a>
+                <span class="term" data-definition="cuCascade component where ALL inter-operator data lives: operators publish batches into shared repositories, downstream operators pull — data never travels by function return." style="font-size: var(--text-xs); color: var(--color-actor-3); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">shared_data_repository_manager</span>
+                <span class="rt-role">memory spaces &amp; repositories (built on the <a href="https://github.com/NVIDIA/cuCascade" target="_blank" rel="noopener"><code>cucascade/</code> ↗</a> submodule)</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/io" target="_blank" rel="noopener"><code>io/</code> ↗</a>
+                <span class="term" data-definition="The IO framework the scan path uses to read local files and object storage on the way to the GPU." style="font-size: var(--text-xs); color: var(--color-actor-4); border: 1px solid var(--color-border); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">scan executors</span>
+                <span class="rt-role">IO framework (files, object storage)</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/blob/dev/src/include/sirius_ffi.hpp" target="_blank" rel="noopener"><code>include/sirius_ffi.hpp</code> ↗</a>
+                <span class="rt-role">the public C FFI — the embedding surface everything external goes through</span>
+              </div>
+              <div class="rt-leaf">
+                <a href="https://github.com/sirius-db/sirius/tree/dev/src/legacy" target="_blank" rel="noopener"><code>legacy/</code> ↗</a>
+                <span style="font-size: var(--text-xs); color: var(--color-error); border: 1px solid var(--color-error); border-radius: 9999px; padding: 0 8px; white-space: nowrap;">⛔ dead code — never modify</span>
+              </div>
+            </div>
+          </details>
+
+          <details>
+            <summary><code>cucascade/</code> <a href="https://github.com/NVIDIA/cuCascade" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a> <span class="rt-role">submodule → NVIDIA/cuCascade — memory tiers, data batches, repositories</span></summary>
+            <div class="rt-kids">
+              <div class="rt-leaf"><span class="rt-role">engine-agnostic substrate: reservations, memory spaces, <code>data_batch</code>, <code>shared_data_repository</code> — extracted from Sirius in Dec 2025</span></div>
+            </div>
+          </details>
+
+          <details>
+            <summary><code>test/cpp/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a>
+              <span style="font-size: var(--text-xs); color: var(--color-accent); border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 0 8px; white-space: nowrap; font-weight: 400;">★ your tests go here</span>
+            </summary>
+            <div class="rt-kids">
+              <div class="rt-leaf"><span class="rt-role">Catch2 unit tests by area (<a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp/pipeline" target="_blank" rel="noopener"><code>pipeline/</code> ↗</a> · <a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp/scan" target="_blank" rel="noopener"><code>scan/</code> ↗</a> · <a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp/scan_manager" target="_blank" rel="noopener"><code>scan_manager/</code> ↗</a>)</span></div>
+              <div class="rt-leaf"><span class="rt-role">new files must be added to <code>TEST_SOURCES</code> in <a href="https://github.com/sirius-db/sirius/blob/dev/CMakeLists.txt" target="_blank" rel="noopener"><code>CMakeLists.txt</code> ↗</a>; the <code>check-orphan-tests</code> pre-commit hook catches forgotten ones</span></div>
+            </div>
+          </details>
+
+          <details>
+            <summary><code>experimental/starrocks/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/experimental/starrocks" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a> <span class="rt-role">the StarRocks CN integration (Rust)</span></summary>
+            <div class="rt-kids">
+              <div class="rt-leaf"><span class="rt-role">Sirius embedded outside DuckDB: a Rust compute-node process speaking StarRocks' thrift/BRPC protocols</span></div>
+            </div>
+          </details>
+
+          <details>
+            <summary><code>rust/crates/</code> <a href="https://github.com/sirius-db/sirius/tree/dev/rust/crates" target="_blank" rel="noopener" title="open on GitHub" style="font-weight:400;">↗</a> <span class="rt-role">Rust bindings over the FFI (<code>sirius-sys</code> · <code>sirius</code>)</span></summary>
+            <div class="rt-kids">
+              <div class="rt-leaf"><span class="rt-role">with <code>src/include/sirius_ffi.hpp</code>, this is the public / embedding surface — everything else above is internal implementation, reachable only through the extension</span></div>
+            </div>
+          </details>
         </div>
       </section>
 
@@ -671,19 +943,68 @@
         <p>Let&rsquo;s trace one query, end to end, with the real functions — every name below is <code>grep</code>-able in the tree:</p>
 
         <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
-          <span class="translation-label">the query</span>
-          <pre><code><span class="code-keyword">SELECT</span> <span class="code-function">count</span>(*) <span class="code-keyword">FROM</span> orders <span class="code-keyword">WHERE</span> amount <span class="code-operator">&gt;</span> <span class="code-number">100</span>;</code></pre>
+          <span class="translation-label">the query</span><pre><code><span class="code-keyword">SELECT</span> <span class="code-function">count</span>(*) <span class="code-keyword">FROM</span> orders <span class="code-keyword">WHERE</span> amount <span class="code-operator">&gt;</span> <span class="code-number">100</span>;</code></pre>
         </div>
 
         <p>DuckDB parses it; Sirius converts the plan and cuts it at the COUNT, because an aggregate is a <span class="term" data-definition="An operator that must consume ALL of its input before it can emit anything — aggregates, sorts, hash-join builds. The plan is cut into a new pipeline at every one.">pipeline breaker</span> — it must see all input before emitting anything. The result is two pipelines:</p>
 
-        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
-          <span class="translation-label">the split plan</span>
-          <pre><code><span class="code-property">Pipeline A (streaming):</span> SCAN(orders) → FILTER(amount&gt;100) → [sink: partial COUNT state]
-<span class="code-property">Pipeline B (terminal):</span> COUNT finalize → RESULT_COLLECTOR</code></pre>
+        <div class="animate-in" style="margin: var(--space-6) 0;">
+          <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); font-family: var(--font-mono); margin-bottom: var(--space-2);">the split plan &mdash; hover any station for its owner</div>
+
+          <!-- Pipeline A -->
+          <div style="border: 1px solid var(--color-border); background: var(--color-surface-warm); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); margin-bottom: var(--space-3);">Pipeline A &mdash; streaming</div>
+            <div style="display: flex; align-items: stretch; gap: var(--space-2); flex-wrap: wrap;">
+              <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+                <div style="font-weight: 600;"><span class="term" data-definition="Source operator: turns splits of the orders table into GPU-resident batches, one task per split. Runs inside a worker task; keeps answering READY while splits remain. Owner: src/op/scan/sirius_gpu_scan_operator.cpp.">SCAN(orders)</span></div>
+                <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/sirius_gpu_scan_operator.cpp" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">op/scan/sirius_gpu_scan_operator.cpp ↗</a></div>
+              </div>
+              <div style="align-self: center; text-align: center; color: var(--color-text-muted);">
+                <div>→</div>
+                <div style="font-size: 11px; font-family: var(--font-mono);"><span class="term" data-definition="A PIPELINE-barrier edge: batch-by-batch flow. The consumer runs as soon as the producer emits one batch — no waiting for the whole upstream result.">≋ streams</span></div>
+              </div>
+              <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+                <div style="font-weight: 600;"><span class="term" data-definition="Streaming operator: evaluates amount &gt; 100 on the GPU and keeps surviving rows. Never blocks — one batch in, one (smaller) batch out. Owner: src/op/sirius_physical_filter.cpp.">FILTER(amount&gt;100)</span></div>
+                <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_filter.cpp" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">op/sirius_physical_filter.cpp ↗</a></div>
+              </div>
+              <div style="align-self: center; text-align: center; color: var(--color-text-muted);">
+                <div>→</div>
+                <div style="font-size: 11px; font-family: var(--font-mono);"><span class="term" data-definition="A PIPELINE-barrier edge: batch-by-batch flow. The consumer runs as soon as the producer emits one batch — no waiting for the whole upstream result.">≋ streams</span></div>
+              </div>
+              <div style="background: var(--color-surface); border: 1px solid var(--color-accent-muted); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+                <div style="font-weight: 600; display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;"><span class="term" data-definition="Pipeline breaker: the sink of Pipeline A. Folds every batch into a running count state and emits nothing until the pipeline finalizes. count(*) with no GROUP BY is the ungrouped aggregate — src/op/sirius_physical_ungrouped_aggregate.cpp; the GROUP BY variant lives in src/op/sirius_physical_grouped_aggregate.cpp.">partial-COUNT sink</span><span style="font-size: 11px; font-family: var(--font-mono); border: 1px solid var(--color-accent-muted); color: var(--color-accent); border-radius: var(--radius-full); padding: 1px 8px;">⛔ breaker</span></div>
+                <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_ungrouped_aggregate.cpp" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">op/sirius_physical_ungrouped_aggregate.cpp ↗</a></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- FULL barrier gate -->
+          <div style="display: flex; align-items: center; gap: var(--space-3); margin: var(--space-3) 0; padding: var(--space-2) var(--space-4); border: 1px dashed var(--color-accent-muted); border-radius: 8px; background: var(--color-accent-light);">
+            <span style="font-family: var(--font-mono); font-weight: 600; color: var(--color-accent); white-space: nowrap;"><span class="term" data-definition="The hard barrier on Pipeline B&rsquo;s input port: the consumer cannot start until the producer pipeline is COMPLETELY finished. The entire count state must exist before finalize may touch it.">▮▮ FULL barrier</span></span>
+            <span style="font-size: var(--text-sm); color: var(--color-text-secondary);">opens only when Pipeline A finishes &mdash; every split scanned, every port drained, every task turned in</span>
+          </div>
+
+          <!-- Pipeline B -->
+          <div style="border: 1px solid var(--color-border); background: var(--color-surface-warm); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); margin-bottom: var(--space-3);">Pipeline B &mdash; terminal</div>
+            <div style="display: flex; align-items: stretch; gap: var(--space-2); flex-wrap: wrap;">
+              <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+                <div style="font-weight: 600;"><span class="term" data-definition="The same aggregate, sealing its accumulated state: finalize_operator() runs exactly once when Pipeline A is declared finished, and Pipeline B pulls the completed state through its FULL-barrier port. Owner: src/op/sirius_physical_ungrouped_aggregate.cpp.">COUNT finalize</span></div>
+                <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_ungrouped_aggregate.cpp" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">op/sirius_physical_ungrouped_aggregate.cpp ↗</a></div>
+              </div>
+              <div style="align-self: center; text-align: center; color: var(--color-text-muted);">
+                <div>→</div>
+                <div style="font-size: 11px; font-family: var(--font-mono);"><span class="term" data-definition="A PIPELINE-barrier edge: batch-by-batch flow. The consumer runs as soon as the producer emits one batch — no waiting for the whole upstream result.">≋ streams</span></div>
+              </div>
+              <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+                <div style="font-weight: 600;"><span class="term" data-definition="Terminal operator of the last pipeline: materializes the final row and fulfills the future DuckDB has been blocking on since start_query(). Owner: src/op/sirius_physical_result_collector.cpp.">RESULT_COLLECTOR</span></div>
+                <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_result_collector.cpp" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">op/sirius_physical_result_collector.cpp ↗</a></div>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <p>Mental model: a kanban factory line. Stations never push work downstream — a station <em>pulls</em> when its input bin has parts, and the andon board only updates when a worker turns in a job card. Hold on to that second rule; it becomes a bug story in Module 7.</p>
+        <p>Mental model: a kanban factory line. Stations never push work downstream — a station <em>pulls</em> when its input bin has parts, and the andon board only updates when a worker turns in a job card. Hold on to that second rule; it becomes a bug story in Module 8.</p>
 
         <p>Not all bins are equal. Each input <span class="term" data-definition="An input slot of an operator, wiring it to one upstream pipeline. A port carries a barrier type plus a repository holding the batches waiting to be consumed.">port</span> carries a barrier type that decides when the consumer may start:</p>
 
@@ -711,8 +1032,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/task_scheduler.cpp:172</span>
-            <pre><code>std::future&lt;<span class="code-keyword">void</span>&gt; task_scheduler::<span class="code-function">start_query</span>()
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/task_scheduler.cpp#L172" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/task_scheduler.cpp:172 &#8599;</a></span><pre><code>std::future&lt;<span class="code-keyword">void</span>&gt; task_scheduler::<span class="code-function">start_query</span>()
 {
   std::scoped_lock <span class="code-function">lock</span>(_query_mutex);
   <span class="code-keyword">const auto</span>&amp; scans = _query-&gt;<span class="code-function">get_scan_operators</span>();
@@ -821,8 +1141,7 @@
         </div>
 
         <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
-          <span class="translation-label">src/include/op/sirius_physical_operator.hpp:49</span>
-          <pre><code><span class="code-keyword">enum class</span> TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+          <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/op/sirius_physical_operator.hpp#L49" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/op/sirius_physical_operator.hpp:49 &#8599;</a></span><pre><code><span class="code-keyword">enum class</span> TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
 
 <span class="code-keyword">enum class</span> MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 
@@ -835,12 +1154,11 @@
         <p>The base implementation walks the input ports looking for a FULL barrier whose producer pipeline hasn&rsquo;t finished. Found one? Answer WAITING, pointing at that pipeline&rsquo;s source. Every port satisfied? The function falls through to READY.</p>
 
         <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
-          <span class="translation-label">src/op/sirius_physical_operator.cpp:275</span>
-          <pre><code>std::optional&lt;task_creation_hint&gt; sirius_physical_operator::<span class="code-function">get_next_task_hint</span>()
+          <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_operator.cpp#L275" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/op/sirius_physical_operator.cpp:275 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>std::optional&lt;task_creation_hint&gt; sirius_physical_operator::<span class="code-function">get_next_task_hint</span>()
 {
   <span class="code-keyword">if</span> (ports.<span class="code-function">empty</span>()) { <span class="code-keyword">return</span> std::nullopt; }
 
-<span class="code-comment">  // look at the input ports and see if there are any unfinished hard barriers</span>
+<span class="code-doc"><span class="doc-p">look at the input ports and see if there are any unfinished hard barriers</span></span>
   <span class="code-keyword">auto</span> unfinished_barrier = std::<span class="code-function">find_if</span>(_ports_list.<span class="code-function">begin</span>(), _ports_list.<span class="code-function">end</span>(), [](<span class="code-keyword">const auto</span>&amp; p) {
     <span class="code-keyword">return</span> p-&gt;type == MemoryBarrierType::FULL &amp;&amp; p-&gt;src_pipeline &amp;&amp;
            !p-&gt;src_pipeline-&gt;<span class="code-function">is_pipeline_finished</span>();
@@ -864,7 +1182,7 @@
             <div class="step-num" style="background: var(--color-actor-2)">1</div>
             <div class="step-body">
               <strong>Reserve GPU memory</strong>
-              <p>Admission control: the memory this batch needs is reserved before anything executes. Module 5 lives entirely inside this step.</p>
+              <p>Admission control: the memory this batch needs is reserved before anything executes. Module 6 lives entirely inside this step.</p>
             </div>
           </div>
           <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
@@ -890,11 +1208,66 @@
           </div>
         </div>
 
+        <p>Where exactly does the CPU stop and the GPU begin? The four moves above straddle a boundary. Hover the nodes — each one answers an ownership question: who controls execution, who owns the memory, where kernels launch, where the sync points are.</p>
+
+        <div class="animate-in" style="display: flex; gap: var(--space-3); flex-wrap: wrap; margin: var(--space-6) 0;">
+
+          <!-- CPU zone -->
+          <div style="flex: 1 1 280px; background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); margin-bottom: var(--space-3);">CPU zone &mdash; scheduling threads</div>
+
+            <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+              <div style="font-weight: 600;"><span class="term" data-definition="Builds the task: asks the operator for a hint, pops the input batch handles off the port repositories, and wraps one pipeline pass into a gpu_pipeline_task. Runs on the task-creator thread. Owner: src/creator/task_creator.cpp.">task creator</span></div>
+              <div style="font-size: 12px; color: var(--color-text-secondary);">hint → pop input → build <code>gpu_pipeline_task</code></div>
+              <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/creator/task_creator.cpp" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">src/creator/task_creator.cpp ↗</a></div>
+            </div>
+            <div style="text-align: center; color: var(--color-text-muted); padding: var(--space-1) 0;">↓</div>
+
+            <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+              <div style="font-weight: 600;"><span class="term" data-definition="WHO OWNS EXECUTION CONTROL: the executor manager thread. It pops tasks off the queue, runs admission control — reserving GPU memory up front from the pipeline&rsquo;s history-based estimate — and decides what runs. Owner: src/pipeline/gpu_pipeline_executor.cpp.">GPU executor manager thread</span></div>
+              <div style="font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="WHO OWNS THE MEMORY: the reservation. Before the task touches the GPU, the manager reserves the memory the batch is estimated to need (from pipeline history). If the reservation cannot be granted, the task waits or downgrades — kernels never start on unbudgeted memory. Module 6 lives inside this step.">reserve GPU memory from pipeline history</span></div>
+              <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_executor.cpp" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">src/pipeline/gpu_pipeline_executor.cpp ↗</a></div>
+            </div>
+            <div style="text-align: center; color: var(--color-text-muted); padding: var(--space-1) 0;">↓</div>
+
+            <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+              <div style="font-weight: 600;"><span class="term" data-definition="The hand-off across the boundary: the manager reserves a slot in the bounded worker pool (backpressure — it blocks until a worker is free), acquires an exclusive CUDA stream from the stream pool, and dispatches the task to that pinned worker thread.">dispatch → pinned worker</span></div>
+              <div style="font-size: 12px; color: var(--color-text-secondary);">bounded pool slot + exclusive CUDA stream</div>
+            </div>
+          </div>
+
+          <!-- GPU zone -->
+          <div style="flex: 1 1 280px; background: var(--color-accent-light); border: 1px solid var(--color-accent-muted); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); margin-bottom: var(--space-3);">GPU zone &mdash; worker thread + its per-task CUDA stream</div>
+
+            <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+              <div style="font-weight: 600; display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;"><span class="term" data-definition="Lock the input batches for reading and colocate them into one memory space so kernels see resident, same-device inputs. Any batch that lives on the host or another device is copied to this GPU here — this is where H2D transfers happen, and the task waits for them. Owner: src/pipeline/gpu_pipeline_task.cpp.">prepare_for_processing()</span><span style="font-size: 11px; font-family: var(--font-mono); border: 1px solid var(--color-accent-muted); color: var(--color-accent); border-radius: var(--radius-full); padding: 1px 8px;"><span class="term" data-definition="WHERE SYNC HAPPENS, part 1: the task cannot execute until its inputs are locked and resident on the device — H2D copies issued here must land before the first kernel reads them.">⏚ sync</span></span></div>
+              <div style="font-size: 12px; color: var(--color-text-secondary);">lock + colocate input batches; H2D copies land here</div>
+              <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_task.cpp" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">src/pipeline/gpu_pipeline_task.cpp ↗</a></div>
+            </div>
+            <div style="text-align: center; color: var(--color-text-muted); padding: var(--space-1) 0;">↓</div>
+
+            <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+              <div style="font-weight: 600;"><span class="term" data-definition="WHERE KERNELS LAUNCH: each operator&rsquo;s execute() runs cudf calls on the worker&rsquo;s exclusive per-task stream. Launches are asynchronous — the CPU-side worker races ahead queueing work while the GPU crunches. Owners: src/op/ operator files.">execute() per operator</span></div>
+              <div style="font-size: 12px; color: var(--color-text-secondary);">cudf kernels, async on the task&rsquo;s stream</div>
+              <div style="font-size: 12px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/tree/dev/src/op" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">src/op/ ↗</a></div>
+            </div>
+            <div style="text-align: center; color: var(--color-text-muted); padding: var(--space-1) 0;">↓</div>
+
+            <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: var(--space-2) var(--space-3); box-shadow: var(--shadow-sm);">
+              <div style="font-weight: 600; display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;"><span class="term" data-definition="Output batches are deposited into the repositories of the downstream ports as handles to GPU-resident data. Nothing is serialized and nothing returns up the call stack — data never travels by function return.">publish_output() / sink()</span><span style="font-size: 11px; font-family: var(--font-mono); background: var(--color-surface); border: 1px solid var(--color-accent); color: var(--color-accent); border-radius: var(--radius-full); padding: 1px 8px;">⬤ batch handle</span></div>
+              <div style="font-size: 12px; color: var(--color-text-secondary);">handles into repositories &mdash; never copies up the stack</div>
+            </div>
+
+            <div style="margin-top: var(--space-3); font-size: 12px; color: var(--color-text-secondary); border-top: 1px dashed var(--color-accent-muted); padding-top: var(--space-2);"><span style="font-family: var(--font-mono); color: var(--color-accent);"><span class="term" data-definition="WHERE SYNC HAPPENS, part 2: before the worker reports mark_task_completed(), it synchronizes the task&rsquo;s stream — every queued kernel and copy must have finished, so the published batches are real, complete data by the time downstream pipelines are re-evaluated.">⏚ sync</span></span> &mdash; the stream is synchronized before the task is marked complete</div>
+          </div>
+        </div>
+
         <div class="callout callout-info">
           <div class="callout-icon">🔗</div>
           <div class="callout-content">
             <strong class="callout-title">Data moves by handle, not copy</strong>
-            <p><code>publish_output()</code> deposits references to GPU-resident batches; nothing is serialized and nothing returns up the call stack. What a batch actually <em>is</em> — that&rsquo;s Module 4.</p>
+            <p><code>publish_output()</code> deposits references to GPU-resident batches; nothing is serialized and nothing returns up the call stack. What a batch actually <em>is</em> — that&rsquo;s Module 5.</p>
           </div>
         </div>
       </section>
@@ -906,8 +1279,7 @@
         <p>Nothing polls this factory. The only moment the engine re-evaluates a pipeline is the tail of <code>mark_task_completed()</code> — a worker turning in a job card:</p>
 
         <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
-          <span class="translation-label">src/pipeline/sirius_pipeline.cpp:459</span>
-          <pre><code>  tasks_completed++;
+          <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/sirius_pipeline.cpp#L459" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp:459 &#8599;</a></span><pre><code>  tasks_completed++;
   <span class="code-function">update_pipeline_status</span>();
 }</code></pre>
         </div>
@@ -916,8 +1288,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/sirius_pipeline.cpp:389</span>
-            <pre><code>      <span class="code-keyword">if</span> (limit_exhausted ||
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/sirius_pipeline.cpp#L389" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp:389 &#8599;</a></span><pre><code>      <span class="code-keyword">if</span> (limit_exhausted ||
           (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>())) {
         <span class="code-keyword">if</span> (tasks_created.<span class="code-function">load</span>() == tasks_completed.<span class="code-function">load</span>()) {
           pipeline_finished.<span class="code-function">store</span>(<span class="code-keyword">true</span>);
@@ -973,12 +1344,67 @@
           <div class="callout-icon">💡</div>
           <div class="callout-content">
             <strong class="callout-title">No timer. No poller.</strong>
-            <p>Completion is <span class="term" data-definition="Pipeline status is re-evaluated only on the completion edge of a task — update_pipeline_status() is driven from mark_task_completed(). There is no timer or polling loop that ever re-checks it.">edge-triggered</span>: if no task completes, <code>update_pipeline_status()</code> never runs and nobody ever re-checks anything. The andon board only updates on a turned-in job card — and that exact property becomes a hang story in Module 7.</p>
+            <p>Completion is <span class="term" data-definition="Pipeline status is re-evaluated only on the completion edge of a task — update_pipeline_status() is driven from mark_task_completed(). There is no timer or polling loop that ever re-checks it.">edge-triggered</span>: if no task completes, <code>update_pipeline_status()</code> never runs and nobody ever re-checks anything. The andon board only updates on a turned-in job card — and that exact property becomes a hang story in Module 8.</p>
           </div>
         </div>
       </section>
 
-      <!-- ── SCREEN 6: QUIZ ─────────────────────────────────────── -->
+      <!-- ── SCREEN 6: OPERATOR EXPLORER ────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Operator explorer: the vertical slice</h2>
+
+        <p>Click an operator from the query you just traced &mdash; see its full vertical slice, from the planner node that creates it down to the command that tests it. Every path is a real link into the tree.</p>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">📥 GPU Scan <span style="font-weight: 400; color: var(--color-text-secondary); font-size: var(--text-sm);">&mdash; the source: splits of a table become GPU batches</span><span style="margin-left: auto; font-size: 11px; font-family: var(--font-mono); color: var(--color-text-muted); border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 1px 8px; white-space: nowrap;">▸ details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">planner</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/planner/sirius_plan_get.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/planner/sirius_plan_get.cpp ↗</a> &mdash; converts DuckDB&rsquo;s LOGICAL_GET into a Sirius scan node</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">physical</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/sirius_gpu_scan_operator.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/op/scan/sirius_gpu_scan_operator.cpp ↗</a> &mdash; the source operator; answers READY once per remaining split, nullopt when exhausted</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">gpu work</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/tree/dev/src/op/scan" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/op/scan/ ↗</a> &mdash; decode paths (Parquet, DuckDB-native) turn storage pages into cudf tables on-device</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">memory</span><span style="font-size: var(--text-sm);">streaming source &mdash; not a breaker; one batch per split, no state accumulated between tasks</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">tests</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp/scan" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">test/cpp/scan/ ↗</a> &mdash; decode + ingest unit tests; <a href="https://github.com/sirius-db/sirius/blob/dev/test/sql/tpch-sirius.test" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">test/sql/tpch-sirius.test ↗</a> exercises it end to end</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">run</span><span style="font-size: var(--text-sm);"><code>pixi run build/release/test/unittest --test-dir . test/sql/tpch-sirius.test</code></span></div>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">σ Filter <span style="font-weight: 400; color: var(--color-text-secondary); font-size: var(--text-sm);">&mdash; the streaming predicate: rows in, fewer rows out</span><span style="margin-left: auto; font-size: 11px; font-family: var(--font-mono); color: var(--color-text-muted); border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 1px 8px; white-space: nowrap;">▸ details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">planner</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/planner/sirius_plan_filter.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/planner/sirius_plan_filter.cpp ↗</a> &mdash; converts LOGICAL_FILTER; the predicate expression comes along</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">physical</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_filter.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/op/sirius_physical_filter.cpp ↗</a> &mdash; <code>execute()</code> loops over input batches, one filtered table per batch</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">gpu work</span><span style="font-size: var(--text-sm);"><code>gpu_expression_executor.select()</code> evaluates <code>amount &gt; 100</code> via cudf&rsquo;s expression machinery and gathers surviving rows &mdash; all on the task&rsquo;s stream</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">memory</span><span style="font-size: var(--text-sm);">streaming (PIPELINE edge), never blocks; output is usually smaller than input, so it shrinks pressure</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">tests</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/test/cpp/operator/test_physical_filter.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">test/cpp/operator/test_physical_filter.cpp ↗</a> &mdash; Catch2 tag <code>[physical_filter]</code></span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">run</span><span style="font-size: var(--text-sm);"><code>pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[physical_filter]"</code></span></div>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">Σ Grouped Aggregate <span style="font-weight: 400; color: var(--color-text-secondary); font-size: var(--text-sm);">&mdash; the pipeline breaker: partial states, then a merge</span><span style="margin-left: auto; font-size: 11px; font-family: var(--font-mono); color: var(--color-text-muted); border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 1px 8px; white-space: nowrap;">▸ details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">planner</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/planner/sirius_plan_aggregate.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/planner/sirius_plan_aggregate.cpp ↗</a> &mdash; converts LOGICAL_AGGREGATE; this is where the plan gets cut into a new pipeline</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">physical</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_grouped_aggregate.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/op/sirius_physical_grouped_aggregate.cpp ↗</a> (per-batch partials) + <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_grouped_aggregate_merge.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">sirius_physical_grouped_aggregate_merge.cpp ↗</a> (final merge)</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">gpu work</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/aggregate/gpu_aggregate_impl.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/op/aggregate/gpu_aggregate_impl.cpp ↗</a> &mdash; <code>cudf::groupby::groupby</code> with per-column aggregation requests (SUM, COUNT_ALL, MIN, &hellip;)</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">memory</span><span style="font-size: var(--text-sm);">blocking (⛔ breaker) &mdash; aggregates each batch to a partial state as it streams in, then the merge operator combines partials behind the barrier; finalize seals the result exactly once</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">tests</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp ↗</a> &mdash; tag <code>[physical_grouped_aggregate]</code></span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">run</span><span style="font-size: var(--text-sm);"><code>pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[physical_grouped_aggregate]"</code></span></div>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">⋈ Hash Join <span style="font-weight: 400; color: var(--color-text-secondary); font-size: var(--text-sm);">&mdash; not in this query, but the one everyone asks about</span><span style="margin-left: auto; font-size: 11px; font-family: var(--font-mono); color: var(--color-text-muted); border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 1px 8px; white-space: nowrap;">▸ details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">planner</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/planner/sirius_plan_comparison_join.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/planner/sirius_plan_comparison_join.cpp ↗</a> &mdash; checks <code>are_conditions_supported()</code>; equality conditions get a hash join, the rest fall elsewhere</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">physical</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_hash_join.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">src/op/sirius_physical_hash_join.cpp ↗</a> &mdash; two-input operator: the build side is a FULL barrier, the probe side streams</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">gpu work</span><span style="font-size: var(--text-sm);"><code>cudf::hash_join</code> / <code>cudf::filtered_join</code> / <code>cudf::mark_join</code> over cuco (CUDA collections) hash tables, per join flavor</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">memory</span><span style="font-size: var(--text-sm);">blocking on the build side. The plan feeds it through <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_partition.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">PARTITION ↗</a> + <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_concat.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">CONCAT ↗</a> so big builds split. Adaptive <code>HASH_JOIN_MODE</code> (<a href="https://github.com/sirius-db/sirius/pull/423" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">#423 ↗</a>) picks STANDARD, BUILD_PROBE (build once, reuse the table), or MIXED_JOIN; cuco tables stay pinned to one device per join (<a href="https://github.com/sirius-db/sirius/pull/996" target="_blank" rel="noopener" style="color: var(--color-info); text-decoration: none;">#996 ↗</a>)</span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">tests</span><span style="font-size: var(--text-sm);"><a href="https://github.com/sirius-db/sirius/blob/dev/test/cpp/operator/test_physical_hash_join_mgpu.cpp" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">test/cpp/operator/test_physical_hash_join_mgpu.cpp ↗</a> &mdash; tag <code>[hash_join]</code>; every TPC-H join in <a href="https://github.com/sirius-db/sirius/blob/dev/test/sql/tpch-sirius.test" target="_blank" rel="noopener" style="font-family: var(--font-mono); color: var(--color-info); text-decoration: none;">test/sql/tpch-sirius.test ↗</a></span></div>
+            <div style="display: flex; gap: var(--space-3); align-items: baseline; padding: 6px 0; border-top: 1px solid var(--color-border-light);"><span style="flex: 0 0 92px; font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted);">run</span><span style="font-size: var(--text-sm);"><code>pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[hash_join]"</code></span></div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ── SCREEN 7: QUIZ ─────────────────────────────────────── -->
       <section class="screen animate-in">
         <h2 class="screen-heading">Trace it yourself</h2>
 
@@ -1093,7 +1519,7 @@
           <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module3')">Try Again</button>
         </div>
 
-        <p style="margin-top: var(--space-8)">We hand-waved &ldquo;the batch goes to the repo.&rdquo; Next module: what a batch actually <em>is</em> — and why it never travels by function return.</p>
+        <p style="margin-top: var(--space-8)">One thing in this trace stayed a black box: &ldquo;the scan produces batches.&rdquo; Produces them <em>from what</em>? Next module opens that box &mdash; splits, the scan manager, and the IO framework that turns files on disk into GPU-resident tables. (What a batch actually <em>is</em> once it exists, and the repositories it travels through &mdash; that&rsquo;s Module 5.)</p>
       </section>
 
     </div>
@@ -1103,6 +1529,286 @@
   <div class="module-content">
     <header class="module-header animate-in">
       <span class="module-number">04</span>
+      <h1 class="module-title">Where Data Comes From</h1>
+      <p class="module-subtitle">Module 3 hand-waved a whole subsystem: &ldquo;the scan executor produces batches.&rdquo; Produced from <em>what</em>? Here&rsquo;s the machinery between a file path and a GPU-resident batch.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: Hero — path to batch ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The quarry that feeds the crusher</h2>
+        <p>Think of a quarry: surveyors mark the seams (metadata walk &rarr; <span class="term" data-definition="One schedulable unit of scan work — e.g. a batch of parquet row groups, or byte ranges of a .duckdb file. Created by a split provider on a CPU thread; consumed one at a time by scan operator tasks.">splits</span>), a blasting schedule decides load sizes (split providers), and a conveyor with a buffer bin (the IO framework) keeps the crusher — GPU decode — fed. The design goal of everything below: <strong>the crusher never waits on the quarry.</strong></p>
+
+        <div style="border: 1px dashed var(--color-border); border-radius: 12px; padding: 14px 16px; margin: var(--space-4) 0 0;">
+          <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">Storage / IO zone</div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="Where table bytes live before Sirius touches them: local parquet, native .duckdb storage, or s3:// objects. (Iceberg support landed in #521 but its GPU scan path is currently non-functional — see its card below.) Everything below exists to turn these into cudf tables without stalling the GPU."><strong>Storage</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);">parquet &middot; .duckdb &middot; s3://</span>
+          </div>
+          <div style="text-align: center; color: var(--color-text-muted); padding: 6px 0;">&darr; &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); color: var(--color-accent); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono);">&#11044; byte ranges</span></div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="The byte-serving layer: a datasource abstracts one storage backend (local file, S3 object), and the IO framework underneath overlaps reads with decode — io_uring reactor threads submit async reads, a pinned-host prefetching cache stages ranges ahead of the decoder, and admission control caps in-flight I/O. Owned by src/io/."><strong>datasource + IO framework</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="Linux's async I/O interface. The reactor (src/io/uring/uring_reactor.cpp) submits and completes reads on dedicated threads — no thread-per-file, no blocking read() in the scan path.">io_uring reactor</span> &middot; <span class="term" data-definition="A pinned-host-memory cache (src/io/cache/prefetching_cache.cpp) that reads ahead of the decoder, so GPU decode finds its bytes already staged in DMA-ready host memory.">pinned prefetch cache</span> &middot; <span class="term" data-definition="The gate that limits how much I/O may be in flight at once, so aggressive prefetching can't exhaust pinned memory or drown the reactor.">admission control</span></span>
+            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/io">src/io/ &#8599;</a></div>
+          </div>
+        </div>
+
+        <div style="text-align: center; color: var(--color-text-muted); padding: 6px 0;">&darr; <span style="font-size: 12px;">metadata walk (control)</span></div>
+
+        <div style="background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: 14px 16px;">
+          <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">CPU zone</div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="The CPU-side coordinator (src/scan_manager/sirius_scan_manager.cpp) that owns split providers and connectors, and balances splits across consumers/GPUs. Runs on CPU producer threads — never touches device memory."><strong>Scan Manager</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="Per-format planner (src/scan_manager/split_provider.cpp) that walks storage metadata and pushes splits into the connector. The 'blasting schedule': it decides the size and shape of each unit of scan work.">split provider</span> &rarr; <span class="term" data-definition="The bounded queue (src/scan_manager/split_connector.cpp) between providers and the scan operator, with close-then-drain EOS semantics and exception carrying. The contract you're about to read.">split_connector</span></span> &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono); color: var(--color-text-secondary);">&#8779; streams</span>
+            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager">src/scan_manager/ &#8599;</a></div>
+          </div>
+        </div>
+
+        <div style="text-align: center; color: var(--color-text-muted); padding: 6px 0;">&darr; &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); color: var(--color-accent); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono);">&#11044; split</span></div>
+
+        <div style="background: var(--color-accent-light); border: 1px solid var(--color-accent-muted); border-radius: 12px; padding: 14px 16px;">
+          <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">GPU zone</div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="The one scan operator (src/op/scan/sirius_gpu_scan_operator.cpp). Its tasks pull splits from the connector and hand each to a gpu_ingestible decoder, which produces a cudf table on the GPU."><strong>scan operator</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="The pluggable decoder interface (src/op/scan/gpu_ingestible.cpp): given one split, produce one cudf table on device. The parquet and DuckDB-native decoders implement it (#871) — the scan operator doesn't know which. S3 plugs in one layer below as a datasource; Iceberg landed as its own ICEBERG_SCAN operator on the parquet machinery, but that path is currently non-functional (stale against the new IO interface).">gpu_ingestible</span> decode</span> &nbsp;<span class="term" data-definition="get_next_split() blocks the scan task's CPU thread until a split is available or the connector is closed and drained — the consumer side waits on the producer side here."><span style="display: inline-block; border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono); color: var(--color-text-secondary);">&#9114; sync</span></span>
+            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/op/scan">src/op/scan/ &#8599;</a></div>
+          </div>
+        </div>
+
+        <div style="text-align: center; color: var(--color-text-muted); padding: 6px 0;">&darr; &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); color: var(--color-accent); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono);">&#11044; batch handle</span></div>
+
+        <div style="background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: 14px 16px;">
+          <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">CPU zone (edge)</div>
+          <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
+            <span class="term" data-definition="The shared_data_repository behind the scan's outgoing port: decoded batches park here as idle, spillable handles until the consumer's barrier releases them. Module 5's subject."><strong>repository</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);">idle batches</span>
+            <div style="font-size: 12px; color: var(--color-text-muted); margin-top: 4px;">data never travels by function return — it goes through repositories</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: Splits & the connector ───────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The connector&rsquo;s contract: close, then drain</h2>
+        <p>A split is one schedulable unit of scan work — a batch of parquet <span class="term" data-definition="Parquet's unit of horizontal partitioning inside a file: a self-contained chunk of rows with its own column statistics. The natural granularity for pruning and for splits.">row groups</span>, or byte ranges of a <code>.duckdb</code> file. The connector between providers and the operator is small enough to memorize, and its three semantics are exactly the ones people get wrong:</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/scan_manager/split_connector.hpp#L60-L78" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/scan_manager/split_connector.hpp &middot; L60-78 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
+<span class="code-doc"><span class="doc-p">Mark the connector as closed: no more splits will be pushed. Idempotent. Wakes all waiting consumers.</span><span class="doc-p"><span class="doc-tag">param exception</span>Optional exception captured by the producer. The first non-null exception passed across all close() calls is stored and rethrown by get_next_split() once the queue has been drained. Subsequent close() calls do not overwrite an already-stored exception.</span></span>
+<span class="code-line">  <span class="code-keyword">void</span> <span class="code-function">close</span>(std::exception_ptr <span class="code-keyword">const</span>&amp; exception = <span class="code-keyword">nullptr</span>);</span>
+<span class="code-line"></span>
+<span class="code-doc"><span class="doc-p">Pull the next split, blocking until one is available or the connector is closed and drained.</span><span class="doc-p"><span class="doc-tag">returns</span>std::nullopt when closed and drained without error; the next split otherwise.</span><span class="doc-p"><span class="doc-tag">throws</span>The exception passed to close() (if any) once the queue is drained.</span></span>
+<span class="code-line">  std::optional&lt;std::unique_ptr&lt;op::operator_data&gt;&gt; <span class="code-function">get_next_split</span>();</span>
+<span class="code-line"></span>
+<span class="code-doc"><span class="doc-p">True iff close() has been called and the queue is drained.</span></span>
+<span class="code-line">  [[<span class="code-property">nodiscard</span>]] <span class="code-keyword">bool</span> <span class="code-function">is_closed</span>() <span class="code-keyword">const</span>;</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">The producer&rsquo;s last word. <code>close()</code> is idempotent and wakes every blocked consumer — the <em>close</em> half of close-then-drain.</p>
+              <p class="tl">Errors ride the connector itself: the first non-null exception wins, and later <code>close()</code> calls cannot overwrite it.</p>
+              <p class="tl">And it is rethrown only <em>after the queue drains</em> — consumers still receive every split that made it in before the failure.</p>
+              <p class="tl">The consumer&rsquo;s entire API: block until a split arrives or the stream is over.</p>
+              <p class="tl"><code>nullopt</code> &ne; error. It is the clean end-of-stream; failure arrives as a throw, on this same call, post-drain.</p>
+              <p class="tl"><code>is_closed</code> = closed <strong>AND</strong> drained. A closed connector with splits still queued has work left to hand out.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128204;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Memorize this contract</strong>
+            <p>Your <code>exchange_channel</code> (<a href="https://github.com/sirius-db/sirius/pull/836">#836</a>) is its network twin — same EOS semantics, batches instead of splits. Module 8&rsquo;s design decisions fall out of this page.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: Pluggable ingestion ──────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Four sources, one scan machinery</h2>
+        <p>The parquet and DuckDB-native paths sit behind <code>gpu_ingestible</code> since the unification (<a href="https://github.com/sirius-db/sirius/pull/871">#871</a>): one scan operator, pluggable decoders (<a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/gpu_ingestible.cpp"><code>src/op/scan/gpu_ingestible.cpp</code> &#8599;</a>). The other two <em>compose</em> with that machinery instead of reimplementing it: S3 is a <span class="term" data-definition="An IO-layer backend that serves byte ranges (src/io/). The parquet decoder reads through it without knowing whether bytes come from local disk or object storage.">datasource</span> feeding the parquet decoder from below, and Iceberg landed as its own <code>ICEBERG_SCAN</code> operator layered on the parquet machinery — though that path is currently non-functional (see the card below). &ldquo;Add a storage format&rdquo; stays a bounded problem — a decoder + split provider for a new file format; just a datasource for a new place bytes live.</p>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">&#129704; Parquet — the workhorse columnar path <span style="margin-left: auto; font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono);">&#9656; details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <p style="margin: 0 0 8px;">Splits are row-group batches; pruning happens before a split is even born. Filter pushdown skips row groups by statistics (<a href="https://github.com/sirius-db/sirius/pull/363">#363</a>); one split can span multiple files (<a href="https://github.com/sirius-db/sirius/pull/738">#738</a>).</p>
+            <p style="margin: 0; font-size: 13px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/parquet_gpu_ingestible.cpp">src/op/scan/parquet_gpu_ingestible.cpp &#8599;</a></p>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">&#129689; DuckDB-native — decode <code>.duckdb</code> straight to the GPU <span style="margin-left: auto; font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono);">&#9656; details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <p style="margin: 0 0 8px;">DuckDB&rsquo;s own storage blocks decode directly to cudf tables — no round-trip through DuckDB&rsquo;s CPU scan. Landed as a decoder (<a href="https://github.com/sirius-db/sirius/pull/736">#736</a>) and matured into the native path (<a href="https://github.com/sirius-db/sirius/pull/792">#792</a>).</p>
+            <p style="margin: 0; font-size: 13px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/duckdb_native_gpu_ingestible.cpp">src/op/scan/duckdb_native_gpu_ingestible.cpp &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/duckdb_native_decoder.cpp">duckdb_native_decoder.cpp &#8599;</a></p>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">&#9729;&#65039; S3 — object storage as &ldquo;just another datasource&rdquo; <span style="margin-left: auto; font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono);">&#9656; details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <p style="margin: 0 0 8px;">Not a new scan path — a new <span class="term" data-definition="The byte-serving abstraction over one storage backend (src/io/sirius_datasource.cpp, built via src/io/datasource_factory.cpp). The IO framework reads through it; S3 plugs in here instead of adding a parallel scan path.">datasource</span>. The lineage: datasource foundation (<a href="https://github.com/sirius-db/sirius/pull/746">#746</a>) &rarr; SigV4 credentials (<a href="https://github.com/sirius-db/sirius/pull/758">#758</a>) &rarr; S3 backend (<a href="https://github.com/sirius-db/sirius/pull/784">#784</a>) &rarr; SQL surface (<a href="https://github.com/sirius-db/sirius/pull/805">#805</a>). <code>s3://</code> URIs route through the same scan manager as local files.</p>
+            <p style="margin: 0; font-size: 13px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/tree/dev/src/io/s3">src/io/s3/ &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/io/sirius_datasource.cpp">src/io/sirius_datasource.cpp &#8599;</a></p>
+          </div>
+        </details>
+
+        <details class="explorer-card" style="border: 1px solid var(--color-border); border-radius: 12px; padding: 0; margin: 10px 0; background: var(--color-surface);">
+          <summary style="cursor: pointer; padding: 14px 18px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 10px;">&#129482; Iceberg — landed in #521, currently non-functional <span style="margin-left: auto; font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono);">&#9656; details</span></summary>
+          <div style="padding: 0 18px 14px;">
+            <p style="margin: 0 0 8px;">What landed (<a href="https://github.com/sirius-db/sirius/pull/521">#521</a>): V1/V2 table scans where the metadata reader walked manifests into splits and positional/equality deletes ran as GPU filter kernels rather than CPU-side row rewrites.</p>
+            <p style="margin: 0 0 8px;"><strong>Current status — the GPU Iceberg path is non-functional in this tree.</strong> It went stale during the IO-framework transition (<a href="https://github.com/sirius-db/sirius/pull/997">#997</a>): <code>iceberg_metadata_reader.cpp</code> and <code>iceberg_scan_task.cpp</code> are excluded from the build, neither the scan manager nor the task creator has any <code>ICEBERG_SCAN</code> handling, and delete-data reading is stubbed out with a runtime warning (<code>prefetch_iceberg_delete_data</code>, <a href="https://github.com/sirius-db/sirius/blob/dev/src/sirius_engine.cpp"><code>src/sirius_engine.cpp</code> &#8599;</a>). The plan generator still accepts <code>iceberg_scan</code>, but nothing downstream can execute it — don&rsquo;t rely on GPU Iceberg scans today.</p>
+            <p style="margin: 0; font-size: 13px; font-family: var(--font-mono);"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/iceberg_metadata_reader.cpp">src/op/scan/iceberg_metadata_reader.cpp &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/iceberg_scan_task.cpp">iceberg_scan_task.cpp &#8599;</a> &middot; <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/scan/iceberg_delete_pipeline.cpp">iceberg_delete_pipeline.cpp &#8599;</a></p>
+          </div>
+        </details>
+      </section>
+
+      <!-- ── Screen 4: The IO framework underneath ──────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The conveyor and the buffer bin</h2>
+        <p>Why a whole framework? Scan throughput was gated on synchronous file I/O — the framework overlaps I/O with decode, and gave S3 a place to plug in as just another datasource.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#9881;&#65039;</div>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/pull/675">#675</a> — the framework lands</h4>
+            <p class="pattern-desc">The May 2026 milestone: io_uring reactor, pinned prefetching cache, buffer pool, admission control — a global-milestone-grade landing, in one PR.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">&#128268;</div>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/pull/740">#740</a> — switched on</h4>
+            <p class="pattern-desc">Wired into the scan manager — the point the stack started serving real scans instead of benchmarks of itself.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">&#128260;</div>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/pull/997">#997</a> — the redesign</h4>
+            <p class="pattern-desc">Partial cache reads, <span class="term" data-definition="Post-#997 policy: the cache is populated from normal read traffic, not only by the prefetcher — a partially-cached range serves the cached part and fetches the rest.">cache-on-read</span>, multi-GPU batch coalescing. The framework you&rsquo;ll actually read today.</p>
+          </div>
+        </div>
+
+        <p>Separately, a second cache line runs above the IO layer — caching <em>scan outputs</em>, not bytes:</p>
+
+        <div class="flow-steps">
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p><a href="https://github.com/sirius-db/sirius/pull/340">#340</a> — cache scan outputs so repeat scans reuse decoded data</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p><a href="https://github.com/sirius-db/sirius/pull/455">#455</a> — on a cache hit, skip file I/O entirely</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">3</div>
+            <p>Second scan of the same table: zero disk reads, decode starts immediately</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 5: Quiz + hand-off ──────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three scenarios</h2>
+        <p>Apply the machinery, don&rsquo;t recall it.</p>
+
+        <div class="quiz-container" id="quiz-m4-ingest">
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Two independent caches stack: scan-output caching (#340, #455) answers repeat scans with zero file I/O, and the IO framework's pinned prefetching cache stages byte ranges ahead of the decoder so decode starts without waiting on a read. Neither is the OS page cache, and nothing decoded stays resident on the GPU between queries."
+               data-explanation-wrong="Decoded tables don't survive between queries as GPU residents, and neither the reactor nor the split provider deduplicates work across queries. Ask which two layers explicitly advertise 'skip file I/O on hit' and 'bytes staged before the decoder asks'.">
+            <h3 class="quiz-question">The same table is scanned twice; the second query does zero disk reads and starts decoding immediately. Which two mechanisms?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The GPU keeps query 1&rsquo;s decoded cudf tables resident, so query 2 skips the scan entirely</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Scan-output caching serves the repeat scan with zero file I/O, and the IO framework&rsquo;s prefetching cache has ranges staged before the decoder asks</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The io_uring reactor deduplicates identical reads across queries</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The split provider re-emits query 1&rsquo;s splits with the data inlined in each split</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="That is the point of the #871 unification: a format is a gpu_ingestible decoder (split → cudf table) plus a split provider (metadata → splits). The scan operator, task creator and pipelines never learn your format exists — they consume splits and produce batches, same as always."
+               data-explanation-wrong="Anything that touches the scan operator or the pipeline layer means the unification failed for your format. The seam is deliberately lower: one class that makes splits, one class that decodes a split.">
+            <h3 class="quiz-question">You&rsquo;re adding a new columnar file format. What do you implement — and what do you NOT touch?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A new scan operator subclass, plus a branch in the physical plan generator</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A gpu_ingestible decoder, plus a new task creator that schedules format-specific tasks</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A gpu_ingestible decoder and a split provider — the scan operator, task creator and pipelines stay untouched</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A datasource backend in src/io/ — formats are handled at the byte layer</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Overlap is owned below the operator: the reactor and the prefetcher (plus admission control) decide how far network I/O runs ahead of decode. The scan operator is deliberately dumb — it blocks on get_next_split() and decodes what it's handed. If the GPU idles between bursts, the conveyor is underfeeding the crusher; tune the IO layer, not the consumer."
+               data-explanation-wrong="The operator has no lever to pull: it consumes splits and decodes — it cannot start reads early or deepen the read-ahead. Ask which layer owns 'how many bytes are in flight while the GPU decodes'.">
+            <h3 class="quiz-question">An S3 scan is slow and the GPU sits idle between decode bursts. Which layer owns fixing the overlap — the scan operator or the IO framework — and why?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The scan operator — it should issue its own reads earlier, before pulling the next split</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The IO framework — the reactor and prefetcher own network/decode overlap; the operator just consumes splits</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Neither — the split provider should cut smaller splits so decode bursts pack tighter</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The scan operator — it should hold multiple splits and decode them concurrently on one stream</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-m4-ingest')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-m4-ingest')">Try Again</button>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">&#10145;&#65039;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Next: The Data Plane</strong>
+            <p>Splits became batches sitting idle in repositories. Next: the rules those repositories play by — ports, barriers, and why data never travels by function return.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</section>
+<section class="module" id="module-5" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">05</span>
       <h1 class="module-title">The Data Plane</h1>
       <p class="module-subtitle">In Sirius, no operator ever returns data to its caller. Ever. Here's why that one decision buys spilling, backpressure, and multi-GPU almost for free.</p>
     </header>
@@ -1116,19 +1822,14 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/include/op/sirius_physical_operator.hpp · L459-472</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/op/sirius_physical_operator.hpp#L459-L472" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/include/op/sirius_physical_operator.hpp · L459-472 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-line">  <span class="code-keyword">struct</span> port {</span>
 <span class="code-line">    MemoryBarrierType <span class="code-property">type</span>;</span>
-<span class="code-line">    <span class="code-comment">/// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").</span></span>
-<span class="code-line">    <span class="code-comment">/// Null repos are treated as "empty, not data-gating" by the base-class port handling methods</span></span>
-<span class="code-line">    <span class="code-comment">/// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).</span></span>
+<span class="code-doc"><span class="doc-p">May be NULL for dependency-only ports that carry no data flow (e.g., "dependency"). Null repos are treated as "empty, not data-gating" by the base-class port handling methods (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).</span></span>
 <span class="code-line">    ::cucascade::shared_data_repository* <span class="code-property">repo</span>;</span>
 <span class="code-line">    duckdb::shared_ptr&lt;pipeline::sirius_pipeline&gt; <span class="code-property">src_pipeline</span>;</span>
 <span class="code-line">    duckdb::shared_ptr&lt;pipeline::sirius_pipeline&gt; <span class="code-property">dest_pipeline</span>;</span>
-<span class="code-line">    <span class="code-comment">//! A UUID for a port on an operator at the beginning of a</span></span>
-<span class="code-line">    <span class="code-comment">// pipeline. This port receives data from a prior pipeline,</span></span>
-<span class="code-line">    <span class="code-comment">// forming an incoming edge from that pipeline.</span></span>
+<span class="code-doc"><span class="doc-p">A UUID for a port on an operator at the beginning of a pipeline. This port receives data from a prior pipeline, forming an incoming edge from that pipeline.</span></span>
 <span class="code-line">    uuid::UUID <span class="code-property">source_port_uuid</span>{uuid::<span class="code-function">now_v7</span>()};</span>
 <span class="code-line">  };</span>
             </code></pre>
@@ -1164,8 +1865,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/op/sirius_physical_operator.cpp · L238-246</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_operator.cpp#L238-L246" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/op/sirius_physical_operator.cpp · L238-246 &#8599;</a></span><pre><code>
 <span class="code-line"><span class="code-keyword">void</span> sirius_physical_operator::<span class="code-function">sink</span>(<span class="code-keyword">const</span> operator_data&amp; output_data, rmm::cuda_stream_view stream)</span>
 <span class="code-line">{</span>
 <span class="code-line">  <span class="code-keyword">auto</span>&amp; pipelineable_output = <span class="code-keyword">dynamic_cast</span>&lt;<span class="code-keyword">const</span> pipelineable_operator_data&amp;&gt;(output_data);</span>
@@ -1302,7 +2002,7 @@
           <div class="callout-icon">⚠️</div>
           <div class="callout-content">
             <strong class="callout-title">How you cause an OOM</strong>
-            <p>Park batches in a private queue, or sit on locks "for later" — either way they're invisible to the downgrade executor and the query dies under pressure instead of spilling. Module 7's streaming design exists to dodge exactly this: ownership stays in repositories, and only <code>{batch_id, size}</code> handles travel through channels.</p>
+            <p>Park batches in a private queue, or sit on locks "for later" — either way they're invisible to the downgrade executor and the query dies under pressure instead of spilling. Module 8's streaming design exists to dodge exactly this: ownership stays in repositories, and only <code>{batch_id, size}</code> handles travel through channels.</p>
           </div>
         </div>
 
@@ -1409,11 +2109,11 @@
     </div>
   </div>
 </section>
-<section class="module" id="module-5">
+<section class="module" id="module-6">
   <div class="module-content">
 
     <header class="module-header animate-in">
-      <span class="module-number">05</span>
+      <span class="module-number">06</span>
       <h1 class="module-title">Memory &amp; Multi-GPU</h1>
       <p class="module-subtitle">GPU memory is the scarcest thing in this engine. Sirius&rsquo;s answer: nothing runs without a reservation, and pressure triggers relocation &mdash; not a crash.</p>
     </header>
@@ -1443,7 +2143,22 @@
           </div>
         </div>
 
-        <p>All three tiers are managed by <code>sirius_memory_reservation_manager</code> (cuCascade). Before the GPU executor&rsquo;s manager thread dispatches a task, it makes a <span class="term" data-definition="A pre-granted memory budget from sirius_memory_reservation_manager, sized from the pipeline&rsquo;s memory history and attached to a task before dispatch. Operators allocate inside it; it is released at task end. No reservation, no execution.">reservation</span> sized from the pipeline&rsquo;s <span class="term" data-definition="A per-pipeline record of observed memory peaks &mdash; including peaks from failed attempts. It sizes future reservations, so a pipeline that OOMed once reserves more the next time.">memory history</span>.</p>
+        <div class="animate-in" style="display:flex; flex-direction:column; gap:8px; margin:16px 0; padding:12px 16px; border:1px solid var(--color-border); border-radius:12px; background:var(--color-bg-warm);">
+          <div style="display:flex; gap:12px; align-items:baseline; flex-wrap:wrap;">
+            <span style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); min-width:120px; font-weight:600;">Who allocates</span>
+            <span style="font-size:13px; flex:1; min-width:240px;">All device memory flows through the <span class="term" data-definition="sirius_memory_reservation_manager (src/memory/, built on cuCascade, RMM underneath): the single gatekeeper for all three tiers. Every device allocation goes through it &mdash; operators never call the allocator directly.">reservation manager</span>; operators allocate inside their task&rsquo;s reservation, never around it.</span>
+          </div>
+          <div style="display:flex; gap:12px; align-items:baseline; flex-wrap:wrap;">
+            <span style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); min-width:120px; font-weight:600;">Lifetime</span>
+            <span style="font-size:13px; flex:1; min-width:240px;">A reservation is <span class="term" data-definition="The reservation&rsquo;s lifetime equals the task&rsquo;s: the executor&rsquo;s manager thread makes it before dispatch, the task&rsquo;s operators allocate inside it, and it is released automatically at task end &mdash; freeing budget for the next blocked task.">task-scoped</span>: booked by the executor manager thread before dispatch, released at task end.</span>
+          </div>
+          <div style="display:flex; gap:12px; align-items:baseline; flex-wrap:wrap;">
+            <span style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--color-text-muted); min-width:120px; font-weight:600;">Where copies happen</span>
+            <span style="font-size:13px; flex:1; min-width:240px;"><span class="term" data-definition="Host-to-device copy. Happens in prepare_for_processing when a task&rsquo;s input batches aren&rsquo;t already resident on the reservation&rsquo;s GPU &mdash; every input is colocated before any operator runs.">H2D</span> on <code>prepare_for_processing</code> when inputs aren&rsquo;t GPU-resident <span class="term" style="display:inline-block; border:1px solid var(--color-accent-muted); border-radius:6px; padding:0 6px; font-size:11px; color:var(--color-accent);" data-definition="Sync point: the task waits for its input batches to finish copying onto the reservation&rsquo;s device before any operator runs.">&#9114; sync</span>; <span class="term" data-definition="Device-to-host copy. Happens when the downgrade executor relieves pressure by migrating idle victim batches from GPU device memory down to pinned host (and onward to disk).">D2H</span> when the downgrade executor migrates idle batches down.</span>
+          </div>
+        </div>
+
+        <p>This tier substrate lives in <a href="https://github.com/NVIDIA/cuCascade">cuCascade</a>, wired into Sirius under <a href="https://github.com/sirius-db/sirius/tree/dev/src/memory"><code>src/memory/</code> &#8599;</a>. All three tiers are managed by <code>sirius_memory_reservation_manager</code> (cuCascade). Before the GPU executor&rsquo;s manager thread dispatches a task, it makes a <span class="term" data-definition="A pre-granted memory budget from sirius_memory_reservation_manager, sized from the pipeline&rsquo;s memory history and attached to a task before dispatch. Operators allocate inside it; it is released at task end. No reservation, no execution.">reservation</span> sized from the pipeline&rsquo;s <span class="term" data-definition="A per-pipeline record of observed memory peaks &mdash; including peaks from failed attempts. It sizes future reservations, so a pipeline that OOMed once reserves more the next time.">memory history</span>.</p>
 
         <div class="step-cards stagger-children">
           <div class="step-card animate-in">
@@ -1537,8 +2252,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/gpu_pipeline_task.cpp:326-331</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_task.cpp#L327-L330" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_task.cpp:327-330 &#8599;</a></span><pre><code>
 <span class="code-line">      <span class="code-keyword">throw</span> <span class="code-function">oom_reschedule_exception</span>(</span>
 <span class="code-line">        std::<span class="code-function">move</span>(operator_input_output_data),</span>
 <span class="code-line">        i,</span>
@@ -1546,7 +2260,7 @@
             </code></pre>
           </div>
           <div class="translation-english">
-            <span class="translation-label">Plain English</span>
+            <span class="translation-label">Plain English <span class="rm-chip">reader mode</span></span>
             <div class="translation-lines">
               <p class="tl">The graceful surrender: not a crash, but a thrown value that <em>is</em> the reschedule plan.</p>
               <p class="tl">The intermediate results move out with the exception &mdash; operators that already finished never re-run.</p>
@@ -1560,12 +2274,8 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/gpu_pipeline_executor.cpp:330-343</span>
-            <pre><code>
-<span class="code-line"><span class="code-comment">          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far</span></span>
-<span class="code-line"><span class="code-comment">          // too short. With 100 retries × 50 ms backoff (~5 s) the probe</span></span>
-<span class="code-line"><span class="code-comment">          // tasks get enough patience to clear the contention window while</span></span>
-<span class="code-line"><span class="code-comment">          // still bailing out on truly wedged queries.</span></span>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_executor.cpp#L330-L343" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_executor.cpp:330-343 &#8599;</a></span><pre><code>
+<span class="code-doc"><span class="doc-p">SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far too short. With 100 retries × 50 ms backoff (~5 s) the probe tasks get enough patience to clear the contention window while still bailing out on truly wedged queries.</span></span>
 <span class="code-line">          <span class="code-keyword">static constexpr</span> <span class="code-keyword">uint32_t</span> MAX_OOM_RETRIES = <span class="code-number">100</span>;</span>
 <span class="code-line">          <span class="code-keyword">if</span> (next_retry_count &gt; MAX_OOM_RETRIES) {</span>
 <span class="code-line">            <span class="code-function">SIRIUS_LOG_ERROR</span>(</span>
@@ -1758,10 +2468,10 @@
     </div>
   </div>
 </section>
-<section class="module" id="module-6" style="background: var(--color-bg-warm)">
+<section class="module" id="module-7" style="background: var(--color-bg-warm)">
   <div class="module-content">
     <header class="module-header animate-in">
-      <span class="module-number">06</span>
+      <span class="module-number">07</span>
       <h1 class="module-title">Design Decisions</h1>
       <p class="module-subtitle">Half of Sirius's design looks over-engineered until you learn which outage or rewrite produced it. Here are the receipts.</p>
     </header>
@@ -1924,16 +2634,10 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/sirius_pipeline.cpp · L427-436</span>
-            <pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/sirius_pipeline.cpp#L427-L436" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp · L427-436 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-line"><span class="code-keyword">void</span> sirius_pipeline::<span class="code-function">mark_task_completed</span>()</span>
 <span class="code-line">{</span>
-<span class="code-line">  <span class="code-comment">// Sanity check: a task is completing here, which means this pipeline was still</span></span>
-<span class="code-line">  <span class="code-comment">// running work. If the pipeline was already marked finished, or any of its</span></span>
-<span class="code-line">  <span class="code-comment">// operators were already finalized, then we declared the pipeline done too</span></span>
-<span class="code-line">  <span class="code-comment">// early — i.e. a task was still in flight when we considered the pipeline</span></span>
-<span class="code-line">  <span class="code-comment">// complete. That mismatch can make the whole query look done while work is</span></span>
-<span class="code-line">  <span class="code-comment">// still running, so surface it loudly.</span></span>
+<span class="code-doc"><span class="doc-p">Sanity check: a task is completing here, which means this pipeline was still running work. If the pipeline was already marked finished, or any of its operators were already finalized, then we declared the pipeline done too early — i.e. a task was still in flight when we considered the pipeline complete. That mismatch can make the whole query look done while work is still running, so surface it loudly.</span></span>
 <span class="code-line">  <span class="code-keyword">const</span> <span class="code-keyword">bool</span> pipeline_was_finished = pipeline_finished.<span class="code-function">load</span>();</span>
 <span class="code-line">  std::string finalized_ops;</span>
             </code></pre>
@@ -2079,10 +2783,10 @@
     </div>
   </div>
 </section>
-<section class="module" id="module-7">
+<section class="module" id="module-8">
   <div class="module-content">
     <header class="module-header animate-in">
-      <span class="module-number">07</span>
+      <span class="module-number">08</span>
       <h1 class="module-title">The Streaming Frontier</h1>
       <p class="module-subtitle">Your sprint: <a href="https://github.com/sirius-db/sirius/issues/836">#836</a> (streaming source) and <a href="https://github.com/sirius-db/sirius/issues/837">#837</a> (streaming sink) — and the two hangs an edge-triggered engine had waiting for them.</p>
     </header>
@@ -2096,16 +2800,15 @@
         <p>Everything in modules 1&ndash;6 assumed data comes from disk. Your job (#836/#837) is to teach the engine that data can come from — and leave to — another machine, so Sirius can run as a StarRocks compute node inside a <span class="term" data-definition="StarRocks&rsquo; unit of distributed execution: one slice of a query plan running on one compute node, wired to other fragments by exchanges. Your source sits at a fragment&rsquo;s bottom edge; your sink at its top.">fragment</span>. The engine&rsquo;s loop barely changes. Its <em>assumptions</em> do.</p>
 
         <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
-          <span class="translation-label">the same trace, new leaf</span>
-          <pre><code><span class="code-line"><span class="code-property">Module 3:</span>    SCAN(orders)              → FILTER → COUNT sink</span>
+          <span class="translation-label">the same trace, new leaf</span><pre><code><span class="code-line"><span class="code-property">Module 3:</span>    SCAN(orders)              → FILTER → COUNT sink</span>
 <span class="code-line"><span class="code-property">Your #836:</span>   STREAMING_SOURCE(channel) → FILTER → COUNT sink</span>
-<span class="code-line"><span class="code-comment">                                          └── everything downstream: untouched</span></span></code></pre>
+<span class="code-line"><span class="code-comment">└── everything downstream: untouched</span></span></code></pre>
         </div>
 
         <div class="pattern-cards stagger-children">
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
             <div class="pattern-icon" style="background: var(--color-actor-4)">📥</div>
-            <h4 class="pattern-title">GPU scan (Module 3)</h4>
+            <h4 class="pattern-title">GPU scan (Modules 3&ndash;4 — M4 covers the scan subsystem in depth)</h4>
             <p class="pattern-desc">Pulls splits from the <span class="term" data-definition="The scan-side feed of splits that gpu_scan pulls from. Its is_closed() already means closed AND drained — the exact predicate shape the exchange_channel copies for its EOS."><code>split_connector</code></span>. While data remains, every poll yields a split, every split a task — the machine feeds itself.</p>
           </div>
           <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
@@ -2129,6 +2832,70 @@
             <p class="pattern-desc">A <span class="term" data-definition="An operator that heads its own pipeline with is_source() AND is_sink() both true — like CONCAT. It creates its own tasks, which gives it a hint to gate on. A pure terminal sink has neither.">boundary operator</span>: <code>is_source() &amp;&amp; is_sink()</code>, heading its own pipeline. <span class="term" data-definition="Slowing a producer when the consumer cannot keep up. In Sirius it must surface as fewer tasks created — never as a blocked worker thread.">Backpressure</span> becomes a <em>task-creation condition</em>: full channel → no sink tasks → upstream port repos fill with idle, spillable batches → the engine throttles itself. No worker ever blocks.</p>
           </div>
         </div>
+      </section>
+
+      <!-- ── SCREEN 1B: TOPOLOGY — WHERE SIRIUS SITS ────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Zoom out: where Sirius sits in the larger system</h2>
+
+        <p>One level up from your operators. StarRocks does <em>all</em> the distributed thinking; Sirius only ever sees one fragment at a time. Hover each box for who owns it.</p>
+
+        <div style="display: flex; flex-direction: column; gap: var(--space-2); margin: var(--space-6) 0;">
+
+          <!-- CPU zone: StarRocks FE -->
+          <div style="background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: var(--space-2);">CPU zone — StarRocks cluster</div>
+            <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow-sm);">
+              <span class="term" data-definition="The StarRocks frontend — Java, completely unmodified by this project. It owns everything distributed: SQL parsing, plan optimization, splitting the plan into fragments, and routing each fragment to a compute node."><strong style="font-weight: 600;">StarRocks FE</strong></span>
+              <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 2px;">Java, unmodified — SQL parsing · planning · fragment routing</div>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: var(--space-3); padding-left: var(--space-8); color: var(--color-text-muted);">
+            <span>↓</span>
+            <span style="font-size: 12px; font-family: var(--font-mono);">thrift heartbeat + BRPC exec_plan_fragment</span>
+          </div>
+
+          <!-- CPU zone: Rust CN wrapper -->
+          <div style="background: var(--color-bg-warm); border: 1px solid var(--color-border); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: var(--space-2);">CPU zone — Rust CN process (one per GPU, in principle)</div>
+            <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow-sm);">
+              <span class="term" data-definition="The Rust compute-node wrapper. It speaks StarRocks&rsquo; protocols upward (heartbeat, exec_plan_fragment) and Sirius&rsquo; FFI downward — and it owns the CN&harr;CN exchange. It runs on host threads; one process per GPU in principle."><strong style="font-weight: 600;">sirius-starrocks-cn</strong></span>
+              <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 2px;"><a href="https://github.com/sirius-db/sirius/tree/dev/experimental/starrocks">experimental/starrocks/&nbsp;↗</a> — registers as a CN, translates fragments</div>
+            </div>
+            <div style="display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3);">
+              <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-accent); border: 1px solid var(--color-accent-muted); border-radius: var(--radius-full); padding: 2px 10px;">⬤ batches ⇄ <span class="term" data-definition="NVIDIA&rsquo;s transfer library for moving data between nodes (GPU&harr;GPU where possible). In the PR #914 design, the Rust wrappers use it for the CN&harr;CN exchange that feeds your streaming sources and drains your streaming sinks. Owned by the Rust wrapper — the engine only ever sees the exchange_channel.">nixl</span> CN&harr;CN exchange</span>
+              <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px;">planned — <a href="https://github.com/sirius-db/sirius/pull/914" style="color: inherit;">PR #914</a> design</span>
+              <span style="font-size: 12px; color: var(--color-text-muted);">feeds streaming sources · drains streaming sinks</span>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: var(--space-3); padding-left: var(--space-8); color: var(--color-text-muted);">
+            <span>↓</span>
+            <span style="font-size: 12px; font-family: var(--font-mono);">FFI — <a href="https://github.com/sirius-db/sirius/blob/dev/src/include/sirius_ffi.hpp">src/include/sirius_ffi.hpp&nbsp;↗</a> + <a href="https://github.com/sirius-db/sirius/tree/dev/rust/crates/sirius">rust/crates/sirius&nbsp;↗</a></span>
+          </div>
+
+          <!-- GPU zone: the engine -->
+          <div style="background: var(--color-accent-light); border: 1px solid var(--color-accent-muted); border-radius: 12px; padding: var(--space-4);">
+            <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: var(--space-2);">GPU zone — the engine (Modules 1&ndash;7)</div>
+            <div style="display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2);">
+              <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 8px 12px; box-shadow: var(--shadow-sm);">
+                <span class="term" data-definition="The engine&rsquo;s entry point. Sirius owns per-fragment execution ONLY — it receives one fragment&rsquo;s plan through the FFI, builds pipelines, runs them, and hands batches back. It never knows about other fragments, other nodes, or the cluster."><strong style="font-weight: 600;">SiriusContext</strong></span>
+              </div>
+              <span style="color: var(--color-text-muted);">→</span>
+              <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 8px 12px; box-shadow: var(--shadow-sm);">
+                <span class="term" data-definition="Module 3&rsquo;s machinery: task creator, hints, port repositories. Your streaming source and sink are just two more operators inside these pipelines — the engine&rsquo;s loop is unchanged."><strong style="font-weight: 600;">pipelines</strong></span>
+              </div>
+              <span style="color: var(--color-text-muted);">→</span>
+              <div style="background: var(--color-bg); border: 1px solid var(--color-border-light); border-radius: 8px; padding: 8px 12px; box-shadow: var(--shadow-sm);">
+                <span class="term" data-definition="Module 5&rsquo;s per-GPU task executors, fed by the scheduler under the reservation system. Sirius&rsquo; ownership ends here — anything that leaves this box for another machine goes back up through the Rust wrapper&rsquo;s exchange."><strong style="font-weight: 600;">per-GPU executors</strong></span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <p>The division of labor to keep in your head while reviewing your own PRs: <strong>StarRocks FE</strong> owns distributed planning and routing; the <strong>Rust wrapper</strong> owns the exchange; <strong>Sirius</strong> owns per-fragment execution and nothing else. Your #836/#837 operators are the seam where the last two meet.</p>
       </section>
 
       <!-- ── SCREEN 2: THE CHANNEL CONTRACT ─────────────────────── -->
@@ -2164,7 +2931,7 @@
           </div>
         </div>
 
-        <p>Why handles? Module 4&rsquo;s law: a batch idle in a repository is a spill candidate. Trace one batch across the boundary:</p>
+        <p>Why handles? Module 5&rsquo;s law: a batch idle in a repository is a spill candidate. Trace one batch across the boundary:</p>
 
         <div class="step-cards stagger-children">
           <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
@@ -2194,7 +2961,7 @@
           <div class="callout-icon">⚖️</div>
           <div class="callout-content">
             <strong class="callout-title">The channel must never own memory</strong>
-            <p>A <code>shared_ptr&lt;data_batch&gt;</code> in the queue would make the channel a hidden owner of GPU memory — invisible to the downgrade executor, Module 5&rsquo;s cardinal sin. Handles keep every queued batch idle-in-repo until the moment a task claims it.</p>
+            <p>A <code>shared_ptr&lt;data_batch&gt;</code> in the queue would make the channel a hidden owner of GPU memory — invisible to the downgrade executor, Module 6&rsquo;s cardinal sin. Handles keep every queued batch idle-in-repo until the moment a task claims it.</p>
           </div>
         </div>
       </section>
@@ -2324,9 +3091,8 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label">src/pipeline/sirius_pipeline.cpp:389</span>
-            <pre><code><span class="code-line">      <span class="code-keyword">if</span> (limit_exhausted ||</span>
-<span class="code-line">          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>()) ) {</span>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/sirius_pipeline.cpp#L389" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/sirius_pipeline.cpp:389 &#8599;</a></span><pre><code><span class="code-line">      <span class="code-keyword">if</span> (limit_exhausted ||</span>
+<span class="code-line">          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>())) {</span>
 <span class="code-line">        <span class="code-keyword">if</span> (tasks_created.<span class="code-function">load</span>() == tasks_completed.<span class="code-function">load</span>()) {</span>
 <span class="code-line">          pipeline_finished.<span class="code-function">store</span>(<span class="code-keyword">true</span>);</span>
 <span class="code-line">          <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; op : <span class="code-function">get_operators</span>()) {</span>
@@ -2417,6 +3183,47 @@
             <p>Operators plus unit tests, no compute-node wiring — <code>exchange_channel</code> + source as PR&nbsp;1, sink as PR&nbsp;2. The CN integration lands only after both stand alone in the tree.</p>
           </div>
         </div>
+
+        <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: var(--space-10) 0 var(--space-2);">The extension path #836/#837 will walk</h3>
+        <p>Every new operator enters the engine the same five-rung way. Rungs 1&ndash;4 are one standalone PR; rung 5 is deliberately its own.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
+            <div class="step-num" style="background: var(--color-actor-1)">1</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">enum</span><a href="https://github.com/sirius-db/sirius/blob/dev/src/include/op/sirius_physical_operator_type.hpp"><code>src/include/op/sirius_physical_operator_type.hpp</code>&nbsp;↗</a></strong>
+              <p>Add the enum value — and its name to the <code>ToString</code> switch in <a href="https://github.com/sirius-db/sirius/blob/dev/src/op/sirius_physical_operator_type.cpp"><code>src/op/sirius_physical_operator_type.cpp</code>&nbsp;↗</a>, or every log line says <code>UNKNOWN</code>.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
+            <div class="step-num" style="background: var(--color-actor-1)">2</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">code</span><a href="https://github.com/sirius-db/sirius/tree/dev/src/op"><code>src/op/</code>&nbsp;↗</a> + <a href="https://github.com/sirius-db/sirius/tree/dev/src/include/op"><code>src/include/op/</code>&nbsp;↗</a></strong>
+              <p>Header + implementation, next to the operators you studied in Modules 3&ndash;4.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
+            <div class="step-num" style="background: var(--color-actor-1)">3</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">build</span><a href="https://github.com/sirius-db/sirius/blob/dev/CMakeLists.txt"><code>CMakeLists.txt</code>&nbsp;↗</a> (root)</strong>
+              <p>Register your <code>.cpp</code> files in <code>EXTENSION_SOURCES</code> and your tests in <code>TEST_SOURCES</code> — unlisted files silently don&rsquo;t build.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-1)">
+            <div class="step-num" style="background: var(--color-actor-1)">4</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-border); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">test</span><a href="https://github.com/sirius-db/sirius/tree/dev/test/cpp"><code>test/cpp/</code>&nbsp;↗</a></strong>
+              <p>Catch2 unit tests, runnable by tag: <code>pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"</code></p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">5</div>
+            <div class="step-body">
+              <strong><span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; border: 1px solid var(--color-actor-2); color: var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px; margin-right: var(--space-2);">later, deliberate</span><a href="https://github.com/sirius-db/sirius/blob/dev/src/planner/sirius_physical_plan_generator.cpp"><code>src/planner/sirius_physical_plan_generator.cpp</code>&nbsp;↗</a></strong>
+              <p>Plan-generator wiring. <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: 2px 10px;">standalone PR first</span> — unwired = the operator simply never runs (silent CPU fallback).</p>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- ── SCREEN 6: QUIZ + COURSE CLOSE ──────────────────────── -->
@@ -2428,7 +3235,7 @@
         <div class="quiz-container" id="quiz-module7">
           <div class="quiz-question-block"
                data-correct="q1-b"
-               data-explanation-right="Right — backpressure is a task-creation condition. The hint answers WAITING, no sink tasks are built, and upstream output parks in port repositories as idle batches — exactly the spillable population Module 4&rsquo;s downgrade executor knows how to relieve. Every worker stays free."
+               data-explanation-right="Right — backpressure is a task-creation condition. The hint answers WAITING, no sink tasks are built, and upstream output parks in port repositories as idle batches — exactly the spillable population Module 5&rsquo;s downgrade executor knows how to relieve. Every worker stays free."
                data-explanation-wrong="Not quite. The engine side is try_push only — a worker never blocks on the channel, and nothing is dropped or failed. A full channel simply stops sink task creation; pressure surfaces as idle batches in port repos, which are spill candidates, not casualties.">
             <h3 class="quiz-question">1. The streaming sink&rsquo;s channel is full and stays full for 30&nbsp;s. What is the CORRECT observable behavior inside the engine?</h3>
             <div class="quiz-options">
@@ -2507,7 +3314,7 @@
           <div class="quiz-question-block"
                data-correct="q4-c"
                data-explanation-right="That&rsquo;s the review answer. The repository stays the single owner, so a queued batch remains idle-in-repo — visible and spillable to the downgrade executor — and the channel can never pin GPU memory. The consumer resolves the id via pop_data_batch_by_id at task-creation time."
-               data-explanation-wrong="Not quite. Message size and ref-count mechanics are noise here — ownership is the point. A shared_ptr in the channel would make the channel a hidden owner of GPU memory, invisible to the downgrade executor (Module 5&rsquo;s cardinal sin). Handles keep batches idle-in-repo, spillable until a task claims them.">
+               data-explanation-wrong="Not quite. Message size and ref-count mechanics are noise here — ownership is the point. A shared_ptr in the channel would make the channel a hidden owner of GPU memory, invisible to the downgrade executor (Module 6&rsquo;s cardinal sin). Handles keep batches idle-in-repo, spillable until a task claims them.">
             <h3 class="quiz-question">4. Your reviewer asks: &ldquo;why does the channel carry <code>{batch_id, size}</code> instead of <code>shared_ptr&lt;data_batch&gt;</code>?&rdquo; Best answer?</h3>
             <div class="quiz-options">
               <button class="quiz-option" data-value="q4-a" onclick="selectOption(this)">
