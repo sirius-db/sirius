@@ -62,9 +62,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
-  /// Target uncompressed byte budget for one data-batch split. Consumed only by
-  /// parquet_batch_coalescer when it bundles files / chunks row groups — the
-  /// ingestible's metadata scan operates one file at a time and does no batching.
+  /// Target decoded column-buffer budget for one data-batch split. Consumed
+  /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
+  /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t scan_output_arity      = 0;
 
@@ -122,7 +122,16 @@ class parquet_split_info : public scan_info {
   {
     std::size_t total = 0;
     for (auto const& s : rg_slices) {
-      total += s.reserved_uncompressed_bytes;
+      total += s.estimated_output_bytes;
+    }
+    return total;
+  }
+
+  [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& s : rg_slices) {
+      total += s.estimated_decode_working_bytes;
     }
     return total;
   }
@@ -152,15 +161,18 @@ class parquet_split_info : public scan_info {
 class parquet_file_scan_info : public scan_info {
  public:
   /// A single pruned row group with the byte accounting the coalescer chunks on.
-  /// @c uncompressed_bytes is the estimated DECODED (GPU-resident) size of the row
-  /// group's emitted columns — fixed-width columns contribute row_count x cuDF
+  /// @c output_bytes estimates the decoded size of projected data columns before
+  /// row filtering, while @c decode_working_bytes also includes columns decoded
+  /// only for filtering. Fixed-width columns contribute row_count x cuDF
   /// decoded width plus validity; VARCHAR uses the parquet decoded BYTE_ARRAY
   /// statistic (@c SizeStatistics, or the encoded size when the writer omitted it)
-  /// plus offsets and validity; pure-filter columns (read for filtering but not
-  /// emitted) are excluded. See @c rg_contribution in parquet_gpu_ingestible.cpp.
+  /// plus offsets and validity. See @c rg_contribution in parquet_gpu_ingestible.cpp.
+  /// Scans with no projected data column use decoded read columns as their
+  /// nonzero execution-history basis.
   struct row_group_entry {
     cudf::size_type index;
-    std::size_t uncompressed_bytes;
+    std::size_t output_bytes;
+    std::size_t decode_working_bytes;
     std::size_t compressed_bytes;
     int64_t num_rows;
   };
@@ -190,7 +202,16 @@ class parquet_file_scan_info : public scan_info {
   {
     std::size_t total = 0;
     for (auto const& rg : row_groups) {
-      total += rg.uncompressed_bytes;
+      total += rg.output_bytes;
+    }
+    return total;
+  }
+
+  [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& rg : row_groups) {
+      total += rg.decode_working_bytes;
     }
     return total;
   }
