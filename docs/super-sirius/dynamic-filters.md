@@ -136,11 +136,13 @@ class dynamic_filter_publish_plan {
  public:
   struct probe_target {
     std::shared_ptr<sirius_dynamic_filter_set> filter_set;
-    std::vector<std::size_t> probe_col_idx;   // build-key idx -> consumer col idx
+    std::vector<std::size_t> probe_col_idx;       // build-key idx -> consumer col idx
+    std::vector<cudf::data_type> probe_col_type;  // consumer storage type per key
   };
 
  private:
   std::vector<probe_target> _probe_targets;
+  std::vector<std::size_t> _build_key_domain_cardinalities;  // per key; 0 = gates off
   std::vector<dynamic_filter_replica_space> _replica_spaces;
 };
 ```
@@ -305,7 +307,7 @@ The normal path is deliberately ordered:
 
 That sequence does not gate a scan reached transitively through an intervening join. For those targets, the management loop first looks for a device-compatible queued task in the marked build subtrees whenever a GPU becomes ready, then falls through to normal locality-aware dispatch if none exists. The preference can advance publication relative to undispatched transitive scan splits, but it does not preempt work or turn the channel into a barrier. See [Transitive scan targets and build-task priority](#transitive-scan-targets-and-build-task-priority).
 
-The publication attempt may intentionally emit no filter—for example, for an empty build, a cast or unsupported key, a domain-covering build, or a non-selective zone range. That successful no-op is still `FINISHED`. Allocation pressure may also leave an optional replica unavailable. Consumers need no readiness protocol: they test the channel and local device availability and pass the batch through when nothing useful can apply. IN-list/Bloom target replication treats `std::bad_alloc` as optional but lets other construction, transfer, and synchronization errors escape and fail the producing task/query. Zone-map target cloning currently catches `std::exception`, logs it, and omits that target replica.
+The publication attempt may intentionally emit no filter—for example, for an empty build, a cast or unsupported key, a domain-covering key, or a non-selective zone range. That successful no-op is still `FINISHED`. Allocation pressure may also leave an optional replica unavailable. Consumers need no readiness protocol: they test the channel and local device availability and pass the batch through when nothing useful can apply. Replica materialization for every filter kind treats a per-target failure (reservation denial, cloning, copy, or completion synchronize) as best-effort: it is logged and that target's replica is omitted.
 
 The `BUILT` transition remains a defense-in-depth second claim point if the build-port hook unexpectedly receives a non-GPU-resident batch. Normal build CONCAT output is GPU-resident, so the ordered build-port path is the path used for scan pushdown. `on_finalize_operator` never publishes; it only changes an unclaimed `OPEN` state to `CLOSED`. GPU construction and replication run without holding `op_state_mutex`.
 

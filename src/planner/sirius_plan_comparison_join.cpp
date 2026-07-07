@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -273,51 +275,84 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
 //===----------------------------------------------------------------------===//
 namespace {
 
-/// Plan-time producer-side selectivity evidence for dynamic-filter wiring, gathered from the
-/// build-side LOGICAL subtree (before create_plan moves data out of it).
-struct build_side_filter_evidence {
-  /// Any predicate anywhere in the subtree: a LOGICAL_FILTER node or GET-level table filters.
-  /// An unfiltered build is (for FK-shaped joins) the whole key domain — its filter keeps every
-  /// probe row by construction, so wiring a producer target for it only buys overhead.
-  bool subtree_filtered = false;
-
-  /// Largest UNFILTERED base-table cardinality among the subtree's GETs, from the table
-  /// function's own statistics (parquet: exact row count from metadata) — a proxy for the build
-  /// key's domain size. 0 when no GET reports statistics.
-  std::size_t domain_cardinality = 0;
-};
-
-build_side_filter_evidence inspect_build_side_for_dynamic_filters(duckdb::LogicalOperator& node,
-                                                                  duckdb::ClientContext& context)
+/// Resolve @p binding through the logical subtree to the LogicalGet that produces it, or nullptr
+/// when the column is computed (cast, expression, aggregate result) or not from a base scan.
+duckdb::LogicalGet* trace_binding_to_get(duckdb::LogicalOperator& node,
+                                         duckdb::ColumnBinding binding)
 {
-  build_side_filter_evidence ev;
-  if (node.type == duckdb::LogicalOperatorType::LOGICAL_FILTER) { ev.subtree_filtered = true; }
-  if (node.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
-    auto& get = node.Cast<duckdb::LogicalGet>();
-    if (!get.table_filters.filters.empty()) { ev.subtree_filtered = true; }
+  switch (node.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_GET: {
+      auto& get = node.Cast<duckdb::LogicalGet>();
+      return get.table_index == binding.table_index ? &get : nullptr;
+    }
+    case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
+      auto& proj = node.Cast<duckdb::LogicalProjection>();
+      if (proj.table_index != binding.table_index || node.children.empty() ||
+          binding.column_index >= proj.expressions.size()) {
+        return nullptr;
+      }
+      auto& expr = *proj.expressions[binding.column_index];
+      if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+        return nullptr;
+      }
+      return trace_binding_to_get(*node.children[0],
+                                  expr.Cast<duckdb::BoundColumnRefExpression>().binding);
+    }
+    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+      auto& aggr = node.Cast<duckdb::LogicalAggregate>();
+      if (binding.table_index != aggr.group_index || node.children.empty() ||
+          binding.column_index >= aggr.groups.size()) {
+        return nullptr;
+      }
+      auto& expr = *aggr.groups[binding.column_index];
+      if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+        return nullptr;
+      }
+      return trace_binding_to_get(*node.children[0],
+                                  expr.Cast<duckdb::BoundColumnRefExpression>().binding);
+    }
+    default: {
+      // Table indexes are binder-unique, so recursing into every child finds the owning subtree
+      // (or nothing, for rebinding operators this walk does not model).
+      for (auto& child : node.children) {
+        if (auto* get = trace_binding_to_get(*child, binding)) { return get; }
+      }
+      return nullptr;
+    }
+  }
+}
+
+/// Per pushed key (aligned with the pushdown info's join_condition): the unfiltered cardinality of
+/// the base table the build key traces to, or 0 when untraceable — the publish coverage gates are
+/// then off for that key and the consumer-side gate is the backstop. Must run before create_plan,
+/// which drains op.conditions and the logical children.
+std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalComparisonJoin& op,
+                                                        duckdb::ClientContext& context)
+{
+  auto const& pushed = op.filter_pushdown->join_condition;
+  std::vector<std::size_t> domains(pushed.size(), 0);
+  for (std::size_t k = 0; k < pushed.size(); ++k) {
+    auto const cond_idx = pushed[k];
+    if (cond_idx >= op.conditions.size()) { continue; }
+    auto& key = *op.conditions[cond_idx].right;
+    if (key.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) { continue; }
+    auto* get =
+      trace_binding_to_get(*op.children[1], key.Cast<duckdb::BoundColumnRefExpression>().binding);
+    if (get == nullptr) { continue; }
     std::size_t card = 0;
-    if (get.function.cardinality) {
+    if (get->function.cardinality) {
       // The table function's own estimate is pre-filter (the optimizer-adjusted
       // estimated_cardinality field would undercount the domain for filtered GETs).
-      auto stats = get.function.cardinality(context, get.bind_data.get());
+      auto stats = get->function.cardinality(context, get->bind_data.get());
       if (stats && stats->has_estimated_cardinality) { card = stats->estimated_cardinality; }
     }
-    if (card == 0) {
-      // May include optimizer filter selectivity
-      card = get.estimated_cardinality;
-    }
-    ev.domain_cardinality = std::max(ev.domain_cardinality, card);
+    domains[k] = card != 0 ? card : get->estimated_cardinality;
   }
-  for (auto& child : node.children) {
-    auto child_ev         = inspect_build_side_for_dynamic_filters(*child, context);
-    ev.subtree_filtered   = ev.subtree_filtered || child_ev.subtree_filtered;
-    ev.domain_cardinality = std::max(ev.domain_cardinality, child_ev.domain_cardinality);
-  }
-  return ev;
+  return domains;
 }
 
 }  // namespace
-   //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
@@ -327,11 +362,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
-  // Inspect the build side for the dynamic-filter wiring decision BEFORE create_plan, which
-  // moves data out of the logical nodes (same constraint as prove_unique_columns below).
-  auto build_filter_evidence = op.filter_pushdown
-                                 ? inspect_build_side_for_dynamic_filters(*op.children[1], context)
-                                 : build_side_filter_evidence{};
+  // Gather per-key domain evidence BEFORE create_plan, which moves data out of the logical nodes
+  // (same constraint as prove_unique_columns below) and drains op.conditions.
+  auto build_key_domains =
+    op.filter_pushdown ? build_key_domain_cardinalities(op, context) : std::vector<std::size_t>{};
 
   // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
@@ -386,12 +420,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> filter_targets;
     std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
     if (op.filter_pushdown) {
-      if (!build_filter_evidence.subtree_filtered) {
+      // An unfiltered build is (for FK-shaped joins) the whole key domain — its filter keeps
+      // every probe row by construction, so wiring a producer target for it only buys overhead.
+      // DuckDB's flag covers the delim-join case where the effective build data is children[0].
+      if (!op.filter_pushdown->build_side_has_filter) {
         SIRIUS_LOG_INFO(
-          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build subtree is "
-          "unfiltered (build est {} rows, key-domain ~{} rows).",
-          rhs_cardinality,
-          build_filter_evidence.domain_cardinality);
+          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is "
+          "unfiltered (build est {} rows).",
+          rhs_cardinality);
       } else {
         auto& memory_manager = sirius_context->get_memory_manager();
         auto const gpu_spaces =
@@ -410,8 +446,16 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
             channel->register_producer();
             sirius::op::dynamic_filter_publish_plan::probe_target target{std::move(channel), {}};
             target.probe_col_idx.reserve(pi.columns.size());
+            target.probe_col_type.reserve(pi.columns.size());
             for (auto const& col : pi.columns) {
               target.probe_col_idx.push_back(col.probe_column_index.column_index);
+              auto storage_type = cudf::data_type{cudf::type_id::EMPTY};
+              try {
+                storage_type = sirius::get_cudf_type(sirius::from_duckdb(col.storage_type));
+              } catch (std::exception const&) {
+                // EMPTY type will prevent zone-map filter construction for this column
+              }
+              target.probe_col_type.push_back(storage_type);
             }
             filter_targets.push_back(std::move(target));
           }
@@ -443,17 +487,16 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
             }
             SIRIUS_LOG_INFO(
               "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
-              "target(s) (build est {} rows, key-domain ~{} rows).",
+              "target(s) (build est {} rows).",
               filter_targets.size(),
-              rhs_cardinality,
-              build_filter_evidence.domain_cardinality);
+              rhs_cardinality);
           }
         }
       }
     }
     sirius::op::dynamic_filter_publish_plan filter_plan{std::move(filter_targets),
                                                         op_params.enable_dynamic_zone_map_filter,
-                                                        build_filter_evidence.domain_cardinality,
+                                                        std::move(build_key_domains),
                                                         std::move(filter_replica_spaces)};
 
     auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(

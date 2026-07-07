@@ -104,7 +104,7 @@ physical hash join. It contains:
 
 - every probe channel and its probe-column mapping;
 - whether zone maps may be emitted;
-- the build-key-domain estimate used by the publication gates; and
+- the per-key build-key-domain estimates used by the publication gates; and
 - non-owning placement handles for the context's active GPU memory spaces.
 
 Each `dynamic_filter_replica_space` pairs a non-null CuCascade GPU
@@ -180,12 +180,11 @@ silent cross-device publication. Scan consumers never invoke it or know how a
 representation is copied.
 
 The publisher synchronizes the construction stream, invokes the capability for
-each built filter, and only then calls `push_filter`. IN-list and Bloom treat
-`std::bad_alloc` for an individual target as best-effort replica unavailability;
-CUDA, device-selection, invariant, and stream-synchronization failures
-propagate. Zone-map replication currently logs and omits a target that cannot
-clone its scalars. Successful replicas are published without weakening the
-authoritative join.
+each built filter, and only then calls `push_filter`. Every filter kind treats
+a per-target failure — reservation denial, cloning, the copy itself, or the
+completion synchronize — as best-effort replica unavailability: it is logged
+and that target's replica is omitted. Successful replicas are published without
+weakening the authoritative join.
 
 ### 4. Build once, copy finalized storage
 
@@ -228,7 +227,6 @@ flowchart LR
     STAGED["Non-peer target GPU<br/>batched D2H → H2D"]
     ZONE["Zone-map target GPU<br/>exact typed target-owned scalars"]
     SKIP["Best-effort target failure<br/>optional replica omitted"]
-    FAIL["IN-list / Bloom CUDA or invariant failure<br/>propagate and fail publication"]
     COMPLETE["Completion pass<br/>synchronize target streams"]
     CHANNEL["push one immutable logical filter<br/>into target channels"]
     CONSUMER["Each scan supplies its memory-space device ID<br/>and selects only the local replica"]
@@ -239,9 +237,8 @@ flowchart LR
     REPLICATE -->|"IN-list / Bloom<br/>peer route unavailable"| HOST
     HOST --> STAGED
     REPLICATE -->|"zone map"| ZONE
-    REPLICATE -.->|"membership std::bad_alloc"| SKIP
+    REPLICATE -.->|"membership target failure"| SKIP
     ZONE -.->|"target clone exception"| SKIP
-    REPLICATE -.->|"membership serious failure"| FAIL
     PEER --> COMPLETE
     STAGED --> COMPLETE
     ZONE --> COMPLETE

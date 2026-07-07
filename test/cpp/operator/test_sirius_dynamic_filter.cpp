@@ -24,8 +24,6 @@
 #include <catch.hpp>
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -208,7 +206,7 @@ TEST_CASE("set_consumer_column_remap translates producer column_ids to output po
   // key by output-column position (what the AST merge and post-decode apply index). The remap is
   // column_ids index -> output position, with size_t(-1) (scan_plan::no_output_position) marking a
   // column_ids entry that produces no output column.
-  constexpr std::size_t kNoOutput = static_cast<std::size_t>(-1);
+  constexpr auto kNoOutput = static_cast<std::size_t>(-1);
 
   sirius_dynamic_filter_set set;
   // column_ids = [A(0), B(1), C(2)]; output = [C, A] -> A(0)->out 1, B(1)->pruned, C(2)->out 0.

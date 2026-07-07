@@ -66,11 +66,11 @@ namespace op {
 dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   std::vector<probe_target> probe_targets,
   bool emit_zone_map_filters,
-  std::size_t build_key_domain_cardinality,
+  std::vector<std::size_t> build_key_domain_cardinalities,
   std::vector<dynamic_filter_replica_space> replica_spaces)
   : _probe_targets(std::move(probe_targets)),
     _emit_zone_map_filters(emit_zone_map_filters),
-    _build_key_domain_cardinality(build_key_domain_cardinality),
+    _build_key_domain_cardinalities(std::move(build_key_domain_cardinalities)),
     _replica_spaces(std::move(replica_spaces))
 {
   if (!_probe_targets.empty() && _replica_spaces.empty()) {
@@ -1436,22 +1436,7 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     return;
   }
 
-  // Skip domain-covering builds before paying to build a membership structure; they will keep
-  // most probe rows, and the consumer-side gate remains the runtime backstop.
-  auto const build_key_domain_cardinality = _plan.build_key_domain_cardinality();
-  if (build_key_domain_cardinality > 0) {
-    auto const covered = static_cast<double>(build_view.num_rows()) /
-                         static_cast<double>(build_key_domain_cardinality);
-    if (covered >= dynamic_filter_publish_plan::k_domain_coverage_threshold) {
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] publish gate: build {} rows cover {:.2f} of key domain "
-        "(~{} rows) -> skip publish.",
-        build_view.num_rows(),
-        covered,
-        build_key_domain_cardinality);
-      return;
-    }
-  }
+  auto const& key_domains = _plan.build_key_domain_cardinalities();
 
   int source_device = -1;
   if (cudaGetDevice(&source_device) != cudaSuccess) {
@@ -1482,6 +1467,8 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     _filter_pushdown.join_condition.size());
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(
     _filter_pushdown.join_condition.size());
+  std::vector<cudf::data_type> per_key_build_type(_filter_pushdown.join_condition.size(),
+                                                  cudf::data_type{cudf::type_id::EMPTY});
 
   // Read a numeric scalar to host as a double for the zone-map range-coverage gate. Returns nullopt
   // for non-numeric keys (the gate is then skipped and the zone-map is published).
@@ -1530,8 +1517,27 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     }
     if (cond_idx >= _right_key_col_indices.size()) { continue; }
 
+    // Skip domain-covering keys before paying to build a membership structure; their filters keep
+    // most probe rows, and the consumer-side gate remains the runtime backstop.
+    auto const key_domain = k < key_domains.size() ? key_domains[k] : 0;
+    if (key_domain > 0) {
+      auto const covered =
+        static_cast<double>(build_view.num_rows()) / static_cast<double>(key_domain);
+      if (covered >= dynamic_filter_publish_plan::k_domain_coverage_threshold) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] publish gate: key {}: build {} rows cover {:.2f} of key "
+          "domain (~{} rows) -> skip key.",
+          k,
+          build_view.num_rows(),
+          covered,
+          key_domain);
+        continue;
+      }
+    }
+
     auto const build_col_idx = _right_key_col_indices[cond_idx];
     auto const& col          = build_view.column(build_col_idx);
+    per_key_build_type[k]    = col.type();
 
     // (1) Zone-map — read-time row-group pruning. This only helps when build keys are correlatively
     // clustered with the filter column(s), so it is off by default (TPC-H keys are scattered).
@@ -1551,12 +1557,11 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
         // Range-coverage publication gate (the zone-map analogue of the cardinality gate above):
         // a [min,max] spanning most of the build key's domain prunes nothing, so skip it.
         bool publish_zone_map = true;
-        if (build_key_domain_cardinality > 0) {
+        if (key_domain > 0) {
           auto const lo = scalar_to_double(*min_s);
           auto const hi = scalar_to_double(*max_s);
           if (lo && hi) {
-            auto const coverage =
-              (*hi - *lo + 1.0) / static_cast<double>(build_key_domain_cardinality);
+            auto const coverage = (*hi - *lo + 1.0) / static_cast<double>(key_domain);
             if (coverage >= dynamic_filter_publish_plan::k_domain_coverage_threshold) {
               SIRIUS_LOG_DEBUG(
                 "[sirius_physical_hash_join] zone-map key {}: skipped (range [{},{}] covers {:.2f} "
@@ -1565,7 +1570,7 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
                 *lo,
                 *hi,
                 coverage,
-                build_key_domain_cardinality);
+                key_domain);
               publish_zone_map = false;
             }
           }
@@ -1657,7 +1662,8 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
       continue;
     }
     for (std::size_t k = 0; k < per_key_membership.size(); ++k) {
-      if (per_key_zone_map[k] &&
+      if (per_key_zone_map[k] && k < tgt.probe_col_type.size() &&
+          tgt.probe_col_type[k] == per_key_build_type[k] &&
           tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_zone_map[k])) {
         ++total_pushed;
       }

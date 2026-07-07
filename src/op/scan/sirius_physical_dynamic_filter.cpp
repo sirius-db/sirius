@@ -67,13 +67,13 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
     auto const& ro = ro_batches[i];
     // A null result means nothing was dropped — the gate declined, or no published filter matched.
     // Forward the batch unchanged (zero-copy; its columns stay co-owned via the idle shared_ptr).
-    auto filtered = apply_dynamic_filters_gated_view(
-      ro.get_data()->cast<::cucascade::gpu_table_representation>().get_table_view(),
-      *_filters,
-      _gate,
-      stream,
-      dynamic_filter_apply_mode::membership_masks_only,
-      ro.get_memory_space()->get_device_id());
+    auto filtered =
+      apply_dynamic_filters_gated_view(sirius::get_cudf_table_view(ro),
+                                       *_filters,
+                                       _gate,
+                                       stream,
+                                       dynamic_filter_apply_mode::membership_masks_only,
+                                       ro.get_memory_space()->get_device_id());
     if (filtered) {
       output_batches.push_back(
         sirius::make_data_batch(std::move(filtered), *ro.get_memory_space(), stream));

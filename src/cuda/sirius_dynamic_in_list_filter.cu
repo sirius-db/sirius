@@ -296,7 +296,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
         continue;
       }
       pending.emplace_back(std::move(replica), stream);
-    } catch (std::bad_alloc const& e) {
+    } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
         "That GPU will skip this optional filter.",
@@ -313,9 +313,18 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
 
   for (auto& [replica, stream] : pending) {
     auto const device_id = replica->device_id;
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-    stream.synchronize();
-    _set->replicas.push_back(std::move(replica));
+    try {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      stream.synchronize();
+      _set->replicas.push_back(std::move(replica));
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "
+        "That GPU will skip this optional filter.",
+        _set->source_device,
+        device_id,
+        e.what());
+    }
   }
 }
 

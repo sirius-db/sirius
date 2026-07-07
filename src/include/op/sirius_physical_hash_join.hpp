@@ -33,6 +33,8 @@
 #include "sirius_config.hpp"
 #include "utils.hpp"
 
+#include <cudf/types.hpp>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -66,12 +68,13 @@ class dynamic_filter_publish_plan final {
   struct probe_target {
     std::shared_ptr<sirius_dynamic_filter_set> filter_set;
     std::vector<std::size_t> probe_col_idx;
+    std::vector<cudf::data_type> probe_col_type;
   };
 
   dynamic_filter_publish_plan() = default;
   dynamic_filter_publish_plan(std::vector<probe_target> probe_targets,
                               bool emit_zone_map_filters,
-                              std::size_t build_key_domain_cardinality,
+                              std::vector<std::size_t> build_key_domain_cardinalities,
                               std::vector<dynamic_filter_replica_space> replica_spaces);
 
   [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
@@ -80,22 +83,24 @@ class dynamic_filter_publish_plan final {
     return _probe_targets;
   }
   [[nodiscard]] bool emit_zone_map_filters() const noexcept { return _emit_zone_map_filters; }
-  [[nodiscard]] std::size_t build_key_domain_cardinality() const noexcept
+  /// Per pushed key, aligned with the pushdown info's join_condition: the unfiltered cardinality
+  /// of the base table the build key traces to, or 0 when untraceable (coverage gates off).
+  [[nodiscard]] std::vector<std::size_t> const& build_key_domain_cardinalities() const noexcept
   {
-    return _build_key_domain_cardinality;
+    return _build_key_domain_cardinalities;
   }
   [[nodiscard]] std::vector<dynamic_filter_replica_space> const& replica_spaces() const noexcept
   {
     return _replica_spaces;
   }
 
-  /// Fraction of the key-domain proxy a build may cover and still publish.
+  /// Fraction of a key's domain a build may cover and still publish that key's filters.
   static constexpr double k_domain_coverage_threshold = 0.5;
 
  private:
   std::vector<probe_target> _probe_targets;
-  bool _emit_zone_map_filters               = false;
-  std::size_t _build_key_domain_cardinality = 0;
+  bool _emit_zone_map_filters = false;
+  std::vector<std::size_t> _build_key_domain_cardinalities;
   /// Non-owning GPU/HOST placements. See @ref dynamic_filter_replica_space for the lifetime
   /// contract.
   std::vector<dynamic_filter_replica_space> _replica_spaces;
