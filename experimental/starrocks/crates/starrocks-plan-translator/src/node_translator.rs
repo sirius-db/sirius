@@ -1,14 +1,15 @@
 use starrocks_thrift::exprs::TExpr;
-use starrocks_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType, TSortInfo};
+use starrocks_thrift::opcodes::TExprOpcode;
+use starrocks_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNode, TPlanNodeType, TSortInfo};
 use substrait::proto::read_rel::local_files::FileOrFiles;
 use substrait::proto::read_rel::local_files::file_or_files::{
     FileFormat, ParquetReadOptions, PathType,
 };
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
-    AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, ProjectRel, ReadRel, Rel,
-    RelCommon, SortField, SortRel, aggregate_rel, fetch_rel, function_argument, rel, rel_common,
-    sort_field,
+    AggregateFunction, AggregateRel, CrossRel, Expression, FetchRel, FilterRel, JoinRel,
+    ProjectRel, ReadRel, Rel, RelCommon, SortField, SortRel, aggregate_rel, fetch_rel,
+    function_argument, join_rel, rel, rel_common, sort_field,
 };
 
 use crate::descriptor_table::DescriptorTable;
@@ -16,7 +17,9 @@ use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::scan_paths::ScanFilePaths;
 use crate::type_mapper;
-use crate::{ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN};
+use crate::{
+    ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON,
+};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
 pub(crate) struct TranslatedRel {
@@ -152,6 +155,8 @@ fn translate_plan_node(
         TPlanNodeType::PROJECT_NODE => translate_project(node, children, ctx),
         TPlanNodeType::AGGREGATION_NODE => translate_aggregation(node, children, ctx),
         TPlanNodeType::SORT_NODE => translate_sort(node, children, ctx),
+        TPlanNodeType::HASH_JOIN_NODE => translate_hash_join(node, children, ctx),
+        TPlanNodeType::NESTLOOP_JOIN_NODE => translate_nestloop_join(node, children, ctx),
         _ => Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
@@ -615,6 +620,204 @@ fn sort_fields(
             })
         })
         .collect()
+}
+
+/// Translates a `HASH_JOIN_NODE` into a Substrait join relation.
+///
+/// StarRocks children are `[probe (left), build (right)]`; the Substrait join condition is
+/// evaluated over the concatenated left-then-right row, which is exactly how
+/// `slot_global_index` resolves slots against the combined layout.
+fn translate_hash_join(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 2)?;
+    let join = node
+        .hash_join_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "HASH_JOIN_NODE",
+            field: "hash_join_node",
+        })?;
+    let mut children = children.into_iter();
+    let left = children.next().unwrap();
+    let right = children.next().unwrap();
+
+    let combined_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
+    let mut conditions = Vec::new();
+    for eq in &join.eq_join_conjuncts {
+        if let Some(opcode) = eq.opcode
+            && opcode != TExprOpcode::EQ
+        {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "only plain equality join conjuncts are supported",
+            });
+        }
+        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        let left_expr = eq.left.translate(&mut expr_ctx)?;
+        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        let right_expr = eq.right.translate(&mut expr_ctx)?;
+        let anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
+        conditions.push(expr_translator::scalar_function(
+            anchor,
+            vec![left_expr, right_expr],
+            crate::type_mapper::bool_type(),
+        ));
+    }
+    for expr in join.other_join_conjuncts.as_deref().unwrap_or_default() {
+        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        conditions.push(expr.translate(&mut expr_ctx)?);
+    }
+    if conditions.is_empty() {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "hash join without join conjuncts",
+        });
+    }
+    let condition = and_conditions(conditions, ctx);
+
+    // Anti joins (from NOT IN / NOT EXISTS rewrites) are not translated: DuckDB's Substrait
+    // consumer has no left-anti conversion, so an emitted plan would fail downstream anyway.
+    let (join_type, semi) = match join.join_op {
+        TJoinOp::INNER_JOIN => (join_rel::JoinType::Inner, false),
+        TJoinOp::LEFT_OUTER_JOIN => (join_rel::JoinType::Left, false),
+        TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, false),
+        TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, false),
+        TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, true),
+        _ => {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "hash join type is unsupported",
+            });
+        }
+    };
+
+    // Semi joins emit only the probe-side row; other joins emit probe then build columns.
+    let (row_tuples, output_width) = if semi {
+        (left.row_tuples.clone(), left.output_width)
+    } else {
+        (combined_tuples, left.output_width + right.output_width)
+    };
+
+    let joined = TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
+                left: Some(Box::new(left.rel)),
+                right: Some(Box::new(right.rel)),
+                expression: Some(Box::new(condition)),
+                r#type: join_type as i32,
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
+    };
+    // Node conjuncts are post-join predicates over the join's output row.
+    apply_conjuncts(joined, node, ctx)
+}
+
+/// Translates a `NESTLOOP_JOIN_NODE` into a Substrait cross product (plus a filter when the
+/// join carries conjuncts). Only inner/cross nested-loop joins are supported.
+fn translate_nestloop_join(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 2)?;
+    let join = node
+        .nestloop_join_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "NESTLOOP_JOIN_NODE",
+            field: "nestloop_join_node",
+        })?;
+    match join.join_op {
+        None | Some(TJoinOp::CROSS_JOIN) | Some(TJoinOp::INNER_JOIN) => {}
+        Some(_) => {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "only inner/cross nested-loop joins are supported",
+            });
+        }
+    }
+    let mut children = children.into_iter();
+    let left = children.next().unwrap();
+    let right = children.next().unwrap();
+    let row_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
+    let output_width = left.output_width + right.output_width;
+
+    let cross = TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Cross(Box::new(CrossRel {
+                left: Some(Box::new(left.rel)),
+                right: Some(Box::new(right.rel)),
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
+    };
+
+    // A conjunct-free cross product is rejected: the GPU physical planner has no cross-product
+    // operator, so the plan would translate and then fail at execution.
+    if join
+        .join_conjuncts
+        .as_ref()
+        .is_none_or(|conjuncts| conjuncts.is_empty())
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "cross joins without join conjuncts are not supported",
+        });
+    }
+    let filtered = if let Some(conjuncts) = join
+        .join_conjuncts
+        .as_ref()
+        .filter(|conjuncts| !conjuncts.is_empty())
+    {
+        let mut conditions = Vec::with_capacity(conjuncts.len());
+        for expr in conjuncts {
+            let mut expr_ctx = ctx.expr_context(&cross.row_tuples);
+            conditions.push(expr.translate(&mut expr_ctx)?);
+        }
+        let condition = and_conditions(conditions, ctx);
+        let TranslatedRel {
+            rel,
+            row_tuples,
+            output_width,
+        } = cross;
+        TranslatedRel {
+            rel: Rel {
+                rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
+                    input: Some(Box::new(rel)),
+                    condition: Some(Box::new(condition)),
+                    ..Default::default()
+                }))),
+            },
+            row_tuples,
+            output_width,
+        }
+    } else {
+        cross
+    };
+    // Node conjuncts are post-join predicates over the join's output row.
+    apply_conjuncts(filtered, node, ctx)
+}
+
+/// Combines one or more boolean conditions with `and`.
+fn and_conditions(mut conditions: Vec<Expression>, ctx: &mut PlanContext<'_>) -> Expression {
+    if conditions.len() == 1 {
+        return conditions.pop().unwrap();
+    }
+    let anchor = ctx.registry.register_function(URN_BOOLEAN, "and");
+    expr_translator::scalar_function(anchor, conditions, crate::type_mapper::bool_type())
 }
 
 /// Builds a Substrait read for a StarRocks scan tuple.
