@@ -191,17 +191,14 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
       duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipeline_inside;
       to_schedule[to_schedule.size() - 1 - meta]->get_pipelines(pipeline_inside, false);
       for (auto& pipeline : pipeline_inside) {
-        if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
-          auto& temp = pipeline->source.get()->Cast<op::sirius_physical_hash_join>();
-          if (temp.join_type == duckdb::JoinType::RIGHT ||
-              temp.join_type == duckdb::JoinType::RIGHT_SEMI ||
-              temp.join_type == duckdb::JoinType::RIGHT_ANTI) {
-            // if (!duckdb::Config::MODIFIED_PIPELINE) sirius_scheduled.push_back(pipeline);
-          }
+        if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+            pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+          // DuckDB adds a build-side scan pipeline (join as source) for
+          // right/outer joins; sirius joins emit unmatched build rows inline,
+          // so keeping it would wire the join's downstream ports twice.
           continue;
-        } else {
-          sirius_scheduled.push_back(pipeline);
         }
+        sirius_scheduled.push_back(pipeline);
       }
       schedule_count++;
     }

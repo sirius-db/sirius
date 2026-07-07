@@ -390,8 +390,18 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
           break;
         }
       }
-      if (limit_exhausted ||
-          (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
+      // Source-exhaustion conjunct: the task
+      // counters can be transiently balanced (0==0 before the first split
+      // arrives, or all-done-before-close), so finishing additionally requires
+      // the pipeline's SOURCE MEMBER — get_operators()/first_node excludes it —
+      // to be past the point where it could ever create another task. For a GPU
+      // scan source, all_ports_empty() is split_connector::is_closed() (closed
+      // AND drained); port-less sources are trivially exhausted. limit_exhausted
+      // keeps its early exit: it finishes without draining the source.
+      bool source_exhausted =
+        !source || (source->is_source_pipeline_finished() && source->all_ports_empty());
+      if (limit_exhausted || (source_exhausted && first_node->is_source_pipeline_finished() &&
+                              first_node->all_ports_empty())) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
           for (auto& op : get_operators()) {

@@ -558,9 +558,16 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
       plan.pruned_row_groups,
       plan.pruned_decoded_bytes);
   }
+  // A fully-pruned table (every row group removed by filter stats) is viable: the
+  // ranges walk yields empty row-group lists, and the coalescer's empty-batch
+  // fallback emits one schema-correct 0-row split so the scan still creates a task
+  // and the pipeline completes (mirrors the parquet all-pruned path). Refusing here
+  // instead throws "duckdb-native scan rejected query" and hangs the query.
   if (plan.n_row_groups > 0 && plan.pruned_row_groups == plan.n_row_groups) {
-    refuse("no row groups in table (empty or fully pruned)");
-    return plan;
+    SIRIUS_LOG_DEBUG(
+      "[duckdb_native_metadata] all {} row groups stats-pruned; scan yields an "
+      "empty result via the coalescer fallback",
+      plan.n_row_groups);
   }
 
   plan.viable = true;

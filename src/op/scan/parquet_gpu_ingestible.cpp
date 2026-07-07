@@ -55,10 +55,12 @@
 #include <io/uring/uring_reactor.hpp>
 
 // standard library
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -100,6 +102,20 @@ class parquet_batch_coalescer : public batch_coalescer {
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
     if (file == nullptr) { return emitted; }
 
+    // Remember the first fully-pruned file. If the WHOLE source coalesces to
+    // nothing, flush() emits one empty split built from it — zero splits mean
+    // zero tasks, and the pipeline-completion accounting only fires from task
+    // completion, hanging sirius_engine::execute().
+    if (file->row_groups.empty() && !_empty_split_fallback) {
+      _empty_split_fallback = fallback_file{
+        file->file_metadata,
+        file->file_path,
+        file->datasource ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
+                         : std::shared_ptr<io::sirius_datasource>{},
+        file->partition_values,
+        file->disable_filter_pushdown};
+    }
+
     if (!_slices.empty() && (_partition_values != file->partition_values ||
                              _disable_pushdown != file->disable_filter_pushdown)) {
       emitted.push_back(emit_current());
@@ -126,6 +142,7 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_unc,
                            cur_comp,
                            std::move(slice_ds));
+      _produced_any = true;
       _acc_bytes += cur_unc;
       _acc_rows += cur_rows;
       cur_rgs.clear();
@@ -159,6 +176,24 @@ class parquet_batch_coalescer : public batch_coalescer {
   {
     std::vector<std::unique_ptr<scan_info>> out;
     if (!_slices.empty()) { out.push_back(emit_current()); }
+    // Every file was stats-pruned to zero row groups: emit exactly one split
+    // with a single zero-row-group slice so the scan still creates one task
+    // (materialize_metadata_to_table short-circuits it to a schema-correct
+    // empty table). Partial prunes never reach here — any surviving slice sets
+    // _produced_any. Zero splits would mean zero tasks, and pipeline-completion
+    // accounting only fires from task completion, hanging the query.
+    if (!_produced_any && _empty_split_fallback) {
+      _slices.emplace_back(_empty_split_fallback->file_metadata,
+                           _empty_split_fallback->file_path,
+                           std::vector<cudf::size_type>{},
+                           /*reserved_uncompressed_bytes=*/0,
+                           /*reserved_compressed_bytes=*/0,
+                           _empty_split_fallback->datasource);
+      _partition_values = _empty_split_fallback->partition_values;
+      _disable_pushdown = _empty_split_fallback->disable_filter_pushdown;
+      _produced_any     = true;
+      out.push_back(emit_current());
+    }
     return out;
   }
 
@@ -195,6 +230,18 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::size_t _emit_count = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
+
+  /// First fully-pruned file, kept as the source for flush()'s empty-split
+  /// fallback when the whole scan produced no slice.
+  struct fallback_file {
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+    std::string file_path;
+    std::shared_ptr<io::sirius_datasource> datasource;
+    std::vector<std::string> partition_values;
+    bool disable_filter_pushdown;
+  };
+  std::optional<fallback_file> _empty_split_fallback;
+  bool _produced_any = false;
 };
 
 /// Column-chunk byte ranges a read fetches for @p row_group_indices, honoring
@@ -633,18 +680,41 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     metadatas.push_back(*slice.file_metadata);
     rg_per_src.push_back(slice.row_group_indices);
   }
+  // All-pruned fallback split (parquet_batch_coalescer::flush): every slice
+  // carries zero row groups.
+  // Don't express that via set_row_groups — the meaning of an empty per-source
+  // vector has flipped between cudf versions ("all row groups" vs "none").
+  // Instead bound the read to zero rows against the footer metadata alone:
+  // cudf builds the schema-correct empty table without touching data pages,
+  // and it flows through the normal filter / partition / projection assembly
+  // below.
+  bool const all_slices_pruned =
+    !split.rg_slices.empty() &&
+    std::all_of(split.rg_slices.begin(), split.rg_slices.end(), [](row_group_slice const& s) {
+      return s.row_group_indices.empty();
+    });
   auto opts = *split.reader_options;
+  if (all_slices_pruned) {
+    opts.set_num_rows(0);
+  } else {
+    opts.set_row_groups(std::move(rg_per_src));
+  }
 
-  opts.set_row_groups(std::move(rg_per_src));
-
-  // Per-task reader filter. Translate DuckDB's static filter first, then AND any AST-capable
-  // dynamic filters (zone maps) into the same cuDF AST passed to read_parquet.
+  // Per-task AST translation for reader-side row-group + row pushdown. set_filter
+  // is gated on translation success AND on the per-batch disable_filter_pushdown
+  // flag (set when the FLBA-decimal probe failed). When pushdown does not engage
+  // — disabled, translation fails, or the split is the all-pruned zero-row
+  // fallback (zero rows need no reader filter; skipping keeps GPU AST
+  // translation off that path) — the row filter is left for
+  // post_filter_and_project to apply post-decode. The translated cuDF AST
+  // (`ast_expression`) must outlive read_parquet; the borrowed Sirius AST and
+  // the translator are only needed during translation.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
   std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
     std::nullopt;
   cudf::ast::expression const* reader_filter_root = nullptr;
 
-  if (_duckdb_filter_expression && !split.disable_filter_pushdown) {
+  if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
     auto name_resolver     = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);

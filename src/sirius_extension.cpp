@@ -1316,7 +1316,10 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                     {LogicalType::VARCHAR},
                                     SiriusReadParquetFunction,
                                     SiriusReadParquetBind);
-  sirius_read_parquet.cardinality = SiriusReadParquetCardinality;
+  sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.projection_pushdown = true;
+  sirius_read_parquet.filter_pushdown     = true;
+  sirius_read_parquet.filter_prune        = true;
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
