@@ -217,7 +217,7 @@ mod tests {
         };
         use substrait::proto::read_rel::{LocalFiles, ReadType};
         use substrait::proto::{
-            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, r#type, rel,
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, rel, r#type,
         };
 
         let names: Vec<String> = columns.iter().map(|(name, _)| name.to_string()).collect();
@@ -348,7 +348,9 @@ mod tests {
             cols_path.to_str().unwrap(),
             &[("name", true), ("id", false)],
         );
-        let result = engine.execute(&pruned).expect("execute pruned fragment on GPU");
+        let result = engine
+            .execute(&pruned)
+            .expect("execute pruned fragment on GPU");
         let batch = result
             .batches
             .iter()
