@@ -773,6 +773,11 @@ double mean_ns_as_ms(std::uint64_t total_ns, std::uint64_t count)
   return static_cast<double>(total_ns) / static_cast<double>(count) / 1'000'000.0;
 }
 
+double bytes_per_sec_to_mib_per_sec(double bytes_per_sec)
+{
+  return bytes_per_sec / static_cast<double>(1024U * 1024U);
+}
+
 std::uint64_t sat_sub(std::uint64_t after, std::uint64_t before)
 {
   return after >= before ? after - before : 0;
@@ -926,7 +931,7 @@ struct bench_record {
   double scan_ms{0.0};
   std::uint64_t payload_bytes_read{0};
   duckdb::idx_t row_count{0};
-  double effective_bytes_per_sec{0.0};
+  double effective_mib_per_sec{0.0};
   std::uint64_t bind_chunk_get_count{0};
   std::uint64_t chunk_get_ns_total{0};
   std::uint64_t chunk_get_count{0};
@@ -956,9 +961,10 @@ bench_record make_record(std::string scenario,
                          std::uint64_t dataset_bytes)
 {
   auto seconds = measurement.wall_clock_ms / 1000.0;
-  auto effective =
+  auto const raw_bytes_per_sec =
     seconds > 0.0 ? static_cast<double>(dataset_bytes) / seconds : static_cast<double>(0);
-  auto const& micro = measurement.micro;
+  auto const effective_mib_per_sec = bytes_per_sec_to_mib_per_sec(raw_bytes_per_sec);
+  auto const& micro                = measurement.micro;
   return bench_record{std::move(scenario),
                       std::move(transport),
                       std::move(projection),
@@ -973,7 +979,7 @@ bench_record make_record(std::string scenario,
                       measurement.scan_ms,
                       measurement.payload_bytes_read,
                       measurement.rows,
-                      effective,
+                      effective_mib_per_sec,
                       measurement.bind_micro.chunk_get_count,
                       micro.chunk_get_ns_total,
                       micro.chunk_get_count,
@@ -1270,7 +1276,7 @@ void write_perf_json(fs::path const& path,
         << "\"scan_ms\": " << r.scan_ms << ", "
         << "\"payload_bytes_read\": " << r.payload_bytes_read << ", "
         << "\"row_count\": " << r.row_count << ", "
-        << "\"effective_bytes_per_sec\": " << r.effective_bytes_per_sec << ", "
+        << "\"effective_mib_per_sec\": " << r.effective_mib_per_sec << ", "
         << "\"bind_chunk_get_count\": " << r.bind_chunk_get_count << ", "
         << "\"chunk_get_ns_total\": " << r.chunk_get_ns_total << ", "
         << "\"chunk_get_count\": " << r.chunk_get_count << ", "
@@ -1333,8 +1339,7 @@ void append_perf_history_jsonl(fs::path const& path,
         << ",\"payload_bytes_read\":" << r.payload_bytes_read << ",\"row_count\":" << r.row_count
         << ",\"bind_chunk_get_count\":" << r.bind_chunk_get_count
         << ",\"wall_clock_ms\":" << std::fixed << std::setprecision(3) << r.wall_clock_ms
-        << ",\"bind_ms\":" << r.bind_ms
-        << ",\"effective_bytes_per_sec\":" << r.effective_bytes_per_sec
+        << ",\"bind_ms\":" << r.bind_ms << ",\"effective_mib_per_sec\":" << r.effective_mib_per_sec
         << ",\"retries_total\":" << r.retries_total
         << ",\"terminal_failures_total\":" << r.terminal_failures_total
         << ",\"device_stream_sync_total\":" << r.device_stream_sync_total << "}";
@@ -1364,7 +1369,7 @@ void require_perf_json_schema(fs::path const& path, std::vector<std::string> exp
                    "\"scan_ms\"",
                    "\"payload_bytes_read\"",
                    "\"row_count\"",
-                   "\"effective_bytes_per_sec\"",
+                   "\"effective_mib_per_sec\"",
                    "\"bind_chunk_get_count\"",
                    "\"chunk_get_ns_total\"",
                    "\"chunk_get_count\"",
@@ -1879,7 +1884,7 @@ TEST_CASE("S3 REST bench perf instrumentation gate keeps micro counters zero", "
 
   auto record = run_rest_minio_bench_scenario(*env,
                                               *large,
-                                              "async_http_gate_off",
+                                              "rest_reactor_http_gate_off",
                                               env->endpoint,
                                               std::nullopt,
                                               false,
@@ -1922,41 +1927,42 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
   std::vector<bench_record> records;
   records.reserve(6);
 
-  // compat_* mirrors the old async-S3 benchmark shape: seven projected columns,
-  // mc=32, and no scan-manager prefetch cache mixed into the raw S3 read path.
-  auto compat_http  = run_rest_minio_bench_scenario(*env,
-                                                   *large,
-                                                   "compat_http",
-                                                   env->endpoint,
-                                                   std::nullopt,
-                                                   false,
-                                                   /*perf_instrumentation=*/true,
-                                                   bench_compat_projection(),
-                                                   std::size_t{32},
-                                                   std::size_t{1},
-                                                   /*enable_prefetch_cache=*/false);
-  auto compat_https = run_rest_minio_bench_scenario(*env,
-                                                    *large,
-                                                    "compat_https",
-                                                    env->https_endpoint,
-                                                    env->ca_bundle_path,
-                                                    true,
-                                                    /*perf_instrumentation=*/true,
-                                                    bench_compat_projection(),
-                                                    std::size_t{32},
-                                                    std::size_t{1},
-                                                    /*enable_prefetch_cache=*/false);
-  auto http         = run_rest_minio_bench_scenario(*env,
+  // rest_reactor_compat_* mirrors the old async-S3 benchmark shape: seven
+  // projected columns, mc=32, and no scan-manager prefetch cache mixed into the
+  // raw S3 read path.
+  auto rest_reactor_compat_http  = run_rest_minio_bench_scenario(*env,
+                                                                *large,
+                                                                "rest_reactor_compat_http",
+                                                                env->endpoint,
+                                                                std::nullopt,
+                                                                false,
+                                                                /*perf_instrumentation=*/true,
+                                                                bench_compat_projection(),
+                                                                std::size_t{32},
+                                                                std::size_t{1},
+                                                                /*enable_prefetch_cache=*/false);
+  auto rest_reactor_compat_https = run_rest_minio_bench_scenario(*env,
+                                                                 *large,
+                                                                 "rest_reactor_compat_https",
+                                                                 env->https_endpoint,
+                                                                 env->ca_bundle_path,
+                                                                 true,
+                                                                 /*perf_instrumentation=*/true,
+                                                                 bench_compat_projection(),
+                                                                 std::size_t{32},
+                                                                 std::size_t{1},
+                                                                 /*enable_prefetch_cache=*/false);
+  auto http                      = run_rest_minio_bench_scenario(*env,
                                             *large,
-                                            "async_http",
+                                            "rest_reactor_http",
                                             env->endpoint,
                                             std::nullopt,
                                             false,
                                             /*perf_instrumentation=*/true,
                                             bench_single_column_projection());
-  auto http_probe   = run_rest_minio_bench_scenario(*env,
+  auto http_probe                = run_rest_minio_bench_scenario(*env,
                                                   *large,
-                                                  "async_http",
+                                                  "rest_reactor_http",
                                                   env->endpoint,
                                                   std::nullopt,
                                                   false,
@@ -1966,17 +1972,17 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
                                                   std::nullopt,
                                                   /*enable_prefetch_cache=*/true,
                                                   /*use_footer_probe=*/true);
-  auto https        = run_rest_minio_bench_scenario(*env,
+  auto https                     = run_rest_minio_bench_scenario(*env,
                                              *large,
-                                             "async_https",
+                                             "rest_reactor_https",
                                              env->https_endpoint,
                                              env->ca_bundle_path,
                                              true,
                                              /*perf_instrumentation=*/true,
                                              bench_single_column_projection());
-  auto https_probe  = run_rest_minio_bench_scenario(*env,
+  auto https_probe               = run_rest_minio_bench_scenario(*env,
                                                    *large,
-                                                   "async_https",
+                                                   "rest_reactor_https",
                                                    env->https_endpoint,
                                                    env->ca_bundle_path,
                                                    true,
@@ -1991,8 +1997,8 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
                         std::cref(http_probe),
                         std::cref(https),
                         std::cref(https_probe),
-                        std::cref(compat_http),
-                        std::cref(compat_https)}) {
+                        std::cref(rest_reactor_compat_http),
+                        std::cref(rest_reactor_compat_https)}) {
     auto const& record = r.get();
     CHECK(record.row_count == large->total_num_rows);
     CHECK(record.payload_bytes_read > 0);
@@ -2020,45 +2026,49 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
   CHECK(http_probe.bind_chunk_get_count == 1);
   CHECK(https.bind_chunk_get_count == 2);
   CHECK(https_probe.bind_chunk_get_count == 1);
-  CHECK(compat_http.row_count == compat_https.row_count);
-  CHECK(compat_http.payload_bytes_read == compat_https.payload_bytes_read);
+  CHECK(rest_reactor_compat_http.row_count == rest_reactor_compat_https.row_count);
+  CHECK(rest_reactor_compat_http.payload_bytes_read ==
+        rest_reactor_compat_https.payload_bytes_read);
   if (https.footer_fetch_ms > http.footer_fetch_ms * 3.0) {
     WARN("HTTPS footer_fetch_ms is more than 3x HTTP on this MinIO run: http="
          << http.footer_fetch_ms << "ms https=" << https.footer_fetch_ms << "ms");
   }
-  if (compat_https.footer_fetch_ms > compat_http.footer_fetch_ms * 3.0) {
+  if (rest_reactor_compat_https.footer_fetch_ms > rest_reactor_compat_http.footer_fetch_ms * 3.0) {
     WARN("HTTPS compat footer_fetch_ms is more than 3x HTTP on this MinIO run: http="
-         << compat_http.footer_fetch_ms << "ms https=" << compat_https.footer_fetch_ms << "ms");
+         << rest_reactor_compat_http.footer_fetch_ms
+         << "ms https=" << rest_reactor_compat_https.footer_fetch_ms << "ms");
   }
-  WARN("S3 REST perf async_http throughput=" << http.effective_bytes_per_sec
-                                             << " B/s footer_fetch_ms=" << http.footer_fetch_ms
-                                             << " chunk_get_ms_mean=" << http.chunk_get_ms_mean);
-  WARN("S3 REST perf async_https throughput=" << https.effective_bytes_per_sec
-                                              << " B/s footer_fetch_ms=" << https.footer_fetch_ms
-                                              << " chunk_get_ms_mean=" << https.chunk_get_ms_mean);
-  warn_footer_probe_ab("async_http", http, http_probe);
-  warn_footer_probe_ab("async_https", https, https_probe);
-  WARN("S3 REST perf compat_http throughput="
-       << compat_http.effective_bytes_per_sec << " B/s footer_fetch_ms="
-       << compat_http.footer_fetch_ms << " chunk_get_ms_mean=" << compat_http.chunk_get_ms_mean
-       << " chunk_get_count=" << compat_http.chunk_get_count);
-  WARN("S3 REST perf compat_https throughput="
-       << compat_https.effective_bytes_per_sec << " B/s footer_fetch_ms="
-       << compat_https.footer_fetch_ms << " chunk_get_ms_mean=" << compat_https.chunk_get_ms_mean
-       << " chunk_get_count=" << compat_https.chunk_get_count);
+  WARN("S3 REST perf rest_reactor_http throughput="
+       << http.effective_mib_per_sec << " MiB/s footer_fetch_ms=" << http.footer_fetch_ms
+       << " chunk_get_ms_mean=" << http.chunk_get_ms_mean);
+  WARN("S3 REST perf rest_reactor_https throughput="
+       << https.effective_mib_per_sec << " MiB/s footer_fetch_ms=" << https.footer_fetch_ms
+       << " chunk_get_ms_mean=" << https.chunk_get_ms_mean);
+  warn_footer_probe_ab("rest_reactor_http", http, http_probe);
+  warn_footer_probe_ab("rest_reactor_https", https, https_probe);
+  WARN("S3 REST perf rest_reactor_compat_http throughput="
+       << rest_reactor_compat_http.effective_mib_per_sec
+       << " MiB/s footer_fetch_ms=" << rest_reactor_compat_http.footer_fetch_ms
+       << " chunk_get_ms_mean=" << rest_reactor_compat_http.chunk_get_ms_mean
+       << " chunk_get_count=" << rest_reactor_compat_http.chunk_get_count);
+  WARN("S3 REST perf rest_reactor_compat_https throughput="
+       << rest_reactor_compat_https.effective_mib_per_sec
+       << " MiB/s footer_fetch_ms=" << rest_reactor_compat_https.footer_fetch_ms
+       << " chunk_get_ms_mean=" << rest_reactor_compat_https.chunk_get_ms_mean
+       << " chunk_get_count=" << rest_reactor_compat_https.chunk_get_count);
 
   attach_baseline_comparison(http, baseline_json, backend);
   attach_baseline_comparison(http_probe, baseline_json, backend);
   attach_baseline_comparison(https, baseline_json, backend);
   attach_baseline_comparison(https_probe, baseline_json, backend);
-  attach_baseline_comparison(compat_http, baseline_json, backend);
-  attach_baseline_comparison(compat_https, baseline_json, backend);
+  attach_baseline_comparison(rest_reactor_compat_http, baseline_json, backend);
+  attach_baseline_comparison(rest_reactor_compat_https, baseline_json, backend);
   records.push_back(std::move(http));
   records.push_back(std::move(http_probe));
   records.push_back(std::move(https));
   records.push_back(std::move(https_probe));
-  records.push_back(std::move(compat_http));
-  records.push_back(std::move(compat_https));
+  records.push_back(std::move(rest_reactor_compat_http));
+  records.push_back(std::move(rest_reactor_compat_https));
   REQUIRE(records.size() >= 6);
 
   auto const path = perf_json_path();
@@ -2069,12 +2079,12 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
                   static_cast<std::uint64_t>(fs::file_size(large->local_path)),
                   records);
   require_perf_json_schema(path,
-                           {"async_http",
-                            "async_http_probe",
-                            "async_https",
-                            "async_https_probe",
-                            "compat_http",
-                            "compat_https"});
+                           {"rest_reactor_http",
+                            "rest_reactor_http_probe",
+                            "rest_reactor_https",
+                            "rest_reactor_https_probe",
+                            "rest_reactor_compat_http",
+                            "rest_reactor_compat_https"});
   WARN("Wrote S3 REST perf JSON baseline to " << path.string());
 }
 
@@ -2116,8 +2126,8 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(projected.device_stream_sync_total == 0);
     CHECK(projected.bind_chunk_get_count >= 2);
     WARN("AWS REST projected mc=" << max_connections
-                                  << " throughput=" << projected.effective_bytes_per_sec
-                                  << " B/s footer_fetch_ms=" << projected.footer_fetch_ms
+                                  << " throughput=" << projected.effective_mib_per_sec
+                                  << " MiB/s footer_fetch_ms=" << projected.footer_fetch_ms
                                   << " ttfb_ns=" << projected.ttfb_ns
                                   << " retries=" << projected.retries_total);
     attach_baseline_comparison(projected, baseline_json, backend);
@@ -2139,8 +2149,8 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(projected_probe.device_stream_sync_total == 0);
     CHECK(projected_probe.bind_chunk_get_count == 1);
     WARN("AWS REST projected_probe mc="
-         << max_connections << " throughput=" << projected_probe.effective_bytes_per_sec
-         << " B/s footer_fetch_ms=" << projected_probe.footer_fetch_ms
+         << max_connections << " throughput=" << projected_probe.effective_mib_per_sec
+         << " MiB/s footer_fetch_ms=" << projected_probe.footer_fetch_ms
          << " ttfb_ns=" << projected_probe.ttfb_ns << " retries=" << projected_probe.retries_total);
     warn_footer_probe_ab("aws_https_projected", records.back(), projected_probe);
     attach_baseline_comparison(projected_probe, baseline_json, backend);
@@ -2155,8 +2165,8 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(full.terminal_failures_total == 0);
     CHECK(full.device_stream_sync_total == 0);
     CHECK(full.bind_chunk_get_count >= 2);
-    WARN("AWS REST full mc=" << max_connections << " throughput=" << full.effective_bytes_per_sec
-                             << " B/s footer_fetch_ms=" << full.footer_fetch_ms
+    WARN("AWS REST full mc=" << max_connections << " throughput=" << full.effective_mib_per_sec
+                             << " MiB/s footer_fetch_ms=" << full.footer_fetch_ms
                              << " ttfb_ns=" << full.ttfb_ns << " retries=" << full.retries_total);
     attach_baseline_comparison(full, baseline_json, backend);
     records.push_back(std::move(full));
@@ -2177,8 +2187,8 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(full_probe.device_stream_sync_total == 0);
     CHECK(full_probe.bind_chunk_get_count == 1);
     WARN("AWS REST full_probe mc="
-         << max_connections << " throughput=" << full_probe.effective_bytes_per_sec
-         << " B/s footer_fetch_ms=" << full_probe.footer_fetch_ms
+         << max_connections << " throughput=" << full_probe.effective_mib_per_sec
+         << " MiB/s footer_fetch_ms=" << full_probe.footer_fetch_ms
          << " ttfb_ns=" << full_probe.ttfb_ns << " retries=" << full_probe.retries_total);
     warn_footer_probe_ab("aws_https_full", records.back(), full_probe);
     attach_baseline_comparison(full_probe, baseline_json, backend);
