@@ -81,13 +81,14 @@ operator_trial try_operator(std::string const& name,
     r.error_message = name + ": requires floating-point input";
     return r;
   }
-  if (name == "dictionary" && !is_str) {
+  if ((name == "dictionary" || name == "dictionary_fast" || name == "str_split") && !is_str) {
     r.error_message = name + ": requires string input";
     return r;
   }
   // Integer-only preprocessing operators
-  if ((name == "delta" || name == "for" || name == "zigzag" || name == "bitpack") && !is_int &&
-      !is_float) {
+  if ((name == "delta" || name == "for" || name == "zigzag" || name == "bitpack" ||
+       name == "rle") &&
+      !is_int && !is_float) {
     r.error_message = name + ": requires numeric input";
     return r;
   }

@@ -69,8 +69,10 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Identity, "identity", {"data"}, {}, false, false, false},
     {OpId::Cascaded, "nvcomp_cascaded", {"output"}, {}, false, false, false},
     // Variable arity (2 or 3: offsets, chars[, null_mask]) -> empty channels, like Dictionary.
-    // catalog_names={} excludes it from the explorer (STRING-only, opt-in via explicit DSL).
-    {OpId::StrSplit, "str_split", {}, {}, false, true, false},
+    // Cataloged so string exploration can discover the decomposed shape
+    // (offsets -> delta -> bitpack, chars -> byte codec); STRING-only via the
+    // try_operator static gate.
+    {OpId::StrSplit, "str_split", {}, {"str_split"}, false, true, false},
   };
   return kTable;
 }

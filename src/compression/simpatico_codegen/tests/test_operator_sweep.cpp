@@ -416,6 +416,28 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
   auto fixtures = build_fixtures(stream, n);
   auto work     = build_work();
 
+  // Minimum applicability: the sweep treats any op failure as "inapplicable"
+  // and skips silently, so a regression that breaks a whole (op, dtype) class
+  // would otherwise just shrink coverage. Assert on shard 0 that the ops each
+  // fixture class exists to exercise actually succeed on it.
+  if (shard_idx == 0) {
+    auto must_apply = [&](char const* fixture_name, std::initializer_list<char const*> ops) {
+      for (auto const& f : fixtures) {
+        if (f.name != fixture_name) continue;
+        for (char const* op : ops) {
+          auto trial = simpatico::try_operator(op, f.view, stream, mr);
+          if (!trial.success) {
+            throw std::runtime_error(std::string("minimum applicability: '") + op +
+                                     "' failed on fixture '" + fixture_name +
+                                     "': " + trial.error_message);
+          }
+        }
+      }
+    };
+    must_apply("string", {"dictionary", "dictionary_fast", "str_split", "ans", "bitcomp"});
+    must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack"});
+  }
+
   std::vector<sweep_stats> per_fixture(fixtures.size());
   for (std::size_t idx = shard_idx; idx < work.size(); idx += n_shards) {
     auto const& item = work[idx];

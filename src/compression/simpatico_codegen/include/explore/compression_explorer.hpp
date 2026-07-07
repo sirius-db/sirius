@@ -42,9 +42,11 @@ struct exploration_config {
   /// sees the sample). Default 0 = always full column.
   ///
   /// This is an approximate speedup, not on by default: measured to match the
-  /// full column for unsorted-numeric and string columns, but to pick markedly
-  /// worse plans for sorted/monotonic columns (e.g. primary keys), whose best
-  /// cascade exploits global structure a prefix distorts.
+  /// full column for unsorted-numeric columns, but to pick markedly worse
+  /// plans for sorted/monotonic columns (e.g. primary keys), whose best
+  /// cascade exploits global structure a prefix distorts. A STRING sample is
+  /// materialized (not a zero-copy slice) so the byte codecs accept it and
+  /// its measured size is exact; cost is proportional to sample_rows.
   size_t sample_rows = 0;
 };
 

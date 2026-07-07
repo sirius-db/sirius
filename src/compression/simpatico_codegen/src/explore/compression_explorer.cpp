@@ -9,6 +9,7 @@
 
 #include "explore/compression_explorer.hpp"
 
+#include "codegen/plan/bitjoin_layout.hpp"  // copy_column_view
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/nvcomp_scratch.hpp"
@@ -278,14 +279,26 @@ exploration_result explore_column_compression(cudf::column_view input,
   // contiguous prefix (a single block preserves the local run/monotonicity
   // structure order-sensitive codecs exploit — multiple far-apart blocks
   // would inject fake jumps that wreck delta/rle). Finalists are re-measured
-  // on the full column below, so the reported numbers stay exact. Zero-copy.
+  // on the full column below, so the reported numbers stay exact. Zero-copy
+  // for fixed-width; a STRING sample is materialized: the zero-copy head
+  // slice still views the parent's full offsets/chars children, which the
+  // nvcomp string codecs reject outright (silently collapsing the search to
+  // dictionary-rooted plans) and which inflates the chars_size baseline.
+  // Materialization cost is proportional to sample_rows — the premise of
+  // sampling.
   bool const sampled =
     config.sample_rows > 0 && static_cast<size_t>(input.size()) > config.sample_rows;
   std::vector<cudf::column_view> sample_slice;
-  if (sampled)
+  std::unique_ptr<cudf::column> sample_owned;
+  if (sampled) {
     sample_slice = cudf::slice(input, {0, static_cast<cudf::size_type>(config.sample_rows)});
-  cudf::column_view const bfs_input = sampled ? sample_slice[0] : input;
-  size_t original_size              = column_size_bytes_ex(bfs_input, stream);
+    if (input.type().id() == cudf::type_id::STRING) {
+      sample_owned = copy_column_view(sample_slice[0], stream, mr);
+    }
+  }
+  cudf::column_view const bfs_input =
+    sample_owned ? sample_owned->view() : (sampled ? sample_slice[0] : input);
+  size_t original_size = column_size_bytes_ex(bfs_input, stream);
   size_t max_candidates             = config.beam_width > 0 ? config.beam_width : 100;
 
   if (config.verbose)
