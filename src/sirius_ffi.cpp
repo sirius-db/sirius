@@ -89,20 +89,24 @@ struct Context::Impl {
       auto load = conn->Query("LOAD '" + escaped + "'");
       if (load->HasError()) { load->ThrowError(); }
     }
-    // Register the engine on the connection and disable the DuckDB-specific optimizer
-    // rewrites the GPU planner does not implement (mirrors SiriusContext's transparent
-    // path: SiriusTableFunctionData::PrepareConnection / OnConnectionOpened).
+    // Register the engine on the connection and disable the DuckDB optimizer rewrites the
+    // GPU planner cannot execute. This is the transparent path's GPU-incompatible set
+    // (IN_CLAUSE, COMPRESSED_MATERIALIZATION, STATISTICS_PROPAGATION; see
+    // sirius_extension.cpp) plus, because this FFI has no CPU fallback, COLUMN_LIFETIME and
+    // LATE_MATERIALIZATION unconditionally (the transparent path disables COLUMN_LIFETIME
+    // only in debug and tolerates LATE_MATERIALIZATION via fallback).
     auto& client = *conn->context;
     client.registered_state->Insert(kSiriusStateKey, context);
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+    // Folds ungrouped MIN/MAX aggregates into EXPRESSION_GET + DUMMY_SCAN the GPU
+    // pipeline cannot schedule; keep the query on the scan -> aggregate path.
+    disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
     disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
-    // LATE_MATERIALIZATION rewrites an ORDER BY ... LIMIT parquet scan into a
-    // semi-join on virtual file_index/file_row_number columns the GPU scan drops.
-    // The transparent path tolerates this via CPU fallback; this FFI has none, so
-    // disable it to avoid wrong results on an otherwise valid plan.
+    // Rewrites an ORDER BY ... LIMIT parquet scan into a semi-join on virtual
+    // file_index/file_row_number columns the GPU scan drops.
     disabled.insert(duckdb::OptimizerType::LATE_MATERIALIZATION);
   }
 };
