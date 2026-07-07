@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -35,25 +37,21 @@
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
-namespace duckdb {
-class SiriusContext;
-}  // namespace duckdb
-
 namespace sirius::ffi {
 
 /// RAII handle to a Sirius engine context.
 ///
-/// Constructing a `Context` brings up an initialized engine (it constructs and
-/// `initialize()`s a `duckdb::SiriusContext`); destroying it tears the engine
-/// down. There is no uninitialized state. Held from Rust via `cxx::UniquePtr`,
-/// so it is created by `make_context()` / `make_context_from_config()` and freed
-/// when the `UniquePtr` drops.
+/// Constructing a `Context` brings up an initialized engine (a
+/// `duckdb::SiriusContext`) and an embedded in-process DuckDB whose connection
+/// has that engine registered as the `sirius_state` so the GPU executor can find
+/// it. DuckDB is used only to lower a Substrait plan to a DuckDB
+/// `LogicalOperator` (the translation step) and to host the catalog — execution
+/// runs directly on the Sirius engine, not through DuckDB's query pipeline.
 ///
-/// The default constructor configures the engine from built-in defaults; the
-/// `config_path` constructor loads a YAML config file instead. Both can throw
-/// (bad config file, GPU bring-up failure); the `make_*` factories below are
-/// bound from Rust as fallible, so the failure surfaces as an error rather than
-/// aborting.
+/// Held from Rust via `cxx::UniquePtr`; created by `make_context()` /
+/// `make_context_from_config()` and freed when the `UniquePtr` drops. The
+/// constructors can throw (bad config, GPU bring-up failure); the `make_*`
+/// factories are bound as fallible so failures surface as errors.
 class SIRIUS_FFI_EXPORT Context {
  public:
   Context();
@@ -63,8 +61,24 @@ class SIRIUS_FFI_EXPORT Context {
   Context(const Context&)            = delete;
   Context& operator=(const Context&) = delete;
 
+  /// Executes a serialized Substrait plan on the GPU, writing the results to the
+  /// Arrow C Data Interface stream at `out_stream_addr` (one schema, a sequence
+  /// of record batches). `out_stream_addr` is the address of a caller-owned
+  /// `ArrowArrayStream` that the caller releases per the Arrow ABI. Throws on
+  /// translation or execution failure.
+  ///
+  /// `plan` is the protobuf-encoded `substrait::Plan` as a byte buffer; its reads
+  /// must be resolvable by DuckDB (e.g. `local_files` parquet reads). The stream
+  /// is passed as an integer address so this public header stays free of
+  /// Arrow/DuckDB types; the Rust bindings pass the address of an
+  /// `FFI_ArrowArrayStream` they own.
+  void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
+
  private:
-  std::unique_ptr<duckdb::SiriusContext> context_;
+  // PIMPL: the engine handle + embedded DuckDB live in the .cpp so this public
+  // header pulls in no DuckDB/cudf/rmm types (DuckDB uses its own smart pointers).
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 /// Create an initialized [`Context`] configured from built-in defaults, owned by
