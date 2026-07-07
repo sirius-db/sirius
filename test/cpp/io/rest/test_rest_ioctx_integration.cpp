@@ -848,6 +848,9 @@ TEST_CASE("footer suffix probe retries transient GET failures",
     CHECK(probe.bytes->size() == parquet.size());
     CHECK(server.head_count() == 0);
     CHECK(server.get_count() == 3);
+    auto const perf = reactor.perf_snapshot();
+    CHECK(perf.retries_total == 2);
+    CHECK(perf.terminal_failures_total == 0);
   }
 
   SECTION("exhausted transient 503s throw after the retry budget")
@@ -874,6 +877,61 @@ TEST_CASE("footer suffix probe retries transient GET failures",
     }
     CHECK(server.head_count() == 0);
     CHECK(server.get_count() == 2);
+    auto const perf = reactor.perf_snapshot();
+    CHECK(perf.retries_total == cfg.max_retry_attempts - 1);
+    CHECK(perf.terminal_failures_total == 1);
+  }
+
+  SECTION("hard non-retriable errors fail without retrying")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets = true;
+    fault.fail_status   = 403;
+    range_http_server server(parquet, fault);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 3;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "footer-suffix-hard-failure");
+
+    try {
+      (void)reactor.fetch_footer_suffix("footer-bucket", "nation.parquet", 1UL << 20);
+      FAIL("fetch_footer_suffix should throw on a hard non-retriable HTTP error");
+    } catch (std::runtime_error const& e) {
+      auto const message = std::string{e.what()};
+      CHECK(message.find("HTTP 403") != std::string::npos);
+    }
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+    auto const perf = reactor.perf_snapshot();
+    CHECK(perf.retries_total == 0);
+    CHECK(perf.terminal_failures_total == 1);
+  }
+
+  SECTION("clean 206 has no retry or terminal-failure telemetry")
+  {
+    range_http_server server(parquet);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 3;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "footer-suffix-clean");
+
+    auto probe = reactor.fetch_footer_suffix("footer-bucket", "nation.parquet", 1UL << 20);
+
+    CHECK(probe.object_size == parquet.size());
+    CHECK(probe.window_lo == 0);
+    REQUIRE(probe.bytes != nullptr);
+    CHECK(probe.bytes->size() == parquet.size());
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+    auto const perf = reactor.perf_snapshot();
+    CHECK(perf.retries_total == 0);
+    CHECK(perf.terminal_failures_total == 0);
   }
 }
 

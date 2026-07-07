@@ -899,6 +899,7 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     if (rc != CURLE_OK && rc != CURLE_WRITE_ERROR) {
       last_error = std::string(curl_easy_strerror(rc));
       if (!is_retriable_curl(rc)) {
+        _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
         throw std::runtime_error("rest_reactor::fetch_footer_suffix: " + last_error + " for " +
                                  obj.bucket + "/" + obj.key);
       }
@@ -936,13 +937,16 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
       last_error = "HTTP " + std::to_string(status);
     } else {
       // 404 / 403 / 401 / ... — an error a HEAD would not recover from either.
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
       throw std::runtime_error("rest_reactor::fetch_footer_suffix: HTTP " + std::to_string(status) +
                                " for " + obj.bucket + "/" + obj.key);
     }
     if (attempt + 1 < _config.max_retry_attempts) {
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
       std::this_thread::sleep_for(compute_backoff(attempt, sink.retry_after, _config));
     }
   }
+  _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
   throw std::runtime_error("rest_reactor::fetch_footer_suffix: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
 }
