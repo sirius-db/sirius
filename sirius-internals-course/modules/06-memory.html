@@ -149,7 +149,7 @@
             </code></pre>
           </div>
           <div class="translation-english">
-            <span class="translation-label">Plain English <span class="rm-chip">reader mode</span></span>
+            <span class="translation-label">Plain English</span>
             <div class="translation-lines">
               <p class="tl">The graceful surrender: not a crash, but a thrown value that <em>is</em> the reschedule plan.</p>
               <p class="tl">The intermediate results move out with the exception &mdash; operators that already finished never re-run.</p>
@@ -163,7 +163,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_executor.cpp#L330-L343" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_executor.cpp:330-343 &#8599;</a></span><pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_executor.cpp#L330-L343" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_executor.cpp:330-343 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-doc"><span class="doc-p">SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far too short. With 100 retries × 50 ms backoff (~5 s) the probe tasks get enough patience to clear the contention window while still bailing out on truly wedged queries.</span></span>
 <span class="code-line">          <span class="code-keyword">static constexpr</span> <span class="code-keyword">uint32_t</span> MAX_OOM_RETRIES = <span class="code-number">100</span>;</span>
 <span class="code-line">          <span class="code-keyword">if</span> (next_retry_count &gt; MAX_OOM_RETRIES) {</span>
@@ -356,4 +356,6 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-5"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">The Data Plane</span></a><a class="ln-next" href="#module-7"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Design Decisions</span></a></div>
 </section>

@@ -5,6 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sirius Internals — Interactive Onboarding</title>
 
+  <script>
+  // Theme init — runs pre-paint to avoid a flash of the wrong theme.
+  (function () {
+    try {
+      var t = localStorage.getItem('sirius-course-theme');
+      if (t !== 'dark' && t !== 'light') {
+        t = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+      document.documentElement.setAttribute('data-theme', t);
+    } catch (e) { document.documentElement.setAttribute('data-theme', 'light'); }
+  })();
+  </script>
+
   <!-- Google Fonts: Bricolage Grotesque · DM Sans · JetBrains Mono -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -133,7 +146,388 @@
       margin-left: 8px;
       vertical-align: middle;
     }
+
+    /* ── Course chrome (educative.io-style) ─────────────────────
+       Fixed left table of contents + per-lesson prev/next cards. */
+    .course-toc {
+      display: none;
+      position: fixed;
+      left: 0; top: var(--nav-height); bottom: 0;
+      width: 280px;
+      overflow-y: auto;
+      background: var(--color-bg);
+      border-right: 1px solid var(--color-border);
+      padding: 22px 14px 40px;
+      z-index: 40;
+    }
+    .course-toc h3 {
+      font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--color-text-muted); margin: 0 10px 12px; font-weight: 600;
+    }
+    .course-toc a {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 10px; border-radius: 8px;
+      color: var(--color-text-secondary); text-decoration: none;
+      font-size: var(--text-sm); line-height: 1.3;
+    }
+    .course-toc a:hover { background: var(--color-accent-light); color: var(--color-text); }
+    .course-toc .toc-num {
+      flex: none; width: 22px; height: 22px; border-radius: 50%;
+      border: 1.5px solid var(--color-accent-muted); color: var(--color-accent);
+      font-size: 11px; font-weight: 600;
+      display: grid; place-items: center;
+    }
+    @media (min-width: 1280px) {
+      .course-toc { display: block; }
+      main { margin-left: 280px; }
+    }
+
+    .lesson-nav {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+      max-width: var(--content-width); margin: var(--space-12) auto 0;
+    }
+    .lesson-nav a {
+      display: block; text-decoration: none;
+      border: 1px solid var(--color-border); border-radius: 12px;
+      padding: 14px 18px; background: var(--color-surface);
+      color: var(--color-text); transition: transform .12s ease, border-color .12s ease;
+    }
+    .lesson-nav a:hover { transform: translateY(-2px); border-color: var(--color-accent); }
+    .lesson-nav .ln-eyebrow {
+      display: block; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--color-text-muted); margin-bottom: 4px;
+    }
+    .lesson-nav .ln-title { font-weight: 600; font-size: var(--text-sm); }
+    .lesson-nav .ln-next { text-align: right; }
+    .lesson-nav .ln-spacer { border: none; background: transparent; pointer-events: none; }
+    @media (max-width: 640px) { .lesson-nav { grid-template-columns: 1fr; } }
+
+    /* ── Technical-reading pass ─────────────────────────────────── */
+
+    /* Inline identifiers in prose read as chips, not bare mono */
+    :where(p, li, .tl, summary, h4, td, .pattern-desc, .callout-content, .rt-role, .badge-desc) > code {
+      background: rgba(42,123,155,0.08);
+      border: 1px solid rgba(42,123,155,0.14);
+      padding: 0.05em 0.35em;
+      border-radius: 4px;
+      font-size: 0.88em;
+    }
+
+    /* Wrapped code lines: hanging indent so soft wraps are visually
+       distinct from real source lines */
+    .translation-code .code-line {
+      display: block;
+      padding-left: 2ch;
+      text-indent: -2ch;
+    }
+
+    /* Remaining inline comments on the dark panel: raise contrast */
+    .code-comment { color: #8A91B4; }
+
+    /* Anchor jumps (TOC / lesson nav) land clear of the fixed header */
+    .module { scroll-margin-top: calc(var(--nav-height) + 8px); }
+
+    /* Copy button on code panels */
+    .translation-code { position: relative; }
+    /* The stock label is absolutely pinned top-right — exactly where the
+       copy button lives. Put the label in flow (as the English panel does),
+       reserving space on the right for the button. */
+    .translation-code .translation-label {
+      position: static;
+      display: block;
+      margin: -4px 0 var(--space-3);
+      padding-right: 84px;
+      /* The stock sheet dims labels with opacity: 0.5 — that halves any
+         color's contrast and is why token fixes never reached the labels.
+         Use full opacity with explicitly-measured colors instead. */
+      opacity: 1;
+      color: #A6ADC8; /* 7.0:1 on the #1E1E2E code panel */
+      /* file paths are long unbreakable tokens — without this they
+         overflow the padding reservation and run under the button */
+      overflow-wrap: anywhere;
+    }
+    .translation-english .translation-label {
+      opacity: 1;
+      color: var(--color-text-secondary); /* 5.5:1 light · 8.4:1 dark on the warm panel */
+    }
+    .copy-btn {
+      position: absolute; top: 10px; right: 12px;
+      font-family: var(--font-mono); font-size: 11px;
+      color: #A6ADC8; background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.14); border-radius: 6px;
+      padding: 3px 10px; cursor: pointer;
+    }
+    .copy-btn:hover { color: #CDD6F4; background: rgba(255,255,255,0.12); }
+    .copy-btn.copied { color: #A6E3A1; border-color: rgba(166,227,161,0.4); }
+
+    /* Sidebar TOC live highlight (driven by the augmentation script) */
+    .course-toc a.active { background: var(--color-accent-light); color: var(--color-text); font-weight: 600; }
+    .course-toc a.active .toc-num { background: var(--color-accent); border-color: var(--color-accent); color: #fff; }
+
+    /* Screen-level sub-navigation under the active module */
+    .course-toc .toc-time { margin-left: auto; font-size: 10px; color: var(--color-text-muted); font-weight: 400; white-space: nowrap; }
+    .course-toc .toc-sub { display: none; margin: 2px 0 6px 32px; border-left: 1px solid var(--color-border); }
+    .course-toc a.active + .toc-sub { display: block; }
+    .course-toc.no-spy .toc-sub { display: block; }
+    .course-toc .toc-sub a { display: block; padding: 4px 10px; font-size: 12px; color: var(--color-text-muted); border-radius: 0 6px 6px 0; }
+    .course-toc .toc-sub a:hover { color: var(--color-text); background: var(--color-accent-light); }
+    .toc-kbd-hint { margin-top: 14px; padding: 8px 10px; font-size: 11px; color: var(--color-text-muted); }
+    kbd {
+      font-family: var(--font-mono); font-size: 10px;
+      border: 1px solid var(--color-border); border-bottom-width: 2px;
+      border-radius: 4px; padding: 1px 5px; background: var(--color-surface);
+    }
+
+    /* Sub-heading anchors land clear of the fixed header too */
+    .screen { scroll-margin-top: calc(var(--nav-height) + 8px); }
+
+    /* Resume-reading toast */
+    .resume-toast {
+      position: fixed; right: 18px; bottom: 18px; z-index: 90;
+      display: flex; align-items: center; gap: 10px;
+      background: var(--color-surface); border: 1px solid var(--color-border);
+      border-radius: 12px; padding: 10px 14px; box-shadow: var(--shadow-md);
+      font-size: var(--text-sm);
+    }
+    .resume-toast button {
+      font: inherit; cursor: pointer; border-radius: 8px;
+      border: 1px solid var(--color-accent-muted); color: var(--color-accent);
+      background: var(--color-accent-light); padding: 4px 12px;
+    }
+    .resume-toast .rt-x { border: none; background: transparent; color: var(--color-text-muted); padding: 4px 6px; }
+
+    /* ── Dark theme (claude-ui-style warm dark, adapted to teal) ──
+       The light theme is the stock warm cream. Dark re-maps every
+       design token to Anthropic-style warm darks — never cold black. */
+    html[data-theme="dark"] {
+      --color-bg:             #262624;
+      --color-bg-warm:        #21201E;
+      --color-bg-code:        #1E1E2E;
+      --color-text:           #F0EEE9;
+      /* Secondary/muted measured against all four dark surfaces:
+         secondary 7.7–9.5:1, muted 5.5–6.8:1 — muted stays ≥4.5 even
+         at the 10-12px caption sizes this course uses it for. */
+      --color-text-secondary: #C9C6BC;
+      --color-text-muted:     #ABA79D;
+      --color-border:         #3D3C38;
+      --color-border-light:   #34332F;
+      --color-surface:        #30302E;
+      --color-surface-warm:   #2B2A28;
+      --color-accent:         #4FA3C4;
+      --color-accent-hover:   #66B4D2;
+      --color-accent-light:   #20353F;
+      --color-accent-muted:   #3B7E9B;
+      --color-success:        #4CAF79;
+      --color-success-light:  #1D3227;
+      --color-error:          #E06B5F;
+      --color-error-light:    #3A2422;
+      --color-info:           #57A8C7;
+      --color-info-light:     #20353F;
+      --color-actor-1:        #E0705A;
+      --color-actor-2:        #57A8C7;
+      --color-actor-3:        #9D91C9;
+      --color-actor-4:        #D9B45E;
+      --color-actor-5:        #58B183;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,0.35);
+      --shadow-md: 0 4px 12px rgba(0,0,0,0.40);
+      --shadow-lg: 0 8px 24px rgba(0,0,0,0.45);
+      --shadow-xl: 0 16px 48px rgba(0,0,0,0.50);
+      /* Ink for text sitting ON brightened accent/actor fills — inline
+         styles reference it as color: var(--fill-ink, white) so they
+         follow the theme instead of bypassing the stylesheet override. */
+      --fill-ink: #14211C;
+    }
+    /* Accent/actor-filled controls: the dark theme brightens those fill
+       colors (so they read as text on dark surfaces), which drops white
+       foregrounds below 4.5:1. On dark, filled controls use dark ink. */
+    html[data-theme="dark"] .quiz-check-btn,
+    html[data-theme="dark"] .dnd-chip,
+    html[data-theme="dark"] .touch-ghost,
+    html[data-theme="dark"] .chat-avatar,
+    html[data-theme="dark"] .layer-tab.active,
+    html[data-theme="dark"] .flow-step-num,
+    html[data-theme="dark"] .step-num,
+    html[data-theme="dark"] .btn-primary,
+    html[data-theme="dark"] .btn-primary:hover,
+    html[data-theme="dark"] .course-toc a.active .toc-num {
+      color: #14211C;
+    }
+
+    /* Components with hardcoded light values */
+    html[data-theme="dark"] .nav {
+      background: rgba(33,32,30,0.92);
+      border-bottom-color: var(--color-border-light);
+    }
+    html[data-theme="dark"] :where(p, li, .tl, summary, h4, td, .pattern-desc, .callout-content, .rt-role, .badge-desc) > code {
+      background: rgba(87,168,199,0.14);
+      border-color: rgba(87,168,199,0.28);
+    }
+    html[data-theme="dark"] .lesson-nav a,
+    html[data-theme="dark"] .repo-tree,
+    html[data-theme="dark"] .resume-toast { background: var(--color-surface); }
+
+    /* Theme toggle in the nav */
+    .theme-toggle {
+      margin-left: 14px; flex: none;
+      width: 30px; height: 30px; border-radius: 50%;
+      border: 1px solid var(--color-border);
+      background: var(--color-surface);
+      color: var(--color-text-secondary);
+      cursor: pointer; font-size: 14px; line-height: 1;
+      display: grid; place-items: center;
+    }
+    .theme-toggle:hover { border-color: var(--color-accent); color: var(--color-accent); }
   </style>
+
+  <script>
+  // Augmentation layer — reading aids only; main.js is untouched.
+  document.addEventListener('DOMContentLoaded', () => {
+    // 0) Light/dark theme toggle (theme applied pre-paint by the head script)
+    const navInner = document.querySelector('.nav-inner');
+    if (navInner) {
+      const tbtn = document.createElement('button');
+      tbtn.type = 'button';
+      tbtn.className = 'theme-toggle';
+      const paint = () => {
+        const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+        tbtn.textContent = dark ? '☀' : '☾';
+        tbtn.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+        tbtn.title = tbtn.getAttribute('aria-label');
+      };
+      tbtn.addEventListener('click', () => {
+        const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', next);
+        try { localStorage.setItem('sirius-course-theme', next); } catch (e) { /* no persistence */ }
+        paint();
+      });
+      paint();
+      navInner.appendChild(tbtn);
+    }
+    // 1) Sidebar TOC scrollspy
+    const tocLinks = Array.from(document.querySelectorAll('.course-toc a'));
+    if (tocLinks.length && 'IntersectionObserver' in window) {
+      const byId = new Map(tocLinks.map(a => [a.getAttribute('href').slice(1), a]));
+      const spy = new IntersectionObserver(entries => {
+        entries.forEach(e => {
+          if (!e.isIntersecting) return;
+          tocLinks.forEach(a => a.classList.remove('active'));
+          const link = byId.get(e.target.id);
+          if (link) link.classList.add('active');
+        });
+      }, { rootMargin: '-40% 0px -55% 0px' });
+      document.querySelectorAll('section.module[id]').forEach(m => spy.observe(m));
+    } else if (tocLinks.length) {
+      // No IntersectionObserver: without an .active link the sub-TOCs would
+      // be permanently hidden — show them all instead.
+      const toc = document.querySelector('.course-toc');
+      if (toc) toc.classList.add('no-spy');
+    }
+
+    // 2) Copy button per code panel (copies code only — reader-mode prose excluded)
+    document.querySelectorAll('.translation-code').forEach(panel => {
+      const pre = panel.querySelector('pre');
+      if (!pre || !navigator.clipboard) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'copy-btn';
+      btn.textContent = 'copy';
+      btn.setAttribute('aria-label', 'Copy code to clipboard');
+      btn.addEventListener('click', () => {
+        const clone = pre.cloneNode(true);
+        clone.querySelectorAll('.code-doc').forEach(n => n.remove());
+        const text = clone.textContent.replace(/\n{3,}/g, '\n\n').trim();
+        navigator.clipboard.writeText(text).then(() => {
+          btn.textContent = 'copied ✓';
+          btn.classList.add('copied');
+          setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1600);
+        });
+      });
+      panel.appendChild(btn);
+    });
+
+    // 3) Screen-level sub-navigation under each TOC module entry
+    const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
+    const moduleSections = Array.from(document.querySelectorAll('section.module[id]'));
+    moduleSections.forEach(mod => {
+      const link = document.querySelector('.course-toc a[href="#' + mod.id + '"]');
+      if (!link) return;
+      const heads = mod.querySelectorAll('.screen-heading');
+      if (!heads.length) return;
+      const sub = document.createElement('div');
+      sub.className = 'toc-sub';
+      heads.forEach((h, i) => {
+        if (!h.id) h.id = mod.id + '-s' + (i + 1) + '-' + slug(h.textContent);
+        const a = document.createElement('a');
+        a.href = '#' + h.id;
+        a.textContent = h.textContent;
+        sub.appendChild(a);
+      });
+      link.insertAdjacentElement('afterend', sub);
+    });
+
+    // 4) Reading-time estimate per module (~220 wpm)
+    moduleSections.forEach(mod => {
+      const link = document.querySelector('.course-toc a[href="#' + mod.id + '"]');
+      if (!link) return;
+      const words = (mod.textContent.match(/\S+/g) || []).length;
+      const t = document.createElement('span');
+      t.className = 'toc-time';
+      t.textContent = Math.max(1, Math.round(words / 220)) + ' min';
+      link.appendChild(t);
+    });
+
+    // 5) Keyboard paging is ALREADY provided by main.js (↑↓←→ jump between
+    // modules, via a document-level listener). Do NOT add a second handler —
+    // it would double-fire. Instead, shield interactive elements from that
+    // handler: main.js only exempts INPUT/TEXTAREA/SELECT, so arrows from a
+    // focused quiz button, link, or <details> summary would teleport the
+    // reader. Interception point matters: a BUBBLE-phase listener on <body>
+    // runs AFTER the focused control's own handlers and default processing,
+    // but BEFORE document-level listeners — so the control receives the event
+    // normally and only the module-jump is suppressed. (A capture-phase
+    // document listener would starve the control itself.)
+    document.body.addEventListener('keydown', e => {
+      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+      const t = e.target;
+      if (t && t.closest && (t.isContentEditable ||
+          t.closest('button, a, summary, [role="button"], [contenteditable]'))) {
+        e.stopPropagation(); // default behavior preserved; document-level jump suppressed
+      }
+    });
+
+    // 6) Resume where you left off (localStorage; degrades silently)
+    try {
+      const KEY = 'sirius-course-scroll';
+      // Feature-test writes up front: in some private-browsing modes getItem
+      // works but setItem throws — probe once instead of throwing per scroll.
+      localStorage.setItem(KEY + '-probe', '1');
+      localStorage.removeItem(KEY + '-probe');
+      let saveT;
+      window.addEventListener('scroll', () => {
+        clearTimeout(saveT);
+        saveT = setTimeout(() => {
+          try { localStorage.setItem(KEY, String(window.scrollY)); } catch (e) { /* storage revoked mid-session */ }
+        }, 400);
+      }, { passive: true });
+      const saved = parseInt(localStorage.getItem(KEY) || '0', 10);
+      if (saved > 1200 && window.scrollY < 200) {
+        const toast = document.createElement('div');
+        toast.className = 'resume-toast';
+        const label = document.createElement('span');
+        label.textContent = 'Pick up where you left off?';
+        const go = document.createElement('button');
+        go.textContent = 'Resume';
+        go.addEventListener('click', () => { window.scrollTo({ top: saved, behavior: 'smooth' }); toast.remove(); });
+        const x = document.createElement('button');
+        x.className = 'rt-x'; x.textContent = '×'; x.setAttribute('aria-label', 'Dismiss');
+        x.addEventListener('click', () => toast.remove());
+        toast.append(label, go, x);
+        document.body.appendChild(toast);
+        setTimeout(() => { if (toast.isConnected) toast.remove(); }, 12000);
+      }
+    } catch (err) { /* private browsing etc. — no resume feature */ }
+  });
+  </script>
 
   <script src="main.js" defer></script>
 </head>
@@ -155,6 +549,19 @@
       </div>
     </div>
   </nav>
+
+  <aside class="course-toc" aria-label="Course contents">
+    <h3>Course contents</h3>
+    <a href="#module-1"><span class="toc-num">1</span>The Big Picture</a>
+    <a href="#module-2"><span class="toc-num">2</span>Meet the Actors</a>
+    <a href="#module-3"><span class="toc-num">3</span>Life of a Query</a>
+    <a href="#module-4"><span class="toc-num">4</span>Where Data Comes From</a>
+    <a href="#module-5"><span class="toc-num">5</span>The Data Plane</a>
+    <a href="#module-6"><span class="toc-num">6</span>Memory &amp; Multi-GPU</a>
+    <a href="#module-7"><span class="toc-num">7</span>Design Decisions</a>
+    <a href="#module-8"><span class="toc-num">8</span>The Streaming Frontier</a>
+    <div class="toc-kbd-hint"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> <kbd>&uarr;</kbd> <kbd>&darr;</kbd> move between modules</div>
+  </aside>
 
   <main id="main">
     <!-- modules/*.html content is assembled here by build.sh -->
@@ -483,6 +890,8 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><span class="ln-spacer"></span><a class="ln-next" href="#module-2"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Meet the Actors</span></a></div>
 </section>
 <section class="module module--alt" id="module-2" style="background: var(--color-bg-warm)">
   <div class="module-content">
@@ -925,6 +1334,8 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-1"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">The Big Picture</span></a><a class="ln-next" href="#module-3"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Life of a Query</span></a></div>
 </section>
 <section class="module" id="module-3">
   <div class="module-content">
@@ -1524,6 +1935,8 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-2"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Meet the Actors</span></a><a class="ln-next" href="#module-4"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Where Data Comes From</span></a></div>
 </section>
 <section class="module" id="module-4" style="background: var(--color-bg-warm)">
   <div class="module-content">
@@ -1558,7 +1971,7 @@
           <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">CPU zone</div>
           <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
             <span class="term" data-definition="The CPU-side coordinator (src/scan_manager/sirius_scan_manager.cpp) that owns split providers and connectors, and balances splits across consumers/GPUs. Runs on CPU producer threads — never touches device memory."><strong>Scan Manager</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="Per-format planner (src/scan_manager/split_provider.cpp) that walks storage metadata and pushes splits into the connector. The 'blasting schedule': it decides the size and shape of each unit of scan work.">split provider</span> &rarr; <span class="term" data-definition="The bounded queue (src/scan_manager/split_connector.cpp) between providers and the scan operator, with close-then-drain EOS semantics and exception carrying. The contract you're about to read.">split_connector</span></span> &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono); color: var(--color-text-secondary);">&#8779; streams</span>
-            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager">src/scan_manager/ &#8599;</a></div>
+            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager">src/scan_manager/ &#8599;</a> &middot; landed as the Scan Manager milestone <a href="https://github.com/sirius-db/sirius/pull/731">#731</a></div>
           </div>
         </div>
 
@@ -1804,6 +2217,8 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-3"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Life of a Query</span></a><a class="ln-next" href="#module-5"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">The Data Plane</span></a></div>
 </section>
 <section class="module" id="module-5" style="background: var(--color-bg-warm)">
   <div class="module-content">
@@ -2108,6 +2523,8 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-4"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Where Data Comes From</span></a><a class="ln-next" href="#module-6"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Memory & Multi-GPU</span></a></div>
 </section>
 <section class="module" id="module-6">
   <div class="module-content">
@@ -2260,7 +2677,7 @@
             </code></pre>
           </div>
           <div class="translation-english">
-            <span class="translation-label">Plain English <span class="rm-chip">reader mode</span></span>
+            <span class="translation-label">Plain English</span>
             <div class="translation-lines">
               <p class="tl">The graceful surrender: not a crash, but a thrown value that <em>is</em> the reschedule plan.</p>
               <p class="tl">The intermediate results move out with the exception &mdash; operators that already finished never re-run.</p>
@@ -2274,7 +2691,7 @@
 
         <div class="translation-block animate-in">
           <div class="translation-code">
-            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_executor.cpp#L330-L343" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_executor.cpp:330-343 &#8599;</a></span><pre><code>
+            <span class="translation-label"><a href="https://github.com/sirius-db/sirius/blob/dev/src/pipeline/gpu_pipeline_executor.cpp#L330-L343" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-decoration-color: rgba(203,166,247,0.4); text-underline-offset: 3px;">src/pipeline/gpu_pipeline_executor.cpp:330-343 &#8599;</a> <span class="rm-chip">reader mode</span></span><pre><code>
 <span class="code-doc"><span class="doc-p">SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far too short. With 100 retries × 50 ms backoff (~5 s) the probe tasks get enough patience to clear the contention window while still bailing out on truly wedged queries.</span></span>
 <span class="code-line">          <span class="code-keyword">static constexpr</span> <span class="code-keyword">uint32_t</span> MAX_OOM_RETRIES = <span class="code-number">100</span>;</span>
 <span class="code-line">          <span class="code-keyword">if</span> (next_retry_count &gt; MAX_OOM_RETRIES) {</span>
@@ -2467,6 +2884,8 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-5"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">The Data Plane</span></a><a class="ln-next" href="#module-7"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">Design Decisions</span></a></div>
 </section>
 <section class="module" id="module-7" style="background: var(--color-bg-warm)">
   <div class="module-content">
@@ -2512,7 +2931,7 @@
               </div>
               <div class="flow-arrow">→</div>
               <div class="flow-step">
-                <div class="flow-step-num" style="background: var(--color-actor-2); border: 4px solid var(--color-actor-2); color: white;">5</div>
+                <div class="flow-step-num" style="background: var(--color-actor-2); border: 4px solid var(--color-actor-2); color: var(--fill-ink, white);">5</div>
                 <p><strong><span class="term" data-definition="The compute-node embedding project: #960 stands up a full Sirius engine context inside a StarRocks compute node — proof the engine survives outside DuckDB.">StarRocks CN</span></strong><br><a href="https://github.com/sirius-db/sirius/pull/960">#960</a></p>
               </div>
             </div>
@@ -2545,7 +2964,7 @@
               </div>
               <div class="flow-arrow">→</div>
               <div class="flow-step">
-                <div class="flow-step-num" style="background: var(--color-actor-5); border: 4px solid var(--color-actor-5); color: white;">5</div>
+                <div class="flow-step-num" style="background: var(--color-actor-5); border: 4px solid var(--color-actor-5); color: var(--fill-ink, white);">5</div>
                 <p><strong>cudf-free core</strong><br><a href="https://github.com/NVIDIA/cuCascade/pull/150">cc#150</a></p>
               </div>
             </div>
@@ -2782,6 +3201,8 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-6"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Memory & Multi-GPU</span></a><a class="ln-next" href="#module-8"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">The Streaming Frontier</span></a></div>
 </section>
 <section class="module" id="module-8">
   <div class="module-content">
@@ -3346,6 +3767,8 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-7"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Design Decisions</span></a><a class="ln-next" href="#module-1"><span class="ln-eyebrow">Course complete &#10003;</span><span class="ln-title">Back to the start</span></a></div>
 </section>
   </main>
 

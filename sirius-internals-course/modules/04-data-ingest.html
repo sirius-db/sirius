@@ -31,7 +31,7 @@
           <div style="font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-muted); margin-bottom: 10px;">CPU zone</div>
           <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 8px; padding: 10px 14px; box-shadow: var(--shadow-sm);">
             <span class="term" data-definition="The CPU-side coordinator (src/scan_manager/sirius_scan_manager.cpp) that owns split providers and connectors, and balances splits across consumers/GPUs. Runs on CPU producer threads — never touches device memory."><strong>Scan Manager</strong></span> &nbsp;<span style="font-family: var(--font-mono); font-size: 12px; color: var(--color-text-secondary);"><span class="term" data-definition="Per-format planner (src/scan_manager/split_provider.cpp) that walks storage metadata and pushes splits into the connector. The 'blasting schedule': it decides the size and shape of each unit of scan work.">split provider</span> &rarr; <span class="term" data-definition="The bounded queue (src/scan_manager/split_connector.cpp) between providers and the scan operator, with close-then-drain EOS semantics and exception carrying. The contract you're about to read.">split_connector</span></span> &nbsp;<span style="display: inline-block; border: 1px solid var(--color-accent-muted); border-radius: 9999px; padding: 1px 10px; font-size: 12px; font-family: var(--font-mono); color: var(--color-text-secondary);">&#8779; streams</span>
-            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager">src/scan_manager/ &#8599;</a></div>
+            <div style="font-size: 12px; color: var(--color-text-muted); font-family: var(--font-mono); margin-top: 4px;"><a href="https://github.com/sirius-db/sirius/tree/dev/src/scan_manager">src/scan_manager/ &#8599;</a> &middot; landed as the Scan Manager milestone <a href="https://github.com/sirius-db/sirius/pull/731">#731</a></div>
           </div>
         </div>
 
@@ -277,4 +277,6 @@
 
     </div>
   </div>
+
+      <div class="lesson-nav"><a href="#module-3"><span class="ln-eyebrow">&larr; Previous</span><span class="ln-title">Life of a Query</span></a><a class="ln-next" href="#module-5"><span class="ln-eyebrow">Next &rarr;</span><span class="ln-title">The Data Plane</span></a></div>
 </section>
