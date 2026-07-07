@@ -19,15 +19,6 @@ CompileFlags:
   Add:
     # Allow variadic CUDA functions
     - "-Xclang=-fcuda-allow-variadic-functions"
-    # clangd needs clang 22+ to natively parse the CUDA 13 cccl/libcudacxx headers (clang 20/21 cap
-    # at CUDA 12.8 and mis-close the cuda::std namespace). -Wno-unknown-cuda-version is a harmless
-    # backstop for clangs that don't yet know the exact toolkit version.
-    - "-Wno-unknown-cuda-version"
-    # nvcc sets these; clang doesn't. cuco/detail/__config #errors without them. The toolkit really
-    # is CUDA 13.0, so report that. (__NVCC__ stays undefined, so nvcc-only code paths aren't taken.)
-    - "-D__CUDACC_VER_MAJOR__=13"
-    - "-D__CUDACC_VER_MINOR__=0"
-    - "-D__CUDACC_EXTENDED_LAMBDA__"
 
 ---
 
