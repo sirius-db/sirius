@@ -168,6 +168,7 @@ std::vector<fixture> build_fixtures(rmm::cuda_stream_view stream, int n)
   add_numeric("f32", make_f32_table(1, n, 3));
   add_numeric("f64", make_f64_table(1, n, 4));
   add_numeric("u8_binary", make_u8_table(n, 5));
+  add_numeric("date", make_chrono_table(cudf::type_id::TIMESTAMP_DAYS, n, 6));
   {
     fixture f;
     f.name = "string";
@@ -436,6 +437,7 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
     };
     must_apply("string", {"dictionary", "dictionary_fast", "str_split", "ans", "bitcomp"});
     must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack"});
+    must_apply("date", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
   }
 
   std::vector<sweep_stats> per_fixture(fixtures.size());

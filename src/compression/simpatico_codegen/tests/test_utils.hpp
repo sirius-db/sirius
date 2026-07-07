@@ -132,6 +132,39 @@ inline std::unique_ptr<cudf::table> make_f64_table(int num_cols, int num_rows, i
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+// Single-column chrono table (DATE32 days / int64 timestamps / durations),
+// bit-identical to its integer storage. A mild upward drift with small jitter
+// makes delta/bitpack meaningful, like real event times.
+inline std::unique_ptr<cudf::table> make_chrono_table(cudf::type_id id, int num_rows, int seed)
+{
+  auto const dt = cudf::data_type{id};
+  auto col      = cudf::make_fixed_width_column(dt, num_rows, cudf::mask_state::UNALLOCATED);
+  if (cudf::size_of(dt) == 4) {
+    std::vector<std::int32_t> host(static_cast<std::size_t>(num_rows));
+    for (int r = 0; r < num_rows; ++r)
+      host[static_cast<std::size_t>(r)] =
+        19000 + r / 7 + static_cast<std::int32_t>((r * 13 + seed) % 5);
+    if (cudaMemcpy(col->mutable_view().head<void>(),
+                   host.data(),
+                   host.size() * sizeof(std::int32_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      throw std::runtime_error("make_chrono_table: cudaMemcpy failed");
+  } else {
+    std::vector<std::int64_t> host(static_cast<std::size_t>(num_rows));
+    for (int r = 0; r < num_rows; ++r)
+      host[static_cast<std::size_t>(r)] =
+        1700000000000000LL + static_cast<std::int64_t>(r) * 1013 + (r * 17 + seed) % 997;
+    if (cudaMemcpy(col->mutable_view().head<void>(),
+                   host.data(),
+                   host.size() * sizeof(std::int64_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      throw std::runtime_error("make_chrono_table: cudaMemcpy failed");
+  }
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 // ---------------------------------------------------------------------------
 // Comparison helpers
 // ---------------------------------------------------------------------------

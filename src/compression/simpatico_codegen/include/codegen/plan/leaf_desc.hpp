@@ -162,6 +162,19 @@ inline constexpr std::pair<cudf::type_id, std::uint8_t> kTypeTags[] = {
   {cudf::type_id::DECIMAL32, 11},
   {cudf::type_id::DECIMAL64, 12},
   {cudf::type_id::DECIMAL128, 13},
+  // Chrono types, compressed as their same-width integer storage (DATE32 =
+  // days as int32; the timestamp/duration families as int64 except *_DAYS);
+  // the tag restores the logical type on read (apply_stored_dtype).
+  {cudf::type_id::TIMESTAMP_DAYS, 14},
+  {cudf::type_id::TIMESTAMP_SECONDS, 15},
+  {cudf::type_id::TIMESTAMP_MILLISECONDS, 16},
+  {cudf::type_id::TIMESTAMP_MICROSECONDS, 17},
+  {cudf::type_id::TIMESTAMP_NANOSECONDS, 18},
+  {cudf::type_id::DURATION_DAYS, 19},
+  {cudf::type_id::DURATION_SECONDS, 20},
+  {cudf::type_id::DURATION_MILLISECONDS, 21},
+  {cudf::type_id::DURATION_MICROSECONDS, 22},
+  {cudf::type_id::DURATION_NANOSECONDS, 23},
 };
 
 inline std::uint8_t dtype_to_tag(cudf::data_type dt) noexcept

@@ -54,6 +54,17 @@ nvcompType_t cascaded_type_for(cudf::data_type t)
     case cudf::type_id::UINT64:
     case cudf::type_id::FLOAT64: return NVCOMP_TYPE_LONGLONG;
     case cudf::type_id::FLOAT32: return NVCOMP_TYPE_INT;
+    // Chrono types at their integer storage width.
+    case cudf::type_id::TIMESTAMP_DAYS:
+    case cudf::type_id::DURATION_DAYS: return NVCOMP_TYPE_INT;
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+    case cudf::type_id::DURATION_SECONDS:
+    case cudf::type_id::DURATION_MILLISECONDS:
+    case cudf::type_id::DURATION_MICROSECONDS:
+    case cudf::type_id::DURATION_NANOSECONDS: return NVCOMP_TYPE_LONGLONG;
     default: return NVCOMP_TYPE_INT;
   }
 }

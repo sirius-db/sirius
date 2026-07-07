@@ -1279,6 +1279,26 @@ bool jit_encode_subtree(PlanTree const& tree,
       dtype           = "int64";
       storage_type_id = cudf::type_id::INT64;
       break;
+    // Chrono columns are physically their integer storage (DATE32 = days as
+    // int32, timestamps/durations as int64); like DECIMAL, encode/decode run
+    // on the storage integer and the logical type is restored from the stored
+    // column dtype at the end of decompress (apply_stored_dtype).
+    case cudf::type_id::TIMESTAMP_DAYS:
+    case cudf::type_id::DURATION_DAYS:
+      dtype           = "int32";
+      storage_type_id = cudf::type_id::INT32;
+      break;
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+    case cudf::type_id::DURATION_SECONDS:
+    case cudf::type_id::DURATION_MILLISECONDS:
+    case cudf::type_id::DURATION_MICROSECONDS:
+    case cudf::type_id::DURATION_NANOSECONDS:
+      dtype           = "int64";
+      storage_type_id = cudf::type_id::INT64;
+      break;
     default: return false;  // non-fusable type
   }
   const char* cxx_dtype = dtype_to_cxx(dtype);

@@ -886,6 +886,29 @@ int main()
                      "str_split_chars_fused_u8");
     }
 
+    {
+      // Chrono columns compress as their integer storage and restore the
+      // logical type at the end of decompress (apply_stored_dtype) — the
+      // comparators check dtype, so a pass proves the restoration. DATE32
+      // through the classic date cascade; an int64 timestamp through a fused
+      // cascade and codec leaves.
+      auto td = make_chrono_table(cudf::type_id::TIMESTAMP_DAYS, 4096, 5);
+      roundtrip_once(td->view(),
+                     "input -> delta -> differences\n"
+                     "delta.differences -> bitpack\n",
+                     1,
+                     "date32_delta_bitpack");
+      roundtrip_once(td->view(), "input -> ans\n", 1, "date32_ans");
+
+      auto tu = make_chrono_table(cudf::type_id::TIMESTAMP_MICROSECONDS, 4096, 9);
+      roundtrip_once(tu->view(),
+                     "input -> delta -> differences\n"
+                     "delta.differences -> bitpack\n",
+                     1,
+                     "timestamp_us_delta_bitpack");
+      roundtrip_once(tu->view(), "input -> nvcomp_cascaded\n", 1, "timestamp_us_cascaded");
+    }
+
     std::printf("test_compress_with_plan_roundtrip: PASS\n");
     return 0;
   } catch (std::exception const& e) {
