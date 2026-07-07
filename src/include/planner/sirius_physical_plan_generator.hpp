@@ -22,10 +22,14 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <memory>
+#include <unordered_map>
+
 namespace duckdb {
 class ClientContext;
 class GPUContext;
 class ColumnDataCollection;
+class DynamicTableFilterSet;
 class LogicalOperator;
 class LogicalAggregate;
 class LogicalColumnDataGet;
@@ -43,6 +47,10 @@ class LogicalProjection;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
 }  // namespace duckdb
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}
 
 namespace sirius::planner {
 
@@ -69,7 +77,19 @@ class sirius_physical_plan_generator {
   // duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::GPUIntermediateRelation>>
   // gpu_recursive_cte_tables;
 
+  /// @brief Map from duckdb::DynamicTableFilterSet pointers to sirius_dynamic_filter_set channels.
+  /// DuckDB pairs a producer (join) and a consumer (scan) by planting the same
+  /// DynamicTableFilterSet pointer on both sides, so we key the channels by these pointers.
+  std::unordered_map<duckdb::DynamicTableFilterSet const*,
+                     std::shared_ptr<sirius::op::sirius_dynamic_filter_set>>
+    dynamic_filter_channels;
+
  public:
+  /// @brief Look up or create the dynamic filter channel keyed by @p key. Returns nullptr if @p key
+  /// is null. Same pointer in repeated calls returns the same channel.
+  [[nodiscard]] std::shared_ptr<sirius::op::sirius_dynamic_filter_set>
+  get_or_create_dynamic_filter_channel(duckdb::DynamicTableFilterSet const* key);
+
   //! Creates a plan from the logical operator. This involves resolving column bindings and
   //! generating physical operator nodes.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(

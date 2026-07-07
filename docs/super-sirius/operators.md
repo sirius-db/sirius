@@ -81,7 +81,7 @@ These operators process data in a single pass without buffering.
 
 Applies a predicate expression to filter rows.
 
-- **GPU execution:** `gpu_expression_executor::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
+- **GPU execution:** `expression_evaluator::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
 - **Key members:** `expression` (filter predicate)
 
 ### `sirius_physical_projection` — `PROJECTION`
@@ -90,11 +90,11 @@ Applies a predicate expression to filter rows.
 Evaluates a list of expressions to produce output columns.
 
 - **GPU execution:** the operator classifies each `select_list` entry as either a pure column passthrough (a `sirius::ast::reference` / BOUND_REF) or an expression that must be evaluated, then takes one of three paths per input batch:
-  - **All evaluated:** `gpu_expression_executor::execute()` produces an owned `cudf::table` of new columns.
+  - **All evaluated:** `expression_evaluator::evaluate()` produces an owned `cudf::table` of new columns.
   - **All passthrough:** the output is a zero-copy `cudf::table_view` over the input columns. The output batch is a view-backed `gpu_table_representation` (see [data management](data-management.md)) whose owner is the input's `read_only_data_batch` lock, which keeps the source columns alive and read-only-pinned for the output's lifetime — no device copies.
   - **Mixed:** only the non-passthrough entries are evaluated; the output view mixes the freshly-evaluated columns with the input's passthrough columns, owned jointly by the evaluated table and the input lock.
 
-  Only the entries that need evaluation are passed to the expression executor (via its `std::vector<sirius::ast::node const*>` constructor). See [expression executor](expression-executor.md).
+  Only the entries that need evaluation are passed to the expression evaluator (via its `std::vector<sirius::ast::node const*>` constructor). See [expression evaluator](expression-executor.md).
 - **Key members:** `select_list` (output expressions)
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
@@ -314,8 +314,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
-| FILTER | Relational | `gpu_expression_executor::select()` |
-| PROJECTION | Relational | `gpu_expression_executor::execute()` |
+| FILTER | Relational | `expression_evaluator::select()` |
+| PROJECTION | Relational | `expression_evaluator::evaluate()` |
 | STREAMING_LIMIT | Relational | Atomic claim-based |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |

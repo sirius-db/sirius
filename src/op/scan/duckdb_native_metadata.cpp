@@ -350,9 +350,10 @@ void compute_segment_bytes_size(std::vector<duckdb_row_group_metadata>& row_grou
 
 /// @brief Check if the filter can be applied to row-group pruning.
 ///
-/// The only filter type we must exclude from statistics pruning is DYNAMIC_FILTER:
-/// its bounds come from a runtime source (e.g. a hash-join build) and are not
-/// currently populated at metadata-walk time.
+/// This DuckDB-native statistics walker only consumes the static payloads represented directly by
+/// DuckDB @c TableFilter nodes. @c DYNAMIC_FILTER is a routing placeholder, while Sirius runtime
+/// join filters use their own publication channel and scan-consumer paths, so it is not translated
+/// by this walker.
 bool filter_is_prunable(duckdb::TableFilterType t)
 {
   return t != duckdb::TableFilterType::DYNAMIC_FILTER;

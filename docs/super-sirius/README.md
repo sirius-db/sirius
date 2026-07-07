@@ -31,7 +31,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Execution Flow](execution-flow.md) | End-to-end query trace with file:line references |
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
-| [Expression Executor](expression-executor.md) | gpu_expression_executor, Sirius AST hierarchy, GPU expression translator, cuDF AST |
+| [Expression Evaluator](expression-executor.md) | `expression_evaluator`, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
 | [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
@@ -40,7 +40,8 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, SCHED-RR, cross-GPU transfers, downgrade, concurrency invariants |
-| [Dynamic Filters](dynamic-filters.md) | Framework for runtime-computed filter predicates: zone maps, bloom filters, SIP, adaptive pushdown |
+| [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, and future SIP/refinement design |
+| [Dynamic Filters — Multi-GPU](dynamic-filters-multi-gpu.md) | Device-local replica fan-out, peer-DMA/HOST-staging routes, ownership contracts, and two-GPU validation |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 
 ## Suggested Reading Order
@@ -49,7 +50,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 2. **Execution Flow** — trace a query end-to-end through the system
 3. **Physical Plan Generation** — how DuckDB logical plans become Sirius pipelines
 4. **Operators** — what each operator does on the GPU
-5. **Expression Executor** — how expressions are evaluated on GPU
+5. **Expression Evaluator** — how expressions are evaluated on GPU
 6. **Pipeline Execution** — how tasks are dispatched and executed
 7. **Task Creator** — how the system decides when to create tasks
 8. **Scan** — how data enters the system from storage

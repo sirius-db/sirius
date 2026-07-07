@@ -29,6 +29,7 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cpu_source.hpp"
@@ -56,6 +57,7 @@
 #include "sirius_config.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <stdexcept>
 
@@ -269,6 +271,13 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   table_info->scan_output_arity      = scan_op.types.size();
   table_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
+  // The ingestible uses dynamic filters for read-time row-group pruning; the dynamic-filter
+  // operator inserted below applies them post-decode. If no producer was wired after planning,
+  // elide both paths for this scan.
+  auto dynamic_filters = scan_op.sirius_dynamic_filters;
+  if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
+  table_info->sirius_dynamic_filters = dynamic_filters;
+
   auto parquet_ingestible = op::scan::make_ingestible(std::move(table_info));
   auto gpu_scan_op        = duckdb::make_uniq<op::scan::sirius_gpu_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(parquet_ingestible));
@@ -279,6 +288,20 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
 
   inserted_operators_.push_back(std::move(gpu_scan_op));
+
+  // Insert the dynamic-filter operator directly above the scan at operators[1]. It filters both the
+  // disk and cached resolutions of this parquet scan.
+  if (dynamic_filters) {
+    auto dynamic_filter_op = duckdb::make_uniq<op::scan::sirius_physical_dynamic_filter>(
+      scan_op.types,
+      scan_op.estimated_cardinality,
+      std::move(dynamic_filters),
+      op_params_.dynamic_filter_keep_threshold);
+    auto* dynamic_filter_ptr = dynamic_filter_op.get();
+    current_pipeline->operators.insert(current_pipeline->operators.begin() + 1,
+                                       *dynamic_filter_ptr);
+    inserted_operators_.push_back(std::move(dynamic_filter_op));
+  }
 }
 
 void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
