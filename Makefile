@@ -17,6 +17,8 @@ DUCKDB_DIR ?= duckdb
 TEST_BUILD_TARGET ?= sirius_unittest
 MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 
+BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
+
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
 	legacy-release \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
@@ -41,73 +43,46 @@ build/%/build.ninja: $(CMAKE_INPUTS) | $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset $*
 
 release: build/release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(BUILD_TARGETS)
 
 debug: build/debug/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(BUILD_TARGETS)
 
 reldebug: relwithdebinfo
 
 debug-release: relwithdebinfo
 
 relwithdebinfo: build/relwithdebinfo/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(BUILD_TARGETS)
 
 legacy-release: build/legacy-release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset legacy-release --target $(MAIN_BUILD_TARGETS)
 
 clang-release: build/clang-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(BUILD_TARGETS)
 
 clang-debug: build/clang-debug/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(BUILD_TARGETS)
 
 clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(BUILD_TARGETS)
 
 # AddressSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
 # llvm-symbolizer is auto-detected on PATH) with:
 #   ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1" \
 #     ./build/clang-asan/extension/sirius/test/cpp/sirius_unittest
 clang-asan: build/clang-asan/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(BUILD_TARGETS)
 
 # ThreadSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
 # llvm-symbolizer is auto-detected on PATH) with:
 #   TSAN_OPTIONS="suppressions=$$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0" \
 #     ./build/clang-tsan/extension/sirius/test/cpp/sirius_unittest
 clang-tsan: build/clang-tsan/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(BUILD_TARGETS)
 
 ci-release: build/ci-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(BUILD_TARGETS)
 
 configure_ci:
 	@echo "configure_ci step is skipped for this extension build..."
