@@ -98,20 +98,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     return _input_data ? _input_data->get_estimated_size_in_bytes() : 0;
   }
 
-  [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input() const
-  {
-    std::size_t input_size = 0;
-    auto* pipelineable_input =
-      dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
-    if (pipelineable_input) {
-      for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
-        if (ro.get_data() && ro.get_current_tier() != cucascade::memory::Tier::GPU) {
-          input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
-        }
-      }
-    }
-    return input_size;
-  }
+  [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input() const;
 
  private:
   std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality

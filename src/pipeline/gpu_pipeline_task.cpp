@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -181,6 +182,32 @@ std::unique_ptr<op::operator_data> run_one_operator(
 }
 
 }  // namespace
+
+std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input() const
+{
+  if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
+      scan_input && scan_input->is_resident()) {
+    // Cached scan inputs can still reside in HOST and require an upload before execution.
+    auto batch = scan_input->get_cached_batch();
+    if (!batch) { return 0; }
+
+    auto ro          = batch->to_read_only();
+    auto const* data = ro.get_data();
+    if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
+    return data->get_uncompressed_data_size_in_bytes();
+  }
+
+  std::size_t input_size   = 0;
+  auto* pipelineable_input = dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
+  if (pipelineable_input) {
+    for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
+      if (ro.get_data() && ro.get_current_tier() != cucascade::memory::Tier::GPU) {
+        input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
+      }
+    }
+  }
+  return input_size;
+}
 
 gpu_pipeline_task::gpu_pipeline_task(
   uint64_t task_id,
