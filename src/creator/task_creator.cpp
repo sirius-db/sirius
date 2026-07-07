@@ -521,6 +521,13 @@ void task_creator::manager_loop()
           task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
         }
+        // Unconditional re-evaluation at every creation exit: with the
+        // source-exhaustion finish guard, "last task completed at T1,
+        // connector closed at T2>T1" has no later mark_task_completed() to
+        // re-check the pipeline — this call, observing the now-exhausted
+        // source, is the paired re-evaluation. Without it, normal fast-GPU
+        // queries would hang.
+        pipeline->update_pipeline_status(false);
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
         _task_scheduler->terminate_query(std::current_exception());

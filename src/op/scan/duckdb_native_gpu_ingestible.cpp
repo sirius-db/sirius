@@ -127,6 +127,17 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
   {
     std::vector<std::unique_ptr<scan_info>> out;
     if (!_acc.empty()) { out.push_back(emit_current()); }
+    // Whole scan coalesced to nothing (every row group empty or stats-pruned): emit
+    // one empty split so the scan still creates a task. decode_duckdb_native_split
+    // turns an empty row-group list into a schema-correct 0-row table. Without this,
+    // zero splits mean zero tasks and the pipeline-completion signal never fires.
+    if (!_produced_any && _have_template) {
+      auto split           = std::make_unique<duckdb_native_scan_info>();
+      split->datasource    = _datasource->duplicate();
+      split->block_manager = _block_manager;
+      _produced_any        = true;
+      out.push_back(std::move(split));
+    }
     return out;
   }
 
@@ -140,6 +151,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     _acc.clear();
     _acc_bytes = 0;
     std::fill(_col_bytes.begin(), _col_bytes.end(), 0);
+    _produced_any = true;
     return split;
   }
 
@@ -152,6 +164,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
   std::size_t _acc_bytes = 0;
 
   bool _have_template = false;
+  bool _produced_any  = false;
   std::shared_ptr<sirius::io::sirius_datasource> _datasource;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 };
@@ -231,8 +244,11 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
 
   // Slice [0, n_row_groups) into parse ranges; each becomes one thunk (Phase 2).
+  // Always at least one range: a zero-row-group table must still push one (empty)
+  // scan_info so the coalescer seeds its template and emits the empty split —
+  // zero splits would mean zero tasks and the query never completes.
   _chunk_row_groups = metadata_parse_chunk();
-  _num_ranges       = utils::ceil_div(_plan.n_row_groups, _chunk_row_groups);
+  _num_ranges = std::max<std::size_t>(1, utils::ceil_div(_plan.n_row_groups, _chunk_row_groups));
 }
 
 duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;

@@ -27,6 +27,12 @@
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
+#include <cstdint>
+
+namespace cudf {
+class table_view;
+}  // namespace cudf
+
 namespace sirius {
 
 namespace pipeline {
@@ -123,6 +129,21 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+  /// @brief Join-type-correct output when one input side has no rows. Invoked by the regular
+  /// execute path when it receives a real 0-row batch (e.g. an all-pruned scan under the
+  /// empty-split fallback): the preserved side's rows are padded, kept, or marked false per
+  /// join type; only the condition evaluation is skipped.
+  std::unique_ptr<operator_data> emit_one_side_empty_result(const cudf::table_view& left,
+                                                            const cudf::table_view& right,
+                                                            bool left_side_empty,
+                                                            cucascade::memory::memory_space& space,
+                                                            rmm::cuda_stream_view stream);
+
+  //! Left table restricted to left_output_col_idxs (the plan's left projection map). Applied
+  //! by the left-only output paths (SEMI/ANTI/MARK), whose result must match op.types;
+  //! selection drops columns only, so row indices from joins on the full table stay valid.
+  cudf::table_view select_left_output(const cudf::table_view& left) const;
 
  protected:
   std::mutex batches_to_processed_mutex;

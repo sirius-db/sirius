@@ -378,16 +378,29 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(st
   // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
   if (_io_ctx && _io_ctx->type() == *type) { return _io_ctx; }
 
-  std::lock_guard lk{_routed_io_ctxs_mtx};
-  if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+  }
+  // Build outside the map mutex: make_ioctx/start spawn reactor threads and
+  // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
+  // park every concurrent lookup behind one long critical section. The build
+  // mutex serializes builders instead, so two first-touches of the same type
+  // never construct twice (a losing ioctx would need drain/stop teardown).
+  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+  }
   auto io_ctx = _ioctx_registry.make_ioctx(*type);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.enable_prefetch_cache && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
   }
-  _routed_io_ctxs.emplace(*type, io_ctx);
-  return io_ctx;
+  std::lock_guard lk{_routed_io_ctxs_mtx};
+  auto [it, inserted] = _routed_io_ctxs.emplace(*type, std::move(io_ctx));
+  return it->second;
 }
 
 void sirius_scan_manager::reset()
