@@ -338,9 +338,14 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   // produces a JIT codegen_fused_representation carrying the fused region's
   // manifest buffers, so their leaves are reconstructed unconditionally as a
   // fused rep.
+  // A fused rep's num_rows drives the codegen decode grid. Use the node's own
+  // output length (round-tripped in leaf_desc); fall back to the column row count
+  // only for legacy blobs that predate the field (ld.num_rows == 0).
+  const cudf::size_type node_rows =
+    ld.num_rows > 0 ? static_cast<cudf::size_type>(ld.num_rows) : col_num_rows;
   auto make_fused_rep = [&](const char* kind_tag) {
     auto rep = std::make_unique<codegen_fused_representation>(
-      kind_tag, tag_to_dtype(ld.type_tag), col_num_rows);
+      kind_tag, tag_to_dtype(ld.type_tag), node_rows);
     for (std::size_t i = 0; i < bufs.size(); ++i) {
       rep->buffers.emplace_back(bufs[i].name, make_col(i));
     }
@@ -377,7 +382,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // v10 combines the per-column fixed-point scale (decimal support) with the
 // ANS/bitcomp string-extras meta; both landed independently as "v9" on separate
 // branches, so the merged format takes a fresh number.
-static constexpr std::uint8_t kVersion = 10;
+static constexpr std::uint8_t kVersion = 11;
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -524,6 +529,7 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
       if (!r.read_u8(k)) return bad("truncated leaf kind");
       ld.kind = static_cast<PlanLeafKind>(k);
       if (!r.read_u8(ld.type_tag)) return bad("truncated leaf type_tag");
+      if (!r.read_u64le(ld.num_rows)) return bad("truncated leaf num_rows");
       if (!read_meta(r, ld.meta)) return bad("truncated/unknown leaf meta");
 
       std::uint8_t nb;
@@ -748,6 +754,7 @@ std::string build_compressed_table_header(compressed_table const& table,
       push_i32le(hdr, ld.slot);
       push_u8(hdr, static_cast<std::uint8_t>(ld.kind));
       push_u8(hdr, ld.type_tag);
+      push_u64le(hdr, ld.num_rows);
       push_meta(hdr, ld.meta);
       push_u8(hdr, static_cast<std::uint8_t>(ld.buffers.size()));
 

@@ -366,6 +366,34 @@ int run_rendered_decode(const jit::FusedTree& tree,
       return -1;
     }
     dptrs.push_back(reinterpret_cast<CUdeviceptr>(it->second.ptr));
+    // Guard: a per-chunk metadata buffer is indexed by the (root) chunk_id in
+    // [0, num_chunks), so it must hold at least num_chunks entries (+1 for the
+    // exclusive-offset arrays). If the launch grid (derived from num_rows) exceeds
+    // what the bound metadata describes, the kernel would read out of bounds and
+    // fault the CUDA context. Fail cleanly instead — this catches any future drift
+    // between a rep's num_rows and its serialized per-chunk channels.
+    {
+      const std::size_t len = it->second.length;
+      const bool is_off     = (b.field == "rle_runs_offsets" || b.field == "bp_offsets");
+      const bool is_perchk  = (b.field == "chunk_min" || b.field == "chunk_bits" ||
+                              b.field == "chunk_count" || b.field == "references" ||
+                              b.field == "offsets" || is_off);
+      const std::size_t need = static_cast<std::size_t>(num_chunks) + (is_off ? 1u : 0u);
+      if (is_perchk && len < need) {
+        std::fprintf(stderr,
+                     "simpatico::codegen: rendered decode: metadata buffer '%s' (node %d) has %zu "
+                     "entries but the grid needs >=%zu (num_rows=%lld num_chunks=%d, kernel=%s) — "
+                     "num_rows/metadata mismatch; refusing to launch\n",
+                     b.field.c_str(),
+                     b.node_id,
+                     len,
+                     need,
+                     static_cast<long long>(num_rows),
+                     num_chunks,
+                     spec.entry_symbol.c_str());
+        return -1;
+      }
+    }
   }
 
   CUdeviceptr d_out    = static_cast<CUdeviceptr>(out_ptr);

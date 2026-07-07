@@ -22,7 +22,11 @@ leaf_desc make_leaf_desc(std::uint32_t node_index,
   d.slot       = slot;
   d.kind       = kind;
   d.type_tag   = dtype_to_tag(rep->decoded_type());
-  d.meta       = rep->describe_meta();
+  // The node's own output length. Decode sizes the codegen kernel grid from this,
+  // so a nested fused subtree (whose length is far below the column row count)
+  // must round-trip its true length rather than inherit the column's.
+  d.num_rows = rep->num_rows > 0 ? static_cast<std::uint64_t>(rep->num_rows) : 0;
+  d.meta     = rep->describe_meta();
   for (auto const& ch : rep->named_channels(stream)) {
     leaf_buffer_desc bd;
     bd.name     = ch.name;

@@ -139,6 +139,35 @@ void test_fused_delta_rle_bitpack()
                "delta.differences.runs -> bitpack\n");
 }
 
+// 1b. Regression: tail-routed nested RLE on a bitpack metadata channel, at a
+//     scale where the metadata channel is far shorter than the column.
+//
+//     `bitpack` is a fused-tree LEAF (build_fused_tree), so `bitpack.chunk_count
+//     -> rle` is decoded as a SEPARATE codegen subtree whose true length is the
+//     parent's per-chunk count (~ceil(col_rows/kChunkSize)), i.e. ~1000x below
+//     the column row count. The decode grid is ceil(rep->num_rows / kChunkSize),
+//     so the subtree's rep MUST carry its own length. Before the fix,
+//     reconstruction gave every fused rep the *column* row count, so this
+//     subtree launched ceil(col_rows/1024) blocks against per-chunk metadata
+//     built for only ceil(chunk_count_len/1024) chunks — a device out-of-bounds
+//     read (context-fatal on real data / hardware). ~300k rows yields ~293
+//     parent chunks, so the buggy grid overran a 2-entry rle_runs_offsets by
+//     ~290 blocks. The tiny hand-written plans elsewhere never dispatch a nested
+//     metadata subtree at this scale, which is why this went uncaught.
+void test_nested_metadata_rle_scale()
+{
+  auto t = make_int32_table(1, 300000, 5);
+  io_roundtrip("nested_metadata_rle_scale",
+               t->view(),
+               "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+               "bitpack.chunk_min -> identity\n"
+               "bitpack.chunk_bits -> identity\n"
+               "bitpack.packed -> identity\n"
+               "bitpack.chunk_count -> rle -> runs, values\n"
+               "bitpack.chunk_count.runs -> rle -> runs, values\n"
+               "bitpack.chunk_count.values -> rle -> runs, values\n");
+}
+
 // 2. FOR + fused bitpack on deltas: JIT fused region covers both ops.
 void test_for_bitpack()
 {
@@ -333,6 +362,7 @@ int main()
   };
   Case cases[] = {
     {"fused_delta_rle_bitpack", test_fused_delta_rle_bitpack},
+    {"nested_metadata_rle_scale", test_nested_metadata_rle_scale},
     {"for_bitpack", test_for_bitpack},
     {"for_only", test_for_only},
     {"zigzag", test_zigzag},

@@ -137,6 +137,11 @@ struct leaf_desc {
   std::int32_t slot        = kSelfRepSlot;
   PlanLeafKind kind        = PlanLeafKind::Unknown;
   std::uint8_t type_tag    = 0;  // decoded column dtype tag
+  // This node's own output length (elements). For a nested fused subtree this is
+  // the channel length, which can be far smaller than the enclosing column's row
+  // count; the codegen decode grid is ceil(num_rows / kChunkSize), so it MUST use
+  // this per-node value rather than the column row count (see rep_from_leaf_desc).
+  std::uint64_t num_rows = 0;
   leaf_meta_v meta{leaf_meta::none{}};
   std::vector<leaf_buffer_desc> buffers;  // channel buffers in named_channels() order
 };
