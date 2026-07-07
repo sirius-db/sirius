@@ -54,6 +54,23 @@ __global__ void bp_offsets_tail_kernel(const std::int32_t* counts,
   offsets[num_chunks] = offsets[num_chunks - 1] + fn(num_chunks - 1);
 }
 
+// Single-thread in-place inclusive scan for small problems. CUB's vectorized
+// scan kernel reads whole 16-byte quads, over-reading a tight allocation
+// whose byte size is not a 16-byte multiple — real OOB on the tiny per-chunk
+// metadata buffers this file scans. At these sizes the launch latency
+// dominates anyway, so a serial kernel costs nothing and reads exactly n
+// elements.
+inline constexpr std::int32_t kSerialScanMaxItems = 1024;
+
+__global__ void inclusive_scan_serial_kernel(std::int32_t* buf, std::int32_t n)
+{
+  std::int32_t acc = 0;
+  for (std::int32_t i = 0; i < n; ++i) {
+    acc += buf[i];
+    buf[i] = acc;
+  }
+}
+
 }  // namespace
 
 extern "C" {
@@ -153,6 +170,18 @@ int simpatico_compute_rle_offsets_inclusive_scan(void* d_rle_offsets_v,  // int3
 
   auto* buf   = static_cast<std::int32_t*>(d_rle_offsets_v);
   auto stream = static_cast<cudaStream_t>(stream_v);
+
+  if (length <= kSerialScanMaxItems) {
+    if (d_temp_storage == nullptr) {
+      // Probe call. Report a token scratch size so the caller's execute call
+      // arrives with d_temp_storage != nullptr and is distinguishable from
+      // another probe (the serial kernel must run exactly once).
+      *d_temp_storage_bytes_inout = 16;
+      return 0;
+    }
+    inclusive_scan_serial_kernel<<<1, 1, 0, stream>>>(buf, length);
+    return static_cast<int>(cudaPeekAtLastError());
+  }
 
   std::size_t tmp_bytes = *d_temp_storage_bytes_inout;
   cudaError_t e =

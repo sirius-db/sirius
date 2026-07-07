@@ -111,6 +111,22 @@ __global__ void compact_bitpack_gather_kernel(const std::uint32_t* __restrict__ 
   }
 }
 
+// Single-thread exclusive scan for small problems (see the caller: CUB's
+// vectorized scan over-reads tight tiny inputs; launch latency dominates at
+// this size anyway).
+inline constexpr std::int32_t kSerialScanMaxItems = 1024;
+
+__global__ void exclusive_scan_serial_kernel(const std::int32_t* __restrict__ in,
+                                             std::int32_t* __restrict__ out,
+                                             std::int32_t n)
+{
+  std::int32_t acc = 0;
+  for (std::int32_t i = 0; i < n; ++i) {
+    out[i] = acc;
+    acc += in[i];
+  }
+}
+
 // Exclusive-scans live_words -> a transient bp_offsets buffer, then launches
 // the gather above. Allocates bp_offsets + CUB scratch via RMM on `stream`;
 // both are RAII-freed (async, same stream) on return.
@@ -129,22 +145,32 @@ void compact_bitpack_gather(void* dst_device,
   auto* d_bp_offsets = static_cast<std::int32_t*>(bp_offsets_buf.data());
   auto* in_words     = static_cast<const std::int32_t*>(d_live_words);
 
-  // CUB's two-call protocol: probe the scratch size (no stream dependency),
-  // then allocate and run the real scan.
-  std::size_t scratch_bytes = 0;
-  check_cuda(
-    cub::DeviceScan::ExclusiveSum(nullptr, scratch_bytes, in_words, d_bp_offsets, num_chunks),
-    "bp_offsets scan probe");
+  if (num_chunks <= kSerialScanMaxItems) {
+    // CUB's vectorized scan kernel reads whole 16-byte quads, over-reading a
+    // tight input allocation whose byte size is not a 16-byte multiple. At
+    // these sizes the launch latency dominates anyway; a serial kernel reads
+    // exactly num_chunks elements.
+    exclusive_scan_serial_kernel<<<1, 1, 0, stream.value()>>>(
+      in_words, d_bp_offsets, num_chunks);
+    check_cuda(cudaPeekAtLastError(), "bp_offsets serial scan");
+  } else {
+    // CUB's two-call protocol: probe the scratch size (no stream dependency),
+    // then allocate and run the real scan.
+    std::size_t scratch_bytes = 0;
+    check_cuda(
+      cub::DeviceScan::ExclusiveSum(nullptr, scratch_bytes, in_words, d_bp_offsets, num_chunks),
+      "bp_offsets scan probe");
 
-  rmm::device_buffer scratch_buf;
-  void* d_scratch = nullptr;
-  if (scratch_bytes > 0) {
-    scratch_buf = rmm::device_buffer(scratch_bytes, stream, mr);
-    d_scratch   = scratch_buf.data();
+    rmm::device_buffer scratch_buf;
+    void* d_scratch = nullptr;
+    if (scratch_bytes > 0) {
+      scratch_buf = rmm::device_buffer(scratch_bytes, stream, mr);
+      d_scratch   = scratch_buf.data();
+    }
+    check_cuda(cub::DeviceScan::ExclusiveSum(
+                 d_scratch, scratch_bytes, in_words, d_bp_offsets, num_chunks, stream.value()),
+               "bp_offsets scan");
   }
-  check_cuda(cub::DeviceScan::ExclusiveSum(
-               d_scratch, scratch_bytes, in_words, d_bp_offsets, num_chunks, stream.value()),
-             "bp_offsets scan");
 
   constexpr int kBlock = 256;
   compact_bitpack_gather_kernel<kBlock>
@@ -198,10 +224,15 @@ void bitpack_compressed_representation::compact_in_place(rmm::cuda_stream_view s
         "column is null but live_packed_bytes > 0");
     }
     // Per-chunk live_words from chunk_bits x chunk_count, then
-    // scan -> bp_offsets, gather the live words into ``dense``.
+    // scan -> bp_offsets, gather the live words into ``dense``. The scan
+    // input is padded to a 16-byte multiple: CUB's vectorized loads read
+    // whole 16-byte quads, which for a tiny chunk count (allocation < 16
+    // bytes) is an out-of-bounds read of the tight allocation.
     cudf::size_type num_chunks = chunk_count->size();
-    rmm::device_buffer lw_buf(
-      static_cast<std::size_t>(num_chunks) * sizeof(std::int32_t), stream, mr);
+    std::size_t const lw_bytes =
+      (static_cast<std::size_t>(num_chunks) * sizeof(std::int32_t) + 15) / 16 * 16;
+    rmm::device_buffer lw_buf(lw_bytes, stream, mr);
+    cudaMemsetAsync(lw_buf.data(), 0, lw_bytes, stream.value());
     if (simpatico_compute_live_words(chunk_count->view().head<void>(),
                                      chunk_bits->view().head<void>(),
                                      num_chunks,
