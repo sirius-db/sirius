@@ -25,7 +25,6 @@
 #include <utility>
 
 namespace duckdb {
-class GPUBufferManager;
 struct DBConfig;
 
 // Bind-time payload for the sirius_read_parquet table function. Carries the
@@ -68,34 +67,9 @@ class SiriusExtension : public Extension {
   std::string Version() const override;
   static void InitialGPUConfigs(DBConfig& db);
   static void RegisterGPUFunctions(DatabaseInstance& catalog);
-#ifdef SIRIUS_ENABLE_LEGACY
-  static void GPUProcessingSubstraitFunction(ClientContext& context,
-                                             TableFunctionInput& data_p,
-                                             DataChunk& output);
-  static void GPUProcessingFunction(ClientContext& context,
-                                    TableFunctionInput& data_p,
-                                    DataChunk& output);
-  static unique_ptr<FunctionData> GPUProcessingSubstraitBind(ClientContext& context,
-                                                             TableFunctionBindInput& input,
-                                                             vector<LogicalType>& return_types,
-                                                             vector<string>& names);
-  static unique_ptr<FunctionData> GPUProcessingBind(ClientContext& context,
-                                                    TableFunctionBindInput& input,
-                                                    vector<LogicalType>& return_types,
-                                                    vector<string>& names);
-#endif
   static void GPUExecutionFunction(ClientContext& context,
                                    TableFunctionInput& data_p,
                                    DataChunk& output);
-#ifdef SIRIUS_ENABLE_LEGACY
-  static void GPUBufferInitFunction(ClientContext& context,
-                                    TableFunctionInput& data_p,
-                                    DataChunk& output);
-  static unique_ptr<FunctionData> GPUBufferInitBind(ClientContext& context,
-                                                    TableFunctionBindInput& input,
-                                                    vector<LogicalType>& return_types,
-                                                    vector<string>& names);
-#endif
   static unique_ptr<FunctionData> GPUExecutionBind(ClientContext& context,
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
@@ -116,10 +90,6 @@ class SiriusExtension : public Extension {
                                                  TableFunctionBindInput& input,
                                                  vector<LogicalType>& return_types,
                                                  vector<string>& names);
-
-#ifdef SIRIUS_ENABLE_LEGACY
-  static bool buffer_is_initialized;
-#endif
 };
 
 }  // namespace duckdb

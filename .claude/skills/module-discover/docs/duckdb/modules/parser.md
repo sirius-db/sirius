@@ -31,7 +31,7 @@ public:
 **Description**: SQL parser that produces a list of `SQLStatement` objects from a query string.
 
 **Our usage**:
-- `src/sirius_extension.cpp` — Parse the SQL string passed to `gpu_processing()`/`gpu_execution()`
+- `src/sirius_extension.cpp` — Parse the SQL string passed to `gpu_execution()`
 - `test/cpp/pipeline/test_modified_pipeline.cpp` — Parse test queries
 - `test/cpp/integration/test_tpcds_plan_translation.cpp` — Parse TPC-DS queries
 
@@ -50,7 +50,7 @@ struct CreateTableFunctionInfo : public CreateFunctionInfo {
 **Description**: Information needed to register a table function in the catalog.
 
 **Our usage**:
-- `src/sirius_extension.cpp` — Create registration info for `gpu_processing`, `gpu_execution`, `gpu_buffer_init`, profiling functions
+- `src/sirius_extension.cpp` — Create registration info for `gpu_execution`, profiling functions
 - `test/cpp/integration/test_tpcds_plan_translation.cpp` — Register test functions
 
 ### ConstantExpression / FunctionExpression / TableFunctionRef

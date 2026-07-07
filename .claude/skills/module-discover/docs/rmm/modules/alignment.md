@@ -6,7 +6,7 @@
 
 ## Summary
 
-Memory alignment helper functions and constants. Used by `GPUBufferManager` for ensuring proper CUDA memory alignment.
+Memory alignment helper functions and constants. Used for ensuring proper CUDA memory alignment.
 
 ## API Reference
 

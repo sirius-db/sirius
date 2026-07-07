@@ -28,10 +28,6 @@ namespace duckdb {
 // * Add a configuration field associated with Sirius (see InitialGPUConfigs in sirius_extension.cpp
 // for examples)
 struct Config {
-  // For gpu buffer manager
-  static bool USE_PIN_MEM_FOR_CPU_PROCESSING;  // use_pin_memory
-  static bool USE_PIN_MEM_FOR_CACHING;         // use_pin_memory_for_caching
-
   // For expression executor
   static bool USE_CUDF_EXPR;  // use_cudf_expr
   // Strategy used by sirius::expression_evaluator.

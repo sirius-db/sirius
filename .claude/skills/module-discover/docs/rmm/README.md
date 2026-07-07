@@ -32,7 +32,7 @@
 We use **8 of 17** modules. Primary integration points:
 - **Stream management**: `rmm::cuda_stream_view` is the standard stream parameter type across all GPU operators, pipeline tasks, and expression executors
 - **Device memory**: `rmm::device_buffer` and `rmm::device_uvector` for GPU memory allocations in operators and CUDA kernels
-- **Memory resources**: `rmm::mr::pool_memory_resource<cuda_memory_resource>` in `GPUBufferManager` for the processing memory pool
+- **Memory resources**: `rmm::mr::pool_memory_resource<cuda_memory_resource>` for Sirius's GPU processing memory pool
 - **Resource refs**: `rmm::device_async_resource_ref` as the standard allocator parameter type in operators and kernels
 - **Error handling**: `rmm::out_of_memory` caught in pipeline OOM reschedule logic
 

@@ -66,8 +66,8 @@ pixi run make test
 Run tests by Catch2 tag or name:
 
 ```bash
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
 ```
 
 ## Using CLion for development

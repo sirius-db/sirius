@@ -26,7 +26,7 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 ### `SIRIUS_DISABLE`
 
-Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks.
+Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
 
 ```bash
 export SIRIUS_DISABLE=1
@@ -350,13 +350,6 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | `sirius_log_dir` | `log` | Log output directory |
 | `sirius_log_flush_seconds` | 5 | Log flush interval |
 
-### Memory
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `use_pin_memory` | true | Use pinned memory for CPU↔GPU transfers |
-| `use_pin_memory_for_caching` | false | Use pinned memory for scan caching |
-
 ### Expression Evaluation
 
 | Variable | Default | Description |
@@ -400,19 +393,17 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 |----------|---------|-------------|
 | `print_gpu_table_max_rows` | - | Max rows to print in debug output |
 | `enable_fallback_check` | - | Enable fallback validation |
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU on Sirius errors. Matches the legacy `gpu_processing` path. Set to `false` to surface Sirius errors instead of silently falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU on Sirius errors. Set to `false` to surface Sirius errors instead of silently falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
-## Legacy Config Flags
+## Compile-Time Config Flags
 
 **File:** `src/include/config.hpp`
 
-Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `namespace sirius::Config`:
+Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `USE_PIN_MEM_FOR_CPU_PROCESSING` | true | `duckdb::Config` |
-| `USE_PIN_MEM_FOR_CACHING` | false | `duckdb::Config` |
 | `USE_CUDF_EXPR` | true | `duckdb::Config` |
 | `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
@@ -426,7 +417,7 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | File | Purpose |
 |------|---------|
 | `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
-| `src/include/config.hpp` | Legacy config flags |
+| `src/include/config.hpp` | Compile-time config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
 | `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |

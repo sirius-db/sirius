@@ -6,7 +6,7 @@
 
 ## Summary
 
-Polymorphic memory resource classes for GPU memory allocation. Sirius uses `cuda_memory_resource` (raw cudaMalloc) as the upstream allocator and wraps it in `pool_memory_resource` for the GPU processing memory pool in `GPUBufferManager`.
+Polymorphic memory resource classes for GPU memory allocation. Sirius uses `cuda_memory_resource` (raw cudaMalloc) as the upstream allocator and wraps it in `pool_memory_resource` for the GPU processing memory pool.
 
 ## API Reference
 

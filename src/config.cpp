@@ -18,9 +18,6 @@
 
 namespace duckdb {
 
-bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
-bool Config::USE_PIN_MEM_FOR_CACHING        = false;
-
 bool Config::USE_CUDF_EXPR = true;
 sirius::expression_evaluator_strategy Config::EXPRESSION_EVALUATOR_STRATEGY =
   sirius::expression_evaluator_strategy::AST_INTERPRET;

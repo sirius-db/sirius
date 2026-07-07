@@ -33,10 +33,6 @@
       "name": "clang-tsan"
     },
     {
-      "configurePreset": "legacy-release",
-      "name": "legacy-release"
-    },
-    {
       "configurePreset": "vcpkg-debug",
       "name": "vcpkg-debug"
     },
@@ -178,14 +174,6 @@
       },
       "inherits": "clang-sanitizer-base",
       "name": "clang-tsan"
-    },
-    {
-      "binaryDir": "${sourceDir}/../build/legacy-release",
-      "cacheVariables": {
-        "ENABLE_LEGACY_SIRIUS": "ON"
-      },
-      "inherits": "release",
-      "name": "legacy-release"
     },
     {
       "cacheVariables": {

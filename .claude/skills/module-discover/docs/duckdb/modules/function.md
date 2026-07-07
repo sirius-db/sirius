@@ -10,7 +10,7 @@
 
 ## Summary
 
-The `function` module defines DuckDB's function system — table functions, scalar functions, and aggregate functions. Sirius uses table functions as its primary extension interface (`gpu_processing`, `gpu_execution`, `gpu_buffer_init`) and reads scalar/aggregate function metadata to map them to GPU equivalents.
+The `function` module defines DuckDB's function system — table functions, scalar functions, and aggregate functions. Sirius uses table functions as its primary extension interface (`gpu_execution`) and reads scalar/aggregate function metadata to map them to GPU equivalents.
 
 ## API Reference
 
@@ -40,7 +40,7 @@ public:
 };
 ```
 
-**Description**: Defines a table-valued function. This is the primary mechanism for Sirius to hook into DuckDB — `gpu_processing`, `gpu_execution`, `gpu_buffer_init`, `start_profiling`, and `stop_profiling` are all registered as table functions.
+**Description**: Defines a table-valued function. This is the primary mechanism for Sirius to hook into DuckDB — `gpu_execution`, `start_profiling`, and `stop_profiling` are all registered as table functions.
 
 **Our usage**:
 - `src/sirius_extension.cpp` — Register all Sirius table functions

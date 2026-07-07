@@ -1,6 +1,6 @@
 # Super Sirius Documentation
 
-Super Sirius is the new task-based GPU execution engine in Sirius. It uses `namespace sirius` and replaces the legacy `gpu_processing` path with a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
+Super Sirius is the task-based GPU execution engine in Sirius. It uses `namespace sirius` and a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
 
 With a Sirius config file (`~/.sirius/sirius.yaml`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required. Legacy `sirius.cfg` is still recognized for compatibility.
 
@@ -11,17 +11,6 @@ LOAD 'sirius.duckdb_extension';
 -- Plain SQL — transparently executed on GPU:
 SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 ```
-
-## How It Differs from Legacy Sirius
-
-| Aspect | Legacy (`gpu_processing`) | Super Sirius |
-|--------|---------------------------|-------------------------------|
-| Namespace | `duckdb` | `sirius` |
-| Entry point | `CALL gpu_processing(...)` | Plain SQL (transparent) or `CALL gpu_execution(...)` |
-| Plan generator | `GPUPhysicalPlanGenerator` | `sirius_physical_plan_generator` |
-| Operators | `GPUPhysicalOperator` in `src/operator/` | `sirius_physical_operator` in `src/op/` |
-| Execution model | Single-threaded GPU executor | Multi-pipeline task-based execution |
-| Memory management | `GPUBufferManager` | cuCascade tiered memory (GPU/Host/Disk) |
 
 ## Table of Contents
 

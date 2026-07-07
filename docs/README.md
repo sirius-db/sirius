@@ -69,10 +69,9 @@ ORDER BY l_returnflag;
 SET gpu_execution = false;
 ```
 
-Two execution paths are available. See each page for build, configuration, and testing details:
+See the [`gpu_execution`](gpu_execution.md) page for build, configuration, and testing details:
 
-- **[`gpu_execution`](gpu_execution.md) (Recommended)** — Out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. Works with **Parquet** data format.
-- **[`gpu_processing`](gpu_processing.md)** — In-memory execution where the dataset must fit in GPU memory. Works with DuckDB's native storage format.
+- **[`gpu_execution`](gpu_execution.md)** — Out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. Works with **Parquet** data format.
 
 ## Configuration
 

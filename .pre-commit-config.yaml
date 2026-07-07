@@ -15,7 +15,7 @@
 # Global exclusions, csv are excluded because they are often test answers, and experimental is out of lint scope.
 # .patch files are verbatim diffs: formatters (trailing-whitespace, end-of-file-fixer)
 # strip the leading context space on blank lines and corrupt `git apply`.
-exclude: \.csv$|\.patch$|^legacy/queries/.*|^experimental/.*
+exclude: \.csv$|\.patch$|^experimental/.*
 
 repos:
   # Standard hooks
@@ -36,7 +36,6 @@ repos:
       - id: end-of-file-fixer
         exclude: |
           (?x)^(
-            ^legacy/queries/.*|
             ^python/cudf/cudf/tests/data/vocab.txt|
             .*version-hint\.text$
           )
@@ -44,7 +43,6 @@ repos:
       - id: pretty-format-json
         args: [--autofix]
       - id: trailing-whitespace
-        exclude: 'test/sql/clickbench-sirius\.test'
   - repo: https://github.com/psf/black
     rev: 25.1.0
     hooks:
