@@ -140,6 +140,7 @@ size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
 struct suffix_sink {
   std::vector<std::uint8_t> data;
   std::size_t cap{0};
+  std::size_t total_received{0};  // wire bytes, incl. those dropped by cap/abort
   long status{0};
   std::string content_range;
   std::string retry_after;
@@ -176,6 +177,7 @@ size_t suffix_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
   auto* s            = static_cast<suffix_sink*>(userdata);
   size_t const bytes = size * nmemb;
+  s->total_received += bytes;
   if (s->status != 206) { return 0; }
   if (s->data.size() < s->cap) {
     size_t const take = std::min(s->cap - s->data.size(), bytes);
@@ -886,6 +888,11 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     long status       = 0;
     curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
 
+    // payload_bytes_read_total is always-on and per-attempt (see the async
+    // worker's finish()), so credit every attempt's wire bytes outside the
+    // perf_instrumentation gate.
+    _perf.payload_bytes_read_total.fetch_add(sink.total_received, std::memory_order_relaxed);
+
     // suffix_write_cb aborts any non-206 body, so a CURLE_WRITE_ERROR here is our
     // own doing and the HTTP status is still valid; only a different curl error
     // (no HTTP status) is a genuine transport failure.
@@ -915,7 +922,6 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
           atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
           std::uint64_t expected = 0;
           _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
-          _perf.payload_bytes_read_total.fetch_add(sink.data.size(), std::memory_order_relaxed);
         }
         probe.object_size = *total;
         probe.window_lo   = *start;

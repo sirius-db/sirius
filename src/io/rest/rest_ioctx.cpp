@@ -76,13 +76,6 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path)
     std::move(path), std::move(parsed.host), std::move(parsed.path), size);
 }
 
-namespace {
-// Suffix length requested by a parquet footer probe.  Generous enough to cover
-// typical parquet footers (KB-scale) plus the 8-byte trailer in one GET; a
-// footer larger than this simply falls through to a ranged GET at read time.
-constexpr std::size_t kFooterProbeBytes = std::size_t{1} << 20;  // 1 MiB
-}  // namespace
-
 std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path, open_hint hint)
 {
   if (hint == open_hint::parquet_footer_probe) {
@@ -102,8 +95,8 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::st
 
   // One suffix-range GET resolves the size and stashes the footer; cuDF's
   // trailer/footer reads are then served from the stash by host_read.
-  footer_probe probe =
-    _reactors.front()->fetch_footer_suffix(parsed.host, parsed.path, kFooterProbeBytes);
+  footer_probe probe = _reactors.front()->fetch_footer_suffix(
+    parsed.host, parsed.path, _reactors.front()->get_config().footer_probe_bytes);
   if (!probe.bytes) {
     // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
     // fall back to a plain HEAD for the size, with no stash.

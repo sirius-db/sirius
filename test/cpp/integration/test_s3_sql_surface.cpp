@@ -301,6 +301,7 @@ struct sirius_memory_limits {
   std::optional<std::size_t> rest_n_reactors;
   std::optional<std::size_t> rest_max_connections;
   std::optional<bool> use_sirius_datasource;
+  std::optional<std::string> rest_footer_probe_bytes;
   bool rest_perf_instrumentation{false};
 };
 
@@ -413,6 +414,9 @@ class sirius_config_env_guard {
         << limits.rest_max_connections.value_or(std::size_t{8})
         << "\n"
            "        request_timeout_s: 30\n";
+    if (limits.rest_footer_probe_bytes.has_value()) {
+      out << "        footer_probe_bytes: " << yaml_quote(*limits.rest_footer_probe_bytes) << "\n";
+    }
     if (limits.rest_perf_instrumentation) { out << "        perf_instrumentation: true\n"; }
     out.close();
     REQUIRE(out);
@@ -843,7 +847,11 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
                                              bool use_footer_probe = false)
 {
   auto& manager = require_sirius_context(fixture).get_scan_manager();
-  auto& rest    = ensure_rest_ioctx_for_bench(manager, uri);
+  // Snapshotting the routed REST ioctx before the measured open requires one
+  // unmeasured datasource lookup.  That may warm the backend's connection path,
+  // so the absolute open_ms is a warm-open measurement; the generic/probe A/B
+  // still uses the same pre-open and remains comparable within this benchmark.
+  auto& rest = ensure_rest_ioctx_for_bench(manager, uri);
 
   auto const wall_start = bench_clock::now();
   auto const before     = rest.perf_snapshot();
@@ -913,6 +921,7 @@ struct bench_record {
   double wall_clock_ms{0.0};
   double open_ms{0.0};
   double footer_fetch_ms{0.0};
+  double bind_ms{0.0};
   double metadata_parse_ms{0.0};
   double scan_ms{0.0};
   std::uint64_t payload_bytes_read{0};
@@ -959,6 +968,7 @@ bench_record make_record(std::string scenario,
                       measurement.wall_clock_ms,
                       measurement.open_ms,
                       measurement.footer_fetch_ms,
+                      measurement.open_ms + measurement.footer_fetch_ms,
                       measurement.metadata_parse_ms,
                       measurement.scan_ms,
                       measurement.payload_bytes_read,
@@ -987,15 +997,13 @@ void warn_footer_probe_ab(std::string_view label,
                           bench_record const& generic,
                           bench_record const& probe)
 {
-  double const generic_bind = generic.open_ms + generic.footer_fetch_ms;
-  double const probe_bind   = probe.open_ms + probe.footer_fetch_ms;
-  WARN("[footerbind A/B] " << label << " bind(open+footer) generic=" << generic_bind << "ms"
+  WARN("[footerbind A/B] " << label << " bind(open+footer) generic=" << generic.bind_ms << "ms"
                            << " (bind_chunk_get=" << generic.bind_chunk_get_count
                            << ", total_chunk_get=" << generic.chunk_get_count
-                           << ") probe=" << probe_bind << "ms"
+                           << ") probe=" << probe.bind_ms << "ms"
                            << " (bind_chunk_get=" << probe.bind_chunk_get_count
                            << ", total_chunk_get=" << probe.chunk_get_count << ") collapse="
-                           << (probe_bind > 0.0 ? generic_bind / probe_bind : 0.0) << "x");
+                           << (probe.bind_ms > 0.0 ? generic.bind_ms / probe.bind_ms : 0.0) << "x");
 }
 
 std::string json_escape(std::string_view value)
@@ -1257,6 +1265,7 @@ void write_perf_json(fs::path const& path,
         << "\"wall_clock_ms\": " << std::fixed << std::setprecision(3) << r.wall_clock_ms << ", "
         << "\"open_ms\": " << r.open_ms << ", "
         << "\"footer_fetch_ms\": " << r.footer_fetch_ms << ", "
+        << "\"bind_ms\": " << r.bind_ms << ", "
         << "\"metadata_parse_ms\": " << r.metadata_parse_ms << ", "
         << "\"scan_ms\": " << r.scan_ms << ", "
         << "\"payload_bytes_read\": " << r.payload_bytes_read << ", "
@@ -1324,6 +1333,7 @@ void append_perf_history_jsonl(fs::path const& path,
         << ",\"payload_bytes_read\":" << r.payload_bytes_read << ",\"row_count\":" << r.row_count
         << ",\"bind_chunk_get_count\":" << r.bind_chunk_get_count
         << ",\"wall_clock_ms\":" << std::fixed << std::setprecision(3) << r.wall_clock_ms
+        << ",\"bind_ms\":" << r.bind_ms
         << ",\"effective_bytes_per_sec\":" << r.effective_bytes_per_sec
         << ",\"retries_total\":" << r.retries_total
         << ",\"terminal_failures_total\":" << r.terminal_failures_total
@@ -1349,6 +1359,7 @@ void require_perf_json_schema(fs::path const& path, std::vector<std::string> exp
                    "\"wall_clock_ms\"",
                    "\"open_ms\"",
                    "\"footer_fetch_ms\"",
+                   "\"bind_ms\"",
                    "\"metadata_parse_ms\"",
                    "\"scan_ms\"",
                    "\"payload_bytes_read\"",
@@ -1465,6 +1476,13 @@ bench_record run_rest_minio_bench_scenario(
   limits.rest_perf_instrumentation = perf_instrumentation;
   limits.rest_max_connections      = rest_max_connections;
   limits.rest_n_reactors           = rest_n_reactors;
+  if (use_footer_probe) {
+    // The default footer-probe window is intentionally 512 KiB.  SF10
+    // lineitem's footer is larger than that, so the benchmark's probe variant
+    // pins a 1 MiB window to keep this scenario focused on the single-suffix-GET
+    // A/B rather than the out-of-window fallback (covered by REST unit tests).
+    limits.rest_footer_probe_bytes = "1 MiB";
+  }
   if (columns.size() > 1) {
     // The compatibility run mirrors the old #982 seven-column async-S3 baseline.
     // SF10 materializes a much wider cuDF table than the single-column CI
@@ -1532,7 +1550,11 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
   CHECK(measurement.rows > 0);
   if (expected_rows.has_value()) { CHECK(measurement.rows == *expected_rows); }
   CHECK(measurement.payload_bytes_read > 0);
-  CHECK(measurement.bind_micro.chunk_get_count >= (use_footer_probe ? 1 : 2));
+  if (use_footer_probe) {
+    CHECK(measurement.bind_micro.chunk_get_count == 1);
+  } else {
+    CHECK(measurement.bind_micro.chunk_get_count >= 2);
+  }
   CHECK(measurement.micro.device_stream_sync_total == 0);
   CHECK(measurement.micro.terminal_failures_total == 0);
   return make_record(footer_probe_scenario_name(std::move(scenario), use_footer_probe),
@@ -2115,7 +2137,7 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(projected_probe.payload_bytes_read == *projected_probe_payload_bytes);
     CHECK(projected_probe.terminal_failures_total == 0);
     CHECK(projected_probe.device_stream_sync_total == 0);
-    CHECK(projected_probe.bind_chunk_get_count >= 1);
+    CHECK(projected_probe.bind_chunk_get_count == 1);
     WARN("AWS REST projected_probe mc="
          << max_connections << " throughput=" << projected_probe.effective_bytes_per_sec
          << " B/s footer_fetch_ms=" << projected_probe.footer_fetch_ms
@@ -2153,7 +2175,7 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(full_probe.payload_bytes_read == *full_probe_payload_bytes);
     CHECK(full_probe.terminal_failures_total == 0);
     CHECK(full_probe.device_stream_sync_total == 0);
-    CHECK(full_probe.bind_chunk_get_count >= 1);
+    CHECK(full_probe.bind_chunk_get_count == 1);
     WARN("AWS REST full_probe mc="
          << max_connections << " throughput=" << full_probe.effective_bytes_per_sec
          << " B/s footer_fetch_ms=" << full_probe.footer_fetch_ms

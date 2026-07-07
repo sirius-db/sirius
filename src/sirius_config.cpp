@@ -115,6 +115,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
   r.optional("honor_retry_after", opt.honor_retry_after);
   r.optional("perf_instrumentation", opt.perf_instrumentation);
+  r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.reject_unknown();
 }
 

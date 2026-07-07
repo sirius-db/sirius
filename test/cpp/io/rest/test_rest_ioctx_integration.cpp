@@ -502,7 +502,7 @@ class range_http_server {
   std::vector<std::thread> _workers;
 };
 
-std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
+sirius::io::rest::config direct_rest_test_config()
 {
   sirius::io::rest::config cfg{};
   cfg.request_timeout_s       = 5;
@@ -512,12 +512,23 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
   cfg.retry_backoff_base      = std::chrono::milliseconds{1};
   cfg.retry_jitter            = std::chrono::milliseconds{0};
   cfg.honor_retry_after       = false;
-  auto authorizer             = std::make_shared<fixed_url_authorizer>(std::move(endpoint));
-  auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+  return cfg;
+}
+
+std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint,
+                                                   sirius::io::rest::config cfg)
+{
+  auto authorizer = std::make_shared<fixed_url_authorizer>(std::move(endpoint));
+  auto ctx        = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
     cfg, std::move(authorizer), nullptr);
   auto ioctx = std::make_shared<rest_ioctx>(1, std::move(ctx));
   ioctx->start();
   return ioctx;
+}
+
+std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
+{
+  return make_direct_rest_ioctx(std::move(endpoint), direct_rest_test_config());
 }
 
 }  // namespace
@@ -587,6 +598,76 @@ TEST_CASE("parquet footer bind is served by one suffix GET and then the stash",
 
   CHECK(server.head_count() == 0);
   CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("footer probe open uses the configured suffix window",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const parquet    = read_binary_file(committed_parquet_fixture("nation.parquet"));
+  auto const footer_len = static_cast<std::size_t>(parquet_footer_len(parquet));
+  auto const footer_off = parquet.size() - 8 - footer_len;
+
+  SECTION("tiny configured window misses the footer body and re-GETs it")
+  {
+    std::size_t constexpr suffix_bytes = 8;
+    REQUIRE(footer_len + 8 > suffix_bytes);
+    range_http_server server(parquet);
+    auto cfg               = direct_rest_test_config();
+    cfg.footer_probe_bytes = suffix_bytes;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    auto const* rest_object =
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+
+    REQUIRE(rest_object != nullptr);
+    CHECK(rest_object->stash_window_lo() == parquet.size() - suffix_bytes);
+    REQUIRE(rest_object->stash() != nullptr);
+    CHECK(rest_object->stash()->size() == suffix_bytes);
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+
+    std::vector<std::uint8_t> footer(footer_len);
+    REQUIRE(datasource->host_read(footer_off, footer.size(), footer.data()) == footer.size());
+    require_bytes_equal(footer,
+                        std::span<std::uint8_t const>(parquet.data() + footer_off, footer_len));
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 2);
+  }
+
+  SECTION("configured window covering the footer serves both cudf footer reads from stash")
+  {
+    auto const suffix_bytes = footer_len + 8;
+    REQUIRE(suffix_bytes <= parquet.size());
+    range_http_server server(parquet);
+    auto cfg               = direct_rest_test_config();
+    cfg.footer_probe_bytes = suffix_bytes;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    auto const* rest_object =
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+
+    REQUIRE(rest_object != nullptr);
+    CHECK(rest_object->stash_window_lo() == parquet.size() - suffix_bytes);
+    REQUIRE(rest_object->stash() != nullptr);
+    CHECK(rest_object->stash()->size() == suffix_bytes);
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+
+    std::array<std::uint8_t, 8> trailer{};
+    REQUIRE(datasource->host_read(
+              parquet.size() - trailer.size(), trailer.size(), trailer.data()) == trailer.size());
+    require_bytes_equal(trailer,
+                        std::span<std::uint8_t const>(parquet.data() + parquet.size() - 8, 8));
+
+    std::vector<std::uint8_t> footer(footer_len);
+    REQUIRE(datasource->host_read(footer_off, footer.size(), footer.data()) == footer.size());
+    require_bytes_equal(footer,
+                        std::span<std::uint8_t const>(parquet.data() + footer_off, footer_len));
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 1);
+  }
 }
 
 TEST_CASE("footer outside the suffix window falls back to one body GET",
@@ -674,7 +755,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
     CHECK(server.head_count() == 1);
-    CHECK(server.get_count() >= 1);
+    CHECK(server.get_count() == 1);
   }
 
   SECTION("unknown Content-Range total")
@@ -688,7 +769,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
     CHECK(server.head_count() == 1);
-    CHECK(server.get_count() >= 1);
+    CHECK(server.get_count() == 1);
   }
 
   SECTION("server ignores Range with 200 full-body")
@@ -702,7 +783,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
     CHECK(server.head_count() == 1);
-    CHECK(server.get_count() >= 1);
+    CHECK(server.get_count() == 1);
   }
 
   SECTION("server ignores Range with 200 full-body on a large object")
@@ -737,6 +818,62 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
     CHECK(datasource->size() == parquet.size());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
+  }
+}
+
+TEST_CASE("footer suffix probe retries transient GET failures",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
+
+  SECTION("transient 503s are retried and the final 206 produces a probe")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets = 2;
+    fault.fail_status     = 503;
+    range_http_server server(parquet, fault);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 3;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "footer-suffix-retry-success");
+
+    auto probe = reactor.fetch_footer_suffix("footer-bucket", "nation.parquet", 1UL << 20);
+
+    CHECK(probe.object_size == parquet.size());
+    CHECK(probe.window_lo == 0);
+    REQUIRE(probe.bytes != nullptr);
+    CHECK(probe.bytes->size() == parquet.size());
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 3);
+  }
+
+  SECTION("exhausted transient 503s throw after the retry budget")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets = true;
+    fault.fail_status   = 503;
+    range_http_server server(parquet, fault);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 2;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "footer-suffix-retry-exhausted");
+
+    try {
+      (void)reactor.fetch_footer_suffix("footer-bucket", "nation.parquet", 1UL << 20);
+      FAIL("fetch_footer_suffix should throw after exhausting transient retries");
+    } catch (std::runtime_error const& e) {
+      auto const message = std::string{e.what()};
+      CHECK(message.find("exhausted retries") != std::string::npos);
+      CHECK(message.find("HTTP 503") != std::string::npos);
+    }
+    CHECK(server.head_count() == 0);
+    CHECK(server.get_count() == 2);
   }
 }
 
