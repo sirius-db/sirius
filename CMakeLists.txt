@@ -94,18 +94,36 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# cuCollections (cuco): header-only, used by the dynamic Bloom filter. libcudf
-# no longer ships its bundled copy, so fetch the same commit cudf is built
-# against. Header-only — populate the sources without add_subdirectory (CCCL
-# comes from cudf); only the include dir is consumed.
-include(FetchContent)
-FetchContent_Declare(
-  cuco
-  URL https://github.com/NVIDIA/cuCollections/archive/f517bbb1277753b1852dfd388993383e401eaa38.tar.gz
-  URL_HASH
-    SHA256=d17e2f6d58cfb2cd473efcbd741c633e7607717102cedc08173a4a69bb2a8ba9
-  SOURCE_SUBDIR do-not-build)
-FetchContent_MakeAvailable(cuco)
+# --- cuCollections (cuco) --- #
+
+# libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from
+# the overlay port (vcpkg_ports/cuco); configure-time downloads are disabled
+# there. Otherwise (pixi build) fetch the same commit cudf is built against
+# (populate sources without add_subdirectory; CCCL comes from cudf). Either way
+# cuco is header-only and exposed as the cuco::cuco target, so both paths
+# consume it identically below.
+if(VCPKG_BUILD)
+  find_package(cuco CONFIG REQUIRED)
+else()
+  include(FetchContent)
+  FetchContent_Declare(
+    cuco
+    URL https://github.com/NVIDIA/cuCollections/archive/f517bbb1277753b1852dfd388993383e401eaa38.tar.gz
+    URL_HASH
+      SHA256=d17e2f6d58cfb2cd473efcbd741c633e7607717102cedc08173a4a69bb2a8ba9
+    SOURCE_SUBDIR do-not-build)
+  FetchContent_MakeAvailable(cuco)
+  # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
+  # so no target is created. Define the same header-only cuco::cuco the vcpkg
+  # port exports (CCCL still comes from cudf) so both build paths consume cuco
+  # identically below.
+  if(NOT TARGET cuco::cuco)
+    add_library(cuco::cuco INTERFACE IMPORTED)
+    set_target_properties(cuco::cuco PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                                "${cuco_SOURCE_DIR}/include")
+  endif()
+endif()
+
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
@@ -344,10 +362,6 @@ set(EXTENSION_SOURCES
 # cmake-format: on
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
-# cuCollections (cuco) device code — used by the dynamic Bloom filter — requires
-# nvcc's extended device lambda and relaxed constexpr support.
-string(APPEND CMAKE_CUDA_FLAGS
-       " --expt-extended-lambda --expt-relaxed-constexpr")
 
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
@@ -418,6 +432,12 @@ foreach(_target sirius_extension sirius_loadable_extension)
                CUDA_SEPARABLE_COMPILATION ON
                CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+  # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own
+  # consumers (tests/benchmarks) with --expt-extended-lambda.
+  target_compile_options(
+    ${_target}
+    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>)
+
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
@@ -435,7 +455,6 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-      $<BUILD_INTERFACE:${cuco_SOURCE_DIR}/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
@@ -457,8 +476,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # (cuCascade::cucascade) and cudf::cudf.
   target_link_libraries(
     ${_target}
-    CUDA::cuda_driver
     cudf::cudf
+    cuco::cuco
     rmm::rmm
     spdlog::spdlog
     cuCascade::cucascade

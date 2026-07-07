@@ -968,7 +968,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                // batches to proceed.
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
       }
-
     }
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
       // Hash table is built, we can process probe batches. The probe-side keys will be processed in

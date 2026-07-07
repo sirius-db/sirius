@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <rmm/aligned.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
@@ -38,12 +39,15 @@ class rmm_cuco_allocator {
 
   value_type* allocate(std::size_t n, cuda::stream_ref stream)
   {
-    return static_cast<value_type*>(
-      _mr.allocate(rmm::cuda_stream_view{stream.get()}, n * sizeof(value_type)));
+    return static_cast<value_type*>(_mr.allocate(
+      rmm::cuda_stream_view{stream.get()}, n * sizeof(value_type), rmm::CUDA_ALLOCATION_ALIGNMENT));
   }
   void deallocate(value_type* p, std::size_t n, cuda::stream_ref stream) noexcept
   {
-    _mr.deallocate(rmm::cuda_stream_view{stream.get()}, p, n * sizeof(value_type));
+    _mr.deallocate(rmm::cuda_stream_view{stream.get()},
+                   p,
+                   n * sizeof(value_type),
+                   rmm::CUDA_ALLOCATION_ALIGNMENT);
   }
   [[nodiscard]] rmm::device_async_resource_ref resource() const noexcept { return _mr; }
 

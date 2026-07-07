@@ -51,11 +51,12 @@ class dynamic_filter_publish_plan final {
   static constexpr double k_default_domain_coverage_threshold = 0.9;
 
   dynamic_filter_publish_plan() = default;
-  dynamic_filter_publish_plan(std::vector<probe_target> probe_targets,
-                              bool emit_zone_map_filters,
-                              std::vector<std::size_t> build_key_domain_cardinalities,
-                              std::vector<dynamic_filter_replica_space> replica_spaces,
-                              double domain_coverage_threshold = k_default_domain_coverage_threshold);
+  dynamic_filter_publish_plan(
+    std::vector<probe_target> probe_targets,
+    bool emit_zone_map_filters,
+    std::vector<std::size_t> build_key_domain_cardinalities,
+    std::vector<dynamic_filter_replica_space> replica_spaces,
+    double domain_coverage_threshold = k_default_domain_coverage_threshold);
 
   [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
   [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
