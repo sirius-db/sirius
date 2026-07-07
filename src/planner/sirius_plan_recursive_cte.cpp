@@ -75,10 +75,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
     }
   }
 
-  auto& types     = cte->second.get()->Types();
-  auto op_type    = op.is_recurring
-                      ? sirius::op::SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN
-                      : sirius::op::SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN;
   auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
     sirius::from_duckdb_vec(cte->second.get()->Types()),
     sirius::op::SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN,

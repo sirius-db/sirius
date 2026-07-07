@@ -94,8 +94,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::fetch_result_internal(
   D_ASSERT(sirius_active_query);
   D_ASSERT(sirius_active_query->is_open_result(pending));
   D_ASSERT(sirius_active_query->sirius_prepared->prepared);
-  auto& engine   = get_sirius_engine();
-  auto& prepared = *sirius_active_query->sirius_prepared->prepared;
+  auto& engine = get_sirius_engine();
   duckdb::unique_ptr<duckdb::QueryResult> result;
   D_ASSERT(engine.has_result_collector());
   SIRIUS_LOG_DEBUG("Fetching result from GPU executor");
@@ -137,7 +136,6 @@ sirius_interface::sirius_pending_statement_or_prepared_statement(
 {
   begin_query_internal(query);
 
-  bool invalidate_query = true;
   duckdb::unique_ptr<duckdb::PendingQueryResult> pending =
     sirius_pending_statement_internal(context, statement_p, parameters);
 

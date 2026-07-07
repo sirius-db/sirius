@@ -86,7 +86,7 @@ AggregateExpressionResult create_aggregate_expressions(
   AggregateExpressionResult result;
 
   // Create output types: first the group by column types, then the aggregate result types
-  for (std::size_t group_idx : group_indexes) {
+  for ([[maybe_unused]] std::size_t group_idx : group_indexes) {
     result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
   }
   for (std::size_t i = 0; i < aggregations.size(); ++i) {

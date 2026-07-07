@@ -164,8 +164,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(
   metadata_processing_state& state, [[maybe_unused]] std::stop_token const& stop)
 {
-  auto& batch_queue = state.queue;
-  bool is_closed    = false;
+  bool is_closed = false;
   while (!is_closed) {
     auto databatch = state.batch_provider->get_next_batch();
     is_closed      = databatch == nullptr;

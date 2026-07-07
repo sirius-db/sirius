@@ -380,9 +380,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // return Make<PhysicalCrossProduct>(op.types, left, right, op.estimated_cardinality);
   }
 
-  std::size_t has_range = 0;
-  bool has_equality     = op.HasEquality(has_range);
-  bool can_merge        = has_range > 0;
+  std::size_t has_range              = 0;
+  [[maybe_unused]] bool has_equality = op.HasEquality(has_range);
+  bool can_merge                     = has_range > 0;
   bool can_iejoin       = has_range >= 2 && recursive_cte_tables.empty();
   switch (op.join_type) {
     case duckdb::JoinType::SEMI:
