@@ -7,10 +7,11 @@
 //! Send + Sync` without ever moving the context across threads.
 //!
 //! The seam is synchronous (see [`FragmentExecutor`]): `execute()` blocks the caller until the
-//! engine thread returns the result. For the single-fragment milestone that caller is the async
-//! `exec_plan_fragment` handler on the BRPC current-thread runtime, so a long GPU query stalls
-//! that runtime — an accepted limitation the trait already documents (the streaming evolution
-//! lifts it).
+//! engine thread returns the result. `exec_plan_fragment` runs it on a `spawn_blocking` worker, so
+//! the BRPC current-thread runtime stays free to serve `fetch_data`, connection cleanup, and
+//! shutdown cancellation while a query runs. The single-fragment limitations are elsewhere: the
+//! whole result is materialized before dispatch returns, and the single process-global context
+//! serializes queries — both lifted by the streaming evolution.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
