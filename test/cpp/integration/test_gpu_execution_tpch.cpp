@@ -26,14 +26,21 @@
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -3508,6 +3515,255 @@ struct labeled_query {
   std::string sql;
 };
 
+std::string sql_string_literal(std::string const& value)
+{
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  escaped.push_back('\'');
+  for (auto const c : value) {
+    if (c == '\'') { escaped.push_back('\''); }
+    escaped.push_back(c);
+  }
+  escaped.push_back('\'');
+  return escaped;
+}
+
+void require_query_ok(duckdb::Connection& con, std::string const& sql)
+{
+  auto result = con.Query(sql);
+  REQUIRE(result);
+  if (result->HasError()) { UNSCOPED_INFO("setup query error: " << result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+}
+
+struct watchdog_query_result {
+  bool timed_out{false};
+  duckdb::idx_t row_count{0};
+  duckdb::idx_t column_count{0};
+  std::vector<std::string> column_names;
+  std::vector<std::string> column_types;
+  std::vector<std::vector<std::string>> rows;
+  std::string error;
+};
+
+watchdog_query_result run_query_with_watchdog(duckdb::Connection& con,
+                                              std::string sql,
+                                              std::chrono::seconds timeout)
+{
+  struct shared_state {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool done{false};
+    watchdog_query_result result;
+  };
+
+  auto state = std::make_shared<shared_state>();
+  std::thread worker([&con, sql = std::move(sql), state]() {
+    watchdog_query_result out;
+    try {
+      auto result = con.Query(sql);
+      if (!result) {
+        out.error = "query returned nullptr";
+      } else if (result->HasError()) {
+        out.error = result->GetError();
+      } else {
+        out.row_count    = result->RowCount();
+        out.column_count = result->ColumnCount();
+        out.column_names.reserve(result->ColumnCount());
+        out.column_types.reserve(result->ColumnCount());
+        for (duckdb::idx_t c = 0; c < result->ColumnCount(); ++c) {
+          out.column_names.push_back(result->ColumnName(c));
+          out.column_types.push_back(result->types[c].ToString());
+        }
+        auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+        out.rows           = GPUExecutionFixtureBase::collect_rows(materialized);
+      }
+    } catch (std::exception const& e) {
+      out.error = e.what();
+    } catch (...) {
+      out.error = "query threw an unknown exception";
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(state->mtx);
+      state->result = std::move(out);
+      state->done   = true;
+    }
+    state->cv.notify_one();
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(state->mtx);
+    if (!state->cv.wait_for(lock, timeout, [&] { return state->done; })) {
+      con.Interrupt();
+      if (!state->cv.wait_for(lock, std::chrono::seconds{5}, [&] { return state->done; })) {
+        worker.detach();
+        watchdog_query_result out;
+        out.timed_out = true;
+        out.error     = "query timed out after " + std::to_string(timeout.count()) + " seconds";
+        return out;
+      }
+    }
+  }
+
+  worker.join();
+  return std::move(state->result);
+}
+
+watchdog_query_result compare_gpu_vs_cpu_with_watchdog(duckdb::Connection& con,
+                                                       std::string const& query,
+                                                       std::chrono::seconds timeout,
+                                                       std::function<void()> on_timeout = {})
+{
+  require_query_ok(con, "SET gpu_execution = true;");
+  auto before_gpu_stats = sirius::test::get_transparent_execution_stats(con);
+
+  auto gpu_result = run_query_with_watchdog(con, query, timeout);
+  INFO("query: " << query);
+  INFO(gpu_result.error);
+  if (gpu_result.timed_out && on_timeout) { on_timeout(); }
+  REQUIRE_FALSE(gpu_result.timed_out);
+  REQUIRE(gpu_result.error.empty());
+
+  auto after_gpu_stats = sirius::test::get_transparent_execution_stats(con);
+  sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
+
+  require_query_ok(con, "SET gpu_execution = false;");
+  auto cpu_result = con.Query(query);
+  require_query_ok(con, "SET gpu_execution = true;");
+  REQUIRE(cpu_result);
+  if (cpu_result->HasError()) { UNSCOPED_INFO("CPU oracle error: " << cpu_result->GetError()); }
+  REQUIRE_FALSE(cpu_result->HasError());
+  auto after_cpu_stats = sirius::test::get_transparent_execution_stats(con);
+  sirius::test::require_transparent_execution_delta(after_gpu_stats, after_cpu_stats, 0, 0, 0);
+
+  std::vector<std::string> cpu_column_names;
+  std::vector<std::string> cpu_column_types;
+  cpu_column_names.reserve(cpu_result->ColumnCount());
+  cpu_column_types.reserve(cpu_result->ColumnCount());
+  for (duckdb::idx_t c = 0; c < cpu_result->ColumnCount(); ++c) {
+    cpu_column_names.push_back(cpu_result->ColumnName(c));
+    cpu_column_types.push_back(cpu_result->types[c].ToString());
+  }
+  auto& cpu_materialized = cpu_result->Cast<duckdb::MaterializedQueryResult>();
+  auto cpu_rows          = GPUExecutionFixtureBase::collect_rows(cpu_materialized);
+
+  REQUIRE(gpu_result.column_count == cpu_result->ColumnCount());
+  REQUIRE(gpu_result.row_count == cpu_result->RowCount());
+  CHECK(gpu_result.column_names == cpu_column_names);
+  CHECK(gpu_result.column_types == cpu_column_types);
+  CHECK(gpu_result.rows == cpu_rows);
+  return gpu_result;
+}
+
+class local_sirius_config_guard {
+ public:
+  explicit local_sirius_config_guard(fs::path config_path)
+  {
+    if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
+      had_original_config_env_ = true;
+      original_config_env_     = current;
+    }
+    if (auto* current = std::getenv("SIRIUS_DISABLE"); current != nullptr) {
+      had_original_disable_env_ = true;
+      original_disable_env_     = current;
+    }
+    setenv("SIRIUS_CONFIG_FILE", config_path.string().c_str(), 1);
+    unsetenv("SIRIUS_DISABLE");
+  }
+
+  ~local_sirius_config_guard()
+  {
+    if (had_original_config_env_) {
+      setenv("SIRIUS_CONFIG_FILE", original_config_env_.c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_CONFIG_FILE");
+    }
+    if (had_original_disable_env_) {
+      setenv("SIRIUS_DISABLE", original_disable_env_.c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_DISABLE");
+    }
+  }
+
+ private:
+  std::string original_config_env_;
+  std::string original_disable_env_;
+  bool had_original_config_env_{false};
+  bool had_original_disable_env_{false};
+};
+
+void pause_shared_envs_for_local_duckdb()
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+}
+
+fs::path scan_memory_config_path()
+{
+  auto path = get_project_root() / "test" / "cpp" / "scan" / "memory.yaml";
+  REQUIRE(fs::exists(path));
+  return path;
+}
+
+class empty_native_table_fixture {
+ public:
+  empty_native_table_fixture()
+  {
+    pause_shared_envs_for_local_duckdb();
+    config_guard_ = std::make_unique<local_sirius_config_guard>(scan_memory_config_path());
+
+    static std::atomic<std::uint64_t> counter{0};
+    auto const id = counter.fetch_add(1, std::memory_order_relaxed);
+    dir_          = fs::temp_directory_path() / ("sirius-empty-native-" + std::to_string(id));
+    std::error_code ec;
+    fs::remove_all(dir_, ec);
+    fs::create_directories(dir_);
+    db_path_ = dir_ / "empty.duckdb";
+
+    db  = std::make_unique<duckdb::DuckDB>(db_path_.string());
+    con = std::make_unique<duckdb::Connection>(*db);
+
+    require_query_ok(
+      *con, "ATTACH " + sql_string_literal(get_tpch_db_path().string()) + " AS tpch (READ_ONLY);");
+    require_query_ok(*con, "CREATE TABLE e(i INTEGER);");
+    require_query_ok(*con, "CHECKPOINT;");
+  }
+
+  ~empty_native_table_fixture()
+  {
+    if (!leaked_) {
+      con.reset();
+      db.reset();
+      std::error_code ec;
+      fs::remove_all(dir_, ec);
+    }
+  }
+
+  void leak_after_timeout()
+  {
+    leaked_ = true;
+    (void)con.release();
+    (void)db.release();
+  }
+
+  std::unique_ptr<duckdb::DuckDB> db;
+  std::unique_ptr<duckdb::Connection> con;
+
+ private:
+  std::unique_ptr<local_sirius_config_guard> config_guard_;
+  fs::path dir_;
+  fs::path db_path_;
+  bool leaked_{false};
+};
+
 // Programmatic port of "S3 pushdown shape-C zero-side joins match the local
 // parquet oracle": every supported join type crossed with which side is pruned
 // to empty. `nation`/`region` are the full tables; the parenthesized subqueries
@@ -3593,6 +3849,76 @@ std::vector<labeled_query> build_empty_side_join_matrix()
 }
 
 }  // namespace
+
+TEST_CASE("gpu_execution - empty native table count identity",
+          "[integration][gpu_execution][empty_result][empty-table]")
+{
+  empty_native_table_fixture fixture;
+  auto result = compare_gpu_vs_cpu_with_watchdog(
+    *fixture.con, "select count(*) as c from e;", std::chrono::seconds{30}, [&fixture] {
+      fixture.leak_after_timeout();
+    });
+  REQUIRE(result.row_count == 1);
+  REQUIRE(result.column_count == 1);
+  CHECK(result.rows == std::vector<std::vector<std::string>>{{"0"}});
+}
+
+TEST_CASE("gpu_execution - empty native table scan preserves schema",
+          "[integration][gpu_execution][empty_result][empty-table]")
+{
+  empty_native_table_fixture fixture;
+  auto result = compare_gpu_vs_cpu_with_watchdog(
+    *fixture.con, "select i from e;", std::chrono::seconds{30}, [&fixture] {
+      fixture.leak_after_timeout();
+    });
+  REQUIRE(result.row_count == 0);
+  REQUIRE(result.column_count == 1);
+  CHECK(result.column_names == std::vector<std::string>{"i"});
+  CHECK(result.column_types == std::vector<std::string>{"INTEGER"});
+}
+
+TEST_CASE("gpu_execution - empty native table left join pads survivor rows",
+          "[integration][gpu_execution][empty_result][empty-table]")
+{
+  empty_native_table_fixture fixture;
+  auto result = compare_gpu_vs_cpu_with_watchdog(
+    *fixture.con,
+    "select n.n_nationkey, e.i from tpch.nation n left join e on n.n_nationkey = e.i "
+    "order by n.n_nationkey;",
+    std::chrono::seconds{30},
+    [&fixture] { fixture.leak_after_timeout(); });
+  REQUIRE(result.row_count == 25);
+  REQUIRE(result.column_count == 2);
+}
+
+TEST_CASE("gpu_execution - empty parquet count identity",
+          "[integration][gpu_execution][parquet][empty_result][empty-table]")
+{
+  empty_native_table_fixture fixture;
+  static std::atomic<std::uint64_t> counter{0};
+  auto const id  = counter.fetch_add(1, std::memory_order_relaxed);
+  auto const dir = fs::temp_directory_path() / ("sirius-empty-parquet-" + std::to_string(id));
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir);
+  auto const parquet_path = dir / "empty.parquet";
+
+  require_query_ok(*fixture.con, "SET gpu_execution = false;");
+  require_query_ok(*fixture.con,
+                   "COPY (SELECT 1 AS i WHERE false) TO " +
+                     sql_string_literal(parquet_path.string()) + " (FORMAT PARQUET);");
+  require_query_ok(*fixture.con, "SET gpu_execution = true;");
+  auto result = compare_gpu_vs_cpu_with_watchdog(
+    *fixture.con,
+    "select count(*) as c from read_parquet(" + sql_string_literal(parquet_path.string()) + ");",
+    std::chrono::seconds{30},
+    [&fixture] { fixture.leak_after_timeout(); });
+  REQUIRE(result.row_count == 1);
+  REQUIRE(result.column_count == 1);
+  CHECK(result.rows == std::vector<std::vector<std::string>>{{"0"}});
+
+  fs::remove_all(dir, ec);
+}
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - all-pruned empty filter",

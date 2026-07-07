@@ -244,8 +244,11 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
 
   // Slice [0, n_row_groups) into parse ranges; each becomes one thunk (Phase 2).
+  // Always at least one range: a zero-row-group table must still push one (empty)
+  // scan_info so the coalescer seeds its template and emits the empty split —
+  // zero splits would mean zero tasks and the query never completes.
   _chunk_row_groups = metadata_parse_chunk();
-  _num_ranges       = utils::ceil_div(_plan.n_row_groups, _chunk_row_groups);
+  _num_ranges = std::max<std::size_t>(1, utils::ceil_div(_plan.n_row_groups, _chunk_row_groups));
 }
 
 duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
