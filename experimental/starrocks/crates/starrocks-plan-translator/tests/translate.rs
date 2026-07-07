@@ -18,9 +18,9 @@ use starrocks_thrift::internal_service::{
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::partitions::{TDataPartition, TPartitionType};
 use starrocks_thrift::plan_nodes::{
-    TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TFileFormatType,
-    TFileScanNode, TFileScanType, TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange,
-    TSelectNode, TSortInfo, TSortNode,
+    TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TEqJoinCondition,
+    TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp, TNestLoopJoinNode,
+    TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode, TSortInfo, TSortNode,
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
@@ -1136,10 +1136,10 @@ fn fragment_output_exprs_add_root_projection() {
     }
 }
 
-/// Verifies unsupported joins return a structured unsupported-plan-node error.
+/// Verifies unsupported plan nodes return a structured unsupported-plan-node error.
 #[test]
-fn unsupported_hash_join_is_structured_error() {
-    let join = base_plan_node(9, TPlanNodeType::HASH_JOIN_NODE, 0, vec![0]);
+fn unsupported_merge_join_is_structured_error() {
+    let join = base_plan_node(9, TPlanNodeType::MERGE_JOIN_NODE, 0, vec![0]);
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![join])),
         Some(base_desc()),
@@ -1152,7 +1152,7 @@ fn unsupported_hash_join_is_structured_error() {
             node_id: 9,
             node_type,
             ..
-        } if node_type == TPlanNodeType::HASH_JOIN_NODE
+        } if node_type == TPlanNodeType::MERGE_JOIN_NODE
     ));
 }
 
@@ -2251,6 +2251,153 @@ fn sort_with_limit_becomes_project_sort_fetch() {
     };
 }
 
+/// Two-table descriptor for join tests: tuple 0 = users(`a`), tuple 1 = orders(`b`).
+fn join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, 0, "b", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Builds a hash-join plan node with one `left = right` equality conjunct.
+fn hash_join_node(join_op: TJoinOp) -> TPlanNode {
+    let mut join = base_plan_node(2, TPlanNodeType::HASH_JOIN_NODE, 2, vec![0, 1]);
+    join.hash_join_node = Some(THashJoinNode::new(
+        join_op,
+        vec![TEqJoinCondition::new(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    join
+}
+
+/// Extracts the field index from a direct struct-field reference.
+fn field_index(expr: &substrait::proto::Expression) -> i32 {
+    let expression::RexType::Selection(selection) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected field reference");
+    };
+    let expression::field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected direct reference");
+    };
+    let expression::reference_segment::ReferenceType::StructField(field) =
+        segment.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected struct field");
+    };
+    field.field
+}
+
+/// Verifies an inner hash join becomes a Substrait join whose equality condition references the
+/// concatenated left-then-right row (right side offset by the left width).
+#[test]
+fn inner_hash_join_translates_to_join_rel() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::INNER_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
+    let expression::RexType::ScalarFunction(equal) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected scalar function join condition");
+    };
+    let args: Vec<_> = equal
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => field_index(value),
+            other => panic!("unexpected argument {other:?}"),
+        })
+        .collect();
+    assert_eq!(args, vec![0, 1]);
+}
+
+/// Verifies a left semi join keeps only the probe-side row layout.
+#[test]
+fn left_semi_join_keeps_probe_layout() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::LEFT_SEMI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::LeftSemi as i32
+    );
+}
+
+/// Verifies a cross nested-loop join with a conjunct becomes filter-over-cross-product.
+#[test]
+fn nestloop_join_translates_to_filtered_cross_rel() {
+    let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
+    join.nestloop_join_node = Some(TNestLoopJoinNode::new(
+        Some(TJoinOp::CROSS_JOIN),
+        None,
+        Some(vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )]),
+        None,
+        None,
+        None,
+    ));
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected filter over cross product");
+    };
+    let rel::RelType::Cross(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected cross product under filter");
+    };
+}
+
 /// Verifies an exchange node is still rejected: fragments are translated in isolation and
 /// multi-fragment plans are a later milestone.
 #[test]
@@ -2492,6 +2639,23 @@ fn aggregation_conjuncts_become_having_filter() {
     };
 }
 
+/// Verifies anti joins are rejected: the Substrait consumer has no left-anti conversion.
+#[test]
+fn anti_hash_join_is_rejected() {
+    for join_op in [TJoinOp::LEFT_ANTI_JOIN, TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN] {
+        let plan = TPlan::new(vec![
+            hash_join_node(join_op),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        assert!(
+            matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+            "{join_op:?}: {err:?}"
+        );
+    }
+}
+
 /// Verifies decimal-typed arithmetic is rejected (it crashes the engine's GPU projection).
 #[test]
 fn decimal_arithmetic_is_rejected() {
@@ -2628,7 +2792,7 @@ fn sort_tuple_exprs_come_from_sort_info() {
 }
 
 /// Verifies GPU-executor guards: non-constant LIKE patterns, non-constant substring bounds,
-/// and ungrouped DISTINCT aggregates are rejected.
+/// bare cross joins, and ungrouped DISTINCT aggregates are rejected.
 #[test]
 fn gpu_unsupported_shapes_are_rejected() {
     // LIKE with a column pattern (not a literal).
@@ -2677,6 +2841,23 @@ fn gpu_unsupported_shapes_are_rejected() {
     .unwrap_err();
     assert!(
         matches!(err, TranslateError::UnsupportedExpression { .. }),
+        "{err:?}"
+    );
+
+    // Nested-loop join without conjuncts (bare cross product).
+    let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
+    join.nestloop_join_node = Some(TNestLoopJoinNode::new(
+        Some(TJoinOp::CROSS_JOIN),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
         "{err:?}"
     );
 
