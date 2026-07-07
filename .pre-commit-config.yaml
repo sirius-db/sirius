@@ -28,6 +28,9 @@ repos:
       - id: check-json
       - id: check-merge-conflict
       - id: check-symlinks
+        # These tracked links target the optional .claude/claude-tools submodule,
+        # which lint CI intentionally leaves uninitialized.
+        exclude: '^\.claude/(commands/(commit-push-pr|review)\.md|skills/skill-creator)$'
       - id: check-toml
       - id: check-yaml
       - id: debug-statements
