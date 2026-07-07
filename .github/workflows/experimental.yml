@@ -69,7 +69,7 @@ jobs:
 
   experimental:
     name: experimental
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim
     needs: [starrocks]
     if: always()
     steps:
