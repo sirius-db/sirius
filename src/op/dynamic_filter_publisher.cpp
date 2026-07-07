@@ -238,9 +238,11 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
       }
     }
 
-    // (2) Membership filter — post-decode. Prefer the exact IN-list when its set fits the device L2
-    // cache; otherwise fall back to the Bloom whenever the key type supports it; `none` only when
-    // the key type has no Bloom support (anything other than INT32/INT64).
+    // (2) Membership filter — post-decode. Prefer, in order:
+    //  - A. the exact IN-list with a brute-force scan for a very small key set (no hash build);
+    //  - B. the exact hash-based IN-list when its cuco set fits the device L2 cache;
+    //  - C. otherwise the Bloom filter whenever the key type supports it;
+    // `none` only when the key type has no membership support (anything other than INT32/INT64).
     auto const set_bytes =
       sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(build_rows, col.type());
     auto const bloom_bytes  = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
@@ -248,7 +250,12 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     bool const in_list_fits = l2_bytes > 0 &&
                               sirius::op::sirius_dynamic_in_list_filter::supports(col) &&
                               set_bytes <= l2_bytes;
-    if (in_list_fits) {
+    if (sirius::op::sirius_dynamic_small_in_list_filter::supports(col, build_rows)) {
+      nvtx3::scoped_range vr{"dynfilter::build_small_in_list"};
+      per_key_membership[k] = std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
+        col, stream, allocator_ref);
+      choice = "small_in_list";
+    } else if (in_list_fits) {
       nvtx3::scoped_range vr{"dynfilter::build_in_list"};
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);

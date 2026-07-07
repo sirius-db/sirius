@@ -661,6 +661,108 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT32 se
           std::vector<int32_t>{std::numeric_limits<int32_t>::min(), 2});
 }
 
+TEST_CASE("sirius_dynamic_small_in_list_filter keeps exactly the rows whose key is a build key",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  // Small build key set {0,1,2,3,4}; probe [0..9]. The brute-force scan keeps the first five.
+  auto keys = cudf::sequence(5,
+                             cudf::numeric_scalar<int64_t>(0, true, stream),
+                             cudf::numeric_scalar<int64_t>(1, true, stream),
+                             stream);
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0,
+                      std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
+                        keys->view(), stream, cudf::get_current_device_resource_ref()));
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 5);
+  REQUIRE(table->num_rows() == 10);
+}
+
+TEST_CASE("sirius_dynamic_small_in_list_filter supports INT32 keys exactly",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  auto keys   = cudf::sequence(5,
+                             cudf::numeric_scalar<int32_t>(0, true, stream),
+                             cudf::numeric_scalar<int32_t>(1, true, stream),
+                             stream);
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0,
+                      std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
+                        keys->view(), stream, cudf::get_current_device_resource_ref()));
+
+  auto table = make_sequence_table(10, stream);  // INT32 [0..9]
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(to_host_int32(out->view().column(0), stream) == std::vector<int32_t>{0, 1, 2, 3, 4});
+}
+
+TEST_CASE("sirius_dynamic_small_in_list_filter matches a key equal to INT32_MIN (cuco's sentinel)",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream      = cudf::get_default_stream();
+  auto const dtype = cudf::data_type{cudf::type_id::INT32};
+  // Single build key {INT32_MIN} — the value cuco::static_set reserves as its empty slot and never
+  // stores. The brute-force scan has no reserved value, so INT32_MIN is a valid needle: this filter
+  // prunes non-matches exactly, where sirius_dynamic_in_list_filter would (harmlessly) keep them.
+  auto keys = make_values_table<int32_t>({std::numeric_limits<int32_t>::min()}, dtype, stream);
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0,
+                      std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
+                        keys->view().column(0), stream, cudf::get_current_device_resource_ref()));
+
+  // Probe {INT32_MIN, INT32_MIN+1, INT32_MIN+2}; only the first is a build key.
+  auto probe = make_values_table<int32_t>({std::numeric_limits<int32_t>::min(),
+                                           std::numeric_limits<int32_t>::min() + 1,
+                                           std::numeric_limits<int32_t>::min() + 2},
+                                          dtype,
+                                          stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), filters, stream);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(to_host_int32(out->view().column(0), stream) ==
+          std::vector<int32_t>{std::numeric_limits<int32_t>::min()});
+}
+
+TEST_CASE("sirius_dynamic_small_in_list_filter: kind, size, capabilities, and supports gate",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream   = cudf::get_default_stream();
+  auto const mr = cudf::get_current_device_resource_ref();
+  using F       = sirius::op::sirius_dynamic_small_in_list_filter;
+
+  auto i32 = cudf::sequence(3,
+                            cudf::numeric_scalar<int32_t>(0, true, stream),
+                            cudf::numeric_scalar<int32_t>(1, true, stream),
+                            stream);
+  auto f64 =
+    make_values_table<double>({0.0, 1.0, 2.0}, cudf::data_type{cudf::type_id::FLOAT64}, stream);
+
+  // supports() gate: 1..k_max_keys keys, INT32/INT64, no nulls.
+  REQUIRE(F::supports(i32->view(), 1));
+  REQUIRE(F::supports(i32->view(), F::k_max_keys));
+  REQUIRE_FALSE(F::supports(i32->view(), 0));                  // need at least one key
+  REQUIRE_FALSE(F::supports(i32->view(), F::k_max_keys + 1));  // above the small-list cap
+  REQUIRE_FALSE(F::supports(f64->view().column(0), 3));        // wrong type
+
+  F f(i32->view(), stream, mr);
+  stream.synchronize();
+  REQUIRE(f.kind() == sirius_dynamic_filter_kind::IN_LIST);
+  REQUIRE(f.size() == 3);
+  REQUIRE(f.replica_count() == 1);  // source-device snapshot built in the constructor
+  // Cast through the base pointer, exactly as the consumer-side merge does: the filter advertises
+  // the runtime-mask capability but not AST lowering, keeping it out of the parquet row-group path.
+  sirius_dynamic_filter const* base = &f;
+  REQUIRE(dynamic_cast<sirius::op::sirius_mask_applicable const*>(base) != nullptr);
+  REQUIRE(dynamic_cast<sirius::op::sirius_ast_lowerable const*>(base) == nullptr);
+}
+
 //===----------------------------------------------------------------------===//
 // apply_dynamic_filters_to_view — view-based core (pinned cached path)
 //===----------------------------------------------------------------------===//

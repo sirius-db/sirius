@@ -329,6 +329,82 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 };
 
 //===----------------------------------------------------------------------===//
+// sirius_dynamic_small_in_list_filter
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Exact set-membership filter for a SMALL build side (<= @ref k_max_keys keys): keeps rows
+ * whose key appears among the build keys.
+ *
+ * The scale-down of @ref sirius_dynamic_in_list_filter for tiny selective builds. Instead of a
+ * persistent @c cuco::static_set, each device replica owns a raw snapshot of the <= @ref
+ * k_max_keys build keys, and @ref compute_mask answers with a branchless linear scan (compare every
+ * probe value against the m needles). For small m this beats building and probing a hash set, and
+ * -- having no reserved empty-slot sentinel -- it is exact for every key value (unlike @ref
+ * sirius_dynamic_in_list_filter, whose static_set never stores @c numeric_limits<KeyT>::min()).
+ *
+ * Like its siblings it is @ref sirius_device_replicable: the constructor builds the source-device
+ * snapshot and @ref replicate_to_devices fans a tiny per-device copy out to each probe device
+ * before publication. The needle buffers are PIMPL'd so rmm/device headers stay out of this header.
+ */
+class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
+                                                  public sirius_mask_applicable,
+                                                  public sirius_device_replicable {
+ public:
+  /// Maximum number of build keys this filter accepts. Above this the producer prefers the cuco
+  /// IN-list set or a Bloom filter instead (see the hash-join membership policy).
+  static constexpr std::size_t k_max_keys = 64;
+
+  /// @param keys   The build keys (INT32/INT64, no nulls; the producer restricts the count to
+  ///               <= @ref k_max_keys). The view need only remain valid for the constructor, which
+  ///               eagerly snapshots the keys into an owned source-device buffer.
+  /// @param stream Producer stream the snapshot is enqueued on; the publish path synchronizes it
+  ///               before fan-out, so consumer streams never observe a partial copy.
+  /// @param mr     Device memory resource backing the source snapshot.
+  sirius_dynamic_small_in_list_filter(cudf::column_view const& keys,
+                                      rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr);
+
+  ~sirius_dynamic_small_in_list_filter() override;
+
+  sirius_dynamic_small_in_list_filter(sirius_dynamic_small_in_list_filter const&) = delete;
+  sirius_dynamic_small_in_list_filter& operator=(sirius_dynamic_small_in_list_filter const&) =
+    delete;
+
+  [[nodiscard]] sirius_dynamic_filter_kind kind() const override
+  {
+    return sirius_dynamic_filter_kind::IN_LIST;
+  }
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
+
+  /// Number of ready device-local replicas (exposed for focused multi-GPU tests/telemetry).
+  [[nodiscard]] std::size_t replica_count() const noexcept;
+
+  /// Number of build keys (needles) backing the scan.
+  [[nodiscard]] std::size_t size() const noexcept { return _num_keys; }
+
+  /// Whether @p keys (a column of @p num_keys rows) can back the small-list scan: 1..k_max_keys
+  /// keys of type INT32/INT64 with no nulls.
+  [[nodiscard]] static bool supports(cudf::column_view const& keys, std::size_t num_keys) noexcept;
+
+ private:
+  cudf::data_type _key_type{cudf::type_id::EMPTY};
+  std::size_t _num_keys = 0;
+
+  /// Per-device raw needle snapshots; PIMPL'd so rmm/device buffers stay in the .cu translation
+  /// unit. Mirrors @ref sirius_dynamic_in_list_filter's replica store.
+  struct needle_store;
+  std::unique_ptr<needle_store> _store;
+};
+
+//===----------------------------------------------------------------------===//
 // sirius_dynamic_bloom_filter
 //===----------------------------------------------------------------------===//
 /**
