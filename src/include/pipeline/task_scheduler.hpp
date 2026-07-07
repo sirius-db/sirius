@@ -32,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace sirius::parallel {
 class downgrade_executor;
@@ -219,6 +220,12 @@ class task_scheduler {
 
   std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
+
+  /// Pipelines that transitively feed a plan-wired dynamic-filter join's build input. The
+  /// management loop gives compatible queued tasks from these pipelines soft priority so later
+  /// splits of a transitive scan target are more likely to observe the filter. Immediate probes are
+  /// ordered independently by the join hint. Set once in prepare_for_query; read-only thereafter.
+  std::unordered_set<const sirius_pipeline*> _filter_build_pipelines;
 
   exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;

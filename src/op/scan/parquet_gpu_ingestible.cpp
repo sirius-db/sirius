@@ -24,11 +24,13 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <op/sirius_dynamic_filter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
@@ -356,6 +358,27 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   _reader_options = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
   if (_plan->is_projected()) { _reader_options->set_column_names(_plan->data_column_names()); }
+
+  _sirius_dynamic_filters = bind.sirius_dynamic_filters;
+
+  // Producers reference probe columns in DuckDB's column_ids space; the AST merge and the
+  // post-decode apply both key by output-column position. Install the translation so push_filter
+  // remaps before storing. Wiring-time setup, before the producing build publishes.
+  if (_sirius_dynamic_filters) {
+    _sirius_dynamic_filters->set_consumer_column_remap(_plan->output_position_by_column_id);
+  }
+
+  // Hive-partition columns are path-derived constants, not decoded parquet columns, so they must
+  // not receive post-decode dynamic filters.
+  if (_sirius_dynamic_filters && _plan->has_partitions()) {
+    std::vector<std::size_t> partition_cols;
+    for (std::size_t i = 0; i < _plan->output_layout.size(); ++i) {
+      if (_plan->output_layout[i].source == scan_plan::output_entry::PARTITION) {
+        partition_cols.push_back(i);
+      }
+    }
+    _sirius_dynamic_filters->ignore_columns(partition_cols);
+  }
 
   _file_paths = bind.resolved_file_paths;
 }
@@ -687,6 +710,10 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // (`ast_expression`) must outlive read_parquet; the borrowed Sirius AST and
   // the translator are only needed during translation.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
+  std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
+    std::nullopt;
+  cudf::ast::expression const* reader_filter_root = nullptr;
+
   if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
     auto name_resolver     = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
@@ -694,8 +721,29 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
     ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
-    if (ast_expression) { opts.set_filter(ast_expression->back()); }
+    if (ast_expression) { reader_filter_root = &ast_expression->back(); }
   }
+
+  if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
+      _sirius_dynamic_filters->has_filters()) {
+    if (ast_expression) {
+      reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
+                                                          reader_filter_root,
+                                                          *_sirius_dynamic_filters,
+                                                          *split.plan,
+                                                          mem_space.get_device_id());
+    } else {
+      dynamic_ast_expression.emplace();
+      reader_filter_root = merge_dynamic_filters_into_ast(dynamic_ast_expression->tree,
+                                                          /*existing_root=*/nullptr,
+                                                          *_sirius_dynamic_filters,
+                                                          *split.plan,
+                                                          mem_space.get_device_id());
+      if (!reader_filter_root) { dynamic_ast_expression.reset(); }
+    }
+  }
+
+  if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   auto [table, _] =
