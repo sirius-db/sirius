@@ -288,9 +288,34 @@ inline double compression_ratio(std::size_t input_bytes, std::size_t compressed_
 
 // ── Column equality (fixed-width + strings) ───────────────────────────────────
 
+// Per-row validity as host bools (true = valid); maskless / 0-null columns are
+// all-valid, so a (mask, 0-null) column and a maskless one compare equal.
+inline std::vector<bool> host_validity_bits(cudf::column_view v)
+{
+  std::vector<bool> valid(static_cast<std::size_t>(v.size()), true);
+  if (v.null_mask() == nullptr || v.null_count() == 0) return valid;
+  std::size_t const first_word = static_cast<std::size_t>(v.offset()) / 32;
+  std::size_t const last_word  = static_cast<std::size_t>(v.offset() + v.size() + 31) / 32;
+  std::vector<uint32_t> words(last_word - first_word);
+  cudaMemcpy(words.data(),
+             reinterpret_cast<uint32_t const*>(v.null_mask()) + first_word,
+             words.size() * sizeof(uint32_t),
+             cudaMemcpyDeviceToHost);
+  for (cudf::size_type r = 0; r < v.size(); ++r) {
+    std::size_t const bit = static_cast<std::size_t>(v.offset() + r);
+    valid[static_cast<std::size_t>(r)] = (words[bit / 32 - first_word] >> (bit % 32)) & 1u;
+  }
+  return valid;
+}
+
 inline bool columns_equal(cudf::column_view a, cudf::column_view b)
 {
   if (a.type() != b.type() || a.size() != b.size()) return false;
+  // Validity must match too: a roundtrip that drops or moves nulls is not a
+  // PASS even when the payload bytes agree.
+  if (a.null_count() != b.null_count() || host_validity_bits(a) != host_validity_bits(b))
+    return false;
+  if (a.size() == 0) return true;
 
   if (a.type().id() == cudf::type_id::STRING) {
     auto stream = cudf::get_default_stream();

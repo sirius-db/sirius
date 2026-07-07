@@ -13,7 +13,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -134,11 +136,41 @@ inline std::unique_ptr<cudf::table> make_f64_table(int num_cols, int num_rows, i
 // Comparison helpers
 // ---------------------------------------------------------------------------
 
+// Per-row validity of a column as host bools (true = valid). A column without
+// a null mask (or with null_count 0) is all-valid, so a (mask, 0-null) column
+// and a maskless column compare equal. Honors the view's row offset.
+inline std::vector<bool> host_validity_bits(cudf::column_view v)
+{
+  std::vector<bool> valid(static_cast<std::size_t>(v.size()), true);
+  if (v.null_mask() == nullptr || v.null_count() == 0) return valid;
+  std::size_t const first_word = static_cast<std::size_t>(v.offset()) / 32;
+  std::size_t const last_word  = static_cast<std::size_t>(v.offset() + v.size() + 31) / 32;
+  std::vector<std::uint32_t> words(last_word - first_word);
+  cudaMemcpy(words.data(),
+             reinterpret_cast<std::uint32_t const*>(v.null_mask()) + first_word,
+             words.size() * sizeof(std::uint32_t),
+             cudaMemcpyDeviceToHost);
+  for (cudf::size_type r = 0; r < v.size(); ++r) {
+    std::size_t const bit = static_cast<std::size_t>(v.offset() + r);
+    valid[static_cast<std::size_t>(r)] = (words[bit / 32 - first_word] >> (bit % 32)) & 1u;
+  }
+  return valid;
+}
+
+// Validity equality: same null_count and the same per-row valid/null pattern.
+inline bool validity_equal(cudf::column_view a, cudf::column_view b)
+{
+  if (a.null_count() != b.null_count()) return false;
+  return host_validity_bits(a) == host_validity_bits(b);
+}
+
 // Byte-exact comparison of the full fixed-width payload (correct for all
-// element widths, verifies lossless roundtrips bit-for-bit).
+// element widths, verifies lossless roundtrips bit-for-bit), plus validity:
+// a roundtrip that loses or moves nulls fails even when the data bytes match.
 inline bool columns_equal(cudf::column_view a, cudf::column_view b)
 {
   if (a.type() != b.type() || a.size() != b.size()) return false;
+  if (!validity_equal(a, b)) return false;
   std::size_t nbytes =
     static_cast<std::size_t>(a.size()) * static_cast<std::size_t>(cudf::size_of(a.type()));
   std::vector<std::uint8_t> ha(nbytes), hb(nbytes);
@@ -201,35 +233,68 @@ inline std::unique_ptr<cudf::table> make_string_table(int num_rows, rmm::cuda_st
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
-// Byte-exact STRING comparison (offsets + chars).
+// Semantic STRING comparison: same validity pattern, and byte-exact content
+// for every VALID row. Row-wise via offsets so sliced views (whose offsets
+// child spans the parent) and differing null-row padding compare correctly;
+// handles INT32 and INT64 offsets.
 inline bool strings_equal(cudf::column_view a, cudf::column_view b, rmm::cuda_stream_view stream)
 {
   if (a.size() != b.size()) return false;
-  cudf::strings_column_view sa(a), sb(b);
-  auto const ca = sa.chars_size(stream);
-  auto const cb = sb.chars_size(stream);
-  if (ca != cb) return false;
+  if (!validity_equal(a, b)) return false;
+  auto const n = a.size();
+  if (n == 0) return true;
 
-  std::size_t const n_off = static_cast<std::size_t>(a.size()) + 1;
-  std::vector<std::int32_t> oa(n_off), ob(n_off);
-  cudaMemcpy(oa.data(),
-             sa.offsets().head<std::int32_t>(),
-             n_off * sizeof(std::int32_t),
-             cudaMemcpyDeviceToHost);
-  cudaMemcpy(ob.data(),
-             sb.offsets().head<std::int32_t>(),
-             n_off * sizeof(std::int32_t),
-             cudaMemcpyDeviceToHost);
-  if (oa != ob) return false;
+  // Per-row byte ranges [o[r], o[r+1]) of the view's rows within the parent
+  // chars buffer (a view's offsets child spans the parent, so index by
+  // view offset).
+  auto read_offsets = [](cudf::column_view col) {
+    cudf::strings_column_view s(col);
+    std::vector<std::int64_t> o(static_cast<std::size_t>(col.size()) + 1);
+    auto off = s.offsets();
+    if (off.type().id() == cudf::type_id::INT64) {
+      cudaMemcpy(o.data(),
+                 off.head<std::int64_t>() + col.offset(),
+                 o.size() * sizeof(std::int64_t),
+                 cudaMemcpyDeviceToHost);
+    } else {
+      std::vector<std::int32_t> o32(o.size());
+      cudaMemcpy(o32.data(),
+                 off.head<std::int32_t>() + col.offset(),
+                 o32.size() * sizeof(std::int32_t),
+                 cudaMemcpyDeviceToHost);
+      std::copy(o32.begin(), o32.end(), o.begin());
+    }
+    return o;
+  };
+  auto const oa = read_offsets(a);
+  auto const ob = read_offsets(b);
 
-  std::vector<std::uint8_t> pa(static_cast<std::size_t>(ca)), pb(static_cast<std::size_t>(cb));
-  if (ca > 0) {
-    cudaMemcpy(
-      pa.data(), sa.chars_begin(stream), static_cast<std::size_t>(ca), cudaMemcpyDeviceToHost);
-    cudaMemcpy(
-      pb.data(), sb.chars_begin(stream), static_cast<std::size_t>(cb), cudaMemcpyDeviceToHost);
+  auto read_span = [&stream](cudf::column_view col, std::vector<std::int64_t> const& o) {
+    cudf::strings_column_view s(col);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(o.back() - o.front()));
+    if (!bytes.empty()) {
+      cudaMemcpy(bytes.data(),
+                 s.chars_begin(stream) + o.front(),
+                 bytes.size(),
+                 cudaMemcpyDeviceToHost);
+    }
+    return bytes;
+  };
+  auto const pa = read_span(a, oa);
+  auto const pb = read_span(b, ob);
+  auto const valid = host_validity_bits(a);  // equals host_validity_bits(b) per validity_equal
+
+  for (cudf::size_type r = 0; r < n; ++r) {
+    if (!valid[static_cast<std::size_t>(r)]) continue;  // null rows may pad differently
+    auto const idx = static_cast<std::size_t>(r);
+    auto const la  = oa[idx + 1] - oa[idx];
+    if (la != ob[idx + 1] - ob[idx]) return false;
+    if (la > 0 && std::memcmp(pa.data() + (oa[idx] - oa.front()),
+                              pb.data() + (ob[idx] - ob.front()),
+                              static_cast<std::size_t>(la)) != 0)
+      return false;
   }
-  return pa == pb;
+  return true;
 }
 
 // Equality for any supported column type (STRING or fixed-width).
