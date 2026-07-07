@@ -106,16 +106,16 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 ### Zero-Copy Projection Passthrough (PR #991)
 
-**Motivation:** A projection that simply re-references input columns (`SELECT a, c, a`) previously deep-copied every output column on device via the expression executor's BOUND_REF path, even though the data already lived on the GPU.
+**Motivation:** A projection that simply re-references input columns (`SELECT a, c, a`) previously deep-copied every output column on device via the expression evaluator's BOUND_REF path, even though the data already lived on the GPU.
 
 **Mechanism:** `sirius_physical_projection::execute()` classifies each `select_list` entry as a pure passthrough (`sirius::ast::reference`) or an expression to evaluate, then takes one of three paths per batch:
 1. **All evaluated:** owned `cudf::table` (unchanged).
 2. **All passthrough:** output is a `cudf::table_view` over the input columns, wrapped as a view-backed batch whose owner is the input's `read_only_data_batch` lock — **zero device copies**.
 3. **Mixed:** only the non-passthrough entries are evaluated; the output view mixes evaluated columns with input columns, jointly owned by the evaluated table (`shared_ptr<cudf::table>`) and the input lock.
 
-Only the entries needing evaluation are handed to the executor (its `std::vector<sirius::ast::node const*>` constructor), so passthrough columns are never materialized.
+Only the entries needing evaluation are handed to the evaluator (its `std::vector<sirius::ast::node const*>` constructor), so passthrough columns are never materialized.
 
-**Code path:** `src/op/sirius_physical_projection.cpp` — `execute()`; `src/include/data/data_batch_utils.hpp` — `make_data_batch_from_view()`; `src/include/expression_executor/gpu_expression_executor.hpp` — subset constructor.
+**Code path:** `src/op/sirius_physical_projection.cpp` — `execute()`; `src/include/data/data_batch_utils.hpp` — `make_data_batch_from_view()`; `src/include/expression_evaluator/expression_evaluator.hpp` — subset constructor.
 
 ### Adaptive MARK Join Build Side (PR #924)
 
@@ -133,7 +133,7 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 
 ### Projection Folding (PR #909)
 
-**Motivation:** Building a Sirius physical plan from DuckDB's logical plan inserts PROJECTION operators that DuckDB's optimizer never sees — for filter `projection_map` reordering, hoisted aggregate child/filter expressions, table-scan filter columns, and the user's SELECT list. Each PROJECTION is a full GPU pipeline stage that runs `gpu_expression_executor` over every batch and materializes an intermediate batch, so stacked projections evaluate expressions more than once.
+**Motivation:** Building a Sirius physical plan from DuckDB's logical plan inserts PROJECTION operators that DuckDB's optimizer never sees — for filter `projection_map` reordering, hoisted aggregate child/filter expressions, table-scan filter columns, and the user's SELECT list. Each PROJECTION is a full GPU pipeline stage that runs `expression_evaluator` over every batch and materializes an intermediate batch, so stacked projections evaluate expressions more than once.
 
 **Mechanism:** All planner projection creation goes through `push_projection()`, and a single `fold_adjacent_projections()` pass over the finished plan tree collapses any `PROJECTION -> PROJECTION` chain into one projection. Folding composes the two select lists with the AST helpers `visit_references()` (find which child outputs the outer list reads) and `substitute_references()` (rewrite outer references in terms of the inner projection's expressions), so the merged projection produces the same columns in one expression-evaluation stage.
 
@@ -223,7 +223,7 @@ Data is moved from GPU to HOST tier via converter registry.
 2. The AST is set on `parquet_reader_options` via `set_filter()`, pushing filtering into the cuDF reader
 3. `TABLE_SCAN` is set to passthrough (no GPU expression evaluation needed)
 
-If translation fails, filtering falls back to `gpu_expression_executor` on the decoded batch.
+If translation fails, filtering falls back to `expression_evaluator` on the decoded batch.
 
 **Code path:**
 - `src/op/scan/scan_utils.cpp` — `convert_table_filters_to_expression()`, `filter_row_groups_with_stats()`

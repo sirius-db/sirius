@@ -37,10 +37,20 @@
 // standard library
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
+
+namespace sirius::scan_manager {
+class sirius_scan_manager;
+}  // namespace sirius::scan_manager
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
 
 namespace sirius::op::scan {
 
@@ -62,6 +72,11 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
+  /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
+  /// wired. The ingestible uses AST-capable filters for row-group pruning; the downstream
+  /// dynamic-filter operator applies membership filters post-decode.
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
+
   /// Target decoded column-buffer budget for one data-batch split. Consumed
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
   /// the ingestible's metadata scan operates one file at a time and does no batching.
@@ -294,6 +309,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.
   std::atomic<std::size_t> _next_file_idx{0};
+
+  // Dynamic join filters shared with the producing hash join; null when none are wired.
+  // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in
+  // the downstream dynamic-filter operator.
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _sirius_dynamic_filters;
 };
 
 std::shared_ptr<parquet_gpu_ingestible> make_ingestible(
