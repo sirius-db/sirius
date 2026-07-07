@@ -179,8 +179,7 @@ The Sirius config file (e.g. `~/.sirius/sirius.yaml`) controls:
 - **GPU memory**: `usage_limit_fraction`, `reservation_limit_fraction`, `downgrade_trigger_fraction`, `downgrade_stop_fraction`
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
-- **Thread pools**: `pipeline`, `duckdb_scan`, `task_creator`, `downgrade` thread counts
-- **Scan cache**: `duckdb_scan.cache` (values: `"none"`, `"parquet"`, `"table_gpu"`, `"table_host"`)
+- **Thread pools**: `pipeline`, `task_creator`, `downgrade` thread counts
 - **Operator params**: `scan_task_batch_size`, `hash_partition_bytes`, `concat_batch_bytes`
 - **Telemetry**: `telemetry.enable_quent`, `telemetry.output_directory`, `telemetry.engine_name`
 
@@ -206,9 +205,6 @@ sirius:
       num_threads: 4
     downgrade:
       num_threads: 1
-    duckdb_scan:
-      num_threads: 4
-      cache: "parquet"
     task_creator:
       num_threads: 6
   operator_params:

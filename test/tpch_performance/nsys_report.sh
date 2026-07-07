@@ -36,6 +36,8 @@ OUTPUT_BASE="${OUTPUT_BASE:-$PROJECT_DIR/reports}"
 LABEL=""
 SF=""
 PARQUET_DIR=""
+DATA_SOURCE="parquet"
+DUCKDB_FILE=""
 PROFILE_DIR=""
 COMPARE_DIR=""
 ITERATIONS="${ITERATIONS:-2}"
@@ -52,6 +54,9 @@ usage() {
     echo "Options:"
     echo "  --sf SF              Scale factor for profiling (e.g., 300_rg2m, 100)"
     echo "  --parquet-dir DIR    Override parquet directory (default: \$PROJECT_DIR/test_datasets/tpch_parquet_sf<SF>)"
+    echo "  --data-source SRC    Input source: parquet (default) or duckdb"
+    echo "  --duckdb-file FILE   DuckDB database file (implies --data-source duckdb;"
+    echo "                       default: \$PROJECT_DIR/test_datasets/tpch_sf<SF>.duckdb)"
     echo "  --profile-dir DIR    Use existing profiles (skip profiling)"
     echo "  --output-dir DIR     Base directory for reports (default: ./reports)"
     echo "  --label LABEL        Custom label (default: sirius_sf<SF>)"
@@ -61,9 +66,6 @@ usage() {
     echo "  -h, --help           Show this help"
     echo ""
     echo "Either --sf or --profile-dir is required."
-    echo ""
-    echo "To set scan_cache_level, configure it in your Sirius YAML config"
-    echo "(pointed at by \$SIRIUS_CONFIG_FILE)."
     exit 1
 }
 
@@ -71,6 +73,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --sf)           SF="$2"; shift 2 ;;
         --parquet-dir)  PARQUET_DIR="$2"; shift 2 ;;
+        --data-source)  DATA_SOURCE="$2"; shift 2 ;;
+        --duckdb-file)  DUCKDB_FILE="$2"; DATA_SOURCE="duckdb"; shift 2 ;;
         --profile-dir)  PROFILE_DIR="$2"; shift 2 ;;
         --output-dir)   OUTPUT_BASE="$2"; shift 2 ;;
         --label)        LABEL="$2"; shift 2 ;;
@@ -83,9 +87,25 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Default parquet dir based on SF (when neither --parquet-dir nor --profile-dir is set)
-if [ -z "$PARQUET_DIR" ] && [ -n "$SF" ]; then
-    PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+if [ "$DATA_SOURCE" != "parquet" ] && [ "$DATA_SOURCE" != "duckdb" ]; then
+    echo "ERROR: --data-source must be 'parquet' or 'duckdb', got: $DATA_SOURCE" >&2
+    usage
+fi
+
+# Resolve the profiling input for the chosen source (used when profiling, i.e. not
+# --profile-dir). parquet -> a directory (default test_datasets/tpch_parquet_sf<SF>);
+# duckdb -> a single .duckdb file (default test_datasets/tpch_sf<SF>.duckdb).
+INPUT=""
+if [ "$DATA_SOURCE" = "duckdb" ]; then
+    INPUT="$DUCKDB_FILE"
+    if [ -z "$INPUT" ] && [ -n "$SF" ]; then
+        INPUT="$PROJECT_DIR/test_datasets/tpch_sf${SF}.duckdb"
+    fi
+else
+    INPUT="$PARQUET_DIR"
+    if [ -z "$INPUT" ] && [ -n "$SF" ]; then
+        INPUT="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+    fi
 fi
 
 if [ -z "$SF" ] && [ -z "$PROFILE_DIR" ]; then
@@ -153,9 +173,15 @@ if [ -n "$PROFILE_DIR" ]; then
     echo ""
 else
     echo "[Phase 2] Running nsys profiling via performance_test.py"
-    echo "  sf=$SF, iterations=$ITERATIONS, parquet=$PARQUET_DIR"
-    if [ ! -d "$PARQUET_DIR" ]; then
-        echo "ERROR: Parquet directory not found: $PARQUET_DIR" >&2
+    echo "  sf=$SF, iterations=$ITERATIONS, source=$DATA_SOURCE, input=$INPUT"
+    if [ "$DATA_SOURCE" = "duckdb" ]; then
+        if [ ! -f "$INPUT" ]; then
+            echo "ERROR: DuckDB file not found: $INPUT" >&2
+            echo "  Pass --duckdb-file or generate it with generate_tpch_data.sh --format duckdb" >&2
+            exit 1
+        fi
+    elif [ ! -d "$INPUT" ]; then
+        echo "ERROR: Parquet directory not found: $INPUT" >&2
         echo "  Pass --parquet-dir or generate data with generate_tpch_data.sh" >&2
         exit 1
     fi
@@ -168,7 +194,8 @@ else
     PY_CMD=(
         pixi run python "$PROJECT_DIR/test/tpch_performance/performance_test.py"
         --mode nsys-profile
-        --input "$PARQUET_DIR"
+        --input "$INPUT"
+        --data-source "$DATA_SOURCE"
         --engine gpu
         --iterations "$ITERATIONS"
         --output "$REPORT_DIR"
@@ -186,11 +213,16 @@ else
     fi
     echo ""
 
-    # Flatten <REPORT_DIR>/profiles_tree/sirius/q<N>/ → <REPORT_DIR>/profiles/q<N>.<ext>
+    # Flatten <REPORT_DIR>/<bench>_profiles_tree/sirius/q<N>/ → <REPORT_DIR>/profiles/q<N>.<ext>
     # so nsys_analyze.sh and Phase 4 metric extraction (which read flat
     # profiles/q<N>.sqlite + q<N>_timings.csv) continue to work unchanged.
-    PROFILES_TREE="$REPORT_DIR/profiles_tree/sirius"
-    if [ -d "$PROFILES_TREE" ]; then
+    # performance_test.py prefixes --name with tpch_<ts>_<mode>_<engine>_iter<N>_, so the
+    # per-query tree is `<REPORT_DIR>/*profiles_tree/sirius`, not a bare `profiles_tree/`.
+    PROFILES_TREE=""
+    for _d in "$REPORT_DIR"/*profiles_tree/sirius; do
+        [ -d "$_d" ] && PROFILES_TREE="$_d" && break
+    done
+    if [ -n "$PROFILES_TREE" ] && [ -d "$PROFILES_TREE" ]; then
         echo "[Phase 2] Flattening per-query outputs into $REPORT_DIR/profiles/"
         for qdir in "$PROFILES_TREE"/q*/; do
             [ -d "$qdir" ] || continue

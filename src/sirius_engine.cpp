@@ -87,21 +87,15 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
   : context(context),
     sirius_iface(sirius_iface),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
-    query_group_uuid_(uuid::now_v7()),
-    query_group_observer_(quent::query_group::create_observer(telemetry_context_->context())),
     query_handle_(
       quent::query::create(telemetry_context_->context(),
                            quent::query::Init{
                              .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
-                             .query_group_id = query_group_uuid_,
+                             .query_group_id = telemetry_context_->query_group_id(),
                            }))
 {
-  // Declare the query group under this engine
-  query_group_observer_->declaration(query_group_uuid_,
-                                     quent::query_group::Declaration{
-                                       .instance_name = "default_group",
-                                       .engine_id     = telemetry_context_->engine_id(),
-                                     });
+  // The query group is session-scoped and owned by telemetry_context; every query in this
+  // context is reported under it (see telemetry_context::query_group_id).
 }
 
 sirius_engine::~sirius_engine() { query_handle_->exit(); }
@@ -317,34 +311,15 @@ void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& p
   if (table_path.empty()) { return; }
   if (iceberg_delete_data_cache_.count(table_path)) { return; }  // already fetched
 
-  // Extract snapshot parameters if present (for snapshot-aware delete discovery).
-  std::optional<uint64_t> snapshot_id;
-  auto sid_it = scan_op.named_parameters.find("snapshot_from_id");
-  if (sid_it != scan_op.named_parameters.end() && !sid_it->second.IsNull()) {
-    snapshot_id = sid_it->second.GetValue<uint64_t>();
-  }
-
-  // Opening secondary connections triggers QueryBegin/QueryEnd on the shared
-  // SiriusContext.  InternalQueryGuard suppresses those side-effects.
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    SIRIUS_LOG_WARN("[sirius_engine] SiriusContext not available; treating iceberg '{}' as V1.",
-                    table_path);
-    iceberg_delete_data_cache_.emplace(table_path, std::make_shared<op::scan::IcebergDeleteData>());
-    return;
-  }
-
-  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
-
-  auto& scan_mgr  = sirius_ctx->get_scan_manager();
-  auto datasource = scan_mgr.create_datasource(table_path);
-  if (!datasource) {
-    throw std::runtime_error(
-      "[sirius_engine] read_iceberg_delete_data: no IO backend supports path: " + table_path);
-  }
-  auto data =
-    op::scan::read_iceberg_delete_data(context, table_path, datasource->io_ctx(), snapshot_id);
-  iceberg_delete_data_cache_.emplace(table_path, std::move(data));
+  // Iceberg delete-data reading is disabled in this build: the metadata reader
+  // (src/op/scan/iceberg_metadata_reader.cpp) is stale against the new io
+  // interface and is excluded from the build. Treat every iceberg table as
+  // having no delete files (V1 semantics) so positional/equality deletes are
+  // simply not applied rather than producing an undefined-symbol link error.
+  SIRIUS_LOG_WARN(
+    "[sirius_engine] iceberg delete-data reading is disabled; treating '{}' as having no deletes.",
+    table_path);
+  iceberg_delete_data_cache_.emplace(table_path, std::make_shared<op::scan::IcebergDeleteData>());
 }
 
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)

@@ -16,14 +16,27 @@
 
 #include "io/datasource_factory.hpp"
 
-#include "io/uri_parser.hpp"
-#include "sirius_config.hpp"
+#include "io/io_context.hpp"
+#include "io/kvikio/kvikio_context.hpp"
+#include "io/object_store_config.hpp"
+#include "io/rest/rest_ioctx.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
+#include "io/s3/static_credentials.hpp"
+#include "io/uring/uring_ioctx.hpp"
+#include "log/logging.hpp"
+#include "scan_manager/config.hpp"
 
 #include <cudf/io/datasource.hpp>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
 #include <cctype>
-#include <filesystem>
+#include <exception>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -45,118 +58,183 @@ std::string to_lower_scheme(std::string_view s)
   return out;
 }
 
+/// First HOST-tier pinned staging resource, or nullptr when none exists.  The
+/// uring / rest reactors stage device reads through it and size their bounce
+/// slots from its block size.
+cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
+  cucascade::memory::memory_reservation_manager& rm)
+{
+  auto host_spaces = rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (host_spaces.empty()) { return nullptr; }
+  return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+}
+
+/// Build a SigV4 authorizer from the object-store credentials, or nullptr when
+/// the store is not configured (empty endpoint / credentials / region — which
+/// disables the REST backend).  The signing form follows @c s3_signing_mode.
+std::shared_ptr<s3::s3_request_authorizer> make_s3_authorizer(const object_store_config& os)
+{
+  if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
+    return nullptr;
+  }
+  auto creds = s3::static_credentials_from(os);
+  switch (os.s3_signing_mode) {
+    case object_store_config::signing_mode::header:
+      return std::make_shared<s3::sirius_sigv4_header_authorizer>(
+        std::move(creds), os.region, os.endpoint);
+    case object_store_config::signing_mode::presigned:
+      return std::make_shared<s3::sirius_sigv4_presigned_authorizer>(
+        std::move(creds), os.region, os.endpoint);
+  }
+  return nullptr;
+}
+
 }  // namespace
+
+using scheme_checker_type = io_context_registry::scheme_checker_type;
+using factory_type        = io_context_registry::factory_type;
+
+factory_type make_kvikio_ioctx_factory()
+{
+  return [](const scan_manager::scan_manager_config&) -> std::shared_ptr<sirius_ioctx> {
+    try {
+      return std::make_shared<kvikio_context>();
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
+
+factory_type make_uring_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager)
+{
+  return [&reservation_manager](
+           const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+    try {
+      auto* host_mr = first_host_resource(reservation_manager);
+      if (host_mr == nullptr) {
+        SIRIUS_LOG_ERROR(
+          "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
+        return nullptr;
+      }
+      // One reactor_context shared by the whole pool: it carries the per-reactor
+      // config (bounce-slot size taken from the staging resource's block size)
+      // and the pinned bounce-staging resource itself.
+      auto uring_cfg        = config.local;
+      uring_cfg.bounce_size = host_mr->get_block_size();
+      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(uring_cfg, host_mr);
+      return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
+
+factory_type make_rest_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager)
+{
+  return [&reservation_manager](
+           const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+    try {
+      auto authorizer = make_s3_authorizer(config.object_store);
+      if (!authorizer) {
+        SIRIUS_LOG_WARN(
+          "make_rest_ioctx_factory: object store not configured (endpoint / credentials / "
+          "region missing); REST backend disabled");
+        return nullptr;
+      }
+      // Host staging is optional for REST — when absent, reactor-staged device
+      // reads are disabled (bounce_block_size 0), host reads still work.
+      auto* host_mr              = first_host_resource(reservation_manager);
+      auto rest_cfg              = config.rest;
+      rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
+      // The object store owns the endpoint and its TLS trust; the reactor's
+      // curl GETs must verify against the same CA bundle / policy the authorizer
+      // presigns for, so source these from object_store rather than rest config.
+      rest_cfg.ca_bundle_path = config.object_store.ca_bundle_path;
+      rest_cfg.tls_verify     = config.object_store.tls_verify;
+      auto ctx                = std::make_shared<rest::rest_reactor::reactor_context>(
+        std::move(rest_cfg), std::move(authorizer), host_mr);
+      return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
 
 // ---------------------------------------------------------------------------
 // datasource_registry
 // ---------------------------------------------------------------------------
 
-void datasource_registry::register_ioctx(std::string scheme, std::shared_ptr<sirius_ioctx> ioctx)
+io_context_registry::io_context_registry(
+  config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
+  : _config(std::move(config)),
+    _reservation_manager(reservation_manager),
+    _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
 {
-  if (scheme.empty()) throw std::invalid_argument("datasource_registry: empty scheme");
-  if (!ioctx) throw std::invalid_argument("datasource_registry: null ioctx for '" + scheme + "'");
-  scheme = to_lower_scheme(scheme);
-  std::unique_lock lk{_mtx};
-  _ioctxs[std::move(scheme)] = std::move(ioctx);
+  // uring / rest claim paths via their reactor's static supports() (local
+  // files and s3:// URLs respectively).  kvikio is the universal fallback —
+  // cudf's default datasource handles any path — so it matches everything.
+  _entries.emplace(
+    io_context_type::kvikio,
+    entry{
+      io_context_type::kvikio, [](std::string_view) { return true; }, make_kvikio_ioctx_factory()});
+  _entries.emplace(io_context_type::uring,
+                   entry{io_context_type::uring,
+                         &uring::uring_reactor::supports,
+                         make_uring_ioctx_factory(_reservation_manager)});
+  _entries.emplace(io_context_type::restful,
+                   entry{io_context_type::restful,
+                         &rest::rest_reactor::supports,
+                         make_rest_ioctx_factory(_reservation_manager)});
 }
 
-std::shared_ptr<sirius_ioctx> datasource_registry::lookup(std::string_view scheme) const
+void io_context_registry::register_ioctx(io_context_type type,
+                                         scheme_checker_type checker,
+                                         factory_type factory)
+{
+  if (!checker) throw std::invalid_argument("datasource_registry: null scheme checker");
+  if (!factory) throw std::invalid_argument("datasource_registry: null factory");
+  std::lock_guard lk{_mtx};
+  _entries[type] = {type, std::move(checker), std::move(factory)};
+}
+
+std::optional<io_context_type> io_context_registry::lookup_path(
+  std::string_view path) const noexcept
 {
   std::shared_lock lk{_mtx};
-  auto it = _ioctxs.find(to_lower_scheme(scheme));
-  return it == _ioctxs.end() ? nullptr : it->second;
-}
-
-std::vector<std::string> datasource_registry::schemes() const
-{
-  std::shared_lock lk{_mtx};
-  std::vector<std::string> out;
-  out.reserve(_ioctxs.size());
-  for (auto const& [scheme, _] : _ioctxs)
-    out.push_back(scheme);
-  return out;
-}
-
-void datasource_registry::clear()
-{
-  std::unique_lock lk{_mtx};
-  _ioctxs.clear();
-}
-
-// ---------------------------------------------------------------------------
-// datasource_factory
-// ---------------------------------------------------------------------------
-
-namespace {
-
-// Documentation constant: the canonical "file" scheme name registered by
-// SiriusContext::initialize(). The factory looks up schemes via
-// registry.lookup(p.scheme) without branching on this name, so the constant
-// is intentionally unused at runtime — kept as a single source of truth that
-// the registration site (sirius_context.cpp) and any future scheme-specific
-// factory code can refer to.
-[[maybe_unused]] constexpr std::string_view kFileScheme = "file";
-
-}  // namespace
-
-// Retained for compatibility with PR1 callsites/tests; prefer sirius::io::parse()
-// for new code. Both helpers route through the real URI parser.
-std::string datasource_factory::extract_scheme(std::string_view uri) { return parse(uri).scheme; }
-
-std::string datasource_factory::extract_path(std::string_view uri) { return parse(uri).path; }
-
-std::unique_ptr<cudf::io::datasource> datasource_factory::create_for_parquet_scan(
-  std::string_view uri, datasource_registry const& registry, sirius_config const& config)
-{
-  // Relative bare paths normalize to file:///<absolute> and dispatch through
-  // create(). We do not emit a cudf-default fallback here: callers that want
-  // the bundled kvikio path use cudf::io::datasource::create directly outside
-  // this factory (single-GPU use_sirius_datasource=false). In multi-GPU mode
-  // kvikio is forbidden — sirius_config::enforce_sirius_datasource_for_multi_gpu()
-  // forces use_sirius_datasource=true whenever >1 GPU is configured.
-  //
-  // DuckDB's iceberg / hive fixtures hand out paths like
-  // "test/cpp/integration/data/...parquet"; we resolve those against the
-  // process CWD via std::filesystem::absolute (matching cudf-default
-  // semantics for relative paths) and prepend "file://" so create()'s parser
-  // routes them through the registered kFileScheme ioctx.
-  if (!uri.empty() && uri.front() != '/' && uri.find("://") == std::string_view::npos) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    auto abs = fs::absolute(fs::path{std::string{uri}}, ec);
-    if (ec) {
-      throw std::runtime_error(
-        "datasource_factory::create_for_parquet_scan: failed to resolve relative path '" +
-        std::string{uri} + "' to absolute: " + ec.message());
+  // kvikio's checker matches everything; _entries iterates in unspecified order,
+  // so defer the catch-all and let an explicit backend (uring/restful) win.
+  std::optional<io_context_type> fallback;
+  for (const auto& [type, entry] : _entries) {
+    if (!entry.checker(path)) continue;
+    if (type == io_context_type::kvikio) {
+      fallback = type;
+      continue;
     }
-    std::string normalized = "file://" + abs.string();
-    return create(normalized, registry, config);
+    // use_sirius_datasource=false disables the uring local datasource: let local
+    // files fall through to the kvikio catch-all instead of letting uring claim them.
+    if (type == io_context_type::uring && _prefer_kvikio_for_file_scheme) { continue; }
+    return type;
   }
-  return create(uri, registry, config);
+  return fallback;
 }
 
-std::unique_ptr<cudf::io::datasource> datasource_factory::create(
-  std::string_view uri, datasource_registry const& registry, sirius_config const& /*config*/)
+std::shared_ptr<sirius_ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept
 {
-  auto p = parse(uri);
+  std::shared_lock lk{_mtx};
+  auto it = _entries.find(type);
+  if (it == _entries.end()) return nullptr;
+  return it->second.factory(_config);
+}
 
-  // ALL schemes (including kFileScheme) MUST be resolved via the registry —
-  // this factory does not silently fall back to the cudf default datasource
-  // (which routes through libkvikio and binds a single CUDA context per
-  // FileHandle, breaking multi-GPU residency). SiriusContext::initialize()
-  // registers kFileScheme -> sirius_ioctx whenever use_sirius_datasource is
-  // true; in a single-GPU configuration with use_sirius_datasource=false the
-  // file scheme is intentionally not registered and callers route through
-  // cudf::io::datasource::create directly instead of invoking this factory.
-  // Multi-GPU mode always uses sirius_datasource (enforced by
-  // sirius_config::enforce_sirius_datasource_for_multi_gpu()).
-  auto ioctx = registry.lookup(p.scheme);
-  if (!ioctx) {
-    throw std::runtime_error("datasource_factory: no ioctx registered for scheme '" + p.scheme +
-                             "' (uri=" + std::string{uri} + ")");
-  }
-
-  return ioctx->open_datasource(std::move(p.path));
+void io_context_registry::clear()
+{
+  std::unique_lock lk{_mtx};
+  _entries.clear();
 }
 
 }  // namespace sirius::io

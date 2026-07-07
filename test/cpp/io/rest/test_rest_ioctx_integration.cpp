@@ -1,0 +1,699 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "catch.hpp"
+#include "io/rest/rest_ioctx.hpp"
+#include "io/sirius_datasource.hpp"
+#include "io/types.hpp"
+#include "memory/topology_index.hpp"
+#include "scan/test_utils.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/s3_container.hpp"
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime.h>
+
+#include <arpa/inet.h>
+#include <cucascade/memory/topology_discovery.hpp>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <iterator>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using sirius::io::io_context_type;
+using sirius::io::rest::rest_ioctx;
+using sirius::scan_manager::scan_manager_config;
+using sirius::scan_manager::sirius_scan_manager;
+using namespace std::chrono_literals;
+
+std::string env_or(std::string const& name, std::string fallback = {})
+{
+  if (auto* value = std::getenv(name.c_str()); value != nullptr) { return value; }
+  return fallback;
+}
+
+std::string require_env(std::string const& name)
+{
+  auto value = env_or(name);
+  REQUIRE_FALSE(value.empty());
+  return value;
+}
+
+cucascade::memory::system_topology_info single_gpu_topology()
+{
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = 1;
+  cucascade::memory::gpu_topology_info gpu;
+  gpu.id        = 0;
+  gpu.numa_node = 0;
+  topology.gpus.push_back(std::move(gpu));
+  return topology;
+}
+
+std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
+{
+  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
+                                                          std::vector<int>{0});
+}
+
+struct scan_manager_fixture {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
+    initialize_memory_manager(1);
+  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+};
+
+scan_manager_config make_minio_rest_config()
+{
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource   = true;
+  cfg.object_store.endpoint   = require_env("SIRIUS_TEST_S3_ENDPOINT");
+  cfg.object_store.region     = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  cfg.object_store.access_key = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
+  cfg.object_store.secret_key = require_env("SIRIUS_TEST_S3_SECRET_KEY");
+  cfg.object_store.tls_verify = false;
+  cfg.rest.request_timeout_s  = 30;
+  cfg.rest.max_connections    = 8;
+  cfg.rest_n_reactors         = 1;
+  return cfg;
+}
+
+scan_manager_config make_tls_minio_rest_config()
+{
+  auto cfg                        = make_minio_rest_config();
+  cfg.object_store.endpoint       = require_env("SIRIUS_TEST_S3_HTTPS_ENDPOINT");
+  cfg.object_store.tls_verify     = true;
+  cfg.object_store.ca_bundle_path = require_env("SIRIUS_TEST_S3_CA_BUNDLE");
+  return cfg;
+}
+
+scan_manager_config make_fake_rest_config(std::string endpoint)
+{
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource        = true;
+  cfg.object_store.endpoint        = std::move(endpoint);
+  cfg.object_store.region          = "us-east-1";
+  cfg.object_store.access_key      = "rest-integration-access-key";
+  cfg.object_store.secret_key      = "rest-integration-secret-key";
+  cfg.object_store.tls_verify      = false;
+  cfg.rest.request_timeout_s       = 5;
+  cfg.rest.max_connections         = 4;
+  cfg.rest.max_retry_attempts      = 3;
+  cfg.rest.max_auth_retry_attempts = 1;
+  cfg.rest.retry_backoff_base      = std::chrono::milliseconds{5};
+  cfg.rest.retry_jitter            = std::chrono::milliseconds{0};
+  cfg.rest.honor_retry_after       = false;
+  cfg.rest_n_reactors              = 1;
+  cfg.enable_prefetch_cache        = false;
+  return cfg;
+}
+
+std::filesystem::path local_fixture_path(std::string const& key)
+{
+  return std::filesystem::path{require_env("SIRIUS_TEST_S3_LOCAL_DIR")} / key;
+}
+
+std::vector<std::uint8_t> read_binary_file(std::filesystem::path const& path)
+{
+  std::ifstream in(path, std::ios::binary);
+  REQUIRE(in.good());
+  std::vector<char> chars((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  return std::vector<std::uint8_t>(chars.begin(), chars.end());
+}
+
+std::vector<std::uint8_t> deterministic_payload(std::size_t size)
+{
+  std::vector<std::uint8_t> out(size);
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    out[i] = static_cast<std::uint8_t>((i * 131U + 17U) & 0xffU);
+  }
+  return out;
+}
+
+void require_bytes_equal(std::span<std::uint8_t const> got, std::span<std::uint8_t const> expected)
+{
+  REQUIRE(got.size() == expected.size());
+  CHECK(std::equal(got.begin(), got.end(), expected.begin(), expected.end()));
+}
+
+std::vector<std::uint8_t> copy_device_to_host(rmm::device_buffer const& device,
+                                              std::size_t size,
+                                              rmm::cuda_stream_view stream)
+{
+  std::vector<std::uint8_t> out(size);
+  REQUIRE(
+    cudaMemcpyAsync(out.data(), device.data(), size, cudaMemcpyDeviceToHost, stream.value()) ==
+    cudaSuccess);
+  stream.synchronize();
+  return out;
+}
+
+rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> const& ds)
+{
+  REQUIRE(ds != nullptr);
+  REQUIRE(ds->io_ctx() != nullptr);
+  CHECK(ds->io_ctx()->type() == io_context_type::restful);
+  auto* rest_ctx = dynamic_cast<rest_ioctx*>(ds->io_ctx().get());
+  REQUIRE(rest_ctx != nullptr);
+  return rest_ctx;
+}
+
+struct range_fault_policy {
+  std::size_t fail_first_gets{0};
+  bool fail_all_gets{false};
+  int fail_status{503};
+  std::chrono::milliseconds response_delay{0};
+};
+
+class range_http_server {
+ public:
+  explicit range_http_server(std::vector<std::uint8_t> object, range_fault_policy fault = {})
+    : _object(std::move(object)), _fault(fault)
+  {
+    REQUIRE_FALSE(_object.empty());
+
+    _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (_listen_fd < 0) { throw std::runtime_error("socket failed: " + errno_message()); }
+    int one = 1;
+    if (::setsockopt(_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+      throw std::runtime_error("setsockopt failed: " + errno_message());
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    if (::bind(_listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      throw std::runtime_error("bind failed: " + errno_message());
+    }
+    if (::listen(_listen_fd, 64) != 0) {
+      throw std::runtime_error("listen failed: " + errno_message());
+    }
+
+    socklen_t len = sizeof(addr);
+    if (::getsockname(_listen_fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+      throw std::runtime_error("getsockname failed: " + errno_message());
+    }
+    _port   = ntohs(addr.sin_port);
+    _thread = std::thread([this] { accept_loop(); });
+  }
+
+  ~range_http_server()
+  {
+    _stop.store(true);
+    if (_listen_fd >= 0) {
+      ::shutdown(_listen_fd, SHUT_RDWR);
+      ::close(_listen_fd);
+      _listen_fd = -1;
+    }
+    if (_thread.joinable()) { _thread.join(); }
+    for (auto& w : _workers) {
+      if (w.joinable()) { w.join(); }
+    }
+  }
+
+  range_http_server(range_http_server const&)            = delete;
+  range_http_server& operator=(range_http_server const&) = delete;
+
+  [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
+  [[nodiscard]] std::size_t get_count() const noexcept { return _get_count.load(); }
+  [[nodiscard]] int peak_active_gets() const noexcept { return _peak_active_gets.load(); }
+
+ private:
+  struct active_get_guard {
+    explicit active_get_guard(range_http_server& server) : _server(server)
+    {
+      int const active = _server._active_gets.fetch_add(1, std::memory_order_relaxed) + 1;
+      int peak         = _server._peak_active_gets.load(std::memory_order_relaxed);
+      while (active > peak && !_server._peak_active_gets.compare_exchange_weak(
+                                peak, active, std::memory_order_relaxed)) {}
+    }
+    ~active_get_guard() { _server._active_gets.fetch_sub(1, std::memory_order_relaxed); }
+    range_http_server& _server;
+  };
+
+  static std::string errno_message() { return std::strerror(errno); }
+
+  void accept_loop()
+  {
+    while (!_stop.load()) {
+      sockaddr_in client{};
+      socklen_t len = sizeof(client);
+      int fd        = ::accept(_listen_fd, reinterpret_cast<sockaddr*>(&client), &len);
+      if (fd < 0) {
+        if (_stop.load()) { return; }
+        continue;
+      }
+      _workers.emplace_back([this, fd] {
+        handle_client(fd);
+        ::close(fd);
+      });
+    }
+  }
+
+  void handle_client(int fd)
+  {
+    timeval timeout{};
+    timeout.tv_sec = 3;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    std::string request(4096, '\0');
+    ssize_t n = ::recv(fd, request.data(), request.size(), 0);
+    if (n <= 0) { return; }
+    request.resize(static_cast<std::size_t>(n));
+
+    bool const is_head = request.rfind("HEAD ", 0) == 0;
+    bool const is_get  = request.rfind("GET ", 0) == 0;
+    if (is_head) {
+      std::string response =
+        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
+        "\r\nConnection: close\r\n\r\n";
+      send_all(fd, response);
+      return;
+    }
+    if (!is_get) {
+      send_all(fd,
+               "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      return;
+    }
+
+    active_get_guard active{*this};
+    if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
+
+    auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
+    if (_fault.fail_all_gets || get_idx < _fault.fail_first_gets) {
+      std::string response =
+        "HTTP/1.1 " + std::to_string(_fault.fail_status) +
+        " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      send_all(fd, response);
+      return;
+    }
+
+    if (auto range = parse_range(request)) {
+      auto const [start, end] = *range;
+      auto const len          = end - start + 1;
+      std::string response =
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len) +
+        "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" +
+        std::to_string(_object.size()) + "\r\nConnection: close\r\n\r\n";
+      send_all(fd, response);
+      send_all(fd, _object.data() + start, len);
+      return;
+    }
+
+    std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
+                           "\r\nConnection: close\r\n\r\n";
+    send_all(fd, response);
+    send_all(fd, _object.data(), _object.size());
+  }
+
+  static void send_all(int fd, std::string_view bytes)
+  {
+    send_all(fd, reinterpret_cast<std::uint8_t const*>(bytes.data()), bytes.size());
+  }
+
+  static void send_all(int fd, std::uint8_t const* bytes, std::size_t size)
+  {
+    std::size_t sent = 0;
+    while (sent < size) {
+      ssize_t n = ::send(fd, bytes + sent, size - sent, MSG_NOSIGNAL);
+      if (n <= 0) { return; }
+      sent += static_cast<std::size_t>(n);
+    }
+  }
+
+  [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> parse_range(
+    std::string const& request) const
+  {
+    std::string lower = request;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    std::string const prefix = "range: bytes=";
+    auto pos                 = lower.find(prefix);
+    if (pos == std::string::npos) { return std::nullopt; }
+    pos += prefix.size();
+    auto const eol     = lower.find("\r\n", pos);
+    auto const end_pos = eol == std::string::npos ? lower.size() : eol;
+    auto const spec    = lower.substr(pos, end_pos - pos);
+    auto const dash    = spec.find('-');
+    if (dash == std::string::npos) { return std::nullopt; }
+    try {
+      std::size_t start = static_cast<std::size_t>(std::stoull(spec.substr(0, dash)));
+      std::size_t end   = _object.size() - 1;
+      if (dash + 1 < spec.size()) {
+        end = static_cast<std::size_t>(std::stoull(spec.substr(dash + 1)));
+      }
+      if (start >= _object.size()) { return std::nullopt; }
+      end = std::min(end, _object.size() - 1);
+      if (end < start) { return std::nullopt; }
+      return std::make_pair(start, end);
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+
+  int _listen_fd{-1};
+  std::uint16_t _port{0};
+  std::vector<std::uint8_t> _object;
+  range_fault_policy _fault;
+  std::atomic<bool> _stop{false};
+  std::atomic<std::size_t> _get_count{0};
+  std::atomic<int> _active_gets{0};
+  std::atomic<int> _peak_active_gets{0};
+  std::thread _thread;
+  std::vector<std::thread> _workers;
+};
+
+}  // namespace
+
+TEST_CASE("rest_ioctx reads the MinIO hello fixture through scan_manager create_datasource",
+          "[s3][integration][rest]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
+
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  CHECK(datasource->io_ctx()->type() == io_context_type::restful);
+  auto* rest_ctx = dynamic_cast<rest_ioctx*>(datasource->io_ctx().get());
+  REQUIRE(rest_ctx != nullptr);
+
+  REQUIRE(datasource->size() == 16);
+
+  std::array<std::uint8_t, 16> got{};
+  REQUIRE(datasource->host_read(0, got.size(), got.data()) == got.size());
+
+  std::array<std::uint8_t, 16> const expected{
+    's', 'i', 'r', 'i', 'u', 's', '-', 's', '3', '-', 'h', 'e', 'l', 'l', 'o', '\n'};
+  CHECK(got == expected);
+}
+
+TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on MinIO fixtures",
+          "[s3][integration][rest]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
+  auto const small  = read_binary_file(local_fixture_path("small.bin"));
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  auto datasource = manager.create_datasource("s3://" + bucket + "/small.bin");
+  require_rest_ioctx(datasource);
+
+  REQUIRE(datasource->size() == small.size());
+
+  std::vector<std::uint8_t> full(small.size());
+  REQUIRE(datasource->host_read(0, full.size(), full.data()) == full.size());
+  require_bytes_equal(full, small);
+
+  std::vector<std::uint8_t> mid(4096);
+  std::size_t const mid_offset = 1234;
+  REQUIRE(datasource->host_read(mid_offset, mid.size(), mid.data()) == mid.size());
+  require_bytes_equal(mid, std::span<std::uint8_t const>(small.data() + mid_offset, mid.size()));
+
+  std::vector<std::uint8_t> crossing(64, std::uint8_t{0xaa});
+  std::size_t const tail_offset = small.size() - 17;
+  REQUIRE(datasource->host_read(tail_offset, crossing.size(), crossing.data()) == 17);
+  require_bytes_equal(std::span<std::uint8_t const>(crossing.data(), 17),
+                      std::span<std::uint8_t const>(small.data() + tail_offset, 17));
+
+  std::array<std::uint8_t, 8> eof{};
+  eof.fill(std::uint8_t{0xcc});
+  CHECK(datasource->host_read(small.size(), eof.size(), eof.data()) == 0);
+  CHECK(datasource->host_read(small.size() + 99, eof.size(), eof.data()) == 0);
+  CHECK(std::all_of(eof.begin(), eof.end(), [](std::uint8_t b) { return b == 0xcc; }));
+}
+
+TEST_CASE("rest_ioctx fans out host_read_ranges against the MinIO medium fixture",
+          "[s3][integration][rest]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
+  auto const medium = read_binary_file(local_fixture_path("medium.bin"));
+  scan_manager_fixture fixture;
+  auto cfg                 = make_minio_rest_config();
+  cfg.rest.max_connections = 4;
+  cfg.rest.chunk_size      = 1UL << 20;
+  cfg.rest.max_n_chunks    = 1;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto datasource = manager.create_datasource("s3://" + bucket + "/medium.bin");
+  require_rest_ioctx(datasource);
+
+  std::vector<std::vector<std::uint8_t>> buffers;
+  std::vector<sirius::io::io_object_segment> segments;
+  std::vector<std::pair<std::size_t, std::size_t>> ranges{
+    {17, 257},
+    {64 * 1024 + 9, 1024},
+    {2 * 1024 * 1024 + 11, 4096},
+    {medium.size() - 333, 333},
+  };
+  buffers.reserve(ranges.size());
+  segments.reserve(ranges.size());
+  std::size_t total = 0;
+  for (auto const& [offset, size] : ranges) {
+    buffers.emplace_back(size);
+    segments.emplace_back(offset, size, buffers.back().data());
+    total += size;
+  }
+
+  auto got =
+    std::move(datasource->io_ctx()->host_read_ranges_async_io(
+                datasource->io_object(), std::span<sirius::io::io_object_segment>(segments)))
+      .get(5s);
+  REQUIRE(got == total);
+  for (std::size_t i = 0; i < ranges.size(); ++i) {
+    auto const [offset, size] = ranges[i];
+    require_bytes_equal(buffers[i], std::span<std::uint8_t const>(medium.data() + offset, size));
+  }
+}
+
+TEST_CASE("rest_ioctx stages device reads through FSMR for single and multi chunk MinIO reads",
+          "[s3][integration][rest]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping rest_ioctx device-read integration test: no CUDA device");
+    return;
+  }
+
+  auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
+  auto const small  = read_binary_file(local_fixture_path("small.bin"));
+  auto const medium = read_binary_file(local_fixture_path("medium.bin"));
+
+  scan_manager_fixture fixture;
+  auto cfg                 = make_minio_rest_config();
+  cfg.rest.max_connections = 4;
+  cfg.rest.chunk_size      = 1UL << 20;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  SECTION("single chunk")
+  {
+    auto datasource = manager.create_datasource("s3://" + bucket + "/small.bin");
+    require_rest_ioctx(datasource);
+
+    rmm::cuda_stream stream;
+    rmm::device_buffer dst(small.size(), stream);
+    REQUIRE(datasource->device_read(
+              0, small.size(), static_cast<std::uint8_t*>(dst.data()), stream) == small.size());
+    auto got = copy_device_to_host(dst, small.size(), stream);
+    require_bytes_equal(got, small);
+  }
+
+  SECTION("multi chunk")
+  {
+    auto datasource = manager.create_datasource("s3://" + bucket + "/medium.bin");
+    require_rest_ioctx(datasource);
+
+    std::size_t const offset = 123;
+    std::size_t const size   = (3UL << 20) + 17;
+    rmm::cuda_stream stream;
+    rmm::device_buffer dst(size, stream);
+    REQUIRE(datasource->device_read(offset, size, static_cast<std::uint8_t*>(dst.data()), stream) ==
+            size);
+    auto got = copy_device_to_host(dst, size, stream);
+    require_bytes_equal(got, std::span<std::uint8_t const>(medium.data() + offset, size));
+  }
+}
+
+TEST_CASE("rest_ioctx retries transient fake-server failures and reports terminal failures",
+          "[s3][integration][rest]")
+{
+  auto payload = deterministic_payload(64 * 1024);
+  scan_manager_fixture fixture;
+
+  SECTION("transient 503s are retried")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets = 2;
+    fault.fail_status     = 503;
+    range_http_server server(payload, fault);
+    auto cfg                    = make_fake_rest_config(server.endpoint());
+    cfg.rest.max_retry_attempts = 4;
+    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+    auto datasource = manager.create_datasource("s3://retry-bucket/object.bin");
+    require_rest_ioctx(datasource);
+    std::vector<std::uint8_t> got(4096);
+    REQUIRE(datasource->host_read(128, got.size(), got.data()) == got.size());
+    require_bytes_equal(got, std::span<std::uint8_t const>(payload.data() + 128, got.size()));
+    CHECK(server.get_count() >= 3);
+  }
+
+  SECTION("exhausted retries surface as an error")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets = true;
+    fault.fail_status   = 503;
+    range_http_server server(payload, fault);
+    auto cfg                    = make_fake_rest_config(server.endpoint());
+    cfg.rest.max_retry_attempts = 2;
+    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+    auto datasource = manager.create_datasource("s3://retry-bucket/object.bin");
+    require_rest_ioctx(datasource);
+    std::array<std::uint8_t, 128> got{};
+    CHECK_THROWS(datasource->host_read(0, got.size(), got.data()));
+    CHECK(server.get_count() >= 2);
+  }
+}
+
+TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
+          "[s3][integration][rest]")
+{
+  auto payload = deterministic_payload(512 * 1024);
+  range_fault_policy fault{};
+  fault.response_delay = 50ms;
+  range_http_server server(payload, fault);
+  scan_manager_fixture fixture;
+  auto cfg                 = make_fake_rest_config(server.endpoint());
+  cfg.rest.max_connections = 2;
+  cfg.rest.chunk_size      = 1024;
+  cfg.rest.max_n_chunks    = 1;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://concurrency-bucket/object.bin");
+  require_rest_ioctx(datasource);
+
+  std::vector<std::vector<std::uint8_t>> buffers;
+  std::vector<sirius::io::io_object_segment> segments;
+  for (std::size_t i = 0; i < 8; ++i) {
+    std::size_t const offset = i * 4096 + 13;
+    std::size_t const size   = 512;
+    buffers.emplace_back(size);
+    segments.emplace_back(offset, size, buffers.back().data());
+  }
+
+  auto got =
+    std::move(datasource->io_ctx()->host_read_ranges_async_io(
+                datasource->io_object(), std::span<sirius::io::io_object_segment>(segments)))
+      .get(10s);
+  REQUIRE(got == 8 * 512);
+  CHECK(server.peak_active_gets() <= 2);
+  CHECK(server.peak_active_gets() >= 1);
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    require_bytes_equal(
+      buffers[i],
+      std::span<std::uint8_t const>(payload.data() + segments[i].offset, segments[i].size));
+  }
+}
+
+TEST_CASE("rest_ioctx reads through the TLS MinIO endpoint with the harness CA bundle",
+          "[s3][integration][rest]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{make_tls_minio_rest_config(), *fixture.memory, fixture.topology};
+  auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
+  require_rest_ioctx(datasource);
+
+  std::array<std::uint8_t, 16> got{};
+  REQUIRE(datasource->host_read(0, got.size(), got.data()) == got.size());
+  std::array<std::uint8_t, 16> const expected{
+    's', 'i', 'r', 'i', 'u', 's', '-', 's', '3', '-', 'h', 'e', 'l', 'l', 'o', '\n'};
+  CHECK(got == expected);
+}
+
+TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging",
+          "[s3][integration][rest]")
+{
+  auto payload = deterministic_payload(128 * 1024);
+  range_fault_policy fault{};
+  fault.response_delay = 100ms;
+  range_http_server server(payload, fault);
+
+  std::vector<std::uint8_t> got(4096);
+  std::future<std::size_t> future;
+  {
+    scan_manager_fixture fixture;
+    auto cfg                 = make_fake_rest_config(server.endpoint());
+    cfg.rest.max_connections = 1;
+    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+    auto datasource = manager.create_datasource("s3://lifecycle-bucket/object.bin");
+    require_rest_ioctx(datasource);
+    future = datasource->host_read_async(0, got.size(), got.data());
+  }
+
+  REQUIRE(future.valid());
+  REQUIRE(future.wait_for(5s) == std::future_status::ready);
+  try {
+    auto const bytes = future.get();
+    if (bytes != 0) {
+      REQUIRE(bytes == got.size());
+      require_bytes_equal(got, std::span<std::uint8_t const>(payload.data(), got.size()));
+    }
+  } catch (std::exception const& e) {
+    INFO("teardown completed in-flight request with exception: " << e.what());
+    SUCCEED("future resolved with an exception during teardown");
+  }
+}

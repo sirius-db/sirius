@@ -49,7 +49,8 @@ SESSION_TIMEOUT=1200
 DROP_OS_CACHE=false
 MULTI_SESSION=false
 PINNING_MODE="none"
-while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] || [ "${1:-}" = "--multi-session" ] || [ "${1:-}" = "--pinning-mode" ]; do
+PIN_AFTER_ITERATION=0
+while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] || [ "${1:-}" = "--multi-session" ] || [ "${1:-}" = "--pinning-mode" ] || [ "${1:-}" = "--pin-after-iteration" ]; do
     if [ "$1" = "--parquet-dir" ]; then
         PARQUET_DIR="$2"
         shift 2
@@ -68,6 +69,9 @@ while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:
     elif [ "$1" = "--pinning-mode" ]; then
         PINNING_MODE="$2"
         shift 2
+    elif [ "$1" = "--pin-after-iteration" ]; then
+        PIN_AFTER_ITERATION="$2"
+        shift 2
     fi
 done
 
@@ -80,16 +84,20 @@ case "$PINNING_MODE" in
 esac
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] [--pin-after-iteration <N>] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 100 \`seq 1 22\`"
     echo "  --iterations N      Number of iterations per query (default: 2, 1 cold + N-1 warm)"
     echo "  --timeout N         Kill the DuckDB session after N seconds (default: 1200, 0 = no timeout)"
     echo "  --multi-session     Run each query in its own DuckDB process (fresh state per query)"
     echo "  --drop-os-cache     Drop OS filesystem cache before each query (requires --multi-session and sudo)"
-    echo "  --pinning-mode MODE 'per-query' calls pin_table for each query's columns before its iterations,"
-    echo "                      then unpin_table afterward. 'pinned-hot' pins the union of"
+    echo "  --pinning-mode MODE 'per-query' calls pin_table for each query's columns, runs its remaining"
+    echo "                      iterations, then unpin_table. 'pinned-hot' pins the union of"
     echo "                      referenced columns once for the whole single-session run."
     echo "                      Sirius engine only. Default: 'none'."
+    echo "  --pin-after-iteration N   With --pinning-mode per-query: run the first N of each query's"
+    echo "                      iterations unpinned (e.g. cold + warm), then pin for the rest"
+    echo "                      (e.g. hot). Default: 0 (pin from the first iteration). Ignored"
+    echo "                      with --pinning-mode pinned-hot (there is no per-query split)."
     exit 1
 fi
 
@@ -196,20 +204,6 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-# Load per-query scan cache level overrides from YAML config.
-# Used in multi-session mode only — in single-session, the Sirius config YAML controls cache level.
-# Format: <query_number>: <cache_level> (one per line, # comments ignored).
-CACHE_CONFIG="$SCRIPT_DIR/scan_cache_levels.yaml"
-declare -A QUERY_CACHE_LEVEL
-if [ -f "$CACHE_CONFIG" ]; then
-    while IFS=': ' read -r key value; do
-        [[ -z "$key" || "$key" == \#* ]] && continue
-        value="${value## }"
-        [[ -z "$value" ]] && continue
-        QUERY_CACHE_LEVEL[$key]="$value"
-    done < "$CACHE_CONFIG"
-fi
-
 # Build list of valid queries (those with existing SQL files).
 VALID_QUERIES=()
 for q in "${QUERIES[@]}"; do
@@ -237,7 +231,7 @@ echo "Iterations: $NUM_ITERATIONS (1 cold + $((NUM_ITERATIONS - 1)) warm)"
 if [ "$PINNING_MODE" != "none" ]; then
     if [ "$ENGINE" = "sirius" ]; then
         if [ "$PINNING_MODE" = "per-query" ]; then
-            echo "Pinning mode: $PINNING_MODE (pin_table per query, tier=${SIRIUS_PIN_TIER:-gpu})"
+            echo "Pinning mode: $PINNING_MODE (pin_table per query, tier=${SIRIUS_PIN_TIER:-gpu}, pin after iteration ${PIN_AFTER_ITERATION})"
         else
             echo "Pinning mode: $PINNING_MODE (pin_table once before timed queries, tier=${SIRIUS_PIN_TIER:-gpu})"
         fi
@@ -284,20 +278,41 @@ run_single_session() {
 
     for q in "${VALID_QUERIES[@]}"; do
         local QUERY_FILE="$QUERY_DIR/q${q}.sql"
-        # Pin/unpin live OUTSIDE the __TPCH_MARKER__ section so pin/unpin
-        # Run Time lines never get counted as query iterations.
+        echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
+
+        # --pin-after-iteration splits this query's N iterations into an
+        # unpinned prefix (e.g. cold + warm) and a pinned suffix (e.g. hot).
+        # Pin/unpin brackets live INSIDE the __TPCH_MARKER__ section now (mid-query
+        # when PIN_POINT > 0), so the result-extraction awk below skips their
+        # Run Time output explicitly instead of relying on section boundaries.
+        local PIN_POINT=0
         if [ "$PIN_PER_QUERY" = true ]; then
+            PIN_POINT="$PIN_AFTER_ITERATION"
+            [ "$PIN_POINT" -gt "$NUM_ITERATIONS" ] && PIN_POINT="$NUM_ITERATIONS"
+        fi
+
+        # Unpinned iterations first (0 of them when PIN_POINT is 0 — the old
+        # "pin from the start" behavior).
+        for ((iter = 0; iter < PIN_POINT; iter++)); do
+            cat "$QUERY_FILE" >> "$TEMP_SQL"
+            printf '\n' >> "$TEMP_SQL"
+        done
+
+        local PINNED_THIS_QUERY=false
+        if [ "$PIN_PER_QUERY" = true ] && [ "$PIN_POINT" -lt "$NUM_ITERATIONS" ]; then
+            PINNED_THIS_QUERY=true
             echo ".print __TPCH_PIN_BEGIN__ ${q}" >> "$TEMP_SQL"
             python3 "$SCRIPT_DIR/tpch_pin_columns.py" pin "$q" "$PARQUET_DIR" >> "$TEMP_SQL"
             echo ".print __TPCH_PIN_END__ ${q}" >> "$TEMP_SQL"
         fi
-        echo ".print ${MARKER_PREFIX} ${q}" >> "$TEMP_SQL"
-        # N iterations back-to-back — nothing between them.
-        for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
+
+        # Remaining iterations (pinned, if pinning is on and any are left).
+        for ((iter = PIN_POINT; iter < NUM_ITERATIONS; iter++)); do
             cat "$QUERY_FILE" >> "$TEMP_SQL"
             printf '\n' >> "$TEMP_SQL"
         done
-        if [ "$PIN_PER_QUERY" = true ]; then
+
+        if [ "$PINNED_THIS_QUERY" = true ]; then
             echo ".print __TPCH_UNPIN_BEGIN__ ${q}" >> "$TEMP_SQL"
             python3 "$SCRIPT_DIR/tpch_pin_columns.py" unpin "$q" >> "$TEMP_SQL"
             echo ".print __TPCH_UNPIN_END__ ${q}" >> "$TEMP_SQL"
@@ -392,15 +407,24 @@ run_single_session() {
         echo ""
         echo "========== Q${q} =========="
 
-        # Extract the section between this query's marker and the next __TPCH_* marker.
-        # Stopping at any __TPCH_ prefix keeps pin/unpin Run Time lines (which sit in
-        # __TPCH_PIN_*/__TPCH_UNPIN_* sections when a pinning mode is on)
-        # out of the query iteration window.
+        # Extract this query's section: starts at its marker, ends at the next
+        # query's marker (or the final end marker). --pin-after-iteration can put
+        # a __TPCH_PIN_*/__TPCH_UNPIN_* bracket in the MIDDLE of this section (once
+        # pinning kicks in partway through the iterations), so drop everything
+        # between a *_BEGIN__ and its matching *_END__ line rather than treating
+        # any '__TPCH_' line as the end of the section.
         local SECTION
-        SECTION=$(awk -v start="${MARKER_PREFIX} ${q}" '
-            $0 == start                            { cap = 1; next }
-            cap && index($0, "__TPCH_") == 1       { exit }
-            cap                                    { print }
+        SECTION=$(awk -v start="${MARKER_PREFIX} ${q}" -v marker_prefix="${MARKER_PREFIX}" -v end_marker="${END_MARKER}" '
+            {
+                if (cap == 0) { if ($0 == start) cap = 1; next }
+                if (skip == 1) {
+                    if (index($0, "__TPCH_PIN_END__") == 1 || index($0, "__TPCH_UNPIN_END__") == 1) skip = 0
+                    next
+                }
+                if (index($0, "__TPCH_PIN_BEGIN__") == 1 || index($0, "__TPCH_UNPIN_BEGIN__") == 1) { skip = 1; next }
+                if (index($0, marker_prefix) == 1 || $0 == end_marker) exit
+                print
+            }
         ' "$TEMP_OUTPUT")
 
         if [ -z "$SECTION" ]; then
@@ -493,7 +517,7 @@ run_multi_session() {
             fi
         fi
 
-        # Build per-query SQL: views + scan cache level (sirius) + timer + N iterations.
+        # Build per-query SQL: views + timer + N iterations.
         # In --pinning-mode per-query, pin before iterations and unpin after — the unpin
         # is mandatory even though the process is about to exit, to release host-pinned
         # memory cleanly back to the allocator before the next process starts.
@@ -505,9 +529,6 @@ run_multi_session() {
         TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
         {
             printf '%s\n' "$VIEW_SQL"
-            if [ "$ENGINE" = "sirius" ] && [ -n "${QUERY_CACHE_LEVEL[$q]:-}" ]; then
-                printf "SET scan_cache_level = '%s';\n" "${QUERY_CACHE_LEVEL[$q]}"
-            fi
             printf ".timer on\n"
             if [ "$PIN_ENABLED" = true ]; then
                 printf ".print __TPCH_PIN_BEGIN__ %s\n" "$q"

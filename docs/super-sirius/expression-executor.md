@@ -8,22 +8,22 @@ This document covers the GPU expression execution subsystem used by FILTER and P
 
 `gpu_expression_executor` evaluates expressions on the GPU using the Sirius AST type hierarchy (see [Sirius AST Type Hierarchy](#sirius-ast-type-hierarchy)). It provides two execution modes:
 
-> **API boundary:** Operator headers and the executor's public header take expressions as `sirius::expression` / `sirius::join_condition` — opaque PIMPL wrappers around a `sirius::ast::node` / DuckDB `JoinCondition` defined in `src/include/expression/`. Plan builders translate at the DuckDB boundary (`sirius::wrap`, which calls `sirius::ast::from_duckdb` internally); operator `.cpp` files unwrap to a `sirius::ast::node const*` via `expression/expression_internal.hpp`. This keeps both `duckdb/planner/expression/...` and `expression/ast/node.hpp` out of the operator surface.
+> **API boundary:** `sirius::ast::node` is the single expression currency at every operator, planner, and executor boundary. Operators own their expressions directly as `std::unique_ptr<sirius::ast::node>` (e.g. a projection's `select_list`, a table scan's `filter_expr`), and `sirius::join_condition` holds its `left`/`right` sides as `std::unique_ptr<sirius::ast::node>`. DuckDB expressions are translated to Sirius AST once, at the planner/scan boundary, via `sirius::ast::from_duckdb(duckdb::Expression const&)`. There is no wrapper type between DuckDB and Sirius's expression IR, so neither `duckdb/planner/expression/...` nor an opaque handle appears on the operator surface — only `sirius::ast::node`.
 
 | Method | Purpose | Used By |
 |--------|---------|---------|
-| `execute(batch)` | Projects: evaluates expressions and returns result columns with all rows | PROJECTION |
-| `select(batch)` | Filters: evaluates a boolean expression and returns only rows that pass | FILTER |
+| `execute(input)` | Projects: evaluates expressions and returns result columns with all rows | PROJECTION |
+| `select(input)` | Filters: evaluates a boolean expression and returns only rows that pass | FILTER |
 
-Both methods accept a `data_batch` and return a new `data_batch` with the result. The `rmm::cuda_stream_view` and memory resource are passed to the constructor and stored as members — they are not per-call arguments.
+Both methods accept a `cudf::table_view` and return a new `cudf::table` with the result. The `rmm::cuda_stream_view` and memory resource are passed to the constructor and stored as members — they are not per-call arguments.
 
-The executor can be constructed from the full operator expression list or from a pre-filtered `std::vector<sirius::ast::node const*>` (non-owning). The PROJECTION operator uses the latter to pass only the entries that actually need evaluation, after pulling out pure BOUND_REF passthroughs that it exposes as zero-copy views (see [operators](operators.md)). `execute()` returns one output column per supplied expression, in order.
+The executor can be constructed from a `duckdb::vector<std::unique_ptr<sirius::ast::node>>` (the full operator expression list), from a single `sirius::ast::node`, from a non-owning `sirius::ast::node const*`, or from a non-owning `std::vector<sirius::ast::node const*>`. The PROJECTION operator uses the non-owning vector form to pass only the entries that actually need evaluation, after pulling out pure BOUND_REF passthroughs that it exposes as zero-copy views (see [operators](operators.md)). `execute()` returns one output column per supplied expression, in order. If a slot is ever null (an unsupported expression that `from_duckdb` could not translate), the executor throws `InternalException` rather than dereferencing it.
 
 ## Sirius AST Type Hierarchy
 
 **Files:** `src/include/expression/ast/node.hpp`, `src/include/expression/ast/*.hpp`
 
-`sirius::ast::node` is a `std::variant`-based sum type over all Sirius expression node kinds. It is the internal representation stored inside `sirius::expression`'s PIMPL, and the type the executor dispatches on via `std::visit`.
+`sirius::ast::node` is a `std::variant`-based sum type over all Sirius expression node kinds. It is the sole expression representation passed across operator, planner, and executor boundaries, and the type the executor dispatches on via `std::visit`.
 
 ```cpp
 struct node {
@@ -43,7 +43,7 @@ struct node {
 };
 ```
 
-`node` is move-only. Children are stored as `std::unique_ptr<node>` inside each alternative struct, making the tree recursive without incomplete-type issues.
+The alternative order is part of the ABI: `std::variant` indexes by position and downstream dispatch depends on it, so new alternatives are appended at the end. `node` is move-only. Children are stored as `std::unique_ptr<node>` inside each alternative struct, making the tree recursive without incomplete-type issues. Every alternative must implement `cudf_ast_op_count() const`, enforced by a `static_assert` at the variant declaration.
 
 | Alternative | Sirius type | Typical source |
 |-------------|-------------|----------------|
@@ -57,10 +57,10 @@ struct node {
 | `unary_op` | `sirius::ast::unary_op` | `NOT x`, `-x`, arithmetic binary ops (`+`, `-`, `*`, `/`) |
 | `coalesce` | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | `in_list` | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
-| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, etc.) — `sirius::function_id` enum |
+| `function_call` | `sirius::ast::function_call` | Named function (`YEAR`, `UPPER`, `concat`, etc.) — `sirius::function_id` enum |
 | `aggregate` | `sirius::ast::aggregate` | Aggregate function (`SUM`, `COUNT`, etc.) — `sirius::aggregate_id` enum |
 
-**Translation boundary:** `sirius::wrap(expr)` calls `sirius::ast::from_duckdb(expr)` to produce a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders. The resulting node is stored in the `sirius::expression` PIMPL and never re-translated.
+**Translation boundary:** `sirius::ast::from_duckdb(expr)` produces a `sirius::ast::node` from a `duckdb::Expression`. This happens once at plan time in the plan builders (and at the scan boundary for pushdown filters); the resulting node is owned by the operator and never re-translated.
 
 **Key files:**
 
@@ -68,11 +68,11 @@ struct node {
 |------|---------|
 | `src/include/expression/ast/node.hpp` | `sirius::ast::node` variant definition |
 | `src/include/expression/ast/from_duckdb.hpp` | `sirius::ast::from_duckdb` — DuckDB → Sirius AST translator |
+| `src/include/expression/ast/utils.hpp` | AST tree utilities — `visit_references`, `clone`, `substitute_references` |
 | `src/include/expression/value.hpp` | `sirius::value` — typed constant payload (INT8–DECIMAL128, VARCHAR, TIMESTAMP, …) |
 | `src/include/expression/function_id.hpp` | `sirius::function_id` closed enum of supported functions |
 | `src/include/expression/aggregate_id.hpp` | `sirius::aggregate_id` closed enum of supported aggregates |
-| `src/include/expression/expression.hpp` | `sirius::expression` — the public PIMPL type |
-| `src/include/expression/expression_internal.hpp` | `sirius::expression::impl` completion; `unwrap()` / `release()` helpers |
+| `src/include/expression/join_condition.hpp` | `sirius::join_condition` — `{left, right, comparison}` with AST-node sides |
 
 ## Execution Strategies
 
@@ -121,7 +121,7 @@ SET expression_executor_strategy = 'ast_jit';   -- or 'ast_interpret', 'material
 | Arithmetic / unary | `sirius::ast::unary_op` | `a + b`, `NOT x`, `-x` |
 | COALESCE | `sirius::ast::coalesce` | `COALESCE(a, b, 0)` |
 | IN-list | `sirius::ast::in_list` | `x IN (1, 2, 3)` |
-| Function call | `sirius::ast::function_call` | `UPPER(name)`, `YEAR(date)` |
+| Function call | `sirius::ast::function_call` | `UPPER(name)`, `YEAR(date)`, `a \|\| b` |
 | Type cast | `sirius::ast::cast` | `CAST(x AS DOUBLE)` |
 | CASE/WHEN | `sirius::ast::case_expr` | `CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END` |
 | BETWEEN | `sirius::ast::between` | `x BETWEEN 10 AND 20` |
@@ -130,6 +130,10 @@ SET expression_executor_strategy = 'ast_jit';   -- or 'ast_interpret', 'material
 `coalesce` is materialized via `cudf::replace_nulls` iteratively across children: the first child is materialized (scalars are lifted to a column); each subsequent child replaces the residual nulls in the running result. Children are only evaluated when the running result still has nulls. The result is wrapped via `materialize_as_ast_column` so COALESCE composes inside AST-capable parents. `cudf_ast_op_count` returns 0 — `coalesce` always takes the materialize-only path.
 
 `in_list` covers the full numeric set (INT8–INT64, UINT8–UINT64, BOOL8, FLOAT, DOUBLE, DECIMAL32/64/128, all TIMESTAMP precisions, DATE) plus VARCHAR. BOOL8 dispatches via `uint8_t` because `std::vector<bool>::data()` is deleted.
+
+### String concatenation
+
+String concatenation — both the `||` operator (`col || ' suffix'`) and the `concat(a, b, …)` function — resolves to `function_id::concat` (DuckDB lowers `||` to a function named `"||"`, which maps to the same id as `"concat"`). It is dispatched as a materialize-only function in `gpu_execute_function.cpp`: every argument is materialized, any scalar argument is broadcast to a full-length column via `cudf::make_column_from_scalar`, and the columns are joined with `cudf::strings::concatenate` using an empty separator. The narep scalar is invalid (null), giving standard SQL null propagation — any NULL input produces a NULL output.
 
 Per-expression-type dispatch lives in `src/expression_executor/specializations/` (one file per Sirius AST alternative: `gpu_execute_comparison.cpp`, `gpu_execute_case.cpp`, etc.). Each specialization decides how to emit cuDF AST nodes, materialize, or fall back based on the effective execution mode.
 
@@ -196,9 +200,10 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass inequalit
 | `src/expression_executor/gpu_expression_executor.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
 | `src/expression_executor/specializations/gpu_execute_*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
 | `src/include/expression_executor/expression_executor_strategy.hpp` | `expression_executor_strategy` enum + string conversions |
+| `src/include/expression_executor/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
 | `src/include/expression_executor/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |
 | `src/expression_executor/gpu_expression_translator.cpp` | Translator implementation |
 | `src/include/expression/ast/node.hpp` | `sirius::ast::node` variant; per-alternative headers included from here |
 | `src/include/expression/ast/from_duckdb.hpp` | `sirius::ast::from_duckdb` — DuckDB → Sirius AST translation |
-| `src/include/expression/expression.hpp` | `sirius::expression` PIMPL type |
-| `src/include/expression/expression_internal.hpp` | PIMPL completion; `unwrap()` / `release()` helpers |
+| `src/include/expression/ast/utils.hpp` | AST tree utilities — `visit_references`, `clone`, `substitute_references` |
+| `src/include/expression/join_condition.hpp` | `sirius::join_condition` — AST-node sides + comparison operator |

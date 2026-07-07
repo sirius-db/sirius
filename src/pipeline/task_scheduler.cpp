@@ -41,9 +41,10 @@ task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+  exec::queue_ordering task_queue_ordering,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _telemetry_context(std::move(telemetry_context))
+  : _task_queue(task_queue_ordering), _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue");
@@ -182,6 +183,11 @@ void task_scheduler::terminate_query(std::exception_ptr error)
 {
   _completion_handler->report_error(std::move(error));
   stop();
+}
+
+void task_scheduler::signal_query_complete()
+{
+  if (_completion_handler) { _completion_handler->mark_completed(); }
 }
 
 void task_scheduler::drain_after_error()

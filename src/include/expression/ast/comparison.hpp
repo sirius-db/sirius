@@ -18,6 +18,7 @@
 
 // sirius
 #include "expression/join_condition.hpp"  // sirius::comparison_type
+#include "helper/logical_type.hpp"        // sirius::logical_type
 
 // standard library
 #include <memory>
@@ -36,6 +37,11 @@ struct comparison {
   sirius::comparison_type op{sirius::comparison_type::equal};
   std::unique_ptr<node> left;
   std::unique_ptr<node> right;
+
+  [[nodiscard]] sirius::logical_type return_type() const noexcept
+  {
+    return sirius::logical_type::make(sirius::type_id::BOOLEAN);
+  }
 
   std::size_t cudf_ast_op_count() const;
 };

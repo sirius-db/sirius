@@ -66,12 +66,16 @@ class task_scheduler {
    *
    * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
    * @param mem_mgr Reference to the memory reservation manager
+   * @param telemetry_context Shared pointer to the telemetry context
+   * @param task_queue_ordering Pop ordering for the pipeline-level task queue
+   *        (FIFO = oldest-first, LIFO = newest-first). Configured via sirius_config.
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
   explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                           std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+                          exec::queue_ordering task_queue_ordering = exec::queue_ordering::FIFO,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
                             downgrade_executors = nullptr);
@@ -158,6 +162,18 @@ class task_scheduler {
    * @param error The error to report.
    */
   void terminate_query(std::exception_ptr error);
+
+  /**
+   * @brief Signal successful query completion from a task_creator pool thread.
+   *
+   * Called by the cpu_source_task lambda when a terminal CPU-only pipeline
+   * completes without dispatching any downstream GPU tasks (e.g. EMPTY_RESULT,
+   * DUMMY_SCAN → RESULT_COLLECTOR with no intermediate operators). Unlike
+   * gpu_pipeline_executor::mark_completed(), this must NOT call
+   * drain_pending_tasks() — doing so from within a bounded_pool lambda
+   * deadlocks on wait_all(). wait_for_completion() drains the queues anyway.
+   */
+  void signal_query_complete();
 
   /**
    * @brief Drain all in-flight tasks after a query error.

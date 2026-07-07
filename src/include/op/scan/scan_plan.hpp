@@ -19,6 +19,7 @@
 // sirius
 #include <helper/logical_type.hpp>
 #include <op/scan/hive_partition.hpp>
+#include <op/scan/owning_table_view.hpp>
 
 // duckdb
 #include <duckdb/common/column_index.hpp>
@@ -27,6 +28,9 @@
 #include <duckdb/common/vector.hpp>
 #include <duckdb/planner/expression.hpp>
 #include <duckdb/planner/table_filter.hpp>
+
+// cudf
+#include <cudf/types.hpp>
 
 // standard library
 #include <cstddef>
@@ -54,7 +58,8 @@ namespace sirius::op::scan {
  *
  * Hive-partition columns live in P-space but are not in the parquet file, so
  * they never appear in D-space. They are injected post-read into the final
- * output in the order column_ids expects.
+ * output in the order column_ids expects. Also, pure filter columns live in D-space
+ * but are not in the final output layout, so they are dropped after filter evaluation.
  */
 struct scan_plan {
   /// A column produced by the parquet reader, in batch order.
@@ -97,11 +102,14 @@ struct scan_plan {
   std::unordered_set<std::size_t> partition_primary_indices;
 
   /// True iff the reader needs explicit column projection — set when the planner
-  /// pruned or reordered columns (non-empty @c projection_ids) or hive-partition
-  /// columns must be dropped from the physical read. When false, the reader's
-  /// natural "read everything in column_ids order" output already matches what
-  /// the pipeline expects, and the scan can skip @c set_column_names and
-  /// per-file name-based leaf resolution.
+  /// pruned or reordered columns (non-empty @c projection_ids, OR a pruned /
+  /// reordered @c column_ids subset even when @c projection_ids is empty — the
+  /// no-projection-pushdown @c sirius_read_parquet case; see
+  /// @c column_ids_need_reader_projection) or when hive-partition columns must be
+  /// dropped from the physical read. When false, the reader's natural "read
+  /// everything in column_ids order" output already matches what the pipeline
+  /// expects, and the scan can skip @c set_column_names and per-file name-based
+  /// leaf resolution.
   bool needs_reader_projection = false;
 
   //===--------------------------------------------------------------------===//
@@ -144,29 +152,38 @@ struct scan_plan {
 ///      covers @c data_columns 1:1 in order.
 [[nodiscard]] bool needs_output_assembly(scan_plan const& plan);
 
-/// Reshape the reader's D-order batch to the plan's output layout: walk
-/// @c output_layout, moving DATA columns out of the batch and synthesizing
-/// PARTITION columns from @p partition_values. Pure-filter data columns
-/// (present in @c data_columns but not referenced by @c output_layout) are
-/// implicitly freed when the released batch goes out of scope.
+/// Reshape the reader's D-order batch to the plan's output layout.
 ///
-/// Callers should gate the call on @ref needs_output_assembly to avoid the
-/// release/rebuild round-trip when assembly is a no-op. When called regardless,
-/// the function still produces a correct output but performs unnecessary work
-/// in the identity case.
+/// When the plan has no partition columns the output is a pure projection /
+/// reordering of the reader's data columns: it is expressed as a non-owning
+/// @ref owning_table_view selection (@c select_columns), so no device buffers
+/// are copied — pure-filter data columns are dropped from the view and freed
+/// when the result is later materialized. When the plan has partition columns
+/// the reader batch is materialized and rebuilt, moving DATA columns out and
+/// synthesizing constant PARTITION columns from @p partition_values.
 ///
+/// Returns @p table unchanged when @c output_layout is empty (SELECT count(*) —
+/// emitting a 0-column table would erase the row count downstream aggregations
+/// consume).
+///
+/// @param table             The reader's D-order batch to reshape (consumed).
 /// @param plan              The scan plan describing the layout.
-/// @param reader_output     The reader's D-order batch to reshape.
 /// @param partition_values  Partition values for this split, in
 ///                          @c partition_columns order. Empty when the plan has
 ///                          no partition columns.
 /// @param stream            CUDA stream for any GPU work (scalar-backed column
-///                          construction).
-[[nodiscard]] std::unique_ptr<cudf::table> assemble_scan_output(
+///                          construction on the partition path).
+[[nodiscard]] owning_table_view assemble_scan_output(
   scan_plan const& plan,
-  std::unique_ptr<cudf::table> reader_output,
+  owning_table_view&& table,
   std::vector<std::string> const& partition_values,
   rmm::cuda_stream_view stream);
+
+/// Batch (D-space) positions of the output DATA columns, in @c output_layout order.
+/// Empty when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in
+/// which case the caller gathers all columns instead.
+/// @param plan  The scan plan describing the layout.
+[[nodiscard]] std::vector<cudf::size_type> output_data_positions(scan_plan const& plan);
 
 /// Build a scan_plan from DuckDB planner inputs. See @c scan_plan for semantics.
 ///
@@ -189,5 +206,18 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t output_types_size,
                           duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices);
+
+/// True when @p column_ids is a pruned or reordered subset of the full schema (of
+/// size @p full_schema_size) — a non-identity projection the cuDF reader must
+/// honor by name even when @c projection_ids is empty (the case for
+/// @c sirius_read_parquet, which DuckDB plans without projection pushdown, so the
+/// reader would otherwise return the full file width and the plan would assemble
+/// the wrong columns by compacted position). False for an empty @p column_ids
+/// (e.g. @c count(*), which must keep the reader's natural batch so the row count
+/// survives) and for a full-identity @c SELECT * read. @c build_scan_plan (to set
+/// @c needs_reader_projection) and the parquet ingestible (to enforce the
+/// column-names invariant) share this so their contracts agree.
+[[nodiscard]] bool column_ids_need_reader_projection(
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids, std::size_t full_schema_size);
 
 }  // namespace sirius::op::scan

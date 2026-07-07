@@ -95,14 +95,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Index the exported contexts by engine instance: each engine's telemetry is
     // the engine's own context plus its workers' contexts.
-    let lister = move || index_query_engines(&lister_output_dir, format);
+    let lister = move || index_query_engines(&lister_output_dir);
 
     // Reconstruct one context's umbrella event stream from its per-entity
     // subdirectories; the analyzer cache chains this across all the contexts that
     // make up an engine instance.
     let importer = move |context_id| {
         let dir = importer_output_dir.join(format!("{context_id}"));
-        Ok(Sirius::import_events(&dir, format)?)
+        Ok(Sirius::import_events(&dir)?)
     };
 
     let analyzer = async {

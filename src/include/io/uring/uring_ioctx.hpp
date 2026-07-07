@@ -19,7 +19,7 @@
 #include "io/templated_ioctx.hpp"
 #include "io/uring/uring_reactor.hpp"
 
-namespace sirius::io {
+namespace sirius::io::uring {
 
 // ---------------------------------------------------------------------------
 // uring_ioctx
@@ -31,18 +31,13 @@ namespace sirius::io {
  */
 class uring_ioctx : public templated_ioctx<uring_reactor> {
  public:
-  /// @param host_ring_depth   Side-channel host ring pool depth.
-  /// @param ring_entries      SQE depth per reactor io_uring.
-  /// @param n_reactors        Number of reactor workers (each owns its own ring).
-  /// @param bounce_slot_size  Size of each pinned bounce slot.
-  /// @param numa_node         Target NUMA node for pinned bounce buffers
-  ///                          shared across all reactors. -1 disables NUMA
-  ///                          binding (legacy single-node behaviour).
-  explicit uring_ioctx(unsigned host_ring_depth = 16,
-                       unsigned ring_entries    = 64,
-                       size_t n_reactors        = 4,
-                       size_t bounce_slot_size  = 1UL * 1024 * 1024,
-                       int numa_node            = -1);
+  /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context
+  /// per pool: it carries the per-reactor @c config and the pinned bounce-staging
+  /// resource, which must outlive this ioctx).  The ioctx config is sourced from
+  /// the reactors themselves — see @c templated_ioctx.
+  uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx);
+
+  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
 };
 
-}  // namespace sirius::io
+}  // namespace sirius::io::uring

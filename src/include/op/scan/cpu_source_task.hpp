@@ -28,6 +28,8 @@
 #include <pipeline/sirius_pipeline_task_states.hpp>
 #include <pipeline/task_scheduler.hpp>
 
+#include <vector>
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -35,8 +37,10 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 class cpu_source_task_global_state : public pipeline::sirius_pipeline_task_global_state {
  public:
-  cpu_source_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-                               sirius_physical_cpu_source* source_op);
+  cpu_source_task_global_state(
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+    sirius_physical_cpu_source* source_op,
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
 
   sirius_physical_cpu_source& get_source_op() { return _op; }
 
@@ -77,7 +81,7 @@ class cpu_source_task_local_state : public pipeline::sirius_pipeline_task_local_
 class cpu_source_task : public pipeline::sirius_pipeline_itask {
  public:
   cpu_source_task(uint64_t task_id,
-                  cucascade::shared_data_repository* data_repo,
+                  std::vector<cucascade::shared_data_repository*> data_repos,
                   std::unique_ptr<cpu_source_task_local_state> local_state,
                   std::shared_ptr<cpu_source_task_global_state> global_state);
 
@@ -93,7 +97,7 @@ class cpu_source_task : public pipeline::sirius_pipeline_itask {
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 
  private:
-  cucascade::shared_data_repository* _data_repo;
+  std::vector<cucascade::shared_data_repository*> _data_repos;
 };
 
 }  // namespace sirius::op::scan

@@ -17,17 +17,22 @@
 #pragma once
 
 #include "io/io_context.hpp"
-#include "io/types.hpp"
+#include "sirius_config.hpp"
 
+#include <absl/functional/any_invocable.h>
+
+#include <functional>
 #include <memory>
 #include <shared_mutex>
-#include <string>
 #include <string_view>
 #include <unordered_map>
-#include <vector>
 
 namespace sirius {
 struct sirius_config;
+}
+
+namespace cucascade::memory {
+class memory_reservation_manager;
 }
 
 namespace sirius::io {
@@ -37,27 +42,37 @@ namespace sirius::io {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Thread-safe registry mapping URI schemes to @c sirius_ioctx instances.
+ * @brief Thread-safe registry of @c sirius_ioctx backends, resolved by full path.
  *
- * The engine constructs a registry at startup and populates it with one
- * @c sirius_ioctx per backend (uring / gds / s3 / rdma_s3). The factory looks
- * up the correct backend by URI scheme at datasource-creation time.
- *
- * Scheme matching is case-insensitive: @c register_ioctx and @c lookup both
- * lowercase the scheme before storing / searching, matching the
- * normalization done by @c sirius::io::parse (RFC 3986 §3.1). Callers may
- * register / look up with any casing — @c register_ioctx("S3", ...) and
- * @c lookup("s3") refer to the same entry.
+ * The engine constructs a registry at startup and registers one entry per backend
+ * (kvikio / uring / restful), each carrying a path-capability checker.  At
+ * datasource-creation time @c lookup_path runs the checkers against a full path
+ * (the checkers parse the URI / stat the filesystem themselves) and picks the
+ * backend, preferring an explicit backend over the kvikio catch-all.
  *
  * All operations are safe under concurrent reads; mutations take an exclusive
  * lock but are expected only at engine bootstrap / shutdown.
  */
-class datasource_registry {
+class io_context_registry {
  public:
-  datasource_registry()                                      = default;
-  ~datasource_registry()                                     = default;
-  datasource_registry(datasource_registry const&)            = delete;
-  datasource_registry& operator=(datasource_registry const&) = delete;
+  using config_type = scan_manager::scan_manager_config;
+
+  /// @param config              Scan-manager configuration consumed by the
+  ///                            per-backend factories at construction time.
+  /// @param reservation_manager Source of the tier-specific memory resources the
+  ///                            backends need (e.g. the HOST-tier pinned staging
+  ///                            resource for the uring / rest reactors).  Must
+  ///                            outlive the registry — the factory closures hold
+  ///                            it by reference.
+  io_context_registry(config_type config,
+                      cucascade::memory::memory_reservation_manager& reservation_manager);
+  ~io_context_registry() = default;
+
+  io_context_registry(io_context_registry const&)            = delete;
+  io_context_registry& operator=(io_context_registry const&) = delete;
+
+  using scheme_checker_type = std::function<bool(std::string_view)>;
+  using factory_type        = std::function<std::shared_ptr<io::sirius_ioctx>(const config_type&)>;
 
   /**
    * @brief Register an ioctx for a scheme. Replaces any prior registration
@@ -65,23 +80,21 @@ class datasource_registry {
    *
    * The scheme is lowercased before storage; subsequent @c lookup calls
    * with any casing of the same scheme resolve to this entry.
+   * @param type    Opaque identifier for the ioctx type. Used by the engine to
+   *                identify the backend.
    */
-  void register_ioctx(std::string scheme, std::shared_ptr<sirius_ioctx> ioctx);
+  void register_ioctx(io_context_type type, scheme_checker_type checker, factory_type factory);
 
-  /**
-   * @brief Look up the ioctx registered for @p scheme.
-   *
-   * The scheme is lowercased before lookup; @c lookup("S3") and
-   * @c lookup("s3") resolve to the same entry.
-   *
-   * @return The ioctx, or @c nullptr if no backend is registered for @p scheme.
-   */
-  [[nodiscard]] std::shared_ptr<sirius_ioctx> lookup(std::string_view scheme) const;
+  /// Resolve the backend for a full @p path (not a bare scheme — the checkers
+  /// parse the URI / stat the filesystem themselves).  Explicit backends
+  /// (uring / restful) take precedence over the kvikio catch-all, so `s3://`
+  /// never resolves to kvikio and a local file routes to uring before the
+  /// universal fallback.  When the registry was built with
+  /// `use_sirius_datasource=false`, the uring local backend is suppressed so local
+  /// files fall through to kvikio.  std::nullopt when nothing matches.
+  std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
-  /**
-   * @brief Return all registered schemes (copy, for testing / diagnostics).
-   */
-  [[nodiscard]] std::vector<std::string> schemes() const;
+  std::shared_ptr<sirius_ioctx> make_ioctx(io_context_type type) const noexcept;
 
   /**
    * @brief Drop all registered ioctxs. Callers are responsible for shutting
@@ -90,127 +103,45 @@ class datasource_registry {
   void clear();
 
  private:
+  struct entry {
+    io_context_type type;
+    scheme_checker_type checker;
+    factory_type factory;
+  };
+  const config_type _config;
+  cucascade::memory::memory_reservation_manager& _reservation_manager;
+  bool _prefer_kvikio_for_file_scheme{false};
   mutable std::shared_mutex _mtx;
-  std::unordered_map<std::string, std::shared_ptr<sirius_ioctx>> _ioctxs;
+  std::unordered_map<io_context_type, entry> _entries;
 };
 
 // ---------------------------------------------------------------------------
-// datasource_factory
+// Per-backend factory builders
 // ---------------------------------------------------------------------------
+//
+// Each returns a @c factory_type closure that builds one backend ioctx from a
+// @c scan_manager_config.  The closure captures @p reservation_manager by
+// reference (it sources the HOST-tier staging resource the reactors need), so
+// @p reservation_manager must outlive every ioctx the returned factory creates.
+// The closures are @c noexcept-safe: a construction failure (missing resource,
+// unconfigured credentials, …) is logged and reported as a null ioctx rather
+// than thrown, matching @c io_context_registry::make_ioctx.
 
-/**
- * @brief Factory that constructs an @c io_datasource from a URI.
- *
- * Dispatch is by URI scheme: the factory extracts the scheme and looks up the
- * registered @c sirius_ioctx. PR1 intentionally ships only the backend-neutral
- * skeleton; backend-specific object construction (for example S3 bucket/key
- * handles) lands with the corresponding backend PR.
- *
- * URI forms supported (parsing is delegated to @c sirius::io::parse):
- *   - <tt>/absolute/path</tt>      — treated as scheme @c "file"
- *   - <tt>file:///abs/path</tt>    — scheme @c "file"
- *   - <tt>s3://bucket/key</tt>,
- *     <tt>gs://bucket/key</tt>,
- *     <tt>azure://container/blob</tt> — object-store schemes (host/key split)
- *   - Relative bare paths are rejected; use absolute or a scheme.
- *
- * The Windows-style drive-letter form <tt>C:/...</tt> is not supported (Sirius
- * builds on Linux only; see CMakeLists.txt requirements).
- */
-class datasource_factory {
- public:
-  /**
-   * @brief Create a @c cudf::io::datasource for @p uri.
-   *
-   * Dispatch:
-   *   - Every URI scheme MUST resolve through the registry to a registered
-   *     @c sirius_ioctx whose @c make_datasource builds a @c sirius_datasource.
-   *     The factory NEVER falls back to cudf's bundled @c file_source factory
-   *     (kvikio-backed) from inside @c create — single-GPU users that opt out
-   *     of @c sirius_datasource bypass this factory entirely instead of routing
-   *     a kvikio fallback through it. In multi-GPU mode kvikio is forbidden
-   *     because its per-FileHandle CUDA-context binding breaks multi-GPU
-   *     residency; @c sirius_config::enforce_sirius_datasource_for_multi_gpu()
-   *     ensures @c use_sirius_datasource is true whenever >1 GPU is configured.
-   *   - Local file paths (@c "/data/foo.parquet", @c "file:///data/foo.parquet")
-   *     route through @c kFileScheme, which is registered in
-   *     @c SiriusContext::initialize() with a uring-backed @c sirius_ioctx
-   *     (registration is skipped when @c use_sirius_datasource is false in a
-   *     single-GPU configuration).
-   *   - Object-store schemes (@c s3://, etc.) require their backend to register
-   *     a @c sirius_ioctx for that scheme at startup. If no ioctx is registered,
-   *     the factory throws rather than silently falling back to kvikio.
-   *
-   * @param uri      The resource URI (e.g. @c "/data/file.parquet",
-   *                 @c "file:///data/file.parquet", @c "s3://bucket/key").
-   * @param registry Registry to look up the backend ioctx (object-store schemes only).
-   * @param config   Engine config (read by object-store backends in later PRs).
-   *
-   * @return A new datasource on success.
-   *
-   * @throw std::invalid_argument if the URI is empty or malformed.
-   * @throw std::runtime_error    if an object-store scheme has no backend
-   *                              registered, or if backend-specific object
-   *                              construction has not landed yet.
-   */
-  static std::unique_ptr<cudf::io::datasource> create(std::string_view uri,
-                                                      datasource_registry const& registry,
-                                                      sirius_config const& config);
+/// kvikio fallback backend (cudf default datasource).  Takes no reservation
+/// manager — kvikio owns no reactor staging.
+io_context_registry::factory_type make_kvikio_ioctx_factory();
 
-  /**
-   * @brief Lenient entry point for parquet-scan IO whose @p uri originates in
-   *        DuckDB's @c MultiFileBindData / @c scan_op.parameters and may be a
-   *        bare relative path rather than a normalized URI.
-   *
-   * Dispatch:
-   *   - Relative bare path (no leading @c '/' and no @c "://"): normalized to
-   *     @c file:///<absolute> via @c std::filesystem::absolute() and dispatched
-   *     through @c create. Covers iceberg / hive test fixtures that hand out
-   *     paths like @c "test/cpp/integration/data/...parquet".
-   *   - Anything else (absolute path, @c file:///..., @c s3://..., object-store
-   *     schemes): delegate to the strict @c create above. Every path resolves
-   *     through the registry to a @c sirius_ioctx — this factory does not emit
-   *     a kvikio fallback (single-GPU @c use_sirius_datasource=false routing
-   *     uses cudf's datasource directly outside this factory).
-   *
-   * The strict @c create keeps its parser-strict contract — prefer it for
-   * callers that should reject unscheme'd input as a real bug.
-   *
-   * @throw std::invalid_argument if the URI is empty (preserves strict
-   *                              @c create's empty-URI rejection).
-   * @throw std::runtime_error    on object-store dispatch failure (same
-   *                              as strict @c create).
-   */
-  static std::unique_ptr<cudf::io::datasource> create_for_parquet_scan(
-    std::string_view uri, datasource_registry const& registry, sirius_config const& config);
+/// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
+/// @c config.local (bounce-slot size taken from the HOST-tier resource's block
+/// size) and @c config.uring_n_reactors.
+io_context_registry::factory_type make_uring_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager);
 
-  /**
-   * @brief Extract the URI scheme. Thin shim over @c sirius::io::parse.
-   *        Prefer calling @c parse directly for new code; retained for
-   *        compatibility with PR1 callsites and tests.
-   *
-   * Throws @c std::invalid_argument on the same inputs as @c parse (empty URI,
-   * empty scheme, relative bare path, malformed URI).
-   */
-  [[nodiscard]] static std::string extract_scheme(std::string_view uri);
-
-  /**
-   * @brief Extract the path portion of @p uri. Thin shim over
-   *        @c sirius::io::parse; returns the parser's @c path field
-   *        (percent-decoded, no host, exactly one bucket/key separator
-   *        slash stripped for object-store schemes; leading slash retained
-   *        for @c file).
-   *
-   * Examples:
-   *   - @c "/data/f.parquet"          -> @c "/data/f.parquet"
-   *   - @c "file:///data/f.parquet"   -> @c "/data/f.parquet"
-   *   - @c "s3://bucket/key"          -> @c "key"
-   *   - @c "s3://bucket//key"         -> @c "/key"
-   *   - @c "s3://bucket///key"        -> @c "//key"
-   *
-   * Throws on relative paths, empty keys, malformed URIs.
-   */
-  [[nodiscard]] static std::string extract_path(std::string_view uri);
-};
+/// RESTful object-store (s3://) backend.  Builds a SigV4 authorizer from
+/// @c config.object_store and a @c rest_reactor::reactor_context from
+/// @c config.rest.  Returns a null ioctx when the object store is not
+/// configured (empty endpoint / credentials / region).
+io_context_registry::factory_type make_rest_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager);
 
 }  // namespace sirius::io

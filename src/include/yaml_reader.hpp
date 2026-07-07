@@ -18,6 +18,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <chrono>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
@@ -198,6 +199,15 @@ void read_yaml(const YAML::Node& node, optional_bytes_value<T>& out)
     val = static_cast<T>(parse_bytes(node.as<std::string>()));
   }
   out.ref = val;
+}
+
+/// Read a YAML integer as a std::chrono::duration (the YAML value is the
+/// count in the duration's native unit — milliseconds for
+/// std::chrono::milliseconds, seconds for std::chrono::seconds, etc.).
+template <typename Rep, typename Period>
+void read_yaml(const YAML::Node& node, std::chrono::duration<Rep, Period>& out)
+{
+  out = std::chrono::duration<Rep, Period>{node.as<Rep>()};
 }
 
 template <StringEnum T>

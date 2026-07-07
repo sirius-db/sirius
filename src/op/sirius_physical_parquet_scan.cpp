@@ -17,7 +17,7 @@
 #include "op/sirius_physical_parquet_scan.hpp"
 
 #include "expression/ast/from_duckdb.hpp"
-#include "expression_executor/gpu_expression_translator_internal.hpp"
+#include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_table_scan.hpp"
