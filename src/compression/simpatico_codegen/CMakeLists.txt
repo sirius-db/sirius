@@ -118,8 +118,7 @@ function(add_codegen_host_test name)
             nvrtc
             cuda
             dl)
-  target_link_options(${name} PRIVATE -Wl,--defsym=__libc_single_threaded=0
-                      "-Wl,-rpath,${CONDA_PREFIX}/lib")
+  target_link_options(${name} PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")
 endfunction()
 
 add_codegen_host_test(test_compress_with_plan_roundtrip)
@@ -148,8 +147,7 @@ target_link_libraries(
           cuda
           dl)
 target_link_options(
-  compress_with_plan_benchmark PRIVATE -Wl,--defsym=__libc_single_threaded=0
-  "-Wl,-rpath,${CONDA_PREFIX}/lib")
+  compress_with_plan_benchmark PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")
 
 # simpatico multi-mode CLI (benchmark / explore / compress / decompress /
 # verify) CMake target is simpatico_cli to avoid collision with the static
@@ -169,8 +167,7 @@ target_link_libraries(
           nvrtc
           cuda
           dl)
-target_link_options(simpatico_cli PRIVATE -Wl,--defsym=__libc_single_threaded=0
-                    "-Wl,-rpath,${CONDA_PREFIX}/lib")
+target_link_options(simpatico_cli PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")
 
 enable_testing()
 add_test(NAME compress_with_plan_roundtrip
