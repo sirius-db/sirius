@@ -164,6 +164,9 @@ name = "arrow-schema"
 version = "59.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80b3e786a0dd9103acd583a6fb486dbf2f3268466cc0bd571dcf34cef231c1f1"
+dependencies = [
+ "bitflags",
+]
 
 [[package]]
 name = "arrow-select"
@@ -1869,6 +1872,8 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 name = "sirius"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "cxx",
  "sirius-sys",
 ]
@@ -1893,7 +1898,9 @@ dependencies = [
  "sirius",
  "starrocks-plan-translator",
  "starrocks-thrift",
+ "substrait",
  "syn",
+ "tempfile",
  "thiserror",
  "thrift",
  "tokio",
@@ -2049,6 +2056,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",

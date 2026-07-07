@@ -79,3 +79,8 @@ proc-macro2.workspace = true
 prost-build.workspace = true
 quote.workspace = true
 syn.workspace = true
+
+[dev-dependencies]
+# The engine integration test builds a local_files Substrait plan + a parquet fixture.
+substrait.workspace = true
+tempfile = "3"
