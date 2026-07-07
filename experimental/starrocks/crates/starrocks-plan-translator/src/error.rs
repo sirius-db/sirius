@@ -37,6 +37,15 @@ pub enum TranslateError {
         /// Short unsupported reason.
         reason: &'static str,
     },
+    /// A FILE_SCAN broker scan range is outside the supported v1 slice (e.g. a
+    /// non-parquet format or a byte-range split).
+    #[error("unsupported scan range at node {node_id}: {reason}")]
+    UnsupportedScanRange {
+        /// StarRocks plan-node id of the scan.
+        node_id: i32,
+        /// Short unsupported reason.
+        reason: &'static str,
+    },
     /// A StarRocks expression node is outside the supported v1 translation slice.
     #[error("unsupported expression node {node_type:?}: {reason}")]
     UnsupportedExpression {

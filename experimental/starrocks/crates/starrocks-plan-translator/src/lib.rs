@@ -25,7 +25,7 @@
 //!
 //! | Plan node        | Substrait relation     |
 //! |------------------|------------------------|
-//! | `FILE_SCAN_NODE` | `ReadRel` (named table) |
+//! | `FILE_SCAN_NODE` | `ReadRel` (local files) |
 //! | `HDFS_SCAN_NODE` | `ReadRel` (named table) |
 //! | `SELECT_NODE`    | `FilterRel`            |
 //! | `PROJECT_NODE`   | `ProjectRel`           |
@@ -75,11 +75,13 @@ pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
 mod node_translator;
+mod scan_paths;
 pub(crate) mod type_mapper;
 
 use descriptor_table::{DescriptorTable, SlotInfo};
 use error::Result;
 pub use error::TranslateError;
+use scan_paths::ScanFilePaths;
 
 /// Substrait comparison function extension URN used for scalar predicates.
 pub const URN_COMPARISON: &str = "extension:io.substrait:functions_comparison";
@@ -185,8 +187,10 @@ impl PlanTranslator {
             })?;
 
         let desc = DescriptorTable::try_from(desc_tbl)?;
+        let scan_paths = ScanFilePaths::from_fragment(params, &desc)?;
         let mut registry = ExtensionRegistry::new();
-        let mut translated = node_translator::translate_plan(plan, &desc, &mut registry)?;
+        let mut translated =
+            node_translator::translate_plan(plan, &desc, &scan_paths, &mut registry)?;
 
         let output_names = if let Some(output_exprs) = fragment
             .output_exprs
