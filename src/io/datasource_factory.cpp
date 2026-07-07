@@ -20,6 +20,7 @@
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/object_store_config.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/s3/s3_rdma_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 #include "io/uring/uring_ioctx.hpp"
@@ -165,6 +166,18 @@ factory_type make_rest_ioctx_factory(
   };
 }
 
+factory_type make_rdma_ioctx_factory()
+{
+  return [](const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+    try {
+      return std::make_shared<s3::s3_rdma_ioctx>(config.object_store);
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_rdma_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // datasource_registry
 // ---------------------------------------------------------------------------
@@ -186,10 +199,20 @@ io_context_registry::io_context_registry(
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
                          make_uring_ioctx_factory(_reservation_manager)});
-  _entries.emplace(io_context_type::restful,
-                   entry{io_context_type::restful,
-                         &rest::rest_reactor::supports,
-                         make_rest_ioctx_factory(_reservation_manager)});
+  // Exactly one backend may claim the s3 scheme: lookup_path iterates an
+  // unordered map and returns the first non-kvikio match, so registering both
+  // would make the winner nondeterministic.  s3_transport picks which one
+  // (AUTO resolves to HTTP; both entries use the same scheme checker).
+  if (_config.object_store.s3_transport == object_store_config::transport::RDMA) {
+    _entries.emplace(
+      io_context_type::rdma,
+      entry{io_context_type::rdma, &rest::rest_reactor::supports, make_rdma_ioctx_factory()});
+  } else {
+    _entries.emplace(io_context_type::restful,
+                     entry{io_context_type::restful,
+                           &rest::rest_reactor::supports,
+                           make_rest_ioctx_factory(_reservation_manager)});
+  }
 }
 
 void io_context_registry::register_ioctx(io_context_type type,

@@ -270,6 +270,7 @@ set(EXTENSION_SOURCES
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
     src/io/s3/s3_list_parser.cpp
+    src/io/s3/s3_rdma_ioctx.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_httpfs.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp

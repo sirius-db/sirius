@@ -36,7 +36,7 @@
 
 namespace sirius::io {
 
-enum class io_context_type { uring, restful, kvikio };
+enum class io_context_type { uring, restful, kvikio, rdma };
 
 /// Hint passed to @c open_datasource so a backend can tailor how it resolves an
 /// object's metadata.  @c generic resolves the size however is cheapest for the
