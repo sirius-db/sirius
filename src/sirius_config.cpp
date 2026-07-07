@@ -101,6 +101,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.optional("secret_key", opt.secret_key);
   r.optional("session_token", opt.session_token);
   r.optional("s3_transport", opt.s3_transport);
+  r.optional("s3_rdma_max_inflight", opt.s3_rdma_max_inflight);
+  r.optional("s3_rdma_arena_slot_size", opt.s3_rdma_arena_slot_size);
   r.optional("signing_mode", opt.s3_signing_mode);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);

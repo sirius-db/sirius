@@ -18,8 +18,10 @@
 
 #include "io/uri_parser.hpp"
 
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace sirius::io::s3 {
 
@@ -31,54 +33,57 @@ std::runtime_error not_implemented(std::string_view entry_point)
                             ": the S3 RDMA transport is not implemented yet");
 }
 
+rdma::cuobj_rdma_reactor::config reactor_config_from(const object_store_config& cfg)
+{
+  return rdma::cuobj_rdma_reactor::config{cfg.s3_rdma_max_inflight, cfg.s3_rdma_arena_slot_size};
+}
+
 }  // namespace
 
-s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg) : _config(std::move(cfg)) {}
-
-s3_rdma_ioctx::~s3_rdma_ioctx() { pre_destroy(); }
-
-bool s3_rdma_ioctx::supports(std::string_view path) const noexcept
+s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg, std::shared_ptr<rdma::rdma_client> client)
+  : templated_ioctx<rdma::cuobj_rdma_reactor>(
+      1,
+      [ctx = std::make_shared<rdma::cuobj_rdma_reactor::reactor_context>(reactor_config_from(cfg),
+                                                                         client)] {
+        return std::make_unique<rdma::cuobj_rdma_reactor>(ctx);
+      }),
+    _client(std::move(client))
 {
-  try {
-    return parse(path).scheme == "s3";
-  } catch (...) {
-    return false;
+}
+
+size_t s3_rdma_ioctx::host_read_io(const sirius_io_object& obj,
+                                   size_t offset,
+                                   size_t size,
+                                   uint8_t* dst)
+{
+  if (!_client) { throw not_implemented("host_read_io"); }
+  return templated_ioctx<rdma::cuobj_rdma_reactor>::host_read_io(obj, offset, size, dst);
+}
+
+exec::semi_future<size_t> s3_rdma_ioctx::host_read_async_io(const sirius_io_object& obj,
+                                                            size_t offset,
+                                                            size_t size,
+                                                            uint8_t* dst) noexcept
+{
+  if (!_client) {
+    return exec::make_semi_future<size_t>(
+      std::make_exception_ptr(not_implemented("host_read_async_io")));
   }
+  return templated_ioctx<rdma::cuobj_rdma_reactor>::host_read_async_io(obj, offset, size, dst);
 }
 
-std::vector<cudf::io::text::byte_range_info> s3_rdma_ioctx::align_and_coalesce(
-  std::span<const cudf::io::text::byte_range_info> ranges,
-  std::optional<size_t> /*alignment*/) const noexcept
+exec::semi_future<size_t> s3_rdma_ioctx::device_read_async_io(const sirius_io_object& obj,
+                                                              size_t offset,
+                                                              size_t size,
+                                                              uint8_t* dst,
+                                                              rmm::cuda_stream_view stream) noexcept
 {
-  return {ranges.begin(), ranges.end()};
-}
-
-size_t s3_rdma_ioctx::host_read_io(const sirius_io_object& /*obj*/,
-                                   size_t /*offset*/,
-                                   size_t /*size*/,
-                                   uint8_t* /*dst*/)
-{
-  throw not_implemented("host_read_io");
-}
-
-exec::semi_future<size_t> s3_rdma_ioctx::host_read_async_io(const sirius_io_object& /*obj*/,
-                                                            size_t /*offset*/,
-                                                            size_t /*size*/,
-                                                            uint8_t* /*dst*/) noexcept
-{
-  return exec::make_semi_future<size_t>(
-    std::make_exception_ptr(not_implemented("host_read_async_io")));
-}
-
-exec::semi_future<size_t> s3_rdma_ioctx::device_read_async_io(
-  const sirius_io_object& /*obj*/,
-  size_t /*offset*/,
-  size_t /*size*/,
-  uint8_t* /*dst*/,
-  rmm::cuda_stream_view /*stream*/) noexcept
-{
-  return exec::make_semi_future<size_t>(
-    std::make_exception_ptr(not_implemented("device_read_async_io")));
+  if (!_client) {
+    return exec::make_semi_future<size_t>(
+      std::make_exception_ptr(not_implemented("device_read_async_io")));
+  }
+  return templated_ioctx<rdma::cuobj_rdma_reactor>::device_read_async_io(
+    obj, offset, size, dst, stream);
 }
 
 exec::semi_future<size_t> s3_rdma_ioctx::host_to_device_read_async_io(
@@ -100,9 +105,18 @@ exec::semi_future<size_t> s3_rdma_ioctx::host_read_ranges_async_io(
     std::make_exception_ptr(not_implemented("host_read_ranges_async_io")));
 }
 
-std::shared_ptr<sirius_io_object> s3_rdma_ioctx::create_io_object(std::string /*path*/)
+std::shared_ptr<sirius_io_object> s3_rdma_ioctx::create_io_object(std::string path)
 {
-  throw not_implemented("create_io_object");
+  if (!_client) { throw not_implemented("create_io_object"); }
+
+  auto parsed = parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("s3_rdma_ioctx::create_io_object: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  const size_t size = _client->head(parsed.host, parsed.path);
+  return std::make_shared<rdma::cuobj_rdma_io_object>(
+    std::move(path), std::move(parsed.host), std::move(parsed.path), size);
 }
 
 }  // namespace sirius::io::s3

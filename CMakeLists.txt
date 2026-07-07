@@ -266,6 +266,8 @@ set(EXTENSION_SOURCES
     src/io/cache/prefetching_cache.cpp
     src/io/cache/types.cpp
     src/io/kvikio/kvikio_context.cpp
+    src/io/rdma/cuobj_rdma_reactor.cpp
+    src/io/rdma/mock_rdma_client.cpp
     src/io/rest/curl_handle.cpp
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp

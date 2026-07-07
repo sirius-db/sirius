@@ -40,6 +40,13 @@ struct object_store_config {
   enum class transport { AUTO, HTTP, RDMA };
   transport s3_transport = transport::AUTO;
 
+  /// RDMA reactor sizing (transport::RDMA only). @c s3_rdma_max_inflight is the
+  /// worker count = the global in-flight ceiling (one blocking GET per worker);
+  /// the per-device landing arena is @c max_inflight × @c slot_size bytes.
+  /// Defaults calibrated on a 100G link — scale bytes in flight with line rate.
+  size_t s3_rdma_max_inflight    = 8;
+  size_t s3_rdma_arena_slot_size = 4UL << 20;
+
   /// SigV4 signing form for S3 requests. @c presigned puts auth in the URL query
   /// string (default; works everywhere AWS does). @c header puts auth in the
   /// @c Authorization header (sign_request) — for on-prem / S3-compatible stores

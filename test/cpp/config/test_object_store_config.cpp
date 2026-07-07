@@ -48,6 +48,8 @@ TEST_CASE("object_store_config defaults are inert", "[object_store_config]")
   CHECK(cfg.secret_key.empty());
   CHECK(cfg.session_token.empty());
   CHECK(cfg.s3_transport == object_store_config::transport::AUTO);
+  CHECK(cfg.s3_rdma_max_inflight == 8);
+  CHECK(cfg.s3_rdma_arena_slot_size == 4UL << 20);
   CHECK(cfg.s3_signing_mode == object_store_config::signing_mode::presigned);
 }
 
@@ -150,6 +152,31 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
   CHECK(os.session_token == "TESTSESSIONTOKEN");
   CHECK(os.s3_signing_mode == object_store_config::signing_mode::header);
   CHECK(os.s3_transport == object_store_config::transport::RDMA);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config parses S3 RDMA reactor knobs from YAML",
+          "[object_store_config][s3][rdma][reactor][config]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_s3_rdma_knobs.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      object_store:\n"
+             "        s3_transport: rdma\n"
+             "        s3_rdma_max_inflight: 2\n"
+             "        s3_rdma_arena_slot_size: 65536\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+
+  auto const& os = cfg.get_scan_manager_config().object_store;
+  CHECK(os.s3_transport == object_store_config::transport::RDMA);
+  CHECK(os.s3_rdma_max_inflight == 2);
+  CHECK(os.s3_rdma_arena_slot_size == 64UL << 10);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

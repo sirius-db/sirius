@@ -16,49 +16,39 @@
 
 #pragma once
 
-#include "io/io_context.hpp"
 #include "io/object_store_config.hpp"
+#include "io/rdma/cuobj_rdma_reactor.hpp"
+#include "io/rdma/rdma_client.hpp"
+#include "io/templated_ioctx.hpp"
 
 namespace sirius::io::s3 {
 
 /**
- * @brief S3-over-RDMA backend, transport-selection stage.
+ * @brief S3-over-RDMA ioctx. Specialisation of
+ *        @c templated_ioctx<rdma::cuobj_rdma_reactor>.
  *
  * Registered for the `s3://` scheme instead of the REST backend when
- * `object_store_config::s3_transport == transport::RDMA`. Routing, the
- * capability profile, and cache gating are final: device reads are supported,
- * the staged host-to-device and vector host-read paths are not (so
- * `can_use_prefetching_cache()` is false and the prefetch cache is never built
- * for this backend). Every data path currently fails with a
- * "RDMA ... not implemented" error — selecting RDMA and touching S3 is a loud
- * error by design, never a silent fallback to another transport. The RDMA
- * reactor (registered landing arena + device-to-device delivery) replaces the
- * failing bodies without changing this surface.
+ * `object_store_config::s3_transport == transport::RDMA`.  One reactor owns the
+ * whole worker pool (`s3_rdma_max_inflight` blocking workers = the global
+ * in-flight ceiling); GPU affinity lives in the per-device landing arenas, not
+ * the reactor count.  The capability profile is structural — device reads
+ * supported, the staged host-to-device and vector host-read paths deliberately
+ * absent — so the prefetch cache is never built for this backend.
+ *
+ * Without a configured @c rdma_client every data path fails loudly with a
+ * "not implemented" error (the transport-selection contract); with one, reads
+ * are served through the client (the mock in tests, cuObject later).
  */
-class s3_rdma_ioctx final : public sirius_ioctx {
+class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
  public:
-  explicit s3_rdma_ioctx(object_store_config cfg);
-  ~s3_rdma_ioctx() override;
+  explicit s3_rdma_ioctx(object_store_config cfg,
+                         std::shared_ptr<rdma::rdma_client> client = nullptr);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::rdma; }
 
-  void shutdown() noexcept override {}
-
-  [[nodiscard]] bool supports(std::string_view path) const noexcept override;
-
-  [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
-  [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
-  [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
-
-  [[nodiscard]] cache::prefetching_stage preferred_prefetching_stage() const noexcept override
-  {
-    return cache::prefetching_stage::none;
-  }
-
-  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<const cudf::io::text::byte_range_info> ranges,
-    std::optional<size_t> alignment) const noexcept override;
-
+  /// Fail-fast without a client: these three intercept before the base builds
+  /// any request, so no transfer machinery (and no backend-typed io_object
+  /// access) is reached until the transport exists.
   size_t host_read_io(const sirius_io_object& obj,
                       size_t offset,
                       size_t size,
@@ -75,6 +65,9 @@ class s3_rdma_ioctx final : public sirius_ioctx {
                                                  uint8_t* dst,
                                                  rmm::cuda_stream_view stream) noexcept override;
 
+  /// The two staged paths are structurally unsupported for this backend; keep
+  /// the transport-selection error shape ("RDMA ... not implemented") instead
+  /// of the generic unsupported-operation message.
   exec::semi_future<size_t> host_to_device_read_async_io(
     const sirius_io_object& obj,
     std::span<io_object_segment> slices,
@@ -87,10 +80,13 @@ class s3_rdma_ioctx final : public sirius_ioctx {
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept override;
 
  protected:
+  /// Parse s3://bucket/key, HEAD it through the client for the size, and build
+  /// the io_object.  Throws a "not implemented" error when no client is
+  /// configured; propagates HEAD failures (missing object) otherwise.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 
  private:
-  object_store_config _config;
+  std::shared_ptr<rdma::rdma_client> _client;
 };
 
 }  // namespace sirius::io::s3

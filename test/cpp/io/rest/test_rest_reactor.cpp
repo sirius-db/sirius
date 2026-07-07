@@ -523,3 +523,5 @@ TEST_CASE("device_cpy_request rejects null-derived host sources before cuda memc
   CHECK(cudaDeviceSynchronize() == cudaSuccess);
   CHECK(cudaFree(device_dst) == cudaSuccess);
 }
+
+#include "../rdma/rdma_mock_reactor_tests.hpp"
