@@ -36,14 +36,26 @@ namespace sirius::op::scan {
 /// @brief Per-scan selectivity gate for post-decode dynamic filters.
 ///
 /// Used by @ref apply_dynamic_filters_gated_view. The first applied non-empty batch decides:
-/// filters that keep more than 25% of rows are disabled for the scan; selective filters stay
-/// active. Growth beyond the snapshot that produced a disable decision re-arms the gate for one
-/// measurement. An immediate Phase 1 probe normally sees the complete publication, while a scan
-/// target reached through an intervening join may observe additional filters on later splits.
-/// Concurrent scan batches may both measure; decision recording is serialized so an older
-/// measurement cannot demote a gate that a selective batch already made active.
+/// filters that keep more than @c keep_threshold of the rows they see are disabled for the scan;
+/// more selective filters stay active. Growth beyond the snapshot that produced a disable decision
+/// re-arms the gate for one measurement. An immediate Phase 1 probe normally sees the complete
+/// publication, while a scan target reached through an intervening join may observe additional
+/// filters on later splits. Concurrent scan batches may both measure; decision recording is
+/// serialized so an older measurement cannot demote a gate that a selective batch already made
+/// active.
 class dynamic_filter_gate {
  public:
+  /// Default fraction of retained rows above which the scan's post-decode filtering is disabled
+  /// (a filter this unselective does not repay its per-split mask kernel).
+  static constexpr double k_default_keep_threshold = 0.9;
+
+  /// @param keep_threshold Disable the scan's filtering once a measured split keeps more than this
+  ///                       fraction of its rows. In [0, 1]; 1.0 never disables.
+  explicit dynamic_filter_gate(double keep_threshold = k_default_keep_threshold)
+    : _keep_threshold(keep_threshold)
+  {
+  }
+
   /// True when a gated apply would do work now: at least one filter exists, and the gate is active
   /// or the append-only filter count has grown beyond the snapshot that disabled it.
   [[nodiscard]] bool applicable(sirius::op::sirius_dynamic_filter_set const& filters) const;
@@ -87,6 +99,9 @@ class dynamic_filter_gate {
   /// A filter that keeps more than this fraction of the rows it sees prunes too little to repay
   /// its per-split mask kernel, so it is dropped from later splits.
   static constexpr double k_filter_skip_keep_threshold = 0.5;
+
+  /// Keep ratio above which the scan-level gate disables. Set at construction from config.
+  double _keep_threshold;
 
   std::atomic<state> _state{state::unknown};
 

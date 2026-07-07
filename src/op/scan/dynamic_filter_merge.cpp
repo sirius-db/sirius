@@ -198,7 +198,6 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
                                             std::size_t rows_after,
                                             std::size_t observed_filter_count)
 {
-  constexpr double keep_threshold = 0.25;  // disable if a batch keeps > 25% of its rows
   if (rows_before == 0) { return; }
 
   // Multiple GPU tasks can finish masks concurrently. Re-read both values while holding the slow
@@ -206,18 +205,18 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
   // after a selective task has already committed it.
   std::scoped_lock decision_lock(_decision_mu);
   auto const current = _state.load(std::memory_order_relaxed);
-  if (current == state::active) { return; }  // proven useful — sticky
+  if (current == state::active) { return; }
   if (current == state::disabled &&
       observed_filter_count <= _decided_filter_count.load(std::memory_order_relaxed)) {
     return;  // same filters the disabling batch saw — no new information
   }
   auto const kept = static_cast<double>(rows_after) / static_cast<double>(rows_before);
   _decided_filter_count.store(observed_filter_count, std::memory_order_relaxed);
-  _state.store(kept > keep_threshold ? state::disabled : state::active, std::memory_order_relaxed);
+  _state.store(kept > _keep_threshold ? state::disabled : state::active, std::memory_order_relaxed);
   SIRIUS_LOG_DEBUG("[apply_dynamic_filters] selectivity gate: kept {:.3f} ({} filters) -> {}.",
                    kept,
                    observed_filter_count,
-                   kept > keep_threshold ? "DISABLED" : "ACTIVE");
+                   kept > _keep_threshold ? "DISABLED" : "ACTIVE");
 }
 
 std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(

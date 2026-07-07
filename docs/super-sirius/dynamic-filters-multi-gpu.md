@@ -137,14 +137,11 @@ first queried `cudaDevAttrL2CacheSize`.
 metadata, and one materialized build view; it is not a shared scheduler service
 or a mutable routing registry.
 
-Two data-bearing sites may offer that view:
-
-1. the build-port hook, as soon as the single concat-folded `BUILD_PROBE` build
-   batch arrives; and
-2. the hash-table `BUILT` transition, as a fallback.
-
-They arbitrate through a publication state machine independent of the hash-table
-build state:
+The build-port hook offers that view as soon as the single concat-folded
+`BUILD_PROBE` build batch arrives, acquiring the batch's read-only accessor
+before routing it so the GPU representation stays pinned against downgrade until
+publication completes. The hook and finalization arbitrate through a publication
+state machine independent of the hash-table build state:
 
 ```text
 OPEN --claim--> PUBLISHING --success--> FINISHED

@@ -31,10 +31,12 @@ namespace sirius::op::scan {
 sirius_physical_dynamic_filter::sirius_physical_dynamic_filter(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters)
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
+  double gate_keep_threshold)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::DYNAMIC_FILTER, std::move(types), estimated_cardinality),
-    _filters(std::move(filters))
+    _filters(std::move(filters)),
+    _gate(gate_keep_threshold)
 {
 }
 

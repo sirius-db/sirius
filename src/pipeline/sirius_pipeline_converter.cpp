@@ -296,7 +296,10 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   // disk and cached resolutions of this parquet scan.
   if (dynamic_filters) {
     auto dynamic_filter_op = duckdb::make_uniq<op::scan::sirius_physical_dynamic_filter>(
-      scan_op.types, scan_op.estimated_cardinality, std::move(dynamic_filters));
+      scan_op.types,
+      scan_op.estimated_cardinality,
+      std::move(dynamic_filters),
+      op_params_.dynamic_filter_keep_threshold);
     auto* dynamic_filter_ptr = dynamic_filter_op.get();
     current_pipeline->operators.insert(current_pipeline->operators.begin() + 1,
                                        *dynamic_filter_ptr);

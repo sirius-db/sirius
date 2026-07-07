@@ -1616,6 +1616,36 @@ static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope
                    params->enable_dynamic_zone_map_filter);
 }
 
+static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double threshold = parameter.GetValue<double>();
+  if (threshold <= 0.0) {
+    throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
+                                threshold);
+  }
+  params->dynamic_filter_domain_coverage_threshold = threshold;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_DOMAIN_COVERAGE_THRESHOLD to {}",
+                   params->dynamic_filter_domain_coverage_threshold);
+}
+
+static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double threshold = parameter.GetValue<double>();
+  if (threshold < 0.0 || threshold > 1.0) {
+    throw InvalidInputException("dynamic_filter_keep_threshold must be in [0.0, 1.0], got %f",
+                                threshold);
+  }
+  params->dynamic_filter_keep_threshold = threshold;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_KEEP_THRESHOLD to {}",
+                   params->dynamic_filter_keep_threshold);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1822,6 +1852,23 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);
+
+  config.AddExtensionOption(
+    "dynamic_filter_domain_coverage_threshold",
+    "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
+    "fraction of the key's domain; >= 1.0 effectively disables the gate",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_domain_coverage_threshold),
+    SetDynamicFilterDomainCoverageThreshold);
+
+  config.AddExtensionOption(
+    "dynamic_filter_keep_threshold",
+    "Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than "
+    "this fraction of its rows (too unselective to repay the mask kernel); in [0.0, 1.0], 1.0 "
+    "keeps filtering always on",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
+    SetDynamicFilterKeepThreshold);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

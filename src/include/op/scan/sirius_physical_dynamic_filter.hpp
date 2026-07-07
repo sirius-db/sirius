@@ -43,9 +43,11 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DYNAMIC_FILTER;
 
-  sirius_physical_dynamic_filter(duckdb::vector<sirius::logical_type> types,
-                                 std::size_t estimated_cardinality,
-                                 std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters);
+  sirius_physical_dynamic_filter(
+    duckdb::vector<sirius::logical_type> types,
+    std::size_t estimated_cardinality,
+    std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
+    double gate_keep_threshold = dynamic_filter_gate::k_default_keep_threshold);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;

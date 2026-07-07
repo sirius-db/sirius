@@ -38,6 +38,7 @@
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter_publisher.hpp"
 #include "op/sirius_dynamic_filter.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -62,43 +63,6 @@
 
 namespace sirius {
 namespace op {
-
-dynamic_filter_publish_plan::dynamic_filter_publish_plan(
-  std::vector<probe_target> probe_targets,
-  bool emit_zone_map_filters,
-  std::vector<std::size_t> build_key_domain_cardinalities,
-  std::vector<dynamic_filter_replica_space> replica_spaces)
-  : _probe_targets(std::move(probe_targets)),
-    _emit_zone_map_filters(emit_zone_map_filters),
-    _build_key_domain_cardinalities(std::move(build_key_domain_cardinalities)),
-    _replica_spaces(std::move(replica_spaces))
-{
-  if (!_probe_targets.empty() && _replica_spaces.empty()) {
-    throw std::invalid_argument(
-      "[dynamic_filter_publish_plan] An enabled dynamic-filter publish plan requires at least one "
-      "GPU memory space");
-  }
-  for (auto const& target : _replica_spaces) {
-    if (target.get_gpu_space().get_tier() != cucascade::memory::Tier::GPU) {
-      throw std::invalid_argument(
-        "[dynamic_filter_publish_plan] A dynamic-filter replica target must be a GPU memory space");
-    }
-    if (target.get_host_staging_space().get_tier() != cucascade::memory::Tier::HOST) {
-      throw std::invalid_argument(
-        "[dynamic_filter_publish_plan] Dynamic-filter staging requires a HOST memory space");
-    }
-  }
-  auto const device_less = [](auto const& lhs, auto const& rhs) {
-    return lhs.get_gpu_space().get_device_id() < rhs.get_gpu_space().get_device_id();
-  };
-  auto const same_device = [](auto const& lhs, auto const& rhs) {
-    return lhs.get_gpu_space().get_device_id() == rhs.get_gpu_space().get_device_id();
-  };
-  // Ensure no duplicated device ids
-  std::sort(_replica_spaces.begin(), _replica_spaces.end(), device_less);
-  _replica_spaces.erase(std::unique(_replica_spaces.begin(), _replica_spaces.end(), same_device),
-                        _replica_spaces.end());
-}
 
 /// Recursively collect all BoundReferenceExpression indices from an expression tree.
 static void collect_bound_ref_indices(const duckdb::Expression& expr,
@@ -1005,15 +969,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
       }
 
-      // Second-chance dynamic-filter publication. Persistent filter storage retains its allocation
-      // stream, so use the build memory space's durable pool rather than this worker-owned stream.
-      auto const* build_space = build_batch_ro.get_memory_space();
-      if (build_space != nullptr &&
-          build_batch_ro.get_current_tier() == cucascade::memory::Tier::GPU) {
-        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{build_space->get_device_id()}};
-        publish_dynamic_filters(sirius::get_cudf_table_view(build_batch_ro),
-                                build_space->acquire_stream());
-      }
     }
     if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
       // Hash table is built, we can process probe batches. The probe-side keys will be processed in
@@ -1362,333 +1317,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 //===----------------------------------------------------------------------===//
 // Dynamic Filters
 //===----------------------------------------------------------------------===//
-namespace {
-// Minimum L2 cache size across every GPU that may probe the filter (0 if any query fails). A single
-// filter kind is replicated to all probe devices, so the exact set must fit the smallest cache.
-std::size_t device_l2_cache_bytes(
-  std::span<dynamic_filter_replica_space const> replica_spaces) noexcept
-{
-  if (replica_spaces.empty()) {
-    int current = -1;
-    if (cudaGetDevice(&current) != cudaSuccess) { return 0; }
-    int l2 = 0;
-    return cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, current) == cudaSuccess && l2 > 0
-             ? static_cast<std::size_t>(l2)
-             : 0;
-  }
-
-  std::size_t minimum = std::numeric_limits<std::size_t>::max();
-  for (auto const& target : replica_spaces) {
-    auto const device_id = target.get_gpu_space().get_device_id();
-    int l2               = 0;
-    if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device_id) != cudaSuccess || l2 <= 0) {
-      return 0;
-    }
-    minimum = std::min(minimum, static_cast<std::size_t>(l2));
-  }
-  return minimum == std::numeric_limits<std::size_t>::max() ? 0 : minimum;
-}
-
-/// Builds, replicates, and fans out one immutable filter snapshot from a complete join build batch.
-/// It borrows plan/key metadata; its caller owns source readiness and exactly-once arbitration.
-class dynamic_filter_publisher final {
- public:
-  dynamic_filter_publisher(duckdb::JoinFilterPushdownInfo const& filter_pushdown,
-                           dynamic_filter_publish_plan const& plan,
-                           std::vector<sirius_physical_hash_join::key_cast_info> const& key_casts,
-                           std::vector<cudf::size_type> const& right_key_col_indices)
-    : _filter_pushdown(filter_pushdown),
-      _plan(plan),
-      _key_casts(key_casts),
-      _right_key_col_indices(right_key_col_indices)
-  {
-  }
-
-  /// Apply publication gates, materialize device replicas, then publish to accepting targets.
-  void publish(cudf::table_view const& build_view, rmm::cuda_stream_view stream) const;
-
- private:
-  duckdb::JoinFilterPushdownInfo const& _filter_pushdown;
-  dynamic_filter_publish_plan const& _plan;
-  std::vector<sirius_physical_hash_join::key_cast_info> const& _key_casts;
-  std::vector<cudf::size_type> const& _right_key_col_indices;
-};
-
-void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
-                                       rmm::cuda_stream_view stream) const
-{
-  nvtx3::scoped_range nvtx_range{"dynfilter::push_build_side"};
-  assert(_plan.enabled());
-
-  if (build_view.num_rows() == 0) {
-    SIRIUS_LOG_DEBUG(
-      "[sirius_physical_hash_join] Skipping dynamic filter push: empty build table.");
-    return;
-  }
-
-  auto target_accepts_filters = [](dynamic_filter_publish_plan::probe_target const& tgt) {
-    return tgt.filter_set && tgt.filter_set->accepting_filters();
-  };
-  auto const& probe_targets = _plan.probe_targets();
-  if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
-    SIRIUS_LOG_DEBUG(
-      "[sirius_physical_hash_join] Skipping dynamic filter push: all target scans drained.");
-    return;
-  }
-
-  auto const& key_domains = _plan.build_key_domain_cardinalities();
-
-  int source_device = -1;
-  if (cudaGetDevice(&source_device) != cudaSuccess) {
-    throw std::runtime_error(
-      "[dynamic_filter_publisher::publish] Dynamic-filter publisher could not identify its source "
-      "GPU");
-  }
-  auto const source_space =
-    std::find_if(_plan.replica_spaces().begin(),
-                 _plan.replica_spaces().end(),
-                 [source_device](auto const& target) {
-                   return target.get_gpu_space().get_device_id() == source_device;
-                 });
-  if (source_space == _plan.replica_spaces().end()) {
-    throw std::logic_error(
-      "[dynamic_filter_publisher::publish] Dynamic-filter source GPU is absent from the immutable "
-      "publish plan");
-  }
-  auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
-  auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
-  auto const l2_bytes      = device_l2_cache_bytes(_plan.replica_spaces());
-
-  // Build up to 2 complementary filters per join key:
-  //  1) a zone-map (read-time ROW-GROUP pruning, the only path that cuts scan I/O)
-  //  2) a membership filter (IN-list / Bloom, post-decode) chosen by L2-cache fit.
-  // The two ride different consumer paths and compose; either may be absent for a key.
-  std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(
-    _filter_pushdown.join_condition.size());
-  std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(
-    _filter_pushdown.join_condition.size());
-  std::vector<cudf::data_type> per_key_build_type(_filter_pushdown.join_condition.size(),
-                                                  cudf::data_type{cudf::type_id::EMPTY});
-
-  // Read a numeric scalar to host as a double for the zone-map range-coverage gate. Returns nullopt
-  // for non-numeric keys (the gate is then skipped and the zone-map is published).
-  auto scalar_to_double = [stream](cudf::scalar const& s) -> std::optional<double> {
-    switch (s.type().id()) {
-      case cudf::type_id::INT8:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::int8_t> const&>(s).value(stream));
-      case cudf::type_id::INT16:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::int16_t> const&>(s).value(stream));
-      case cudf::type_id::INT32:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::int32_t> const&>(s).value(stream));
-      case cudf::type_id::INT64:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::int64_t> const&>(s).value(stream));
-      case cudf::type_id::UINT8:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::uint8_t> const&>(s).value(stream));
-      case cudf::type_id::UINT16:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::uint16_t> const&>(s).value(stream));
-      case cudf::type_id::UINT32:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::uint32_t> const&>(s).value(stream));
-      case cudf::type_id::UINT64:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::uint64_t> const&>(s).value(stream));
-      default: return std::nullopt;
-    }
-  };
-
-  for (std::size_t k = 0; k < _filter_pushdown.join_condition.size(); ++k) {
-    auto const cond_idx = _filter_pushdown.join_condition[k];
-    // Skip cast keys to ensure type-equivalent build/probe base keys are used for the dynamic
-    // filter. We can repair this constraint later.
-    if (cond_idx < _key_casts.size() &&
-        (_key_casts[cond_idx].cast_right || _key_casts[cond_idx].cast_left)) {
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic filter key {}: skipped (cast on build key "
-        "cond_idx={}).",
-        k,
-        cond_idx);
-      continue;
-    }
-    if (cond_idx >= _right_key_col_indices.size()) { continue; }
-
-    // Skip domain-covering keys before paying to build a membership structure; their filters keep
-    // most probe rows, and the consumer-side gate remains the runtime backstop.
-    auto const key_domain = k < key_domains.size() ? key_domains[k] : 0;
-    if (key_domain > 0) {
-      auto const covered =
-        static_cast<double>(build_view.num_rows()) / static_cast<double>(key_domain);
-      if (covered >= dynamic_filter_publish_plan::k_domain_coverage_threshold) {
-        SIRIUS_LOG_DEBUG(
-          "[sirius_physical_hash_join] publish gate: key {}: build {} rows cover {:.2f} of key "
-          "domain (~{} rows) -> skip key.",
-          k,
-          build_view.num_rows(),
-          covered,
-          key_domain);
-        continue;
-      }
-    }
-
-    auto const build_col_idx = _right_key_col_indices[cond_idx];
-    auto const& col          = build_view.column(build_col_idx);
-    per_key_build_type[k]    = col.type();
-
-    // (1) Zone-map — read-time row-group pruning. This only helps when build keys are correlatively
-    // clustered with the filter column(s), so it is off by default (TPC-H keys are scattered).
-    if (_plan.emit_zone_map_filters()) {
-      nvtx3::scoped_range vr{"dynfilter::build_zone_map"};
-      auto min_s = cudf::reduce(col,
-                                *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
-                                col.type(),
-                                stream,
-                                allocator_ref);
-      auto max_s = cudf::reduce(col,
-                                *cudf::make_max_aggregation<cudf::reduce_aggregation>(),
-                                col.type(),
-                                stream,
-                                allocator_ref);
-      if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
-        // Range-coverage publication gate (the zone-map analogue of the cardinality gate above):
-        // a [min,max] spanning most of the build key's domain prunes nothing, so skip it.
-        bool publish_zone_map = true;
-        if (key_domain > 0) {
-          auto const lo = scalar_to_double(*min_s);
-          auto const hi = scalar_to_double(*max_s);
-          if (lo && hi) {
-            auto const coverage = (*hi - *lo + 1.0) / static_cast<double>(key_domain);
-            if (coverage >= dynamic_filter_publish_plan::k_domain_coverage_threshold) {
-              SIRIUS_LOG_DEBUG(
-                "[sirius_physical_hash_join] zone-map key {}: skipped (range [{},{}] covers {:.2f} "
-                "of key domain ~{}).",
-                k,
-                *lo,
-                *hi,
-                coverage,
-                key_domain);
-              publish_zone_map = false;
-            }
-          }
-        }
-        if (publish_zone_map) {
-          std::vector<sirius::op::zone_map_entry> zones;
-          zones.push_back({std::move(min_s), std::move(max_s)});
-          per_key_zone_map[k] = std::make_shared<sirius::op::sirius_dynamic_zone_map_filter>(
-            std::move(zones), true, true);
-        }
-      }
-    }
-
-    // (2) Membership filter — post-decode. Prefer the exact IN-list when its set fits the device L2
-    // cache; otherwise fall back to the Bloom whenever the key type supports it; `none` only when
-    // the key type has no Bloom support (anything other than INT32/INT64).
-    auto const set_bytes =
-      sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(build_rows, col.type());
-    auto const bloom_bytes  = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
-    char const* choice      = "none";
-    bool const in_list_fits = l2_bytes > 0 &&
-                              sirius::op::sirius_dynamic_in_list_filter::supports(col) &&
-                              set_bytes <= l2_bytes;
-    if (in_list_fits) {
-      nvtx3::scoped_range vr{"dynfilter::build_in_list"};
-      per_key_membership[k] =
-        std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);
-      choice = "in_list";
-    } else if (sirius::op::sirius_dynamic_bloom_filter::supports(col.type())) {
-      nvtx3::scoped_range vr{"dynfilter::build_bloom"};
-      per_key_membership[k] =
-        std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
-      choice = "bloom";
-    }
-    SIRIUS_LOG_DEBUG(
-      "[sirius_physical_hash_join] dynamic filter key {}: build_rows={} zone_map={} membership: "
-      "in_list_set={}B bloom={}B L2={}B -> {}",
-      k,
-      build_rows,
-      per_key_zone_map[k] ? "yes" : "no",
-      set_bytes,
-      bloom_bytes,
-      l2_bytes,
-      choice);
-  }
-
-  // Publish is cross-stream: consumers probe these structures from their own task streams the
-  // moment push_filter lands, with no event ordering back to local producer `stream`.
-  auto const built = [](auto const& f) { return static_cast<bool>(f); };
-  if (std::any_of(per_key_membership.begin(), per_key_membership.end(), built) ||
-      std::any_of(per_key_zone_map.begin(), per_key_zone_map.end(), built)) {
-    stream.synchronize();
-
-    // Build each structure only on the producer. Remote GPUs receive the finished static-set slots,
-    // Bloom words, or exact zone bounds. Replication completes before the single logical filter is
-    // published, so consumers never wait and never observe a cross-device pointer.
-    nvtx3::scoped_range replicate_range{"dynfilter::replicate_devices"};
-    auto replicate = [this](std::shared_ptr<sirius_dynamic_filter> const& filter) {
-      if (!filter) { return; }
-      auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());
-      if (replicable == nullptr) {
-        throw std::logic_error(
-          "[dynamic_filter_publisher::publish] A published device-backed dynamic filter must "
-          "implement sirius_device_replicable");
-      }
-      replicable->replicate_to_devices(_plan.replica_spaces());
-    };
-    for (auto const& filter : per_key_zone_map) {
-      replicate(filter);
-    }
-    for (auto const& filter : per_key_membership) {
-      replicate(filter);
-    }
-  }
-
-  // Fan out across probe targets
-  std::size_t total_pushed   = 0;
-  std::size_t active_targets = 0;
-  for (auto const& tgt : probe_targets) {
-    if (!target_accepts_filters(tgt)) { continue; }
-    ++active_targets;
-
-    if (tgt.probe_col_idx.size() != per_key_membership.size()) {
-      SIRIUS_LOG_WARN(
-        "[sirius_physical_hash_join] dynamic-filter column mismatch (probe_col_idx={} keys={}); "
-        "skipping target to preserve correctness.",
-        tgt.probe_col_idx.size(),
-        per_key_membership.size());
-      continue;
-    }
-    for (std::size_t k = 0; k < per_key_membership.size(); ++k) {
-      if (per_key_zone_map[k] && k < tgt.probe_col_type.size() &&
-          tgt.probe_col_type[k] == per_key_build_type[k] &&
-          tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_zone_map[k])) {
-        ++total_pushed;
-      }
-      if (per_key_membership[k] &&
-          tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_membership[k])) {
-        ++total_pushed;
-      }
-    }
-  }
-  SIRIUS_LOG_INFO(
-    "[sirius_physical_hash_join] Pushed {} dynamic filter(s) across {} active target(s) "
-    "of {} wired target(s) ({} build rows, {} keys).",
-    total_pushed,
-    active_targets,
-    probe_targets.size(),
-    build_view.num_rows(),
-    _filter_pushdown.join_condition.size());
-}
-}  // namespace
-
 void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& build_view,
                                                         rmm::cuda_stream_view stream)
 {
-  // Publication is independent of the join state machine. Never hold op_state_mutex while reducing,
-  // copying replicas, or synchronizing devices: the first caller atomically owns the work.
+  // Publication is independent of the join state machine.
   auto expected = dynamic_filter_publication_state::OPEN;
   if (!_dynamic_filter_publication_state.compare_exchange_strong(
         expected,
@@ -1719,49 +1351,44 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   std::shared_ptr<::cucascade::data_batch> batch,
   std::size_t partition_idx)
 {
+  //===----------Dynamic Table Filters----------===//
+  // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
+  // compute and publish the filter from the build keys. Only meaningful for the build port of a
+  // BUILD_PROBE join currently.
+  std::optional<::cucascade::read_only_data_batch> build_ro;
+  if (port_id == "build" && batch) {
+    bool claim = false;
+    {
+      std::scoped_lock lg(op_state_mutex);
+      claim = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
+                dynamic_filter_publication_state::OPEN &&
+              _join_mode == HASH_JOIN_MODE::BUILD_PROBE && filter_pushdown &&
+              _dynamic_filter_plan.enabled();
+    }
+    if (claim) { build_ro.emplace(batch->to_read_only()); }
+  }
+
   // Route the batch to the target port exactly as the base does.
   sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
     port_id, batch, partition_idx);
 
-  //===----------Dynamic Table Filters----------===//
-  // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
-  // compute and publish the filter from the build keys.
-  // Only meaningful for the build port of a BUILD_PROBE join (which guarantees one folded build
-  // batch).
-  if (port_id != "build" || !batch) { return; }
+  if (!build_ro) { return; }
 
   nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
-  {
-    std::scoped_lock lg(op_state_mutex);
-    if (_dynamic_filter_publication_state.load(std::memory_order_acquire) !=
-        dynamic_filter_publication_state::OPEN) {
-      return;
-    }
-    // Skip non-BUILD_PROBE (multi-batch build → a single batch's min/max would be a wrong, partial
-    // bound) at this phase, and unwired joins.
-    if (_join_mode != HASH_JOIN_MODE::BUILD_PROBE || !filter_pushdown ||
-        !_dynamic_filter_plan.enabled()) {
-      return;
-    }
-  }
-
-  // Leave the state OPEN when the delivered batch is not GPU-resident; execute may later claim it
-  // from the migrated/execution-ready GPU representation. This is defense-in-depth: normal
-  // build-side CONCAT delivery is GPU-resident and completes publication here before this join's
-  // immediate probe data scan is scheduled. A scan target below an intervening join can run sooner.
-  auto ro  = batch->to_read_only();
-  auto* ms = ro.get_data() ? ro.get_memory_space() : nullptr;
-  if (!ms || ro.get_current_tier() != ::cucascade::memory::Tier::GPU) { return; }
+  auto* ms = build_ro->get_data() ? build_ro->get_memory_space() : nullptr;
+  // Non-GPU residency here means the batch was already downgraded before this delivery (it can be
+  // shared with an earlier consumer, e.g. CTE fan-out). Publication is best-effort: skip it.
+  if (!ms || build_ro->get_current_tier() != ::cucascade::memory::Tier::GPU) { return; }
 
   // The build batch was produced on a different stream than the publication stream. Order the
   // publication stream after the batch's writer event.
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
   auto publish_stream = ms->acquire_stream();
-  if (auto const writer_event = ro.get_writer_event(); writer_event != nullptr) {
+  if (auto const writer_event = build_ro->get_writer_event(); writer_event != nullptr) {
     auto const status = cudaStreamWaitEvent(publish_stream.value(), writer_event, 0);
     if (status != cudaSuccess) {
       throw std::runtime_error(
-        std::string("[sirius_physical_hash_join::push_data_batch_partitioned]dynamic-filter "
+        std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
                     "writer-event wait failed: ") +
         cudaGetErrorString(status));
     }
@@ -1775,7 +1402,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
         cudaGetErrorString(status));
     }
   }
-  publish_dynamic_filters(sirius::get_cudf_table_view(ro), publish_stream);
+  publish_dynamic_filters(sirius::get_cudf_table_view(*build_ro), publish_stream);
 }
 
 void sirius_physical_hash_join::on_finalize_operator()
