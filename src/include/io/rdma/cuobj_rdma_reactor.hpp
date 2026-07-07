@@ -37,6 +37,18 @@
 
 namespace sirius::io::rdma {
 
+/// GPUDirect RDMA write-ordering: a flush before the consuming copy is needed
+/// unless the platform orders NIC writes for all devices.  @p writes_ordering
+/// is the CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING value
+/// (NONE = 0, OWNER = 100, ALL_DEVICES = 200); whether OWNER truly needs the
+/// flush for same-device consumers is validated on the rig — until then this
+/// stays conservative.
+[[nodiscard]] constexpr bool flush_required(int writes_ordering) noexcept
+{
+  constexpr int k_all_devices_ordered = 200;  // CU_..._ORDERING_ALL_DEVICES
+  return writes_ordering < k_all_devices_ordered;
+}
+
 /// s3://bucket/key object handle resolved by @c s3_rdma_ioctx::create_io_object
 /// (HEAD via the client).
 class cuobj_rdma_io_object : public sirius_io_object {
@@ -109,9 +121,16 @@ class cuobj_rdma_reactor {
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
     [[nodiscard]] const std::shared_ptr<rdma_client>& client() const noexcept { return _client; }
 
+    /// Flush GPUDirect writes before the consuming D2D copy.  Off by default;
+    /// set at init from the device's writes-ordering attribute
+    /// (see @c flush_required) once the real data path is enabled.
+    [[nodiscard]] bool flush_before_copy() const noexcept { return _flush_before_copy; }
+    void set_flush_before_copy(bool value) noexcept { _flush_before_copy = value; }
+
    private:
     config _config;
     std::shared_ptr<rdma_client> _client;
+    bool _flush_before_copy{false};
   };
 
   using io_object_type       = cuobj_rdma_io_object;
@@ -164,6 +183,7 @@ class cuobj_rdma_reactor {
   struct arena {
     uint8_t* base{nullptr};
     std::unique_ptr<slot_pool> pool;
+    std::shared_ptr<rdma_client> registrar;  // deregisters base on teardown
     ~arena();
   };
 

@@ -43,6 +43,19 @@ class rdma_client {
   /// throws on transport failure.
   virtual size_t get(
     std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst) = 0;
+
+  /// Optional: make [base, base + bytes) usable as a device GET destination
+  /// (RDMA registration).  Default no-op — host transports and the mock need
+  /// nothing.  Throws on registration failure.
+  virtual void register_memory(void* base, size_t bytes)
+  {
+    (void)base;
+    (void)bytes;
+  }
+
+  /// Optional counterpart to @ref register_memory.  Must not throw (called
+  /// from teardown paths).
+  virtual void deregister_memory(void* base) noexcept { (void)base; }
 };
 
 }  // namespace sirius::io::rdma

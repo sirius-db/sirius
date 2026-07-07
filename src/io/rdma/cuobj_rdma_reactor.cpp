@@ -70,7 +70,10 @@ cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg)
 
 cuobj_rdma_reactor::arena::~arena()
 {
-  if (base != nullptr) { (void)cudaFree(base); }
+  if (base != nullptr) {
+    if (registrar) { registrar->deregister_memory(base); }
+    (void)cudaFree(base);
+  }
 }
 
 cuobj_rdma_reactor::cuobj_rdma_reactor(std::shared_ptr<reactor_context> ctx)
@@ -161,6 +164,12 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
     const size_t n    = client.get(chunk.bucket, chunk.key, chunk.offset, chunk.size, slot_ptr);
     if (n != chunk.size) { throw short_read_error(n, chunk.size); }
 
+    if (_ctx->flush_before_copy()) {
+      throw_on_cuda_error(
+        cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+                                           cudaFlushGPUDirectRDMAWritesToOwner),
+        "GPUDirect writes flush failed");
+    }
     throw_on_cuda_error(
       cudaMemcpyAsync(chunk.dst, slot_ptr, n, cudaMemcpyDeviceToDevice, chunk.stream.value()),
       "D2D copy enqueue failed");
@@ -192,6 +201,10 @@ cuobj_rdma_reactor::arena& cuobj_rdma_reactor::arena_for_device(int device_id)
     cudaMalloc(reinterpret_cast<void**>(&ar->base), _config.max_inflight * _config.arena_slot_size),
     "landing arena allocation failed");
   ar->pool = std::make_unique<slot_pool>(_config.max_inflight);
+  if (const auto& client = _ctx->client()) {
+    client->register_memory(ar->base, _config.max_inflight * _config.arena_slot_size);
+    ar->registrar = client;
+  }
   return *_arenas.emplace(device_id, std::move(ar)).first->second;
 }
 

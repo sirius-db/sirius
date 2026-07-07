@@ -758,3 +758,5 @@ TEST_CASE("mock_request_authorizer can force credential errors", "[s3][authorize
   CHECK(request.url == "https://signed.example/object");
   CHECK(request.headers.empty());
 }
+
+#include "../rdma/rdma_real_client_tests.hpp"

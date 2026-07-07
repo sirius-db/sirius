@@ -36,6 +36,12 @@ option(ENABLE_STREAM_CHECK
 option(SIRIUS_BUILD_S3_TESTS
        "Build the testcontainers-backed S3 integration test harness" ON)
 
+# Enables the cuObject-backed S3-over-RDMA data plane. Requires the cuObject
+# SDK: set CUOBJ_SDK_ROOT (include/ + lib/ layout) or install libcuobjclient
+# into the environment prefix. OFF builds are unchanged — the RDMA backend's
+# HTTP control plane still compiles, and device transfers fail loudly.
+option(SIRIUS_ENABLE_S3_RDMA "Enable the cuObject S3-over-RDMA data plane" OFF)
+
 # In the vcpkg build, vcpkg headers must take priority over: 1) conda's CCCL
 # 3.1.4 (injected via CXXFLAGS as -I.../include/cccl) 2) DuckDB's bundled fmt
 # 6.1.2 (uses duckdb_fmt namespace, incompatible with spdlog) Fix: strip conda
@@ -266,6 +272,7 @@ set(EXTENSION_SOURCES
     src/io/cache/prefetching_cache.cpp
     src/io/cache/types.cpp
     src/io/kvikio/kvikio_context.cpp
+    src/io/rdma/cuobj_rdma_client.cpp
     src/io/rdma/cuobj_rdma_reactor.cpp
     src/io/rdma/mock_rdma_client.cpp
     src/io/rest/curl_handle.cpp
@@ -535,6 +542,22 @@ target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto)
+
+if(SIRIUS_ENABLE_S3_RDMA)
+  find_path(
+    CUOBJ_INCLUDE_DIR cuobjclient.h
+    HINTS "$ENV{CUOBJ_SDK_ROOT}" ${CUOBJ_SDK_ROOT}
+    PATH_SUFFIXES include REQUIRED)
+  find_library(
+    CUOBJ_CLIENT_LIB cuobjclient
+    HINTS "$ENV{CUOBJ_SDK_ROOT}" ${CUOBJ_SDK_ROOT}
+    PATH_SUFFIXES lib lib64 REQUIRED)
+  foreach(_target sirius_extension sirius_loadable_extension)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_ENABLE_S3_RDMA)
+    target_include_directories(${_target} PRIVATE ${CUOBJ_INCLUDE_DIR})
+    target_link_libraries(${_target} ${CUOBJ_CLIENT_LIB})
+  endforeach()
+endif()
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
