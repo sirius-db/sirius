@@ -7,6 +7,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -215,8 +216,8 @@ struct identity_compressor : compressor {
 /// 2. Keys+indices mode: stores separate keys (strings) and indices columns for fast reconstruction
 ///    This mode avoids the expensive make_strings_column reconstruction.
 struct dictionary_compressed_representation : compressed_representation {
-  // Accepts the (keys, indices) form or the (keys_offsets, keys_chars,
-  // indices) form.
+  // Accepts the (keys, indices[, null_mask]) form or the (keys_offsets,
+  // keys_chars, indices[, null_mask]) form.
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -226,6 +227,17 @@ struct dictionary_compressed_representation : compressed_representation {
 
   std::unique_ptr<cudf::column> dict_column;
   mutable std::unique_ptr<cudf::column> keys_chars_copy;  // Lazily created on first access
+  // Lazily synthesized channels for shapes whose children cannot be viewed
+  // directly: a childless empty dictionary (zero-row compress stores
+  // cudf::make_empty_column(DICTIONARY32)) and childless empty keys (encode of
+  // an all-null column yields zero keys). See named_channels().
+  mutable std::unique_ptr<cudf::column> keys_offsets_synth;
+  mutable std::unique_ptr<cudf::column> indices_synth;
+  // Lazily copied validity bitmask bytes (UINT8), exposed as the optional
+  // "null_mask" channel (and marked required) so a nullable column's validity
+  // survives every channel-based path: .hpln IO and decomposed plans rebuild
+  // via from_outputs, which cannot see the mask carried on the stored columns.
+  mutable std::unique_ptr<cudf::column> null_mask_copy;
 
   // For fast reconstruction mode: store keys and indices separately
   std::unique_ptr<cudf::column> keys_column;   // Keys as strings column (for fast reconstruction)
@@ -235,7 +247,10 @@ struct dictionary_compressed_representation : compressed_representation {
   explicit dictionary_compressed_representation(std::unique_ptr<cudf::column> dict_col)
     : dict_column(std::move(dict_col)), keys_chars_copy(nullptr), fast_mode(false)
   {
-    original_type = dict_column ? dict_column->type() : cudf::data_type{cudf::type_id::STRING};
+    // Per the base-class contract these describe the RECONSTRUCTED column
+    // (dictionary decode yields STRING), not the stored dictionary form.
+    original_type = cudf::data_type{cudf::type_id::STRING};
+    num_rows      = dict_column ? dict_column->size() : 0;
   }
 
   // Fast reconstruction constructor: keys (strings column) + indices
@@ -247,7 +262,8 @@ struct dictionary_compressed_representation : compressed_representation {
       indices_only(std::move(indices)),
       fast_mode(true)
   {
-    original_type = indices_only ? indices_only->type() : cudf::data_type{cudf::type_id::STRING};
+    original_type = cudf::data_type{cudf::type_id::STRING};
+    num_rows      = indices_only ? indices_only->size() : 0;
   }
 
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
@@ -258,46 +274,100 @@ struct dictionary_compressed_representation : compressed_representation {
     std::vector<compressible_output> outputs;
 
     if (fast_mode) {
-      // Fast mode: expose keys (strings) and indices directly
+      // Fast mode: expose keys (strings) and indices directly. The indices
+      // column carries the parent validity (get_indices_annotated), but a
+      // codec routed onto the indices channel keeps only its data bytes, so
+      // for a nullable column the mask additionally travels as its own
+      // channel.
       if (keys_column) { outputs.push_back({"keys", keys_column->view()}); }
       if (indices_only) { outputs.push_back({"indices", indices_only->view()}); }
+      if (indices_only && indices_only->null_count() > 0) {
+        ensure_null_mask_copy(indices_only->view(), stream);
+        outputs.push_back({"null_mask", null_mask_copy->view()});
+      }
       return outputs;
     }
 
-    // Full dict_column mode: expose keys_offsets, keys_chars, indices.
-    auto dict_view = dict_column->view();
+    // Full dict_column mode: expose keys_offsets, keys_chars, indices and —
+    // for a nullable column — null_mask.
+    auto dict_view            = dict_column->view();
+    bool const childless_dict = dict_column->num_children() == 0;  // zero-row compress
+    bool const childless_keys =  // encode of an all-null column: zero keys, no offsets child
+      childless_dict || cudf::dictionary_column_view(dict_view).keys().num_children() == 0;
 
-    outputs.push_back(
-      {"keys_offsets", get_dictionary_child_view(dict_view, dictionary_view_kind::KeysOffsets)});
+    if (childless_keys) {
+      if (!keys_offsets_synth) {
+        // Canonical empty keys: a single zero offset.
+        keys_offsets_synth =
+          cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::INT32),
+                                        1,
+                                        cudf::mask_state::UNALLOCATED,
+                                        stream,
+                                        rmm::mr::get_current_device_resource_ref());
+        cudaMemsetAsync(keys_offsets_synth->mutable_view().head<void>(),
+                        0,
+                        sizeof(std::int32_t),
+                        stream.value());
+        cudaStreamSynchronize(stream.value());
+      }
+      outputs.push_back({"keys_offsets", keys_offsets_synth->view()});
+    } else {
+      outputs.push_back(
+        {"keys_offsets", get_dictionary_child_view(dict_view, dictionary_view_kind::KeysOffsets)});
+    }
 
-    // For keys_chars, we need to create a UINT8 column since chars are not a column child in modern
-    // cuDF
+    // For keys_chars, we need to create a UINT8 column since chars are not a
+    // column child in modern cuDF. Always emitted — zero-row when the keys
+    // have no bytes — so the channel arity is stable and an all-empty-keys
+    // table reads back.
     if (!keys_chars_copy) {
       // The resulting column's device_buffer remembers ``stream`` for its own
       // eventual deallocation, so the caller-supplied stream must stay valid
       // for the column's lifetime (a private stream destroyed at the end of
       // this scope would leave a dangling handle).
       auto mr                      = rmm::mr::get_current_device_resource_ref();
-      auto [chars_ptr, chars_size] = get_dictionary_keys_chars_info(dict_view, stream);
+      auto [chars_ptr, chars_size] = childless_dict
+                                       ? std::pair<char const*, int64_t>{nullptr, 0}
+                                       : get_dictionary_keys_chars_info(dict_view, stream);
+      keys_chars_copy = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
+                                                      static_cast<cudf::size_type>(chars_size),
+                                                      cudf::mask_state::UNALLOCATED,
+                                                      stream,
+                                                      mr);
       if (chars_ptr != nullptr && chars_size > 0) {
-        keys_chars_copy = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
-                                                        static_cast<cudf::size_type>(chars_size),
-                                                        cudf::mask_state::UNALLOCATED,
-                                                        stream,
-                                                        mr);
         cudaMemcpyAsync(keys_chars_copy->mutable_view().head<void>(),
                         chars_ptr,
                         chars_size,
                         cudaMemcpyDeviceToDevice,
                         stream.value());
-        cudaStreamSynchronize(stream.value());
       }
+      cudaStreamSynchronize(stream.value());
     }
-    if (keys_chars_copy) { outputs.push_back({"keys_chars", keys_chars_copy->view()}); }
+    outputs.push_back({"keys_chars", keys_chars_copy->view()});
 
-    outputs.push_back(
-      {"indices", get_dictionary_child_view(dict_view, dictionary_view_kind::Indices)});
+    if (childless_dict) {
+      if (!indices_synth) {
+        indices_synth = cudf::make_empty_column(cudf::data_type(cudf::type_id::INT32));
+      }
+      outputs.push_back({"indices", indices_synth->view()});
+    } else {
+      outputs.push_back(
+        {"indices", get_dictionary_child_view(dict_view, dictionary_view_kind::Indices)});
+    }
+
+    if (dict_column->null_count() > 0) {
+      ensure_null_mask_copy(dict_view, stream);
+      outputs.push_back({"null_mask", null_mask_copy->view()});
+    }
     return outputs;
+  }
+
+  std::vector<std::string> required_channels() const override
+  {
+    bool const nullable = fast_mode ? (indices_only && indices_only->null_count() > 0)
+                                    : (dict_column && dict_column->null_count() > 0);
+    if (nullable) return {"null_mask"};
+    return {};
   }
 
   std::unique_ptr<cudf::column> release_output(std::string const& name) override
@@ -309,6 +379,24 @@ struct dictionary_compressed_representation : compressed_representation {
     return nullptr;
   }
   PlanLeafKind kind() const override { return PlanLeafKind::Dictionary; }
+
+ private:
+  // Copy `source`'s validity bitmask into the owned UINT8 null_mask_copy
+  // column (no-op if already built).
+  void ensure_null_mask_copy(cudf::column_view const& source, rmm::cuda_stream_view stream) const
+  {
+    if (null_mask_copy) return;
+    auto mr                 = rmm::mr::get_current_device_resource_ref();
+    rmm::device_buffer bits = cudf::copy_bitmask(source, stream, mr);
+    auto const mask_bytes =
+      static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(source.size()));
+    null_mask_copy = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
+                                                    mask_bytes,
+                                                    std::move(bits),
+                                                    rmm::device_buffer{},
+                                                    0);
+    cudaStreamSynchronize(stream.value());
+  }
 };
 
 /// Dictionary compressor: STRING column only. Encodes via cudf dictionary encode; stores keys
@@ -366,6 +454,10 @@ struct str_split_compressed_representation : compressed_representation {
   std::vector<compressible_output> named_channels(rmm::cuda_stream_view /*stream*/) const override
   {
     std::vector<compressible_output> out;
+    // The single-shot decompress() MOVES the channels into make_strings_column;
+    // a consumed rep has no channels left to enumerate (describe/serialize
+    // must run before decompress).
+    if (!offsets_ || !chars_) return out;
     out.push_back({"offsets", offsets_->view()});
     out.push_back({"chars", chars_->view()});
     if (null_mask_) out.push_back({"null_mask", null_mask_->view()});  // 2- or 3-channel

@@ -11,6 +11,7 @@
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -85,6 +86,14 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
     if (indices_only->size() == 0) {
       return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
     }
+    if (keys_column->size() == 0) {
+      // Zero keys with rows present means every row is null (encode drops
+      // null rows from the key set); decode would gather from the empty —
+      // possibly childless — keys column, so build the all-null strings
+      // column directly.
+      return cudf::make_column_from_scalar(
+        cudf::string_scalar("", false, stream, mr), indices_only->size(), stream, mr);
+    }
     // Create dictionary column from keys and indices, then decode
     // This avoids the expensive make_strings_column reconstruction from offsets+chars
     auto dict_col =
@@ -96,6 +105,11 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
   if (dict_column == nullptr) { return nullptr; }
   if (dict_column->size() == 0) {
     return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
+  }
+  if (cudf::dictionary_column_view(dict_column->view()).keys().size() == 0) {
+    // Zero keys with rows present: all rows are null (see fast-mode note).
+    return cudf::make_column_from_scalar(
+      cudf::string_scalar("", false, stream, mr), dict_column->size(), stream, mr);
   }
   return cudf::dictionary::decode(dict_column->view(), stream, mr);
 }

@@ -17,6 +17,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/null_mask.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
@@ -158,6 +159,36 @@ std::unique_ptr<compressed_representation> identity_compressed_representation::f
   return std::make_unique<identity_compressed_representation>(std::move(outputs[0]));
 }
 
+namespace {
+
+// Reads a "null_mask" channel column (UINT8 bitmask bytes, as emitted by
+// dictionary/str_split named_channels) into a device_buffer + null count over
+// `num_rows` rows. Returns false and sets *error_out on a malformed channel.
+bool take_null_mask_channel(std::unique_ptr<cudf::column> mask_col,
+                            cudf::size_type num_rows,
+                            rmm::device_buffer* mask_out,
+                            cudf::size_type* null_count_out,
+                            rmm::cuda_stream_view stream,
+                            std::string* error_out)
+{
+  if (mask_col->type().id() != cudf::type_id::UINT8) {
+    if (error_out) *error_out = "dictionary null_mask must be UINT8";
+    return false;
+  }
+  if (static_cast<std::size_t>(mask_col->size()) < cudf::bitmask_allocation_size_bytes(num_rows)) {
+    if (error_out) *error_out = "dictionary null_mask is shorter than the row count requires";
+    return false;
+  }
+  auto const* bits =
+    reinterpret_cast<cudf::bitmask_type const*>(mask_col->view().data<std::uint8_t>());
+  *null_count_out = num_rows > 0 ? cudf::null_count(bits, 0, num_rows, stream) : 0;
+  auto contents   = mask_col->release();
+  *mask_out       = std::move(*contents.data);
+  return true;
+}
+
+}  // namespace
+
 std::unique_ptr<compressed_representation> dictionary_compressed_representation::from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -165,31 +196,43 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {
-  // Fast path: keys (strings column) + indices (2 outputs). This avoids
-  // expensive make_strings_column reconstruction.
-  if (outputs.size() == 2 && output_names.size() == 2 && output_names[0] == "keys" &&
+  if (output_names.size() != outputs.size()) {
+    if (error_out) *error_out = "dictionary: output_names / outputs size mismatch";
+    return nullptr;
+  }
+  // Both forms accept a trailing optional "null_mask" channel (UINT8 bitmask
+  // bytes of the decoded column) — reattached below so validity survives
+  // channel-based round-trips (.hpln IO and decomposed plans).
+  bool const has_mask = !output_names.empty() && output_names.back() == "null_mask";
+
+  // Fast path: keys (strings column) + indices. This avoids expensive
+  // make_strings_column reconstruction.
+  if (output_names.size() == (has_mask ? 3u : 2u) && output_names[0] == "keys" &&
       output_names[1] == "indices") {
     auto keys    = std::move(outputs[0]);
     auto indices = std::move(outputs[1]);
+    if (has_mask) {
+      rmm::device_buffer mask;
+      cudf::size_type null_count = 0;
+      if (!take_null_mask_channel(
+            std::move(outputs[2]), indices->size(), &mask, &null_count, stream, error_out)) {
+        return nullptr;
+      }
+      // Fast mode carries validity on the indices column (the fast ctor /
+      // decompress path derives the parent mask from it).
+      if (null_count > 0) indices->set_null_mask(std::move(mask), null_count);
+    }
     return std::make_unique<dictionary_compressed_representation>(std::move(keys),
                                                                   std::move(indices));
   }
 
-  // Legacy path: keys_offsets, keys_chars, indices (3 outputs).
-  if (outputs.size() != 3) {
-    if (error_out) {
-      *error_out =
-        "dictionary expects 2 outputs (keys, indices) or 3 outputs "
-        "(keys_offsets, keys_chars, indices)";
-    }
-    return nullptr;
-  }
-  if (output_names.size() != 3 || output_names[0] != "keys_offsets" ||
+  // Legacy path: keys_offsets, keys_chars, indices (+ null_mask).
+  if (outputs.size() != (has_mask ? 4u : 3u) || output_names[0] != "keys_offsets" ||
       output_names[1] != "keys_chars" || output_names[2] != "indices") {
     if (error_out) {
       *error_out =
         "dictionary outputs must be named 'keys_offsets, keys_chars, "
-        "indices' or 'keys, indices'";
+        "indices[, null_mask]' or 'keys, indices[, null_mask]'";
     }
     return nullptr;
   }
@@ -201,6 +244,13 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
   cudf::size_type num_keys    = num_offsets > 0 ? static_cast<cudf::size_type>(num_offsets - 1) : 0;
   if (keys_chars->type().id() != cudf::type_id::UINT8) {
     if (error_out) *error_out = "dictionary keys_chars must be UINT8";
+    return nullptr;
+  }
+
+  rmm::device_buffer mask(0, stream, mr);
+  cudf::size_type null_count = 0;
+  if (has_mask && !take_null_mask_channel(
+                    std::move(outputs[3]), indices->size(), &mask, &null_count, stream, error_out)) {
     return nullptr;
   }
 
@@ -216,8 +266,11 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
                                                 0,
                                                 rmm::device_buffer(0, stream, mr));
 
-  auto dict_col =
-    cudf::make_dictionary_column(std::move(keys_strings), std::move(indices), stream, mr);
+  auto dict_col = null_count > 0
+                    ? cudf::make_dictionary_column(
+                        std::move(keys_strings), std::move(indices), std::move(mask), null_count)
+                    : cudf::make_dictionary_column(
+                        std::move(keys_strings), std::move(indices), stream, mr);
   // Indices, keys, and chars are then obtained as views from this column via
   // get_dictionary_child_view(dict_col->view(), ...) / dictionary_column_view.
   return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));

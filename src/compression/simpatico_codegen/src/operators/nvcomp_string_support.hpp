@@ -9,8 +9,10 @@
 // codec bytes exactly like the fixed-width case.
 //
 // Null masks are NOT preserved — matching every other simpatico codec, which
-// reconstruct with mask_state::UNALLOCATED. Compression therefore assumes the
-// column is non-nullable.
+// reconstruct with mask_state::UNALLOCATED. Nullable input is therefore
+// REJECTED at compress time (silent validity loss on strings is a correctness
+// bug, not a representation detail); nullable strings must route through
+// str_split or dictionary, which carry validity as a channel.
 
 #pragma once
 
@@ -82,6 +84,15 @@ compressed_string compress_string_column(cudf::column_view const& col,
   // count exactly. The pin path never slices, so this is defensive.
   if (col.offset() != 0 || offsets.size() != col.size() + 1) {
     throw std::runtime_error("nvcomp string compressor: sliced columns unsupported");
+  }
+
+  // This path stores only offsets+chars, so a null mask would be silently
+  // dropped; reject instead and let the plan route nullable strings through
+  // str_split or dictionary.
+  if (col.null_count() > 0) {
+    throw std::runtime_error(
+      "nvcomp string compressor: nullable STRING unsupported (null mask would be dropped); "
+      "use str_split or dictionary");
   }
 
   std::size_t const offsets_uncompressed = static_cast<std::size_t>(offsets.size()) *

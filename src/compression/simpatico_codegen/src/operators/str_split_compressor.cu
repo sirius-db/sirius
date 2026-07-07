@@ -55,10 +55,31 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
                              type_id_to_name(column_to_compress.type()) + "'");
   }
 
+  if (column_to_compress.size() == 0) {
+    // Canonical empty rep: one zero offset and no chars, built directly rather
+    // than copied from the input — the canonical empty STRING column,
+    // cudf::make_empty_column(STRING), has no offsets child to copy from.
+    auto offsets = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT32}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
+    cudaMemsetAsync(
+      offsets->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
+    auto chars = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::UINT8}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
+    cudaStreamSynchronize(stream.value());
+    return std::make_unique<str_split_compressed_representation>(
+      0, std::move(offsets), std::move(chars), nullptr);
+  }
+
   std::unique_ptr<cudf::column>
     owned;  ///< Owned copy of the input column, if needed (post-gather).
   cudf::column_view src = column_to_compress;
-  if (column_to_compress.offset() != 0) {
+  // Normalize any sliced view to an owned compact copy: a non-zero offset
+  // needs rebasing, and a head-slice (offset 0, size < parent) still views the
+  // parent's full offsets child, so the emitted channels would be mutually
+  // inconsistent (offsets/chars parent-sized, null_mask slice-sized).
+  if (column_to_compress.offset() != 0 ||
+      cudf::strings_column_view(column_to_compress).offsets().size() !=
+        column_to_compress.size() + 1) {
     owned = copy_column_view(column_to_compress, stream, mr);
     src   = owned->view();
   }
