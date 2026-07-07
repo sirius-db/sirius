@@ -49,7 +49,6 @@ def log(msg):
 MODES = ("grouped", "sequential", "isolated", "nsys-profile")
 ENGINE_CHOICES = ("gpu", "cpu", "both")
 PIN_CHOICES = ("none", "gpu", "host")
-DATA_SOURCE_CHOICES = ("parquet", "duckdb")
 TPCH_TABLES = (
     "customer",
     "lineitem",
@@ -100,7 +99,6 @@ def setup_benchmark_dir(
     pin,
     name=None,
     nsys_profile=False,
-    data_source="parquet",
 ):
     """Create the benchmark output directory and return its paths.
 
@@ -140,7 +138,6 @@ def setup_benchmark_dir(
         "mode": mode,
         "iterations": iterations,
         "engine": engine,
-        "data_source": data_source,
         "queries": [f"q{q}" for q in queries],
         "pin": pin,
         "nsys_profile": nsys_profile,
@@ -267,30 +264,17 @@ def _build_views_sql(parquet_dir):
     return "\n".join(parts) + "\n"
 
 
-def open_connection(source, gpu_execution=False, data_source="parquet"):
-    """Open a DuckDB connection over the benchmark source, optionally LOAD Sirius.
-
-    parquet: in-memory DB with CREATE VIEW ... read_parquet over the directory.
-    duckdb:  open the .duckdb file directly (read-only); its native TPC-H tables
-             are already present in the `main` schema, so no views are registered.
-             Read-only avoids write locks / accidental WAL and is correct for a
-             read-only benchmark; it mirrors how run_tpch_duckdb.sh opens the file.
-    """
-    if data_source == "duckdb":
-        log(f"Opening DuckDB database file {source} (read-only)")
-        con = duckdb.connect(
-            source, read_only=True, config={"allow_unsigned_extensions": "true"}
-        )
-    else:
-        log(f"Opening DuckDB connection over parquet dir {source}")
-        con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
-        log("Registering TPC-H parquet views")
-        for stmt in _build_views_sql(source).split(";"):
-            stmt = stmt.strip()
-            if not stmt:
-                continue
-            con.execute(stmt)
-        log("All TPC-H views registered")
+def open_connection(parquet_dir, gpu_execution=False):
+    """Open an in-memory DuckDB, register TPC-H parquet views, optionally LOAD Sirius."""
+    log(f"Opening DuckDB connection over parquet dir {parquet_dir}")
+    con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+    log("Registering TPC-H parquet views")
+    for stmt in _build_views_sql(parquet_dir).split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        con.execute(stmt)
+    log("All TPC-H views registered")
     if gpu_execution:
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
@@ -371,8 +355,8 @@ def run_grouped(
     writer,
     *,
     benchmark_dir,
+    parquet_dir,
     pin,
-    data_source="parquet",
     duckdb_profiling=False,
 ):
     """Per-query iterations back-to-back; one connection per engine. Pin per query."""
@@ -381,12 +365,12 @@ def run_grouped(
     )
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
-        con = open_connection(source, gpu_execution=use_gpu, data_source=data_source)
+        con = open_connection(source, gpu_execution=use_gpu)
         try:
             for qnum in queries:
                 if pin_enabled and use_gpu:
                     log(f"  Pinning tables for q{qnum}")
-                    _execute_multi(con, emit_pin(qnum, source, data_source))
+                    _execute_multi(con, emit_pin(qnum, parquet_dir))
                 try:
                     for it in range(iterations):
                         log(f"--- q{qnum} iter{it} engine={name} ---")
@@ -417,19 +401,19 @@ def run_sequential(
     writer,
     *,
     benchmark_dir,
+    parquet_dir,
     pin,
-    data_source="parquet",
     duckdb_profiling=False,
 ):
     """Round-robin iterations; one connection per engine. Single union-pin at session start."""
     log("Mode 'sequential': single connection per engine, round-robin iterations")
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
-        con = open_connection(source, gpu_execution=use_gpu, data_source=data_source)
+        con = open_connection(source, gpu_execution=use_gpu)
         try:
             if pin_enabled and use_gpu:
                 log("  Union-pinning all referenced TPC-H tables once at session start")
-                _execute_multi(con, emit_pin_all(source, data_source))
+                _execute_multi(con, emit_pin_all(parquet_dir))
             try:
                 for it in range(iterations):
                     for qnum in queries:
@@ -461,8 +445,8 @@ def run_isolated(
     writer,
     *,
     benchmark_dir,
+    parquet_dir,
     pin,
-    data_source="parquet",
     duckdb_profiling=False,
 ):
     """Fresh connection + OS cache drop per (query, iteration). Pin per execution."""
@@ -472,14 +456,12 @@ def run_isolated(
         for qnum in queries:
             for it in range(iterations):
                 log(f"--- q{qnum} iter{it} engine={name} (cold connection) ---")
-                con = open_connection(
-                    source, gpu_execution=use_gpu, data_source=data_source
-                )
+                con = open_connection(source, gpu_execution=use_gpu)
                 try:
                     drop_os_cache()
                     if pin_enabled and use_gpu:
                         log(f"  Pinning tables for q{qnum}")
-                        _execute_multi(con, emit_pin(qnum, source, data_source))
+                        _execute_multi(con, emit_pin(qnum, parquet_dir))
                     _run_one(
                         writer,
                         con,
@@ -505,7 +487,7 @@ RUNNERS = {
 }
 
 
-def _build_nsys_temp_sql(qnum, source, iterations, pin, qdir, data_source="parquet"):
+def _build_nsys_temp_sql(qnum, parquet_dir, iterations, pin, qdir):
     """Write the DuckDB SQL script for one nsys-profiled query.
 
     Produces a timings.csv with rows (views, iter_1, iter_2, ...). The
@@ -526,17 +508,12 @@ def _build_nsys_temp_sql(qnum, source, iterations, pin, qdir, data_source="parqu
     parts = [
         "CREATE TEMP TABLE _timings (seq INTEGER, step VARCHAR, ts TIMESTAMP);",
         "INSERT INTO _timings VALUES (0, 'start', current_timestamp);",
+        _build_views_sql(parquet_dir).rstrip("\n"),
+        "INSERT INTO _timings VALUES (1, 'views', current_timestamp);",
     ]
-    # parquet registers views over the directory; duckdb opens the .duckdb file
-    # directly (its native tables are already present), so no view scaffolding is
-    # needed. The 'views' timing marker is kept either way so timings.csv parsing
-    # (which skips one 'views' row) stays uniform across sources.
-    if data_source != "duckdb":
-        parts.append(_build_views_sql(source).rstrip("\n"))
-    parts.append("INSERT INTO _timings VALUES (1, 'views', current_timestamp);")
 
     if pin != "none":
-        parts.append(emit_pin(qnum, source, data_source))
+        parts.append(emit_pin(qnum, parquet_dir))
 
     parts.append("SET gpu_execution = true;")
     # Open the nsys capture range BEFORE the first (cold) iteration so the cold
@@ -580,7 +557,7 @@ def _build_nsys_temp_sql(qnum, source, iterations, pin, qdir, data_source="parqu
 
 def run_nsys_profile(
     queries,
-    source,
+    parquet_dir,
     iterations,
     writer,
     *,
@@ -588,7 +565,6 @@ def run_nsys_profile(
     pin,
     config_path,
     query_timeout,
-    data_source="parquet",
 ):
     """Profile each query with NVIDIA Nsight Systems: one DuckDB subprocess per query.
 
@@ -621,9 +597,7 @@ def run_nsys_profile(
         sub_log_dir = os.path.join(qdir, "log_dir")
         os.makedirs(sub_log_dir, exist_ok=True)
 
-        sql_path = _build_nsys_temp_sql(
-            qnum, source, iterations, pin, qdir, data_source
-        )
+        sql_path = _build_nsys_temp_sql(qnum, parquet_dir, iterations, pin, qdir)
         nsys_output = os.path.join(qdir, "nsys")
         stdout_path = os.path.join(qdir, "nsys_stdout.txt")
 
@@ -639,21 +613,6 @@ def run_nsys_profile(
             "--capture-range=cudaProfilerApi",
             "--capture-range-end=stop",
         ]
-        # For duckdb source, open the .duckdb file as the CLI's default database
-        # (its native TPC-H tables become queryable by name) — mirroring
-        # open_connection / run_tpch_duckdb.sh. For parquet, the in-script
-        # CREATE VIEW read_parquet statements supply the tables, so no DB arg.
-        duckdb_invocation = [DUCKDB_BIN]
-        if data_source == "duckdb":
-            duckdb_invocation.append(source)
-        duckdb_invocation += [
-            # -unsigned mirrors the Python runner's allow_unsigned_extensions
-            # config (open_connection): without it, the DuckDB CLI rejects
-            # locally-built (unsigned) Sirius extensions.
-            "-unsigned",
-            "-f",
-            sql_path,
-        ]
         nsys_cmd.extend(
             [
                 "--output",
@@ -661,7 +620,13 @@ def run_nsys_profile(
                 "--force-overwrite=true",
                 "--stats=false",
                 "--export=sqlite",
-                *duckdb_invocation,
+                DUCKDB_BIN,
+                # -unsigned mirrors the Python runner's allow_unsigned_extensions
+                # config (open_connection): without it, the DuckDB CLI rejects
+                # locally-built (unsigned) Sirius extensions.
+                "-unsigned",
+                "-f",
+                sql_path,
             ]
         )
 
@@ -736,16 +701,12 @@ def run_nsys_profile(
                 it += 1
 
 
-def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
+def split_sirius_log(log_dir, benchmark_dir, queries, iterations, mode):
     """Split the combined Sirius spdlog into one log file per query.
 
-    A query's segment runs from its `QueryBegin: SQL: <sql>` marker to the next such
-    marker. Benchmarked-query begins are identified by matching the logged
-    (whitespace-normalized) SQL against the known QUERIES text, so interleaved control
-    statements (`SET gpu_execution`, `CALL pin_table`/`unpin_table`, `CREATE VIEW`,
-    `LOAD`) are ignored and segments are grouped by query content. This is robust
-    across data sources (parquet/duckdb), pinning on/off, and every iteration mode --
-    it keys on query text, not on statement counts or run ordering.
+    Mirrors the bash post-processor in run_tpch_parquet.sh:591-628: find QueryBegin
+    markers that aren't pin/unpin/CREATE VIEW, then partition them by query based on
+    the iteration mode's run ordering.
     """
     log_files = sorted(glob.glob(os.path.join(log_dir, "sirius*.log")))
     if not log_files:
@@ -756,42 +717,38 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
     with open(log_path) as f:
         lines = f.readlines()
 
-    def _norm(sql):
-        # Mirror SiriusContext::QueryBegin whitespace collapsing, drop a trailing ';',
-        # and lowercase so the match is exact but tolerant of formatting differences.
-        return " ".join(sql.split()).rstrip(";").strip().lower()
-
-    known = {_norm(QUERIES[f"q{q}"]): q for q in queries}
-
-    marker = "QueryBegin: SQL: "
-    begins = []  # (qnum, line_index), in log order
+    begin_indices = []
     for i, line in enumerate(lines):
-        pos = line.find(marker)
-        if pos == -1:
+        if "QueryBegin:" not in line:
             continue
-        qnum = known.get(_norm(line[pos + len(marker) :]))
-        if qnum is not None:
-            begins.append((qnum, i))
-
-    if not begins:
-        log("No matched query begins in the Sirius log; skipping per-query split")
-        return
+        if "pin_table" in line or "unpin_table" in line or "CREATE VIEW" in line:
+            continue
+        begin_indices.append(i)
 
     expected = len(queries) * iterations
-    if len(begins) != expected:
+    if len(begin_indices) != expected:
         log(
-            f"WARNING: expected {expected} query begins, matched {len(begins)} in "
-            f"{log_path} (a query may have errored); writing what matched"
+            f"WARNING: expected {expected} QueryBegin lines in {log_path}, "
+            f"found {len(begin_indices)}; skipping per-query log split"
         )
+        return
+
+    spans = []
+    for i, start in enumerate(begin_indices):
+        end = begin_indices[i + 1] if i + 1 < len(begin_indices) else len(lines)
+        spans.append((start, end))
 
     per_query_spans = {q: [] for q in queries}
-    for k, (qnum, start) in enumerate(begins):
-        end = begins[k + 1][1] if k + 1 < len(begins) else len(lines)
-        per_query_spans[qnum].append((start, end))
+    if mode in ("grouped", "isolated"):
+        for qi, q in enumerate(queries):
+            for it in range(iterations):
+                per_query_spans[q].append(spans[qi * iterations + it])
+    else:  # sequential
+        for it in range(iterations):
+            for qi, q in enumerate(queries):
+                per_query_spans[q].append(spans[it * len(queries) + qi])
 
     for q, span_list in per_query_spans.items():
-        if not span_list:
-            continue
         qdir = os.path.join(benchmark_dir, "sirius", f"q{q}")
         os.makedirs(qdir, exist_ok=True)
         out_path = os.path.join(qdir, "sirius.log")
@@ -875,21 +832,7 @@ def parse_args():
         "--input",
         type=str,
         required=True,
-        help="TPC-H input: a parquet directory (--data-source parquet; one .parquet "
-        "file or subdir per table) or a single .duckdb file (--data-source duckdb)",
-    )
-    p.add_argument(
-        "--data-source",
-        choices=DATA_SOURCE_CHOICES,
-        default="parquet",
-        help=(
-            "Input data source/format: 'parquet' (a directory of TPC-H parquet "
-            "files scanned via read_parquet -> GPU_PARQUET_SCAN) or 'duckdb' (a "
-            "single .duckdb file whose native TPC-H tables are scanned via the "
-            "GPU-native seq_scan). Pinning works for both. NOTE: this is a 2-value "
-            "flag, distinct from the legacy benchmark_and_validate.sh --data-source "
-            "(which also has a redundant 'duckdb-native' alias). (default: parquet)"
-        ),
+        help="Path to a TPC-H parquet directory (one .parquet file or subdir per table)",
     )
     p.add_argument(
         "--mode",
@@ -994,17 +937,12 @@ def parse_args():
 def main():
     args = parse_args()
     source = args.input
-    if args.data_source == "duckdb":
-        if not os.path.isfile(source):
-            raise SystemExit(
-                f"--data-source duckdb requires --input to be a .duckdb file; "
-                f"got {source!r}"
-            )
-    elif not os.path.isdir(source):
+    if not os.path.isdir(source):
         raise SystemExit(
-            f"--data-source parquet requires --input to be a parquet directory; "
-            f"got {source!r}"
+            f"--input must be a parquet directory; got {source!r}. "
+            ".duckdb database files are not supported."
         )
+    parquet_dir = source
     queries = parse_query_spec(args.queries)
     engine_modes = resolve_engine_modes(args.engine)
     output_root = args.output or DEFAULT_OUTPUT_ROOT
@@ -1050,12 +988,10 @@ def main():
         args.pin,
         name=args.name,
         nsys_profile=nsys_profile,
-        data_source=args.data_source,
     )
     os.environ["SIRIUS_LOG_DIR"] = log_dir
 
     log(f"Source:        {source}")
-    log(f"Data source:   {args.data_source}")
     log(f"Mode:          {args.mode}")
     log(f"Iterations:    {args.iterations}")
     log(f"Engine:        {args.engine}")
@@ -1075,14 +1011,13 @@ def main():
         if nsys_profile:
             run_nsys_profile(
                 queries,
-                source,
+                parquet_dir,
                 args.iterations,
                 writer,
                 benchmark_dir=benchmark_dir,
                 pin=args.pin,
                 config_path=config_path,
                 query_timeout=args.query_timeout,
-                data_source=args.data_source,
             )
         else:
             RUNNERS[args.mode](
@@ -1092,8 +1027,8 @@ def main():
                 args.iterations,
                 writer,
                 benchmark_dir=benchmark_dir,
+                parquet_dir=parquet_dir,
                 pin=args.pin,
-                data_source=args.data_source,
                 duckdb_profiling=args.duckdb_profiling,
             )
 
@@ -1104,7 +1039,7 @@ def main():
     # runs in its own subprocess with its own SIRIUS_LOG_DIR, so the per-query
     # logs are already isolated under <bench>/sirius/q<N>/log_dir/.
     if not nsys_profile and any(use_gpu for _, use_gpu in engine_modes):
-        split_sirius_log(log_dir, benchmark_dir, queries, args.iterations)
+        split_sirius_log(log_dir, benchmark_dir, queries, args.iterations, args.mode)
 
     if args.validation:
         log("Starting validation")
