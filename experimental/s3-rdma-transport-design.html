@@ -139,6 +139,10 @@ flowchart LR
   C --> D["no host staging can sneak in;<br/>the cache's null-gap crash path<br/>(SF10) is unreachable"]
 ```
 
+This is not just hygiene: the armed cache currently **over-reads 2–7× on sparse
+column projections** (issue #1078, a foreground/background allocation race) —
+this backend is structurally immune to that too, the same way kvikio is.
+
 `max_inflight` = worker count = **global** in-flight ceiling (one blocking
 `cuObjGet` per worker); "per-device" applies only to arena placement
 (`max_inflight × slot_size` per active GPU, worst case). Direct-into-RMM is a
@@ -164,6 +168,11 @@ ceiling and multiply sessions. Hence three independent axes:
   per-GPU / per-NIC **reactor sharding** — tighter NIC↔GPU affinity at the cost
   of global rate-limit complexity — is the deferred evolution for explicit
   multi-NIC/NUMA topologies, not v1.
+
+**New consumers stay compatible:** the transparent `read_parquet('s3://')` front
+door (#1074, `sirius_httpfs`) resolves its backend per path through
+`create_datasource(path)` and reads with single positional `host_read`s — under
+`s3_transport=RDMA` it works unchanged, with no transport-specific checks.
 
 **Known v1 scope limit (not Parquet):** the DuckDB-native `.db` decoder is the
 one caller of the vector host-read entry point, which this backend omits — a
