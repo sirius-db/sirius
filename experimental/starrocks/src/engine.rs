@@ -275,6 +275,38 @@ mod tests {
         }
     }
 
+    /// Replays a Substrait plan dumped via `SIRIUS_CN_DUMP_FRAGMENTS` (path in
+    /// `SIRIUS_SUBSTRAIT_PLAN`) against the engine — a debug harness for diagnosing a captured
+    /// plan in isolation, outside the FE/CN loop.
+    #[test]
+    #[ignore = "debug harness: set SIRIUS_SUBSTRAIT_PLAN to a dumped plan and run with a GPU"]
+    fn engine_replays_dumped_substrait_plan() {
+        let path = std::env::var("SIRIUS_SUBSTRAIT_PLAN").expect("SIRIUS_SUBSTRAIT_PLAN not set");
+        let plan = std::fs::read(&path).expect("read dumped substrait plan");
+        let engine = SiriusEngine::start(None).expect("bring up sirius engine");
+        let (respond_tx, respond_rx) = channel();
+        engine
+            .requests
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(ExecuteRequest {
+                plan,
+                respond: respond_tx,
+            })
+            .unwrap();
+        let batches = respond_rx
+            .recv()
+            .expect("engine response")
+            .expect("execute");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        eprintln!("plan {path} returned {rows} row(s)");
+        for batch in &batches {
+            eprintln!("{batch:?}");
+        }
+    }
+
     /// End-to-end: drive a `local_files` parquet plan through the engine actor and read the rows
     /// back. Exercises the dedicated-thread bring-up, the channel round-trip, and GPU execution.
     /// Requires a GPU and `LD_LIBRARY_PATH` to the built engine (like the `sirius` crate's context
