@@ -61,18 +61,11 @@ static void init_gpu()
   codegen::jit::ensure_cuda_context();
 }
 
-/// Explicit, non-default stream for all driver work, created once and never
-/// torn down before process exit.
-///
-/// nvcomp-backed operators (ans/bitcomp/cascaded/snappy/deflate/lz4) cache
-/// their nvcomp::*Manager thread-locally, keyed by the stream they were built
-/// with (see e.g. ans_compressor.cu) — the Manager must not outlive that
-/// stream. Those caches are only torn down at thread exit, so a
-/// function-scoped stream (destroyed when e.g. run_compress() returns) can
-/// go dangling before the cache that still references it. A function-local
-/// static is destroyed via the regular __exit_funcs/atexit path, which glibc
-/// runs strictly after __call_tls_dtors (thread-local destructors) — so it
-/// outlives every thread_local manager cache and is safe to hand out here.
+/// Explicit, non-default stream for all driver work, created once as a
+/// function-local static and never torn down before process exit (destroyed via
+/// the regular atexit path). The nvcomp-backed operators drive the low-level
+/// batched API with all memory owned by RMM and hold no stream-bound state, so
+/// this stream just needs to outlive the work enqueued on it.
 static rmm::cuda_stream_view driver_stream()
 {
   static rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
@@ -345,7 +338,26 @@ static int run_explore(int argc, char** argv)
                  dtype_name(col_view.type()).c_str(),
                  col_view.size());
 
-    auto result = simpatico::explore_column_compression(col_view, cfg.ecfg, stream, mr);
+    // A column may be too large to explore within device memory even though the
+    // codecs fail cleanly (RMM throws rmm::out_of_memory). Such a throw here is
+    // a healthy-context OOM (not a fatal CUDA error), so catch it, emit an
+    // identity plan for the column, and keep going rather than aborting the run.
+    simpatico::exploration_result result;
+    try {
+      result = simpatico::explore_column_compression(col_view, cfg.ecfg, stream, mr);
+    } catch (std::exception const& e) {
+      std::fprintf(stderr,
+                   "# column %d (%s): exploration failed (%s); emitting identity\n",
+                   ci,
+                   col_name.c_str(),
+                   e.what());
+      std::printf("# column: %s  dtype: %s  ratio: 1.000x  depth: 0\n",
+                  col_name.c_str(),
+                  dtype_name(col_view.type()).c_str());
+      std::printf("# note: exploration skipped (out of memory); using identity\n");
+      std::printf("input -> identity\n");
+      continue;
+    }
 
     std::printf("# column: %s  dtype: %s  ratio: %.3fx  depth: %zu\n",
                 col_name.c_str(),

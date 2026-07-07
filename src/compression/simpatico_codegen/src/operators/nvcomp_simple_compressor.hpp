@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
-// Shared compress / decompress implementation for simple nvcomp Manager codecs
-// (Snappy, LZ4, GDeflate).
+// Shared compress / decompress helpers for the byte-stream nvcomp codecs
+// (LZ4, Snappy, GDeflate, Cascaded, ANS, bitcomp).
 //
-// Each codec's .cu file:
-//   1. Provides a thread-local Manager cache and a `get_*_manager(stream)` fn.
-//   2. Calls `nvcomp_compress_impl` / `nvcomp_decompress_impl` passing that fn.
-//
-// The `nvcomp_simple_rep_base` template in representation.hpp supplies
-// `named_channels()` inline (identical for all codecs — lazy D2D copy to a
-// UINT8 column) so there is nothing to share there.
+// All codecs drive nvcomp through the low-level *batched* API via a
+// `batched_codec_ops` bundle (see nvcomp_batched_codec.hpp). That API leaves
+// every device allocation to us (RMM), so nvcomp never allocates its own memory
+// and an out-of-memory condition throws cleanly instead of faulting a kernel and
+// corrupting the CUDA context. Each codec's .cu file builds its ops once and
+// calls the fixed-width helpers here (and, for STRING-capable codecs, the
+// primitives in nvcomp_string_support.hpp).
 
 #pragma once
 
 #include "codegen/plan/representation.hpp"
+#include "nvcomp_batched_codec.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
-#include <cuda_runtime.h>
-
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -32,63 +32,36 @@
 namespace simpatico {
 namespace detail {
 
-// Compress a raw byte range through an already-resolved Manager `*mgr`. Returns
-// the worst-case-allocated device_buffer and the actual compressed byte count.
-// The single "compress one buffer through a Manager" primitive shared by the
-// fixed-width path (nvcomp_compress_impl) and the string path (offsets + chars
-// streams). Throws std::runtime_error on CUDA failures.
-template <typename MgrT>
-std::pair<std::unique_ptr<rmm::device_buffer>, size_t> nvcomp_compress_bytes(
-  MgrT* mgr,
+// Compress a raw device byte range through `ops`. Returns the compressed frame
+// and its exact byte size. Shared by the fixed-width path and the STRING path
+// (which compresses the offsets and chars sub-streams independently).
+inline std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> nvcomp_compress_bytes(
+  batched_codec_ops const& ops,
   void const* src,
-  size_t n_bytes,
+  std::size_t n_bytes,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
-  auto cconfig = mgr->configure_compression(n_bytes);
-  auto comp_buf =
-    std::make_unique<rmm::device_buffer>(cconfig.max_compressed_buffer_size, stream, mr);
-
-  rmm::device_buffer comp_size_dev(sizeof(size_t), stream, mr);
-
-  mgr->compress(static_cast<uint8_t const*>(src),
-                static_cast<uint8_t*>(comp_buf->data()),
-                cconfig,
-                static_cast<size_t*>(comp_size_dev.data()));
-
-  size_t actual_size = 0;
-  if (cudaMemcpyAsync(&actual_size,
-                      comp_size_dev.data(),
-                      sizeof(size_t),
-                      cudaMemcpyDeviceToHost,
-                      stream.value()) != cudaSuccess) {
-    throw std::runtime_error("nvcomp compress: D2H size copy failed");
-  }
-  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) {
-    throw std::runtime_error("nvcomp compress: stream sync failed");
-  }
-  return {std::move(comp_buf), actual_size};
+  return batched_compress_bytes(ops, src, n_bytes, stream, mr);
 }
 
-// Decompress a byte range produced by nvcomp_compress_bytes into `dst` (device).
-// The Manager reads the uncompressed size from the stream header. Enqueued on
-// `stream`; the caller synchronizes.
-template <typename MgrT>
-void nvcomp_decompress_bytes(MgrT* mgr,
-                             void const* comp,
-                             void* dst,
-                             rmm::cuda_stream_view /*stream*/)
+// Decompress a frame produced by nvcomp_compress_bytes into `dst` (device),
+// which must hold exactly `out_bytes`. Enqueued on `stream`; synchronizes.
+inline void nvcomp_decompress_bytes(batched_codec_ops const& ops,
+                                    void const* comp,
+                                    std::size_t comp_size,
+                                    void* dst,
+                                    std::size_t out_bytes,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
 {
-  auto dconfig = mgr->configure_decompression(static_cast<uint8_t const*>(comp));
-  mgr->decompress(static_cast<uint8_t*>(dst), static_cast<uint8_t const*>(comp), dconfig);
+  batched_decompress_bytes(ops, comp, comp_size, dst, out_bytes, stream, mr);
 }
 
-// Compress a fixed-width column through `*mgr`.  Returns the worst-case
-// allocated device_buffer and the actual compressed byte count.
-// Throws std::runtime_error on CUDA failures.
-template <typename MgrT>
-std::pair<std::unique_ptr<rmm::device_buffer>, size_t> nvcomp_compress_impl(
-  MgrT* (*get_mgr)(cudaStream_t),
+// Compress a fixed-width column through `ops`. Returns the compressed frame and
+// its actual byte count.
+inline std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> nvcomp_compress_impl(
+  batched_codec_ops const& ops,
   cudf::column_view const& col,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
@@ -96,22 +69,21 @@ std::pair<std::unique_ptr<rmm::device_buffer>, size_t> nvcomp_compress_impl(
   if (!cudf::is_fixed_width(col.type())) {
     throw std::runtime_error("nvcomp simple compressor: only fixed-width columns supported");
   }
-  size_t const uncompressed_size =
-    static_cast<size_t>(col.size()) * static_cast<size_t>(cudf::size_of(col.type()));
+  std::size_t const uncompressed_size =
+    static_cast<std::size_t>(col.size()) * static_cast<std::size_t>(cudf::size_of(col.type()));
 
-  return nvcomp_compress_bytes(
-    get_mgr(stream.value()), col.head<void>(), uncompressed_size, stream, mr);
+  return batched_compress_bytes(ops, col.head<void>(), uncompressed_size, stream, mr);
 }
 
-// Decompress a payload produced by `nvcomp_compress_impl` back to a column.
-template <typename MgrT>
-std::unique_ptr<cudf::column> nvcomp_decompress_impl(MgrT* (*get_mgr)(cudaStream_t),
-                                                     rmm::device_buffer const* compressed_data,
-                                                     size_t compressed_size,
-                                                     cudf::data_type orig_type,
-                                                     cudf::size_type n_rows,
-                                                     rmm::cuda_stream_view stream,
-                                                     rmm::device_async_resource_ref mr)
+// Decompress a frame produced by nvcomp_compress_impl back to a fixed-width column.
+inline std::unique_ptr<cudf::column> nvcomp_decompress_impl(
+  batched_codec_ops const& ops,
+  rmm::device_buffer const* compressed_data,
+  std::size_t compressed_size,
+  cudf::data_type orig_type,
+  cudf::size_type n_rows,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
   if (n_rows == 0 || compressed_data == nullptr || compressed_size == 0) {
     return cudf::make_fixed_width_column(
@@ -120,10 +92,15 @@ std::unique_ptr<cudf::column> nvcomp_decompress_impl(MgrT* (*get_mgr)(cudaStream
 
   auto out_col =
     cudf::make_fixed_width_column(orig_type, n_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  nvcomp_decompress_bytes(
-    get_mgr(stream.value()), compressed_data->data(), out_col->mutable_view().head<void>(), stream);
-
-  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) return nullptr;
+  std::size_t const out_bytes =
+    static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(cudf::size_of(orig_type));
+  batched_decompress_bytes(ops,
+                           compressed_data->data(),
+                           compressed_size,
+                           out_col->mutable_view().head<void>(),
+                           out_bytes,
+                           stream,
+                           mr);
   return out_col;
 }
 

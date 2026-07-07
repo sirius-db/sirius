@@ -59,6 +59,7 @@ add_library(
   src/operators/bitjoin_bitextract.cu
   src/operators/dictionary_compressor.cu
   src/operators/str_split_compressor.cu
+  src/operators/nvcomp_batched_codec.cu
   src/operators/nvcomp_scratch.cpp
   # Plain-CUDA JIT host
   src/jit/fused_tree.cpp
@@ -146,8 +147,8 @@ target_link_libraries(
           nvrtc
           cuda
           dl)
-target_link_options(
-  compress_with_plan_benchmark PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")
+target_link_options(compress_with_plan_benchmark PRIVATE
+                    "-Wl,-rpath,${CONDA_PREFIX}/lib")
 
 # simpatico multi-mode CLI (benchmark / explore / compress / decompress /
 # verify) CMake target is simpatico_cli to avoid collision with the static

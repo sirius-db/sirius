@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // nvcomp Cascaded compressor.
 //
-// Uses the nvcomp high-level Manager API (`nvcomp::CascadedManager`), which
-// handles batching internally. The Manager is cached thread-locally keyed by
-// `(stream, chunk_size, num_deltas, num_RLEs, use_bp, nvcompType_t)` to avoid
-// the per-call constructor cost.
+// Uses the nvcomp low-level batched Cascaded API via a `batched_codec_ops`
+// bundle (see nvcomp_batched_codec.{hpp,cu}); all device memory is owned by RMM.
+// Ops are built per call because Cascaded's opts depend on the column dtype and
+// the plan's (deltas, RLEs, bp) knobs.
 //
 // DSL surface:
 //   `input -> nvcomp_cascaded`               nvcomp defaults
@@ -16,6 +16,8 @@
 // matches what nvcomp expects (e.g. delta over int32 needs NVCOMP_TYPE_INT).
 
 #include "codegen/plan/representation.hpp"
+#include "nvcomp_batched_codec.hpp"
+#include "nvcomp_simple_compressor.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -28,7 +30,7 @@
 
 #include <cuda_runtime.h>
 
-#include <nvcomp/cascaded.hpp>
+#include <nvcomp/cascaded.h>
 
 #include <cstdint>
 #include <memory>
@@ -69,37 +71,49 @@ nvcompType_t cascaded_type_for(cudf::data_type t)
   }
 }
 
-struct cascaded_manager_cache {
-  std::unique_ptr<nvcomp::CascadedManager> mgr;
-  cudaStream_t stream = nullptr;
-  size_t chunk_size   = 0;
-  int num_RLEs        = -1;
-  int num_deltas      = -1;
-  int use_bp          = -1;
-  nvcompType_t type   = NVCOMP_TYPE_INT;
-};
-
-static thread_local cascaded_manager_cache tls_cascaded_mgr;
-
-nvcomp::CascadedManager* get_cascaded_manager(cudaStream_t s,
-                                              nvcompBatchedCascadedCompressOpts_t const& copts)
+// Build the batched ops for a specific Cascaded configuration. Cascaded's opts
+// depend on the column dtype and the plan's (deltas, RLEs, bp) knobs, so ops are
+// built per call rather than cached in a static.
+detail::batched_codec_ops make_cascaded_ops(nvcompBatchedCascadedCompressOpts_t copts)
 {
-  if (tls_cascaded_mgr.mgr && tls_cascaded_mgr.stream == s &&
-      tls_cascaded_mgr.chunk_size == kCascadedManagerChunkSize &&
-      tls_cascaded_mgr.num_RLEs == copts.num_RLEs &&
-      tls_cascaded_mgr.num_deltas == copts.num_deltas && tls_cascaded_mgr.use_bp == copts.use_bp &&
-      tls_cascaded_mgr.type == copts.type) {
-    return tls_cascaded_mgr.mgr.get();
-  }
-  tls_cascaded_mgr.mgr = std::make_unique<nvcomp::CascadedManager>(
-    kCascadedManagerChunkSize, copts, nvcompBatchedCascadedDecompressDefaultOpts, s);
-  tls_cascaded_mgr.stream     = s;
-  tls_cascaded_mgr.chunk_size = kCascadedManagerChunkSize;
-  tls_cascaded_mgr.num_RLEs   = copts.num_RLEs;
-  tls_cascaded_mgr.num_deltas = copts.num_deltas;
-  tls_cascaded_mgr.use_bp     = copts.use_bp;
-  tls_cascaded_mgr.type       = copts.type;
-  return tls_cascaded_mgr.mgr.get();
+  nvcompBatchedCascadedDecompressOpts_t dopts = nvcompBatchedCascadedDecompressDefaultOpts;
+
+  detail::batched_codec_ops o;
+  o.chunk_size             = kCascadedManagerChunkSize;
+  o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
+    return nvcompBatchedCascadedCompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+  };
+  o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
+    return nvcompBatchedCascadedCompressGetMaxOutputChunkSize(mc, copts, mo);
+  };
+  o.compress_async = [copts](void const* const* up,
+                             size_t const* ub,
+                             size_t mc,
+                             size_t nc,
+                             void* t,
+                             size_t tb,
+                             void* const* cp,
+                             size_t* cb,
+                             nvcompStatus_t* st,
+                             cudaStream_t s) {
+    return nvcompBatchedCascadedCompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
+  };
+  o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
+    return nvcompBatchedCascadedDecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
+  };
+  o.decompress_async = [dopts](void const* const* cp,
+                               size_t const* cb,
+                               size_t const* ubuf,
+                               size_t* actual,
+                               size_t nc,
+                               void* t,
+                               size_t tb,
+                               void* const* up,
+                               nvcompStatus_t* st,
+                               cudaStream_t s) {
+    return nvcompBatchedCascadedDecompressAsync(cp, cb, ubuf, actual, nc, t, tb, up, dopts, st, s);
+  };
+  return o;
 }
 
 }  // namespace
@@ -168,18 +182,13 @@ std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
   copts.num_RLEs                            = compress_num_RLEs;
   copts.use_bp                              = compress_use_bp;
 
-  auto* mgr = get_cascaded_manager(stream.value(), copts);
-
-  auto const* comp_ptr = static_cast<uint8_t const*>(compressed_data->data());
-  auto dconfig         = mgr->configure_decompression(comp_ptr);
-
-  auto out_col = cudf::make_fixed_width_column(
-    original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto* out_ptr = static_cast<uint8_t*>(out_col->mutable_view().head<void>());
-
-  mgr->decompress(out_ptr, comp_ptr, dconfig);
-  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) return nullptr;
-  return out_col;
+  return detail::nvcomp_decompress_impl(make_cascaded_ops(copts),
+                                        compressed_data.get(),
+                                        compressed_size,
+                                        original_type,
+                                        num_rows,
+                                        stream,
+                                        mr);
 }
 
 std::unique_ptr<compressed_representation> cascaded_compressor::compress(
@@ -213,30 +222,8 @@ std::unique_ptr<compressed_representation> cascaded_compressor::compress(
   copts.num_RLEs                            = num_RLEs_;
   copts.use_bp                              = use_bp_;
 
-  auto* mgr = get_cascaded_manager(stream.value(), copts);
-
-  auto cconfig = mgr->configure_compression(uncompressed_size);
-  auto comp_buf =
-    std::make_unique<rmm::device_buffer>(cconfig.max_compressed_buffer_size, stream, mr);
-
-  rmm::device_buffer comp_size_dev(sizeof(size_t), stream, mr);
-
-  mgr->compress(static_cast<uint8_t const*>(column_to_compress.head<void>()),
-                static_cast<uint8_t*>(comp_buf->data()),
-                cconfig,
-                static_cast<size_t*>(comp_size_dev.data()));
-
-  size_t actual_size = 0;
-  if (cudaMemcpyAsync(&actual_size,
-                      comp_size_dev.data(),
-                      sizeof(size_t),
-                      cudaMemcpyDeviceToHost,
-                      stream.value()) != cudaSuccess) {
-    throw std::runtime_error("nvcomp_cascaded: D2H size copy failed");
-  }
-  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) {
-    throw std::runtime_error("nvcomp_cascaded: stream sync failed");
-  }
+  auto [comp_buf, actual_size] =
+    detail::nvcomp_compress_impl(make_cascaded_ops(copts), column_to_compress, stream, mr);
 
   return std::make_unique<cascaded_compressed_representation>(
     dt, n, std::move(comp_buf), actual_size, uncompressed_size, num_deltas_, num_RLEs_, use_bp_);
@@ -253,10 +240,7 @@ std::unique_ptr<cudf::column> cascaded_compressor::decompress(
 }
 
 namespace detail {
-void release_cascaded_manager_scratch()
-{
-  if (tls_cascaded_mgr.mgr) tls_cascaded_mgr.mgr->deallocate_gpu_mem();
-}
+void release_cascaded_manager_scratch() {}  // no cached manager under the batched API
 }  // namespace detail
 
 }  // namespace simpatico

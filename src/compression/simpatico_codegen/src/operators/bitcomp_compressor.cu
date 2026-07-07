@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // nvcomp Bitcomp standalone compressor.
 //
-// Mirror of ans_compressor.cu using `nvcomp::BitcompManager`. Bitcomp
-// targets numeric data with high zero-density / low-magnitude residues —
-// a natural fit downstream of delta or RLE chains.
+// Mirror of ans_compressor.cu using the nvcomp low-level batched Bitcomp API via
+// a `batched_codec_ops` bundle (all device memory owned by RMM). Bitcomp targets
+// numeric data with high zero-density / low-magnitude residues — a natural fit
+// downstream of delta or RLE chains.
 //
 // DSL surface:
 //   `input -> bitcomp`           algorithm=0 (default, best ratio).
 //   `input -> bitcomp_default`   alias for bitcomp.
 //   `input -> bitcomp_sparse`    algorithm=1 — faster on zero-rich data.
 //
-// The compress-time algorithm is stashed on the rep so decompress
-// reuses the same Manager cache slot.
+// The compress-time algorithm is stashed on the rep so decompress rebuilds the
+// matching ops.
 
 #include "codegen/plan/representation.hpp"
+#include "nvcomp_batched_codec.hpp"
 #include "nvcomp_simple_compressor.hpp"
 #include "nvcomp_string_support.hpp"
 
@@ -28,7 +30,7 @@
 
 #include <cuda_runtime.h>
 
-#include <nvcomp/bitcomp.hpp>
+#include <nvcomp/bitcomp.h>
 
 #include <cstdint>
 #include <memory>
@@ -40,30 +42,50 @@ namespace simpatico {
 namespace {
 constexpr size_t kBitcompManagerChunkSize = 64 * 1024;
 
-struct bitcomp_manager_cache {
-  std::unique_ptr<nvcomp::BitcompManager> mgr;
-  cudaStream_t stream = nullptr;
-  size_t chunk_size   = 0;
-  int algorithm       = -1;
-};
-
-static thread_local bitcomp_manager_cache tls_bitcomp_mgr;
-
-nvcomp::BitcompManager* get_bitcomp_manager(cudaStream_t s, int algorithm)
+// Build the batched ops for a bitcomp algorithm variant. Cheap to build, so we
+// construct per call rather than caching.
+detail::batched_codec_ops make_bitcomp_ops(int algorithm)
 {
-  if (tls_bitcomp_mgr.mgr && tls_bitcomp_mgr.stream == s &&
-      tls_bitcomp_mgr.chunk_size == kBitcompManagerChunkSize &&
-      tls_bitcomp_mgr.algorithm == algorithm) {
-    return tls_bitcomp_mgr.mgr.get();
-  }
-  nvcompBatchedBitcompCompressOpts_t copts = nvcompBatchedBitcompCompressDefaultOpts;
-  copts.algorithm                          = algorithm;
-  tls_bitcomp_mgr.mgr                      = std::make_unique<nvcomp::BitcompManager>(
-    kBitcompManagerChunkSize, copts, nvcompBatchedBitcompDecompressDefaultOpts, s);
-  tls_bitcomp_mgr.stream     = s;
-  tls_bitcomp_mgr.chunk_size = kBitcompManagerChunkSize;
-  tls_bitcomp_mgr.algorithm  = algorithm;
-  return tls_bitcomp_mgr.mgr.get();
+  nvcompBatchedBitcompCompressOpts_t copts   = nvcompBatchedBitcompCompressDefaultOpts;
+  copts.algorithm                            = algorithm;
+  nvcompBatchedBitcompDecompressOpts_t dopts = nvcompBatchedBitcompDecompressDefaultOpts;
+
+  detail::batched_codec_ops o;
+  o.chunk_size             = kBitcompManagerChunkSize;
+  o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
+    return nvcompBatchedBitcompCompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+  };
+  o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
+    return nvcompBatchedBitcompCompressGetMaxOutputChunkSize(mc, copts, mo);
+  };
+  o.compress_async = [copts](void const* const* up,
+                             size_t const* ub,
+                             size_t mc,
+                             size_t nc,
+                             void* t,
+                             size_t tb,
+                             void* const* cp,
+                             size_t* cb,
+                             nvcompStatus_t* st,
+                             cudaStream_t s) {
+    return nvcompBatchedBitcompCompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
+  };
+  o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
+    return nvcompBatchedBitcompDecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
+  };
+  o.decompress_async = [dopts](void const* const* cp,
+                               size_t const* cb,
+                               size_t const* ubuf,
+                               size_t* actual,
+                               size_t nc,
+                               void* t,
+                               size_t tb,
+                               void* const* up,
+                               nvcompStatus_t* st,
+                               cudaStream_t s) {
+    return nvcompBatchedBitcompDecompressAsync(cp, cb, ubuf, actual, nc, t, tb, up, dopts, st, s);
+  };
+  return o;
 }
 }  // namespace
 
@@ -119,11 +141,10 @@ std::unique_ptr<cudf::column> bitcomp_compressed_representation::decompress(
   // STRING: split the payload into the offsets and chars codec streams,
   // decompress each, and rebuild the strings column.
   if (original_type.id() == cudf::type_id::STRING) {
-    int const algorithm = compress_algorithm;
+    auto ops = make_bitcomp_ops(compress_algorithm);
     auto decompress_bytes =
-      [&](void const* comp, std::size_t /*comp_size*/, void* out, std::size_t /*out_bytes*/) {
-        detail::nvcomp_decompress_bytes(
-          get_bitcomp_manager(stream.value(), algorithm), comp, out, stream);
+      [&](void const* comp, std::size_t comp_size, void* out, std::size_t out_bytes) {
+        detail::nvcomp_decompress_bytes(ops, comp, comp_size, out, out_bytes, stream, mr);
       };
     auto col = detail::rebuild_string_column(compressed_data ? compressed_data->data() : nullptr,
                                              compressed_size,
@@ -139,23 +160,13 @@ std::unique_ptr<cudf::column> bitcomp_compressed_representation::decompress(
     return col;
   }
 
-  if (num_rows == 0 || compressed_data == nullptr || compressed_size == 0) {
-    return cudf::make_fixed_width_column(
-      original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  }
-
-  auto* mgr = get_bitcomp_manager(stream.value(), compress_algorithm);
-
-  auto const* comp_ptr = static_cast<uint8_t const*>(compressed_data->data());
-  auto dconfig         = mgr->configure_decompression(comp_ptr);
-
-  auto out_col = cudf::make_fixed_width_column(
-    original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto* out_ptr = static_cast<uint8_t*>(out_col->mutable_view().head<void>());
-
-  mgr->decompress(out_ptr, comp_ptr, dconfig);
-  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) return nullptr;
-  return out_col;
+  return detail::nvcomp_decompress_impl(make_bitcomp_ops(compress_algorithm),
+                                        compressed_data.get(),
+                                        compressed_size,
+                                        original_type,
+                                        num_rows,
+                                        stream,
+                                        mr);
 }
 
 std::unique_ptr<compressed_representation> bitcomp_compressor::compress(
@@ -178,10 +189,9 @@ std::unique_ptr<compressed_representation> bitcomp_compressor::compress(
   // STRING: compress the offsets and chars streams independently with bitcomp
   // and store them concatenated in the rep's payload.
   if (dt.id() == cudf::type_id::STRING) {
-    int const algorithm = algorithm_;
+    auto ops            = make_bitcomp_ops(algorithm_);
     auto compress_bytes = [&](void const* ptr, std::size_t bytes) {
-      return detail::nvcomp_compress_bytes(
-        get_bitcomp_manager(stream.value(), algorithm), ptr, bytes, stream, mr);
+      return detail::nvcomp_compress_bytes(ops, ptr, bytes, stream, mr);
     };
 
     auto cs  = detail::compress_string_column(column_to_compress, compress_bytes, stream, mr);
@@ -203,30 +213,8 @@ std::unique_ptr<compressed_representation> bitcomp_compressor::compress(
 
   size_t const uncompressed_size = static_cast<size_t>(n) * cudf::size_of(dt);
 
-  auto* mgr = get_bitcomp_manager(stream.value(), algorithm_);
-
-  auto cconfig = mgr->configure_compression(uncompressed_size);
-  auto comp_buf =
-    std::make_unique<rmm::device_buffer>(cconfig.max_compressed_buffer_size, stream, mr);
-
-  rmm::device_buffer comp_size_dev(sizeof(size_t), stream, mr);
-
-  mgr->compress(static_cast<uint8_t const*>(column_to_compress.head<void>()),
-                static_cast<uint8_t*>(comp_buf->data()),
-                cconfig,
-                static_cast<size_t*>(comp_size_dev.data()));
-
-  size_t actual_size = 0;
-  if (cudaMemcpyAsync(&actual_size,
-                      comp_size_dev.data(),
-                      sizeof(size_t),
-                      cudaMemcpyDeviceToHost,
-                      stream.value()) != cudaSuccess) {
-    throw std::runtime_error("bitcomp_compressor: D2H size copy failed");
-  }
-  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) {
-    throw std::runtime_error("bitcomp_compressor: stream sync failed");
-  }
+  auto [comp_buf, actual_size] =
+    detail::nvcomp_compress_impl(make_bitcomp_ops(algorithm_), column_to_compress, stream, mr);
 
   return std::make_unique<bitcomp_compressed_representation>(
     dt, n, std::move(comp_buf), actual_size, uncompressed_size, algorithm_);
@@ -243,10 +231,7 @@ std::unique_ptr<cudf::column> bitcomp_compressor::decompress(
 }
 
 namespace detail {
-void release_bitcomp_manager_scratch()
-{
-  if (tls_bitcomp_mgr.mgr) tls_bitcomp_mgr.mgr->deallocate_gpu_mem();
-}
+void release_bitcomp_manager_scratch() {}  // no cached manager under the batched API
 }  // namespace detail
 
 }  // namespace simpatico

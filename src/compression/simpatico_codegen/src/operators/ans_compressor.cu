@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // nvcomp ANS (entropy coder) compressor.
 //
-// Uses the nvcomp high-level Manager API (`nvcomp::ANSManager`), which handles
-// batching internally. The Manager is cached thread-locally keyed by
-// `(chunk_size, stream)` to avoid the per-call constructor cost. nvcomp requires
-// the Manager not outlive its `user_stream`, so the cache invalidates on stream
-// change.
+// Uses the nvcomp low-level batched API via a `batched_codec_ops` bundle (see
+// nvcomp_batched_codec.{hpp,cu}); all device memory is owned by RMM so nvcomp
+// never allocates its own. Handles fixed-width columns and, via
+// nvcomp_string_support.hpp, STRING columns (offsets + chars sub-streams).
 
 #include "codegen/plan/representation.hpp"
+#include "nvcomp_batched_codec.hpp"
 #include "nvcomp_simple_compressor.hpp"
 #include "nvcomp_string_support.hpp"
 
@@ -22,7 +22,7 @@
 
 #include <cuda_runtime.h>
 
-#include <nvcomp/ans.hpp>
+#include <nvcomp/ans.h>
 
 #include <cstdint>
 #include <memory>
@@ -36,28 +36,50 @@ namespace {
 // for parallelism. ANS supports up to 16 MB chunks (`nvcompANSCompressionMaxAllowedChunkSize`).
 constexpr size_t kAnsManagerChunkSize = 64 * 1024;
 
-// Thread-local cache of the ANSManager. Rebuilt on stream change.
-struct ans_manager_cache {
-  std::unique_ptr<nvcomp::ANSManager> mgr;
-  cudaStream_t stream = nullptr;
-  size_t chunk_size   = 0;
-};
-
-static thread_local ans_manager_cache tls_ans_mgr;
-
-nvcomp::ANSManager* get_ans_manager(cudaStream_t s)
+detail::batched_codec_ops const& ans_ops()
 {
-  if (tls_ans_mgr.mgr && tls_ans_mgr.stream == s &&
-      tls_ans_mgr.chunk_size == kAnsManagerChunkSize) {
-    return tls_ans_mgr.mgr.get();
-  }
-  tls_ans_mgr.mgr        = std::make_unique<nvcomp::ANSManager>(kAnsManagerChunkSize,
-                                                         nvcompBatchedANSCompressDefaultOpts,
-                                                         nvcompBatchedANSDecompressDefaultOpts,
-                                                         s);
-  tls_ans_mgr.stream     = s;
-  tls_ans_mgr.chunk_size = kAnsManagerChunkSize;
-  return tls_ans_mgr.mgr.get();
+  static detail::batched_codec_ops const ops = [] {
+    nvcompBatchedANSCompressOpts_t copts   = nvcompBatchedANSCompressDefaultOpts;
+    nvcompBatchedANSDecompressOpts_t dopts = nvcompBatchedANSDecompressDefaultOpts;
+
+    detail::batched_codec_ops o;
+    o.chunk_size             = kAnsManagerChunkSize;
+    o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
+      return nvcompBatchedANSCompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+    };
+    o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
+      return nvcompBatchedANSCompressGetMaxOutputChunkSize(mc, copts, mo);
+    };
+    o.compress_async = [copts](void const* const* up,
+                               size_t const* ub,
+                               size_t mc,
+                               size_t nc,
+                               void* t,
+                               size_t tb,
+                               void* const* cp,
+                               size_t* cb,
+                               nvcompStatus_t* st,
+                               cudaStream_t s) {
+      return nvcompBatchedANSCompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
+    };
+    o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
+      return nvcompBatchedANSDecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
+    };
+    o.decompress_async = [dopts](void const* const* cp,
+                                 size_t const* cb,
+                                 size_t const* ubuf,
+                                 size_t* actual,
+                                 size_t nc,
+                                 void* t,
+                                 size_t tb,
+                                 void* const* up,
+                                 nvcompStatus_t* st,
+                                 cudaStream_t s) {
+      return nvcompBatchedANSDecompressAsync(cp, cb, ubuf, actual, nc, t, tb, up, dopts, st, s);
+    };
+    return o;
+  }();
+  return ops;
 }
 }  // namespace
 
@@ -97,8 +119,8 @@ std::unique_ptr<cudf::column> ans_compressed_representation::decompress(
   // decompress each, and rebuild the strings column.
   if (original_type.id() == cudf::type_id::STRING) {
     auto decompress_bytes =
-      [&](void const* comp, std::size_t /*comp_size*/, void* out, std::size_t /*out_bytes*/) {
-        detail::nvcomp_decompress_bytes(get_ans_manager(stream.value()), comp, out, stream);
+      [&](void const* comp, std::size_t comp_size, void* out, std::size_t out_bytes) {
+        detail::nvcomp_decompress_bytes(ans_ops(), comp, comp_size, out, out_bytes, stream, mr);
       };
     auto col = detail::rebuild_string_column(compressed_data ? compressed_data->data() : nullptr,
                                              compressed_size,
@@ -114,23 +136,8 @@ std::unique_ptr<cudf::column> ans_compressed_representation::decompress(
     return col;
   }
 
-  if (num_rows == 0 || compressed_data == nullptr || compressed_size == 0) {
-    return cudf::make_fixed_width_column(
-      original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  }
-
-  auto* mgr = get_ans_manager(stream.value());
-
-  auto const* comp_ptr = static_cast<uint8_t const*>(compressed_data->data());
-  auto dconfig         = mgr->configure_decompression(comp_ptr);
-
-  auto out_col = cudf::make_fixed_width_column(
-    original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto* out_ptr = static_cast<uint8_t*>(out_col->mutable_view().head<void>());
-
-  mgr->decompress(out_ptr, comp_ptr, dconfig);
-  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) return nullptr;
-  return out_col;
+  return detail::nvcomp_decompress_impl(
+    ans_ops(), compressed_data.get(), compressed_size, original_type, num_rows, stream, mr);
 }
 
 std::unique_ptr<compressed_representation> ans_compressor::compress(
@@ -153,7 +160,7 @@ std::unique_ptr<compressed_representation> ans_compressor::compress(
   // store them concatenated in the rep's payload.
   if (dt.id() == cudf::type_id::STRING) {
     auto compress_bytes = [&](void const* ptr, std::size_t bytes) {
-      return detail::nvcomp_compress_bytes(get_ans_manager(stream.value()), ptr, bytes, stream, mr);
+      return detail::nvcomp_compress_bytes(ans_ops(), ptr, bytes, stream, mr);
     };
 
     auto cs  = detail::compress_string_column(column_to_compress, compress_bytes, stream, mr);
@@ -171,33 +178,8 @@ std::unique_ptr<compressed_representation> ans_compressor::compress(
 
   size_t const uncompressed_size = static_cast<size_t>(n) * cudf::size_of(dt);
 
-  auto* mgr = get_ans_manager(stream.value());
-
-  auto cconfig = mgr->configure_compression(uncompressed_size);
-  auto comp_buf =
-    std::make_unique<rmm::device_buffer>(cconfig.max_compressed_buffer_size, stream, mr);
-
-  // Device-side single-element size buffer to receive the actual
-  // compressed size. NVCOMP_NATIVE bitstream embeds size in header;
-  // we still want it on host for ratio reporting.
-  rmm::device_buffer comp_size_dev(sizeof(size_t), stream, mr);
-
-  mgr->compress(static_cast<uint8_t const*>(column_to_compress.head<void>()),
-                static_cast<uint8_t*>(comp_buf->data()),
-                cconfig,
-                static_cast<size_t*>(comp_size_dev.data()));
-
-  size_t actual_size = 0;
-  if (cudaMemcpyAsync(&actual_size,
-                      comp_size_dev.data(),
-                      sizeof(size_t),
-                      cudaMemcpyDeviceToHost,
-                      stream.value()) != cudaSuccess) {
-    throw std::runtime_error("ans_compressor: D2H size copy failed");
-  }
-  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) {
-    throw std::runtime_error("ans_compressor: stream sync failed");
-  }
+  auto [comp_buf, actual_size] =
+    detail::nvcomp_compress_impl(ans_ops(), column_to_compress, stream, mr);
 
   return std::make_unique<ans_compressed_representation>(
     dt, n, std::move(comp_buf), actual_size, uncompressed_size);
@@ -214,10 +196,7 @@ std::unique_ptr<cudf::column> ans_compressor::decompress(
 }
 
 namespace detail {
-void release_ans_manager_scratch()
-{
-  if (tls_ans_mgr.mgr) tls_ans_mgr.mgr->deallocate_gpu_mem();
-}
+void release_ans_manager_scratch() {}  // no cached manager under the batched API
 }  // namespace detail
 
 }  // namespace simpatico
