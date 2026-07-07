@@ -352,7 +352,7 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
  public:
   /// Maximum number of build keys this filter accepts. Above this the producer prefers the cuco
   /// IN-list set or a Bloom filter instead (see the hash-join membership policy).
-  static constexpr std::size_t k_max_keys = 64;
+  static constexpr std::size_t k_max_keys = 32;
 
   /// @param keys   The build keys (INT32/INT64, no nulls; the producer restricts the count to
   ///               <= @ref k_max_keys). The view need only remain valid for the constructor, which

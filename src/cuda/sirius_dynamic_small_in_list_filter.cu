@@ -86,12 +86,13 @@ namespace sirius::op {
 // Per-device needle storage (PIMPL)
 //===----------------------------------------------------------------------===//
 
-/// Per-device raw snapshots of the build keys. Mirrors sirius_dynamic_in_list_filter's replica
-/// store, but a device_buffer of raw bytes needs no cuco set / typed variant: the outer class's
-/// _key_type / _num_keys decode the bytes in compute_mask.
+/// @brief Per-device raw snapshots of the build keys. Mirrors sirius_dynamic_in_list_filter's
+/// replica store, but a device_buffer of raw bytes needs no cuco set / typed variant: the outer
+/// class's _key_type / _num_keys decode the bytes in compute_mask.
 struct sirius_dynamic_small_in_list_filter::needle_store {
-  /// One device-local needle buffer. Frees on its owning device (an rmm::device_buffer frees on
-  /// the current device, so teardown must restore that device first — mirrors set_replica).
+  /// @brief One device-local needle buffer. Frees on its owning device (an rmm::device_buffer
+  /// frees on the current device, so teardown must restore that device first — mirrors
+  /// set_replica).
   struct needle_replica {
     int device_id = -1;
     rmm::device_buffer needles;
