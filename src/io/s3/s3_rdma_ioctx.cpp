@@ -18,6 +18,7 @@
 
 #include "io/uri_parser.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -49,6 +50,23 @@ s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg, std::shared_ptr<rdma::rdma
       }),
     _client(std::move(client))
 {
+}
+
+rdma::rdma_perf_snapshot s3_rdma_ioctx::perf_snapshot() const noexcept
+{
+  rdma::rdma_perf_snapshot total;
+  for (const auto& reactor : _reactors) {
+    auto const s = reactor->perf_snapshot();
+    total.bytes_total += s.bytes_total;
+    total.requests_total += s.requests_total;
+    total.retries_total += s.retries_total;
+    total.short_read_total += s.short_read_total;
+    total.error_total += s.error_total;
+    total.slot_wait_total += s.slot_wait_total;
+    total.flush_total += s.flush_total;
+    total.inflight_peak = std::max(total.inflight_peak, s.inflight_peak);
+  }
+  return total;
 }
 
 size_t s3_rdma_ioctx::host_read_io(const sirius_io_object& obj,

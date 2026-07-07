@@ -46,6 +46,10 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::rdma; }
 
+  /// Pool-aggregated transfer counters (single reactor today; summed if the
+  /// pool ever grows).
+  [[nodiscard]] rdma::rdma_perf_snapshot perf_snapshot() const noexcept;
+
   /// Fail-fast without a client: these three intercept before the base builds
   /// any request, so no transfer machinery (and no backend-typed io_object
   /// access) is reached until the transport exists.

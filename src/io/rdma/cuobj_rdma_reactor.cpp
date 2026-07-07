@@ -119,6 +119,51 @@ void cuobj_rdma_reactor::shutdown()
 
 void cuobj_rdma_reactor::interrupt() { _cv.notify_all(); }
 
+bool cuobj_rdma_reactor::stopping()
+{
+  std::lock_guard lk{_mtx};
+  return _stopping;
+}
+
+rdma_perf_snapshot cuobj_rdma_reactor::perf_snapshot() const noexcept
+{
+  rdma_perf_snapshot s;
+  s.bytes_total      = _bytes_total.load(std::memory_order_relaxed);
+  s.requests_total   = _requests_total.load(std::memory_order_relaxed);
+  s.retries_total    = _retries_total.load(std::memory_order_relaxed);
+  s.short_read_total = _short_read_total.load(std::memory_order_relaxed);
+  s.error_total      = _error_total.load(std::memory_order_relaxed);
+  s.slot_wait_total  = _slot_wait_total.load(std::memory_order_relaxed);
+  s.flush_total      = _flush_total.load(std::memory_order_relaxed);
+  s.inflight_peak    = _inflight_peak.load(std::memory_order_relaxed);
+  return s;
+}
+
+size_t cuobj_rdma_reactor::get_with_retry(
+  std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst)
+{
+  auto& client = *_ctx->client();
+  for (size_t attempt = 1;; ++attempt) {
+    try {
+      const size_t n = client.get(bucket, key, offset, size, dst);
+      if (n != size) {
+        _short_read_total.fetch_add(1, std::memory_order_relaxed);
+        throw short_read_error(n, size);
+      }
+      return n;
+    } catch (...) {
+      if (attempt >= _config.max_get_attempts || stopping()) { throw; }
+      _retries_total.fetch_add(1, std::memory_order_relaxed);
+      auto delay = _config.retry_backoff_base * attempt;
+      if (_config.retry_jitter.count() > 0) {
+        delay += std::chrono::milliseconds{
+          static_cast<int64_t>(attempt * 1315423911U % (_config.retry_jitter.count() + 1))};
+      }
+      if (delay.count() > 0) { std::this_thread::sleep_for(delay); }
+    }
+  }
+}
+
 void cuobj_rdma_reactor::worker_loop()
 {
   for (;;) {
@@ -133,6 +178,9 @@ void cuobj_rdma_reactor::worker_loop()
       chunk = std::move(_queue.front());
       _queue.pop_front();
       ++_active;
+      if (auto peak = _inflight_peak.load(std::memory_order_relaxed); _active > peak) {
+        _inflight_peak.store(_active, std::memory_order_relaxed);
+      }
     }
     process_chunk(*chunk);
     {
@@ -145,11 +193,11 @@ void cuobj_rdma_reactor::worker_loop()
 
 void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
 {
+  _requests_total.fetch_add(1, std::memory_order_relaxed);
   try {
-    auto& client = *_ctx->client();
     if (!chunk.is_device) {
-      const size_t n = client.get(chunk.bucket, chunk.key, chunk.offset, chunk.size, chunk.dst);
-      if (n != chunk.size) { throw short_read_error(n, chunk.size); }
+      const size_t n = get_with_retry(chunk.bucket, chunk.key, chunk.offset, chunk.size, chunk.dst);
+      _bytes_total.fetch_add(n, std::memory_order_relaxed);
       chunk.manager->chunk_complete(n);
       return;
     }
@@ -157,18 +205,27 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
     const int device =
       chunk.device_id >= 0 ? chunk.device_id : rmm::get_current_cuda_device().value();
     rmm::cuda_set_device_raii device_scope{rmm::cuda_device_id{device}};
-    auto& ar   = arena_for_device(device);
-    auto token = ar.pool->acquire_token();
+    auto& ar = arena_for_device(device);
+    int slot = ar.pool->try_acquire();
+    if (slot == slot_pool::no_slot) {
+      _slot_wait_total.fetch_add(1, std::memory_order_relaxed);
+      slot = ar.pool->acquire();
+    }
+    struct slot_release {
+      slot_pool* pool;
+      int slot;
+      ~slot_release() { pool->release(slot); }
+    } release{ar.pool.get(), slot};
 
-    uint8_t* slot_ptr = ar.base + static_cast<size_t>(token.slot_index()) * _config.arena_slot_size;
-    const size_t n    = client.get(chunk.bucket, chunk.key, chunk.offset, chunk.size, slot_ptr);
-    if (n != chunk.size) { throw short_read_error(n, chunk.size); }
+    uint8_t* slot_ptr = ar.base + static_cast<size_t>(slot) * _config.arena_slot_size;
+    const size_t n    = get_with_retry(chunk.bucket, chunk.key, chunk.offset, chunk.size, slot_ptr);
 
     if (_ctx->flush_before_copy()) {
       throw_on_cuda_error(
         cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
                                            cudaFlushGPUDirectRDMAWritesToOwner),
         "GPUDirect writes flush failed");
+      _flush_total.fetch_add(1, std::memory_order_relaxed);
     }
     throw_on_cuda_error(
       cudaMemcpyAsync(chunk.dst, slot_ptr, n, cudaMemcpyDeviceToDevice, chunk.stream.value()),
@@ -184,8 +241,10 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
     (void)cudaEventDestroy(event);
     throw_on_cuda_error(sync_err, "D2D completion wait failed");
 
+    _bytes_total.fetch_add(n, std::memory_order_relaxed);
     chunk.manager->chunk_complete(n);
   } catch (...) {
+    _error_total.fetch_add(1, std::memory_order_relaxed);
     chunk.manager->report_error(std::current_exception());
   }
 }
@@ -302,9 +361,15 @@ size_t cuobj_rdma_reactor::host_read(const io_object_type& file,
   if (!_ctx->client()) { throw not_implemented("host_read"); }
   const size_t n = clipped_size(file, offset, size);
   if (n == 0) { return 0; }
-  const size_t got = _ctx->client()->get(file.bucket(), file.key(), offset, n, dst);
-  if (got != n) { throw short_read_error(got, n); }
-  return got;
+  _requests_total.fetch_add(1, std::memory_order_relaxed);
+  try {
+    const size_t got = get_with_retry(file.bucket(), file.key(), offset, n, dst);
+    _bytes_total.fetch_add(got, std::memory_order_relaxed);
+    return got;
+  } catch (...) {
+    _error_total.fetch_add(1, std::memory_order_relaxed);
+    throw;
+  }
 }
 
 std::unique_ptr<cuobj_rdma_reactor::io_object_type> cuobj_rdma_reactor::create_io_object(

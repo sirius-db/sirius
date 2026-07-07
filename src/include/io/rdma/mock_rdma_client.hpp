@@ -42,6 +42,9 @@ class mock_rdma_client final : public rdma_client {
 
   /// Subsequent get() calls throw std::runtime_error(message) until cleared.
   void fail_gets(std::string message);
+  /// The next @p count get() calls throw std::runtime_error(message); later
+  /// calls behave normally.  A persistent fail_gets wins if both are set.
+  void fail_next_gets(size_t count, std::string message);
   /// Subsequent get() calls deliver at most @p bytes until cleared.
   void short_read(size_t bytes);
   void clear_fault();
@@ -62,6 +65,8 @@ class mock_rdma_client final : public rdma_client {
   std::condition_variable _gate_cv;
   std::map<std::pair<std::string, std::string>, std::vector<std::uint8_t>> _objects;
   std::optional<std::string> _fail_message;
+  size_t _fail_next_count{0};
+  std::string _fail_next_message;
   std::optional<size_t> _short_read;
   bool _gate_closed{false};
   size_t _gets_issued{0};

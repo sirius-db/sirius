@@ -63,6 +63,13 @@ void mock_rdma_client::fail_gets(std::string message)
   _fail_message = std::move(message);
 }
 
+void mock_rdma_client::fail_next_gets(size_t count, std::string message)
+{
+  std::lock_guard lk{_mtx};
+  _fail_next_count   = count;
+  _fail_next_message = std::move(message);
+}
+
 void mock_rdma_client::short_read(size_t bytes)
 {
   std::lock_guard lk{_mtx};
@@ -73,6 +80,7 @@ void mock_rdma_client::clear_fault()
 {
   std::lock_guard lk{_mtx};
   _fail_message.reset();
+  _fail_next_count = 0;
   _short_read.reset();
 }
 
@@ -129,6 +137,10 @@ size_t mock_rdma_client::get(
   _gate_cv.wait(lk, [&] { return !_gate_closed; });
 
   if (_fail_message) { throw std::runtime_error(*_fail_message); }
+  if (_fail_next_count > 0) {
+    --_fail_next_count;
+    throw std::runtime_error(_fail_next_message);
+  }
   auto it = _objects.find({std::string(bucket), std::string(key)});
   if (it == _objects.end()) {
     throw std::runtime_error("mock_rdma_client: no such object s3://" + std::string(bucket) + "/" +

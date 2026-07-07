@@ -24,6 +24,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -48,6 +50,21 @@ namespace sirius::io::rdma {
   constexpr int k_all_devices_ordered = 200;  // CU_..._ORDERING_ALL_DEVICES
   return writes_ordering < k_all_devices_ordered;
 }
+
+/// Pull-based transfer counters, snapshotted lock-free from the reactor's
+/// atomics (the REST backend's perf-snapshot pattern).  Values accumulate for
+/// the reactor's lifetime and are never reset.
+struct rdma_perf_snapshot {
+  uint64_t bytes_total{0};       ///< bytes successfully delivered (device + host paths)
+  uint64_t requests_total{0};    ///< chunks / sync host reads processed (a retried one counts once)
+  uint64_t retries_total{0};     ///< retry attempts performed (attempts beyond the first)
+  uint64_t short_read_total{0};  ///< short reads observed (every occurrence, retried or terminal)
+  uint64_t error_total{0};       ///< chunks / sync host reads that failed terminally
+  uint64_t slot_wait_total{0};   ///< arena-slot acquisitions that had to block (0 by construction
+                                 ///< while slots == workers; kept for staged-completion shapes)
+  uint64_t flush_total{0};       ///< GPUDirect write flushes performed (0 while flushing is off)
+  uint64_t inflight_peak{0};     ///< max chunks concurrently being processed by the worker pool
+};
 
 /// s3://bucket/key object handle resolved by @c s3_rdma_ioctx::create_io_object
 /// (HEAD via the client).
@@ -107,6 +124,11 @@ class cuobj_rdma_reactor {
   struct config {
     size_t max_inflight{8};
     size_t arena_slot_size{4UL << 20};
+    /// Total transfer attempts per chunk / sync host read (the first + retries).
+    /// Only client transport failures and short reads retry — never CUDA work.
+    size_t max_get_attempts{3};
+    std::chrono::milliseconds retry_backoff_base{5};
+    std::chrono::milliseconds retry_jitter{5};
   };
 
   /// Shared per-pool state: the effective config + the transfer client (may be
@@ -170,6 +192,8 @@ class cuobj_rdma_reactor {
   void shutdown();
   void interrupt();
 
+  [[nodiscard]] rdma_perf_snapshot perf_snapshot() const noexcept;
+
   /// Concept stub: real object creation needs the client (HEAD) and lives in
   /// @c s3_rdma_ioctx::create_io_object.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
@@ -190,6 +214,12 @@ class cuobj_rdma_reactor {
   void worker_loop();
   void process_chunk(cuobj_chunked_rx_request& chunk);
   arena& arena_for_device(int device_id);
+  [[nodiscard]] bool stopping();
+  /// Bounded-retry transfer into @p dst: up to max_get_attempts client gets
+  /// (+ the short-read check), backoff between attempts, abort when stopping.
+  /// Counts retries/short reads; throws the last error on exhaustion.
+  size_t get_with_retry(
+    std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst);
 
   std::shared_ptr<reactor_context> _ctx;
   config _config;
@@ -206,6 +236,15 @@ class cuobj_rdma_reactor {
 
   std::mutex _arena_mtx;
   std::map<int, std::unique_ptr<arena>> _arenas;
+
+  std::atomic<uint64_t> _bytes_total{0};
+  std::atomic<uint64_t> _requests_total{0};
+  std::atomic<uint64_t> _retries_total{0};
+  std::atomic<uint64_t> _short_read_total{0};
+  std::atomic<uint64_t> _error_total{0};
+  std::atomic<uint64_t> _slot_wait_total{0};
+  std::atomic<uint64_t> _flush_total{0};
+  std::atomic<uint64_t> _inflight_peak{0};
 };
 
 }  // namespace sirius::io::rdma
