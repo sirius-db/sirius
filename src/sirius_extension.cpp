@@ -673,8 +673,8 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
 }
 
 [[maybe_unused]] static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
-                                                                Planner& planner,
-                                                                Connection& new_conn)
+                                                                 Planner& planner,
+                                                                 Connection& new_conn)
 {
   unique_ptr<LogicalOperator> plan;
   plan = std::move(planner.plan);

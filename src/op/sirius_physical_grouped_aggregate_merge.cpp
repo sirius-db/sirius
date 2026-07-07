@@ -36,8 +36,8 @@ namespace op {
 // callers in Super Sirius and have been removed.
 
 // Helper to convert vector<vector<idx_t>> to vector<unsafe_vector<idx_t>>
-[[maybe_unused]] static duckdb::vector<duckdb::unsafe_vector<std::size_t>> convert_grouping_functions(
-  const duckdb::vector<duckdb::vector<std::size_t>>& src)
+[[maybe_unused]] static duckdb::vector<duckdb::unsafe_vector<std::size_t>>
+convert_grouping_functions(const duckdb::vector<duckdb::vector<std::size_t>>& src)
 {
   duckdb::vector<duckdb::unsafe_vector<std::size_t>> result;
   result.reserve(src.size());
