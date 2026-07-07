@@ -269,12 +269,22 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
   std::lock_guard<std::mutex> guard(lock);
   if (!_num_partitions.has_value() && !_drives_partition_count &&
       _sibling_partition_op != nullptr) {
-    // Prefer scheduling the side that sizes the sibling pair. If that side is complete but empty,
-    // schedule this side so it can elect one partition from the empty sizing input.
-    auto driver_hint = _sibling_partition_op->get_next_task_hint();
-    if (driver_hint.has_value()) { return driver_hint; }
-    return sirius_physical_operator::get_next_task_hint();
-  } else if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
+    // The non-driver normally waits for the sizing side. If that side finished
+    // without input, no task can negotiate a count; elect one partition so the
+    // downstream zero-side path can proceed.
+    auto& sizing_partition     = _sibling_partition_op->Cast<sirius_physical_partition>();
+    bool sizing_finished_empty = false;
+    if (sizing_partition.ports.size() == 1) {
+      auto sizing_port      = sizing_partition.ports.begin()->second;
+      sizing_finished_empty = sizing_port->src_pipeline &&
+                              sizing_port->src_pipeline->is_pipeline_finished() &&
+                              sizing_port->repo && sizing_port->repo->total_size() == 0;
+    }
+    if (!sizing_finished_empty) { return _sibling_partition_op->get_next_task_hint(); }
+    _num_partitions = 1;
+    sizing_partition.set_num_partitions(1);
+  }
+  if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
     // If this is part of a join and its on the probe side, and we have determined the number of
     // partitions, we have this behave as a pipeline operator and just schedule tasks
 
