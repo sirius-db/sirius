@@ -679,7 +679,7 @@ TEST_CASE("sirius_dynamic_small_in_list_filter keeps exactly the rows whose key 
   auto out   = sirius::op::scan::apply_dynamic_filters_to_view(table->view(), filters, stream);
   stream.synchronize();
   REQUIRE(out != nullptr);
-  REQUIRE(out->num_rows() == 5);
+  REQUIRE(to_host_int64(out->view().column(0), stream) == std::vector<int64_t>{0, 1, 2, 3, 4});
   REQUIRE(table->num_rows() == 10);
 }
 
@@ -737,24 +737,36 @@ TEST_CASE("sirius_dynamic_small_in_list_filter: kind, size, capabilities, and su
   auto const mr = cudf::get_current_device_resource_ref();
   using F       = sirius::op::sirius_dynamic_small_in_list_filter;
 
-  auto i32 = cudf::sequence(3,
-                            cudf::numeric_scalar<int32_t>(0, true, stream),
-                            cudf::numeric_scalar<int32_t>(1, true, stream),
-                            stream);
+  auto one_i32       = cudf::sequence(1,
+                                cudf::numeric_scalar<int32_t>(0, true, stream),
+                                cudf::numeric_scalar<int32_t>(1, true, stream),
+                                stream);
+  auto max_i32       = cudf::sequence(static_cast<cudf::size_type>(F::k_max_keys),
+                                cudf::numeric_scalar<int32_t>(0, true, stream),
+                                cudf::numeric_scalar<int32_t>(1, true, stream),
+                                stream);
+  auto oversized_i32 = cudf::sequence(static_cast<cudf::size_type>(F::k_max_keys + 1),
+                                      cudf::numeric_scalar<int32_t>(0, true, stream),
+                                      cudf::numeric_scalar<int32_t>(1, true, stream),
+                                      stream);
+  auto empty_i32     = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
+  auto null_i32      = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 1, cudf::mask_state::ALL_NULL, stream);
   auto f64 =
     make_values_table<double>({0.0, 1.0, 2.0}, cudf::data_type{cudf::type_id::FLOAT64}, stream);
 
   // supports() gate: 1..k_max_keys keys, INT32/INT64, no nulls.
-  REQUIRE(F::supports(i32->view(), 1));
-  REQUIRE(F::supports(i32->view(), F::k_max_keys));
-  REQUIRE_FALSE(F::supports(i32->view(), 0));                  // need at least one key
-  REQUIRE_FALSE(F::supports(i32->view(), F::k_max_keys + 1));  // above the small-list cap
-  REQUIRE_FALSE(F::supports(f64->view().column(0), 3));        // wrong type
+  REQUIRE(F::supports(one_i32->view()));
+  REQUIRE(F::supports(max_i32->view()));
+  REQUIRE_FALSE(F::supports(empty_i32->view()));
+  REQUIRE_FALSE(F::supports(oversized_i32->view()));
+  REQUIRE_FALSE(F::supports(f64->view().column(0)));
+  REQUIRE_FALSE(F::supports(null_i32->view()));
 
-  F f(i32->view(), stream, mr);
+  F f(max_i32->view(), stream, mr);
   stream.synchronize();
   REQUIRE(f.kind() == sirius_dynamic_filter_kind::IN_LIST);
-  REQUIRE(f.size() == 3);
+  REQUIRE(f.size() == F::k_max_keys);
   REQUIRE(f.replica_count() == 1);  // source-device snapshot built in the constructor
   // Cast through the base pointer, exactly as the consumer-side merge does: the filter advertises
   // the runtime-mask capability but not AST lowering, keeping it out of the parquet row-group path.

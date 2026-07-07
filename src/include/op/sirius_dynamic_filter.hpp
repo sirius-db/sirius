@@ -352,7 +352,7 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
  public:
   /// Maximum number of build keys this filter accepts. Above this the producer prefers the cuco
   /// IN-list set or a Bloom filter instead (see the hash-join membership policy).
-  static constexpr std::size_t k_max_keys = 32;
+  static constexpr std::size_t k_max_keys = 12;
 
   /// @param keys   The build keys (INT32/INT64, no nulls; the producer restricts the count to
   ///               <= @ref k_max_keys). The view need only remain valid for the constructor, which
@@ -390,9 +390,8 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
   /// Number of build keys (needles) backing the scan.
   [[nodiscard]] std::size_t size() const noexcept { return _num_keys; }
 
-  /// Whether @p keys (a column of @p num_keys rows) can back the small-list scan: 1..k_max_keys
-  /// keys of type INT32/INT64 with no nulls.
-  [[nodiscard]] static bool supports(cudf::column_view const& keys, std::size_t num_keys) noexcept;
+  /// Whether @p keys can back the small-list scan: 1..k_max_keys INT32/INT64 keys with no nulls.
+  [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
 
  private:
   cudf::data_type _key_type{cudf::type_id::EMPTY};

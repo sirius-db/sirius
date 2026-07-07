@@ -127,10 +127,10 @@ struct sirius_dynamic_small_in_list_filter::needle_store {
 // sirius_dynamic_small_in_list_filter
 //===----------------------------------------------------------------------===//
 
-bool sirius_dynamic_small_in_list_filter::supports(cudf::column_view const& keys,
-                                                   std::size_t num_keys) noexcept
+bool sirius_dynamic_small_in_list_filter::supports(cudf::column_view const& keys) noexcept
 {
-  auto const id = keys.type().id();
+  auto const num_keys = static_cast<std::size_t>(keys.size());
+  auto const id       = keys.type().id();
   return num_keys >= 1 && num_keys <= k_max_keys &&
          (id == cudf::type_id::INT32 || id == cudf::type_id::INT64) && keys.null_count() == 0;
 }
@@ -139,7 +139,7 @@ sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
   cudf::column_view const& keys, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
   : _key_type(keys.type()), _num_keys(static_cast<std::size_t>(keys.size()))
 {
-  if (!supports(keys, _num_keys)) {
+  if (!supports(keys)) {
     throw std::invalid_argument(
       "[sirius_dynamic_small_in_list_filter] unsupported key column (1..k_max_keys INT32/INT64 "
       "keys with no nulls required).");
