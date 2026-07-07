@@ -1,0 +1,321 @@
+<section class="module" id="module-6" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">06</span>
+      <h1 class="module-title">Design Decisions</h1>
+      <p class="module-subtitle">Half of Sirius's design looks over-engineered until you learn which outage or rewrite produced it. Here are the receipts.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: The two currents (hero) ──────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The two currents</h2>
+        <p>Cut a tree and every season is right there in the wood — a drought ring, a growth spurt, a lightning scar. Sirius reads the same way: every "weird" rule is a fossilized incident, and reading the rings gets you the judgment without living the incidents. Almost every ring lines up along one of two currents.</p>
+
+        <div class="animate-in" style="background: var(--color-surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-md); padding: var(--space-6); margin: var(--space-8) 0;">
+
+          <div style="border-left: 4px solid var(--color-actor-2); border-radius: var(--radius-sm); background: var(--color-surface-warm); padding: var(--space-4) var(--space-5); margin-bottom: var(--space-5);">
+            <div style="display: flex; align-items: baseline; gap: var(--space-3); flex-wrap: wrap;">
+              <span style="font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; color: var(--color-actor-2);">Current 1 · away from DuckDB</span>
+              <span style="font-size: var(--text-xs); color: var(--color-text-muted);">destination: a standalone <span class="term" data-definition="The decoupling current's end state: Sirius packaged as a standalone, embeddable GPU engine library that any host — DuckDB, a Rust service, a StarRocks node — can drive over a stable boundary.">libsirius</span></span>
+            </div>
+            <div class="flow-steps" style="margin: var(--space-4) 0 0;">
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-2); color: var(--color-actor-2);">1</div>
+                <p><strong>Native type system</strong><br><a href="https://github.com/sirius-db/sirius/pull/643">#643</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-2); color: var(--color-actor-2);">2</div>
+                <p><strong><span class="term" data-definition="Sirius's native expression AST. Built in #796; since #847 it is the input to lowering, so DuckDB expressions get translated once at the planner boundary and never travel deeper.">sirius::ast</span></strong><br><a href="https://github.com/sirius-db/sirius/pull/796">#796</a>/<a href="https://github.com/sirius-db/sirius/pull/847">#847</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-2); color: var(--color-actor-2);">3</div>
+                <p><strong><span class="term" data-definition="The pointer-to-implementation indirection that once hid DuckDB types behind Sirius's public headers. Native types (#643) removed the need, so #880 deleted the machinery.">PIMPL</span> retired</strong><br><a href="https://github.com/sirius-db/sirius/pull/880">#880</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-2); color: var(--color-actor-2);">4</div>
+                <p><strong>Rust <span class="term" data-definition="Foreign-function interface: the C-ABI boundary added in #908 so non-C++ hosts (Rust first) can drive the engine. The first load-bearing piece of the libsirius surface.">FFI</span></strong><br><a href="https://github.com/sirius-db/sirius/pull/908">#908</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: var(--color-actor-2); border: 4px solid var(--color-actor-2); color: white;">5</div>
+                <p><strong><span class="term" data-definition="The compute-node embedding project: #960 stands up a full Sirius engine context inside a StarRocks compute node — proof the engine survives outside DuckDB.">StarRocks CN</span></strong><br><a href="https://github.com/sirius-db/sirius/pull/960">#960</a></p>
+              </div>
+            </div>
+          </div>
+
+          <div style="border-left: 4px solid var(--color-actor-5); border-radius: var(--radius-sm); background: var(--color-surface-warm); padding: var(--space-4) var(--space-5);">
+            <div style="display: flex; align-items: baseline; gap: var(--space-3); flex-wrap: wrap;">
+              <span style="font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; color: var(--color-actor-5);">Current 2 · into cuCascade</span>
+              <span style="font-size: var(--text-xs); color: var(--color-text-muted);">anything engine-agnostic sinks down: memory, batches, repositories</span>
+            </div>
+            <div class="flow-steps" style="margin: var(--space-4) 0 0;">
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-5); color: var(--color-actor-5);">1</div>
+                <p><strong>Extracted from Sirius</strong><br>Dec&nbsp;2025</p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-5); color: var(--color-actor-5);">2</div>
+                <p><strong>Submodule</strong><br><a href="https://github.com/sirius-db/sirius/pull/144">#144</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-5); color: var(--color-actor-5);">3</div>
+                <p><strong>Partitioned repositories</strong><br><a href="https://github.com/NVIDIA/cuCascade/pull/26">cc#26</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-5); color: var(--color-actor-5);">4</div>
+                <p><strong>Tri-class batches</strong><br><a href="https://github.com/NVIDIA/cuCascade/pull/117">cc#117</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: var(--color-actor-5); border: 4px solid var(--color-actor-5); color: white;">5</div>
+                <p><strong>cudf-free core</strong><br><a href="https://github.com/NVIDIA/cuCascade/pull/150">cc#150</a></p>
+              </div>
+            </div>
+          </div>
+
+          <p style="margin: var(--space-4) 0 0; font-size: var(--text-xs); color: var(--color-text-muted); font-family: var(--font-mono);">hollow ring = laid down and hardened · filled ring = the growing edge</p>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">Why you should care</strong>
+            <p>These two currents explain almost every decision below — and new code that swims against them gets rewritten. Knowing them is the difference between a PR that merges and a PR that gets a history lesson.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: Eight decision cards ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Eight decisions, eight receipts</h2>
+        <p>Each card is one standing decision: what was decided, why it stuck, and the PR where it happened. Contradict one in review and someone will paste you the receipt.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">🧩</div>
+            <h4 class="pattern-title">Extension, not engine</h4>
+            <p class="pattern-desc">Riding inside DuckDB bought a parser, optimizer, and catalog for free on day one. The coupling was the price — Current 1 is that debt being repaid deliberately.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);">2024 inception · <a href="https://github.com/sirius-db/sirius/pull/643">#643</a> · <a href="https://github.com/sirius-db/sirius/pull/880">#880</a> · <a href="https://github.com/sirius-db/sirius/pull/908">#908</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">⚒️</div>
+            <h4 class="pattern-title">cuDF over hand-written kernels</h4>
+            <p class="pattern-desc">Every operator got cheaper to build and faster to trust, with <span class="term" data-definition="cuCollections — NVIDIA's GPU hash-table library underneath cudf's joins and aggregations. Adopting cudf meant inheriting cuco-grade hash tables instead of maintaining hand-rolled ones.">cuco</span> hash tables inherited for free. The legacy kernels were deleted wholesale in Jun 2025.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/6">#6</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">🏗️</div>
+            <h4 class="pattern-title">Total rewrite: Super Sirius</h4>
+            <p class="pattern-desc">The old gpu_executor was single-threaded — no overlap, no memory tiering, no way to retrofit either. The task-based pipeline engine was built alongside it, then cut over.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/96">#96</a> · <a href="https://github.com/sirius-db/sirius/pull/198">#198</a> · <a href="https://github.com/sirius-db/sirius/pull/206">#206</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">📦</div>
+            <h4 class="pattern-title">Repositories + ports, never returns</h4>
+            <p class="pattern-desc">Data lives in shared repositories and moves as handles through ports — no operator ever returns batches to a caller. That one rule buys spillability, barriers, and inspectability (module 4).</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/NVIDIA/cuCascade/pull/26">cc#26</a> · <a href="https://github.com/sirius-db/sirius/pull/519">#519</a> · <a href="https://github.com/sirius-db/sirius/pull/689">#689</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">📐</div>
+            <h4 class="pattern-title">Descriptors now, wiring later</h4>
+            <p class="pattern-desc">Plan-time code emits <span class="term" data-definition="A plan-time, data-only description of the repositories and ports that will connect operators — no engine objects, no allocations. Turned into live wiring later (#607, #770).">repository wiring descriptors</span> through a <span class="term" data-definition="The plan-time construction context passed where sirius_engine&amp; used to be: it accumulates wiring descriptors, keeping pipeline construction engine-free and testable.">pipeline_build_context</span>; <span class="term" data-definition="The runtime step that turns wiring descriptors into live repositories and ports, once an engine and device context actually exist.">materialization</span> happens once an engine exists. Planning stays engine-free and testable.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/607">#607</a> · <a href="https://github.com/sirius-db/sirius/pull/770">#770</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">🕶️</div>
+            <h4 class="pattern-title">Transparent interception</h4>
+            <p class="pattern-desc">GPU support is a plan-generator decision made inside an optimizer extension — invisible to users, with CPU fallback as the safe default. No special syntax, ever.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/518">#518</a> · <a href="https://github.com/sirius-db/sirius/pull/673">#673</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">🧯</div>
+            <h4 class="pattern-title">Downgrade is an executor</h4>
+            <p class="pattern-desc">Spilling is scheduled work with its own threads and priorities — not an allocator callback firing at the worst possible moment, inside someone else's stack frame.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/97">#97</a> · <a href="https://github.com/sirius-db/sirius/pull/368">#368</a> · <a href="https://github.com/sirius-db/sirius/pull/579">#579</a> · <a href="https://github.com/sirius-db/sirius/pull/647">#647</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">🧲</div>
+            <h4 class="pattern-title">Locality first, reservation-device authority</h4>
+            <p class="pattern-desc">Work follows data across GPUs, and the device that reserved the memory has the final word. The #732→#827 backpressure regression is why the authority rule exists.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/732">#732</a> · <a href="https://github.com/sirius-db/sirius/pull/827">#827</a> · <a href="https://github.com/sirius-db/sirius/pull/996">#996</a></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: Archaeology — code↔English ───────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Archaeology: reading a bug's fossil</h2>
+        <p>Decisions also fossilize at line granularity. Pipelines were once declared finished while tasks were still in flight — the query-end SEGFAULT saga (<a href="https://github.com/sirius-db/sirius/pull/766">#766</a>, <a href="https://github.com/sirius-db/sirius/pull/788">#788</a>, <a href="https://github.com/sirius-db/sirius/pull/804">#804</a>) — so <code>mark_task_completed</code> now audits its own invariant on entry.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/sirius_pipeline.cpp · L427-436</span>
+            <pre><code>
+<span class="code-line"><span class="code-keyword">void</span> sirius_pipeline::<span class="code-function">mark_task_completed</span>()</span>
+<span class="code-line">{</span>
+<span class="code-line">  <span class="code-comment">// Sanity check: a task is completing here, which means this pipeline was still</span></span>
+<span class="code-line">  <span class="code-comment">// running work. If the pipeline was already marked finished, or any of its</span></span>
+<span class="code-line">  <span class="code-comment">// operators were already finalized, then we declared the pipeline done too</span></span>
+<span class="code-line">  <span class="code-comment">// early — i.e. a task was still in flight when we considered the pipeline</span></span>
+<span class="code-line">  <span class="code-comment">// complete. That mismatch can make the whole query look done while work is</span></span>
+<span class="code-line">  <span class="code-comment">// still running, so surface it loudly.</span></span>
+<span class="code-line">  <span class="code-keyword">const</span> <span class="code-keyword">bool</span> pipeline_was_finished = pipeline_finished.<span class="code-function">load</span>();</span>
+<span class="code-line">  std::string finalized_ops;</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">A task is reporting completion. Sounds routine — this exact moment used to SEGFAULT whole queries.</p>
+              <p class="tl">Six lines of comment guarding two lines of code: that ratio is the scar, not the wound.</p>
+              <p class="tl">The invariant, stated plainly: if a task is finishing here, nobody may have already declared this pipeline done.</p>
+              <p class="tl">And the failure mode it fossilizes: the query looks complete, teardown begins, and live tasks are still touching freed state.</p>
+              <p class="tl">Evidence sample one: atomically read whether someone already flipped the finished flag.</p>
+              <p class="tl">Evidence sample two: start collecting the names of any already-finalized operators — for the loud log this is about to write.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">🪨</div>
+          <div class="callout-content">
+            <strong class="callout-title">Why the comment is load-bearing</strong>
+            <p>Without it, this check reads as paranoia and some future cleanup PR deletes it. The comment stores <em>which incident</em> produced the code — the ring around the scar — so the invariant survives its authors.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: Want the full history? ───────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Want the full history?</h2>
+        <p>This module showed you the load-bearing rings. The complete cross-section — every PR, in order, clickable — lives one level up.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">🕰️</div>
+            <h4 class="pattern-title"><a href="../sirius-dev-timeline.html">The interactive PR timeline</a></h4>
+            <p class="pattern-desc">Every decision in this module as one continuous, browsable history — from inception to last week. At the repo root: <code>sirius-dev-timeline.html</code>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">📚</div>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/tree/dev/docs/super-sirius">docs/super-sirius/</a></h4>
+            <p class="pattern-desc">The reference docs for the live engine — its README gives the reading order. Required before modifying Super Sirius code, not just recommended.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Quiz ──────────────────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three review comments</h2>
+        <p>Three PRs, three reviewer questions. Answer as the author — with receipts.</p>
+
+        <div class="quiz-container" id="quiz-module6">
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Both standing decisions in one review comment: repositories keep ownership so the batches stay findable and spillable under pressure (cc#26, #689), and only handles/IDs ever cross a boundary — raw buffers never travel."
+               data-explanation-wrong="Ask two things: who can still find these batches under memory pressure, and what Sirius ever allows across an operator or process boundary. (Hint: it is never a raw pointer, and barriers gate timing — not ownership.)">
+            <h3 class="quiz-question">You're adding an operator that must hand result batches to an external process. Which two standing decisions dictate where those batches live and how they're referenced?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Pin the batches with mutable locks and pass raw device pointers — the locks guarantee the buffers stay put</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Batches stay owned by a repository, so they remain findable and spillable; the external process gets handles/IDs — never raw buffers</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Copy them into an operator-owned pinned-host staging area and hand over that pointer</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The port's barrier type decides ownership — make the port FULL and export from there</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="That's Current 1. Since #847 the native AST is what lowering consumes; #796 built it, and #880 retired the PIMPL machinery that raw-DuckDB threading used to require. Translate once at the boundary and everything downstream stays DuckDB-free."
+               data-explanation-wrong="Check Current 1's direction: types (#643), then expressions (#796/#847), then execution state — everything moves away from DuckDB at the planner boundary. Routing DuckDB types deeper, or hiding them behind indirection retired in #880, swims upstream. And cuCascade only absorbs engine-agnostic machinery — never SQL frontend concepts.">
+            <h3 class="quiz-question">You want to teach the planner a new DuckDB expression type. Which direction does the codebase want you to go?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Thread the duckdb::Expression through the planner and evaluate it with DuckDB's evaluator at runtime</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Wrap it in a PIMPL shim so the DuckDB type stays out of public headers</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Translate it into sirius::ast at the boundary — the native AST is the lowering input, so nothing below the planner sees a DuckDB expression</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Add the expression type to cuCascade so both layers can share it</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-a"
+               data-explanation-right="Exactly — #607 split descriptors from live wiring and #770 finished the job. Plan-time code describes repositories and ports as data; materialization turns them into live objects once an engine exists. That's what lets planning move earlier and be tested without standing up an engine."
+               data-explanation-wrong="The answer is architectural, not mechanical. Since #607/#770, plan-time construction produces wiring descriptors — pure data, no engine objects — and materialization happens later. What does that buy planning? Two things: it can move earlier, and it stays testable.">
+            <h3 class="quiz-question">A reviewer asks why your pipeline-construction change takes a <code>pipeline_build_context</code> instead of <code>sirius_engine&amp;</code>. What's the answer?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Plan-time construction must stay engine-free: the context collects wiring descriptors now, materialization happens later — so planning can move earlier and stay testable</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Passing the engine would create a circular include between the planner and engine headers</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>An engine reference risks data races with the downgrade executor's threads during planning</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>sirius_engine is effectively a singleton, so taking it as a parameter is redundant boilerplate</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module6')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module6')">Try Again</button>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">➡️</div>
+          <div class="callout-content">
+            <strong class="callout-title">Next: The Streaming Frontier</strong>
+            <p>The newest growth ring is being laid down right now — the streaming source and sink (<a href="https://github.com/sirius-db/sirius/pull/836">#836</a>, <a href="https://github.com/sirius-db/sirius/pull/837">#837</a>) — and you're the one drawing it.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</section>

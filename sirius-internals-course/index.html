@@ -1,0 +1,2546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sirius Internals — Interactive Onboarding</title>
+
+  <!-- Google Fonts: Bricolage Grotesque · DM Sans · JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="styles.css">
+
+  <style>
+    :root {
+      --color-accent:       #2A7B9B;
+      --color-accent-hover: #1F6280;
+      --color-accent-light: #E4F2F7;
+      --color-accent-muted: #5A9DB8;
+    }
+  </style>
+
+  <script src="main.js" defer></script>
+</head>
+<body>
+
+  <nav class="nav" id="nav">
+    <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+    <div class="nav-inner">
+      <span class="nav-title">Sirius Internals — Interactive Onboarding</span>
+      <div class="nav-dots" id="nav-dots" role="tablist">
+        <button class="nav-dot" data-target="module-1" data-tooltip="The Big Picture" role="tab" aria-label="Module 1: The Big Picture"></button>
+        <button class="nav-dot" data-target="module-2" data-tooltip="Meet the Actors" role="tab" aria-label="Module 2: Meet the Actors"></button>
+        <button class="nav-dot" data-target="module-3" data-tooltip="Life of a Query" role="tab" aria-label="Module 3: Life of a Query"></button>
+        <button class="nav-dot" data-target="module-4" data-tooltip="The Data Plane" role="tab" aria-label="Module 4: The Data Plane"></button>
+        <button class="nav-dot" data-target="module-5" data-tooltip="Memory & Multi-GPU" role="tab" aria-label="Module 5: Memory and Multi-GPU"></button>
+        <button class="nav-dot" data-target="module-6" data-tooltip="Design Decisions" role="tab" aria-label="Module 6: Design Decisions"></button>
+        <button class="nav-dot" data-target="module-7" data-tooltip="The Streaming Frontier" role="tab" aria-label="Module 7: The Streaming Frontier"></button>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main">
+    <!-- modules/*.html content is assembled here by build.sh -->
+<section class="module" id="module-1">
+  <div class="module-content">
+
+    <header class="module-header animate-in">
+      <span class="module-number">01</span>
+      <h1 class="module-title">The Big Picture</h1>
+      <p class="module-subtitle">You load one extension. Your SQL doesn't change. Supported queries silently run on the GPU. Where exactly does the swap happen?</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: What Sirius is ─────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">A simultaneous interpreter in the booth</h2>
+
+        <p>DuckDB is the speaker at the podium; Sirius sits in the interpreter's booth, translating the talk into GPU execution live, mid-sentence. When it hits an idiom it can't translate, it hands the mic back — and the audience never notices the switch.</p>
+
+        <div class="icon-rows stagger-children">
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-actor-2)">&#128483;&#65039;</div>
+            <div>
+              <strong>DuckDB speaks</strong>
+              <p>Parses, binds, optimizes — business as usual. It has no idea it's being interpreted.</p>
+            </div>
+          </div>
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-actor-1)">&#127911;</div>
+            <div>
+              <strong>Sirius translates live</strong>
+              <p>In the booth, it converts DuckDB's optimized plan into its own GPU operators, mid-sentence.</p>
+            </div>
+          </div>
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-actor-4)">&#127908;</div>
+            <div>
+              <strong>The mic hands back silently</strong>
+              <p>Untranslatable idiom? The CPU takes over — correct results, and nobody hears the switch.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>Concretely: Sirius is a GPU-native SQL engine shipped as a DuckDB extension. Compute runs on <span class="term" data-definition="NVIDIA's GPU DataFrame library (RAPIDS). Sirius's compute layer — joins, filters, and aggregations run as libcudf calls instead of hand-written kernels.">cuDF</span> and <span class="term" data-definition="RAPIDS Memory Manager — the pool allocator for GPU device memory. Every device allocation in Sirius flows through it.">RMM</span>, with memory and data-movement primitives from NVIDIA <span class="term" data-definition="NVIDIA's building-block library for GPU query engines: memory tiers, spilling, and data-movement primitives. The current Sirius engine is built on top of it.">cuCascade</span>.</p>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#129504;</div>
+          <div class="callout-content">
+            <strong class="callout-title">The whole engine in one sentence</strong>
+            <p>Sirius intercepts a SQL query, converts DuckDB's plan into its own physical operators, groups them into pipelines, and a task creator turns 'operator + available input' into GPU tasks that a scheduler runs. Data flows between operators through repositories (not function returns), and ports tell each operator where its input lives.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: The interception path ──────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The swap happens in exactly one place</h2>
+
+        <p>Sirius hooks DuckDB through an <span class="term" data-definition="A DuckDB hook that lets an extension inspect or rewrite the optimized logical plan before physical planning. Sirius uses it only to capture a copy of the plan — judgment happens later.">optimizer extension</span>. The hook itself decides nothing about GPU support — it just captures the plan for a later verdict.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <strong>The hook copies the optimized logical plan</strong>
+              <p>DuckDB's optimizer finishes; Sirius copies the plan and stashes it in its per-connection state. No GPU judgment yet.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <strong><span class="term" data-definition="A late callback in DuckDB's prepare phase. This is where Sirius actually runs create_plan() on the captured plan copy and the GPU-vs-CPU verdict lands.">OnFinalizePrepare</span> runs <code>create_plan()</code></strong>
+              <p><code>sirius_physical_plan_generator::create_plan()</code> walks the copy, building Sirius physical operators — or throwing at the first unsupported one.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <strong>Success wraps the plan; a throw falls back</strong>
+              <p>Success: the plan is wrapped in <span class="term" data-definition="The wrapper physical operator that gets swapped into DuckDB's plan on success. When DuckDB executes it, Sirius's GPU engine runs the query underneath.">PhysicalSiriusExecution</span> and swapped in. Throw: DuckDB's own CPU plan runs, silently.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/transparent/sirius_optimizer_extension.cpp</span>
+            <pre><code>
+<span class="code-line"><span class="code-comment">  // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this</span></span>
+<span class="code-line"><span class="code-comment">  // copy — that's the single source of truth for GPU support. If the plan contains</span></span>
+<span class="code-line"><span class="code-comment">  // unsupported operators, create_plan() throws and we fall back to CPU.</span></span>
+<span class="code-line">  <span class="code-keyword">try</span> {</span>
+<span class="code-line">    <span class="code-keyword">auto</span> plan_copy = plan-&gt;<span class="code-function">Copy</span>(context);</span>
+<span class="code-line">    ctx-&gt;<span class="code-function">set_captured_logical_plan</span>(std::<span class="code-function">move</span>(plan_copy));</span>
+<span class="code-line">  } <span class="code-keyword">catch</span> (duckdb::NotImplementedException&amp;) {</span>
+<span class="code-line"><span class="code-comment">    // Plan not serializable — skip GPU.</span></span>
+<span class="code-line">  } <span class="code-keyword">catch</span> (std::exception&amp; e) {</span>
+<span class="code-line">    spdlog::<span class="code-function">debug</span>(<span class="code-string">"Transparent execution: failed to copy logical plan: {}"</span>, e.what());</span>
+<span class="code-line">  }</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">The comment states the contract: <code>create_plan()</code> on this copy is the <em>single source of truth</em> for GPU support — no other code path gets a vote.</p>
+              <p class="tl">And the failure mode is spelled out up front: an unsupported operator means a throw, and the throw <em>is</em> the fallback signal.</p>
+              <p class="tl">Copy the plan so Sirius owns its own version — DuckDB keeps the original, untouched, ready for CPU execution.</p>
+              <p class="tl">Stash the copy in Sirius's per-connection state; OnFinalizePrepare will pick it up once preparation finalizes.</p>
+              <p class="tl">Some plans can't even be copied (not serializable). No drama: quietly skip GPU — the user's query still runs on CPU.</p>
+              <p class="tl">Anything else unexpected gets logged at debug level. The user never sees an error, just a CPU-executed query.</p>
+              <p class="tl">Either way the query proceeds. GPU is an optimization, never a requirement.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">&#128161;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Key insight: GPU support is a plan-level decision, made once</strong>
+            <p><code>create_plan()</code> either succeeds (plan wrapped and swapped) or throws (silent CPU fallback). So when a query unexpectedly runs on CPU — or you wonder "will my new operator ever be used?" — there is exactly one gate to check.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: Four eras ──────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Four eras to get here</h2>
+
+        <p>The codebase you're joining is the third engine to wear the name. Knowing the strata explains why <code>src/legacy/</code> exists and why everything new lives in namespace <code>sirius</code>.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">&#9935;&#65039;</div>
+            <h4 class="pattern-title">2024 · Hand-written CUDA</h4>
+            <p class="pattern-desc">The <span class="term" data-definition="The original 2024 engine: a bespoke CUDA kernel per operator. Dead code today, quarantined under src/legacy/ — never modify it.">gpu_processing</span> era: a bespoke kernel per operator. Heroic, unmaintainable, ultimately a dead end.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#128260;</div>
+            <h4 class="pattern-title">Apr 2025 · The cuDF pivot</h4>
+            <p class="pattern-desc"><a href="https://github.com/sirius-db/sirius/pull/6">#6</a> rebased compute onto cuDF: stop writing kernels, start composing libcudf. The engine got a library.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">&#127959;&#65039;</div>
+            <h4 class="pattern-title">Dec 2025&ndash;Feb 2026 · <span class="term" data-definition="The current, live engine: namespace sirius, source under src/op/, src/planner/, src/pipeline/, src/cuda/. A ground-up rewrite on cuCascade with pipelines, repositories, ports, and a task scheduler.">Super Sirius</span></h4>
+            <p class="pattern-desc">Ground-up rewrite on cuCascade: <a href="https://github.com/sirius-db/sirius/pull/96">#96</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/134">#134</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/198">#198</a>, first end-to-end query in <a href="https://github.com/sirius-db/sirius/pull/206">#206</a>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">&#127917;</div>
+            <h4 class="pattern-title">Apr 2026 · <span class="term" data-definition="The contract that plain SQL needs no changes: Sirius hooks DuckDB's planning, swaps in a GPU plan when supported, and silently falls back to CPU when not.">Transparent interception</span></h4>
+            <p class="pattern-desc"><a href="https://github.com/sirius-db/sirius/pull/518">#518</a>: load the extension and plain SQL just runs on GPU. No special syntax — the interpreter enters the booth.</p>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code">src/legacy/</code>
+            <span class="badge-desc">The dead gpu_processing path, quarantined. Read it for archaeology — never modify it. All new work targets Super Sirius.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: The flow strip (hero visual) ───────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The whole machine on one strip</h2>
+
+        <p>This is the map for the rest of the course — every later module zooms into one or two boxes on this strip.</p>
+
+        <div class="flow-steps animate-in">
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p>SQL query arrives</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p>Interception (plan captured)</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">3</div>
+            <p>Plan conversion <code>create_plan()</code></p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">4</div>
+            <p>Sirius physical operators</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">5</div>
+            <p>Pipelines &amp; ports</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">6</div>
+            <p><code>task_creator</code>: operator + input &rarr; tasks</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">7</div>
+            <p><code>task_scheduler</code> runs them on GPU</p>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code">repositories</code>
+            <span class="badge-desc">Underneath the strip: data never travels as function returns — operators publish results into repositories, and ports tell each operator where its input lives.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code">memory tiers</code>
+            <span class="badge-desc">Beneath everything: buffers live in tiers (GPU, host, disk), so plans bigger than VRAM can still finish. Module 5 goes deep here.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 5: Quiz ───────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Check your map</h2>
+
+        <div class="quiz-container" id="quiz-module1">
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Exactly — the LATERAL join has no GPU operator mapping, so create_plan() threw during prepare. The fallback happens before execution and is silent: correct results, CPU speed, idle GPU."
+               data-explanation-wrong="Not quite. An unloaded extension would leave every query on CPU, not just this one — and a mid-query crash wouldn't quietly return clean results. The decision lands before execution, inside create_plan().">
+            <h3 class="quiz-question">A teammate's query with a LATERAL join returns correct results but runs slow, and nvidia-smi shows the GPU idle. What happened?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The Sirius extension isn't loaded, so DuckDB never offered the plan to the GPU</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>create_plan()</code> hit an unsupported operator, threw, and the query silently fell back to DuckDB's CPU execution</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The GPU plan crashed mid-execution and DuckDB re-ran the query on the CPU</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-a"
+               data-explanation-right="Yes. create_plan() is the single gate — plan-level and all-or-nothing. A new operator class is invisible until the plan generator maps a logical operator to it."
+               data-explanation-wrong="Not quite. The scheduler only runs tasks from a plan that already passed the gate, and the optimizer hook copies the plan blindly — judgment happens in exactly one place: create_plan().">
+            <h3 class="quiz-question">You added a new GPU operator class and rebuilt, but queries never use it. What's the one place that decides?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>sirius_physical_plan_generator::create_plan()</code> — until it maps the logical operator to your class, the plan throws to CPU</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The <code>task_scheduler</code> — it decides at runtime which operators are worth running on the GPU</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The optimizer extension hook — it filters unsupported operators out of the plan copy</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Exactly — transparent interception means the swap (and the swap back) is invisible. If GPU coverage were a user-facing error, every unsupported operator would be a breaking change."
+               data-explanation-wrong="Not the reason. Silence is a deliberate contract: plain SQL in, correct results out, GPU when possible. (Fallbacks do get logged at debug level — the silence is for the user, not the log.)">
+            <h3 class="quiz-question">Why is the CPU fallback silent by design, rather than a warning or an error?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>DuckDB aborts the whole query if an optimizer extension raises, so Sirius has no choice</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>It's the transparency contract: users write plain SQL, correctness is always available on CPU, and GPU is an optimization — not a requirement</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Logging every fallback would be prohibitively noisy at production query volume</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module1')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module1')">Try Again</button>
+        </div>
+
+        <p><strong>Next: Meet the Actors</strong> — the seven objects that do all of this.</p>
+      </section>
+
+    </div>
+  </div>
+</section>
+<section class="module module--alt" id="module-2" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">02</span>
+      <h1 class="module-title">Meet the Actors</h1>
+      <p class="module-subtitle">Every Sirius bug report eventually reduces to: which of seven objects misbehaved? Learn their names and their threads and you can triage anything.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: The ownership tree ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">One room, seven consoles</h2>
+        <p>Think mission control: the Flight Director owns the go/no-go, the trajectory team plans the next burn, each spacecraft has its own ops crew, and life support quietly keeps everyone breathing. Nothing talks directly — it all goes through the loop. In Sirius the room itself is <span class="term" data-definition="The per-connection root object of the engine. It constructs and owns every component with query lifetime — memory manager, data repository manager, task scheduler, downgrade executors, task creator, scan manager. Defined in src/include/sirius_context.hpp."><code>SiriusContext</code></span>, registered as a DuckDB <span class="term" data-definition="DuckDB's hook for attaching per-connection extension state. Sirius hangs its entire engine off this, so every connection gets its own private set of actors — no globals."><code>ClientContextState</code></span> — and its member list <em>is</em> the component map.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/include/sirius_context.hpp</span>
+            <pre><code>
+<span class="code-line">  std::shared_ptr&lt;<span class="code-keyword">const</span> sirius::telemetry::telemetry_context&gt; <span class="code-property">telemetry_context_</span>;</span>
+<span class="code-line">  std::unique_ptr&lt;cucascade::shared_data_repository_manager&gt; <span class="code-property">data_repository_manager_</span>;</span>
+<span class="code-line">  std::unique_ptr&lt;sirius::pipeline::task_scheduler&gt; <span class="code-property">task_scheduler_</span>;</span>
+<span class="code-line">  std::vector&lt;std::unique_ptr&lt;sirius::parallel::downgrade_executor&gt;&gt; <span class="code-property">downgrade_executors_</span>;</span>
+<span class="code-line">  std::unique_ptr&lt;sirius::creator::task_creator&gt; <span class="code-property">task_creator_</span>;</span>
+<span class="code-line">  std::unique_ptr&lt;sirius::scan_manager::sirius_scan_manager&gt; <span class="code-property">scan_manager_</span>;</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">The flight recorder — every console below reports its timings here.</p>
+              <p class="tl">The shared telemetry log: all data that moves between operators lives here, never handed console-to-console.</p>
+              <p class="tl">The Flight Director — one management loop that bridges task requests to the per-GPU crews.</p>
+              <p class="tl">Life support — note the <code>vector</code>: one downgrade executor per <span class="term" data-definition="cuCascade's abstraction for one tier of the memory hierarchy — each GPU's device memory, pinned host memory, disk — each with its own capacity and reservation accounting.">memory space</span>, not per query.</p>
+              <p class="tl">The trajectory team — decides what runs next. Deciding, not running.</p>
+              <p class="tl">Ground stations — owns splitting base tables and feeding the data uplink.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">Roles are strictly separated</strong>
+            <p><em>Deciding</em> what runs next (task_creator) is a different object — and different threads — from <em>running</em> it (the executors) and from <em>surviving memory pressure</em> (the downgrade executors). "Where do I put this logic?" and "whose thread am I on?" are the two questions that prevent broken PRs.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: Actor cards ─────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The seven consoles</h2>
+        <p>Each console has exactly one job. Memorize the mapping — every stack trace you'll ever read lands in one of these.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">📋</div>
+            <h4 class="pattern-title"><code>sirius_engine</code> + plan generator</h4>
+            <p class="pattern-desc">Mission planning. At query start it translates DuckDB's plan into GPU pipelines (<code>src/planner/sirius_physical_plan_generator.cpp</code>) — once, on the DuckDB query thread.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🧭</div>
+            <h4 class="pattern-title"><span class="term" data-definition="The decision-maker (src/creator/). Its threads walk each pipeline's hint chain and turn READY hints into executable tasks. It never executes anything itself."><code>task_creator</code></span></h4>
+            <p class="pattern-desc">The trajectory team — decides the next burn. Walks each pipeline's <span class="term" data-definition="A per-pipeline chain of scheduling hints. Each hint reports a state (e.g. READY, FINISHED); the task_creator only creates tasks for hints that report READY — this is how 'waiting' is expressed without blocking any thread.">hint chain</span> and turns READY hints into tasks. 2 threads by default.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">🎙️</div>
+            <h4 class="pattern-title"><span class="term" data-definition="The top-level orchestrator (src/pipeline/). A single management event loop that bridges task requests from the task_creator to the per-GPU executors. Renamed from pipeline_executor in PR #687."><code>task_scheduler</code></span></h4>
+            <p class="pattern-desc">The Flight Director — owns the go/no-go. A management event loop bridging task requests to executors. Renamed from <code>pipeline_executor</code> in <a href="https://github.com/sirius-db/sirius/pull/687">#687</a>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">🚀</div>
+            <h4 class="pattern-title"><span class="term" data-definition="The per-GPU execution engine: one manager thread dispatching to a fixed pool of 4 worker threads, each pinned to that GPU with its own CUDA stream. Tasks run to completion on a worker."><code>gpu_pipeline_executor</code></span></h4>
+            <p class="pattern-desc">One ops crew per spacecraft — one executor per GPU. 1 manager thread + 4 workers, each worker pinned with its own CUDA stream.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">📡</div>
+            <h4 class="pattern-title"><span class="term" data-definition="Owns ingest: splits base-table data into scan splits, tracks which splits are ready, and hands them to scan executors that load data toward the GPU."><code>scan_manager</code></span> + scan executor</h4>
+            <p class="pattern-desc">Ground stations. Splits base tables into scan splits and runs the ingest that feeds every pipeline's first operator.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">🛟</div>
+            <h4 class="pattern-title"><span class="term" data-definition="One per memory space (src/downgrade/): a monitor thread watches pressure and processing threads spill victim batches down the hierarchy (GPU → host → disk) so queries degrade instead of OOMing."><code>downgrade_executor</code></span></h4>
+            <p class="pattern-desc">Life support — consumables management. Monitor + processing threads per memory space; spills batches downhill before anyone hits OOM.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🗄️</div>
+            <h4 class="pattern-title"><span class="term" data-definition="cuCascade component where ALL inter-operator data lives. Operators publish batches into shared repositories and downstream operators pull from them — nothing passes data hand-to-hand."><code>shared_data_repository_manager</code></span></h4>
+            <p class="pattern-desc">The shared telemetry log. Every batch an operator produces is published here for the next one to pull — no direct hand-offs, ever.</p>
+          </div>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code" style="grid-column: 1 / -1">
+            <span class="translation-label">the defaults, straight from sirius_config.hpp</span>
+            <pre><code>
+<span class="code-line">  exec::thread_pool_config <span class="code-property">_task_creator_config</span>{.num_threads        = <span class="code-number">2</span>,</span>
+<span class="code-line">  exec::thread_pool_config <span class="code-property">_gpu_pipeline_executor_config</span>{.num_threads        = <span class="code-number">4</span>,</span>
+            </code></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: The thread model ────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Whose thread am I on?</h2>
+        <p>There are exactly two kinds of threads in this engine: the one that blocks once, and the ones that loop forever. Click a console to see what its thread does all day.</p>
+
+        <div class="arch-diagram">
+          <div class="arch-zone">
+            <h4 class="arch-zone-label">Blocks — one shot, then waits</h4>
+            <div class="arch-component" data-desc="The only thread a user ever sees. It runs plan generation, submits the query, then blocks on a future until the result collector fulfills it — it does zero GPU work itself.">
+              <div class="arch-icon">🧑‍🚀</div>
+              <span>DuckDB query thread</span>
+            </div>
+          </div>
+          <div class="arch-zone">
+            <h4 class="arch-zone-label">Loops — long-lived event loops</h4>
+            <div class="arch-component" data-desc="task_scheduler's single management thread: an event loop that pulls task requests and routes each one to the right GPU's executor. It never touches data.">
+              <div class="arch-icon">🎙️</div>
+              <span>Scheduler management loop</span>
+            </div>
+            <div class="arch-component" data-desc="Per GPU: 1 manager thread dispatches to 4 pinned workers, each with its own CUDA stream. Workers run tasks to completion — a blocked worker is 25% of that GPU gone.">
+              <div class="arch-icon">🚀</div>
+              <span>GPU manager + 4 workers (per GPU)</span>
+            </div>
+            <div class="arch-component" data-desc="task_creator's 2-thread pool: walks hint chains, creates tasks for READY hints, and notices when a pipeline's last task finishes so the next pipeline can start.">
+              <div class="arch-icon">🧭</div>
+              <span>Task-creator manager (2 threads)</span>
+            </div>
+            <div class="arch-component" data-desc="One monitor loop per memory space watches pressure; when a space runs hot, processing threads pick victim batches and spill them to the tier below.">
+              <div class="arch-icon">🛟</div>
+              <span>Downgrade monitor (per memory space)</span>
+            </div>
+          </div>
+          <div class="arch-description">Click a thread to see what it does all day.</div>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: Group chat (hero) ───────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The room, live</h2>
+        <p>Here's the radio traffic for one query: <code>SELECT count(*) FROM orders WHERE amount &gt; 100;</code>. Note who talks to whom — and who never talks to anyone directly.</p>
+
+        <div class="chat-window" id="chat-actors">
+          <div class="chat-messages">
+            <div class="chat-message" data-msg="0" data-sender="duckdb" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-4)">D</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-4)">DuckDB → all</span>
+                <p>Prepared statement ready. Sirius, you're up — plan swapped in.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="1" data-sender="scheduler" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-1)">S</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-1)">Scheduler → TaskCreator</span>
+                <p>start_query(). Please make a task for the SCAN.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="2" data-sender="taskcreator" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-3)">TC</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-3)">TaskCreator → GPU-0</span>
+                <p>Scan says READY. Here's a gpu_pipeline_task for Pipeline A.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="3" data-sender="gpu0" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-2)">G0</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-2)">GPU-0 → all</span>
+                <p>Reserved 512 MB, ran scan→filter→partial count. Batch published to the repo.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="4" data-sender="downgrade" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-5)">DG</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-5)">Downgrade → all</span>
+                <p>GPU 0 at 92% — spilling two idle batches to host. Carry on.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="5" data-sender="taskcreator" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-3)">TC</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-3)">TaskCreator → GPU-0</span>
+                <p>Scan drained, last task done → Pipeline A finished. Pipeline B is READY.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="6" data-sender="gpu0" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-2)">G0</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-2)">GPU-0 → DuckDB</span>
+                <p>COUNT finalized into RESULT_COLLECTOR. Future fulfilled — your rows, sir.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="chat-typing" style="display:none">
+            <div class="chat-avatar" id="chat-actors-typing-avatar">?</div>
+            <div class="chat-typing-dots">
+              <span class="typing-dot"></span>
+              <span class="typing-dot"></span>
+              <span class="typing-dot"></span>
+            </div>
+          </div>
+
+          <div class="chat-controls">
+            <button class="btn chat-next-btn">Next Message</button>
+            <button class="btn chat-all-btn">Play All</button>
+            <button class="btn chat-reset-btn">Replay</button>
+            <span class="chat-progress"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Quiz ──────────────────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Triage drill</h2>
+        <p>Three pages from the on-call runbook. Pick your first move.</p>
+
+        <div class="quiz-container" id="quiz-module2">
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Exactly. Executors only run tasks they are handed — an idle GPU with zero tasks means nothing was created, and creation lives in task_creator: some hint upstream never flipped to READY."
+               data-explanation-wrong="Not quite. Separate deciding from running: a clean, idle GPU means the executors have nothing to execute — so ask who decides what runs next, and why it is deciding 'nothing'.">
+            <h3 class="quiz-question">Queries stall: GPU idle, no tasks executing, nvidia-smi clean. Which console do you check first?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The gpu_pipeline_executor workers — one of them must be wedged</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The task_creator's hint chains — is anything actually reporting READY?</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The downgrade_executor — memory pressure must be throttling tasks</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The task_scheduler loop — it must be dropping task requests</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Right — SiriusContext is the per-connection root that owns every component with query lifetime. State parked anywhere else either leaks across connections (singleton, TLS) or dies with a single operator."
+               data-explanation-wrong="Think ownership tree: which object is constructed per connection, owns all seven actors, and is torn down exactly when query state should disappear?">
+            <h3 class="quiz-question">You need per-query state that every operator can reach. Where does it live?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A static singleton next to sirius_engine</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>SiriusContext — it owns everything with query lifetime</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A member on whichever physical operator needs it first</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Thread-local storage on the GPU worker threads</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="Exactly — with 4 workers per GPU running tasks to completion, one blocked worker is 25% of that GPU's throughput gone. The engine's answer to waiting lives upstream: don't create the task until its input is READY (module 7 builds a whole streaming source on this idea)."
+               data-explanation-wrong="The problem isn't CUDA or sandboxing — it's the execution model. Count the workers per GPU, remember tasks run to completion, and ask what happens to everything queued behind a sleeper.">
+            <h3 class="quiz-question">Your fix blocks inside a GPU worker until network data arrives. Why will reviewers reject it?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>CUDA streams can't overlap with host-side network I/O</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>DuckDB's extension sandbox forbids opening sockets</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Workers are a fixed pool (4 per GPU) that run tasks to completion — parking one on a wait starves the pipeline</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>It would deadlock the downgrade monitor's spill path</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module2')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module2')">Try Again</button>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">➡️</div>
+          <div class="callout-content">
+            <strong class="callout-title">Next: Life of a Query</strong>
+            <p>You know the seven consoles and their threads. Now watch them run one query, step by step.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</section>
+<section class="module" id="module-3">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">03</span>
+      <h1 class="module-title">Life of a Query</h1>
+      <p class="module-subtitle">One query traced end to end with the real functions — from SQL string to fulfilled future.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── SCREEN 1: PLANNING ─────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">One query, two pipelines</h2>
+
+        <p>Let&rsquo;s trace one query, end to end, with the real functions — every name below is <code>grep</code>-able in the tree:</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">the query</span>
+          <pre><code><span class="code-keyword">SELECT</span> <span class="code-function">count</span>(*) <span class="code-keyword">FROM</span> orders <span class="code-keyword">WHERE</span> amount <span class="code-operator">&gt;</span> <span class="code-number">100</span>;</code></pre>
+        </div>
+
+        <p>DuckDB parses it; Sirius converts the plan and cuts it at the COUNT, because an aggregate is a <span class="term" data-definition="An operator that must consume ALL of its input before it can emit anything — aggregates, sorts, hash-join builds. The plan is cut into a new pipeline at every one.">pipeline breaker</span> — it must see all input before emitting anything. The result is two pipelines:</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">the split plan</span>
+          <pre><code><span class="code-property">Pipeline A (streaming):</span> SCAN(orders) → FILTER(amount&gt;100) → [sink: partial COUNT state]
+<span class="code-property">Pipeline B (terminal):</span> COUNT finalize → RESULT_COLLECTOR</code></pre>
+        </div>
+
+        <p>Mental model: a kanban factory line. Stations never push work downstream — a station <em>pulls</em> when its input bin has parts, and the andon board only updates when a worker turns in a job card. Hold on to that second rule; it becomes a bug story in Module 7.</p>
+
+        <p>Not all bins are equal. Each input <span class="term" data-definition="An input slot of an operator, wiring it to one upstream pipeline. A port carries a barrier type plus a repository holding the batches waiting to be consumed.">port</span> carries a barrier type that decides when the consumer may start:</p>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code term" data-definition="Batch-by-batch flow: the consumer runs as soon as the producer emits one batch. No waiting for the whole upstream result.">PIPELINE</code>
+            <span class="badge-desc">A&rsquo;s internal hops: SCAN → FILTER → sink stream batch by batch.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code term" data-definition="The hard barrier: the consumer cannot start until the producer pipeline is COMPLETELY finished. The entire upstream result must exist first.">FULL</code>
+            <span class="badge-desc">B&rsquo;s input port: COUNT finalize is blocked until Pipeline A completely finishes.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code term" data-definition="The middle ground: the consumer may begin before the producer pipeline fully finishes, without full batch-by-batch streaming. Used for hand-offs like concatenation wiring.">PARTIAL</code>
+            <span class="badge-desc">Not used in this query — the in-between type for hand-offs like concat.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 2: KICKOFF + HERO FLOW ANIMATION ───────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Kickoff: one line of code starts everything</h2>
+
+        <p>DuckDB&rsquo;s execution thread calls exactly one Sirius entry point, then goes to sleep. Everything else in this module happens on Sirius worker threads while that thread blocks on the returned future.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/task_scheduler.cpp:172</span>
+            <pre><code>std::future&lt;<span class="code-keyword">void</span>&gt; task_scheduler::<span class="code-function">start_query</span>()
+{
+  std::scoped_lock <span class="code-function">lock</span>(_query_mutex);
+  <span class="code-keyword">const auto</span>&amp; scans = _query-&gt;<span class="code-function">get_scan_operators</span>();
+
+  _task_creator-&gt;<span class="code-function">schedule</span>(scans.<span class="code-function">front</span>());
+
+  <span class="code-keyword">return</span> _completion_handler-&gt;<span class="code-function">get_awaitable</span>();
+}</code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Returns a future — this is what the DuckDB thread will block on until the answer exists.</p>
+              <p class="tl">Take the query lock and look up the pipeline sources: the scan operators.</p>
+              <p class="tl">Schedule the first scan. This is the only <em>push</em> in the whole engine — every move after this is a pull.</p>
+              <p class="tl">Hand back the awaitable; the <span class="term" data-definition="The terminal operator of the last pipeline. It materializes the final rows and fulfills the future that DuckDB has been blocking on since start_query().">RESULT_COLLECTOR</span> fulfills it at the very end of Pipeline B.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>Here is the entire run, end to end. Click through it once now — the next three screens zoom into the machinery behind steps 3, 4&ndash;6 and 9.</p>
+
+        <div class="flow-animation" data-steps='[
+          {"highlight":"flow-m3-plangen","label":"SQL arrives. DuckDB parses it; the plan generator splits the plan at the pipeline breaker into Pipeline A (scan, filter, count sink) and Pipeline B (finalize, collect).","packet":true,"from":"m3-duckdb","to":"m3-plangen"},
+          {"highlight":"flow-m3-scan","label":"task_scheduler::start_query() schedules the first scan — the only push in the engine — and hands DuckDB a future to block on.","packet":true,"from":"m3-plangen","to":"m3-scan"},
+          {"highlight":"flow-m3-scan","label":"The task creator asks the scan: get_next_task_hint() answers READY, so a gpu_pipeline_task is built for the first split of orders."},
+          {"highlight":"flow-m3-filter","label":"The task runs: the scan batch is pulled through FILTER(amount &gt; 100) on the GPU.","packet":true,"from":"m3-scan","to":"m3-filter"},
+          {"highlight":"flow-m3-sink","label":"Surviving rows reach the partial-COUNT sink, which folds them into its running count state.","packet":true,"from":"m3-filter","to":"m3-sink"},
+          {"highlight":"flow-m3-repo","label":"publish_output(): the result handle — not a copy — lands in the repository of the downstream port.","packet":true,"from":"m3-sink","to":"m3-repo"},
+          {"highlight":"flow-m3-filter","label":"Pulse 2: the scan still has splits, so the hint is READY again and another task pulls the next batch through the same stations.","packet":true,"from":"m3-scan","to":"m3-filter"},
+          {"highlight":"flow-m3-sink","label":"Pulse 3: batch after batch, tasks_completed ticks up and the count state keeps accumulating.","packet":true,"from":"m3-filter","to":"m3-sink"},
+          {"highlight":"flow-m3-sink","label":"The scan is exhausted and the last task completes: mark_task_completed() runs update_pipeline_status() — Pipeline A is finished and its operators finalize."},
+          {"highlight":"flow-m3-finalize","label":"The FULL barrier on Pipeline B is now satisfied. COUNT finalize pulls the completed state through its port.","packet":true,"from":"m3-repo","to":"m3-finalize"},
+          {"highlight":"flow-m3-collector","label":"Pipeline B runs: the final count lands in the RESULT_COLLECTOR.","packet":true,"from":"m3-finalize","to":"m3-collector"},
+          {"highlight":"flow-m3-duckdb","label":"The RESULT_COLLECTOR fulfills the future. The DuckDB thread wakes up and returns the answer to the client.","packet":true,"from":"m3-collector","to":"m3-duckdb"}
+        ]'>
+          <div class="flow-actors">
+            <div class="flow-actor" id="flow-m3-duckdb">
+              <div class="flow-actor-icon">🦆</div>
+              <span>DuckDB</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-plangen">
+              <div class="flow-actor-icon">✂️</div>
+              <span>plan generator</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-scan">
+              <div class="flow-actor-icon">📥</div>
+              <span>SCAN · A</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-filter">
+              <div class="flow-actor-icon">σ</div>
+              <span>FILTER · A</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-sink">
+              <div class="flow-actor-icon">Σ</div>
+              <span>COUNT sink · A</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-repo">
+              <div class="flow-actor-icon">🗄️</div>
+              <span>port repo</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-finalize">
+              <div class="flow-actor-icon">🧮</div>
+              <span>COUNT finalize · B</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-collector">
+              <div class="flow-actor-icon">📤</div>
+              <span>RESULT_COLLECTOR · B</span>
+            </div>
+          </div>
+
+          <div class="flow-packet"></div>
+
+          <div class="flow-step-label">Click "Next Step" to begin</div>
+
+          <div class="flow-controls">
+            <button class="btn flow-next-btn">Next Step</button>
+            <button class="btn flow-reset-btn">Restart</button>
+            <span class="flow-progress"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 3: THE HINT PROTOCOL ────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The heart: <code>get_next_task_hint()</code></h2>
+
+        <p>The task creator never guesses what to run next. Before building any task it asks the operator for a hint — and there are exactly three possible answers.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">⚡</div>
+            <h4 class="pattern-title"><code>READY{this}</code></h4>
+            <p class="pattern-desc">&ldquo;Build me a task.&rdquo; Every input port has data, or I am a source with splits left. The creator wraps the pipeline in a <span class="term" data-definition="The unit of scheduled work in Sirius: one batch (split) pushed through every operator of one pipeline, ending at its sink. Defined in src/include/pipeline/gpu_pipeline_task.hpp.">gpu_pipeline_task</span>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">🔁</div>
+            <h4 class="pattern-title"><code>WAITING_FOR_INPUT_DATA{producer}</code></h4>
+            <p class="pattern-desc">&ldquo;Go ask upstream.&rdquo; A FULL-barrier port has an unfinished producer, and the hint carries a pointer to it. The creator recurses — the <span class="term" data-definition="The recursion of get_next_task_hint() calls: a consumer answers WAITING and points at its producer, so the task creator asks the producer instead — repeating until some operator answers READY. Deepest producers run first.">hint chain</span>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🏁</div>
+            <h4 class="pattern-title"><code>std::nullopt</code></h4>
+            <p class="pattern-desc">&ldquo;I&rsquo;m done forever.&rdquo; No task will ever be needed here again — a scan answers this once its last <span class="term" data-definition="One scan-sized chunk of the input table — the granularity at which tasks are created. A scan with splits remaining keeps answering READY; out of splits, it answers nullopt.">split</span> is gone. The creator stops asking.</p>
+          </div>
+        </div>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">src/include/op/sirius_physical_operator.hpp:49</span>
+          <pre><code><span class="code-keyword">enum class</span> TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
+<span class="code-keyword">enum class</span> MemoryBarrierType { PIPELINE, PARTIAL, FULL };
+
+<span class="code-keyword">struct</span> task_creation_hint {
+  TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
+  sirius_physical_operator* producer{<span class="code-keyword">nullptr</span>};
+};</code></pre>
+        </div>
+
+        <p>The base implementation walks the input ports looking for a FULL barrier whose producer pipeline hasn&rsquo;t finished. Found one? Answer WAITING, pointing at that pipeline&rsquo;s source. Every port satisfied? The function falls through to READY.</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">src/op/sirius_physical_operator.cpp:275</span>
+          <pre><code>std::optional&lt;task_creation_hint&gt; sirius_physical_operator::<span class="code-function">get_next_task_hint</span>()
+{
+  <span class="code-keyword">if</span> (ports.<span class="code-function">empty</span>()) { <span class="code-keyword">return</span> std::nullopt; }
+
+<span class="code-comment">  // look at the input ports and see if there are any unfinished hard barriers</span>
+  <span class="code-keyword">auto</span> unfinished_barrier = std::<span class="code-function">find_if</span>(_ports_list.<span class="code-function">begin</span>(), _ports_list.<span class="code-function">end</span>(), [](<span class="code-keyword">const auto</span>&amp; p) {
+    <span class="code-keyword">return</span> p-&gt;type == MemoryBarrierType::FULL &amp;&amp; p-&gt;src_pipeline &amp;&amp;
+           !p-&gt;src_pipeline-&gt;<span class="code-function">is_pipeline_finished</span>();
+  });
+
+  <span class="code-keyword">if</span> (unfinished_barrier != _ports_list.<span class="code-function">end</span>()) {
+    <span class="code-keyword">auto</span>* producer = &amp;((*unfinished_barrier)-&gt;src_pipeline-&gt;<span class="code-function">get_operators</span>()[<span class="code-number">0</span>].<span class="code-function">get</span>());
+    <span class="code-keyword">return</span> task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+  }</code></pre>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 4: A TASK RUNS ──────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">A task runs the line</h2>
+
+        <p>A READY hint becomes a <code>gpu_pipeline_task</code>: one split pushed through every station of one pipeline. Four moves, always in this order:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">1</div>
+            <div class="step-body">
+              <strong>Reserve GPU memory</strong>
+              <p>Admission control: the memory this batch needs is reserved before anything executes. Module 5 lives entirely inside this step.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">2</div>
+            <div class="step-body">
+              <strong><code>prepare_for_processing()</code></strong>
+              <p>Lock the input batches and colocate them into one memory space, so the kernels see resident, same-device inputs.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">3</div>
+            <div class="step-body">
+              <strong><code>execute()</code> each operator</strong>
+              <p>The batch is pulled through the station chain on the GPU: scan output through FILTER, results into the partial-COUNT sink.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">4</div>
+            <div class="step-body">
+              <strong><code>publish_output()</code> → terminal <code>sink()</code></strong>
+              <p>Surviving rows are pushed into the <span class="term" data-definition="The buffer attached to a port (a cucascade::shared_data_repository) where producer tasks deposit output batch handles for the consumer to pull later.">repository</span> of the next port — as handles, never copies.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">🔗</div>
+          <div class="callout-content">
+            <strong class="callout-title">Data moves by handle, not copy</strong>
+            <p><code>publish_output()</code> deposits references to GPU-resident batches; nothing is serialized and nothing returns up the call stack. What a batch actually <em>is</em> — that&rsquo;s Module 4.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 5: COMPLETION DRIVES EVERYTHING ─────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Completion drives everything</h2>
+
+        <p>Nothing polls this factory. The only moment the engine re-evaluates a pipeline is the tail of <code>mark_task_completed()</code> — a worker turning in a job card:</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">src/pipeline/sirius_pipeline.cpp:459</span>
+          <pre><code>  tasks_completed++;
+  <span class="code-function">update_pipeline_status</span>();
+}</code></pre>
+        </div>
+
+        <p><code>update_pipeline_status()</code> then asks one compound question. Every clause exists to kill a specific bug:</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/sirius_pipeline.cpp:389</span>
+            <pre><code>      <span class="code-keyword">if</span> (limit_exhausted ||
+          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>())) {
+        <span class="code-keyword">if</span> (tasks_created.<span class="code-function">load</span>() == tasks_completed.<span class="code-function">load</span>()) {
+          pipeline_finished.<span class="code-function">store</span>(<span class="code-keyword">true</span>);
+          <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; op : <span class="code-function">get_operators</span>()) {
+            op.<span class="code-function">get</span>().<span class="code-function">finalize_operator</span>();
+          }
+          <span class="code-function">end_nvtx_range_if_finished</span>();
+          should_notify = <span class="code-keyword">true</span>;
+        }
+      }</code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Escape hatch: a LIMIT downstream already has every row it needs — stop early.</p>
+              <p class="tl">Otherwise, two conditions: the source has handed out its last split, AND every input port has been drained.</p>
+              <p class="tl">In-flight accounting: every job card issued has been turned back in. No task is still running against these operators.</p>
+              <p class="tl">Only now is the pipeline declared finished.</p>
+              <p class="tl">Each operator gets its one <span class="term" data-definition="The end-of-pipeline call each operator receives exactly once, when its pipeline is declared finished. Aggregates seal their accumulated state here — finalize on a partial state would produce a wrong answer.">finalize</span> call — the partial COUNT seals its state here.</p>
+              <p class="tl">Close the profiling range, and flag that downstream pipelines waiting on our FULL barrier must be notified — this is what wakes Pipeline B.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="flow-steps">
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p>last task finishes → <code>mark_task_completed()</code></p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p><code>update_pipeline_status()</code> re-checks A</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">3</div>
+            <p>A finished → operators finalize</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">4</div>
+            <p>B&rsquo;s FULL barrier satisfied → B runs</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">5</div>
+            <p>RESULT_COLLECTOR fulfills the future</p>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">No timer. No poller.</strong>
+            <p>Completion is <span class="term" data-definition="Pipeline status is re-evaluated only on the completion edge of a task — update_pipeline_status() is driven from mark_task_completed(). There is no timer or polling loop that ever re-checks it.">edge-triggered</span>: if no task completes, <code>update_pipeline_status()</code> never runs and nobody ever re-checks anything. The andon board only updates on a turned-in job card — and that exact property becomes a hang story in Module 7.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 6: QUIZ ─────────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Trace it yourself</h2>
+
+        <p>Four scenarios, same query. Answer from the loop you just walked, not from memory.</p>
+
+        <div class="quiz-container" id="quiz-module3">
+          <div class="quiz-question-block"
+               data-correct="q1-b"
+               data-explanation-right="Exactly — the aggregate is a pipeline breaker, so B&rsquo;s port is a FULL barrier. Finalize on a partial count is not slow, it is wrong."
+               data-explanation-wrong="Not quite. Nothing about the scheduler or the GPU forbids overlap — the constraint is semantic: COUNT finalize is meaningless until every batch has been folded into the state. That is exactly what the FULL barrier on B&rsquo;s input port encodes.">
+            <h3 class="quiz-question">1. Why can&rsquo;t Pipeline B start as soon as the first filtered batch exists?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q1-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The scheduler runs pipelines strictly in plan order, one at a time</span>
+              </button>
+              <button class="quiz-option" data-value="q1-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>B&rsquo;s input port is a FULL barrier: COUNT finalize needs the complete count state — an early start would finalize a partial, wrong result</span>
+              </button>
+              <button class="quiz-option" data-value="q1-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The GPU cannot execute tasks from two pipelines concurrently</span>
+              </button>
+              <button class="quiz-option" data-value="q1-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The RESULT_COLLECTOR holds a lock on the port repository until A drains it</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q2-c"
+               data-explanation-right="Yes — that producer pointer is the hint chain in action: walk upstream until someone says READY. Deepest producers run first, which is pull-when-ready by construction."
+               data-explanation-wrong="Not quite. There is no polling and no error path here — the hint carries a producer pointer precisely so the creator can walk upstream and build the task where data can actually be produced.">
+            <h3 class="quiz-question">2. The filter&rsquo;s hint returns <code>WAITING_FOR_INPUT_DATA</code> with <code>producer=scan</code>. What does the task creator do next?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q2-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Parks the filter on a wait-queue and polls it until input data arrives</span>
+              </button>
+              <button class="quiz-option" data-value="q2-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Builds the filter task anyway, with an empty input batch</span>
+              </button>
+              <button class="quiz-option" data-value="q2-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Recurses: asks the scan for <em>its</em> hint — the deepest producer that answers READY gets the task</span>
+              </button>
+              <button class="quiz-option" data-value="q2-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Fails the query — WAITING at task-creation time is an invariant violation</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q3-b"
+               data-explanation-right="Exactly. Completion is edge-triggered: update_pipeline_status() runs from mark_task_completed(). No completing task means no edge — nobody ever re-asks whether the pipeline is done."
+               data-explanation-wrong="Look at snippet E again: in the steady state, update_pipeline_status() is driven from mark_task_completed(). With zero tasks in flight there is no completion edge — so that is the function that silently never ran.">
+            <h3 class="quiz-question">3. A query hangs. Zero tasks in flight, and the pipeline never finishes. Which function had no reason to run?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q3-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>get_next_task_hint()</code></span>
+              </button>
+              <button class="quiz-option" data-value="q3-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>update_pipeline_status()</code> — it is only called on task completion; with nothing completing, the status is never re-evaluated</span>
+              </button>
+              <button class="quiz-option" data-value="q3-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>start_query()</code></span>
+              </button>
+              <button class="quiz-option" data-value="q3-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>publish_output()</code></span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q4-c"
+               data-explanation-right="Right — source exhausted and ports drained only prove no NEW work exists; the counter check proves no OLD work is still in flight. Skip it and you finalize operators a live task is still writing to."
+               data-explanation-wrong="Not quite. The other two clauses already cover new work (source exhausted, ports drained); this one is in-flight accounting. Without it, a still-running task could execute against operators that were just finalized under its feet — premature completion, use-after-free territory.">
+            <h3 class="quiz-question">4. <code>tasks_created == tasks_completed</code> is checked inside the finish condition. What bug does that prevent?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q4-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Creating two tasks for the same split</span>
+              </button>
+              <button class="quiz-option" data-value="q4-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Double-counting rows in the partial COUNT state</span>
+              </button>
+              <button class="quiz-option" data-value="q4-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Declaring the pipeline finished while a task is still running — finalizing operators under a live task</span>
+              </button>
+              <button class="quiz-option" data-value="q4-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Letting Pipeline B start before its FULL barrier is satisfied</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module3')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module3')">Try Again</button>
+        </div>
+
+        <p style="margin-top: var(--space-8)">We hand-waved &ldquo;the batch goes to the repo.&rdquo; Next module: what a batch actually <em>is</em> — and why it never travels by function return.</p>
+      </section>
+
+    </div>
+  </div>
+</section>
+<section class="module" id="module-4" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">04</span>
+      <h1 class="module-title">The Data Plane</h1>
+      <p class="module-subtitle">In Sirius, no operator ever returns data to its caller. Ever. Here's why that one decision buys spilling, backpressure, and multi-GPU almost for free.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: The port ─────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">A named dock, not a return value</h2>
+        <p>Think freight docks: a producer pipeline drops pallets — batches — at a named dock, and the dock's rules say when the consumer may start unloading. In Sirius the dock is a <span class="term" data-definition="The struct that defines where an operator's data arrives or leaves: a barrier type + a pointer to a shared repository + the producing and consuming pipelines. Every operator declares its ports at plan time — they are the edges of the pipeline graph."><code>port</code></span> — and it never holds goods itself, it points at the <span class="term" data-definition="cucascade::shared_data_repository — the shared, first-class store where ALL inter-operator batches live. Because repositories are inspectable objects (not private members), the downgrade executor can walk them to find spill victims."><code>repository</code></span> where they live.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/include/op/sirius_physical_operator.hpp · L459-472</span>
+            <pre><code>
+<span class="code-line">  <span class="code-keyword">struct</span> port {</span>
+<span class="code-line">    MemoryBarrierType <span class="code-property">type</span>;</span>
+<span class="code-line">    <span class="code-comment">/// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").</span></span>
+<span class="code-line">    <span class="code-comment">/// Null repos are treated as "empty, not data-gating" by the base-class port handling methods</span></span>
+<span class="code-line">    <span class="code-comment">/// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).</span></span>
+<span class="code-line">    ::cucascade::shared_data_repository* <span class="code-property">repo</span>;</span>
+<span class="code-line">    duckdb::shared_ptr&lt;pipeline::sirius_pipeline&gt; <span class="code-property">src_pipeline</span>;</span>
+<span class="code-line">    duckdb::shared_ptr&lt;pipeline::sirius_pipeline&gt; <span class="code-property">dest_pipeline</span>;</span>
+<span class="code-line">    <span class="code-comment">//! A UUID for a port on an operator at the beginning of a</span></span>
+<span class="code-line">    <span class="code-comment">// pipeline. This port receives data from a prior pipeline,</span></span>
+<span class="code-line">    <span class="code-comment">// forming an incoming edge from that pipeline.</span></span>
+<span class="code-line">    uuid::UUID <span class="code-property">source_port_uuid</span>{uuid::<span class="code-function">now_v7</span>()};</span>
+<span class="code-line">  };</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">A dock, in thirteen lines — this struct is the entire contract for data crossing an operator boundary.</p>
+              <p class="tl">The unloading rule: PIPELINE, PARTIAL, or FULL. This one enum decides when the consumer may start.</p>
+              <p class="tl">This docstring is load-bearing: a port may carry no data at all — the pointer below is allowed to be NULL.</p>
+              <p class="tl">The warehouse behind the dock. The port doesn't hold batches; it points at the repository where they live.</p>
+              <p class="tl">Who delivers here, and who picks up — this pair makes the port an edge in the pipeline graph.</p>
+              <p class="tl">Incoming docks are addressable across pipeline boundaries...</p>
+              <p class="tl">...so each one gets a manifest number (UUIDv7) that a later pipeline can name exactly.</p>
+              <p class="tl">No buffers, no queues, no callbacks. A rule, a place, and two parties.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">🔗</div>
+          <div class="callout-content">
+            <strong class="callout-title">repo == NULL is a feature, not a bug</strong>
+            <p>When the scan pipeline was split out (<a href="https://github.com/sirius-db/sirius/pull/620">#620</a>), some pipelines still had to run in order without exchanging a single batch. The answer is a <span class="term" data-definition="A port whose repo pointer is NULL: a pure scheduling edge that orders two pipelines without carrying data. The base-class port methods treat it as 'empty, not data-gating' — it constrains when things run, never what data exists.">dependency-only port</span>: a scheduling edge with no warehouse — same struct, treated as "empty, not data-gating".</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: How output leaves an operator ────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Output is a push, never a return</h2>
+        <p>Here is the entire replacement for "function returns data" — the base-class <code>sink()</code>, about seven lines. When our running <code>count(*)</code> query's filter finishes a batch of partial counts, this is how they leave: each <span class="term" data-definition="The manifest, not the pallet: a small object identifying a batch. push_data_batch moves handles between ports and repositories — the underlying device buffers are never repacked or copied.">handle</span> is filed at every downstream dock, and the caller never sees a thing.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/op/sirius_physical_operator.cpp · L238-246</span>
+            <pre><code>
+<span class="code-line"><span class="code-keyword">void</span> sirius_physical_operator::<span class="code-function">sink</span>(<span class="code-keyword">const</span> operator_data&amp; output_data, rmm::cuda_stream_view stream)</span>
+<span class="code-line">{</span>
+<span class="code-line">  <span class="code-keyword">auto</span>&amp; pipelineable_output = <span class="code-keyword">dynamic_cast</span>&lt;<span class="code-keyword">const</span> pipelineable_operator_data&amp;&gt;(output_data);</span>
+<span class="code-line">  <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; batch : pipelineable_output.<span class="code-function">get_data_batches</span>()) {</span>
+<span class="code-line">    <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; next_port_info : next_port_after_sink) {</span>
+<span class="code-line">      next_port_info.next_operator-&gt;<span class="code-function">push_data_batch</span>(next_port_info.next_operator_port_name, batch);</span>
+<span class="code-line">    }</span>
+<span class="code-line">  }</span>
+<span class="code-line">}</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">Every operator's output funnels through here, on the worker's CUDA stream. Note the return type: void.</p>
+              <p class="tl">Downcast to <span class="term" data-definition="The operator_data subtype that actually carries GPU data batches. sink() downcasts to it because only pipelineable outputs fan out through ports — other operator_data flavors carry control state."><code>pipelineable_operator_data</code></span> — the flavor of output that actually carries batches.</p>
+              <p class="tl">For every pallet this operator produced...</p>
+              <p class="tl">...and every downstream dock wired up at plan time...</p>
+              <p class="tl">...hand over the manifest: the handle moves into the next operator's port. No copy, no return value, no waiting on the consumer.</p>
+              <p class="tl">That's it. Seven lines replace the entire concept of returning data to a caller.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="flow-steps">
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p>Worker finishes a batch on its CUDA stream</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p><code>sink()</code> fans out: every batch × every downstream port</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">3</div>
+            <p><code>push_data_batch</code> files the handle in that port's repository</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">4</div>
+            <p>The consumer's barrier decides when it may start pulling</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: Barriers + drag-and-drop ─────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three unloading rules</h2>
+        <p>The <span class="term" data-definition="MemoryBarrierType — the port's release rule: PIPELINE (consume batch-by-batch as produced), PARTIAL (consume incrementally across a pipeline boundary), FULL (consume nothing until the producing pipeline completely finishes). It defines pipeline semantics, not memory ordering.">barrier type</span> is pipeline semantics compressed into one enum. Same repository machinery underneath — only the release rule changes.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">🚚</div>
+            <h4 class="pattern-title">PIPELINE — roll-through dock</h4>
+            <p class="pattern-desc">Pallets release one at a time, the moment they land. This is how a filter chain streams: each batch flows straight to the next operator in the same pipeline.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">🌊</div>
+            <h4 class="pattern-title">PARTIAL — wave release</h4>
+            <p class="pattern-desc">Goods release in waves while the shipment is still arriving. CONCAT-after-PARTITION consumes partitions incrementally, across a pipeline boundary.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🏛️</div>
+            <h4 class="pattern-title">FULL — bonded warehouse</h4>
+            <p class="pattern-desc">Sealed until the entire shipment clears customs. A hash-join's build side stays invisible until its producing pipeline completely finishes.</p>
+          </div>
+        </div>
+
+        <p>You're wiring a new operator. Drag each workload onto the port configuration it needs.</p>
+
+        <div class="dnd-container" id="dnd-module4">
+          <div class="dnd-chips">
+            <div class="dnd-chip" draggable="true" data-answer="build">Hash-join build side</div>
+            <div class="dnd-chip" draggable="true" data-answer="filter">FILTER feeding a projection in the same pipeline</div>
+            <div class="dnd-chip" draggable="true" data-answer="concat">CONCAT consuming partitions produced upstream</div>
+            <div class="dnd-chip" draggable="true" data-answer="dep">Dependency-only scheduling edge (no data)</div>
+          </div>
+          <div class="dnd-zones">
+            <div class="dnd-zone" data-correct="filter">
+              <p class="dnd-zone-label">PIPELINE — roll-through dock</p>
+              <div class="dnd-zone-target">Drop here</div>
+            </div>
+            <div class="dnd-zone" data-correct="concat">
+              <p class="dnd-zone-label">PARTIAL — wave release</p>
+              <div class="dnd-zone-target">Drop here</div>
+            </div>
+            <div class="dnd-zone" data-correct="build">
+              <p class="dnd-zone-label">FULL — bonded warehouse</p>
+              <div class="dnd-zone-target">Drop here</div>
+            </div>
+            <div class="dnd-zone" data-correct="dep">
+              <p class="dnd-zone-label">port with repo == NULL</p>
+              <div class="dnd-zone-target">Drop here</div>
+            </div>
+          </div>
+          <button class="quiz-check-btn" onclick="checkDnD('dnd-module4')">Check Matches</button>
+          <button class="quiz-reset-btn" onclick="resetDnD('dnd-module4')">Reset</button>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: Batch lifecycle (hero) ───────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Pallets have manifests: the batch lifecycle</h2>
+        <p>A <span class="term" data-definition="cuCascade's unit of data movement: a handle to buffers living in some memory space (GPU, pinned host, disk), tracked by ID. Moving one between operators or GPUs transfers the handle — the buffers are never repacked."><code>data_batch</code></span> is the manifest, not the pallet — and you never touch its buffers directly, only through <span class="term" data-definition="Access to a batch's buffers is only possible by constructing a lock object whose lifetime IS your access window: the destructor releases the batch back toward idle. No lock object, no pointer — forgetting to unlock is unrepresentable.">RAII locks</span>: many <span class="term" data-definition="The shared lock class: any number of concurrent readers may hold a batch read_only. Mutation and memory-space conversion must wait until every reader has released.">read_only</span> readers XOR one <span class="term" data-definition="The exclusive lock class: exactly one holder, zero readers. Required for in-place mutation and for converting the batch to another memory space (e.g., GPU to host).">mutable</span> holder. <span class="term" data-definition="The unlocked state: nobody holds the batch. The only state from which either lock class can be acquired — and the only state the downgrade executor is allowed to spill."><code>idle</code></span> means nobody holds it.</p>
+
+        <div class="flow-steps">
+          <div class="flow-step" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="flow-step-num" style="background: var(--color-actor-2)">N</div>
+            <p><strong>read_only</strong><br>Any number of concurrent readers. Converters queue behind all of them.</p>
+          </div>
+          <div class="flow-arrow">⇄</div>
+          <div class="flow-step" style="border: 2px solid var(--color-success); background: var(--color-success-light)">
+            <div class="flow-step-num" style="background: var(--color-success)">0</div>
+            <p><strong>idle</strong><br>Nobody holds it. The only state that can be locked either way — and the only state that can be spilled.</p>
+          </div>
+          <div class="flow-arrow">⇄</div>
+          <div class="flow-step" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="flow-step-num" style="background: var(--color-actor-1)">1</div>
+            <p><strong>mutable_locked</strong><br>Exactly one exclusive holder. Required to mutate — or convert to another memory space.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">Spillable = idle + in a registered repository</strong>
+            <p>The <span class="term" data-definition="The per-memory-space service (src/downgrade/) that reacts to memory pressure by moving victim batches down the hierarchy: GPU device memory to pinned host to disk. It finds victims by walking registered repositories for idle batches.">downgrade executor</span> never asks operators for memory back — it walks repositories and takes idle batches. Both conditions are load-bearing: a batch it can't <em>find</em> or can't <em>lock</em> might as well not exist. That is why repositories being first-class, inspectable objects is the whole game — it's what makes <span class="term" data-definition="Moving an idle batch to a lower memory tier (GPU to host to disk) to free space. Transparent to operators: the handle stays valid; only where the buffers live changes.">spilling</span> possible at all.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">⚠️</div>
+          <div class="callout-content">
+            <strong class="callout-title">How you cause an OOM</strong>
+            <p>Park batches in a private queue, or sit on locks "for later" — either way they're invisible to the downgrade executor and the query dies under pressure instead of spilling. Module 7's streaming design exists to dodge exactly this: ownership stays in repositories, and only <code>{batch_id, size}</code> handles travel through channels.</p>
+          </div>
+        </div>
+
+        <p>History: this tri-class lock design replaced a 4-state FSM (cuCascade <a href="https://github.com/NVIDIA/cuCascade/pull/117">#117</a>, adopted in Sirius <a href="https://github.com/sirius-db/sirius/pull/689">#689</a>) — lock-discipline races stopped being runtime bugs and became compile errors.</p>
+      </section>
+
+      <!-- ── Quiz ──────────────────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three tickets</h2>
+        <p>Three incidents, all traceable to this module. Pick your diagnosis.</p>
+
+        <div class="quiz-container" id="quiz-module4">
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Two conditions make a batch spillable: idle, and discoverable in a registered repository. Your queue violates both — the locks pin the batches, and the private container hides them. Keep output parked in the port's repository and take locks only for the duration of actual work."
+               data-explanation-wrong="Neither RMM fragmentation nor the barrier is involved. Ask what the downgrade executor can actually see when it hunts for victims — and what state a batch must be in before it is allowed to move.">
+            <h3 class="quiz-question">Your new operator buffers output batches in a private std::deque of locked handles while waiting for a slow consumer. Under memory pressure the query OOMs instead of spilling. Why?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The deque's host-side allocations fragment the RMM pool until the next reservation fails</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The downgrade executor can only spill idle batches it finds in registered repositories — locked handles in a private queue are invisible and unspillable</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>std::deque reallocation deep-copies the device buffers, doubling the footprint</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The slow consumer's FULL barrier blocks the spill path until the pipeline finishes</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="FULL is a bonded warehouse: the port releases nothing until the producing pipeline is completely finished. For bounded input that means batch semantics plus a memory bulge; for an unbounded stream, the producer never finishes — so the consumer never starts."
+               data-explanation-wrong="Barriers never affect locking and never drop data — they only gate when the consumer may start consuming. Ask when a FULL port releases its first batch, then ask when an unbounded producer finishes.">
+            <h3 class="quiz-question">You wire a streaming producer to its consumer with a FULL barrier. What breaks?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Nothing functional — you just lose some pipelining overlap</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Batches arrive unlocked, so concurrent readers race the producer's writes</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Nothing runs until the producer pipeline completely finishes — streaming becomes batch, and an unbounded stream deadlocks</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The repository rejects pushes after the first wave and silently drops data</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="The lock classes serialize the lifecycle: many readers XOR one mutable holder, and idle is the only state you can convert from. The reader finishes, the batch passes through idle, then the converter takes the exclusive lock. No priority, no preemption — just the discipline."
+               data-explanation-wrong="There is no preemption or priority in the lock discipline, and no cycle either — the reader holds nothing else, so nothing deadlocks. The converter simply waits: mutable access requires the batch to pass through idle first.">
+            <h3 class="quiz-question">Two operators need the same batch concurrently — one is reading it, the other wants to convert it to host memory. What happens?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Both proceed — the conversion targets a different memory space, so there is no conflict</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The conversion needs the mutable lock, so it waits until every read_only lock releases and the batch passes through idle</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The reader is preempted — conversions have priority under memory pressure</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Deadlock — the reader and the converter block each other forever</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module4')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module4')">Try Again</button>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">➡️</div>
+          <div class="callout-content">
+            <strong class="callout-title">Next: Memory &amp; Multi-GPU</strong>
+            <p>Repositories decide where data <em>lives</em>. Next: who pays the memory bill — reservations, tiers, spilling, and the device contract.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</section>
+<section class="module" id="module-5">
+  <div class="module-content">
+
+    <header class="module-header animate-in">
+      <span class="module-number">05</span>
+      <h1 class="module-title">Memory &amp; Multi-GPU</h1>
+      <p class="module-subtitle">GPU memory is the scarcest thing in this engine. Sirius&rsquo;s answer: nothing runs without a reservation, and pressure triggers relocation &mdash; not a crash.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: Tiers & reservations ───────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Book before you travel</h2>
+
+        <p>Think of a hotel with an annex and a storage depot: you don&rsquo;t get a room by walking in, you <em>book before travel</em>. In Sirius, every memory allocation lives on a three-rung <span class="term" data-definition="A rung on the spill ladder: tier 0 = GPU device memory, tier 1 = pinned host memory per NUMA node, tier 2 = disk. Downgrade moves data down; demand pulls it back up.">tier</span> ladder, and no task touches tier 0 without a booking.</p>
+
+        <div class="flow-steps animate-in">
+          <div class="flow-step">
+            <div class="flow-step-num">0</div>
+            <p><strong>GPU device memory</strong><br>the main building &mdash; fast, tiny, contested</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p><strong><span class="term" data-definition="Page-locked CPU RAM, one pool per NUMA node, that GPUs can DMA to and from at full interconnect speed. This is Sirius tier 1.">Pinned host</span>, per NUMA</strong><br>the annex &mdash; roomier, a walk away</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p><strong>Disk</strong><br>the storage depot &mdash; vast, slow, the floor</p>
+          </div>
+        </div>
+
+        <p>All three tiers are managed by <code>sirius_memory_reservation_manager</code> (cuCascade). Before the GPU executor&rsquo;s manager thread dispatches a task, it makes a <span class="term" data-definition="A pre-granted memory budget from sirius_memory_reservation_manager, sized from the pipeline&rsquo;s memory history and attached to a task before dispatch. Operators allocate inside it; it is released at task end. No reservation, no execution.">reservation</span> sized from the pipeline&rsquo;s <span class="term" data-definition="A per-pipeline record of observed memory peaks &mdash; including peaks from failed attempts. It sizes future reservations, so a pipeline that OOMed once reserves more the next time.">memory history</span>.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <strong>Reserve</strong>
+              <p>The manager thread books a budget on a specific <span class="term" data-definition="A concrete memory location in cuCascade terms: one GPU device, one pinned-host NUMA pool, or disk. Batches and reservations are always bound to exactly one.">memory space</span>, sized from what this pipeline actually used before.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <strong>Run inside the budget</strong>
+              <p>The task dispatches; its operators allocate within the reservation &mdash; never around it.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <strong>Release at task end</strong>
+              <p>Check-out is automatic. The freed budget is what lets the next blocked task dispatch.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code">no reservation</code>
+            <span class="badge-desc">&rarr; the task won&rsquo;t run. There is no walk-in path to GPU memory.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: Pressure & downgrade (HERO) ────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The night manager: downgrade under pressure</h2>
+
+        <p>Each memory space has its own <code>downgrade_executor</code> &mdash; a night manager with two employees: a monitor thread watching occupancy, and a processing thread executing <span class="term" data-definition="A unit of work for the downgrade executor&rsquo;s processing thread: relocate this victim batch one tier down to relieve pressure in its memory space.">downgrade requests</span>. Step through what happens when the main building fills.</p>
+
+        <div class="flow-animation animate-in" data-steps='[
+          {"highlight":"flow-actor-m5-gpu","label":"Monitor thread sees GPU memory usage cross its threshold &mdash; pressure detected, no panic"},
+          {"highlight":"flow-actor-m5-gpu","label":"Candidate hunt: idle batches sitting in repositories first, then batches held inside queued tasks (inspectable task queue, PR #637)"},
+          {"highlight":"flow-actor-m5-host","packet":true,"from":"actor-m5-gpu","to":"actor-m5-host","label":"Processing thread executes the downgrade request: the victim batch relocates to pinned host memory"},
+          {"highlight":"flow-actor-m5-host","label":"Freed device memory lets a blocked reservation be granted &mdash; the stalled task dispatches"},
+          {"highlight":"flow-actor-m5-disk","packet":true,"from":"actor-m5-host","to":"actor-m5-disk","label":"Host tier under pressure too: the batch continues down to disk (fallback added in PR #647)"},
+          {"highlight":"flow-actor-m5-gpu","packet":true,"from":"actor-m5-disk","to":"actor-m5-gpu","label":"When a task needs that data again, it climbs back up on demand &mdash; nothing lost, nothing crashed"}
+        ]'>
+          <div class="flow-actors">
+            <div class="flow-actor" id="flow-actor-m5-gpu">
+              <div class="flow-actor-icon">0</div>
+              <span>GPU device memory<br>tier 0</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m5-host">
+              <div class="flow-actor-icon">1</div>
+              <span>pinned host (per NUMA)<br>tier 1</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m5-disk">
+              <div class="flow-actor-icon">2</div>
+              <span>disk<br>tier 2</span>
+            </div>
+          </div>
+
+          <div class="flow-packet"></div>
+
+          <div class="flow-step-label">Click &ldquo;Next Step&rdquo; to begin</div>
+
+          <div class="flow-controls">
+            <button class="btn flow-next-btn">Next Step</button>
+            <button class="btn flow-reset-btn">Restart</button>
+            <span class="flow-progress"></span>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code">repositories</code>
+            <span class="badge-desc">First-choice victims: idle batches parked between operators &mdash; unlocked, cheap to migrate.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code">queued tasks</code>
+            <span class="badge-desc">Second choice: batches held by queued-but-not-running tasks, reachable only through the <span class="term" data-definition="A task queue the downgrade executor can look inside (PR #637), making batches held by queued-but-not-yet-running tasks visible as spill candidates.">inspectable task queue</span> (<a href="https://github.com/sirius-db/sirius/pull/637">#637</a>).</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: OOM as control flow ────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">OOM is control flow, not a crash</h2>
+
+        <p>What if a task allocates beyond its reservation anyway? It throws <span class="term" data-definition="The exception a task throws when an allocation exceeds its reservation. It carries the intermediate operator data plus a resume index, so the retry restarts mid-pipeline instead of from scratch.">oom_reschedule_exception</span> &mdash; the moment a task gives up gracefully, packaging its partial state and the operator index to resume from.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/gpu_pipeline_task.cpp:326-331</span>
+            <pre><code>
+<span class="code-line">      <span class="code-keyword">throw</span> <span class="code-function">oom_reschedule_exception</span>(</span>
+<span class="code-line">        std::<span class="code-function">move</span>(operator_input_output_data),</span>
+<span class="code-line">        i,</span>
+<span class="code-line">        <span class="code-string">"OOM at operator "</span> + op.<span class="code-function">get_name</span>() + <span class="code-string">" (index "</span> + std::<span class="code-function">to_string</span>(i) + <span class="code-string">")"</span>);</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">The graceful surrender: not a crash, but a thrown value that <em>is</em> the reschedule plan.</p>
+              <p class="tl">The intermediate results move out with the exception &mdash; operators that already finished never re-run.</p>
+              <p class="tl"><code>i</code> is the resume index: the retry restarts at exactly this operator, mid-pipeline.</p>
+              <p class="tl">And the message names the failing operator &mdash; the breadcrumb you grep for in a log full of retries.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>The executor catches it, backs off, and requeues. The retry budget is a hard constant &mdash; and the comment above it is real tuning history, recorded in code.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/gpu_pipeline_executor.cpp:330-343</span>
+            <pre><code>
+<span class="code-line"><span class="code-comment">          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far</span></span>
+<span class="code-line"><span class="code-comment">          // too short. With 100 retries × 50 ms backoff (~5 s) the probe</span></span>
+<span class="code-line"><span class="code-comment">          // tasks get enough patience to clear the contention window while</span></span>
+<span class="code-line"><span class="code-comment">          // still bailing out on truly wedged queries.</span></span>
+<span class="code-line">          <span class="code-keyword">static constexpr</span> <span class="code-keyword">uint32_t</span> MAX_OOM_RETRIES = <span class="code-number">100</span>;</span>
+<span class="code-line">          <span class="code-keyword">if</span> (next_retry_count &gt; MAX_OOM_RETRIES) {</span>
+<span class="code-line">            <span class="code-function">SIRIUS_LOG_ERROR</span>(</span>
+<span class="code-line">              <span class="code-string">"GPU Pipeline Executor: task {} (original task {}) exceeded {} OOM retries at "</span></span>
+<span class="code-line">              <span class="code-string">"operator index {} — terminating query"</span>,</span>
+<span class="code-line">              gpu_task-&gt;<span class="code-function">get_task_id</span>(),</span>
+<span class="code-line">              orig_task_id,</span>
+<span class="code-line">              MAX_OOM_RETRIES,</span>
+<span class="code-line">              oom.<span class="code-function">get_resume_operator_index</span>());</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">Read the comment out loud: at SF100, 10 retries &times; 5 ms &mdash; 50 ms of patience &mdash; was far too short.</p>
+              <p class="tl">Now it&rsquo;s 100 retries &times; 50 ms (~5 s): enough for probe tasks to outlast a contention window, while still bailing on truly wedged queries.</p>
+              <p class="tl">The budget itself: a hard cap of 100 retries.</p>
+              <p class="tl">Only past that cap does OOM stop being control flow&hellip;</p>
+              <p class="tl">&hellip;and become a loud, logged query termination.</p>
+              <p class="tl">The log carries the task id and the <em>original</em> task id &mdash; each retry is a fresh task.</p>
+              <p class="tl">Plus the exact operator index where the reservation ran out: your first stop when debugging.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128257;</div>
+          <div class="callout-content">
+            <strong class="callout-title">The closed loop</strong>
+            <p>Reserve &rarr; run &rarr; spill-under-pressure &rarr; retry-on-OOM is one circle, not four features. The memory history records each failure&rsquo;s peak, so the retry books a bigger room &mdash; the system converges instead of thrashing.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: Multi-GPU & the device contract ────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Multi-GPU: your room number comes from your booking</h2>
+
+        <p>Since <a href="https://github.com/sirius-db/sirius/pull/732">#732</a>, tasks are dispatched by <span class="term" data-definition="The dispatch preference: send a task to the GPU that already holds its input batches. Round-robin is only the tiebreak when nothing has a preference.">data locality</span> &mdash; round-robin only when nothing has a preference. Which device your code runs on is decided by one thing: the <span class="term" data-definition="The multi-GPU rule (docs/super-sirius/pipeline-execution.md calls it SCHED-RR): gpu_pipeline_task::execute takes its memory space from the task&rsquo;s reservation, and prepare_for_processing colocates every input batch onto it before any operator runs. Never infer the device from a batch.">device contract</span> (SCHED-RR).</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <strong>The reservation names the device</strong>
+              <p><code>gpu_pipeline_task::execute</code> takes its memory space from its reservation &mdash; the booking is the sole authority.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <strong><code>prepare_for_processing</code> colocates everything</strong>
+              <p><em>Every</em> input batch is moved onto that memory space &mdash; before any operator runs.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <strong>Only then do operators run</strong>
+              <p>An operator never asks a batch where it lives. Batches are guests; the booking decided the room.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">&#9888;&#65039;</div>
+          <div class="callout-content">
+            <strong class="callout-title">War story: push, pile-up, pin</strong>
+            <p><a href="https://github.com/sirius-db/sirius/pull/732">#732</a>&rsquo;s greedy <em>push</em> scheduling piled tasks into per-GPU queues &mdash; beyond the downgrade executor&rsquo;s reach, so their batches could never be spilled. <a href="https://github.com/sirius-db/sirius/pull/827">#827</a> restored pull-signal backpressure: workers ask for work, queues stay shallow, victims stay reachable. And after cross-device SIGABRTs, <a href="https://github.com/sirius-db/sirius/pull/996">#996</a> turned &ldquo;prefer this device&rdquo; into &ldquo;pin this device&rdquo; for <span class="term" data-definition="cuCollections &mdash; the GPU hash-table library underneath Sirius joins and aggregations. Its structures are bound to one device, which is why #996 pins instead of prefers.">cuco</span>-backed operators.</p>
+          </div>
+        </div>
+
+        <p>Which brings us to the two ways new code dies in production here:</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-error)">
+            <div class="pattern-icon" style="background: var(--color-error)">&#128274;</div>
+            <h4 class="pattern-title">Hoarding out of reach</h4>
+            <p class="pattern-desc">Holding memory the downgrade executor can&rsquo;t see &mdash; a private stash outside repositories and the inspectable queue turns pressure into a dead query.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-error)">
+            <div class="pattern-icon" style="background: var(--color-error)">&#129517;</div>
+            <h4 class="pattern-title">Guessing the device</h4>
+            <p class="pattern-desc">Inferring your GPU from anything but the task&rsquo;s reservation &mdash; a <a href="https://github.com/sirius-db/sirius/pull/996">#996</a>-class crash waiting for an 8-GPU box.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 5: Quiz ───────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Debug it before it ships</h2>
+
+        <div class="quiz-container" id="quiz-module5">
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Exactly. Before prepare_for_processing runs, batch 0 may still be host-resident or parked on a different device than the reservation. The authoritative memory space is the task&rsquo;s reservation &mdash; anything else is a cross-device access waiting to SIGABRT (the #996 class of bug)."
+               data-explanation-wrong="Not quite. Single-GPU tests pass precisely because every batch trivially agrees with the reservation there. The contract says the reservation &mdash; not any batch &mdash; names the device, and before colocation batch 0 can live anywhere.">
+            <h3 class="quiz-question">A new operator picks its CUDA device with <code>batches[0]-&gt;get_memory_space()</code> before <code>prepare_for_processing</code> has run. Single-GPU tests pass. What happens on an 8-GPU box?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Nothing &mdash; <code>prepare_for_processing</code> will colocate the batches later, fixing any mismatch</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Batch 0 may be host-resident or on another device; the reservation is the authority, so this is a cross-device crash or corruption</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Locality-based dispatch guarantees batch 0 already sits on the dispatch device, so it&rsquo;s slow but safe</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="Right. With no lower tier, no downgrade request can succeed &mdash; there is nothing productive to do. Sirius&rsquo;s actual bug fix here (#911) stopped the monitor from busy-spinning full candidate scans that could never free anything."
+               data-explanation-wrong="Not quite. Killing queries would turn pressure into failure when the system may simply be at a stable high-water mark, and rescanning can never succeed with nowhere to move data. The fixed bug (#911) was exactly that futile busy-spin &mdash; the monitor must idle.">
+            <h3 class="quiz-question">The host tier is full and no disk tier is configured. What should the downgrade monitor do &mdash; and what bug did Sirius actually fix here?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Keep rescanning for candidates in a tight loop &mdash; something will eventually free up</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Terminate the largest running query to relieve pressure immediately</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Idle &mdash; nothing can be freed, and the fixed bug was a busy-spin of futile full scans</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-a"
+               data-explanation-right="Exactly. The pipeline&rsquo;s memory history records the peak observed during the failed attempt, and estimates keep the higher peak. The next reservation is booked bigger up front &mdash; that&rsquo;s what closes the reserve&ndash;run&ndash;spill&ndash;retry loop."
+               data-explanation-wrong="Not quite. The retry backoff buys time within one query; it teaches nothing across queries. Learning lives in the pipeline memory history: failure peaks are recorded, estimates keep the higher peak, and future reservations grow to match.">
+            <h3 class="quiz-question">Your operator&rsquo;s first run OOMs, retries, then succeeds using far more memory than the estimate. What mechanism makes the <em>next</em> query&rsquo;s estimate better?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The pipeline memory history records the failure peak, and estimates keep the higher peak &mdash; so future reservations are sized up</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The 100 &times; 50 ms backoff gives the allocator time to defragment, so later runs fit the original estimate</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The downgrade executor remembers the operator and pre-spills more aggressively before it runs again</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Yes. Repository batches are idle &mdash; no locks, no owner mid-flight, cheap to migrate. Batches inside queued tasks are only reachable through the inspectable task queue (#637) and need coordination, so they&rsquo;re deliberately the second-choice tier of candidates."
+               data-explanation-wrong="Not quite. Size and recency aren&rsquo;t the split &mdash; ownership is. A repository batch is idle and migrates cheaply; a batch inside a queued task needs the inspectable-queue path and coordination with the scheduler, which is why it&rsquo;s only the fallback candidate pool.">
+            <h3 class="quiz-question">Why does downgrade prefer batches in repositories over batches inside queued tasks?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Repository batches are older, so evicting them follows LRU order</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Repository batches are idle and cheap to migrate; queued-task batches need the inspectable-queue path and coordination &mdash; a second-choice pool</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Queued-task batches are already pinned to a device by SCHED-RR and can never be moved</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module5')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module5')">Try Again</button>
+        </div>
+
+        <p><strong>Next: Design Decisions.</strong> Every rule in this module was learned from a specific incident &mdash; next comes the decision history, so you inherit the scar tissue without the scars.</p>
+      </section>
+
+    </div>
+  </div>
+</section>
+<section class="module" id="module-6" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">06</span>
+      <h1 class="module-title">Design Decisions</h1>
+      <p class="module-subtitle">Half of Sirius's design looks over-engineered until you learn which outage or rewrite produced it. Here are the receipts.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: The two currents (hero) ──────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The two currents</h2>
+        <p>Cut a tree and every season is right there in the wood — a drought ring, a growth spurt, a lightning scar. Sirius reads the same way: every "weird" rule is a fossilized incident, and reading the rings gets you the judgment without living the incidents. Almost every ring lines up along one of two currents.</p>
+
+        <div class="animate-in" style="background: var(--color-surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-md); padding: var(--space-6); margin: var(--space-8) 0;">
+
+          <div style="border-left: 4px solid var(--color-actor-2); border-radius: var(--radius-sm); background: var(--color-surface-warm); padding: var(--space-4) var(--space-5); margin-bottom: var(--space-5);">
+            <div style="display: flex; align-items: baseline; gap: var(--space-3); flex-wrap: wrap;">
+              <span style="font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; color: var(--color-actor-2);">Current 1 · away from DuckDB</span>
+              <span style="font-size: var(--text-xs); color: var(--color-text-muted);">destination: a standalone <span class="term" data-definition="The decoupling current's end state: Sirius packaged as a standalone, embeddable GPU engine library that any host — DuckDB, a Rust service, a StarRocks node — can drive over a stable boundary.">libsirius</span></span>
+            </div>
+            <div class="flow-steps" style="margin: var(--space-4) 0 0;">
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-2); color: var(--color-actor-2);">1</div>
+                <p><strong>Native type system</strong><br><a href="https://github.com/sirius-db/sirius/pull/643">#643</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-2); color: var(--color-actor-2);">2</div>
+                <p><strong><span class="term" data-definition="Sirius's native expression AST. Built in #796; since #847 it is the input to lowering, so DuckDB expressions get translated once at the planner boundary and never travel deeper.">sirius::ast</span></strong><br><a href="https://github.com/sirius-db/sirius/pull/796">#796</a>/<a href="https://github.com/sirius-db/sirius/pull/847">#847</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-2); color: var(--color-actor-2);">3</div>
+                <p><strong><span class="term" data-definition="The pointer-to-implementation indirection that once hid DuckDB types behind Sirius's public headers. Native types (#643) removed the need, so #880 deleted the machinery.">PIMPL</span> retired</strong><br><a href="https://github.com/sirius-db/sirius/pull/880">#880</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-2); color: var(--color-actor-2);">4</div>
+                <p><strong>Rust <span class="term" data-definition="Foreign-function interface: the C-ABI boundary added in #908 so non-C++ hosts (Rust first) can drive the engine. The first load-bearing piece of the libsirius surface.">FFI</span></strong><br><a href="https://github.com/sirius-db/sirius/pull/908">#908</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: var(--color-actor-2); border: 4px solid var(--color-actor-2); color: white;">5</div>
+                <p><strong><span class="term" data-definition="The compute-node embedding project: #960 stands up a full Sirius engine context inside a StarRocks compute node — proof the engine survives outside DuckDB.">StarRocks CN</span></strong><br><a href="https://github.com/sirius-db/sirius/pull/960">#960</a></p>
+              </div>
+            </div>
+          </div>
+
+          <div style="border-left: 4px solid var(--color-actor-5); border-radius: var(--radius-sm); background: var(--color-surface-warm); padding: var(--space-4) var(--space-5);">
+            <div style="display: flex; align-items: baseline; gap: var(--space-3); flex-wrap: wrap;">
+              <span style="font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; color: var(--color-actor-5);">Current 2 · into cuCascade</span>
+              <span style="font-size: var(--text-xs); color: var(--color-text-muted);">anything engine-agnostic sinks down: memory, batches, repositories</span>
+            </div>
+            <div class="flow-steps" style="margin: var(--space-4) 0 0;">
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-5); color: var(--color-actor-5);">1</div>
+                <p><strong>Extracted from Sirius</strong><br>Dec&nbsp;2025</p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-5); color: var(--color-actor-5);">2</div>
+                <p><strong>Submodule</strong><br><a href="https://github.com/sirius-db/sirius/pull/144">#144</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-5); color: var(--color-actor-5);">3</div>
+                <p><strong>Partitioned repositories</strong><br><a href="https://github.com/NVIDIA/cuCascade/pull/26">cc#26</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: transparent; border: 4px solid var(--color-actor-5); color: var(--color-actor-5);">4</div>
+                <p><strong>Tri-class batches</strong><br><a href="https://github.com/NVIDIA/cuCascade/pull/117">cc#117</a></p>
+              </div>
+              <div class="flow-arrow">→</div>
+              <div class="flow-step">
+                <div class="flow-step-num" style="background: var(--color-actor-5); border: 4px solid var(--color-actor-5); color: white;">5</div>
+                <p><strong>cudf-free core</strong><br><a href="https://github.com/NVIDIA/cuCascade/pull/150">cc#150</a></p>
+              </div>
+            </div>
+          </div>
+
+          <p style="margin: var(--space-4) 0 0; font-size: var(--text-xs); color: var(--color-text-muted); font-family: var(--font-mono);">hollow ring = laid down and hardened · filled ring = the growing edge</p>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">Why you should care</strong>
+            <p>These two currents explain almost every decision below — and new code that swims against them gets rewritten. Knowing them is the difference between a PR that merges and a PR that gets a history lesson.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: Eight decision cards ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Eight decisions, eight receipts</h2>
+        <p>Each card is one standing decision: what was decided, why it stuck, and the PR where it happened. Contradict one in review and someone will paste you the receipt.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">🧩</div>
+            <h4 class="pattern-title">Extension, not engine</h4>
+            <p class="pattern-desc">Riding inside DuckDB bought a parser, optimizer, and catalog for free on day one. The coupling was the price — Current 1 is that debt being repaid deliberately.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);">2024 inception · <a href="https://github.com/sirius-db/sirius/pull/643">#643</a> · <a href="https://github.com/sirius-db/sirius/pull/880">#880</a> · <a href="https://github.com/sirius-db/sirius/pull/908">#908</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">⚒️</div>
+            <h4 class="pattern-title">cuDF over hand-written kernels</h4>
+            <p class="pattern-desc">Every operator got cheaper to build and faster to trust, with <span class="term" data-definition="cuCollections — NVIDIA's GPU hash-table library underneath cudf's joins and aggregations. Adopting cudf meant inheriting cuco-grade hash tables instead of maintaining hand-rolled ones.">cuco</span> hash tables inherited for free. The legacy kernels were deleted wholesale in Jun 2025.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/6">#6</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">🏗️</div>
+            <h4 class="pattern-title">Total rewrite: Super Sirius</h4>
+            <p class="pattern-desc">The old gpu_executor was single-threaded — no overlap, no memory tiering, no way to retrofit either. The task-based pipeline engine was built alongside it, then cut over.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/96">#96</a> · <a href="https://github.com/sirius-db/sirius/pull/198">#198</a> · <a href="https://github.com/sirius-db/sirius/pull/206">#206</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">📦</div>
+            <h4 class="pattern-title">Repositories + ports, never returns</h4>
+            <p class="pattern-desc">Data lives in shared repositories and moves as handles through ports — no operator ever returns batches to a caller. That one rule buys spillability, barriers, and inspectability (module 4).</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/NVIDIA/cuCascade/pull/26">cc#26</a> · <a href="https://github.com/sirius-db/sirius/pull/519">#519</a> · <a href="https://github.com/sirius-db/sirius/pull/689">#689</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">📐</div>
+            <h4 class="pattern-title">Descriptors now, wiring later</h4>
+            <p class="pattern-desc">Plan-time code emits <span class="term" data-definition="A plan-time, data-only description of the repositories and ports that will connect operators — no engine objects, no allocations. Turned into live wiring later (#607, #770).">repository wiring descriptors</span> through a <span class="term" data-definition="The plan-time construction context passed where sirius_engine&amp; used to be: it accumulates wiring descriptors, keeping pipeline construction engine-free and testable.">pipeline_build_context</span>; <span class="term" data-definition="The runtime step that turns wiring descriptors into live repositories and ports, once an engine and device context actually exist.">materialization</span> happens once an engine exists. Planning stays engine-free and testable.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/607">#607</a> · <a href="https://github.com/sirius-db/sirius/pull/770">#770</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">🕶️</div>
+            <h4 class="pattern-title">Transparent interception</h4>
+            <p class="pattern-desc">GPU support is a plan-generator decision made inside an optimizer extension — invisible to users, with CPU fallback as the safe default. No special syntax, ever.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/518">#518</a> · <a href="https://github.com/sirius-db/sirius/pull/673">#673</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">🧯</div>
+            <h4 class="pattern-title">Downgrade is an executor</h4>
+            <p class="pattern-desc">Spilling is scheduled work with its own threads and priorities — not an allocator callback firing at the worst possible moment, inside someone else's stack frame.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/97">#97</a> · <a href="https://github.com/sirius-db/sirius/pull/368">#368</a> · <a href="https://github.com/sirius-db/sirius/pull/579">#579</a> · <a href="https://github.com/sirius-db/sirius/pull/647">#647</a></p>
+          </div>
+
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">🧲</div>
+            <h4 class="pattern-title">Locality first, reservation-device authority</h4>
+            <p class="pattern-desc">Work follows data across GPUs, and the device that reserved the memory has the final word. The #732→#827 backpressure regression is why the authority rule exists.</p>
+            <p style="margin-top: var(--space-3); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted);"><a href="https://github.com/sirius-db/sirius/pull/732">#732</a> · <a href="https://github.com/sirius-db/sirius/pull/827">#827</a> · <a href="https://github.com/sirius-db/sirius/pull/996">#996</a></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: Archaeology — code↔English ───────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Archaeology: reading a bug's fossil</h2>
+        <p>Decisions also fossilize at line granularity. Pipelines were once declared finished while tasks were still in flight — the query-end SEGFAULT saga (<a href="https://github.com/sirius-db/sirius/pull/766">#766</a>, <a href="https://github.com/sirius-db/sirius/pull/788">#788</a>, <a href="https://github.com/sirius-db/sirius/pull/804">#804</a>) — so <code>mark_task_completed</code> now audits its own invariant on entry.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/sirius_pipeline.cpp · L427-436</span>
+            <pre><code>
+<span class="code-line"><span class="code-keyword">void</span> sirius_pipeline::<span class="code-function">mark_task_completed</span>()</span>
+<span class="code-line">{</span>
+<span class="code-line">  <span class="code-comment">// Sanity check: a task is completing here, which means this pipeline was still</span></span>
+<span class="code-line">  <span class="code-comment">// running work. If the pipeline was already marked finished, or any of its</span></span>
+<span class="code-line">  <span class="code-comment">// operators were already finalized, then we declared the pipeline done too</span></span>
+<span class="code-line">  <span class="code-comment">// early — i.e. a task was still in flight when we considered the pipeline</span></span>
+<span class="code-line">  <span class="code-comment">// complete. That mismatch can make the whole query look done while work is</span></span>
+<span class="code-line">  <span class="code-comment">// still running, so surface it loudly.</span></span>
+<span class="code-line">  <span class="code-keyword">const</span> <span class="code-keyword">bool</span> pipeline_was_finished = pipeline_finished.<span class="code-function">load</span>();</span>
+<span class="code-line">  std::string finalized_ops;</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">A task is reporting completion. Sounds routine — this exact moment used to SEGFAULT whole queries.</p>
+              <p class="tl">Six lines of comment guarding two lines of code: that ratio is the scar, not the wound.</p>
+              <p class="tl">The invariant, stated plainly: if a task is finishing here, nobody may have already declared this pipeline done.</p>
+              <p class="tl">And the failure mode it fossilizes: the query looks complete, teardown begins, and live tasks are still touching freed state.</p>
+              <p class="tl">Evidence sample one: atomically read whether someone already flipped the finished flag.</p>
+              <p class="tl">Evidence sample two: start collecting the names of any already-finalized operators — for the loud log this is about to write.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">🪨</div>
+          <div class="callout-content">
+            <strong class="callout-title">Why the comment is load-bearing</strong>
+            <p>Without it, this check reads as paranoia and some future cleanup PR deletes it. The comment stores <em>which incident</em> produced the code — the ring around the scar — so the invariant survives its authors.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: Want the full history? ───────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Want the full history?</h2>
+        <p>This module showed you the load-bearing rings. The complete cross-section — every PR, in order, clickable — lives one level up.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">🕰️</div>
+            <h4 class="pattern-title"><a href="../sirius-dev-timeline.html">The interactive PR timeline</a></h4>
+            <p class="pattern-desc">Every decision in this module as one continuous, browsable history — from inception to last week. At the repo root: <code>sirius-dev-timeline.html</code>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">📚</div>
+            <h4 class="pattern-title"><a href="https://github.com/sirius-db/sirius/tree/dev/docs/super-sirius">docs/super-sirius/</a></h4>
+            <p class="pattern-desc">The reference docs for the live engine — its README gives the reading order. Required before modifying Super Sirius code, not just recommended.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Quiz ──────────────────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three review comments</h2>
+        <p>Three PRs, three reviewer questions. Answer as the author — with receipts.</p>
+
+        <div class="quiz-container" id="quiz-module6">
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Both standing decisions in one review comment: repositories keep ownership so the batches stay findable and spillable under pressure (cc#26, #689), and only handles/IDs ever cross a boundary — raw buffers never travel."
+               data-explanation-wrong="Ask two things: who can still find these batches under memory pressure, and what Sirius ever allows across an operator or process boundary. (Hint: it is never a raw pointer, and barriers gate timing — not ownership.)">
+            <h3 class="quiz-question">You're adding an operator that must hand result batches to an external process. Which two standing decisions dictate where those batches live and how they're referenced?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Pin the batches with mutable locks and pass raw device pointers — the locks guarantee the buffers stay put</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Batches stay owned by a repository, so they remain findable and spillable; the external process gets handles/IDs — never raw buffers</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Copy them into an operator-owned pinned-host staging area and hand over that pointer</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The port's barrier type decides ownership — make the port FULL and export from there</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="That's Current 1. Since #847 the native AST is what lowering consumes; #796 built it, and #880 retired the PIMPL machinery that raw-DuckDB threading used to require. Translate once at the boundary and everything downstream stays DuckDB-free."
+               data-explanation-wrong="Check Current 1's direction: types (#643), then expressions (#796/#847), then execution state — everything moves away from DuckDB at the planner boundary. Routing DuckDB types deeper, or hiding them behind indirection retired in #880, swims upstream. And cuCascade only absorbs engine-agnostic machinery — never SQL frontend concepts.">
+            <h3 class="quiz-question">You want to teach the planner a new DuckDB expression type. Which direction does the codebase want you to go?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Thread the duckdb::Expression through the planner and evaluate it with DuckDB's evaluator at runtime</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Wrap it in a PIMPL shim so the DuckDB type stays out of public headers</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Translate it into sirius::ast at the boundary — the native AST is the lowering input, so nothing below the planner sees a DuckDB expression</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Add the expression type to cuCascade so both layers can share it</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-a"
+               data-explanation-right="Exactly — #607 split descriptors from live wiring and #770 finished the job. Plan-time code describes repositories and ports as data; materialization turns them into live objects once an engine exists. That's what lets planning move earlier and be tested without standing up an engine."
+               data-explanation-wrong="The answer is architectural, not mechanical. Since #607/#770, plan-time construction produces wiring descriptors — pure data, no engine objects — and materialization happens later. What does that buy planning? Two things: it can move earlier, and it stays testable.">
+            <h3 class="quiz-question">A reviewer asks why your pipeline-construction change takes a <code>pipeline_build_context</code> instead of <code>sirius_engine&amp;</code>. What's the answer?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Plan-time construction must stay engine-free: the context collects wiring descriptors now, materialization happens later — so planning can move earlier and stay testable</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Passing the engine would create a circular include between the planner and engine headers</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>An engine reference risks data races with the downgrade executor's threads during planning</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>sirius_engine is effectively a singleton, so taking it as a parameter is redundant boilerplate</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module6')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module6')">Try Again</button>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">➡️</div>
+          <div class="callout-content">
+            <strong class="callout-title">Next: The Streaming Frontier</strong>
+            <p>The newest growth ring is being laid down right now — the streaming source and sink (<a href="https://github.com/sirius-db/sirius/pull/836">#836</a>, <a href="https://github.com/sirius-db/sirius/pull/837">#837</a>) — and you're the one drawing it.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</section>
+<section class="module" id="module-7">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">07</span>
+      <h1 class="module-title">The Streaming Frontier</h1>
+      <p class="module-subtitle">Your sprint: <a href="https://github.com/sirius-db/sirius/issues/836">#836</a> (streaming source) and <a href="https://github.com/sirius-db/sirius/issues/837">#837</a> (streaming sink) — and the two hangs an edge-triggered engine had waiting for them.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── SCREEN 1: WHERE YOUR OPERATORS SIT ─────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Where your operators sit</h2>
+
+        <p>Everything in modules 1&ndash;6 assumed data comes from disk. Your job (#836/#837) is to teach the engine that data can come from — and leave to — another machine, so Sirius can run as a StarRocks compute node inside a <span class="term" data-definition="StarRocks&rsquo; unit of distributed execution: one slice of a query plan running on one compute node, wired to other fragments by exchanges. Your source sits at a fragment&rsquo;s bottom edge; your sink at its top.">fragment</span>. The engine&rsquo;s loop barely changes. Its <em>assumptions</em> do.</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">the same trace, new leaf</span>
+          <pre><code><span class="code-line"><span class="code-property">Module 3:</span>    SCAN(orders)              → FILTER → COUNT sink</span>
+<span class="code-line"><span class="code-property">Your #836:</span>   STREAMING_SOURCE(channel) → FILTER → COUNT sink</span>
+<span class="code-line"><span class="code-comment">                                          └── everything downstream: untouched</span></span></code></pre>
+        </div>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">📥</div>
+            <h4 class="pattern-title">GPU scan (Module 3)</h4>
+            <p class="pattern-desc">Pulls splits from the <span class="term" data-definition="The scan-side feed of splits that gpu_scan pulls from. Its is_closed() already means closed AND drained — the exact predicate shape the exchange_channel copies for its EOS."><code>split_connector</code></span>. While data remains, every poll yields a split, every split a task — the machine feeds itself.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">📡</div>
+            <h4 class="pattern-title">Your streaming source</h4>
+            <p class="pattern-desc">Pops handles from an <span class="term" data-definition="The planned bounded channel of {batch_id, size_bytes} handles with close-then-drain end-of-stream (design: src/include/exec/exchange_channel.hpp). From the streaming design notes — NOT yet in tree."><code>exchange_channel</code></span> a remote producer pushes into. Same hint machinery — but a stream can legally produce <strong>zero tasks</strong>. Hold that thought.</p>
+          </div>
+        </div>
+
+        <p style="margin-top: var(--space-8)">Your sink (#837) mirrors it at the <em>top</em> of the fragment — and its shape is the first real design decision on your PR:</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-error)">
+            <div class="pattern-icon" style="background: var(--color-error)">✗</div>
+            <h4 class="pattern-title">RESULT_COLLECTOR clone</h4>
+            <p class="pattern-desc">A pure terminal: its <code>sink()</code> runs inside the <em>compute</em> pipeline&rsquo;s task. It creates no tasks of its own — so a full channel could only ever stall a worker thread mid-task.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-success)">
+            <div class="pattern-icon" style="background: var(--color-success)">✓</div>
+            <h4 class="pattern-title">CONCAT-shape boundary</h4>
+            <p class="pattern-desc">A <span class="term" data-definition="An operator that heads its own pipeline with is_source() AND is_sink() both true — like CONCAT. It creates its own tasks, which gives it a hint to gate on. A pure terminal sink has neither.">boundary operator</span>: <code>is_source() &amp;&amp; is_sink()</code>, heading its own pipeline. <span class="term" data-definition="Slowing a producer when the consumer cannot keep up. In Sirius it must surface as fewer tasks created — never as a blocked worker thread.">Backpressure</span> becomes a <em>task-creation condition</em>: full channel → no sink tasks → upstream port repos fill with idle, spillable batches → the engine throttles itself. No worker ever blocks.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 2: THE CHANNEL CONTRACT ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The channel contract</h2>
+
+        <p>Both operators stand on one primitive. Its contract fits on a card — read it as the spec your unit tests will assert:</p>
+
+        <div style="border: 2px dashed var(--color-actor-2); border-radius: var(--radius-md); padding: var(--space-6); background: var(--color-surface); box-shadow: var(--shadow-sm); margin: var(--space-6) 0;">
+          <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: var(--space-1) var(--space-3); margin-bottom: var(--space-4);">Planned API — from the design notes, not yet in tree</span>
+          <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: 0 0 var(--space-4);"><code>exchange_channel</code> — bounded, close-then-drain</h3>
+          <div class="badge-list">
+            <div class="badge-item">
+              <code class="badge-code">{batch_id, size_bytes}</code>
+              <span class="badge-desc">What travels: a handle, never a batch. The batch is registered in a repository FIRST, then the handle is pushed.</span>
+            </div>
+            <div class="badge-item">
+              <code class="badge-code">try_push(h)</code>
+              <span class="badge-desc">False when full or closed; never blocks. The engine side only ever uses the <code>try_</code> pair.</span>
+            </div>
+            <div class="badge-item">
+              <code class="badge-code">try_pop()</code>
+              <span class="badge-desc">Nullopt when empty; never blocks. Blocking <code>push</code>/<code>pop</code> exist only for the wrapper/test side.</span>
+            </div>
+            <div class="badge-item">
+              <code class="badge-code">close()</code>
+              <span class="badge-desc">Idempotent. Forbids new pushes — but queued items stay poppable: <span class="term" data-definition="The EOS discipline: close() rejects new pushes while queued items remain poppable. The stream is only over when closed AND empty. Same predicate shape as split_connector::is_closed().">close-then-drain</span>, not abort.</span>
+            </div>
+            <div class="badge-item">
+              <code class="badge-code">drained()</code>
+              <span class="badge-desc"><code>closed() &amp;&amp; empty()</code> — the one true <span class="term" data-definition="End of stream: the point after which no more batches will ever arrive. In this design it is exactly the state drained() — closed AND empty.">EOS</span> predicate, same shape as <code>split_connector::is_closed()</code>.</span>
+            </div>
+          </div>
+        </div>
+
+        <p>Why handles? Module 4&rsquo;s law: a batch idle in a repository is a spill candidate. Trace one batch across the boundary:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">1</div>
+            <div class="step-body">
+              <strong>Producer registers the batch in a repository</strong>
+              <p>Ownership lands where the downgrade executor can see it — idle, unlocked, spillable.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">2</div>
+            <div class="step-body">
+              <strong>Then it pushes <code>{batch_id, size_bytes}</code></strong>
+              <p>Two POD fields cross the channel. The channel holds metadata, never memory.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">3</div>
+            <div class="step-body">
+              <strong>Your source resolves the id at task-creation time</strong>
+              <p><code>pop_data_batch_by_id(h.batch_id)</code> claims the batch from the repo only when a task is actually being built.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">⚖️</div>
+          <div class="callout-content">
+            <strong class="callout-title">The channel must never own memory</strong>
+            <p>A <code>shared_ptr&lt;data_batch&gt;</code> in the queue would make the channel a hidden owner of GPU memory — invisible to the downgrade executor, Module 5&rsquo;s cardinal sin. Handles keep every queued batch idle-in-repo until the moment a task claims it.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 3: THE HINT TABLE ───────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Your source&rsquo;s hint table</h2>
+
+        <p>Module 3&rsquo;s three answers, re-derived for a channel instead of a <code>split_connector</code> — this is the table your operator&rsquo;s <code>get_next_task_hint()</code> implements (per the design notes):</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">⚡</div>
+            <h4 class="pattern-title">channel non-empty</h4>
+            <p class="pattern-desc"><code>READY{this}</code> — one task per available batch, open <em>or</em> closed. Multi-shot; READY must carry <code>this</code> (a null producer throws).</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">⏸</div>
+            <h4 class="pattern-title">open but empty</h4>
+            <p class="pattern-desc"><code>WAITING_FOR_INPUT_DATA{nullptr}</code> — &ldquo;not now.&rdquo; The producer is a remote machine; there is no upstream operator for the hint chain to recurse into.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🏁</div>
+            <h4 class="pattern-title">closed AND drained</h4>
+            <p class="pattern-desc"><code>std::nullopt</code> — exhausted forever, terminal. The streaming twin of a scan running out of splits.</p>
+          </div>
+        </div>
+
+        <div class="badge-list" style="margin-top: var(--space-6)">
+          <div class="badge-item">
+            <code class="badge-code">all_ports_empty()</code>
+            <span class="badge-desc">Overridden to <code>channel-&gt;drained()</code>. A zero-port source inherits a base that returns true unconditionally — forget this override and your operator&rsquo;s body silently never runs.</span>
+          </div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">⚠️</div>
+          <div class="callout-content">
+            <strong class="callout-title">The hint is not <span class="term" data-definition="Deciding whether work may consume resources at the moment it starts — here, gating each individual pull at task-creation time, not just once per hint round.">admission control</span></strong>
+            <p>Module 3&rsquo;s task creator evaluates the hint once, then loops building tasks — it does <em>not</em> re-poll the hint per pull. Per-pull gating belongs in <code>get_next_task_input_data()</code>: <code>try_pop()</code>, and return <code>nullptr</code> when nothing is there.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 4: THE WAR STORY (HERO) ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The war story: two hangs, zero crashes</h2>
+
+        <p>Picture a mailroom lit by a motion-sensor: the light (the completion check) only switches on when somebody walks <em>out</em> — a task completes. Sirius is <span class="term" data-definition="Edge-triggered: re-evaluate only when an event fires (here: a task completion). Level-triggered: keep re-checking while a condition holds. Sirius completion is edge-triggered — a condition that becomes true without an event is never noticed. That asymmetry is this entire module.">edge-triggered, not level-triggered</span> — and a courier who delivers <em>nothing</em> never trips the sensor. Step through the first hang found while prototyping your source, then its fix:</p>
+
+        <div class="flow-animation" data-steps='[
+          {"highlight":"flow-actor-m7-producer","label":"BUG 1 — the empty stream. The remote producer connects, has zero rows for this fragment, and immediately calls close() on the channel.","packet":true,"from":"actor-m7-producer","to":"actor-m7-channel"},
+          {"highlight":"flow-actor-m7-channel","label":"The channel is now closed AND empty — drained(). End of stream, before it ever began."},
+          {"highlight":"flow-actor-m7-creator","label":"The task creator polls your source once: get_next_task_hint() sees drained() and answers nullopt — exhausted forever. A correct answer. Zero tasks created.","packet":true,"from":"actor-m7-creator","to":"actor-m7-source"},
+          {"highlight":"flow-actor-m7-status","label":"Nothing was created, so nothing ever completes — and update_pipeline_status() only runs on a completion edge. The check never fires. Not once. The room stays dark."},
+          {"highlight":"flow-actor-m7-future","label":"The future never resolves. No error, no crash, no log line. Nothing was wrong — nobody re-checked. The query waits forever."},
+          {"highlight":"flow-actor-m7-channel","label":"THE FIX, part 1: close() fires a wake, so the task creator re-polls the source instead of waiting for a completion edge that will never come.","packet":true,"from":"actor-m7-channel","to":"actor-m7-creator"},
+          {"highlight":"flow-actor-m7-source","label":"THE FIX, part 2: in the task-creation path, the drained-source-with-no-task case explicitly calls update_pipeline_status() itself.","packet":true,"from":"actor-m7-source","to":"actor-m7-status"},
+          {"highlight":"flow-actor-m7-status","label":"The check finally runs: source finished, ports empty, created == completed. Pipeline finished; operators finalize; downstream is notified."},
+          {"highlight":"flow-actor-m7-future","label":"The collector fulfills the future and the query returns its empty result. The switch is wired to the door now — not just to the walkers.","packet":true,"from":"actor-m7-status","to":"actor-m7-future"}
+        ]'>
+          <div class="flow-actors">
+            <div class="flow-actor" id="flow-actor-m7-producer">
+              <div class="flow-actor-icon">🛰️</div>
+              <span>Remote producer</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-channel">
+              <div class="flow-actor-icon">📮</div>
+              <span>exchange_channel</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-source">
+              <div class="flow-actor-icon">📡</div>
+              <span>Streaming source</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-creator">
+              <div class="flow-actor-icon">🏗️</div>
+              <span>Task creator</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-status">
+              <div class="flow-actor-icon">💡</div>
+              <span>Pipeline status</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-future">
+              <div class="flow-actor-icon">⏳</div>
+              <span>Query future</span>
+            </div>
+          </div>
+
+          <div class="flow-packet"></div>
+
+          <div class="flow-step-label">Click "Next Step" to begin</div>
+
+          <div class="flow-controls">
+            <button class="btn flow-next-btn">Next Step</button>
+            <button class="btn flow-reset-btn">Restart</button>
+            <span class="flow-progress"></span>
+          </div>
+        </div>
+
+        <p>Bug 2 is crueler — the stream <em>works</em>, and the hang is a 5&nbsp;ms race at the end:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-4)">
+            <div class="step-num" style="background: var(--color-actor-4)">1</div>
+            <div class="step-body">
+              <strong>t = 0 — the last of 10 tasks completes</strong>
+              <p>Its completion edge runs the check: channel open, not drained → correctly <em>not finished</em>. Right answer, at that instant.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-4)">
+            <div class="step-num" style="background: var(--color-actor-4)">2</div>
+            <div class="step-body">
+              <strong>t = 5 ms — <code>close()</code> arrives</strong>
+              <p><code>drained()</code> flips to true&hellip; but a close is not a completion edge, and edges are the only trigger there is.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-error)">
+            <div class="step-num" style="background: var(--color-error)">∞</div>
+            <div class="step-body">
+              <strong>Zero tasks in flight — zero future edges</strong>
+              <p>The finish condition is true forever, and nobody ever looks at it again. Hang.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>Both fixes land with #836 in the task-creation path (<code>src/creator/task_creator.cpp</code>) — planned, not yet in tree. Now re-read Module 3&rsquo;s finish condition — same file, same lines — with streaming eyes:</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/sirius_pipeline.cpp:389</span>
+            <pre><code><span class="code-line">      <span class="code-keyword">if</span> (limit_exhausted ||</span>
+<span class="code-line">          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>()) ) {</span>
+<span class="code-line">        <span class="code-keyword">if</span> (tasks_created.<span class="code-function">load</span>() == tasks_completed.<span class="code-function">load</span>()) {</span>
+<span class="code-line">          pipeline_finished.<span class="code-function">store</span>(<span class="code-keyword">true</span>);</span>
+<span class="code-line">          <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; op : <span class="code-function">get_operators</span>()) {</span>
+<span class="code-line">            op.<span class="code-function">get</span>().<span class="code-function">finalize_operator</span>();</span>
+<span class="code-line">          }</span>
+<span class="code-line">          <span class="code-function">end_nvtx_range_if_finished</span>();</span>
+<span class="code-line">          should_notify = <span class="code-keyword">true</span>;</span>
+<span class="code-line">        }</span>
+<span class="code-line">      }</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">STREAMING EYES</span>
+            <div class="translation-lines">
+              <p class="tl">You studied this in Module 3 — the LIMIT escape hatch is irrelevant for a stream that produced nothing.</p>
+              <p class="tl">For your source, both clauses delegate to the channel: <em>finished</em> and <code>all_ports_empty()</code> are both <code>drained()</code>. An empty, closed stream passes instantly.</p>
+              <p class="tl">Zero created equals zero completed — trivially true. Every condition holds.</p>
+              <p class="tl">So the pipeline <em>would</em> finish, and every operator <em>would</em> finalize&hellip;</p>
+              <p class="tl">&hellip;and <code>should_notify</code> <em>would</em> wake the downstream FULL barrier, exactly like Module 3.</p>
+              <p class="tl">The condition is perfect. The streaming question is different: <strong>who calls this when a stream closes and no task is in flight?</strong> Pre-fix: nobody.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">Install your own switch</strong>
+            <p>A scan gets its completion evaluation for free — there&rsquo;s always a task in flight to trip the sensor. A stream must install its own switch: every zero-task EOS path has to trigger the status evaluation itself. Any operator whose input isn&rsquo;t the scan manager will face this exact gap.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 5: SHIP CHECKLIST ───────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The ship checklist</h2>
+
+        <p>Six invariants, one from each stop of this course. Pin this next to your two PRs:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>The channel carries handles; the repository owns batches <code>M4</code></strong>
+              <p>Queued data stays idle-in-repo — spillable — and the channel never pins GPU memory.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>Barrier types on the wired ports are streaming-compatible <code>M4</code></strong>
+              <p>A FULL barrier waits for a producer pipeline to finish — check what that means when the producer is a stream.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>Admission lives in <code>get_next_task_input_data()</code>, not just the hint <code>M3</code></strong>
+              <p>The creator&rsquo;s loop doesn&rsquo;t re-poll hints — gate every pull, return <code>nullptr</code> when the channel is dry.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>Zero-task EOS paths trigger status evaluation themselves <code>M7</code></strong>
+              <p>No completion edge means no free re-check. The empty stream and the late close both need <em>your</em> switch.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>External consumers must not outlive <span class="term" data-definition="task_scheduler::drain_after_error() — the error path with load-bearing teardown ordering: stop the task creator FIRST, keep its queue interrupted, drain every executor, only then restart. Anything outside the engine still holding handles after that order runs is a use-after-free."><code>drain_after_error</code></span>&rsquo;s drain order <code>M2/M3</code></strong>
+              <p>The error path tears down in a fixed order; a remote reader holding handles past it is a use-after-free.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>The device comes from the reservation when #838 partitioning arrives <code>M5</code></strong>
+              <p>Never infer a GPU from a batch — the task&rsquo;s reservation is the sole authority, streaming or not.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">🚢</div>
+          <div class="callout-content">
+            <strong class="callout-title">Agreed sequencing: standalone PRs first</strong>
+            <p>Operators plus unit tests, no compute-node wiring — <code>exchange_channel</code> + source as PR&nbsp;1, sink as PR&nbsp;2. The CN integration lands only after both stand alone in the tree.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 6: QUIZ + COURSE CLOSE ──────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Review questions for your own PRs</h2>
+
+        <p>Four questions a sharp reviewer will ask on #836/#837. Answer like you&rsquo;re defending the design.</p>
+
+        <div class="quiz-container" id="quiz-module7">
+          <div class="quiz-question-block"
+               data-correct="q1-b"
+               data-explanation-right="Right — backpressure is a task-creation condition. The hint answers WAITING, no sink tasks are built, and upstream output parks in port repositories as idle batches — exactly the spillable population Module 4&rsquo;s downgrade executor knows how to relieve. Every worker stays free."
+               data-explanation-wrong="Not quite. The engine side is try_push only — a worker never blocks on the channel, and nothing is dropped or failed. A full channel simply stops sink task creation; pressure surfaces as idle batches in port repos, which are spill candidates, not casualties.">
+            <h3 class="quiz-question">1. The streaming sink&rsquo;s channel is full and stays full for 30&nbsp;s. What is the CORRECT observable behavior inside the engine?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q1-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The upstream worker blocks on <code>push()</code> until the channel has room — that&rsquo;s what a bounded channel is for</span>
+              </button>
+              <button class="quiz-option" data-value="q1-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>No new sink tasks are created; upstream batches accumulate as idle, spillable batches in port repositories; no worker ever blocks</span>
+              </button>
+              <button class="quiz-option" data-value="q1-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The sink drops the oldest queued batches and logs a warning until the channel drains</span>
+              </button>
+              <button class="quiz-option" data-value="q1-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The query fails with a backpressure timeout once the retry budget is exhausted</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q2-b"
+               data-explanation-right="Exactly. A RESULT_COLLECTOR-shape sink has no tasks of its own — its sink() runs inside the compute pipeline&rsquo;s task, so honoring a full channel would mean stalling that worker mid-task. A boundary operator creates its own tasks, so the hint can simply refuse to create one."
+               data-explanation-wrong="Not quite. The shapes differ in who owns the task: RESULT_COLLECTOR&rsquo;s sink() runs inside somebody else&rsquo;s task, so a full channel leaves nothing to gate — you could only block the worker. The CONCAT shape heads its own pipeline, making backpressure a task-creation condition.">
+            <h3 class="quiz-question">2. Why must the sink be a CONCAT-shape boundary operator instead of a RESULT_COLLECTOR-shape terminal sink?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q2-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The CONCAT shape avoids a host-side copy of the final result before it crosses the channel</span>
+              </button>
+              <button class="quiz-option" data-value="q2-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A RESULT_COLLECTOR-shape sink creates no tasks of its own, so a full channel has nothing to gate — the only place to wait would be a blocked worker thread</span>
+              </button>
+              <button class="quiz-option" data-value="q2-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>is_source()</code> is required so the engine will call <code>finalize_operator()</code> on the sink</span>
+              </button>
+              <button class="quiz-option" data-value="q2-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The plan generator can only place a RESULT_COLLECTOR in the query&rsquo;s last pipeline, and a fragment has no last pipeline</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q3-b"
+               data-explanation-right="Yes — a silent hang. The last completion edge ran the check and correctly saw open-not-drained; the close() 5 ms later changed the answer but arrived with zero tasks in flight, so nothing ever re-ran the evaluation. That is Bug 2, and exactly why close() must fire a wake."
+               data-explanation-wrong="Not quite. All ten batches processed fine — nothing is lost or wrong. The failure is temporal: the final check ran 5 ms too early (open-not-drained), and the close() that would flip it had no completion edge left to ride. Pre-fix, that is a hang with empty logs — and there is no idle timer to save you.">
+            <h3 class="quiz-question">3. A fragment&rsquo;s stream delivers 10 batches, all processed; <code>close()</code> arrives 5&nbsp;ms after the last task completed. Pre-fix, what does the user see and why?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q3-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The query returns correctly — <code>close()</code> flips <code>drained()</code>, and the source hint returns <code>nullopt</code> on the next poll</span>
+              </button>
+              <button class="quiz-option" data-value="q3-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A hang: the last completion check saw open-but-not-drained, and the close arrived with no task left in flight to re-trigger the evaluation</span>
+              </button>
+              <button class="quiz-option" data-value="q3-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A crash in <code>finalize_operator()</code> — the pipeline finalizes twice, once per signal</span>
+              </button>
+              <button class="quiz-option" data-value="q3-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The query returns, but only after the scheduler&rsquo;s idle timer re-polls the pipeline status</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q4-c"
+               data-explanation-right="That&rsquo;s the review answer. The repository stays the single owner, so a queued batch remains idle-in-repo — visible and spillable to the downgrade executor — and the channel can never pin GPU memory. The consumer resolves the id via pop_data_batch_by_id at task-creation time."
+               data-explanation-wrong="Not quite. Message size and ref-count mechanics are noise here — ownership is the point. A shared_ptr in the channel would make the channel a hidden owner of GPU memory, invisible to the downgrade executor (Module 5&rsquo;s cardinal sin). Handles keep batches idle-in-repo, spillable until a task claims them.">
+            <h3 class="quiz-question">4. Your reviewer asks: &ldquo;why does the channel carry <code>{batch_id, size}</code> instead of <code>shared_ptr&lt;data_batch&gt;</code>?&rdquo; Best answer?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q4-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Smaller messages — two POD fields move through a bounded queue faster than a control block</span>
+              </button>
+              <button class="quiz-option" data-value="q4-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>shared_ptr</code> cannot safely cross the FFI boundary to the StarRocks side of the exchange</span>
+              </button>
+              <button class="quiz-option" data-value="q4-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Ownership stays with the repository, so queued batches remain idle and spillable and the channel never pins GPU memory; ids resolve via <code>pop_data_batch_by_id</code> at task-creation time</span>
+              </button>
+              <button class="quiz-option" data-value="q4-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>It avoids atomic ref-count contention between the producer and consumer threads</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module7')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module7')">Try Again</button>
+        </div>
+
+        <p style="margin-top: var(--space-8)">That&rsquo;s the course: the whole engine in Modules 1&ndash;6, and the newest ring on the tree — yours — in this one. The full designs live at <code>experimental/starrocks/docs/streaming-source-plan.md</code>, <code>streaming-sink-plan.md</code>, and <code>discoveries.md</code>; the work is <a href="https://github.com/sirius-db/sirius/issues/836">#836</a> and <a href="https://github.com/sirius-db/sirius/issues/837">#837</a>. Standalone operators, unit tests, no CN wiring — go install your switch.</p>
+      </section>
+
+    </div>
+  </div>
+</section>
+  </main>
+
+</body>
+</html>

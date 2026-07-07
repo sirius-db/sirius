@@ -1,0 +1,296 @@
+<section class="module" id="module-1">
+  <div class="module-content">
+
+    <header class="module-header animate-in">
+      <span class="module-number">01</span>
+      <h1 class="module-title">The Big Picture</h1>
+      <p class="module-subtitle">You load one extension. Your SQL doesn't change. Supported queries silently run on the GPU. Where exactly does the swap happen?</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: What Sirius is ─────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">A simultaneous interpreter in the booth</h2>
+
+        <p>DuckDB is the speaker at the podium; Sirius sits in the interpreter's booth, translating the talk into GPU execution live, mid-sentence. When it hits an idiom it can't translate, it hands the mic back — and the audience never notices the switch.</p>
+
+        <div class="icon-rows stagger-children">
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-actor-2)">&#128483;&#65039;</div>
+            <div>
+              <strong>DuckDB speaks</strong>
+              <p>Parses, binds, optimizes — business as usual. It has no idea it's being interpreted.</p>
+            </div>
+          </div>
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-actor-1)">&#127911;</div>
+            <div>
+              <strong>Sirius translates live</strong>
+              <p>In the booth, it converts DuckDB's optimized plan into its own GPU operators, mid-sentence.</p>
+            </div>
+          </div>
+          <div class="icon-row animate-in">
+            <div class="icon-circle" style="background: var(--color-actor-4)">&#127908;</div>
+            <div>
+              <strong>The mic hands back silently</strong>
+              <p>Untranslatable idiom? The CPU takes over — correct results, and nobody hears the switch.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>Concretely: Sirius is a GPU-native SQL engine shipped as a DuckDB extension. Compute runs on <span class="term" data-definition="NVIDIA's GPU DataFrame library (RAPIDS). Sirius's compute layer — joins, filters, and aggregations run as libcudf calls instead of hand-written kernels.">cuDF</span> and <span class="term" data-definition="RAPIDS Memory Manager — the pool allocator for GPU device memory. Every device allocation in Sirius flows through it.">RMM</span>, with memory and data-movement primitives from NVIDIA <span class="term" data-definition="NVIDIA's building-block library for GPU query engines: memory tiers, spilling, and data-movement primitives. The current Sirius engine is built on top of it.">cuCascade</span>.</p>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#129504;</div>
+          <div class="callout-content">
+            <strong class="callout-title">The whole engine in one sentence</strong>
+            <p>Sirius intercepts a SQL query, converts DuckDB's plan into its own physical operators, groups them into pipelines, and a task creator turns 'operator + available input' into GPU tasks that a scheduler runs. Data flows between operators through repositories (not function returns), and ports tell each operator where its input lives.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: The interception path ──────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The swap happens in exactly one place</h2>
+
+        <p>Sirius hooks DuckDB through an <span class="term" data-definition="A DuckDB hook that lets an extension inspect or rewrite the optimized logical plan before physical planning. Sirius uses it only to capture a copy of the plan — judgment happens later.">optimizer extension</span>. The hook itself decides nothing about GPU support — it just captures the plan for a later verdict.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <strong>The hook copies the optimized logical plan</strong>
+              <p>DuckDB's optimizer finishes; Sirius copies the plan and stashes it in its per-connection state. No GPU judgment yet.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <strong><span class="term" data-definition="A late callback in DuckDB's prepare phase. This is where Sirius actually runs create_plan() on the captured plan copy and the GPU-vs-CPU verdict lands.">OnFinalizePrepare</span> runs <code>create_plan()</code></strong>
+              <p><code>sirius_physical_plan_generator::create_plan()</code> walks the copy, building Sirius physical operators — or throwing at the first unsupported one.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <strong>Success wraps the plan; a throw falls back</strong>
+              <p>Success: the plan is wrapped in <span class="term" data-definition="The wrapper physical operator that gets swapped into DuckDB's plan on success. When DuckDB executes it, Sirius's GPU engine runs the query underneath.">PhysicalSiriusExecution</span> and swapped in. Throw: DuckDB's own CPU plan runs, silently.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/transparent/sirius_optimizer_extension.cpp</span>
+            <pre><code>
+<span class="code-line"><span class="code-comment">  // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this</span></span>
+<span class="code-line"><span class="code-comment">  // copy — that's the single source of truth for GPU support. If the plan contains</span></span>
+<span class="code-line"><span class="code-comment">  // unsupported operators, create_plan() throws and we fall back to CPU.</span></span>
+<span class="code-line">  <span class="code-keyword">try</span> {</span>
+<span class="code-line">    <span class="code-keyword">auto</span> plan_copy = plan-&gt;<span class="code-function">Copy</span>(context);</span>
+<span class="code-line">    ctx-&gt;<span class="code-function">set_captured_logical_plan</span>(std::<span class="code-function">move</span>(plan_copy));</span>
+<span class="code-line">  } <span class="code-keyword">catch</span> (duckdb::NotImplementedException&amp;) {</span>
+<span class="code-line"><span class="code-comment">    // Plan not serializable — skip GPU.</span></span>
+<span class="code-line">  } <span class="code-keyword">catch</span> (std::exception&amp; e) {</span>
+<span class="code-line">    spdlog::<span class="code-function">debug</span>(<span class="code-string">"Transparent execution: failed to copy logical plan: {}"</span>, e.what());</span>
+<span class="code-line">  }</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">The comment states the contract: <code>create_plan()</code> on this copy is the <em>single source of truth</em> for GPU support — no other code path gets a vote.</p>
+              <p class="tl">And the failure mode is spelled out up front: an unsupported operator means a throw, and the throw <em>is</em> the fallback signal.</p>
+              <p class="tl">Copy the plan so Sirius owns its own version — DuckDB keeps the original, untouched, ready for CPU execution.</p>
+              <p class="tl">Stash the copy in Sirius's per-connection state; OnFinalizePrepare will pick it up once preparation finalizes.</p>
+              <p class="tl">Some plans can't even be copied (not serializable). No drama: quietly skip GPU — the user's query still runs on CPU.</p>
+              <p class="tl">Anything else unexpected gets logged at debug level. The user never sees an error, just a CPU-executed query.</p>
+              <p class="tl">Either way the query proceeds. GPU is an optimization, never a requirement.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">&#128161;</div>
+          <div class="callout-content">
+            <strong class="callout-title">Key insight: GPU support is a plan-level decision, made once</strong>
+            <p><code>create_plan()</code> either succeeds (plan wrapped and swapped) or throws (silent CPU fallback). So when a query unexpectedly runs on CPU — or you wonder "will my new operator ever be used?" — there is exactly one gate to check.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: Four eras ──────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Four eras to get here</h2>
+
+        <p>The codebase you're joining is the third engine to wear the name. Knowing the strata explains why <code>src/legacy/</code> exists and why everything new lives in namespace <code>sirius</code>.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">&#9935;&#65039;</div>
+            <h4 class="pattern-title">2024 · Hand-written CUDA</h4>
+            <p class="pattern-desc">The <span class="term" data-definition="The original 2024 engine: a bespoke CUDA kernel per operator. Dead code today, quarantined under src/legacy/ — never modify it.">gpu_processing</span> era: a bespoke kernel per operator. Heroic, unmaintainable, ultimately a dead end.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">&#128260;</div>
+            <h4 class="pattern-title">Apr 2025 · The cuDF pivot</h4>
+            <p class="pattern-desc"><a href="https://github.com/sirius-db/sirius/pull/6">#6</a> rebased compute onto cuDF: stop writing kernels, start composing libcudf. The engine got a library.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">&#127959;&#65039;</div>
+            <h4 class="pattern-title">Dec 2025&ndash;Feb 2026 · <span class="term" data-definition="The current, live engine: namespace sirius, source under src/op/, src/planner/, src/pipeline/, src/cuda/. A ground-up rewrite on cuCascade with pipelines, repositories, ports, and a task scheduler.">Super Sirius</span></h4>
+            <p class="pattern-desc">Ground-up rewrite on cuCascade: <a href="https://github.com/sirius-db/sirius/pull/96">#96</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/134">#134</a> &rarr; <a href="https://github.com/sirius-db/sirius/pull/198">#198</a>, first end-to-end query in <a href="https://github.com/sirius-db/sirius/pull/206">#206</a>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">&#127917;</div>
+            <h4 class="pattern-title">Apr 2026 · <span class="term" data-definition="The contract that plain SQL needs no changes: Sirius hooks DuckDB's planning, swaps in a GPU plan when supported, and silently falls back to CPU when not.">Transparent interception</span></h4>
+            <p class="pattern-desc"><a href="https://github.com/sirius-db/sirius/pull/518">#518</a>: load the extension and plain SQL just runs on GPU. No special syntax — the interpreter enters the booth.</p>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code">src/legacy/</code>
+            <span class="badge-desc">The dead gpu_processing path, quarantined. Read it for archaeology — never modify it. All new work targets Super Sirius.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: The flow strip (hero visual) ───────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The whole machine on one strip</h2>
+
+        <p>This is the map for the rest of the course — every later module zooms into one or two boxes on this strip.</p>
+
+        <div class="flow-steps animate-in">
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p>SQL query arrives</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p>Interception (plan captured)</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">3</div>
+            <p>Plan conversion <code>create_plan()</code></p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">4</div>
+            <p>Sirius physical operators</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">5</div>
+            <p>Pipelines &amp; ports</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">6</div>
+            <p><code>task_creator</code>: operator + input &rarr; tasks</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">7</div>
+            <p><code>task_scheduler</code> runs them on GPU</p>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code">repositories</code>
+            <span class="badge-desc">Underneath the strip: data never travels as function returns — operators publish results into repositories, and ports tell each operator where its input lives.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code">memory tiers</code>
+            <span class="badge-desc">Beneath everything: buffers live in tiers (GPU, host, disk), so plans bigger than VRAM can still finish. Module 5 goes deep here.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 5: Quiz ───────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Check your map</h2>
+
+        <div class="quiz-container" id="quiz-module1">
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Exactly — the LATERAL join has no GPU operator mapping, so create_plan() threw during prepare. The fallback happens before execution and is silent: correct results, CPU speed, idle GPU."
+               data-explanation-wrong="Not quite. An unloaded extension would leave every query on CPU, not just this one — and a mid-query crash wouldn't quietly return clean results. The decision lands before execution, inside create_plan().">
+            <h3 class="quiz-question">A teammate's query with a LATERAL join returns correct results but runs slow, and nvidia-smi shows the GPU idle. What happened?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The Sirius extension isn't loaded, so DuckDB never offered the plan to the GPU</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>create_plan()</code> hit an unsupported operator, threw, and the query silently fell back to DuckDB's CPU execution</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The GPU plan crashed mid-execution and DuckDB re-ran the query on the CPU</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-a"
+               data-explanation-right="Yes. create_plan() is the single gate — plan-level and all-or-nothing. A new operator class is invisible until the plan generator maps a logical operator to it."
+               data-explanation-wrong="Not quite. The scheduler only runs tasks from a plan that already passed the gate, and the optimizer hook copies the plan blindly — judgment happens in exactly one place: create_plan().">
+            <h3 class="quiz-question">You added a new GPU operator class and rebuilt, but queries never use it. What's the one place that decides?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>sirius_physical_plan_generator::create_plan()</code> — until it maps the logical operator to your class, the plan throws to CPU</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The <code>task_scheduler</code> — it decides at runtime which operators are worth running on the GPU</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The optimizer extension hook — it filters unsupported operators out of the plan copy</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Exactly — transparent interception means the swap (and the swap back) is invisible. If GPU coverage were a user-facing error, every unsupported operator would be a breaking change."
+               data-explanation-wrong="Not the reason. Silence is a deliberate contract: plain SQL in, correct results out, GPU when possible. (Fallbacks do get logged at debug level — the silence is for the user, not the log.)">
+            <h3 class="quiz-question">Why is the CPU fallback silent by design, rather than a warning or an error?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>DuckDB aborts the whole query if an optimizer extension raises, so Sirius has no choice</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>It's the transparency contract: users write plain SQL, correctness is always available on CPU, and GPU is an optimization — not a requirement</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Logging every fallback would be prohibitively noisy at production query volume</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module1')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module1')">Try Again</button>
+        </div>
+
+        <p><strong>Next: Meet the Actors</strong> — the seven objects that do all of this.</p>
+      </section>
+
+    </div>
+  </div>
+</section>

@@ -1,0 +1,349 @@
+<section class="module" id="module-5">
+  <div class="module-content">
+
+    <header class="module-header animate-in">
+      <span class="module-number">05</span>
+      <h1 class="module-title">Memory &amp; Multi-GPU</h1>
+      <p class="module-subtitle">GPU memory is the scarcest thing in this engine. Sirius&rsquo;s answer: nothing runs without a reservation, and pressure triggers relocation &mdash; not a crash.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: Tiers & reservations ───────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Book before you travel</h2>
+
+        <p>Think of a hotel with an annex and a storage depot: you don&rsquo;t get a room by walking in, you <em>book before travel</em>. In Sirius, every memory allocation lives on a three-rung <span class="term" data-definition="A rung on the spill ladder: tier 0 = GPU device memory, tier 1 = pinned host memory per NUMA node, tier 2 = disk. Downgrade moves data down; demand pulls it back up.">tier</span> ladder, and no task touches tier 0 without a booking.</p>
+
+        <div class="flow-steps animate-in">
+          <div class="flow-step">
+            <div class="flow-step-num">0</div>
+            <p><strong>GPU device memory</strong><br>the main building &mdash; fast, tiny, contested</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p><strong><span class="term" data-definition="Page-locked CPU RAM, one pool per NUMA node, that GPUs can DMA to and from at full interconnect speed. This is Sirius tier 1.">Pinned host</span>, per NUMA</strong><br>the annex &mdash; roomier, a walk away</p>
+          </div>
+          <div class="flow-arrow">&rarr;</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p><strong>Disk</strong><br>the storage depot &mdash; vast, slow, the floor</p>
+          </div>
+        </div>
+
+        <p>All three tiers are managed by <code>sirius_memory_reservation_manager</code> (cuCascade). Before the GPU executor&rsquo;s manager thread dispatches a task, it makes a <span class="term" data-definition="A pre-granted memory budget from sirius_memory_reservation_manager, sized from the pipeline&rsquo;s memory history and attached to a task before dispatch. Operators allocate inside it; it is released at task end. No reservation, no execution.">reservation</span> sized from the pipeline&rsquo;s <span class="term" data-definition="A per-pipeline record of observed memory peaks &mdash; including peaks from failed attempts. It sizes future reservations, so a pipeline that OOMed once reserves more the next time.">memory history</span>.</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <strong>Reserve</strong>
+              <p>The manager thread books a budget on a specific <span class="term" data-definition="A concrete memory location in cuCascade terms: one GPU device, one pinned-host NUMA pool, or disk. Batches and reservations are always bound to exactly one.">memory space</span>, sized from what this pipeline actually used before.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <strong>Run inside the budget</strong>
+              <p>The task dispatches; its operators allocate within the reservation &mdash; never around it.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <strong>Release at task end</strong>
+              <p>Check-out is automatic. The freed budget is what lets the next blocked task dispatch.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code">no reservation</code>
+            <span class="badge-desc">&rarr; the task won&rsquo;t run. There is no walk-in path to GPU memory.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: Pressure & downgrade (HERO) ────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The night manager: downgrade under pressure</h2>
+
+        <p>Each memory space has its own <code>downgrade_executor</code> &mdash; a night manager with two employees: a monitor thread watching occupancy, and a processing thread executing <span class="term" data-definition="A unit of work for the downgrade executor&rsquo;s processing thread: relocate this victim batch one tier down to relieve pressure in its memory space.">downgrade requests</span>. Step through what happens when the main building fills.</p>
+
+        <div class="flow-animation animate-in" data-steps='[
+          {"highlight":"flow-actor-m5-gpu","label":"Monitor thread sees GPU memory usage cross its threshold &mdash; pressure detected, no panic"},
+          {"highlight":"flow-actor-m5-gpu","label":"Candidate hunt: idle batches sitting in repositories first, then batches held inside queued tasks (inspectable task queue, PR #637)"},
+          {"highlight":"flow-actor-m5-host","packet":true,"from":"actor-m5-gpu","to":"actor-m5-host","label":"Processing thread executes the downgrade request: the victim batch relocates to pinned host memory"},
+          {"highlight":"flow-actor-m5-host","label":"Freed device memory lets a blocked reservation be granted &mdash; the stalled task dispatches"},
+          {"highlight":"flow-actor-m5-disk","packet":true,"from":"actor-m5-host","to":"actor-m5-disk","label":"Host tier under pressure too: the batch continues down to disk (fallback added in PR #647)"},
+          {"highlight":"flow-actor-m5-gpu","packet":true,"from":"actor-m5-disk","to":"actor-m5-gpu","label":"When a task needs that data again, it climbs back up on demand &mdash; nothing lost, nothing crashed"}
+        ]'>
+          <div class="flow-actors">
+            <div class="flow-actor" id="flow-actor-m5-gpu">
+              <div class="flow-actor-icon">0</div>
+              <span>GPU device memory<br>tier 0</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m5-host">
+              <div class="flow-actor-icon">1</div>
+              <span>pinned host (per NUMA)<br>tier 1</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m5-disk">
+              <div class="flow-actor-icon">2</div>
+              <span>disk<br>tier 2</span>
+            </div>
+          </div>
+
+          <div class="flow-packet"></div>
+
+          <div class="flow-step-label">Click &ldquo;Next Step&rdquo; to begin</div>
+
+          <div class="flow-controls">
+            <button class="btn flow-next-btn">Next Step</button>
+            <button class="btn flow-reset-btn">Restart</button>
+            <span class="flow-progress"></span>
+          </div>
+        </div>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code">repositories</code>
+            <span class="badge-desc">First-choice victims: idle batches parked between operators &mdash; unlocked, cheap to migrate.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code">queued tasks</code>
+            <span class="badge-desc">Second choice: batches held by queued-but-not-running tasks, reachable only through the <span class="term" data-definition="A task queue the downgrade executor can look inside (PR #637), making batches held by queued-but-not-yet-running tasks visible as spill candidates.">inspectable task queue</span> (<a href="https://github.com/sirius-db/sirius/pull/637">#637</a>).</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: OOM as control flow ────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">OOM is control flow, not a crash</h2>
+
+        <p>What if a task allocates beyond its reservation anyway? It throws <span class="term" data-definition="The exception a task throws when an allocation exceeds its reservation. It carries the intermediate operator data plus a resume index, so the retry restarts mid-pipeline instead of from scratch.">oom_reschedule_exception</span> &mdash; the moment a task gives up gracefully, packaging its partial state and the operator index to resume from.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/gpu_pipeline_task.cpp:326-331</span>
+            <pre><code>
+<span class="code-line">      <span class="code-keyword">throw</span> <span class="code-function">oom_reschedule_exception</span>(</span>
+<span class="code-line">        std::<span class="code-function">move</span>(operator_input_output_data),</span>
+<span class="code-line">        i,</span>
+<span class="code-line">        <span class="code-string">"OOM at operator "</span> + op.<span class="code-function">get_name</span>() + <span class="code-string">" (index "</span> + std::<span class="code-function">to_string</span>(i) + <span class="code-string">")"</span>);</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">The graceful surrender: not a crash, but a thrown value that <em>is</em> the reschedule plan.</p>
+              <p class="tl">The intermediate results move out with the exception &mdash; operators that already finished never re-run.</p>
+              <p class="tl"><code>i</code> is the resume index: the retry restarts at exactly this operator, mid-pipeline.</p>
+              <p class="tl">And the message names the failing operator &mdash; the breadcrumb you grep for in a log full of retries.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>The executor catches it, backs off, and requeues. The retry budget is a hard constant &mdash; and the comment above it is real tuning history, recorded in code.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/gpu_pipeline_executor.cpp:330-343</span>
+            <pre><code>
+<span class="code-line"><span class="code-comment">          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far</span></span>
+<span class="code-line"><span class="code-comment">          // too short. With 100 retries × 50 ms backoff (~5 s) the probe</span></span>
+<span class="code-line"><span class="code-comment">          // tasks get enough patience to clear the contention window while</span></span>
+<span class="code-line"><span class="code-comment">          // still bailing out on truly wedged queries.</span></span>
+<span class="code-line">          <span class="code-keyword">static constexpr</span> <span class="code-keyword">uint32_t</span> MAX_OOM_RETRIES = <span class="code-number">100</span>;</span>
+<span class="code-line">          <span class="code-keyword">if</span> (next_retry_count &gt; MAX_OOM_RETRIES) {</span>
+<span class="code-line">            <span class="code-function">SIRIUS_LOG_ERROR</span>(</span>
+<span class="code-line">              <span class="code-string">"GPU Pipeline Executor: task {} (original task {}) exceeded {} OOM retries at "</span></span>
+<span class="code-line">              <span class="code-string">"operator index {} — terminating query"</span>,</span>
+<span class="code-line">              gpu_task-&gt;<span class="code-function">get_task_id</span>(),</span>
+<span class="code-line">              orig_task_id,</span>
+<span class="code-line">              MAX_OOM_RETRIES,</span>
+<span class="code-line">              oom.<span class="code-function">get_resume_operator_index</span>());</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">Read the comment out loud: at SF100, 10 retries &times; 5 ms &mdash; 50 ms of patience &mdash; was far too short.</p>
+              <p class="tl">Now it&rsquo;s 100 retries &times; 50 ms (~5 s): enough for probe tasks to outlast a contention window, while still bailing on truly wedged queries.</p>
+              <p class="tl">The budget itself: a hard cap of 100 retries.</p>
+              <p class="tl">Only past that cap does OOM stop being control flow&hellip;</p>
+              <p class="tl">&hellip;and become a loud, logged query termination.</p>
+              <p class="tl">The log carries the task id and the <em>original</em> task id &mdash; each retry is a fresh task.</p>
+              <p class="tl">Plus the exact operator index where the reservation ran out: your first stop when debugging.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">&#128257;</div>
+          <div class="callout-content">
+            <strong class="callout-title">The closed loop</strong>
+            <p>Reserve &rarr; run &rarr; spill-under-pressure &rarr; retry-on-OOM is one circle, not four features. The memory history records each failure&rsquo;s peak, so the retry books a bigger room &mdash; the system converges instead of thrashing.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: Multi-GPU & the device contract ────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Multi-GPU: your room number comes from your booking</h2>
+
+        <p>Since <a href="https://github.com/sirius-db/sirius/pull/732">#732</a>, tasks are dispatched by <span class="term" data-definition="The dispatch preference: send a task to the GPU that already holds its input batches. Round-robin is only the tiebreak when nothing has a preference.">data locality</span> &mdash; round-robin only when nothing has a preference. Which device your code runs on is decided by one thing: the <span class="term" data-definition="The multi-GPU rule (docs/super-sirius/pipeline-execution.md calls it SCHED-RR): gpu_pipeline_task::execute takes its memory space from the task&rsquo;s reservation, and prepare_for_processing colocates every input batch onto it before any operator runs. Never infer the device from a batch.">device contract</span> (SCHED-RR).</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <strong>The reservation names the device</strong>
+              <p><code>gpu_pipeline_task::execute</code> takes its memory space from its reservation &mdash; the booking is the sole authority.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <strong><code>prepare_for_processing</code> colocates everything</strong>
+              <p><em>Every</em> input batch is moved onto that memory space &mdash; before any operator runs.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <strong>Only then do operators run</strong>
+              <p>An operator never asks a batch where it lives. Batches are guests; the booking decided the room.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">&#9888;&#65039;</div>
+          <div class="callout-content">
+            <strong class="callout-title">War story: push, pile-up, pin</strong>
+            <p><a href="https://github.com/sirius-db/sirius/pull/732">#732</a>&rsquo;s greedy <em>push</em> scheduling piled tasks into per-GPU queues &mdash; beyond the downgrade executor&rsquo;s reach, so their batches could never be spilled. <a href="https://github.com/sirius-db/sirius/pull/827">#827</a> restored pull-signal backpressure: workers ask for work, queues stay shallow, victims stay reachable. And after cross-device SIGABRTs, <a href="https://github.com/sirius-db/sirius/pull/996">#996</a> turned &ldquo;prefer this device&rdquo; into &ldquo;pin this device&rdquo; for <span class="term" data-definition="cuCollections &mdash; the GPU hash-table library underneath Sirius joins and aggregations. Its structures are bound to one device, which is why #996 pins instead of prefers.">cuco</span>-backed operators.</p>
+          </div>
+        </div>
+
+        <p>Which brings us to the two ways new code dies in production here:</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-error)">
+            <div class="pattern-icon" style="background: var(--color-error)">&#128274;</div>
+            <h4 class="pattern-title">Hoarding out of reach</h4>
+            <p class="pattern-desc">Holding memory the downgrade executor can&rsquo;t see &mdash; a private stash outside repositories and the inspectable queue turns pressure into a dead query.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-error)">
+            <div class="pattern-icon" style="background: var(--color-error)">&#129517;</div>
+            <h4 class="pattern-title">Guessing the device</h4>
+            <p class="pattern-desc">Inferring your GPU from anything but the task&rsquo;s reservation &mdash; a <a href="https://github.com/sirius-db/sirius/pull/996">#996</a>-class crash waiting for an 8-GPU box.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 5: Quiz ───────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Debug it before it ships</h2>
+
+        <div class="quiz-container" id="quiz-module5">
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Exactly. Before prepare_for_processing runs, batch 0 may still be host-resident or parked on a different device than the reservation. The authoritative memory space is the task&rsquo;s reservation &mdash; anything else is a cross-device access waiting to SIGABRT (the #996 class of bug)."
+               data-explanation-wrong="Not quite. Single-GPU tests pass precisely because every batch trivially agrees with the reservation there. The contract says the reservation &mdash; not any batch &mdash; names the device, and before colocation batch 0 can live anywhere.">
+            <h3 class="quiz-question">A new operator picks its CUDA device with <code>batches[0]-&gt;get_memory_space()</code> before <code>prepare_for_processing</code> has run. Single-GPU tests pass. What happens on an 8-GPU box?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Nothing &mdash; <code>prepare_for_processing</code> will colocate the batches later, fixing any mismatch</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Batch 0 may be host-resident or on another device; the reservation is the authority, so this is a cross-device crash or corruption</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Locality-based dispatch guarantees batch 0 already sits on the dispatch device, so it&rsquo;s slow but safe</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="Right. With no lower tier, no downgrade request can succeed &mdash; there is nothing productive to do. Sirius&rsquo;s actual bug fix here (#911) stopped the monitor from busy-spinning full candidate scans that could never free anything."
+               data-explanation-wrong="Not quite. Killing queries would turn pressure into failure when the system may simply be at a stable high-water mark, and rescanning can never succeed with nowhere to move data. The fixed bug (#911) was exactly that futile busy-spin &mdash; the monitor must idle.">
+            <h3 class="quiz-question">The host tier is full and no disk tier is configured. What should the downgrade monitor do &mdash; and what bug did Sirius actually fix here?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Keep rescanning for candidates in a tight loop &mdash; something will eventually free up</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Terminate the largest running query to relieve pressure immediately</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Idle &mdash; nothing can be freed, and the fixed bug was a busy-spin of futile full scans</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-a"
+               data-explanation-right="Exactly. The pipeline&rsquo;s memory history records the peak observed during the failed attempt, and estimates keep the higher peak. The next reservation is booked bigger up front &mdash; that&rsquo;s what closes the reserve&ndash;run&ndash;spill&ndash;retry loop."
+               data-explanation-wrong="Not quite. The retry backoff buys time within one query; it teaches nothing across queries. Learning lives in the pipeline memory history: failure peaks are recorded, estimates keep the higher peak, and future reservations grow to match.">
+            <h3 class="quiz-question">Your operator&rsquo;s first run OOMs, retries, then succeeds using far more memory than the estimate. What mechanism makes the <em>next</em> query&rsquo;s estimate better?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The pipeline memory history records the failure peak, and estimates keep the higher peak &mdash; so future reservations are sized up</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The 100 &times; 50 ms backoff gives the allocator time to defragment, so later runs fit the original estimate</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The downgrade executor remembers the operator and pre-spills more aggressively before it runs again</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Yes. Repository batches are idle &mdash; no locks, no owner mid-flight, cheap to migrate. Batches inside queued tasks are only reachable through the inspectable task queue (#637) and need coordination, so they&rsquo;re deliberately the second-choice tier of candidates."
+               data-explanation-wrong="Not quite. Size and recency aren&rsquo;t the split &mdash; ownership is. A repository batch is idle and migrates cheaply; a batch inside a queued task needs the inspectable-queue path and coordination with the scheduler, which is why it&rsquo;s only the fallback candidate pool.">
+            <h3 class="quiz-question">Why does downgrade prefer batches in repositories over batches inside queued tasks?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Repository batches are older, so evicting them follows LRU order</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Repository batches are idle and cheap to migrate; queued-task batches need the inspectable-queue path and coordination &mdash; a second-choice pool</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Queued-task batches are already pinned to a device by SCHED-RR and can never be moved</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module5')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module5')">Try Again</button>
+        </div>
+
+        <p><strong>Next: Design Decisions.</strong> Every rule in this module was learned from a specific incident &mdash; next comes the decision history, so you inherit the scar tissue without the scars.</p>
+      </section>
+
+    </div>
+  </div>
+</section>

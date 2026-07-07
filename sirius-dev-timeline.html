@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sirius Development Timeline — by Architecture Module</title>
+<style>
+  :root {
+    --surface-1: #fcfcfb;
+    --page: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --milestone: #2a78d6;  /* slot 1 blue */
+    --feature:   #1baf7a;  /* slot 2 aqua */
+    --refactor:  #eda100;  /* slot 3 yellow */
+    --fix:       #008300;  /* slot 4 green */
+    --chip-wash: rgba(11,11,11,0.045);
+    --tooltip-bg: #0b0b0b;
+    --tooltip-ink: #ffffff;
+    --wash-blue: rgba(42,120,214,0.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1: #1a1a19;
+      --page: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --milestone: #3987e5;
+      --feature:   #199e70;
+      --refactor:  #c98500;
+      --fix:       #008300;
+      --chip-wash: rgba(255,255,255,0.06);
+      --tooltip-bg: #f4f4f2;
+      --tooltip-ink: #0b0b0b;
+      --wash-blue: rgba(57,135,229,0.08);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 32px 24px 80px; }
+  header h1 { font-size: 26px; font-weight: 650; margin: 0 0 6px; letter-spacing: -0.01em; }
+  header .sub { color: var(--text-secondary); max-width: 860px; margin: 0 0 4px; }
+  header .meta { color: var(--text-muted); font-size: 12.5px; }
+  a { color: var(--milestone); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* architecture flow strip */
+  .flow { display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; margin: 22px 0 8px; }
+  .flow .box {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; min-width: 118px;
+  }
+  .flow .box b { display: block; font-size: 13px; font-weight: 600; }
+  .flow .box span { color: var(--text-muted); font-size: 11.5px; }
+  .flow .arr { align-self: center; color: var(--text-muted); padding: 0 8px; font-size: 15px; }
+  .flow-note { color: var(--text-muted); font-size: 12.5px; margin: 6px 0 0; }
+
+  /* stat tiles */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 24px 0; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile .label { color: var(--text-secondary); font-size: 12.5px; }
+  .tile .value { font-size: 27px; font-weight: 600; margin-top: 2px; }
+
+  /* filter row */
+  .filters {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    position: sticky; top: 0; z-index: 20; background: var(--page);
+    padding: 12px 0; border-bottom: 1px solid var(--grid); margin-bottom: 18px;
+  }
+  .fgroup { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .fgroup .glabel { color: var(--text-muted); font-size: 12px; margin-right: 2px; }
+  .chip {
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+    border-radius: 999px; padding: 4px 12px; font-size: 12.5px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px; font-family: inherit;
+  }
+  .chip:hover { background: var(--chip-wash); }
+  .chip[aria-pressed="true"] { border-color: var(--text-secondary); color: var(--text-primary); background: var(--chip-wash); font-weight: 600; }
+  .chip .sw { width: 11px; height: 11px; display: inline-block; flex: none; }
+  .chip[aria-pressed="false"] .sw { opacity: 0.35; }
+  #search {
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+    border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 13px; width: 220px;
+  }
+  #search::placeholder { color: var(--text-muted); }
+
+  /* timeline card */
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 18px 18px 10px; }
+  .card h2 { font-size: 16px; font-weight: 650; margin: 0 0 2px; }
+  .card .hint { color: var(--text-muted); font-size: 12.5px; margin: 0 0 10px; }
+  #chart-scroll { overflow-x: auto; }
+  #timeline { display: block; }
+  .lane-label { font-size: 12px; fill: var(--text-secondary); font-weight: 600; }
+  .lane-sub { font-size: 10.5px; fill: var(--text-muted); font-weight: 400; }
+  .tick-label { font-size: 11px; fill: var(--text-muted); }
+  .year-label { font-size: 12px; font-weight: 600; fill: var(--text-secondary); }
+  .era-label { font-size: 11px; fill: var(--text-muted); }
+  .anno-label { font-size: 11px; fill: var(--text-secondary); }
+  .mark { cursor: pointer; }
+  .mark:focus { outline: none; }
+  .mark:focus .shape, .mark.selected .shape { stroke: var(--text-primary); stroke-width: 1.5; }
+
+  /* tooltip */
+  #tooltip {
+    position: fixed; pointer-events: none; z-index: 50; display: none;
+    background: var(--tooltip-bg); color: var(--tooltip-ink);
+    border-radius: 8px; padding: 8px 11px; max-width: 340px; font-size: 12.5px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+  }
+  #tooltip .tt-value { font-weight: 650; font-size: 13px; }
+  #tooltip .tt-sub { opacity: 0.75; margin-top: 2px; }
+  #tooltip .tt-key { display: inline-block; width: 12px; height: 3px; margin-right: 6px; vertical-align: middle; }
+
+  /* detail panel */
+  #detail {
+    margin-top: 14px; border-top: 1px solid var(--grid); padding: 14px 4px 8px;
+    display: none;
+  }
+  #detail.open { display: block; }
+  #detail .d-date { color: var(--text-muted); font-size: 12.5px; }
+  #detail .d-title { font-size: 15.5px; font-weight: 650; margin: 2px 0 6px; }
+  #detail .d-sig { color: var(--text-secondary); max-width: 900px; }
+  #detail .d-links { margin-top: 8px; font-size: 13px; }
+  .type-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; }
+
+  /* narrative */
+  .story { margin: 34px 0 10px; max-width: 900px; }
+  .story h2 { font-size: 18px; font-weight: 650; margin-bottom: 6px; }
+  .story p { color: var(--text-secondary); }
+  .story b { color: var(--text-primary); }
+
+  /* module sections */
+  .mod { margin-top: 30px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  .mod h3 { margin: 0 0 4px; font-size: 16px; font-weight: 650; }
+  .mod .paths { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--text-muted); margin-bottom: 6px; }
+  .mod .desc { color: var(--text-secondary); max-width: 900px; margin: 0 0 12px; }
+  table { border-collapse: collapse; width: 100%; }
+  th { text-align: left; color: var(--text-muted); font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 10px; border-bottom: 1px solid var(--grid); }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.c-date { white-space: nowrap; color: var(--text-muted); font-variant-numeric: tabular-nums; font-size: 12.5px; }
+  td.c-pr { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.c-title { font-weight: 550; }
+  td.c-sig { color: var(--text-secondary); }
+  tr.is-milestone td.c-title::before { content: "◆ "; color: var(--milestone); }
+  .empty-note { color: var(--text-muted); font-size: 13px; padding: 10px; }
+  footer { margin-top: 40px; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--grid); padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap viz-root">
+  <header>
+    <h1>Sirius Development Timeline</h1>
+    <p class="sub">
+      Curated milestones from the <code>dev</code> branch of
+      <a href="https://github.com/sirius-db/sirius" target="_blank" rel="noopener">sirius-db/sirius</a>,
+      organized by architecture module. Sirius is a GPU-native SQL engine shipped as a DuckDB extension:
+      it intercepts SQL transparently, converts DuckDB's plan into its own physical operators, groups them
+      into pipelines, and a task creator turns "operator + available input" into GPU tasks run by a scheduler.
+      Data flows between operators through repositories; ports tell each operator where its input lives.
+    </p>
+    <p class="meta" id="gen-meta"></p>
+  </header>
+
+  <div class="flow" aria-hidden="true">
+    <div class="box"><b>SQL</b><span>DuckDB client</span></div>
+    <div class="arr">→</div>
+    <div class="box"><b>Interception</b><span>optimizer hook</span></div>
+    <div class="arr">→</div>
+    <div class="box"><b>Plan conversion</b><span>planner + expressions</span></div>
+    <div class="arr">→</div>
+    <div class="box"><b>Physical operators</b><span>GPU joins, aggs, scans</span></div>
+    <div class="arr">→</div>
+    <div class="box"><b>Pipelines &amp; ports</b><span>repository wiring</span></div>
+    <div class="arr">→</div>
+    <div class="box"><b>Task creator</b><span>operator + input → task</span></div>
+    <div class="arr">→</div>
+    <div class="box"><b>Scheduler</b><span>runs GPU tasks</span></div>
+  </div>
+  <p class="flow-note">Underneath all of it: data repositories, memory tiers and the IO framework (cuCascade) carry data between operators — no function-return data flow.</p>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="filters" role="group" aria-label="Filters">
+    <div class="fgroup" id="range-chips"><span class="glabel">Range</span></div>
+    <div class="fgroup" id="type-chips"><span class="glabel">Type</span></div>
+    <div class="fgroup" id="module-chips"><span class="glabel">Module</span></div>
+    <input id="search" type="search" placeholder="Search title / PR # / keyword…" aria-label="Search events">
+  </div>
+
+  <div class="card">
+    <h2>Timeline by architecture module</h2>
+    <p class="hint">Each mark is one curated PR (♦ milestone · ● feature · ■ refactor · ▲ fix). Hover for a summary, click for details and the GitHub link. Filters above scope the timeline, the counts and every module table below.</p>
+    <div id="chart-scroll"><svg id="timeline" role="img" aria-label="Swimlane timeline of Sirius pull requests per architecture module"></svg></div>
+    <div id="detail" aria-live="polite"></div>
+  </div>
+
+  <section class="story" id="story"></section>
+
+  <div id="modules"></div>
+
+  <footer id="foot"></footer>
+</div>
+
+<div id="tooltip" role="tooltip"></div>
+
+<script>
+"use strict";
+/* ============ DATA (mined from git history, dev branch) ============ */
+const GENERATED = { on: "2026-07-07", commitsMined: 1014, firstCommit: "2024-06-19", lastCommit: "2026-07-01" };
+
+const MODULES = [
+  { key: "global",    short: "Project milestones",    label: "Global Project Milestones", pathHint: "cross-cutting", paths: "cross-cutting — no single directory",
+    desc: "The turning points every module builds on: engine rewrites, backend pivots, benchmark coverage, and the moments today's architecture snapped into place. Read this lane first." },
+  { key: "intercept", short: "Interception & entry",  label: "Query Interception & Engine Entry", pathHint: "src/transparent · extension entry", paths: "src/transparent/ · src/sirius_extension.cpp · src/sirius_engine.cpp · src/sirius_context.cpp · src/sirius_config.cpp · src/sirius_ffi.cpp",
+    desc: "How SQL enters Sirius: the DuckDB optimizer hook that transparently swaps in GPU execution (no special syntax), the engine/context/config lifecycle, CPU fallback policy, and the newer embedding surfaces (Rust FFI, StarRocks)." },
+  { key: "planner",   short: "Plan conversion",       label: "Plan Conversion & Expressions", pathHint: "src/planner · src/expression*", paths: "src/planner/ · src/expression/ · src/expression_executor/",
+    desc: "Converting DuckDB's plan into Sirius physical operators, plus the expression subsystem's long march from routing DuckDB expressions to a fully native sirius::ast lowered into cuDF ASTs — with JIT compilation and operator fusion." },
+  { key: "op",        short: "Operators & kernels",   label: "Physical Operators & GPU Kernels", pathHint: "src/op · src/cuda", paths: "src/op/ · src/cuda/",
+    desc: "The GPU operators themselves: the join family (hash, nested-loop, mixed, adaptive, mark/semi/anti, full-outer), aggregation, sort, Top-N, and the scan operators (Parquet, Iceberg, GPU-native DuckDB format) with pruning and dynamic filters." },
+  { key: "pipeline",  short: "Pipelines & ports",     label: "Pipelines & Ports", pathHint: "src/pipeline", paths: "src/pipeline/",
+    desc: "Grouping operators into pipelines and wiring data repositories between them — the ports that tell each operator where its input lives. The descriptor/runtime wiring split (#770) and the finalization-race fixes are the key reads here." },
+  { key: "creator",   short: "Task creator & scans",  label: "Task Creator & Scan Manager", pathHint: "src/creator · src/scan_manager", paths: "src/creator/ · src/scan_manager/",
+    desc: "Turning \"operator + available input\" into schedulable GPU tasks: port-info handling, partition-count logic, cache-aware scan scheduling, and the Scan Manager that centralizes split production across file formats and S3." },
+  { key: "sched",     short: "Scheduler & downgrade", label: "Scheduler & Downgrade Executor", pathHint: "src/parallel · src/downgrade · src/exec", paths: "src/parallel/ · src/downgrade/ · src/exec/",
+    desc: "The executors that actually run tasks: thread pools pinned to CPU cores, per-task CUDA streams, the task_scheduler orchestrator, and the downgrade executor that spills GPU → host → disk under memory pressure." },
+  { key: "memio",     short: "Memory & IO",           label: "Data Repositories, Memory Tiers & IO (cuCascade)", pathHint: "src/memory · src/io · cucascade/", paths: "src/memory/ · src/io/ · src/data/ · cucascade/ (NVIDIA submodule)",
+    desc: "The substrate everything flows through: reservation-based memory management across GPU/host/disk tiers, data batches and repositories (extracted into NVIDIA cuCascade in Dec 2025), and the io_uring-based IO/prefetching/caching framework with the S3 datasource." },
+];
+const EVENTS = [
+  /* ---- Global project milestones ---- */
+  {module:"global",date:"2024-06-19",pr:null,title:"Project inception (DuckDB extension template)",significance:"Initial commit bootstraps the repo from the DuckDB extension template (originally 'quack'), establishing Sirius as a DuckDB extension rather than a standalone engine.",type:"milestone",headline:"inception"},
+  {module:"global",date:"2024-08-03",pr:null,title:"Legacy GPU execution engine begins",significance:"First appearance of gpu_executor.cpp and gpu_physical_* operators — the start of the hand-written CUDA 'gpu_processing' era that carried Sirius for its first ~1.5 years.",type:"milestone"},
+  {module:"global",date:"2024-11-04",pr:null,title:"First TPC-H query on the engine",significance:"First TPC-H query lands, establishing TPC-H as the driving benchmark workload that shapes the project from here on.",type:"milestone"},
+  {module:"global",date:"2025-04-13",pr:6,title:"libcudf (cuDF) integration",significance:"cuDF integration merged (guarded by USE_CUDF), pivoting Sirius from bespoke kernels toward RAPIDS libcudf as the GPU compute backend.",type:"milestone",headline:"cuDF backend"},
+  {module:"global",date:"2025-06-23",pr:null,title:"libcudf becomes default; pre-cudf kernels removed",significance:"CMake defaults to libcudf and the legacy pre-cudf kernel path is deleted, making cuDF the mainline backend for the legacy engine.",type:"milestone"},
+  {module:"global",date:"2025-08-30",pr:null,title:"Legacy stack passes full TPC-H suite",significance:"All original TPC-H queries pass on the legacy engine with correctness + performance harness — the legacy engine reaches feature-completeness for the core benchmark.",type:"milestone"},
+  {module:"global",date:"2025-12-02",pr:96,title:"Sirius Pipeline framework (Super Sirius) begins",significance:"PipelineTask/Queue/Executor (#96) and DuckDB-to-Sirius pipeline conversion (#101) introduce the new execution framework later branded 'Super Sirius', replacing the monolithic gpu_executor model.",type:"milestone",headline:"Super Sirius begins"},
+  {module:"global",date:"2026-01-02",pr:134,title:"Migration to cuCascade GPU library",significance:"Sirius adopts cuCascade (added as a submodule a week later) as its memory/data-repository primitives library — a foundational dependency for the new stack.",type:"milestone",headline:"cuCascade"},
+  {module:"global",date:"2026-01-31",pr:198,title:"New execution framework enabled",significance:"Enables the new pipeline framework and guts ~650 lines of the old gpu_executor — the new stack goes from parallel scaffolding to the active execution path.",type:"milestone"},
+  {module:"global",date:"2026-02-05",pr:206,title:"First end-to-end query on cuCascade stack",significance:"First full query executed on Sirius running atop cuCascade and the new pipeline framework — the new architecture proven end-to-end.",type:"milestone"},
+  {module:"global",date:"2026-02-19",pr:267,title:"TPC-H queries in integration tests (new stack)",significance:"TPC-H queries wired into the integration test suite on the new stack, establishing continuous correctness validation for Super Sirius.",type:"milestone"},
+  {module:"global",date:"2026-03-20",pr:505,title:"Comprehensive Super Sirius documentation",significance:"docs/super-sirius/ lands (architecture, execution flow, memory, config), the first newcomer-facing documentation of the new architecture.",type:"milestone"},
+  {module:"global",date:"2026-03-24",pr:509,title:"ENABLE_LEGACY_SIRIUS build flag",significance:"Legacy code path becomes conditionally compiled, formally separating the old and new engines and marking the new stack as the default.",type:"milestone"},
+  {module:"global",date:"2026-04-01",pr:521,title:"Apache Iceberg V1/V2 scan",significance:"Adds Iceberg V1/V2 table scans with GPU-accelerated delete filters, extending Sirius from raw parquet toward lakehouse table formats.",type:"milestone"},
+  {module:"global",date:"2026-04-21",pr:518,title:"Transparent GPU execution via optimizer extension",significance:"A DuckDB optimizer extension transparently intercepts queries and reroutes them to the GPU — users get GPU acceleration without special syntax. A defining UX turning point.",type:"milestone",headline:"transparent GPU exec"},
+  {module:"global",date:"2026-04-24",pr:692,title:"Legacy CUDA isolated under src/legacy/",significance:"All legacy CUDA is relocated under src/legacy/ with its own CMake, quarantining the old engine and cleanly delineating it from Super Sirius.",type:"milestone"},
+  {module:"global",date:"2026-05-01",pr:675,title:"Sirius IO, prefetching and caching framework",significance:"Introduces the io/ framework (io_uring reactor, prefetching cache, admission control, datasource abstraction), the foundation for scalable and remote data access.",type:"milestone"},
+  {module:"global",date:"2026-05-21",pr:732,title:"Single-node multi-GPU execution",significance:"Adds single-node multi-GPU support with dedicated architecture docs, unlocking scaling beyond one GPU.",type:"milestone",headline:"multi-GPU"},
+  {module:"global",date:"2026-05-30",pr:805,title:"S3 read_parquet SQL surface",significance:"S3 datasource (foundation #746, backend #784) culminates in an S3 read_parquet SQL surface with CPU fallback — querying data directly from cloud object storage.",type:"milestone"},
+
+  /* ---- Query Interception & Engine Entry ---- */
+  {module:"intercept",date:"2024-08-30",pr:null,title:"First extension entry point",significance:"Adds src/sirius_extension.cpp (362 lines) registering the Sirius extension and its load hooks — the origin of engine entry.",type:"milestone"},
+  {module:"intercept",date:"2025-03-06",pr:null,title:"Partially support substrait",significance:"First transparent-ish interception path: routes queries through Substrait plans inside the extension instead of only explicit calls.",type:"feature"},
+  {module:"intercept",date:"2025-04-10",pr:null,title:"Fallback to duckdb #1",significance:"Introduces the first CPU-fallback mechanism so unsupported queries silently revert to DuckDB rather than failing.",type:"feature"},
+  {module:"intercept",date:"2025-04-13",pr:null,title:"cuDF integration behind USE_CUDF env var",significance:"Adds env-var gated backend selection at the extension entry, the first runtime engine-backend switch.",type:"feature"},
+  {module:"intercept",date:"2025-08-23",pr:null,title:"Runtime config replaces constexpr",significance:"Creates src/config.cpp, moving configuration from compile-time constexpr to runtime-mutable values — foundation of the config lifecycle.",type:"refactor"},
+  {module:"intercept",date:"2025-08-24",pr:null,title:"Config exposed as extension options",significance:"Registers Sirius configuration as DuckDB extension options, wiring config into the extension load/SET surface.",type:"feature"},
+  {module:"intercept",date:"2026-01-20",pr:133,title:"Sirius context and config",significance:"Introduces SiriusContext and SiriusConfig (sirius_context.cpp, sirius_config.cpp, config_option.hpp), establishing the engine context and config lifecycle.",type:"milestone"},
+  {module:"intercept",date:"2026-01-31",pr:198,title:"Enabling new execution framework",significance:"Adds sirius_engine.cpp (904 lines) and rewires the extension to drive the new execution engine — the core engine-entry object.",type:"milestone"},
+  {module:"intercept",date:"2026-02-04",pr:203,title:"Return result",significance:"Adds sirius_interface.cpp, the interface layer that runs a query through the engine and returns results back to DuckDB.",type:"feature"},
+  {module:"intercept",date:"2026-02-23",pr:308,title:"DuckDB fallback as a config option",significance:"Promotes CPU fallback to a first-class configuration option controllable at runtime rather than hardcoded behavior.",type:"feature"},
+  {module:"intercept",date:"2026-03-10",pr:429,title:"Per query config",significance:"Enables per-query configuration overrides, letting individual queries tune engine settings via the config lifecycle.",type:"feature"},
+  {module:"intercept",date:"2026-03-11",pr:354,title:"Log configuration moves to runtime engine settings",significance:"Shifts logging config out of compile-time flags into runtime engine settings, consolidating config into the engine lifecycle.",type:"refactor"},
+  {module:"intercept",date:"2026-04-06",pr:540,title:"Decompose initialize_internal into focused helpers",significance:"Major engine-init cleanup removing ~1127 lines from sirius_engine.cpp by splitting monolithic initialization into focused helpers.",type:"refactor"},
+  {module:"intercept",date:"2026-04-10",pr:565,title:"Replace libconfig++ with YAML config",significance:"Replaces the libconfig++ dependency with a YAML-based config framework, overhauling config loading in sirius_config.cpp/sirius_context.cpp.",type:"refactor"},
+  {module:"intercept",date:"2026-04-21",pr:518,title:"Transparent GPU execution via optimizer extension",significance:"Landmark interception: OptimizerExtension + OnFinalizePrepare hooks capture plans and swap in PhysicalSiriusExecution so plain SQL runs on GPU without CALL wrappers; adds src/transparent/.",type:"milestone"},
+  {module:"intercept",date:"2026-04-21",pr:673,title:"CPU fallback on by default for gpu_execution",significance:"Flips the default so transparent gpu_execution falls back to DuckDB CPU automatically, making interception safe-by-default.",type:"feature"},
+  {module:"intercept",date:"2026-05-06",pr:607,title:"Decouple pipeline classes from sirius_engine",significance:"Decouples pipeline construction from sirius_engine, slimming the engine entry object and clarifying its responsibilities.",type:"refactor"},
+  {module:"intercept",date:"2026-05-29",pr:815,title:"Move telemetry_context into SiriusContext",significance:"Consolidates telemetry ownership into SiriusContext, tightening the engine/context lifecycle boundaries.",type:"refactor"},
+  {module:"intercept",date:"2026-05-30",pr:805,title:"S3 read_parquet SQL surface + CPU fallback",significance:"Adds sirius_sql_rewrite.cpp, an SQL-rewrite interception layer that exposes S3 read_parquet with CPU fallback at the query surface.",type:"feature"},
+  {module:"intercept",date:"2026-06-10",pr:908,title:"Rust FFI: sirius-sys + sirius crate scaffolding",significance:"Adds src/sirius_ffi.cpp, a C FFI surface exposing the engine to Rust (sirius-sys/sirius crates) — a new external entry path.",type:"feature"},
+  {module:"intercept",date:"2026-06-23",pr:960,title:"StarRocks: Sirius engine context in the CN",significance:"Extends the FFI to bring up a Sirius engine context inside a StarRocks compute node, embedding the engine in an external host.",type:"feature"},
+
+  /* ---- Plan Conversion & Expressions ---- */
+  {module:"planner",date:"2025-05-26",pr:null,title:"Source files for expression executor",significance:"Foundational commit introducing the GPU expression executor with per-node specializations (comparison, case, cast, function, operator, reference) — basis of the whole expression subsystem.",type:"milestone"},
+  {module:"planner",date:"2025-06-08",pr:null,title:"Structured GPU column type (width/scale)",significance:"Wraps GPU column type as a struct carrying width/scale, establishing the type metadata needed for decimals and richer type handling.",type:"feature"},
+  {module:"planner",date:"2025-06-17",pr:null,title:"TPC-H original Q2 works",significance:"First end-to-end TPC-H queries on the stack; adds suffix string function, int32 join keys and group-by duplicate elimination.",type:"milestone"},
+  {module:"planner",date:"2025-07-05",pr:null,title:"NULL support in expressions",significance:"Introduces NULL semantics into the expression executor, foundational for correct SQL evaluation.",type:"feature"},
+  {module:"planner",date:"2025-08-28",pr:null,title:"TPC-H original Q18 works",significance:"All original TPC-H queries now run (except Q17), marking near-complete TPC-H coverage on the plan/expression path.",type:"milestone"},
+  {module:"planner",date:"2026-01-02",pr:134,title:"Migrating to use cuCascade",significance:"Adopts the cuCascade execution framework — the architectural foundation for the rewritten pipeline/operator stack.",type:"milestone"},
+  {module:"planner",date:"2026-01-26",pr:136,title:"DuckDB scan data into the data repository",significance:"Wires DuckDB scan output into the cuCascade data repository via host_table_allocation, establishing the scan-to-pipeline data flow.",type:"feature"},
+  {module:"planner",date:"2026-01-30",pr:167,title:"Adding new physical operators",significance:"Adds native Sirius physical operators (filter, projection, top_n, ungrouped aggregation split into local+merge) on the new framework.",type:"feature"},
+  {module:"planner",date:"2026-01-31",pr:198,title:"Enabling new execution framework",significance:"Switches from DuckDB PhysicalOperator to Sirius PhysicalOperator and rebuilds the query plan with the new operators, turning on the new execution path.",type:"milestone"},
+  {module:"planner",date:"2026-02-03",pr:195,title:"GpuPipeline Executor, DuckDBScanExecutor and more",significance:"Introduces the GPU pipeline executor, task-creation APIs and DuckDB scan executor that drive the new operator pipelines.",type:"feature"},
+  {module:"planner",date:"2026-02-05",pr:206,title:"First query using Sirius on cuCascade",significance:"First complete query executed end-to-end on the cuCascade-based stack, validating the new plan/execution architecture.",type:"milestone"},
+  {module:"planner",date:"2026-02-17",pr:252,title:"Enabling Parquet scans in Sirius",significance:"Adds Parquet scan planning/operators, extending source support beyond DuckDB table scans.",type:"feature"},
+  {module:"planner",date:"2026-02-24",pr:251,title:"DuckDB expression trees → cuDF ASTs",significance:"First translator lowering DuckDB expression trees into cuDF ASTs, including join conditions — seeds the AST-based expression path.",type:"feature"},
+  {module:"planner",date:"2026-04-01",pr:521,title:"Iceberg V1/V2 scan with GPU delete filters",significance:"Adds Iceberg V1/V2 scan planning with GPU-accelerated delete filtering, a major new table-format source.",type:"feature"},
+  {module:"planner",date:"2026-04-08",pr:363,title:"Row-group pruning with filter pushdown",significance:"Implements filter pushdown and row-group pruning in scan planning, cutting I/O for Parquet scans.",type:"feature"},
+  {module:"planner",date:"2026-04-15",pr:531,title:"Expression executor with AST support for JIT and fusion",significance:"New AST-tree expression executor supporting cuDF JIT (compute_column_jit) and fused-operator kernels with selectable execution strategies — a major evaluation-engine advance.",type:"milestone"},
+  {module:"planner",date:"2026-04-18",pr:643,title:"Sirius-native type system (logical_type / type_id)",significance:"Introduces a Sirius-native logical_type/type_id system, decoupling the plan/expression layers from DuckDB's type vocabulary.",type:"refactor"},
+  {module:"planner",date:"2026-04-21",pr:620,title:"Scan operator pipeline construction",significance:"Splits the monolithic Parquet scan into cooperating metadata-scan and GPU-scan operators across two pipelines linked by a scheduling handoff port.",type:"refactor"},
+  {module:"planner",date:"2026-04-21",pr:658,title:"gpu_expression_executor promoted to primary path",significance:"Makes the Sirius-native gpu_expression_executor the primary evaluation path over the legacy routing.",type:"refactor"},
+  {module:"planner",date:"2026-04-23",pr:683,title:"Operators/executor/planner migrate to sirius::expression",significance:"Migrates operators, executor and planner onto the sirius::expression wrapper, decoupling them from raw DuckDB expressions.",type:"refactor"},
+  {module:"planner",date:"2026-04-30",pr:731,title:"Sirius Scan Manager",significance:"Introduces the Scan Manager that centralizes split production/distribution feeding the scan operators.",type:"feature"},
+  {module:"planner",date:"2026-05-06",pr:648,title:"Quent Integration, Act 1: The Query Plan",significance:"Adds plan-level telemetry (operators, ports, edges) via a Rust/cxx Quent bridge, instrumenting the converted query plan.",type:"feature"},
+  {module:"planner",date:"2026-05-21",pr:732,title:"Single-node multi-GPU",significance:"Adds single-node multi-GPU execution, reworking the task creator and pipeline execution for multiple devices.",type:"milestone"},
+  {module:"planner",date:"2026-05-23",pr:796,title:"sirius::ast::from_duckdb translator",significance:"Phase 4 of the native AST effort: a translator building sirius::ast nodes directly from DuckDB expressions.",type:"feature"},
+  {module:"planner",date:"2026-05-29",pr:807,title:"Dual-path gpu_expression_executor",significance:"Phase 5: gpu_expression_executor runs on both DuckDB and native Sirius AST inputs, enabling the cutover.",type:"feature"},
+  {module:"planner",date:"2026-05-30",pr:792,title:"GPU-native DuckDB scan operator",significance:"Adds a GPU-native operator that decodes DuckDB-native storage splits directly into cuDF tables, plus the seq_scan pipeline hook.",type:"feature"},
+  {module:"planner",date:"2026-06-02",pr:828,title:"Native Sirius AST in per-specialization executors",significance:"Per-specialization executors consume native Sirius AST nodes, advancing removal of DuckDB expression types from evaluation.",type:"feature"},
+  {module:"planner",date:"2026-06-03",pr:847,title:"gpu_expression_translator flips to sirius::ast input",significance:"Flips the cuDF-AST lowering translator to take sirius::ast::node input — native AST replaces DuckDB expression routing in expression lowering.",type:"milestone"},
+  {module:"planner",date:"2026-06-05",pr:880,title:"Retire the sirius::expression PIMPL wrapper",significance:"Retires the PIMPL wrapper, completing the migration to a fully native Sirius AST expression stack.",type:"refactor"},
+  {module:"planner",date:"2026-06-08",pr:871,title:"Unify GPU scan operators behind gpu_ingestible",significance:"Collapses parquet/duckdb-native/cached scan operators into one gpu_scan_operator parameterized by a pluggable gpu_ingestible interface.",type:"refactor"},
+  {module:"planner",date:"2026-06-11",pr:909,title:"Projection folding",significance:"Adds projection folding as a plan-conversion optimization, reducing redundant projection work in generated plans.",type:"feature"},
+
+  /* ---- Physical Operators & GPU Kernels ---- */
+  {module:"op",date:"2024-07-23",pr:null,title:"Initial GPU pipeline/executor scaffolding",significance:"gpu_pipeline, gpu_meta_pipeline and the CUDA extension land — the foundation of the whole physical-operator layer.",type:"milestone"},
+  {module:"op",date:"2024-11-04",pr:null,title:"First GPU filter & projection expressions",significance:"First hand-written GPU filter and projection expression execution.",type:"feature"},
+  {module:"op",date:"2024-11-14",pr:null,title:"Join family kernels",significance:"Adds multikey hash join plus semi/anti/mark join CUDA kernels, expanding the join operator family.",type:"feature"},
+  {module:"op",date:"2024-12-11",pr:null,title:"Group-by reimplemented on CUB",significance:"Reimplements GPU group-by aggregation on CUB primitives for speed/scalability.",type:"refactor"},
+  {module:"op",date:"2024-12-24",pr:null,title:"String group-by working",significance:"Enables string-keyed group-by aggregation on the GPU.",type:"feature"},
+  {module:"op",date:"2025-04-13",pr:null,title:"cuDF-backed operator path (USE_CUDF)",significance:"Introduces the libcudf-backed operator path — the pivot from hand-written kernels to cuDF primitives.",type:"milestone"},
+  {module:"op",date:"2025-05-05",pr:null,title:"Top-N operator + order-by/group-by fixes",significance:"Adds the Top-N operator alongside order-by/group-by correctness fixes.",type:"feature"},
+  {module:"op",date:"2025-06-08",pr:null,title:"Decimal column support in scan",significance:"First decimal-type support in the scan operator, backed by a column-type struct carrying width/scale.",type:"feature"},
+  {module:"op",date:"2025-06-18",pr:null,title:"decimal128 execution (TPC-H Q11)",significance:"Adds decimal128 execution/materialization and cuDF-backed nested-loop join keyed on decimal128 columns.",type:"feature"},
+  {module:"op",date:"2025-07-05",pr:null,title:"NULL semantics in GPU expressions",significance:"Adds NULL-value semantics to the GPU expression executor.",type:"feature"},
+  {module:"op",date:"2025-08-15",pr:null,title:"distinct_hash_join for unique build keys",significance:"Uses cuDF distinct_hash_join for unique build keys, optimizing the hash-join build path.",type:"feature"},
+  {module:"op",date:"2026-01-02",pr:134,title:"Operator layer migrates to cuCascade",significance:"Migrates the operator layer onto the cuCascade runtime (shared_ptr data_batch, processing-count handles) — a major architectural pivot.",type:"milestone"},
+  {module:"op",date:"2026-01-30",pr:167,title:"New physical operators ported",significance:"Ports limit, filter, projection, top-n and ungrouped aggregate (split into local+merge) onto the new framework.",type:"feature"},
+  {module:"op",date:"2026-01-31",pr:198,title:"New execution framework switched on",significance:"Switches on the new pipeline execution framework as the active engine.",type:"milestone"},
+  {module:"op",date:"2026-02-05",pr:206,title:"First query on cuCascade engine",significance:"First end-to-end query running through the new cuCascade-based engine — proof the rewrite works.",type:"milestone"},
+  {module:"op",date:"2026-02-09",pr:193,title:"Grouped aggregate + partition operator",significance:"Adds grouped aggregation (local+merge) and the partition operator on the new framework.",type:"feature"},
+  {module:"op",date:"2026-02-10",pr:217,title:"Sort operator + large strings",significance:"Introduces the GPU sort operator and large-string handling.",type:"feature"},
+  {module:"op",date:"2026-02-10",pr:229,title:"COLUMN_DATA_SCAN, CTE, and DELIM_JOIN",significance:"Adds column-data scan, CTE, and delimiter (correlated) join operators.",type:"feature"},
+  {module:"op",date:"2026-02-11",pr:231,title:"Parquet scan operator",significance:"Adds the GPU Parquet scan operator.",type:"feature"},
+  {module:"op",date:"2026-02-13",pr:245,title:"Joins V0 + unique_ptr<operator_data> refactor",significance:"First hash-join family (inner/left/right/full-outer) on the new framework, plus operator_data ownership refactor.",type:"feature"},
+  {module:"op",date:"2026-02-18",pr:261,title:"Semi-joins fixed",significance:"Fixes and enables semi-join execution on the new join operators.",type:"fix"},
+  {module:"op",date:"2026-02-24",pr:264,title:"Nested loop join",significance:"Adds the nested-loop join operator for non-equi join conditions.",type:"feature"},
+  {module:"op",date:"2026-02-24",pr:306,title:"Anti join support",significance:"Adds anti-join operator support.",type:"feature"},
+  {module:"op",date:"2026-02-24",pr:307,title:"Mark join support",significance:"Adds mark-join operator support (for correlated IN/EXISTS).",type:"feature"},
+  {module:"op",date:"2026-02-25",pr:326,title:"Mixed join in hash join operator",significance:"Uses cuDF mixed_join for multi-condition/inequality joins with side-swapping in the hash-join operator.",type:"feature"},
+  {module:"op",date:"2026-03-03",pr:368,title:"Memory-pressure-driven downgrade",significance:"Adds memory-pressure-driven task downgrade with per-space executors, reshaping the execution model under memory limits.",type:"feature"},
+  {module:"op",date:"2026-03-11",pr:423,title:"Adaptive Join",significance:"Adds the BUILD_PROBE adaptive join mode that builds a persistent hash table on a single build partition instead of full-barrier joins.",type:"feature"},
+  {module:"op",date:"2026-03-26",pr:512,title:"FULL OUTER JOIN via cudf::hash_join::full_join",significance:"Adds true FULL OUTER JOIN via cuDF hash_join::full_join.",type:"feature"},
+  {module:"op",date:"2026-04-01",pr:521,title:"Iceberg V1/V2 scan with GPU delete filters",significance:"Adds Apache Iceberg V1/V2 table scan with GPU-accelerated delete filtering.",type:"feature"},
+  {module:"op",date:"2026-04-08",pr:363,title:"Row-group pruning with filter pushdown",significance:"Applies filter-based row-group pruning and translates DuckDB filters to cuDF AST to bypass the scan operator, cutting I/O and cache size.",type:"feature"},
+  {module:"op",date:"2026-04-15",pr:531,title:"AST expression executor (JIT + fusion)",significance:"New expression executor using cuDF AST for JIT compilation and operator fusion — a new execution model for expressions.",type:"milestone"},
+  {module:"op",date:"2026-04-21",pr:518,title:"Transparent GPU execution",significance:"Intercepts plain SQL via DuckDB optimizer hooks and replaces the CPU plan with a Sirius GPU plan — no CALL wrapper needed.",type:"milestone"},
+  {module:"op",date:"2026-05-06",pr:736,title:"GPU-native DuckDB decode kernel (Part 1)",significance:"Starts the 10-PR GPU-native DuckDB decode path: per-column decode dispatcher plus UNCOMPRESSED/CONSTANT codecs.",type:"milestone"},
+  {module:"op",date:"2026-05-18",pr:664,title:"Dynamic table filters",significance:"Scaffolds the dynamic-filter framework (polymorphic filters, AST lowering, thread-safe channel) for runtime filter pushdown.",type:"feature"},
+  {module:"op",date:"2026-05-21",pr:732,title:"Single-node multi-GPU",significance:"Adds single-node multi-GPU execution — a scaling turning point for the operator/runtime layer.",type:"milestone"},
+
+  /* ---- Pipelines & Ports ---- */
+  {module:"pipeline",date:"2025-12-02",pr:96,title:"Pipeline Task, Queue, and Executor",significance:"Creates the pipeline execution framework from scratch: gpu_pipeline_executor, pipeline/gpu queues, pipeline task, task_request, and multi-GPU executor scaffolding.",type:"milestone"},
+  {module:"pipeline",date:"2026-01-31",pr:198,title:"Enabling new execution framework",significance:"Switches the query plan from DuckDB PhysicalOperator to Sirius operators and turns on the new pipeline/meta-pipeline execution path.",type:"milestone"},
+  {module:"pipeline",date:"2026-02-02",pr:201,title:"Updating Sirius Pipeline Interface",significance:"Adds the sink operator into the pipeline's operator vector and implements get_parent, establishing pipeline topology navigation.",type:"feature"},
+  {module:"pipeline",date:"2026-02-03",pr:195,title:"GpuPipeline Executor and task-creation APIs",significance:"Introduces task-creation APIs and decouples tasks from executors; adds thread-pool/MPMC request queues underpinning executor scheduling.",type:"feature"},
+  {module:"pipeline",date:"2026-02-05",pr:206,title:"First query using Sirius on cuCascade",significance:"First end-to-end query executed through the pipeline framework on cuCascade, proving the executor/task-creation path works.",type:"milestone"},
+  {module:"pipeline",date:"2026-03-17",pr:479,title:"Drain and restart task creator during executor drain",significance:"Adds task-creator drain/restart during executor drain — an early pipeline-lifecycle correctness fix for teardown ordering.",type:"fix"},
+  {module:"pipeline",date:"2026-03-31",pr:520,title:"Cleanup executor class design",significance:"Extracts shared executor infrastructure (thread pool, task queue, manager thread) into an itask_executor base shared by GPU/scan/downgrade executors.",type:"refactor"},
+  {module:"pipeline",date:"2026-04-06",pr:540,title:"Decompose initialize_internal",significance:"Splits the ~1140-line engine init into explicit pipeline phases (scheduling → splitting → wiring → parents → finalization → sibling linking), making the wiring/finalization boundary explicit.",type:"refactor"},
+  {module:"pipeline",date:"2026-04-09",pr:573,title:"operator_data → pipelineable_operator_data",significance:"Splits operator_data into a generic base plus pipelineable_operator_data carrying the data-batch vector — a clean extension point for data flowing between operators.",type:"refactor"},
+  {module:"pipeline",date:"2026-04-13",pr:626,title:"Remove DuckDB execution-state types from operator base",significance:"Removes DuckDB execution/state headers from the operator base, part of decoupling pipeline operators from the DuckDB engine.",type:"refactor"},
+  {module:"pipeline",date:"2026-04-14",pr:628,title:"Replace DuckDB utility types in pipeline headers",significance:"Replaces DuckDB reference/reference_map utility types in pipeline/meta_pipeline headers with std-only Sirius equivalents, continuing engine decoupling.",type:"refactor"},
+  {module:"pipeline",date:"2026-04-21",pr:620,title:"Scan operator pipeline construction",significance:"Splits monolithic parquet scan into two cooperating pipelines linked by a scheduling-only handoff port (PARTIAL barrier, null repo); metadata partitions flow via side-channel instead of a data-repo port.",type:"feature"},
+  {module:"pipeline",date:"2026-04-23",pr:687,title:"pipeline_executor renamed to task_scheduler",significance:"Renames the top-level orchestrator to match task_creator/task_request vocabulary; per-GPU gpu_pipeline_executor left intact.",type:"refactor"},
+  {module:"pipeline",date:"2026-05-01",pr:733,title:"Deduplicate get_next_ports_after_sink",significance:"Centralizes special-cased left/right delim-join port navigation in sirius_pipeline, deduplicating port-resolution call sites in the converter.",type:"refactor"},
+  {module:"pipeline",date:"2026-05-04",pr:689,title:"Data batch refactor",significance:"Adopts cuCascade's tri-class data_batch (read_only/mutable) across executors and tasks, simplifying lock_or_prepare_batch and removing batch race conditions in port data movement.",type:"refactor"},
+  {module:"pipeline",date:"2026-05-06",pr:607,title:"Decouple pipeline classes from sirius_engine",significance:"Introduces pipeline_build_context to replace sirius_engine& in plan-time pipeline construction; wire_data_repositories becomes the sole remaining runtime engine dependency, enabling planning to move to the optimizer stage.",type:"milestone"},
+  {module:"pipeline",date:"2026-05-07",pr:763,title:"Pipeline diagnostics: converter renames + barrier info",significance:"Renames misleading converter symbols (pipeline_breakers → inserted_operators) and annotates the plan printer with input memory-barrier/port info for clearer pipeline diagnostics.",type:"refactor"},
+  {module:"pipeline",date:"2026-05-07",pr:766,title:"Fix race between task creation and pipeline finalization",significance:"Adds a per-pipeline mutex so task creation (including pulling data from a port) and pipeline-completion status updates are serialized; ensures all operators are finalized at query end.",type:"fix"},
+  {module:"pipeline",date:"2026-05-12",pr:770,title:"Split wire_data_repositories into descriptors + runtime",significance:"THE ports milestone (Phase 2 of #601): plan-time pure repository_wiring descriptors emitted by the converter, and a separate materialize_repository_wiring runtime step (repo creation, port attachment, sink fanout). The converter's wiring becomes engine-free with no port manipulation.",type:"milestone"},
+  {module:"pipeline",date:"2026-05-21",pr:732,title:"Single-node multi-GPU",significance:"Adds single-node multi-GPU support across the task scheduler, executors, and converter, switching scheduling toward data-locality-aware dispatch.",type:"milestone"},
+  {module:"pipeline",date:"2026-05-21",pr:788,title:"Fix racy SEGFAULT on query end",significance:"Drains the task-creation queue and waits for empty before marking completion, preventing a SEGFAULT when a task-creation request resolves against freed operator nodes.",type:"fix"},
+  {module:"pipeline",date:"2026-06-01",pr:827,title:"Optimizing multi-GPU",significance:"Restores pull-signal backpressure in the multi-GPU scheduler (regressed by the push model in #732) so the downgrade executor can reach queued tasks under memory pressure.",type:"feature"},
+  {module:"pipeline",date:"2026-06-02",pr:804,title:"Fix SEGFAULT at query end 2",significance:"Follow-up teardown race fix: blocks task creation on completed operators and eliminates duplicate task-creation requests during pipeline finalization.",type:"fix"},
+  {module:"pipeline",date:"2026-06-16",pr:945,title:"Clamp GPU reservation to memory-space limit",significance:"Clamps a pipeline task's memory-history-derived reservation request to the GPU memory space limit, avoiding inflated multi-GiB requests that broke predicate-based downgrade.",type:"fix"},
+  {module:"pipeline",date:"2026-06-25",pr:996,title:"Enforce partition device pin for cuco-backed operators",significance:"Enforces (not just prefers) partition device pinning for cuco-backed partitioned operators in multi-GPU, fixing cross-device cuco access SIGABRTs.",type:"fix"},
+
+  /* ---- Task Creator & Scan Manager ---- */
+  {module:"creator",date:"2025-12-12",pr:97,title:"Downgrade Task, Queue, and Executor",significance:"First task-creation code: adds task_creator.cpp plus downgrade_task_creator.cpp, establishing the downgrade (CPU/host-fallback) task path.",type:"feature"},
+  {module:"creator",date:"2026-01-11",pr:139,title:"Task Creator",significance:"Builds the task_creator framework that converts a physical operator plan into schedulable GPU tasks — the plan-to-task conversion at the heart of this module.",type:"milestone"},
+  {module:"creator",date:"2026-01-31",pr:198,title:"Task creator rewired into new framework",significance:"Switches DuckDB PhysicalOperator to Sirius operators and uses DUCKDB_SCAN for scan tasks.",type:"feature"},
+  {module:"creator",date:"2026-02-17",pr:252,title:"Parquet scans enabled",significance:"Enables Parquet scan reading and pinned-memory caching of compressed byte ranges, with substantial task_creator rework.",type:"feature"},
+  {module:"creator",date:"2026-03-03",pr:371,title:"Partition-count logic reworked",significance:"Inserts a pipeline breaker before partitioning and moves partition sizing into the new operator_params config group.",type:"feature"},
+  {module:"creator",date:"2026-03-05",pr:340,title:"Option for caching scan outputs",significance:"Adds persistent scan-output caching that avoids cloning for parquet — the foundation for running scans from cache.",type:"feature"},
+  {module:"creator",date:"2026-03-09",pr:376,title:"Misc task scheduling improvements",significance:"Orders tasks per pipeline and adds a partition next-task hint so the build side completes first.",type:"refactor"},
+  {module:"creator",date:"2026-03-12",pr:455,title:"Skip file I/O when running from cache",significance:"Skips file I/O entirely on cache hits and folds parquet header/footer into cached byte ranges so libcudf avoids datasource fallback.",type:"feature"},
+  {module:"creator",date:"2026-03-24",pr:507,title:"Probing joins + tuned startup scan scheduling",significance:"Tunes startup scan scheduling (up to 2 scans, topology-driven task creation) and decouples build-hash-table sizing to enable probing joins.",type:"feature"},
+  {module:"creator",date:"2026-03-30",pr:519,title:"Refactor next port info",significance:"Replaces the ad-hoc pair with a named next_port_info struct (next_operator + port name) for port-info handling in task_creator.",type:"refactor"},
+  {module:"creator",date:"2026-03-31",pr:520,title:"Cleanup executor class design",significance:"Extracts shared executor infrastructure into an itask_executor base class, unifying pipeline/scan/downgrade executors.",type:"refactor"},
+  {module:"creator",date:"2026-04-20",pr:537,title:"Fix count(*)/MIN/MAX crashes with cpu_source_task",significance:"Adds cpu_source_task handling in task_creator (CPU-source fallback path).",type:"fix"},
+  {module:"creator",date:"2026-04-21",pr:620,title:"Scan operator pipeline construction",significance:"Splits the monolithic PARQUET_SCAN into cooperating metadata-scan and GPU-scan pipelines, simplifying task_creator scan handling.",type:"milestone"},
+  {module:"creator",date:"2026-04-23",pr:637,title:"Downgrade of in-flight tasks; task queue refactor",significance:"Task-queue refactor to an inspectable MPSC queue with convertible_data, letting the downgrade executor downgrade queued tasks.",type:"refactor"},
+  {module:"creator",date:"2026-04-23",pr:687,title:"pipeline_executor → task_scheduler",significance:"Renames the orchestrator to align vocabulary with task_creator/task_request.",type:"refactor"},
+  {module:"creator",date:"2026-04-30",pr:731,title:"Sirius Scan Manager",significance:"Introduces sirius_scan_manager, parquet_split_provider and split_connector — centralizing scan splitting/partitioning.",type:"milestone"},
+  {module:"creator",date:"2026-05-01",pr:733,title:"Deduplicate get_next_ports_after_sink",significance:"Deduplicates special-cased delim-join port routing, simplifying task_creator port-info logic.",type:"refactor"},
+  {module:"creator",date:"2026-05-04",pr:738,title:"Multifile parquet splits",significance:"Bundles multiple files into a single parquet read / data batch.",type:"feature"},
+  {module:"creator",date:"2026-05-16",pr:740,title:"IO framework enabled in scan manager",significance:"Wires the IO framework into the scan manager: prefetching, IoContext, and scope_dispatcher-based thread pooling.",type:"feature"},
+  {module:"creator",date:"2026-05-21",pr:732,title:"Multi-GPU task creation",significance:"Data-locality-driven push scheduling and partition affinity across GPUs.",type:"milestone"},
+  {module:"creator",date:"2026-05-22",pr:749,title:"Polymorphic scan_info + factory",significance:"Refactors scan_manager to a polymorphic scan_info base with virtual make_provider and a cache-extracted factory (DuckDB GPU-native part 8a).",type:"refactor"},
+  {module:"creator",date:"2026-05-22",pr:791,title:"duckdb_native_split_provider",significance:"Metadata-only walk over .duckdb storage emitting one split per row-group batch (part 8b).",type:"feature"},
+  {module:"creator",date:"2026-05-22",pr:784,title:"S3 datasource backend + scan_manager integration",significance:"Adds an S3 datasource backend and routes s3:// paths through the scan_manager at the runtime level.",type:"feature"},
+  {module:"creator",date:"2026-05-30",pr:792,title:"GPU-native DuckDB scan operator",significance:"Decodes .duckdb splits directly to cudf tables, plus the seq_scan→GPU pipeline hook (part 10).",type:"milestone"},
+  {module:"creator",date:"2026-06-01",pr:827,title:"Optimizing multi-GPU",significance:"Restores pull-signal backpressure in the multi-GPU task scheduler so greedy push scheduling no longer piles up tasks.",type:"feature"},
+  {module:"creator",date:"2026-06-04",pr:808,title:"Restore some scan behavior to pre-multi-GPU",significance:"Re-honors use_sirius_data_source and only splits scans per-file when needed, respecting target scan size.",type:"fix"},
+  {module:"creator",date:"2026-06-08",pr:871,title:"gpu_ingestible scan unification",significance:"Unifies parquet and duckdb-native GPU scan operators into a single sirius_gpu_scan_operator with a pluggable gpu_ingestible interface.",type:"milestone"},
+  {module:"creator",date:"2026-06-10",pr:913,title:"Cleanup scan manager",significance:"One shared io_context across GPUs, datasource carries its own io_context, removes CPU executors, GPU reader on by default.",type:"refactor"},
+  {module:"creator",date:"2026-06-25",pr:996,title:"Enforce partition device pin (multi-GPU)",significance:"Enforces partition device pinning for cuco-backed operators in task_creator, fixing multi-GPU partition-affinity crashes.",type:"fix"},
+  {module:"creator",date:"2026-06-30",pr:997,title:"Updated IO framework",significance:"Redesigns io_context/reactor for partial cache reads and cache population on read, with a large scan_manager rewrite and a load-balancing scan-batch coalescer.",type:"feature"},
+
+  /* ---- Scheduler & Downgrade Executor ---- */
+  {module:"sched",date:"2025-09-30",pr:null,title:"Base task, scheduler, and executor interfaces",significance:"Foundational commit defining the base Task, Scheduler and Executor interfaces the whole module is built on.",type:"milestone"},
+  {module:"sched",date:"2025-10-13",pr:null,title:"Task/queue/executor interface fixes + tests",significance:"Hardened the early interface contracts and added the first executor tests.",type:"refactor"},
+  {module:"sched",date:"2025-10-30",pr:null,title:"Task Interface + Sirius std wrapper",significance:"Reworked the Task interface and introduced a Sirius std wrapper, simplifying executor task handling.",type:"refactor"},
+  {module:"sched",date:"2025-12-12",pr:97,title:"Downgrade Task, Queue, and Executor",significance:"Introduced the entire downgrade subsystem that spills GPU data to relieve memory pressure.",type:"milestone"},
+  {module:"sched",date:"2025-12-15",pr:117,title:"Memory space with reservation",significance:"Added reservation-aware memory spaces and tier-selection strategy that underpin downgrade/spill decisions.",type:"feature"},
+  {module:"sched",date:"2026-01-02",pr:134,title:"Migrating to cuCascade",significance:"Migrated task/executor infrastructure onto the cuCascade library, the backbone for later data_batch and streaming work.",type:"refactor"},
+  {module:"sched",date:"2026-01-20",pr:133,title:"Sirius context and config",significance:"Added SiriusContext/config that owns and constructs the executors, centralizing scheduler configuration.",type:"feature"},
+  {module:"sched",date:"2026-01-22",pr:175,title:"Bind threads to correct CPU cores",significance:"Added CPU-core affinity so GPU executor worker threads are pinned to cores near their GPU.",type:"feature"},
+  {module:"sched",date:"2026-02-09",pr:214,title:"Add stream to tasks",significance:"Executors acquire a CUDA stream and pass it through to each task, enabling per-task stream execution.",type:"feature"},
+  {module:"sched",date:"2026-03-03",pr:368,title:"Memory-pressure-driven downgrade execution",significance:"Added a memory-pressure monitor with per-memory-space downgrade executors that trigger spills automatically.",type:"milestone"},
+  {module:"sched",date:"2026-03-18",pr:438,title:"Remove cudf::get_default_stream uses",significance:"Eliminated implicit default-stream usage so all work runs on explicit per-task streams.",type:"refactor"},
+  {module:"sched",date:"2026-03-19",pr:506,title:"Fix downgrade executor restart after stop()",significance:"Fixed executor lifecycle so a stopped downgrade executor can be cleanly restarted.",type:"fix"},
+  {module:"sched",date:"2026-03-31",pr:520,title:"Cleanup executor class design",significance:"Extracted a shared itask_executor base plus bounded_thread_pool, unifying start/stop/schedule/drain lifecycle across executors.",type:"refactor"},
+  {module:"sched",date:"2026-04-09",pr:579,title:"Downgrade request model",significance:"Redesigned the downgrade executor around a queue-of-requests model with a retry-with-downgrade loop in the pipeline executor.",type:"milestone"},
+  {module:"sched",date:"2026-04-20",pr:647,title:"DISK tier fallback in downgrade",significance:"Added non-blocking HOST→DISK spill fallback so GPU data can go to disk when host memory is exhausted.",type:"feature"},
+  {module:"sched",date:"2026-04-23",pr:637,title:"Downgrade of queued tasks; task queue refactor",significance:"Replaced the task queue with an inspectable MPSC queue and convertible_data so downgrade can spill batches held inside queued tasks.",type:"refactor"},
+  {module:"sched",date:"2026-04-23",pr:687,title:"pipeline_executor → task_scheduler",significance:"Renamed the top-level orchestrator, clarifying scheduling vs per-GPU executor roles.",type:"refactor"},
+  {module:"sched",date:"2026-05-04",pr:689,title:"Data batch refactor",significance:"Adopted tri-class data_batch (read_only/mutable), removing races and simplifying lock_or_prepare_batch during downgrade.",type:"refactor"},
+  {module:"sched",date:"2026-05-11",pr:776,title:"Per-operator memory estimate without history",significance:"Added per-operator memory estimates for pipelines lacking history, improving downgrade/scheduling admission decisions.",type:"feature"},
+  {module:"sched",date:"2026-05-21",pr:732,title:"Single-node multi-GPU scheduling",significance:"Dispatches tasks across per-GPU executors by data locality.",type:"milestone"},
+  {module:"sched",date:"2026-06-01",pr:827,title:"Optimizing multi-GPU",significance:"Restored pull-signal backpressure so tasks don't pile up in per-GPU queues beyond the reach of the downgrade executor.",type:"feature"},
+  {module:"sched",date:"2026-06-02",pr:804,title:"Fix SEGFAULT at query end 2",significance:"Prevented stale/duplicate task-creation requests at query teardown, fixing crashes during executor shutdown.",type:"fix"},
+  {module:"sched",date:"2026-06-10",pr:911,title:"Stop monitor spinning when no downgrade target viable",significance:"Stopped the downgrade monitor from busy-spinning full scans when nothing can be freed (HOST full, no DISK).",type:"fix"},
+  {module:"sched",date:"2026-06-11",pr:918,title:"rebind_stream for downgrade deallocations",significance:"Downgrade deallocations run on the executor's stream, cutting peak memory and avoiding blocking task streams.",type:"feature"},
+  {module:"sched",date:"2026-06-16",pr:809,title:"Quent Task Instrumentation",significance:"Added a task-lifecycle FSM with event instrumentation to generate per-task query timelines.",type:"feature"},
+  {module:"sched",date:"2026-06-30",pr:1035,title:"Downgrade executor shutdown improvement",significance:"Made the downgrade executor shut down promptly instead of waiting a full monitor period during engine teardown.",type:"fix"},
+
+  /* ---- Data Repositories, Memory Tiers & IO (cuCascade) ---- */
+  {module:"memio",date:"2025-09-26",pr:null,title:"First memory reservation system",significance:"Seeds the whole module: the first reservation-based memory accounting layer that later becomes cuCascade's memory manager.",type:"milestone"},
+  {module:"memio",date:"2025-10-25",pr:null,title:"Memory spaces across hardware topologies",significance:"Introduces the memory_space abstraction so reservations can target GPU/host/disk tiers mapped to hardware topology.",type:"milestone"},
+  {module:"memio",date:"2025-10-27",pr:null,title:"DataBatch dual ref-counting",significance:"Establishes the DataBatch as the unit that data repositories pass between operators, with view + pin reference counting for lifetime and residency.",type:"feature"},
+  {module:"memio",date:"2025-12-04",pr:112,title:"Topology-aware memory manager initialization",significance:"Adds TopologyDiscovery (from RapidsMPF) + NVML so the memory manager initializes tiers/NUMA-aware allocators from detected hardware.",type:"milestone"},
+  {module:"memio",date:"2025-12-12",pr:97,title:"Downgrade Task, Queue, and Executor",significance:"First spilling/tier-migration engine: moves batches down the memory hierarchy (GPU→host→disk) under pressure.",type:"feature"},
+  {module:"memio",date:"2025-12-15",pr:117,title:"Memory space with reservation",significance:"Ties reservations to allocation in the resource adaptors; adds OOM handling, tier-selection strategy and reserve/reserve_upto/reserve_or_null APIs.",type:"feature"},
+  {module:"memio",date:"2025-12-17",pr:null,repo:"cucascade",title:"cuCascade repo genesis",significance:"Memory reservation, memory spaces, data_batch, data_repository and topology discovery extracted from Sirius into a reusable NVIDIA library.",type:"milestone"},
+  {module:"memio",date:"2026-01-02",pr:134,title:"Migrating to use cuCascade",significance:"Deletes Sirius's local memory/data implementations and switches APIs to cuCascade data_batch (shared_ptr, processing-count handles).",type:"milestone"},
+  {module:"memio",date:"2026-01-09",pr:144,title:"cuCascade added as a submodule",significance:"Vendors cuCascade at cucascade/, making it the canonical source of memory/data-repository primitives.",type:"milestone"},
+  {module:"memio",date:"2026-01-20",pr:26,repo:"cucascade",title:"Partitions concept in data_repository",significance:"Reworks data_repository to hold partitioned vectors of batches with per-partition push/pop/by-id APIs, enabling partition-aware operator data exchange.",type:"feature"},
+  {module:"memio",date:"2026-02-05",pr:206,title:"First query on cuCascade stack",significance:"First end-to-end query executing on the cuCascade-backed memory/data stack, validating the migration.",type:"milestone"},
+  {module:"memio",date:"2026-02-19",pr:52,repo:"cucascade",title:"Host representation + fast GPU↔host converters",significance:"Adds a host-tier representation plus fast GPU↔host converters — the core data-movement path between memory tiers.",type:"feature"},
+  {module:"memio",date:"2026-02-23",pr:303,title:"Stream reservations",significance:"Enables per-stream reservation tracking so concurrent GPU streams account memory correctly against the reservation system.",type:"feature"},
+  {module:"memio",date:"2026-03-03",pr:368,title:"Memory-pressure-driven downgrade",significance:"Makes downgrade reactive to real memory pressure with an executor per memory space, turning spilling into an automatic tiering mechanism.",type:"feature"},
+  {module:"memio",date:"2026-03-05",pr:340,title:"Caching scan outputs",significance:"First caching layer: decoded scan outputs can be cached (GPU/host) to avoid re-decoding on repeat scans.",type:"feature"},
+  {module:"memio",date:"2026-03-12",pr:455,title:"Skip file I/O when running from cache",significance:"Short-circuits file reads entirely on cache hits, completing the cached-scan fast path.",type:"feature"},
+  {module:"memio",date:"2026-03-13",pr:452,title:"Defragmentor policy",significance:"Adds a defragmenter OOM policy that compacts fragmented memory as an alternative to spilling before failing allocations.",type:"feature"},
+  {module:"memio",date:"2026-04-14",pr:96,repo:"cucascade",title:"File downgrade (disk tier)",significance:"Implements the disk/file tier as a spill target in cuCascade so batches can be downgraded all the way to disk.",type:"feature"},
+  {module:"memio",date:"2026-04-20",pr:647,title:"DISK tier fallback in downgrade",significance:"Wires Sirius's downgrade path to fall back to the DISK tier, completing GPU→host→disk spilling end to end.",type:"feature"},
+  {module:"memio",date:"2026-04-22",pr:98,repo:"cucascade",title:"RMM usage migrated to CCCL MR design",significance:"Rewrites all memory-resource classes onto the CCCL memory_resource concept (any_resource, stream_ref) — a foundational modernization of the allocator layer.",type:"refactor"},
+  {module:"memio",date:"2026-04-24",pr:681,title:"Restore stable + nightly RAPIDS compatibility",significance:"Restores building against both stable and nightly RAPIDS after the CCCL MR / cudf churn.",type:"fix"},
+  {module:"memio",date:"2026-05-01",pr:117,repo:"cucascade",title:"Tri-class data_batch model",significance:"Replaces the 4-state batch FSM with data_batch / read_only_data_batch / mutable_data_batch RAII locks, making unsafe access a compile error.",type:"milestone"},
+  {module:"memio",date:"2026-05-01",pr:675,title:"Sirius IO, Prefetching and Caching Framework",significance:"Adds sirius::io — io_uring reactor stack, cudf datasource, pinned prefetching cache, buffer pool and admission control behind C++20 concepts.",type:"milestone"},
+  {module:"memio",date:"2026-05-04",pr:689,title:"Data batch refactor",significance:"Migrates Sirius operators onto the tri-class data_batch, simplifying lock_or_prepare_batch and removing batch race conditions.",type:"refactor"},
+  {module:"memio",date:"2026-05-06",pr:746,title:"s3datasource foundation (1/3)",significance:"Backend-neutral S3 foundation: URI parser, datasource_factory and registry — part 1 of the S3→parquet path.",type:"feature"},
+  {module:"memio",date:"2026-05-07",pr:758,title:"s3datasource credential providers (2/3)",significance:"Adds the credential_provider abstraction and a hand-rolled SigV4 default implementation for S3.",type:"feature"},
+  {module:"memio",date:"2026-05-16",pr:740,title:"IO framework live in the scan manager",significance:"Turns the IO framework on inside the scan manager (prefetching + IoContext live) — the point the new IO stack starts serving real scans.",type:"milestone"},
+  {module:"memio",date:"2026-05-22",pr:784,title:"s3datasource backend integration (3/3)",significance:"S3 reactor backend wired into the scan manager, completing the S3→parquet scan path.",type:"feature"},
+  {module:"memio",date:"2026-05-30",pr:805,title:"S3 read_parquet SQL surface",significance:"Exposes S3 parquet reads through SQL read_parquet with a CPU fallback path for unsupported cases.",type:"feature"},
+  {module:"memio",date:"2026-06-05",pr:859,title:"Async libcurl-multi S3 backend",significance:"Adds an async libcurl-multi S3 backend mirroring the io_uring reactor model for overlapped remote reads.",type:"feature"},
+  {module:"memio",date:"2026-06-23",pr:150,repo:"cucascade",title:"cudf-free cuCascade core",significance:"Splits the library into a cudf-free core and an optional cucascade-cudf target, so non-cudf consumers avoid the full cuDF stack.",type:"milestone"},
+  {module:"memio",date:"2026-06-30",pr:997,title:"Updated IO framework",significance:"Redesigns io_context/reactor for OS-page-like partial cache reads and cache-on-read, plus semi_future, round-robin balancing and multi-GPU batch coalescing in scan_manager.",type:"refactor"},
+];
+const STORY_HTML = `
+<h2>How to read this timeline</h2>
+<p><b>2024 — the legacy era.</b> Sirius starts (Jun 2024) from the DuckDB extension template with hand-written CUDA operators
+(the <code>gpu_processing</code> path, now under <code>src/legacy/</code>). By Nov 2024 the first TPC-H query runs, and TPC-H
+becomes the benchmark that shapes everything after.</p>
+<p><b>2025 — the cuDF pivot, and foundations built beside the old engine.</b> In Apr 2025 libcudf integration (#6) replaces
+bespoke kernels with RAPIDS primitives; by Aug 2025 the legacy stack passes the full TPC-H suite. Meanwhile, starting
+Sep 2025, today's architecture is built in parallel: the memory reservation system (Sep), memory spaces across hardware
+tiers (Oct), base task/scheduler/executor interfaces (Sep–Oct), then in December the pipeline framework (#96), the
+downgrade executor (#97), the topology-aware memory manager (#112) — and cuCascade is extracted into its own NVIDIA
+library (Dec 17).</p>
+<p><b>Jan–Feb 2026 — the cutover.</b> #134 migrates Sirius onto cuCascade and #144 vendors it as a submodule; #139 builds the
+task creator; #198 flips the new execution framework on; and on Feb 5, #206 runs the <b>first end-to-end query</b> on the new
+stack. Feb–Mar is a sprint of operator build-out: hash-join family (#245), sort (#217), grouped aggregation (#193), nested
+loop (#264), anti/mark joins (#306/#307), mixed join (#326), Parquet scan (#231/#252).</p>
+<p><b>Mar–May 2026 — hardening and the defining features.</b> Memory-pressure-driven downgrade (#368), the downgrade request
+model (#579) and the DISK tier (#647) make spilling automatic. Then the headline landings: <b>transparent GPU execution</b>
+(#518, Apr 21) makes interception invisible; legacy CUDA is quarantined (#692); the <b>IO/prefetching/caching framework</b>
+(#675) and its scan-manager enablement (#740); the <b>ports milestone</b> — wire_data_repositories split into plan-time
+descriptors + runtime materialization (#770); the Scan Manager (#731); the tri-class data_batch (cuCascade #117, Sirius #689);
+<b>single-node multi-GPU</b> (#732); and the three-part S3 path (#746 → #758 → #784) surfacing in SQL (#805).</p>
+<p><b>Jun–Jul 2026 — the current frontier.</b> The native expression AST fully replaces DuckDB expression routing
+(#847, #880); scan operators unify behind gpu_ingestible (#871); the scan manager and IO framework are redesigned
+(#913, #997); multi-GPU correctness hardens (#996, #945, #827); task instrumentation lands (Quent, #809); and Sirius starts
+being embedded elsewhere — a Rust FFI (#908) and a Sirius engine context inside a StarRocks compute node (#960).</p>`;
+
+/* ============ CONSTANTS ============ */
+const TYPES = [
+  { key: "milestone", label: "Milestone", color: "var(--milestone)", shape: "diamond" },
+  { key: "feature",   label: "Feature",   color: "var(--feature)",   shape: "circle" },
+  { key: "refactor",  label: "Refactor",  color: "var(--refactor)",  shape: "square" },
+  { key: "fix",       label: "Fix",       color: "var(--fix)",       shape: "triangle" },
+];
+const RANGES = [
+  { key: "all",  label: "All time" },
+  { key: "2026", label: "2026 (Super Sirius era)" },
+  { key: "2025", label: "2025" },
+  { key: "6mo",  label: "Last 6 months" },
+];
+const PR_URL = (e) => e.repo === "cucascade"
+  ? "https://github.com/NVIDIA/cuCascade/pull/" + e.pr
+  : "https://github.com/sirius-db/sirius/pull/" + e.pr;
+
+/* ============ STATE ============ */
+const state = {
+  range: "all",
+  types: new Set(TYPES.map(t => t.key)),
+  modules: new Set(MODULES.map(m => m.key)),
+  q: "",
+  selected: null,
+};
+
+/* ============ HELPERS ============ */
+const $ = (s) => document.querySelector(s);
+const parseDate = (s) => new Date(s + "T00:00:00Z");
+const fmt = (s) => parseDate(s).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+const typeOf = (k) => TYPES.find(t => t.key === k) || TYPES[1];
+
+function rangeBounds(key) {
+  const min = parseDate(GENERATED.firstCommit), max = parseDate(GENERATED.lastCommit);
+  if (key === "2026") return [parseDate("2026-01-01"), max];
+  if (key === "2025") return [parseDate("2025-01-01"), parseDate("2025-12-31")];
+  if (key === "6mo")  return [new Date(max.getTime() - 183 * 864e5), max];
+  return [min, max];
+}
+
+function visibleEvents() {
+  const [lo, hi] = rangeBounds(state.range);
+  const q = state.q.trim().toLowerCase();
+  return EVENTS.filter(e => {
+    const d = parseDate(e.date);
+    if (d < lo || d > hi) return false;
+    if (!state.types.has(e.type)) return false;
+    if (!state.modules.has(e.module)) return false;
+    if (q) {
+      const hay = (e.title + " " + (e.significance || "") + " #" + (e.pr || "")).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+/* ============ SHAPES ============ */
+function shapePath(shape, cx, cy, r) {
+  if (shape === "diamond")  return `M ${cx} ${cy - r} L ${cx + r} ${cy} L ${cx} ${cy + r} L ${cx - r} ${cy} Z`;
+  if (shape === "square")   return `M ${cx - r * 0.82} ${cy - r * 0.82} H ${cx + r * 0.82} V ${cy + r * 0.82} H ${cx - r * 0.82} Z`;
+  if (shape === "triangle") return `M ${cx} ${cy - r} L ${cx + r * 0.95} ${cy + r * 0.75} L ${cx - r * 0.95} ${cy + r * 0.75} Z`;
+  return null; // circle drawn as <circle>
+}
+function legendGlyph(t) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("width", "12"); svg.setAttribute("height", "12");
+  svg.setAttribute("viewBox", "0 0 12 12"); svg.classList.add("sw");
+  if (t.shape === "circle") {
+    const c = document.createElementNS(ns, "circle");
+    c.setAttribute("cx", 6); c.setAttribute("cy", 6); c.setAttribute("r", 4.5);
+    c.setAttribute("fill", t.color); svg.appendChild(c);
+  } else {
+    const p = document.createElementNS(ns, "path");
+    p.setAttribute("d", shapePath(t.shape, 6, 6, 5.5));
+    p.setAttribute("fill", t.color); svg.appendChild(p);
+  }
+  return svg;
+}
+
+/* ============ FILTER CHIPS ============ */
+function buildChips() {
+  const rc = $("#range-chips");
+  RANGES.forEach(r => {
+    const b = document.createElement("button");
+    b.className = "chip"; b.textContent = r.label;
+    b.setAttribute("aria-pressed", String(state.range === r.key));
+    b.addEventListener("click", () => {
+      state.range = r.key;
+      rc.querySelectorAll(".chip").forEach(x => x.setAttribute("aria-pressed", "false"));
+      b.setAttribute("aria-pressed", "true");
+      render();
+    });
+    rc.appendChild(b);
+  });
+  const tc = $("#type-chips");
+  TYPES.forEach(t => {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.appendChild(legendGlyph(t));
+    b.appendChild(document.createTextNode(t.label));
+    b.setAttribute("aria-pressed", "true");
+    b.addEventListener("click", () => {
+      if (state.types.has(t.key)) state.types.delete(t.key); else state.types.add(t.key);
+      b.setAttribute("aria-pressed", String(state.types.has(t.key)));
+      render();
+    });
+    tc.appendChild(b);
+  });
+  const mc = $("#module-chips");
+  const allB = document.createElement("button");
+  allB.className = "chip"; allB.textContent = "All modules"; allB.setAttribute("aria-pressed", "true");
+  allB.addEventListener("click", () => {
+    const allOn = state.modules.size === MODULES.length;
+    state.modules = allOn ? new Set() : new Set(MODULES.map(m => m.key));
+    mc.querySelectorAll(".chip").forEach((x, i) => x.setAttribute("aria-pressed", String(!allOn)));
+    render();
+  });
+  mc.appendChild(allB);
+  MODULES.forEach(m => {
+    const b = document.createElement("button");
+    b.className = "chip"; b.textContent = m.short;
+    b.setAttribute("aria-pressed", "true");
+    b.addEventListener("click", () => {
+      if (state.modules.has(m.key)) state.modules.delete(m.key); else state.modules.add(m.key);
+      b.setAttribute("aria-pressed", String(state.modules.has(m.key)));
+      allB.setAttribute("aria-pressed", String(state.modules.size === MODULES.length));
+      render();
+    });
+    mc.appendChild(b);
+  });
+  $("#search").addEventListener("input", (ev) => { state.q = ev.target.value; render(); });
+}
+
+/* ============ TILES ============ */
+function renderTiles(evts) {
+  const tiles = [
+    { label: "Commits mined (dev)", value: GENERATED.commitsMined.toLocaleString() },
+    { label: "Curated PRs shown", value: String(evts.length) },
+    { label: "Milestones shown", value: String(evts.filter(e => e.type === "milestone").length) },
+    { label: "Architecture modules", value: String(MODULES.length) },
+    { label: "Project span", value: "25 months" },
+  ];
+  const el = $("#tiles"); el.textContent = "";
+  tiles.forEach(t => {
+    const d = document.createElement("div"); d.className = "tile";
+    const l = document.createElement("div"); l.className = "label"; l.textContent = t.label;
+    const v = document.createElement("div"); v.className = "value"; v.textContent = t.value;
+    d.appendChild(l); d.appendChild(v); el.appendChild(d);
+  });
+}
+
+/* ============ TIMELINE ============ */
+const LAYOUT = { left: 208, right: 30, top: 46, laneH: 66, axisH: 34, minW: 1000 };
+
+function renderTimeline(evts) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = $("#timeline");
+  svg.textContent = "";
+  const lanes = MODULES.filter(m => state.modules.has(m.key));
+  const [lo, hi] = rangeBounds(state.range);
+  const scrollBox = $("#chart-scroll");
+  const width = Math.max(LAYOUT.minW, scrollBox.clientWidth - 2);
+  const height = LAYOUT.top + lanes.length * LAYOUT.laneH + LAYOUT.axisH;
+  svg.setAttribute("width", width); svg.setAttribute("height", height);
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  const x = (d) => LAYOUT.left + (d - lo) / (hi - lo) * (width - LAYOUT.left - LAYOUT.right);
+
+  const mk = (tag, attrs, parent) => {
+    const el = document.createElementNS(ns, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    (parent || svg).appendChild(el); return el;
+  };
+
+  /* month/quarter gridlines + labels */
+  const months = [];
+  const cur = new Date(Date.UTC(lo.getUTCFullYear(), lo.getUTCMonth(), 1));
+  while (cur <= hi) { months.push(new Date(cur)); cur.setUTCMonth(cur.getUTCMonth() + 1); }
+  const spanDays = (hi - lo) / 864e5;
+  const step = spanDays > 540 ? 3 : (spanDays > 240 ? 2 : 1);
+  const plotBottom = LAYOUT.top + lanes.length * LAYOUT.laneH;
+  months.forEach((m, i) => {
+    if (m < lo) return;
+    const px = x(m);
+    if (i % step === 0) {
+      mk("line", { x1: px, y1: LAYOUT.top - 4, x2: px, y2: plotBottom, stroke: "var(--grid)", "stroke-width": 1 });
+      const t = mk("text", { x: px + 4, y: plotBottom + 16, class: "tick-label" });
+      t.textContent = m.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+      if (m.getUTCMonth() === 0 || i === 0) {
+        const y = mk("text", { x: px + 4, y: plotBottom + 31, class: "year-label" });
+        y.textContent = String(m.getUTCFullYear());
+      }
+    }
+  });
+
+  /* era annotations (only in full view) */
+  if (state.range === "all") {
+    const eras = [
+      { from: "2024-06-19", to: "2025-12-31", label: "legacy gpu_processing era → foundations" },
+      { from: "2026-01-01", to: GENERATED.lastCommit, label: "Super Sirius era (cuCascade-based engine)" },
+    ];
+    eras.forEach((e, i) => {
+      const x0 = x(parseDate(e.from)), x1 = x(parseDate(e.to));
+      if (i === 1) mk("rect", { x: x0, y: LAYOUT.top - 6, width: x1 - x0, height: plotBottom - LAYOUT.top + 6, fill: "var(--wash-blue)" });
+      const t = mk("text", { x: x0 + 6, y: LAYOUT.top - 14, class: "era-label" });
+      t.textContent = e.label;
+    });
+  }
+
+  /* lanes */
+  lanes.forEach((m, li) => {
+    const yTop = LAYOUT.top + li * LAYOUT.laneH;
+    if (li > 0) mk("line", { x1: 12, y1: yTop, x2: width - 8, y2: yTop, stroke: "var(--grid)", "stroke-width": 1 });
+    const lbl = mk("text", { x: 14, y: yTop + 28, class: "lane-label" });
+    lbl.textContent = m.short;
+    const sub = mk("text", { x: 14, y: yTop + 43, class: "lane-sub" });
+    sub.textContent = m.pathHint;
+  });
+  mk("line", { x1: LAYOUT.left - 10, y1: LAYOUT.top - 6, x2: LAYOUT.left - 10, y2: plotBottom, stroke: "var(--baseline)", "stroke-width": 1 });
+  mk("line", { x1: 12, y1: plotBottom, x2: width - 8, y2: plotBottom, stroke: "var(--baseline)", "stroke-width": 1 });
+
+  /* marks with collision rows (beeswarm-lite) */
+  const laneIndex = Object.fromEntries(lanes.map((m, i) => [m.key, i]));
+  const placed = {}; // module -> [{x, row}]
+  const R = { milestone: 7, feature: 5, refactor: 5, fix: 4.5 };
+  evts.slice().sort((a, b) => a.date < b.date ? -1 : 1).forEach(e => {
+    const li = laneIndex[e.module]; if (li === undefined) return;
+    const px = x(parseDate(e.date));
+    const rows = placed[e.module] || (placed[e.module] = []);
+    let row = 0;
+    const need = (R[e.type] || 5) * 2 + 6;
+    while (rows.some(p => p.row === row && Math.abs(p.x - px) < need)) { row = (row + 1) % 3; if (row === 0) break; }
+    rows.push({ x: px, row });
+    const cy = LAYOUT.top + li * LAYOUT.laneH + LAYOUT.laneH / 2 + (row === 1 ? -15 : row === 2 ? 15 : 0);
+    const t = typeOf(e.type);
+    const r = R[e.type] || 5;
+
+    const g = mk("g", { class: "mark", tabindex: 0, role: "button" });
+    g.setAttribute("aria-label", `${e.title}${e.pr ? " (PR " + e.pr + ")" : ""}, ${fmt(e.date)}, ${t.label}`);
+    /* hit target ≥ 24px */
+    mk("circle", { cx: px, cy, r: 13, fill: "transparent" }, g);
+    if (t.shape === "circle") {
+      mk("circle", { cx: px, cy, r, fill: t.color, stroke: "var(--surface-1)", "stroke-width": 2, class: "shape" }, g);
+    } else {
+      mk("path", { d: shapePath(t.shape, px, cy, r + (t.shape === "diamond" ? 1.5 : 0)), fill: t.color, stroke: "var(--surface-1)", "stroke-width": 2, class: "shape" }, g);
+    }
+    if (state.selected && state.selected === e) g.classList.add("selected");
+    g.addEventListener("pointerenter", (ev) => showTip(e, ev));
+    g.addEventListener("pointermove", (ev) => moveTip(ev));
+    g.addEventListener("pointerleave", hideTip);
+    g.addEventListener("focus", (ev) => { const b = g.getBoundingClientRect(); showTip(e, { clientX: b.x + b.width / 2, clientY: b.y }); });
+    g.addEventListener("blur", hideTip);
+    g.addEventListener("click", () => selectEvent(e, g));
+    g.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); selectEvent(e, g); } });
+  });
+
+  /* selective direct labels: global milestones lane only, top handful */
+  const labeled = evts.filter(e => e.module === "global" && e.type === "milestone" && e.headline);
+  labeled.forEach((e, i) => {
+    const li = laneIndex["global"]; if (li === undefined) return;
+    const px = x(parseDate(e.date));
+    const cy = LAYOUT.top + li * LAYOUT.laneH + LAYOUT.laneH / 2;
+    const t = mk("text", { x: px, y: i % 2 === 0 ? cy - 17 : cy + 26, class: "anno-label", "text-anchor": "middle" });
+    t.textContent = e.headline;
+  });
+}
+
+/* ============ TOOLTIP ============ */
+function showTip(e, ev) {
+  const tip = $("#tooltip"); tip.textContent = "";
+  const v = document.createElement("div"); v.className = "tt-value";
+  v.textContent = (e.pr ? "#" + e.pr + " · " : "") + e.title;
+  const s1 = document.createElement("div"); s1.className = "tt-sub";
+  const key = document.createElement("span"); key.className = "tt-key"; key.style.background = typeOf(e.type).color;
+  s1.appendChild(key);
+  s1.appendChild(document.createTextNode(`${typeOf(e.type).label} · ${fmt(e.date)} · ${(MODULES.find(m => m.key === e.module) || {}).short || e.module}`));
+  const s2 = document.createElement("div"); s2.className = "tt-sub"; s2.textContent = e.significance || "";
+  tip.appendChild(v); tip.appendChild(s1); tip.appendChild(s2);
+  tip.style.display = "block";
+  moveTip(ev);
+}
+function moveTip(ev) {
+  const tip = $("#tooltip");
+  const pad = 14;
+  let xx = ev.clientX + pad, yy = ev.clientY + pad;
+  const r = tip.getBoundingClientRect();
+  if (xx + r.width > window.innerWidth - 8) xx = ev.clientX - r.width - pad;
+  if (yy + r.height > window.innerHeight - 8) yy = ev.clientY - r.height - pad;
+  tip.style.left = xx + "px"; tip.style.top = yy + "px";
+}
+function hideTip() { $("#tooltip").style.display = "none"; }
+
+/* ============ DETAIL PANEL ============ */
+function selectEvent(e, g) {
+  state.selected = e;
+  document.querySelectorAll(".mark.selected").forEach(x => x.classList.remove("selected"));
+  if (g) g.classList.add("selected");
+  const d = $("#detail"); d.textContent = ""; d.classList.add("open");
+  const t = typeOf(e.type);
+  const date = document.createElement("div"); date.className = "d-date";
+  date.textContent = fmt(e.date) + " · " + ((MODULES.find(m => m.key === e.module) || {}).label || e.module);
+  const title = document.createElement("div"); title.className = "d-title";
+  title.textContent = (e.pr ? "#" + e.pr + " — " : "") + e.title;
+  const chip = document.createElement("span"); chip.className = "type-chip";
+  chip.appendChild(legendGlyph(t)); chip.appendChild(document.createTextNode(t.label));
+  const sig = document.createElement("p"); sig.className = "d-sig"; sig.textContent = e.significance || "";
+  const links = document.createElement("div"); links.className = "d-links";
+  if (e.pr) {
+    const a = document.createElement("a");
+    a.href = PR_URL(e); a.target = "_blank"; a.rel = "noopener";
+    a.textContent = "Open " + (e.repo === "cucascade" ? "NVIDIA/cuCascade" : "sirius-db/sirius") + " PR #" + e.pr + " ↗";
+    links.appendChild(a);
+  }
+  d.appendChild(date); d.appendChild(title); d.appendChild(chip); d.appendChild(sig); d.appendChild(links);
+  d.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+/* ============ MODULE TABLES (the table view) ============ */
+function renderModules(evts) {
+  const host = $("#modules"); host.textContent = "";
+  MODULES.forEach(m => {
+    if (!state.modules.has(m.key)) return;
+    const rows = evts.filter(e => e.module === m.key);
+    const sec = document.createElement("section"); sec.className = "mod"; sec.id = "mod-" + m.key;
+    const h = document.createElement("h3"); h.textContent = m.label;
+    const p = document.createElement("div"); p.className = "paths"; p.textContent = m.paths;
+    const desc = document.createElement("p"); desc.className = "desc"; desc.textContent = m.desc;
+    sec.appendChild(h); sec.appendChild(p); sec.appendChild(desc);
+    if (!rows.length) {
+      const em = document.createElement("div"); em.className = "empty-note";
+      em.textContent = "No curated PRs match the current filters.";
+      sec.appendChild(em);
+    } else {
+      const tbl = document.createElement("table");
+      const thead = document.createElement("thead");
+      const trh = document.createElement("tr");
+      ["Date", "PR", "Type", "Change", "Why it matters"].forEach(hd => {
+        const th = document.createElement("th"); th.textContent = hd; trh.appendChild(th);
+      });
+      thead.appendChild(trh); tbl.appendChild(thead);
+      const tb = document.createElement("tbody");
+      rows.forEach(e => {
+        const tr = document.createElement("tr");
+        if (e.type === "milestone") tr.className = "is-milestone";
+        const td1 = document.createElement("td"); td1.className = "c-date"; td1.textContent = e.date;
+        const td2 = document.createElement("td"); td2.className = "c-pr";
+        if (e.pr) {
+          const a = document.createElement("a"); a.href = PR_URL(e); a.target = "_blank"; a.rel = "noopener";
+          a.textContent = "#" + e.pr + (e.repo === "cucascade" ? " (cuCascade)" : "");
+          td2.appendChild(a);
+        } else td2.textContent = "—";
+        const td3 = document.createElement("td");
+        const chip = document.createElement("span"); chip.className = "type-chip";
+        const t = typeOf(e.type);
+        chip.appendChild(legendGlyph(t)); chip.appendChild(document.createTextNode(t.label));
+        td3.appendChild(chip);
+        const td4 = document.createElement("td"); td4.className = "c-title"; td4.textContent = e.title;
+        const td5 = document.createElement("td"); td5.className = "c-sig"; td5.textContent = e.significance || "";
+        tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4); tr.appendChild(td5);
+        tb.appendChild(tr);
+      });
+      tbl.appendChild(tb); sec.appendChild(tbl);
+    }
+    host.appendChild(sec);
+  });
+}
+
+/* ============ RENDER ============ */
+function render() {
+  const evts = visibleEvents();
+  renderTiles(evts);
+  renderTimeline(evts);
+  renderModules(evts);
+}
+
+function init() {
+  $("#gen-meta").textContent =
+    `Generated ${fmt(GENERATED.on)} from ${GENERATED.commitsMined.toLocaleString()} commits on dev ` +
+    `(${fmt(GENERATED.firstCommit)} → ${fmt(GENERATED.lastCommit)}). Dates are commit author dates; ` +
+    `PR numbers link to GitHub. This is a curated subset — not every PR.`;
+  $("#story").innerHTML = STORY_HTML; /* static author-written narrative, no user data */
+  $("#foot").textContent =
+    "Method: git log per module path on the dev branch of sirius-db/sirius (plus the NVIDIA/cuCascade submodule), " +
+    "curated to architectural milestones, feature landings and major refactors. " +
+    "Curation is opinionated — open the linked PRs for the authoritative record.";
+  buildChips();
+  render();
+  window.addEventListener("resize", () => renderTimeline(visibleEvents()));
+}
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,445 @@
+<section class="module" id="module-3">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">03</span>
+      <h1 class="module-title">Life of a Query</h1>
+      <p class="module-subtitle">One query traced end to end with the real functions — from SQL string to fulfilled future.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── SCREEN 1: PLANNING ─────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">One query, two pipelines</h2>
+
+        <p>Let&rsquo;s trace one query, end to end, with the real functions — every name below is <code>grep</code>-able in the tree:</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">the query</span>
+          <pre><code><span class="code-keyword">SELECT</span> <span class="code-function">count</span>(*) <span class="code-keyword">FROM</span> orders <span class="code-keyword">WHERE</span> amount <span class="code-operator">&gt;</span> <span class="code-number">100</span>;</code></pre>
+        </div>
+
+        <p>DuckDB parses it; Sirius converts the plan and cuts it at the COUNT, because an aggregate is a <span class="term" data-definition="An operator that must consume ALL of its input before it can emit anything — aggregates, sorts, hash-join builds. The plan is cut into a new pipeline at every one.">pipeline breaker</span> — it must see all input before emitting anything. The result is two pipelines:</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">the split plan</span>
+          <pre><code><span class="code-property">Pipeline A (streaming):</span> SCAN(orders) → FILTER(amount&gt;100) → [sink: partial COUNT state]
+<span class="code-property">Pipeline B (terminal):</span> COUNT finalize → RESULT_COLLECTOR</code></pre>
+        </div>
+
+        <p>Mental model: a kanban factory line. Stations never push work downstream — a station <em>pulls</em> when its input bin has parts, and the andon board only updates when a worker turns in a job card. Hold on to that second rule; it becomes a bug story in Module 7.</p>
+
+        <p>Not all bins are equal. Each input <span class="term" data-definition="An input slot of an operator, wiring it to one upstream pipeline. A port carries a barrier type plus a repository holding the batches waiting to be consumed.">port</span> carries a barrier type that decides when the consumer may start:</p>
+
+        <div class="badge-list">
+          <div class="badge-item">
+            <code class="badge-code term" data-definition="Batch-by-batch flow: the consumer runs as soon as the producer emits one batch. No waiting for the whole upstream result.">PIPELINE</code>
+            <span class="badge-desc">A&rsquo;s internal hops: SCAN → FILTER → sink stream batch by batch.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code term" data-definition="The hard barrier: the consumer cannot start until the producer pipeline is COMPLETELY finished. The entire upstream result must exist first.">FULL</code>
+            <span class="badge-desc">B&rsquo;s input port: COUNT finalize is blocked until Pipeline A completely finishes.</span>
+          </div>
+          <div class="badge-item">
+            <code class="badge-code term" data-definition="The middle ground: the consumer may begin before the producer pipeline fully finishes, without full batch-by-batch streaming. Used for hand-offs like concatenation wiring.">PARTIAL</code>
+            <span class="badge-desc">Not used in this query — the in-between type for hand-offs like concat.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 2: KICKOFF + HERO FLOW ANIMATION ───────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Kickoff: one line of code starts everything</h2>
+
+        <p>DuckDB&rsquo;s execution thread calls exactly one Sirius entry point, then goes to sleep. Everything else in this module happens on Sirius worker threads while that thread blocks on the returned future.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/task_scheduler.cpp:172</span>
+            <pre><code>std::future&lt;<span class="code-keyword">void</span>&gt; task_scheduler::<span class="code-function">start_query</span>()
+{
+  std::scoped_lock <span class="code-function">lock</span>(_query_mutex);
+  <span class="code-keyword">const auto</span>&amp; scans = _query-&gt;<span class="code-function">get_scan_operators</span>();
+
+  _task_creator-&gt;<span class="code-function">schedule</span>(scans.<span class="code-function">front</span>());
+
+  <span class="code-keyword">return</span> _completion_handler-&gt;<span class="code-function">get_awaitable</span>();
+}</code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Returns a future — this is what the DuckDB thread will block on until the answer exists.</p>
+              <p class="tl">Take the query lock and look up the pipeline sources: the scan operators.</p>
+              <p class="tl">Schedule the first scan. This is the only <em>push</em> in the whole engine — every move after this is a pull.</p>
+              <p class="tl">Hand back the awaitable; the <span class="term" data-definition="The terminal operator of the last pipeline. It materializes the final rows and fulfills the future that DuckDB has been blocking on since start_query().">RESULT_COLLECTOR</span> fulfills it at the very end of Pipeline B.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>Here is the entire run, end to end. Click through it once now — the next three screens zoom into the machinery behind steps 3, 4&ndash;6 and 9.</p>
+
+        <div class="flow-animation" data-steps='[
+          {"highlight":"flow-m3-plangen","label":"SQL arrives. DuckDB parses it; the plan generator splits the plan at the pipeline breaker into Pipeline A (scan, filter, count sink) and Pipeline B (finalize, collect).","packet":true,"from":"m3-duckdb","to":"m3-plangen"},
+          {"highlight":"flow-m3-scan","label":"task_scheduler::start_query() schedules the first scan — the only push in the engine — and hands DuckDB a future to block on.","packet":true,"from":"m3-plangen","to":"m3-scan"},
+          {"highlight":"flow-m3-scan","label":"The task creator asks the scan: get_next_task_hint() answers READY, so a gpu_pipeline_task is built for the first split of orders."},
+          {"highlight":"flow-m3-filter","label":"The task runs: the scan batch is pulled through FILTER(amount &gt; 100) on the GPU.","packet":true,"from":"m3-scan","to":"m3-filter"},
+          {"highlight":"flow-m3-sink","label":"Surviving rows reach the partial-COUNT sink, which folds them into its running count state.","packet":true,"from":"m3-filter","to":"m3-sink"},
+          {"highlight":"flow-m3-repo","label":"publish_output(): the result handle — not a copy — lands in the repository of the downstream port.","packet":true,"from":"m3-sink","to":"m3-repo"},
+          {"highlight":"flow-m3-filter","label":"Pulse 2: the scan still has splits, so the hint is READY again and another task pulls the next batch through the same stations.","packet":true,"from":"m3-scan","to":"m3-filter"},
+          {"highlight":"flow-m3-sink","label":"Pulse 3: batch after batch, tasks_completed ticks up and the count state keeps accumulating.","packet":true,"from":"m3-filter","to":"m3-sink"},
+          {"highlight":"flow-m3-sink","label":"The scan is exhausted and the last task completes: mark_task_completed() runs update_pipeline_status() — Pipeline A is finished and its operators finalize."},
+          {"highlight":"flow-m3-finalize","label":"The FULL barrier on Pipeline B is now satisfied. COUNT finalize pulls the completed state through its port.","packet":true,"from":"m3-repo","to":"m3-finalize"},
+          {"highlight":"flow-m3-collector","label":"Pipeline B runs: the final count lands in the RESULT_COLLECTOR.","packet":true,"from":"m3-finalize","to":"m3-collector"},
+          {"highlight":"flow-m3-duckdb","label":"The RESULT_COLLECTOR fulfills the future. The DuckDB thread wakes up and returns the answer to the client.","packet":true,"from":"m3-collector","to":"m3-duckdb"}
+        ]'>
+          <div class="flow-actors">
+            <div class="flow-actor" id="flow-m3-duckdb">
+              <div class="flow-actor-icon">🦆</div>
+              <span>DuckDB</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-plangen">
+              <div class="flow-actor-icon">✂️</div>
+              <span>plan generator</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-scan">
+              <div class="flow-actor-icon">📥</div>
+              <span>SCAN · A</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-filter">
+              <div class="flow-actor-icon">σ</div>
+              <span>FILTER · A</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-sink">
+              <div class="flow-actor-icon">Σ</div>
+              <span>COUNT sink · A</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-repo">
+              <div class="flow-actor-icon">🗄️</div>
+              <span>port repo</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-finalize">
+              <div class="flow-actor-icon">🧮</div>
+              <span>COUNT finalize · B</span>
+            </div>
+            <div class="flow-actor" id="flow-m3-collector">
+              <div class="flow-actor-icon">📤</div>
+              <span>RESULT_COLLECTOR · B</span>
+            </div>
+          </div>
+
+          <div class="flow-packet"></div>
+
+          <div class="flow-step-label">Click "Next Step" to begin</div>
+
+          <div class="flow-controls">
+            <button class="btn flow-next-btn">Next Step</button>
+            <button class="btn flow-reset-btn">Restart</button>
+            <span class="flow-progress"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 3: THE HINT PROTOCOL ────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The heart: <code>get_next_task_hint()</code></h2>
+
+        <p>The task creator never guesses what to run next. Before building any task it asks the operator for a hint — and there are exactly three possible answers.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">⚡</div>
+            <h4 class="pattern-title"><code>READY{this}</code></h4>
+            <p class="pattern-desc">&ldquo;Build me a task.&rdquo; Every input port has data, or I am a source with splits left. The creator wraps the pipeline in a <span class="term" data-definition="The unit of scheduled work in Sirius: one batch (split) pushed through every operator of one pipeline, ending at its sink. Defined in src/include/pipeline/gpu_pipeline_task.hpp.">gpu_pipeline_task</span>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">🔁</div>
+            <h4 class="pattern-title"><code>WAITING_FOR_INPUT_DATA{producer}</code></h4>
+            <p class="pattern-desc">&ldquo;Go ask upstream.&rdquo; A FULL-barrier port has an unfinished producer, and the hint carries a pointer to it. The creator recurses — the <span class="term" data-definition="The recursion of get_next_task_hint() calls: a consumer answers WAITING and points at its producer, so the task creator asks the producer instead — repeating until some operator answers READY. Deepest producers run first.">hint chain</span>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🏁</div>
+            <h4 class="pattern-title"><code>std::nullopt</code></h4>
+            <p class="pattern-desc">&ldquo;I&rsquo;m done forever.&rdquo; No task will ever be needed here again — a scan answers this once its last <span class="term" data-definition="One scan-sized chunk of the input table — the granularity at which tasks are created. A scan with splits remaining keeps answering READY; out of splits, it answers nullopt.">split</span> is gone. The creator stops asking.</p>
+          </div>
+        </div>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">src/include/op/sirius_physical_operator.hpp:49</span>
+          <pre><code><span class="code-keyword">enum class</span> TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
+<span class="code-keyword">enum class</span> MemoryBarrierType { PIPELINE, PARTIAL, FULL };
+
+<span class="code-keyword">struct</span> task_creation_hint {
+  TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
+  sirius_physical_operator* producer{<span class="code-keyword">nullptr</span>};
+};</code></pre>
+        </div>
+
+        <p>The base implementation walks the input ports looking for a FULL barrier whose producer pipeline hasn&rsquo;t finished. Found one? Answer WAITING, pointing at that pipeline&rsquo;s source. Every port satisfied? The function falls through to READY.</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">src/op/sirius_physical_operator.cpp:275</span>
+          <pre><code>std::optional&lt;task_creation_hint&gt; sirius_physical_operator::<span class="code-function">get_next_task_hint</span>()
+{
+  <span class="code-keyword">if</span> (ports.<span class="code-function">empty</span>()) { <span class="code-keyword">return</span> std::nullopt; }
+
+<span class="code-comment">  // look at the input ports and see if there are any unfinished hard barriers</span>
+  <span class="code-keyword">auto</span> unfinished_barrier = std::<span class="code-function">find_if</span>(_ports_list.<span class="code-function">begin</span>(), _ports_list.<span class="code-function">end</span>(), [](<span class="code-keyword">const auto</span>&amp; p) {
+    <span class="code-keyword">return</span> p-&gt;type == MemoryBarrierType::FULL &amp;&amp; p-&gt;src_pipeline &amp;&amp;
+           !p-&gt;src_pipeline-&gt;<span class="code-function">is_pipeline_finished</span>();
+  });
+
+  <span class="code-keyword">if</span> (unfinished_barrier != _ports_list.<span class="code-function">end</span>()) {
+    <span class="code-keyword">auto</span>* producer = &amp;((*unfinished_barrier)-&gt;src_pipeline-&gt;<span class="code-function">get_operators</span>()[<span class="code-number">0</span>].<span class="code-function">get</span>());
+    <span class="code-keyword">return</span> task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+  }</code></pre>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 4: A TASK RUNS ──────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">A task runs the line</h2>
+
+        <p>A READY hint becomes a <code>gpu_pipeline_task</code>: one split pushed through every station of one pipeline. Four moves, always in this order:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">1</div>
+            <div class="step-body">
+              <strong>Reserve GPU memory</strong>
+              <p>Admission control: the memory this batch needs is reserved before anything executes. Module 5 lives entirely inside this step.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">2</div>
+            <div class="step-body">
+              <strong><code>prepare_for_processing()</code></strong>
+              <p>Lock the input batches and colocate them into one memory space, so the kernels see resident, same-device inputs.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">3</div>
+            <div class="step-body">
+              <strong><code>execute()</code> each operator</strong>
+              <p>The batch is pulled through the station chain on the GPU: scan output through FILTER, results into the partial-COUNT sink.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">4</div>
+            <div class="step-body">
+              <strong><code>publish_output()</code> → terminal <code>sink()</code></strong>
+              <p>Surviving rows are pushed into the <span class="term" data-definition="The buffer attached to a port (a cucascade::shared_data_repository) where producer tasks deposit output batch handles for the consumer to pull later.">repository</span> of the next port — as handles, never copies.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">🔗</div>
+          <div class="callout-content">
+            <strong class="callout-title">Data moves by handle, not copy</strong>
+            <p><code>publish_output()</code> deposits references to GPU-resident batches; nothing is serialized and nothing returns up the call stack. What a batch actually <em>is</em> — that&rsquo;s Module 4.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 5: COMPLETION DRIVES EVERYTHING ─────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Completion drives everything</h2>
+
+        <p>Nothing polls this factory. The only moment the engine re-evaluates a pipeline is the tail of <code>mark_task_completed()</code> — a worker turning in a job card:</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">src/pipeline/sirius_pipeline.cpp:459</span>
+          <pre><code>  tasks_completed++;
+  <span class="code-function">update_pipeline_status</span>();
+}</code></pre>
+        </div>
+
+        <p><code>update_pipeline_status()</code> then asks one compound question. Every clause exists to kill a specific bug:</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/sirius_pipeline.cpp:389</span>
+            <pre><code>      <span class="code-keyword">if</span> (limit_exhausted ||
+          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>())) {
+        <span class="code-keyword">if</span> (tasks_created.<span class="code-function">load</span>() == tasks_completed.<span class="code-function">load</span>()) {
+          pipeline_finished.<span class="code-function">store</span>(<span class="code-keyword">true</span>);
+          <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; op : <span class="code-function">get_operators</span>()) {
+            op.<span class="code-function">get</span>().<span class="code-function">finalize_operator</span>();
+          }
+          <span class="code-function">end_nvtx_range_if_finished</span>();
+          should_notify = <span class="code-keyword">true</span>;
+        }
+      }</code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">PLAIN ENGLISH</span>
+            <div class="translation-lines">
+              <p class="tl">Escape hatch: a LIMIT downstream already has every row it needs — stop early.</p>
+              <p class="tl">Otherwise, two conditions: the source has handed out its last split, AND every input port has been drained.</p>
+              <p class="tl">In-flight accounting: every job card issued has been turned back in. No task is still running against these operators.</p>
+              <p class="tl">Only now is the pipeline declared finished.</p>
+              <p class="tl">Each operator gets its one <span class="term" data-definition="The end-of-pipeline call each operator receives exactly once, when its pipeline is declared finished. Aggregates seal their accumulated state here — finalize on a partial state would produce a wrong answer.">finalize</span> call — the partial COUNT seals its state here.</p>
+              <p class="tl">Close the profiling range, and flag that downstream pipelines waiting on our FULL barrier must be notified — this is what wakes Pipeline B.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="flow-steps">
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p>last task finishes → <code>mark_task_completed()</code></p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p><code>update_pipeline_status()</code> re-checks A</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">3</div>
+            <p>A finished → operators finalize</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">4</div>
+            <p>B&rsquo;s FULL barrier satisfied → B runs</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">5</div>
+            <p>RESULT_COLLECTOR fulfills the future</p>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">No timer. No poller.</strong>
+            <p>Completion is <span class="term" data-definition="Pipeline status is re-evaluated only on the completion edge of a task — update_pipeline_status() is driven from mark_task_completed(). There is no timer or polling loop that ever re-checks it.">edge-triggered</span>: if no task completes, <code>update_pipeline_status()</code> never runs and nobody ever re-checks anything. The andon board only updates on a turned-in job card — and that exact property becomes a hang story in Module 7.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 6: QUIZ ─────────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Trace it yourself</h2>
+
+        <p>Four scenarios, same query. Answer from the loop you just walked, not from memory.</p>
+
+        <div class="quiz-container" id="quiz-module3">
+          <div class="quiz-question-block"
+               data-correct="q1-b"
+               data-explanation-right="Exactly — the aggregate is a pipeline breaker, so B&rsquo;s port is a FULL barrier. Finalize on a partial count is not slow, it is wrong."
+               data-explanation-wrong="Not quite. Nothing about the scheduler or the GPU forbids overlap — the constraint is semantic: COUNT finalize is meaningless until every batch has been folded into the state. That is exactly what the FULL barrier on B&rsquo;s input port encodes.">
+            <h3 class="quiz-question">1. Why can&rsquo;t Pipeline B start as soon as the first filtered batch exists?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q1-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The scheduler runs pipelines strictly in plan order, one at a time</span>
+              </button>
+              <button class="quiz-option" data-value="q1-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>B&rsquo;s input port is a FULL barrier: COUNT finalize needs the complete count state — an early start would finalize a partial, wrong result</span>
+              </button>
+              <button class="quiz-option" data-value="q1-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The GPU cannot execute tasks from two pipelines concurrently</span>
+              </button>
+              <button class="quiz-option" data-value="q1-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The RESULT_COLLECTOR holds a lock on the port repository until A drains it</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q2-c"
+               data-explanation-right="Yes — that producer pointer is the hint chain in action: walk upstream until someone says READY. Deepest producers run first, which is pull-when-ready by construction."
+               data-explanation-wrong="Not quite. There is no polling and no error path here — the hint carries a producer pointer precisely so the creator can walk upstream and build the task where data can actually be produced.">
+            <h3 class="quiz-question">2. The filter&rsquo;s hint returns <code>WAITING_FOR_INPUT_DATA</code> with <code>producer=scan</code>. What does the task creator do next?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q2-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Parks the filter on a wait-queue and polls it until input data arrives</span>
+              </button>
+              <button class="quiz-option" data-value="q2-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Builds the filter task anyway, with an empty input batch</span>
+              </button>
+              <button class="quiz-option" data-value="q2-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Recurses: asks the scan for <em>its</em> hint — the deepest producer that answers READY gets the task</span>
+              </button>
+              <button class="quiz-option" data-value="q2-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Fails the query — WAITING at task-creation time is an invariant violation</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q3-b"
+               data-explanation-right="Exactly. Completion is edge-triggered: update_pipeline_status() runs from mark_task_completed(). No completing task means no edge — nobody ever re-asks whether the pipeline is done."
+               data-explanation-wrong="Look at snippet E again: in the steady state, update_pipeline_status() is driven from mark_task_completed(). With zero tasks in flight there is no completion edge — so that is the function that silently never ran.">
+            <h3 class="quiz-question">3. A query hangs. Zero tasks in flight, and the pipeline never finishes. Which function had no reason to run?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q3-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>get_next_task_hint()</code></span>
+              </button>
+              <button class="quiz-option" data-value="q3-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>update_pipeline_status()</code> — it is only called on task completion; with nothing completing, the status is never re-evaluated</span>
+              </button>
+              <button class="quiz-option" data-value="q3-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>start_query()</code></span>
+              </button>
+              <button class="quiz-option" data-value="q3-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>publish_output()</code></span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q4-c"
+               data-explanation-right="Right — source exhausted and ports drained only prove no NEW work exists; the counter check proves no OLD work is still in flight. Skip it and you finalize operators a live task is still writing to."
+               data-explanation-wrong="Not quite. The other two clauses already cover new work (source exhausted, ports drained); this one is in-flight accounting. Without it, a still-running task could execute against operators that were just finalized under its feet — premature completion, use-after-free territory.">
+            <h3 class="quiz-question">4. <code>tasks_created == tasks_completed</code> is checked inside the finish condition. What bug does that prevent?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q4-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Creating two tasks for the same split</span>
+              </button>
+              <button class="quiz-option" data-value="q4-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Double-counting rows in the partial COUNT state</span>
+              </button>
+              <button class="quiz-option" data-value="q4-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Declaring the pipeline finished while a task is still running — finalizing operators under a live task</span>
+              </button>
+              <button class="quiz-option" data-value="q4-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Letting Pipeline B start before its FULL barrier is satisfied</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module3')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module3')">Try Again</button>
+        </div>
+
+        <p style="margin-top: var(--space-8)">We hand-waved &ldquo;the batch goes to the repo.&rdquo; Next module: what a batch actually <em>is</em> — and why it never travels by function return.</p>
+      </section>
+
+    </div>
+  </div>
+</section>

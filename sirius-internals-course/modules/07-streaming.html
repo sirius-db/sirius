@@ -1,0 +1,461 @@
+<section class="module" id="module-7">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">07</span>
+      <h1 class="module-title">The Streaming Frontier</h1>
+      <p class="module-subtitle">Your sprint: <a href="https://github.com/sirius-db/sirius/issues/836">#836</a> (streaming source) and <a href="https://github.com/sirius-db/sirius/issues/837">#837</a> (streaming sink) — and the two hangs an edge-triggered engine had waiting for them.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── SCREEN 1: WHERE YOUR OPERATORS SIT ─────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Where your operators sit</h2>
+
+        <p>Everything in modules 1&ndash;6 assumed data comes from disk. Your job (#836/#837) is to teach the engine that data can come from — and leave to — another machine, so Sirius can run as a StarRocks compute node inside a <span class="term" data-definition="StarRocks&rsquo; unit of distributed execution: one slice of a query plan running on one compute node, wired to other fragments by exchanges. Your source sits at a fragment&rsquo;s bottom edge; your sink at its top.">fragment</span>. The engine&rsquo;s loop barely changes. Its <em>assumptions</em> do.</p>
+
+        <div class="translation-code" style="border-radius: var(--radius-md); box-shadow: var(--shadow-md); margin: var(--space-6) 0;">
+          <span class="translation-label">the same trace, new leaf</span>
+          <pre><code><span class="code-line"><span class="code-property">Module 3:</span>    SCAN(orders)              → FILTER → COUNT sink</span>
+<span class="code-line"><span class="code-property">Your #836:</span>   STREAMING_SOURCE(channel) → FILTER → COUNT sink</span>
+<span class="code-line"><span class="code-comment">                                          └── everything downstream: untouched</span></span></code></pre>
+        </div>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">📥</div>
+            <h4 class="pattern-title">GPU scan (Module 3)</h4>
+            <p class="pattern-desc">Pulls splits from the <span class="term" data-definition="The scan-side feed of splits that gpu_scan pulls from. Its is_closed() already means closed AND drained — the exact predicate shape the exchange_channel copies for its EOS."><code>split_connector</code></span>. While data remains, every poll yields a split, every split a task — the machine feeds itself.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">📡</div>
+            <h4 class="pattern-title">Your streaming source</h4>
+            <p class="pattern-desc">Pops handles from an <span class="term" data-definition="The planned bounded channel of {batch_id, size_bytes} handles with close-then-drain end-of-stream (design: src/include/exec/exchange_channel.hpp). From the streaming design notes — NOT yet in tree."><code>exchange_channel</code></span> a remote producer pushes into. Same hint machinery — but a stream can legally produce <strong>zero tasks</strong>. Hold that thought.</p>
+          </div>
+        </div>
+
+        <p style="margin-top: var(--space-8)">Your sink (#837) mirrors it at the <em>top</em> of the fragment — and its shape is the first real design decision on your PR:</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-error)">
+            <div class="pattern-icon" style="background: var(--color-error)">✗</div>
+            <h4 class="pattern-title">RESULT_COLLECTOR clone</h4>
+            <p class="pattern-desc">A pure terminal: its <code>sink()</code> runs inside the <em>compute</em> pipeline&rsquo;s task. It creates no tasks of its own — so a full channel could only ever stall a worker thread mid-task.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-success)">
+            <div class="pattern-icon" style="background: var(--color-success)">✓</div>
+            <h4 class="pattern-title">CONCAT-shape boundary</h4>
+            <p class="pattern-desc">A <span class="term" data-definition="An operator that heads its own pipeline with is_source() AND is_sink() both true — like CONCAT. It creates its own tasks, which gives it a hint to gate on. A pure terminal sink has neither.">boundary operator</span>: <code>is_source() &amp;&amp; is_sink()</code>, heading its own pipeline. <span class="term" data-definition="Slowing a producer when the consumer cannot keep up. In Sirius it must surface as fewer tasks created — never as a blocked worker thread.">Backpressure</span> becomes a <em>task-creation condition</em>: full channel → no sink tasks → upstream port repos fill with idle, spillable batches → the engine throttles itself. No worker ever blocks.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 2: THE CHANNEL CONTRACT ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The channel contract</h2>
+
+        <p>Both operators stand on one primitive. Its contract fits on a card — read it as the spec your unit tests will assert:</p>
+
+        <div style="border: 2px dashed var(--color-actor-2); border-radius: var(--radius-md); padding: var(--space-6); background: var(--color-surface); box-shadow: var(--shadow-sm); margin: var(--space-6) 0;">
+          <span style="display: inline-block; font-family: var(--font-mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-actor-2); font-weight: 600; border: 1px solid var(--color-actor-2); border-radius: var(--radius-full); padding: var(--space-1) var(--space-3); margin-bottom: var(--space-4);">Planned API — from the design notes, not yet in tree</span>
+          <h3 style="font-family: var(--font-display); font-size: var(--text-xl); margin: 0 0 var(--space-4);"><code>exchange_channel</code> — bounded, close-then-drain</h3>
+          <div class="badge-list">
+            <div class="badge-item">
+              <code class="badge-code">{batch_id, size_bytes}</code>
+              <span class="badge-desc">What travels: a handle, never a batch. The batch is registered in a repository FIRST, then the handle is pushed.</span>
+            </div>
+            <div class="badge-item">
+              <code class="badge-code">try_push(h)</code>
+              <span class="badge-desc">False when full or closed; never blocks. The engine side only ever uses the <code>try_</code> pair.</span>
+            </div>
+            <div class="badge-item">
+              <code class="badge-code">try_pop()</code>
+              <span class="badge-desc">Nullopt when empty; never blocks. Blocking <code>push</code>/<code>pop</code> exist only for the wrapper/test side.</span>
+            </div>
+            <div class="badge-item">
+              <code class="badge-code">close()</code>
+              <span class="badge-desc">Idempotent. Forbids new pushes — but queued items stay poppable: <span class="term" data-definition="The EOS discipline: close() rejects new pushes while queued items remain poppable. The stream is only over when closed AND empty. Same predicate shape as split_connector::is_closed().">close-then-drain</span>, not abort.</span>
+            </div>
+            <div class="badge-item">
+              <code class="badge-code">drained()</code>
+              <span class="badge-desc"><code>closed() &amp;&amp; empty()</code> — the one true <span class="term" data-definition="End of stream: the point after which no more batches will ever arrive. In this design it is exactly the state drained() — closed AND empty.">EOS</span> predicate, same shape as <code>split_connector::is_closed()</code>.</span>
+            </div>
+          </div>
+        </div>
+
+        <p>Why handles? Module 4&rsquo;s law: a batch idle in a repository is a spill candidate. Trace one batch across the boundary:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">1</div>
+            <div class="step-body">
+              <strong>Producer registers the batch in a repository</strong>
+              <p>Ownership lands where the downgrade executor can see it — idle, unlocked, spillable.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">2</div>
+            <div class="step-body">
+              <strong>Then it pushes <code>{batch_id, size_bytes}</code></strong>
+              <p>Two POD fields cross the channel. The channel holds metadata, never memory.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-2)">
+            <div class="step-num" style="background: var(--color-actor-2)">3</div>
+            <div class="step-body">
+              <strong>Your source resolves the id at task-creation time</strong>
+              <p><code>pop_data_batch_by_id(h.batch_id)</code> claims the batch from the repo only when a task is actually being built.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">⚖️</div>
+          <div class="callout-content">
+            <strong class="callout-title">The channel must never own memory</strong>
+            <p>A <code>shared_ptr&lt;data_batch&gt;</code> in the queue would make the channel a hidden owner of GPU memory — invisible to the downgrade executor, Module 5&rsquo;s cardinal sin. Handles keep every queued batch idle-in-repo until the moment a task claims it.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 3: THE HINT TABLE ───────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Your source&rsquo;s hint table</h2>
+
+        <p>Module 3&rsquo;s three answers, re-derived for a channel instead of a <code>split_connector</code> — this is the table your operator&rsquo;s <code>get_next_task_hint()</code> implements (per the design notes):</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">⚡</div>
+            <h4 class="pattern-title">channel non-empty</h4>
+            <p class="pattern-desc"><code>READY{this}</code> — one task per available batch, open <em>or</em> closed. Multi-shot; READY must carry <code>this</code> (a null producer throws).</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">⏸</div>
+            <h4 class="pattern-title">open but empty</h4>
+            <p class="pattern-desc"><code>WAITING_FOR_INPUT_DATA{nullptr}</code> — &ldquo;not now.&rdquo; The producer is a remote machine; there is no upstream operator for the hint chain to recurse into.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🏁</div>
+            <h4 class="pattern-title">closed AND drained</h4>
+            <p class="pattern-desc"><code>std::nullopt</code> — exhausted forever, terminal. The streaming twin of a scan running out of splits.</p>
+          </div>
+        </div>
+
+        <div class="badge-list" style="margin-top: var(--space-6)">
+          <div class="badge-item">
+            <code class="badge-code">all_ports_empty()</code>
+            <span class="badge-desc">Overridden to <code>channel-&gt;drained()</code>. A zero-port source inherits a base that returns true unconditionally — forget this override and your operator&rsquo;s body silently never runs.</span>
+          </div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">⚠️</div>
+          <div class="callout-content">
+            <strong class="callout-title">The hint is not <span class="term" data-definition="Deciding whether work may consume resources at the moment it starts — here, gating each individual pull at task-creation time, not just once per hint round.">admission control</span></strong>
+            <p>Module 3&rsquo;s task creator evaluates the hint once, then loops building tasks — it does <em>not</em> re-poll the hint per pull. Per-pull gating belongs in <code>get_next_task_input_data()</code>: <code>try_pop()</code>, and return <code>nullptr</code> when nothing is there.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 4: THE WAR STORY (HERO) ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The war story: two hangs, zero crashes</h2>
+
+        <p>Picture a mailroom lit by a motion-sensor: the light (the completion check) only switches on when somebody walks <em>out</em> — a task completes. Sirius is <span class="term" data-definition="Edge-triggered: re-evaluate only when an event fires (here: a task completion). Level-triggered: keep re-checking while a condition holds. Sirius completion is edge-triggered — a condition that becomes true without an event is never noticed. That asymmetry is this entire module.">edge-triggered, not level-triggered</span> — and a courier who delivers <em>nothing</em> never trips the sensor. Step through the first hang found while prototyping your source, then its fix:</p>
+
+        <div class="flow-animation" data-steps='[
+          {"highlight":"flow-actor-m7-producer","label":"BUG 1 — the empty stream. The remote producer connects, has zero rows for this fragment, and immediately calls close() on the channel.","packet":true,"from":"actor-m7-producer","to":"actor-m7-channel"},
+          {"highlight":"flow-actor-m7-channel","label":"The channel is now closed AND empty — drained(). End of stream, before it ever began."},
+          {"highlight":"flow-actor-m7-creator","label":"The task creator polls your source once: get_next_task_hint() sees drained() and answers nullopt — exhausted forever. A correct answer. Zero tasks created.","packet":true,"from":"actor-m7-creator","to":"actor-m7-source"},
+          {"highlight":"flow-actor-m7-status","label":"Nothing was created, so nothing ever completes — and update_pipeline_status() only runs on a completion edge. The check never fires. Not once. The room stays dark."},
+          {"highlight":"flow-actor-m7-future","label":"The future never resolves. No error, no crash, no log line. Nothing was wrong — nobody re-checked. The query waits forever."},
+          {"highlight":"flow-actor-m7-channel","label":"THE FIX, part 1: close() fires a wake, so the task creator re-polls the source instead of waiting for a completion edge that will never come.","packet":true,"from":"actor-m7-channel","to":"actor-m7-creator"},
+          {"highlight":"flow-actor-m7-source","label":"THE FIX, part 2: in the task-creation path, the drained-source-with-no-task case explicitly calls update_pipeline_status() itself.","packet":true,"from":"actor-m7-source","to":"actor-m7-status"},
+          {"highlight":"flow-actor-m7-status","label":"The check finally runs: source finished, ports empty, created == completed. Pipeline finished; operators finalize; downstream is notified."},
+          {"highlight":"flow-actor-m7-future","label":"The collector fulfills the future and the query returns its empty result. The switch is wired to the door now — not just to the walkers.","packet":true,"from":"actor-m7-status","to":"actor-m7-future"}
+        ]'>
+          <div class="flow-actors">
+            <div class="flow-actor" id="flow-actor-m7-producer">
+              <div class="flow-actor-icon">🛰️</div>
+              <span>Remote producer</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-channel">
+              <div class="flow-actor-icon">📮</div>
+              <span>exchange_channel</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-source">
+              <div class="flow-actor-icon">📡</div>
+              <span>Streaming source</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-creator">
+              <div class="flow-actor-icon">🏗️</div>
+              <span>Task creator</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-status">
+              <div class="flow-actor-icon">💡</div>
+              <span>Pipeline status</span>
+            </div>
+            <div class="flow-actor" id="flow-actor-m7-future">
+              <div class="flow-actor-icon">⏳</div>
+              <span>Query future</span>
+            </div>
+          </div>
+
+          <div class="flow-packet"></div>
+
+          <div class="flow-step-label">Click "Next Step" to begin</div>
+
+          <div class="flow-controls">
+            <button class="btn flow-next-btn">Next Step</button>
+            <button class="btn flow-reset-btn">Restart</button>
+            <span class="flow-progress"></span>
+          </div>
+        </div>
+
+        <p>Bug 2 is crueler — the stream <em>works</em>, and the hang is a 5&nbsp;ms race at the end:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-4)">
+            <div class="step-num" style="background: var(--color-actor-4)">1</div>
+            <div class="step-body">
+              <strong>t = 0 — the last of 10 tasks completes</strong>
+              <p>Its completion edge runs the check: channel open, not drained → correctly <em>not finished</em>. Right answer, at that instant.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-actor-4)">
+            <div class="step-num" style="background: var(--color-actor-4)">2</div>
+            <div class="step-body">
+              <strong>t = 5 ms — <code>close()</code> arrives</strong>
+              <p><code>drained()</code> flips to true&hellip; but a close is not a completion edge, and edges are the only trigger there is.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-error)">
+            <div class="step-num" style="background: var(--color-error)">∞</div>
+            <div class="step-body">
+              <strong>Zero tasks in flight — zero future edges</strong>
+              <p>The finish condition is true forever, and nobody ever looks at it again. Hang.</p>
+            </div>
+          </div>
+        </div>
+
+        <p>Both fixes land with #836 in the task-creation path (<code>src/creator/task_creator.cpp</code>) — planned, not yet in tree. Now re-read Module 3&rsquo;s finish condition — same file, same lines — with streaming eyes:</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/pipeline/sirius_pipeline.cpp:389</span>
+            <pre><code><span class="code-line">      <span class="code-keyword">if</span> (limit_exhausted ||</span>
+<span class="code-line">          (first_node-&gt;<span class="code-function">is_source_pipeline_finished</span>() &amp;&amp; first_node-&gt;<span class="code-function">all_ports_empty</span>()) ) {</span>
+<span class="code-line">        <span class="code-keyword">if</span> (tasks_created.<span class="code-function">load</span>() == tasks_completed.<span class="code-function">load</span>()) {</span>
+<span class="code-line">          pipeline_finished.<span class="code-function">store</span>(<span class="code-keyword">true</span>);</span>
+<span class="code-line">          <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; op : <span class="code-function">get_operators</span>()) {</span>
+<span class="code-line">            op.<span class="code-function">get</span>().<span class="code-function">finalize_operator</span>();</span>
+<span class="code-line">          }</span>
+<span class="code-line">          <span class="code-function">end_nvtx_range_if_finished</span>();</span>
+<span class="code-line">          should_notify = <span class="code-keyword">true</span>;</span>
+<span class="code-line">        }</span>
+<span class="code-line">      }</span></code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">STREAMING EYES</span>
+            <div class="translation-lines">
+              <p class="tl">You studied this in Module 3 — the LIMIT escape hatch is irrelevant for a stream that produced nothing.</p>
+              <p class="tl">For your source, both clauses delegate to the channel: <em>finished</em> and <code>all_ports_empty()</code> are both <code>drained()</code>. An empty, closed stream passes instantly.</p>
+              <p class="tl">Zero created equals zero completed — trivially true. Every condition holds.</p>
+              <p class="tl">So the pipeline <em>would</em> finish, and every operator <em>would</em> finalize&hellip;</p>
+              <p class="tl">&hellip;and <code>should_notify</code> <em>would</em> wake the downstream FULL barrier, exactly like Module 3.</p>
+              <p class="tl">The condition is perfect. The streaming question is different: <strong>who calls this when a stream closes and no task is in flight?</strong> Pre-fix: nobody.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">Install your own switch</strong>
+            <p>A scan gets its completion evaluation for free — there&rsquo;s always a task in flight to trip the sensor. A stream must install its own switch: every zero-task EOS path has to trigger the status evaluation itself. Any operator whose input isn&rsquo;t the scan manager will face this exact gap.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 5: SHIP CHECKLIST ───────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The ship checklist</h2>
+
+        <p>Six invariants, one from each stop of this course. Pin this next to your two PRs:</p>
+
+        <div class="step-cards stagger-children">
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>The channel carries handles; the repository owns batches <code>M4</code></strong>
+              <p>Queued data stays idle-in-repo — spillable — and the channel never pins GPU memory.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>Barrier types on the wired ports are streaming-compatible <code>M4</code></strong>
+              <p>A FULL barrier waits for a producer pipeline to finish — check what that means when the producer is a stream.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>Admission lives in <code>get_next_task_input_data()</code>, not just the hint <code>M3</code></strong>
+              <p>The creator&rsquo;s loop doesn&rsquo;t re-poll hints — gate every pull, return <code>nullptr</code> when the channel is dry.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>Zero-task EOS paths trigger status evaluation themselves <code>M7</code></strong>
+              <p>No completion edge means no free re-check. The empty stream and the late close both need <em>your</em> switch.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>External consumers must not outlive <span class="term" data-definition="task_scheduler::drain_after_error() — the error path with load-bearing teardown ordering: stop the task creator FIRST, keep its queue interrupted, drain every executor, only then restart. Anything outside the engine still holding handles after that order runs is a use-after-free."><code>drain_after_error</code></span>&rsquo;s drain order <code>M2/M3</code></strong>
+              <p>The error path tears down in a fixed order; a remote reader holding handles past it is a use-after-free.</p>
+            </div>
+          </div>
+          <div class="step-card animate-in" style="border-left-color: var(--color-success)">
+            <div class="step-num" style="background: var(--color-success)">✓</div>
+            <div class="step-body">
+              <strong>The device comes from the reservation when #838 partitioning arrives <code>M5</code></strong>
+              <p>Never infer a GPU from a batch — the task&rsquo;s reservation is the sole authority, streaming or not.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">🚢</div>
+          <div class="callout-content">
+            <strong class="callout-title">Agreed sequencing: standalone PRs first</strong>
+            <p>Operators plus unit tests, no compute-node wiring — <code>exchange_channel</code> + source as PR&nbsp;1, sink as PR&nbsp;2. The CN integration lands only after both stand alone in the tree.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── SCREEN 6: QUIZ + COURSE CLOSE ──────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Review questions for your own PRs</h2>
+
+        <p>Four questions a sharp reviewer will ask on #836/#837. Answer like you&rsquo;re defending the design.</p>
+
+        <div class="quiz-container" id="quiz-module7">
+          <div class="quiz-question-block"
+               data-correct="q1-b"
+               data-explanation-right="Right — backpressure is a task-creation condition. The hint answers WAITING, no sink tasks are built, and upstream output parks in port repositories as idle batches — exactly the spillable population Module 4&rsquo;s downgrade executor knows how to relieve. Every worker stays free."
+               data-explanation-wrong="Not quite. The engine side is try_push only — a worker never blocks on the channel, and nothing is dropped or failed. A full channel simply stops sink task creation; pressure surfaces as idle batches in port repos, which are spill candidates, not casualties.">
+            <h3 class="quiz-question">1. The streaming sink&rsquo;s channel is full and stays full for 30&nbsp;s. What is the CORRECT observable behavior inside the engine?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q1-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The upstream worker blocks on <code>push()</code> until the channel has room — that&rsquo;s what a bounded channel is for</span>
+              </button>
+              <button class="quiz-option" data-value="q1-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>No new sink tasks are created; upstream batches accumulate as idle, spillable batches in port repositories; no worker ever blocks</span>
+              </button>
+              <button class="quiz-option" data-value="q1-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The sink drops the oldest queued batches and logs a warning until the channel drains</span>
+              </button>
+              <button class="quiz-option" data-value="q1-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The query fails with a backpressure timeout once the retry budget is exhausted</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q2-b"
+               data-explanation-right="Exactly. A RESULT_COLLECTOR-shape sink has no tasks of its own — its sink() runs inside the compute pipeline&rsquo;s task, so honoring a full channel would mean stalling that worker mid-task. A boundary operator creates its own tasks, so the hint can simply refuse to create one."
+               data-explanation-wrong="Not quite. The shapes differ in who owns the task: RESULT_COLLECTOR&rsquo;s sink() runs inside somebody else&rsquo;s task, so a full channel leaves nothing to gate — you could only block the worker. The CONCAT shape heads its own pipeline, making backpressure a task-creation condition.">
+            <h3 class="quiz-question">2. Why must the sink be a CONCAT-shape boundary operator instead of a RESULT_COLLECTOR-shape terminal sink?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q2-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The CONCAT shape avoids a host-side copy of the final result before it crosses the channel</span>
+              </button>
+              <button class="quiz-option" data-value="q2-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A RESULT_COLLECTOR-shape sink creates no tasks of its own, so a full channel has nothing to gate — the only place to wait would be a blocked worker thread</span>
+              </button>
+              <button class="quiz-option" data-value="q2-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>is_source()</code> is required so the engine will call <code>finalize_operator()</code> on the sink</span>
+              </button>
+              <button class="quiz-option" data-value="q2-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The plan generator can only place a RESULT_COLLECTOR in the query&rsquo;s last pipeline, and a fragment has no last pipeline</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q3-b"
+               data-explanation-right="Yes — a silent hang. The last completion edge ran the check and correctly saw open-not-drained; the close() 5 ms later changed the answer but arrived with zero tasks in flight, so nothing ever re-ran the evaluation. That is Bug 2, and exactly why close() must fire a wake."
+               data-explanation-wrong="Not quite. All ten batches processed fine — nothing is lost or wrong. The failure is temporal: the final check ran 5 ms too early (open-not-drained), and the close() that would flip it had no completion edge left to ride. Pre-fix, that is a hang with empty logs — and there is no idle timer to save you.">
+            <h3 class="quiz-question">3. A fragment&rsquo;s stream delivers 10 batches, all processed; <code>close()</code> arrives 5&nbsp;ms after the last task completed. Pre-fix, what does the user see and why?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q3-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The query returns correctly — <code>close()</code> flips <code>drained()</code>, and the source hint returns <code>nullopt</code> on the next poll</span>
+              </button>
+              <button class="quiz-option" data-value="q3-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A hang: the last completion check saw open-but-not-drained, and the close arrived with no task left in flight to re-trigger the evaluation</span>
+              </button>
+              <button class="quiz-option" data-value="q3-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A crash in <code>finalize_operator()</code> — the pipeline finalizes twice, once per signal</span>
+              </button>
+              <button class="quiz-option" data-value="q3-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The query returns, but only after the scheduler&rsquo;s idle timer re-polls the pipeline status</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="q4-c"
+               data-explanation-right="That&rsquo;s the review answer. The repository stays the single owner, so a queued batch remains idle-in-repo — visible and spillable to the downgrade executor — and the channel can never pin GPU memory. The consumer resolves the id via pop_data_batch_by_id at task-creation time."
+               data-explanation-wrong="Not quite. Message size and ref-count mechanics are noise here — ownership is the point. A shared_ptr in the channel would make the channel a hidden owner of GPU memory, invisible to the downgrade executor (Module 5&rsquo;s cardinal sin). Handles keep batches idle-in-repo, spillable until a task claims them.">
+            <h3 class="quiz-question">4. Your reviewer asks: &ldquo;why does the channel carry <code>{batch_id, size}</code> instead of <code>shared_ptr&lt;data_batch&gt;</code>?&rdquo; Best answer?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="q4-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Smaller messages — two POD fields move through a bounded queue faster than a control block</span>
+              </button>
+              <button class="quiz-option" data-value="q4-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span><code>shared_ptr</code> cannot safely cross the FFI boundary to the StarRocks side of the exchange</span>
+              </button>
+              <button class="quiz-option" data-value="q4-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Ownership stays with the repository, so queued batches remain idle and spillable and the channel never pins GPU memory; ids resolve via <code>pop_data_batch_by_id</code> at task-creation time</span>
+              </button>
+              <button class="quiz-option" data-value="q4-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>It avoids atomic ref-count contention between the producer and consumer threads</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module7')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module7')">Try Again</button>
+        </div>
+
+        <p style="margin-top: var(--space-8)">That&rsquo;s the course: the whole engine in Modules 1&ndash;6, and the newest ring on the tree — yours — in this one. The full designs live at <code>experimental/starrocks/docs/streaming-source-plan.md</code>, <code>streaming-sink-plan.md</code>, and <code>discoveries.md</code>; the work is <a href="https://github.com/sirius-db/sirius/issues/836">#836</a> and <a href="https://github.com/sirius-db/sirius/issues/837">#837</a>. Standalone operators, unit tests, no CN wiring — go install your switch.</p>
+      </section>
+
+    </div>
+  </div>
+</section>

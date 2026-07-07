@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sirius Internals — Interactive Onboarding</title>
+
+  <!-- Google Fonts: Bricolage Grotesque · DM Sans · JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="styles.css">
+
+  <style>
+    :root {
+      --color-accent:       #2A7B9B;
+      --color-accent-hover: #1F6280;
+      --color-accent-light: #E4F2F7;
+      --color-accent-muted: #5A9DB8;
+    }
+  </style>
+
+  <script src="main.js" defer></script>
+</head>
+<body>
+
+  <nav class="nav" id="nav">
+    <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+    <div class="nav-inner">
+      <span class="nav-title">Sirius Internals — Interactive Onboarding</span>
+      <div class="nav-dots" id="nav-dots" role="tablist">
+        <button class="nav-dot" data-target="module-1" data-tooltip="The Big Picture" role="tab" aria-label="Module 1: The Big Picture"></button>
+        <button class="nav-dot" data-target="module-2" data-tooltip="Meet the Actors" role="tab" aria-label="Module 2: Meet the Actors"></button>
+        <button class="nav-dot" data-target="module-3" data-tooltip="Life of a Query" role="tab" aria-label="Module 3: Life of a Query"></button>
+        <button class="nav-dot" data-target="module-4" data-tooltip="The Data Plane" role="tab" aria-label="Module 4: The Data Plane"></button>
+        <button class="nav-dot" data-target="module-5" data-tooltip="Memory & Multi-GPU" role="tab" aria-label="Module 5: Memory and Multi-GPU"></button>
+        <button class="nav-dot" data-target="module-6" data-tooltip="Design Decisions" role="tab" aria-label="Module 6: Design Decisions"></button>
+        <button class="nav-dot" data-target="module-7" data-tooltip="The Streaming Frontier" role="tab" aria-label="Module 7: The Streaming Frontier"></button>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main">
+    <!-- modules/*.html content is assembled here by build.sh -->

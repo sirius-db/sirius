@@ -1,0 +1,310 @@
+<section class="module" id="module-4" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">04</span>
+      <h1 class="module-title">The Data Plane</h1>
+      <p class="module-subtitle">In Sirius, no operator ever returns data to its caller. Ever. Here's why that one decision buys spilling, backpressure, and multi-GPU almost for free.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: The port ─────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">A named dock, not a return value</h2>
+        <p>Think freight docks: a producer pipeline drops pallets — batches — at a named dock, and the dock's rules say when the consumer may start unloading. In Sirius the dock is a <span class="term" data-definition="The struct that defines where an operator's data arrives or leaves: a barrier type + a pointer to a shared repository + the producing and consuming pipelines. Every operator declares its ports at plan time — they are the edges of the pipeline graph."><code>port</code></span> — and it never holds goods itself, it points at the <span class="term" data-definition="cucascade::shared_data_repository — the shared, first-class store where ALL inter-operator batches live. Because repositories are inspectable objects (not private members), the downgrade executor can walk them to find spill victims."><code>repository</code></span> where they live.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/include/op/sirius_physical_operator.hpp · L459-472</span>
+            <pre><code>
+<span class="code-line">  <span class="code-keyword">struct</span> port {</span>
+<span class="code-line">    MemoryBarrierType <span class="code-property">type</span>;</span>
+<span class="code-line">    <span class="code-comment">/// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").</span></span>
+<span class="code-line">    <span class="code-comment">/// Null repos are treated as "empty, not data-gating" by the base-class port handling methods</span></span>
+<span class="code-line">    <span class="code-comment">/// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).</span></span>
+<span class="code-line">    ::cucascade::shared_data_repository* <span class="code-property">repo</span>;</span>
+<span class="code-line">    duckdb::shared_ptr&lt;pipeline::sirius_pipeline&gt; <span class="code-property">src_pipeline</span>;</span>
+<span class="code-line">    duckdb::shared_ptr&lt;pipeline::sirius_pipeline&gt; <span class="code-property">dest_pipeline</span>;</span>
+<span class="code-line">    <span class="code-comment">//! A UUID for a port on an operator at the beginning of a</span></span>
+<span class="code-line">    <span class="code-comment">// pipeline. This port receives data from a prior pipeline,</span></span>
+<span class="code-line">    <span class="code-comment">// forming an incoming edge from that pipeline.</span></span>
+<span class="code-line">    uuid::UUID <span class="code-property">source_port_uuid</span>{uuid::<span class="code-function">now_v7</span>()};</span>
+<span class="code-line">  };</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">A dock, in thirteen lines — this struct is the entire contract for data crossing an operator boundary.</p>
+              <p class="tl">The unloading rule: PIPELINE, PARTIAL, or FULL. This one enum decides when the consumer may start.</p>
+              <p class="tl">This docstring is load-bearing: a port may carry no data at all — the pointer below is allowed to be NULL.</p>
+              <p class="tl">The warehouse behind the dock. The port doesn't hold batches; it points at the repository where they live.</p>
+              <p class="tl">Who delivers here, and who picks up — this pair makes the port an edge in the pipeline graph.</p>
+              <p class="tl">Incoming docks are addressable across pipeline boundaries...</p>
+              <p class="tl">...so each one gets a manifest number (UUIDv7) that a later pipeline can name exactly.</p>
+              <p class="tl">No buffers, no queues, no callbacks. A rule, a place, and two parties.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">🔗</div>
+          <div class="callout-content">
+            <strong class="callout-title">repo == NULL is a feature, not a bug</strong>
+            <p>When the scan pipeline was split out (<a href="https://github.com/sirius-db/sirius/pull/620">#620</a>), some pipelines still had to run in order without exchanging a single batch. The answer is a <span class="term" data-definition="A port whose repo pointer is NULL: a pure scheduling edge that orders two pipelines without carrying data. The base-class port methods treat it as 'empty, not data-gating' — it constrains when things run, never what data exists.">dependency-only port</span>: a scheduling edge with no warehouse — same struct, treated as "empty, not data-gating".</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: How output leaves an operator ────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Output is a push, never a return</h2>
+        <p>Here is the entire replacement for "function returns data" — the base-class <code>sink()</code>, about seven lines. When our running <code>count(*)</code> query's filter finishes a batch of partial counts, this is how they leave: each <span class="term" data-definition="The manifest, not the pallet: a small object identifying a batch. push_data_batch moves handles between ports and repositories — the underlying device buffers are never repacked or copied.">handle</span> is filed at every downstream dock, and the caller never sees a thing.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/op/sirius_physical_operator.cpp · L238-246</span>
+            <pre><code>
+<span class="code-line"><span class="code-keyword">void</span> sirius_physical_operator::<span class="code-function">sink</span>(<span class="code-keyword">const</span> operator_data&amp; output_data, rmm::cuda_stream_view stream)</span>
+<span class="code-line">{</span>
+<span class="code-line">  <span class="code-keyword">auto</span>&amp; pipelineable_output = <span class="code-keyword">dynamic_cast</span>&lt;<span class="code-keyword">const</span> pipelineable_operator_data&amp;&gt;(output_data);</span>
+<span class="code-line">  <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; batch : pipelineable_output.<span class="code-function">get_data_batches</span>()) {</span>
+<span class="code-line">    <span class="code-keyword">for</span> (<span class="code-keyword">auto</span>&amp; next_port_info : next_port_after_sink) {</span>
+<span class="code-line">      next_port_info.next_operator-&gt;<span class="code-function">push_data_batch</span>(next_port_info.next_operator_port_name, batch);</span>
+<span class="code-line">    }</span>
+<span class="code-line">  }</span>
+<span class="code-line">}</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">Every operator's output funnels through here, on the worker's CUDA stream. Note the return type: void.</p>
+              <p class="tl">Downcast to <span class="term" data-definition="The operator_data subtype that actually carries GPU data batches. sink() downcasts to it because only pipelineable outputs fan out through ports — other operator_data flavors carry control state."><code>pipelineable_operator_data</code></span> — the flavor of output that actually carries batches.</p>
+              <p class="tl">For every pallet this operator produced...</p>
+              <p class="tl">...and every downstream dock wired up at plan time...</p>
+              <p class="tl">...hand over the manifest: the handle moves into the next operator's port. No copy, no return value, no waiting on the consumer.</p>
+              <p class="tl">That's it. Seven lines replace the entire concept of returning data to a caller.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="flow-steps">
+          <div class="flow-step">
+            <div class="flow-step-num">1</div>
+            <p>Worker finishes a batch on its CUDA stream</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">2</div>
+            <p><code>sink()</code> fans out: every batch × every downstream port</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">3</div>
+            <p><code>push_data_batch</code> files the handle in that port's repository</p>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">
+            <div class="flow-step-num">4</div>
+            <p>The consumer's barrier decides when it may start pulling</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: Barriers + drag-and-drop ─────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three unloading rules</h2>
+        <p>The <span class="term" data-definition="MemoryBarrierType — the port's release rule: PIPELINE (consume batch-by-batch as produced), PARTIAL (consume incrementally across a pipeline boundary), FULL (consume nothing until the producing pipeline completely finishes). It defines pipeline semantics, not memory ordering.">barrier type</span> is pipeline semantics compressed into one enum. Same repository machinery underneath — only the release rule changes.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">🚚</div>
+            <h4 class="pattern-title">PIPELINE — roll-through dock</h4>
+            <p class="pattern-desc">Pallets release one at a time, the moment they land. This is how a filter chain streams: each batch flows straight to the next operator in the same pipeline.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">🌊</div>
+            <h4 class="pattern-title">PARTIAL — wave release</h4>
+            <p class="pattern-desc">Goods release in waves while the shipment is still arriving. CONCAT-after-PARTITION consumes partitions incrementally, across a pipeline boundary.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🏛️</div>
+            <h4 class="pattern-title">FULL — bonded warehouse</h4>
+            <p class="pattern-desc">Sealed until the entire shipment clears customs. A hash-join's build side stays invisible until its producing pipeline completely finishes.</p>
+          </div>
+        </div>
+
+        <p>You're wiring a new operator. Drag each workload onto the port configuration it needs.</p>
+
+        <div class="dnd-container" id="dnd-module4">
+          <div class="dnd-chips">
+            <div class="dnd-chip" draggable="true" data-answer="build">Hash-join build side</div>
+            <div class="dnd-chip" draggable="true" data-answer="filter">FILTER feeding a projection in the same pipeline</div>
+            <div class="dnd-chip" draggable="true" data-answer="concat">CONCAT consuming partitions produced upstream</div>
+            <div class="dnd-chip" draggable="true" data-answer="dep">Dependency-only scheduling edge (no data)</div>
+          </div>
+          <div class="dnd-zones">
+            <div class="dnd-zone" data-correct="filter">
+              <p class="dnd-zone-label">PIPELINE — roll-through dock</p>
+              <div class="dnd-zone-target">Drop here</div>
+            </div>
+            <div class="dnd-zone" data-correct="concat">
+              <p class="dnd-zone-label">PARTIAL — wave release</p>
+              <div class="dnd-zone-target">Drop here</div>
+            </div>
+            <div class="dnd-zone" data-correct="build">
+              <p class="dnd-zone-label">FULL — bonded warehouse</p>
+              <div class="dnd-zone-target">Drop here</div>
+            </div>
+            <div class="dnd-zone" data-correct="dep">
+              <p class="dnd-zone-label">port with repo == NULL</p>
+              <div class="dnd-zone-target">Drop here</div>
+            </div>
+          </div>
+          <button class="quiz-check-btn" onclick="checkDnD('dnd-module4')">Check Matches</button>
+          <button class="quiz-reset-btn" onclick="resetDnD('dnd-module4')">Reset</button>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: Batch lifecycle (hero) ───────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Pallets have manifests: the batch lifecycle</h2>
+        <p>A <span class="term" data-definition="cuCascade's unit of data movement: a handle to buffers living in some memory space (GPU, pinned host, disk), tracked by ID. Moving one between operators or GPUs transfers the handle — the buffers are never repacked."><code>data_batch</code></span> is the manifest, not the pallet — and you never touch its buffers directly, only through <span class="term" data-definition="Access to a batch's buffers is only possible by constructing a lock object whose lifetime IS your access window: the destructor releases the batch back toward idle. No lock object, no pointer — forgetting to unlock is unrepresentable.">RAII locks</span>: many <span class="term" data-definition="The shared lock class: any number of concurrent readers may hold a batch read_only. Mutation and memory-space conversion must wait until every reader has released.">read_only</span> readers XOR one <span class="term" data-definition="The exclusive lock class: exactly one holder, zero readers. Required for in-place mutation and for converting the batch to another memory space (e.g., GPU to host).">mutable</span> holder. <span class="term" data-definition="The unlocked state: nobody holds the batch. The only state from which either lock class can be acquired — and the only state the downgrade executor is allowed to spill."><code>idle</code></span> means nobody holds it.</p>
+
+        <div class="flow-steps">
+          <div class="flow-step" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="flow-step-num" style="background: var(--color-actor-2)">N</div>
+            <p><strong>read_only</strong><br>Any number of concurrent readers. Converters queue behind all of them.</p>
+          </div>
+          <div class="flow-arrow">⇄</div>
+          <div class="flow-step" style="border: 2px solid var(--color-success); background: var(--color-success-light)">
+            <div class="flow-step-num" style="background: var(--color-success)">0</div>
+            <p><strong>idle</strong><br>Nobody holds it. The only state that can be locked either way — and the only state that can be spilled.</p>
+          </div>
+          <div class="flow-arrow">⇄</div>
+          <div class="flow-step" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="flow-step-num" style="background: var(--color-actor-1)">1</div>
+            <p><strong>mutable_locked</strong><br>Exactly one exclusive holder. Required to mutate — or convert to another memory space.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">Spillable = idle + in a registered repository</strong>
+            <p>The <span class="term" data-definition="The per-memory-space service (src/downgrade/) that reacts to memory pressure by moving victim batches down the hierarchy: GPU device memory to pinned host to disk. It finds victims by walking registered repositories for idle batches.">downgrade executor</span> never asks operators for memory back — it walks repositories and takes idle batches. Both conditions are load-bearing: a batch it can't <em>find</em> or can't <em>lock</em> might as well not exist. That is why repositories being first-class, inspectable objects is the whole game — it's what makes <span class="term" data-definition="Moving an idle batch to a lower memory tier (GPU to host to disk) to free space. Transparent to operators: the handle stays valid; only where the buffers live changes.">spilling</span> possible at all.</p>
+          </div>
+        </div>
+
+        <div class="callout callout-warning">
+          <div class="callout-icon">⚠️</div>
+          <div class="callout-content">
+            <strong class="callout-title">How you cause an OOM</strong>
+            <p>Park batches in a private queue, or sit on locks "for later" — either way they're invisible to the downgrade executor and the query dies under pressure instead of spilling. Module 7's streaming design exists to dodge exactly this: ownership stays in repositories, and only <code>{batch_id, size}</code> handles travel through channels.</p>
+          </div>
+        </div>
+
+        <p>History: this tri-class lock design replaced a 4-state FSM (cuCascade <a href="https://github.com/NVIDIA/cuCascade/pull/117">#117</a>, adopted in Sirius <a href="https://github.com/sirius-db/sirius/pull/689">#689</a>) — lock-discipline races stopped being runtime bugs and became compile errors.</p>
+      </section>
+
+      <!-- ── Quiz ──────────────────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Three tickets</h2>
+        <p>Three incidents, all traceable to this module. Pick your diagnosis.</p>
+
+        <div class="quiz-container" id="quiz-module4">
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Two conditions make a batch spillable: idle, and discoverable in a registered repository. Your queue violates both — the locks pin the batches, and the private container hides them. Keep output parked in the port's repository and take locks only for the duration of actual work."
+               data-explanation-wrong="Neither RMM fragmentation nor the barrier is involved. Ask what the downgrade executor can actually see when it hunts for victims — and what state a batch must be in before it is allowed to move.">
+            <h3 class="quiz-question">Your new operator buffers output batches in a private std::deque of locked handles while waiting for a slow consumer. Under memory pressure the query OOMs instead of spilling. Why?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The deque's host-side allocations fragment the RMM pool until the next reservation fails</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The downgrade executor can only spill idle batches it finds in registered repositories — locked handles in a private queue are invisible and unspillable</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>std::deque reallocation deep-copies the device buffers, doubling the footprint</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The slow consumer's FULL barrier blocks the spill path until the pipeline finishes</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="FULL is a bonded warehouse: the port releases nothing until the producing pipeline is completely finished. For bounded input that means batch semantics plus a memory bulge; for an unbounded stream, the producer never finishes — so the consumer never starts."
+               data-explanation-wrong="Barriers never affect locking and never drop data — they only gate when the consumer may start consuming. Ask when a FULL port releases its first batch, then ask when an unbounded producer finishes.">
+            <h3 class="quiz-question">You wire a streaming producer to its consumer with a FULL barrier. What breaks?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Nothing functional — you just lose some pipelining overlap</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Batches arrive unlocked, so concurrent readers race the producer's writes</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Nothing runs until the producer pipeline completely finishes — streaming becomes batch, and an unbounded stream deadlocks</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The repository rejects pushes after the first wave and silently drops data</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="The lock classes serialize the lifecycle: many readers XOR one mutable holder, and idle is the only state you can convert from. The reader finishes, the batch passes through idle, then the converter takes the exclusive lock. No priority, no preemption — just the discipline."
+               data-explanation-wrong="There is no preemption or priority in the lock discipline, and no cycle either — the reader holds nothing else, so nothing deadlocks. The converter simply waits: mutable access requires the batch to pass through idle first.">
+            <h3 class="quiz-question">Two operators need the same batch concurrently — one is reading it, the other wants to convert it to host memory. What happens?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Both proceed — the conversion targets a different memory space, so there is no conflict</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The conversion needs the mutable lock, so it waits until every read_only lock releases and the batch passes through idle</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The reader is preempted — conversions have priority under memory pressure</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Deadlock — the reader and the converter block each other forever</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module4')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module4')">Try Again</button>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">➡️</div>
+          <div class="callout-content">
+            <strong class="callout-title">Next: Memory &amp; Multi-GPU</strong>
+            <p>Repositories decide where data <em>lives</em>. Next: who pays the memory bill — reservations, tiers, spilling, and the device contract.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</section>

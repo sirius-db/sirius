@@ -1,0 +1,315 @@
+<section class="module module--alt" id="module-2" style="background: var(--color-bg-warm)">
+  <div class="module-content">
+    <header class="module-header animate-in">
+      <span class="module-number">02</span>
+      <h1 class="module-title">Meet the Actors</h1>
+      <p class="module-subtitle">Every Sirius bug report eventually reduces to: which of seven objects misbehaved? Learn their names and their threads and you can triage anything.</p>
+    </header>
+
+    <div class="module-body">
+
+      <!-- ── Screen 1: The ownership tree ─────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">One room, seven consoles</h2>
+        <p>Think mission control: the Flight Director owns the go/no-go, the trajectory team plans the next burn, each spacecraft has its own ops crew, and life support quietly keeps everyone breathing. Nothing talks directly — it all goes through the loop. In Sirius the room itself is <span class="term" data-definition="The per-connection root object of the engine. It constructs and owns every component with query lifetime — memory manager, data repository manager, task scheduler, downgrade executors, task creator, scan manager. Defined in src/include/sirius_context.hpp."><code>SiriusContext</code></span>, registered as a DuckDB <span class="term" data-definition="DuckDB's hook for attaching per-connection extension state. Sirius hangs its entire engine off this, so every connection gets its own private set of actors — no globals."><code>ClientContextState</code></span> — and its member list <em>is</em> the component map.</p>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code">
+            <span class="translation-label">src/include/sirius_context.hpp</span>
+            <pre><code>
+<span class="code-line">  std::shared_ptr&lt;<span class="code-keyword">const</span> sirius::telemetry::telemetry_context&gt; <span class="code-property">telemetry_context_</span>;</span>
+<span class="code-line">  std::unique_ptr&lt;cucascade::shared_data_repository_manager&gt; <span class="code-property">data_repository_manager_</span>;</span>
+<span class="code-line">  std::unique_ptr&lt;sirius::pipeline::task_scheduler&gt; <span class="code-property">task_scheduler_</span>;</span>
+<span class="code-line">  std::vector&lt;std::unique_ptr&lt;sirius::parallel::downgrade_executor&gt;&gt; <span class="code-property">downgrade_executors_</span>;</span>
+<span class="code-line">  std::unique_ptr&lt;sirius::creator::task_creator&gt; <span class="code-property">task_creator_</span>;</span>
+<span class="code-line">  std::unique_ptr&lt;sirius::scan_manager::sirius_scan_manager&gt; <span class="code-property">scan_manager_</span>;</span>
+            </code></pre>
+          </div>
+          <div class="translation-english">
+            <span class="translation-label">Plain English</span>
+            <div class="translation-lines">
+              <p class="tl">The flight recorder — every console below reports its timings here.</p>
+              <p class="tl">The shared telemetry log: all data that moves between operators lives here, never handed console-to-console.</p>
+              <p class="tl">The Flight Director — one management loop that bridges task requests to the per-GPU crews.</p>
+              <p class="tl">Life support — note the <code>vector</code>: one downgrade executor per <span class="term" data-definition="cuCascade's abstraction for one tier of the memory hierarchy — each GPU's device memory, pinned host memory, disk — each with its own capacity and reservation accounting.">memory space</span>, not per query.</p>
+              <p class="tl">The trajectory team — decides what runs next. Deciding, not running.</p>
+              <p class="tl">Ground stations — owns splitting base tables and feeding the data uplink.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="callout callout-accent">
+          <div class="callout-icon">💡</div>
+          <div class="callout-content">
+            <strong class="callout-title">Roles are strictly separated</strong>
+            <p><em>Deciding</em> what runs next (task_creator) is a different object — and different threads — from <em>running</em> it (the executors) and from <em>surviving memory pressure</em> (the downgrade executors). "Where do I put this logic?" and "whose thread am I on?" are the two questions that prevent broken PRs.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 2: Actor cards ─────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The seven consoles</h2>
+        <p>Each console has exactly one job. Memorize the mapping — every stack trace you'll ever read lands in one of these.</p>
+
+        <div class="pattern-cards stagger-children">
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">📋</div>
+            <h4 class="pattern-title"><code>sirius_engine</code> + plan generator</h4>
+            <p class="pattern-desc">Mission planning. At query start it translates DuckDB's plan into GPU pipelines (<code>src/planner/sirius_physical_plan_generator.cpp</code>) — once, on the DuckDB query thread.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🧭</div>
+            <h4 class="pattern-title"><span class="term" data-definition="The decision-maker (src/creator/). Its threads walk each pipeline's hint chain and turn READY hints into executable tasks. It never executes anything itself."><code>task_creator</code></span></h4>
+            <p class="pattern-desc">The trajectory team — decides the next burn. Walks each pipeline's <span class="term" data-definition="A per-pipeline chain of scheduling hints. Each hint reports a state (e.g. READY, FINISHED); the task_creator only creates tasks for hints that report READY — this is how 'waiting' is expressed without blocking any thread.">hint chain</span> and turns READY hints into tasks. 2 threads by default.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-1)">
+            <div class="pattern-icon" style="background: var(--color-actor-1)">🎙️</div>
+            <h4 class="pattern-title"><span class="term" data-definition="The top-level orchestrator (src/pipeline/). A single management event loop that bridges task requests from the task_creator to the per-GPU executors. Renamed from pipeline_executor in PR #687."><code>task_scheduler</code></span></h4>
+            <p class="pattern-desc">The Flight Director — owns the go/no-go. A management event loop bridging task requests to executors. Renamed from <code>pipeline_executor</code> in <a href="https://github.com/sirius-db/sirius/pull/687">#687</a>.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-2)">
+            <div class="pattern-icon" style="background: var(--color-actor-2)">🚀</div>
+            <h4 class="pattern-title"><span class="term" data-definition="The per-GPU execution engine: one manager thread dispatching to a fixed pool of 4 worker threads, each pinned to that GPU with its own CUDA stream. Tasks run to completion on a worker."><code>gpu_pipeline_executor</code></span></h4>
+            <p class="pattern-desc">One ops crew per spacecraft — one executor per GPU. 1 manager thread + 4 workers, each worker pinned with its own CUDA stream.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-4)">
+            <div class="pattern-icon" style="background: var(--color-actor-4)">📡</div>
+            <h4 class="pattern-title"><span class="term" data-definition="Owns ingest: splits base-table data into scan splits, tracks which splits are ready, and hands them to scan executors that load data toward the GPU."><code>scan_manager</code></span> + scan executor</h4>
+            <p class="pattern-desc">Ground stations. Splits base tables into scan splits and runs the ingest that feeds every pipeline's first operator.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-5)">
+            <div class="pattern-icon" style="background: var(--color-actor-5)">🛟</div>
+            <h4 class="pattern-title"><span class="term" data-definition="One per memory space (src/downgrade/): a monitor thread watches pressure and processing threads spill victim batches down the hierarchy (GPU → host → disk) so queries degrade instead of OOMing."><code>downgrade_executor</code></span></h4>
+            <p class="pattern-desc">Life support — consumables management. Monitor + processing threads per memory space; spills batches downhill before anyone hits OOM.</p>
+          </div>
+          <div class="pattern-card animate-in" style="border-top: 3px solid var(--color-actor-3)">
+            <div class="pattern-icon" style="background: var(--color-actor-3)">🗄️</div>
+            <h4 class="pattern-title"><span class="term" data-definition="cuCascade component where ALL inter-operator data lives. Operators publish batches into shared repositories and downstream operators pull from them — nothing passes data hand-to-hand."><code>shared_data_repository_manager</code></span></h4>
+            <p class="pattern-desc">The shared telemetry log. Every batch an operator produces is published here for the next one to pull — no direct hand-offs, ever.</p>
+          </div>
+        </div>
+
+        <div class="translation-block animate-in">
+          <div class="translation-code" style="grid-column: 1 / -1">
+            <span class="translation-label">the defaults, straight from sirius_config.hpp</span>
+            <pre><code>
+<span class="code-line">  exec::thread_pool_config <span class="code-property">_task_creator_config</span>{.num_threads        = <span class="code-number">2</span>,</span>
+<span class="code-line">  exec::thread_pool_config <span class="code-property">_gpu_pipeline_executor_config</span>{.num_threads        = <span class="code-number">4</span>,</span>
+            </code></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Screen 3: The thread model ────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Whose thread am I on?</h2>
+        <p>There are exactly two kinds of threads in this engine: the one that blocks once, and the ones that loop forever. Click a console to see what its thread does all day.</p>
+
+        <div class="arch-diagram">
+          <div class="arch-zone">
+            <h4 class="arch-zone-label">Blocks — one shot, then waits</h4>
+            <div class="arch-component" data-desc="The only thread a user ever sees. It runs plan generation, submits the query, then blocks on a future until the result collector fulfills it — it does zero GPU work itself.">
+              <div class="arch-icon">🧑‍🚀</div>
+              <span>DuckDB query thread</span>
+            </div>
+          </div>
+          <div class="arch-zone">
+            <h4 class="arch-zone-label">Loops — long-lived event loops</h4>
+            <div class="arch-component" data-desc="task_scheduler's single management thread: an event loop that pulls task requests and routes each one to the right GPU's executor. It never touches data.">
+              <div class="arch-icon">🎙️</div>
+              <span>Scheduler management loop</span>
+            </div>
+            <div class="arch-component" data-desc="Per GPU: 1 manager thread dispatches to 4 pinned workers, each with its own CUDA stream. Workers run tasks to completion — a blocked worker is 25% of that GPU gone.">
+              <div class="arch-icon">🚀</div>
+              <span>GPU manager + 4 workers (per GPU)</span>
+            </div>
+            <div class="arch-component" data-desc="task_creator's 2-thread pool: walks hint chains, creates tasks for READY hints, and notices when a pipeline's last task finishes so the next pipeline can start.">
+              <div class="arch-icon">🧭</div>
+              <span>Task-creator manager (2 threads)</span>
+            </div>
+            <div class="arch-component" data-desc="One monitor loop per memory space watches pressure; when a space runs hot, processing threads pick victim batches and spill them to the tier below.">
+              <div class="arch-icon">🛟</div>
+              <span>Downgrade monitor (per memory space)</span>
+            </div>
+          </div>
+          <div class="arch-description">Click a thread to see what it does all day.</div>
+        </div>
+      </section>
+
+      <!-- ── Screen 4: Group chat (hero) ───────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">The room, live</h2>
+        <p>Here's the radio traffic for one query: <code>SELECT count(*) FROM orders WHERE amount &gt; 100;</code>. Note who talks to whom — and who never talks to anyone directly.</p>
+
+        <div class="chat-window" id="chat-actors">
+          <div class="chat-messages">
+            <div class="chat-message" data-msg="0" data-sender="duckdb" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-4)">D</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-4)">DuckDB → all</span>
+                <p>Prepared statement ready. Sirius, you're up — plan swapped in.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="1" data-sender="scheduler" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-1)">S</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-1)">Scheduler → TaskCreator</span>
+                <p>start_query(). Please make a task for the SCAN.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="2" data-sender="taskcreator" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-3)">TC</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-3)">TaskCreator → GPU-0</span>
+                <p>Scan says READY. Here's a gpu_pipeline_task for Pipeline A.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="3" data-sender="gpu0" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-2)">G0</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-2)">GPU-0 → all</span>
+                <p>Reserved 512 MB, ran scan→filter→partial count. Batch published to the repo.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="4" data-sender="downgrade" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-5)">DG</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-5)">Downgrade → all</span>
+                <p>GPU 0 at 92% — spilling two idle batches to host. Carry on.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="5" data-sender="taskcreator" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-3)">TC</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-3)">TaskCreator → GPU-0</span>
+                <p>Scan drained, last task done → Pipeline A finished. Pipeline B is READY.</p>
+              </div>
+            </div>
+            <div class="chat-message" data-msg="6" data-sender="gpu0" style="display:none">
+              <div class="chat-avatar" style="background: var(--color-actor-2)">G0</div>
+              <div class="chat-bubble">
+                <span class="chat-sender" style="color: var(--color-actor-2)">GPU-0 → DuckDB</span>
+                <p>COUNT finalized into RESULT_COLLECTOR. Future fulfilled — your rows, sir.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="chat-typing" style="display:none">
+            <div class="chat-avatar" id="chat-actors-typing-avatar">?</div>
+            <div class="chat-typing-dots">
+              <span class="typing-dot"></span>
+              <span class="typing-dot"></span>
+              <span class="typing-dot"></span>
+            </div>
+          </div>
+
+          <div class="chat-controls">
+            <button class="btn chat-next-btn">Next Message</button>
+            <button class="btn chat-all-btn">Play All</button>
+            <button class="btn chat-reset-btn">Replay</button>
+            <span class="chat-progress"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Quiz ──────────────────────────────────────────────── -->
+      <section class="screen animate-in">
+        <h2 class="screen-heading">Triage drill</h2>
+        <p>Three pages from the on-call runbook. Pick your first move.</p>
+
+        <div class="quiz-container" id="quiz-module2">
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Exactly. Executors only run tasks they are handed — an idle GPU with zero tasks means nothing was created, and creation lives in task_creator: some hint upstream never flipped to READY."
+               data-explanation-wrong="Not quite. Separate deciding from running: a clean, idle GPU means the executors have nothing to execute — so ask who decides what runs next, and why it is deciding 'nothing'.">
+            <h3 class="quiz-question">Queries stall: GPU idle, no tasks executing, nvidia-smi clean. Which console do you check first?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The gpu_pipeline_executor workers — one of them must be wedged</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The task_creator's hint chains — is anything actually reporting READY?</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The downgrade_executor — memory pressure must be throttling tasks</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>The task_scheduler loop — it must be dropping task requests</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-b"
+               data-explanation-right="Right — SiriusContext is the per-connection root that owns every component with query lifetime. State parked anywhere else either leaks across connections (singleton, TLS) or dies with a single operator."
+               data-explanation-wrong="Think ownership tree: which object is constructed per connection, owns all seven actors, and is torn down exactly when query state should disappear?">
+            <h3 class="quiz-question">You need per-query state that every operator can reach. Where does it live?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A static singleton next to sirius_engine</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>SiriusContext — it owns everything with query lifetime</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>A member on whichever physical operator needs it first</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Thread-local storage on the GPU worker threads</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <div class="quiz-question-block"
+               data-correct="option-c"
+               data-explanation-right="Exactly — with 4 workers per GPU running tasks to completion, one blocked worker is 25% of that GPU's throughput gone. The engine's answer to waiting lives upstream: don't create the task until its input is READY (module 7 builds a whole streaming source on this idea)."
+               data-explanation-wrong="The problem isn't CUDA or sandboxing — it's the execution model. Count the workers per GPU, remember tasks run to completion, and ask what happens to everything queued behind a sleeper.">
+            <h3 class="quiz-question">Your fix blocks inside a GPU worker until network data arrives. Why will reviewers reject it?</h3>
+            <div class="quiz-options">
+              <button class="quiz-option" data-value="option-a" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>CUDA streams can't overlap with host-side network I/O</span>
+              </button>
+              <button class="quiz-option" data-value="option-b" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>DuckDB's extension sandbox forbids opening sockets</span>
+              </button>
+              <button class="quiz-option" data-value="option-c" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>Workers are a fixed pool (4 per GPU) that run tasks to completion — parking one on a wait starves the pipeline</span>
+              </button>
+              <button class="quiz-option" data-value="option-d" onclick="selectOption(this)">
+                <div class="quiz-option-radio"></div>
+                <span>It would deadlock the downgrade monitor's spill path</span>
+              </button>
+            </div>
+            <div class="quiz-feedback"></div>
+          </div>
+
+          <button class="quiz-check-btn" onclick="checkQuiz('quiz-module2')">Check Answers</button>
+          <button class="quiz-reset-btn" onclick="resetQuiz('quiz-module2')">Try Again</button>
+        </div>
+
+        <div class="callout callout-info">
+          <div class="callout-icon">➡️</div>
+          <div class="callout-content">
+            <strong class="callout-title">Next: Life of a Query</strong>
+            <p>You know the seven consoles and their threads. Now watch them run one query, step by step.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</section>
