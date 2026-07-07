@@ -59,6 +59,7 @@ namespace {
 // ---------------------------------------------------------------------
 std::size_t dtype_elem_size(const std::string& name)
 {
+  if (name == "int8_t") return 1;
   if (name == "int32_t") return 4;
   if (name == "int64_t") return 8;
   return 0;  // 0 => unsupported (caller throws)
@@ -70,6 +71,16 @@ std::size_t dtype_elem_size(const std::string& name)
 const char* unsigned_counterpart(std::size_t elem_size)
 {
   return (elem_size == 8) ? "uint64_t" : "uint32_t";
+}
+
+// Exact-width unsigned type name. A signed element must pass through this
+// BEFORE widening to unsigned_counterpart wherever the widened value is
+// right-shifted (ZigZag's inverse): a direct int8_t -> uint32_t cast
+// sign-extends garbage above the element's width. No-op for 4/8-byte
+// elements (exact width == counterpart width).
+const char* exact_unsigned(std::size_t elem_size)
+{
+  return (elem_size == 8) ? "uint64_t" : (elem_size == 1) ? "uint8_t" : "uint32_t";
 }
 
 // ---------------------------------------------------------------------
@@ -903,7 +914,10 @@ ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& 
 
   // Stored element at this position (read once textually; compiler CSEs the
   // duplicate load).  base == chunk_start (chunk_id*CHUNK), known at entry.
-  const std::string load = "static_cast<" + utype + ">(" + p_data + "[chunk_start + (__POS__)])";
+  // Cast through the exact-width unsigned so a negative stored byte doesn't
+  // sign-extend garbage into the shift domain.
+  const std::string load = "static_cast<" + utype + ">(static_cast<" +
+                           exact_unsigned(esize) + ">(" + p_data + "[chunk_start + (__POS__)]))";
 
   ValueSource vs;
   vs.elem_type = elem_type;
@@ -962,10 +976,12 @@ void Walker::emit_zigzag_producer(const ::codegen::jit::FusedTree& node,
     // Emit the per-element inverse, given a textual code-value expression
     // `code_expr` (already position-substituted).
     auto emit_inverse_loop = [&](const std::string& code_expr) {
+      // The exact-width unsigned inner cast prevents sign-extension garbage
+      // above the element's width in the shift below (matters for int8_t).
       body_ << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
             << ") {\n"
-            << "        const " << utype << " _zc = static_cast<" << utype << ">(" << code_expr
-            << ");\n"
+            << "        const " << utype << " _zc = static_cast<" << utype << ">(static_cast<"
+            << exact_unsigned(esize) << ">(" << code_expr << "));\n"
             << "        (" << dst << ")[i] = static_cast<" << elem_type
             << ">((_zc >> 1) ^ (static_cast<" << utype << ">(0) - (_zc & static_cast<" << utype
             << ">(1))));\n"

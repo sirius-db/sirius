@@ -852,6 +852,40 @@ int main()
       expect(decoded->view().column(0).null_count() == 1, "dictionary_decomposed_nulls: count");
     }
 
+    {
+      // u8 codegen on string sub-channels: RLE on the (mostly 0xFF) null_mask
+      // bytes and a fused delta->bitpack cascade on the chars bytes.
+      auto stream = cudf::get_default_stream();
+      std::vector<std::string> v64;
+      std::vector<bool> b64;
+      for (int i = 0; i < 64; ++i) {
+        v64.push_back("val" + std::to_string(i % 7));
+        b64.push_back(i != 13 && i != 47);
+      }
+      auto tn = make_strings_table(v64, b64, stream);
+      auto ct = roundtrip_once(tn->view(),
+                               "input -> str_split -> offsets, chars, null_mask\n"
+                               "str_split.offsets -> delta -> differences\n"
+                               "str_split.offsets.differences -> bitpack\n"
+                               "str_split.chars -> lz4\n"
+                               "str_split.null_mask -> rle -> runs, values\n",
+                               1,
+                               "str_split_null_mask_rle_u8");
+      auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
+      expect(decoded->view().column(0).null_count() == 2, "str_split_null_mask_rle_u8: count");
+
+      std::vector<std::string> vals8 = {"aa", "bb", "cc", "aa", "dd", "bb", "ee", "aa"};
+      auto t8                        = make_strings_table(vals8, {}, stream);
+      roundtrip_once(t8->view(),
+                     "input -> str_split -> offsets, chars\n"
+                     "str_split.offsets -> delta -> differences\n"
+                     "str_split.offsets.differences -> bitpack\n"
+                     "str_split.chars -> delta -> differences\n"
+                     "str_split.chars.differences -> bitpack\n",
+                     1,
+                     "str_split_chars_fused_u8");
+    }
+
     std::printf("test_compress_with_plan_roundtrip: PASS\n");
     return 0;
   } catch (std::exception const& e) {

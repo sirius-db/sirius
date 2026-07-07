@@ -259,6 +259,10 @@ const char* dtype_to_cxx(const char* dtype)
   // the original float type_id so cudf reinterprets the bits correctly.
   if (s == "float32") return "int32_t";
   if (s == "float64") return "int64_t";
+  // Byte types (string sub-channels: chars, null_mask, keys_chars) map to the
+  // SIGNED int8_t: zigzag's shift = elem_size*8-1 relies on sign-extension.
+  // The output column retains the original UINT8 type_id.
+  if (s == "uint8" || s == "uint8_t" || s == "int8" || s == "int8_t") return "int8_t";
   return nullptr;
 }
 
@@ -472,7 +476,9 @@ int decode_fused_subtree(codegen::jit::FusedTree const& tree,
                    dtype ? dtype : "(null)");
       return -1;
     }
-    const std::size_t elem_size = (std::strcmp(cxx_dtype, "int64_t") == 0) ? 8u : 4u;
+    const std::size_t elem_size = (std::strcmp(cxx_dtype, "int64_t") == 0)  ? 8u
+                                  : (std::strcmp(cxx_dtype, "int8_t") == 0) ? 1u
+                                                                            : 4u;
 
     // Device transients (bp_offsets/scratch) from the RMM async pool, freed
     // async on return.
@@ -808,6 +814,8 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           // be INT32 regardless of the column dtype.
           const cudf::data_type bp_elem_type = (spec.buffers[i_min].elem_size == 8)
                                                  ? cudf::data_type(cudf::type_id::INT64)
+                                               : (spec.buffers[i_min].elem_size == 1)
+                                                 ? cudf::data_type(cudf::type_id::UINT8)
                                                  : cudf::data_type(cudf::type_id::INT32);
           auto mins_col                      = std::make_unique<cudf::column>(bp_elem_type,
                                                          static_cast<cudf::size_type>(num_chunks),
@@ -881,6 +889,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             (first_elem_size == static_cast<std::int32_t>(cudf::size_of(original_type)))
               ? original_type
             : (first_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+            : (first_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                      : cudf::data_type(cudf::type_id::INT32);
           auto first_col = std::make_unique<cudf::column>(first_elem_type,
                                                           static_cast<cudf::size_type>(num_chunks),
@@ -964,6 +973,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             (refs_elem_size == static_cast<std::int32_t>(cudf::size_of(original_type)))
               ? original_type
             : (refs_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+            : (refs_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                     : cudf::data_type(cudf::type_id::INT32);
           auto refs_col = std::make_unique<cudf::column>(refs_elem_type,
                                                          static_cast<cudf::size_type>(num_chunks),
@@ -1040,6 +1050,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           const cudf::data_type data_elem_type =
             (elem_size == static_cast<std::int32_t>(cudf::size_of(original_type))) ? original_type
             : (elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+            : (elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                : cudf::data_type(cudf::type_id::INT32);
 
           if (is_fixed_stride) {
@@ -1254,6 +1265,8 @@ bool jit_encode_subtree(PlanTree const& tree,
   const char* dtype             = nullptr;
   cudf::type_id storage_type_id = input_col.type().id();
   switch (input_col.type().id()) {
+    case cudf::type_id::INT8: dtype = "int8"; break;
+    case cudf::type_id::UINT8: dtype = "uint8"; break;
     case cudf::type_id::INT32: dtype = "int32"; break;
     case cudf::type_id::INT64: dtype = "int64"; break;
     case cudf::type_id::FLOAT32: dtype = "float32"; break;

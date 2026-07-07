@@ -253,6 +253,12 @@ int simpatico_compact_raw_values(
                                        static_cast<std::int64_t*>(d_compact_v),
                                        offs,
                                        chunk_size);
+  } else if (elem_size == 1) {
+    compact_raw_values_kernel<std::int8_t>
+      <<<num_chunks, 128, 0, stream>>>(static_cast<const std::int8_t*>(d_padded_v),
+                                       static_cast<std::int8_t*>(d_compact_v),
+                                       offs,
+                                       chunk_size);
   } else {
     compact_raw_values_kernel<std::int32_t>
       <<<num_chunks, 128, 0, stream>>>(static_cast<const std::int32_t*>(d_padded_v),

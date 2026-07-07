@@ -49,6 +49,8 @@ namespace {
 const char* codegen_dtype_str_for(cudf::data_type type)
 {
   switch (type.id()) {
+    case cudf::type_id::INT8: return "int8";
+    case cudf::type_id::UINT8: return "uint8";
     case cudf::type_id::INT32: return "int32";
     case cudf::type_id::INT64: return "int64";
     case cudf::type_id::FLOAT32: return "float32";
