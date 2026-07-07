@@ -3,10 +3,12 @@
 //! This crate converts a StarRocks `TExecPlanFragmentParams` (the Thrift plan a
 //! StarRocks frontend ships to a backend) into a `substrait` `Plan`. It is meant
 //! as a foundation more operators are built on, so it favours explicit, checked
-//! invariants over breadth: v1 supports scan, filter, and projection, and
-//! everything outside that surface returns a structured [`TranslateError`] that
+//! invariants over breadth: it translates one fragment at a time, and everything
+//! outside the supported surface returns a structured [`TranslateError`] that
 //! names the offending node/type — so the next contributor knows exactly what to
-//! implement next.
+//! implement next. In particular `EXCHANGE_NODE` is rejected: a fragment is
+//! translated in isolation, and multi-fragment plans (every exchange is a
+//! fragment boundary) are a later milestone.
 //!
 //! # Wire format: flat preorder
 //!
@@ -21,23 +23,27 @@
 //! instead of silently producing a truncated tree. **Any new node translator
 //! must preserve this invariant.**
 //!
-//! # Supported surface (v1)
+//! # Supported surface
 //!
-//! | Plan node        | Substrait relation     |
-//! |------------------|------------------------|
-//! | `FILE_SCAN_NODE` | `ReadRel` (local files) |
-//! | `HDFS_SCAN_NODE` | `ReadRel` (named table) |
-//! | `SELECT_NODE`    | `FilterRel`            |
-//! | `PROJECT_NODE`   | `ProjectRel`           |
+//! | Plan node            | Substrait relation |
+//! |----------------------|--------------------|
+//! | `FILE_SCAN_NODE`     | `ReadRel` (local files) |
+//! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
+//! | `SELECT_NODE`        | `FilterRel`        |
+//! | `PROJECT_NODE`       | `ProjectRel`       |
 //!
-//! | Expression node | Substrait expression |
-//! |-----------------|----------------------|
-//! | `SLOT_REF`      | field reference (resolved by `DescriptorTable::slot_global_index`) |
-//! | `*_LITERAL`     | width-matched typed literal |
-//! | `BINARY_PRED`   | comparison function (`equal`, `not_equal`, `lt`, `lte`, `gt`, `gte`) |
-//! | `COMPOUND_PRED` | boolean function (`and`, `or`, `not`) |
-//! | `CAST_EXPR`     | cast (throwing failure behavior) |
-//! | `IS_NULL_PRED`  | `is_null` / `is_not_null` |
+//! | Expression node   | Substrait expression |
+//! |-------------------|----------------------|
+//! | `SLOT_REF`        | field reference (resolved by `DescriptorTable::slot_global_index`) |
+//! | `*_LITERAL`       | width-matched typed literal (incl. `DATE_LITERAL` as epoch days) |
+//! | `BINARY_PRED`     | comparison function (`equal`, `not_equal`, `lt`, `lte`, `gt`, `gte`) |
+//! | `COMPOUND_PRED`   | boolean function (`and`, `or`, `not`) |
+//! | `CAST_EXPR`       | cast (throwing failure behavior) |
+//! | `IS_NULL_PRED`    | `is_null` / `is_not_null` |
+//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` |
+//! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
+//! | `CASE_EXPR`       | if-then chain (no leading case operand) |
+//! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
@@ -87,6 +93,12 @@ use scan_paths::ScanFilePaths;
 pub const URN_COMPARISON: &str = "extension:io.substrait:functions_comparison";
 /// Substrait boolean function extension URN used for compound predicates.
 pub const URN_BOOLEAN: &str = "extension:io.substrait:functions_boolean";
+/// Substrait arithmetic function extension URN.
+pub const URN_ARITHMETIC: &str = "extension:io.substrait:functions_arithmetic";
+/// Substrait string function extension URN.
+pub const URN_STRING: &str = "extension:io.substrait:functions_string";
+/// Substrait datetime function extension URN.
+pub const URN_DATETIME: &str = "extension:io.substrait:functions_datetime";
 
 /// Result of translating one StarRocks plan fragment.
 pub struct TranslatedPlan {
