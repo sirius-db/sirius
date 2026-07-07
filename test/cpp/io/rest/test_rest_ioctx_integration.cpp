@@ -32,6 +32,8 @@
 #include <arpa/inet.h>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <netinet/in.h>
+#include <spdlog/sinks/base_sink.h>
+#include <spdlog/spdlog.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -51,6 +53,7 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -234,7 +237,10 @@ std::uint32_t parquet_footer_len(std::span<std::uint8_t const> parquet)
 struct range_fault_policy {
   std::size_t fail_first_gets{0};
   bool fail_all_gets{false};
+  std::size_t fail_first_heads{0};
+  bool fail_all_heads{false};
   int fail_status{503};
+  int fail_head_status{503};
   std::chrono::milliseconds response_delay{0};
   bool omit_content_range{false};
   bool unknown_content_range_total{false};
@@ -359,7 +365,14 @@ class range_http_server {
     bool const is_head = request.rfind("HEAD ", 0) == 0;
     bool const is_get  = request.rfind("GET ", 0) == 0;
     if (is_head) {
-      _head_count.fetch_add(1, std::memory_order_relaxed);
+      auto const head_idx = _head_count.fetch_add(1, std::memory_order_relaxed);
+      if (_fault.fail_all_heads || head_idx < _fault.fail_first_heads) {
+        std::string response =
+          "HTTP/1.1 " + std::to_string(_fault.fail_head_status) +
+          " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send_all(fd, response);
+        return;
+      }
       std::string response =
         "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
         "\r\nConnection: close\r\n\r\n";
@@ -530,6 +543,62 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
 {
   return make_direct_rest_ioctx(std::move(endpoint), direct_rest_test_config());
 }
+
+class capture_sink final : public spdlog::sinks::base_sink<std::mutex> {
+ public:
+  struct record {
+    spdlog::level::level_enum level;
+    std::string payload;
+  };
+
+  [[nodiscard]] std::vector<record> records() const
+  {
+    std::lock_guard<std::mutex> lock(_records_mutex);
+    return _records;
+  }
+
+ protected:
+  void sink_it_(spdlog::details::log_msg const& msg) override
+  {
+    std::lock_guard<std::mutex> lock(_records_mutex);
+    _records.push_back({msg.level, std::string(msg.payload.data(), msg.payload.size())});
+  }
+
+  void flush_() override {}
+
+ private:
+  mutable std::mutex _records_mutex;
+  std::vector<record> _records;
+};
+
+class scoped_spdlog_capture {
+ public:
+  scoped_spdlog_capture()
+    : _logger(spdlog::default_logger()),
+      _sink(std::make_shared<capture_sink>()),
+      _old_level(_logger->level())
+  {
+    _logger->sinks().push_back(_sink);
+    _logger->set_level(spdlog::level::trace);
+  }
+
+  ~scoped_spdlog_capture()
+  {
+    auto& sinks = _logger->sinks();
+    sinks.erase(std::remove(sinks.begin(), sinks.end(), _sink), sinks.end());
+    _logger->set_level(_old_level);
+  }
+
+  scoped_spdlog_capture(scoped_spdlog_capture const&)            = delete;
+  scoped_spdlog_capture& operator=(scoped_spdlog_capture const&) = delete;
+
+  [[nodiscard]] std::vector<capture_sink::record> records() const { return _sink->records(); }
+
+ private:
+  std::shared_ptr<spdlog::logger> _logger;
+  std::shared_ptr<capture_sink> _sink;
+  spdlog::level::level_enum _old_level;
+};
 
 }  // namespace
 
@@ -932,6 +1001,164 @@ TEST_CASE("footer suffix probe retries transient GET failures",
     auto const perf = reactor.perf_snapshot();
     CHECK(perf.retries_total == 0);
     CHECK(perf.terminal_failures_total == 0);
+  }
+}
+
+TEST_CASE("HEAD object-size retries update REST perf counters",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const payload = deterministic_payload(4096);
+
+  SECTION("transient 503s are retried and the final HEAD returns the size")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_heads = 2;
+    fault.fail_head_status = 503;
+    range_http_server server(payload, fault);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 3;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "head-retry-success");
+
+    CHECK(reactor.head_object_size("head-bucket", "head-success.bin") == payload.size());
+    CHECK(server.head_count() == 3);
+    CHECK(server.get_count() == 0);
+    auto const perf = reactor.perf_snapshot();
+    CHECK(perf.retries_total == 2);
+    CHECK(perf.terminal_failures_total == 0);
+  }
+
+  SECTION("exhausted transient 503s are reported as one terminal failure")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_heads   = true;
+    fault.fail_head_status = 503;
+    range_http_server server(payload, fault);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 2;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "head-retry-exhausted");
+
+    try {
+      (void)reactor.head_object_size("head-bucket", "head-exhausted.bin");
+      FAIL("head_object_size should throw after exhausting transient retries");
+    } catch (std::runtime_error const& e) {
+      auto const message = std::string{e.what()};
+      CHECK(message.find("exhausted retries") != std::string::npos);
+      CHECK(message.find("HTTP 503") != std::string::npos);
+    }
+    CHECK(server.head_count() == 2);
+    CHECK(server.get_count() == 0);
+    auto const perf = reactor.perf_snapshot();
+    CHECK(perf.retries_total == cfg.max_retry_attempts - 1);
+    CHECK(perf.terminal_failures_total == 1);
+  }
+
+  SECTION("hard non-retriable HEAD errors fail without retrying")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_heads   = true;
+    fault.fail_head_status = 403;
+    range_http_server server(payload, fault);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 3;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "head-hard-failure");
+
+    try {
+      (void)reactor.head_object_size("head-bucket", "head-forbidden.bin");
+      FAIL("head_object_size should throw on a hard non-retriable HTTP error");
+    } catch (std::runtime_error const& e) {
+      auto const message = std::string{e.what()};
+      CHECK(message.find("HTTP 403") != std::string::npos);
+    }
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 0);
+    auto const perf = reactor.perf_snapshot();
+    CHECK(perf.retries_total == 0);
+    CHECK(perf.terminal_failures_total == 1);
+  }
+
+  SECTION("clean HEAD has no retry or terminal-failure telemetry")
+  {
+    range_http_server server(payload);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 3;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "head-clean");
+
+    CHECK(reactor.head_object_size("head-bucket", "head-clean.bin") == payload.size());
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 0);
+    auto const perf = reactor.perf_snapshot();
+    CHECK(perf.retries_total == 0);
+    CHECK(perf.terminal_failures_total == 0);
+  }
+}
+
+TEST_CASE("REST retry logging includes object keys and stays quiet on clean requests",
+          "[s3][integration][rest][footerbind]")
+{
+  auto const payload = deterministic_payload(4096);
+
+  SECTION("a retried request emits a warning with the object key")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets = 1;
+    fault.fail_status     = 503;
+    range_http_server server(payload, fault);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 2;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "retry-log-warning");
+
+    scoped_spdlog_capture logs;
+    auto probe = reactor.fetch_footer_suffix("log-bucket", "warn-retry.parquet", 1024);
+    REQUIRE(probe.bytes != nullptr);
+
+    auto const records = logs.records();
+    auto const found   = std::any_of(records.begin(), records.end(), [](auto const& r) {
+      return r.level == spdlog::level::warn &&
+             r.payload.find("warn-retry.parquet") != std::string::npos;
+    });
+    CHECK(found);
+  }
+
+  SECTION("clean first-try suffix GET and HEAD do not emit warnings or errors")
+  {
+    range_http_server server(payload);
+    auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg                    = direct_rest_test_config();
+    cfg.max_retry_attempts      = 2;
+    cfg.max_auth_retry_attempts = 1;
+    auto ctx                    = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "retry-log-clean");
+
+    scoped_spdlog_capture logs;
+    auto probe = reactor.fetch_footer_suffix("log-bucket", "clean.parquet", 1024);
+    REQUIRE(probe.bytes != nullptr);
+    CHECK(reactor.head_object_size("log-bucket", "clean.parquet") == payload.size());
+
+    auto const records        = logs.records();
+    auto const warning_or_bad = std::any_of(
+      records.begin(), records.end(), [](auto const& r) { return r.level >= spdlog::level::warn; });
+    CHECK_FALSE(warning_or_bad);
   }
 }
 

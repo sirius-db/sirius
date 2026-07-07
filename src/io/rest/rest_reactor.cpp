@@ -20,6 +20,7 @@
 #include "io/details/slot_pool.hpp"
 #include "io/rest/curl_handle.hpp"
 #include "io/uri_parser.hpp"
+#include "log/logging.hpp"
 
 #include <rmm/cuda_device.hpp>
 
@@ -830,6 +831,7 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
       curl_off_t cl = -1;
       curl_easy_getinfo(h.get(), CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
       if (cl < 0) {
+        _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
         throw std::runtime_error("rest_reactor::head_object_size: missing Content-Length for " +
                                  obj.bucket + "/" + obj.key);
       }
@@ -841,13 +843,22 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
     bool const retriable =
       (rc != CURLE_OK && is_retriable_curl(rc)) || (rc == CURLE_OK && is_retriable_status(status));
     if (!retriable) {
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
       throw std::runtime_error("rest_reactor::head_object_size: " + last_error + " for " +
                                obj.bucket + "/" + obj.key);
     }
     if (attempt + 1 < _config.max_retry_attempts) {
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
+      SIRIUS_LOG_WARN("rest_reactor::head_object_size: retrying {}/{} after {} (attempt {}/{})",
+                      obj.bucket,
+                      obj.key,
+                      last_error,
+                      attempt + 1,
+                      _config.max_retry_attempts);
       std::this_thread::sleep_for(compute_backoff(attempt, hc.retry_after, _config));
     }
   }
+  _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
   throw std::runtime_error("rest_reactor::head_object_size: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
 }
@@ -943,6 +954,12 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
     }
     if (attempt + 1 < _config.max_retry_attempts) {
       _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
+      SIRIUS_LOG_WARN("rest_reactor::fetch_footer_suffix: retrying {}/{} after {} (attempt {}/{})",
+                      obj.bucket,
+                      obj.key,
+                      last_error,
+                      attempt + 1,
+                      _config.max_retry_attempts);
       std::this_thread::sleep_for(compute_backoff(attempt, sink.retry_after, _config));
     }
   }
@@ -1299,7 +1316,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     // a genuine AccessDenied still fails fast.
     auto schedule_retry = [&](std::unique_ptr<rest_chunked_rx_request> req,
                               std::string const& retry_after,
-                              bool is_auth) {
+                              bool is_auth,
+                              std::string const& reason) {
       std::size_t& counter = is_auth ? req->auth_attempt : req->attempt;
       std::size_t const max_attempts =
         is_auth ? _config.max_auth_retry_attempts : _config.max_retry_attempts;
@@ -1313,6 +1331,12 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       // and reuses the current step without inflating it.
       auto const delay = compute_backoff(req->attempt, retry_after, _config);
       _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
+      SIRIUS_LOG_WARN("rest_reactor: retrying {}/{} after {} (attempt {}/{})",
+                      req->object.bucket,
+                      req->object.key,
+                      reason,
+                      counter + 1,
+                      max_attempts);
       counter += 1;
       retry_heap.push_back(retry_entry{std::chrono::steady_clock::now() + delay, std::move(req)});
       std::push_heap(retry_heap.begin(), retry_heap.end(), retry_cmp);
@@ -1517,8 +1541,13 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       // with a fresh signature a bounded number of times before giving up.
       bool const auth_retriable = rc == CURLE_OK && status == 403;
       if (retriable || auth_retriable) {
-        schedule_retry(
-          std::move(s.req), s.hc.retry_after, /*is_auth=*/auth_retriable && !retriable);
+        std::string const reason =
+          rc != CURLE_OK ? std::string(curl_easy_strerror(rc))
+                         : (short_read ? "short read" : "HTTP " + std::to_string(status));
+        schedule_retry(std::move(s.req),
+                       s.hc.retry_after,
+                       /*is_auth=*/auth_retriable && !retriable,
+                       reason);
         return false;
       }
       std::string const msg = rc != CURLE_OK
