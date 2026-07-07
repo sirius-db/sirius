@@ -97,8 +97,8 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
-    join_type(join_type),
-    conditions(std::move(cond))
+    conditions(std::move(cond)),
+    join_type(join_type)
 {
   reorder_conditions(conditions);
 
@@ -127,8 +127,8 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
-    join_type(join_type),
-    conditions(std::move(cond))
+    conditions(std::move(cond)),
+    join_type(join_type)
 {
   reorder_conditions(conditions);
   children.push_back(std::move(left));
@@ -158,8 +158,8 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
-    join_type(join_type),
-    conditions(std::move(cond))
+    conditions(std::move(cond)),
+    join_type(join_type)
 {
   reorder_conditions(conditions);
   children.push_back(std::move(left));

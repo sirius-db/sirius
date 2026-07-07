@@ -38,7 +38,7 @@ namespace sirius {
 namespace pipeline {
 
 sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
-  : build_ctx_(ctx), ready(false), initialized(false), source(nullptr), sink(nullptr)
+  : ready(false), initialized(false), source(nullptr), sink(nullptr), build_ctx_(ctx)
 {
 }
 
