@@ -396,12 +396,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
-  cucascade::memory::fixed_size_host_memory_resource* host_fsmr = nullptr;
   {
     auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!host_spaces.empty()) {
-      host_fsmr = host_spaces[0]
-                    ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
       std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
         per_node_pools;
       int fallback_node = -1;

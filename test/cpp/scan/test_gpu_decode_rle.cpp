@@ -50,7 +50,6 @@ using sirius::test::decode::rle::make_rle_block;
 
 namespace {
 
-auto const I8  = cudf::data_type{cudf::type_id::INT8};
 auto const I16 = cudf::data_type{cudf::type_id::INT16};
 auto const I32 = cudf::data_type{cudf::type_id::INT32};
 auto const I64 = cudf::data_type{cudf::type_id::INT64};
