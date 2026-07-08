@@ -330,7 +330,14 @@ exploration_result explore_column_compression(cudf::column_view input,
       std::cerr << "[explore] Depth " << depth << ": " << beam.size()
                 << " candidates, best=" << best_ratio << "\n";
 
-    std::vector<std::unique_ptr<bfs_candidate>> all_children;
+    // Min-heap (worst ratio at front) of the top max_candidates children; losers
+    // are freed as they arrive, capping peak memory at ~beam_width candidates
+    // rather than beam_width × pending × ops. Surviving set is identical.
+    std::vector<std::unique_ptr<bfs_candidate>> next_beam;
+    auto ratio_gt = [](std::unique_ptr<bfs_candidate> const& a,
+                       std::unique_ptr<bfs_candidate> const& b) {
+      return a->compression_ratio > b->compression_ratio;
+    };
 
     for (auto& candidate : beam) {
       if (candidate->pending.empty()) {
@@ -416,24 +423,28 @@ exploration_result explore_column_compression(cudf::column_view input,
             best_leaf_bytes = child->total_leaf_bytes;
             best_depth      = depth + 1;
           }
-          all_children.push_back(std::move(child));
+          if (next_beam.size() < max_candidates) {
+            next_beam.push_back(std::move(child));
+            std::push_heap(next_beam.begin(), next_beam.end(), ratio_gt);
+          } else if (child->compression_ratio > next_beam.front()->compression_ratio) {
+            std::pop_heap(next_beam.begin(), next_beam.end(), ratio_gt);
+            next_beam.back() = std::move(child);
+            std::push_heap(next_beam.begin(), next_beam.end(), ratio_gt);
+          }
         }
       }
     }
 
-    if (all_children.empty()) break;
+    if (next_beam.empty()) break;
 
-    std::sort(all_children.begin(), all_children.end(), [](auto const& a, auto const& b) {
+    std::sort(next_beam.begin(), next_beam.end(), [](auto const& a, auto const& b) {
       return a->compression_ratio > b->compression_ratio;
     });
 
     cudaStreamSynchronize(stream.value());
     beam.clear();
-    size_t keep = std::min(max_candidates, all_children.size());
-    for (size_t i = 0; i < keep; ++i)
-      beam.push_back(std::move(all_children[i]));
+    beam.swap(next_beam);
     cudaStreamSynchronize(stream.value());
-    all_children.clear();
 
     bool has_pending = false;
     for (auto const& c2 : beam)

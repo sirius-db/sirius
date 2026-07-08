@@ -8,6 +8,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
@@ -20,6 +21,7 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -30,6 +32,13 @@ namespace simpatico {
 namespace {
 
 constexpr size_t MAX_INDICES = 1 << 28;  // 256M rows (sanity bound)
+
+// cudf::dictionary::encode faults with a context-corrupting illegal access on
+// very large, very-high-cardinality strings — inputs a dictionary can't help
+// anyway. Probe a bounded prefix and skip such columns before the full encode.
+constexpr cudf::size_type kDictProbeRows = 1 << 18;
+constexpr size_t kDictProbeThreshold     = 1 << 20;
+constexpr double kDictMaxCardFraction    = 0.5;
 
 std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
   cudf::column_view const& col,
@@ -55,6 +64,17 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
     }
     auto empty_dict = cudf::make_empty_column(cudf::data_type(cudf::type_id::DICTIONARY32));
     return std::make_unique<dictionary_compressed_representation>(std::move(empty_dict));
+  }
+
+  if (static_cast<size_t>(n) > kDictProbeThreshold) {
+    auto const sample_n = std::min<cudf::size_type>(n, kDictProbeRows);
+    auto probe          = cudf::dictionary::encode(
+      cudf::slice(col, {0, sample_n}).front(), cudf::data_type(cudf::type_id::INT32), stream, mr);
+    cudaStreamSynchronize(stream.value());
+    auto const keys = cudf::dictionary_column_view(probe->view()).keys().size();
+    if (static_cast<double>(keys) > kDictMaxCardFraction * static_cast<double>(sample_n)) {
+      throw std::runtime_error("dictionary_compressor: cardinality too high (skipping)");
+    }
   }
 
   auto dict_col = cudf::dictionary::encode(col, cudf::data_type(cudf::type_id::INT32), stream, mr);
