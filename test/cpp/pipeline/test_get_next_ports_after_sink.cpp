@@ -61,7 +61,7 @@ TEST_CASE("yields nothing when no sink is set", "[pipeline][get_next_ports_after
   sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
   REQUIRE(not pipeline.get_sink());
 
-  for (const auto& port : pipeline.get_next_ports_after_sink()) {
+  for ([[maybe_unused]] const auto& port : pipeline.get_next_ports_after_sink()) {
     FAIL("port found");
   }
 }
@@ -99,7 +99,7 @@ TEST_CASE("yields nothing for standard sink with no ports", "[pipeline][get_next
   sirius_pipeline_build_state build_state;
   build_state.set_pipeline_sink(pipeline, &sink_op, 0);
 
-  for (const auto& port : pipeline.get_next_ports_after_sink()) {
+  for ([[maybe_unused]] const auto& port : pipeline.get_next_ports_after_sink()) {
     FAIL("port found");
   }
 }
