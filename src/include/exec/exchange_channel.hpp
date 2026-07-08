@@ -50,7 +50,8 @@ struct exchange_batch_handle {
 ///   - drained() ≡  closed() && empty()  — terminal EOS predicate.
 ///   - Engine workers use try_push / try_pop only (non-blocking). Blocking push / pop are
 ///     provided for the wrapper / test side.
-///   - Callbacks (on_push / on_pop) fire outside the lock; single-slot — last setter wins.
+///   - Callbacks (on_push / on_pop / on_close) fire outside the lock; each is single-slot —
+///     last setter wins. on_close fires exactly once, on the first successful close().
 class exchange_channel {
  public:
   struct config {
@@ -104,15 +105,19 @@ class exchange_channel {
     return true;
   }
 
-  /// Idempotent close. Queued items remain poppable after close.
+  /// Idempotent close. Queued items remain poppable after close. Fires the on-close callback
+  /// exactly once, on the first successful call, outside the lock.
   void close()
   {
+    std::function<void()> cb;
     {
       std::unique_lock<std::mutex> lock(_mutex);
       if (_closed) return;
       _closed = true;
+      cb      = _on_close;
     }
     _cv.notify_all();
+    if (cb) cb();
   }
 
   // -----------------------------------------------------------------------
@@ -216,6 +221,16 @@ class exchange_channel {
     _on_pop = std::move(cb);
   }
 
+  /// Fired exactly once, after the first successful close() (repeated close() calls are a
+  /// no-op and do not re-fire it), outside the lock. Distinct from on_push/on_pop: "the stream
+  /// ended" is a different event than "data is available", with a different intended consumer
+  /// (pipeline-completion re-evaluation vs. task-creation re-scheduling).
+  void set_on_close(std::function<void()> cb)
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _on_close = std::move(cb);
+  }
+
  private:
   /// full() without taking the lock. Caller must hold _mutex.
   [[nodiscard]] bool full_unlocked() const
@@ -250,6 +265,7 @@ class exchange_channel {
   bool _closed{false};
   std::function<void()> _on_push;
   std::function<void()> _on_pop;
+  std::function<void()> _on_close;
 };
 
 }  // namespace sirius::exec

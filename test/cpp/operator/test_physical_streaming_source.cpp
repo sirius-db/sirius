@@ -31,6 +31,7 @@
 #include <helper/type_conversions.hpp>
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_streaming_source.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 
 #include <atomic>
 #include <memory>
@@ -72,6 +73,24 @@ static auto make_source(std::size_t channel_capacity = 16)
     ch,
     repo);
   return std::make_tuple(std::move(op), ch, repo);
+}
+
+/// Wire a trivial single-operator pipeline (source == sink, no intermediate
+/// operators) around an already-constructed streaming source, so tests can drive
+/// the *real* sirius_pipeline completion predicate (update_pipeline_status() /
+/// is_pipeline_finished()) instead of only inspecting the operator in isolation.
+/// Mirrors the minimal wiring pattern used by
+/// test/cpp/pipeline/test_gpu_pipeline_task_history.cpp's create_pipeline_context().
+static duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipeline(
+  sirius_physical_streaming_source& op)
+{
+  sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipeline, op);
+  build_state.set_pipeline_sink(*pipeline, &op, 1);
+  op.set_pipeline(pipeline);
+  return pipeline;
 }
 
 }  // namespace
@@ -350,7 +369,6 @@ TEST_CASE("streaming_source SRC-13: task owns batch; repo no longer holds it", "
 
   auto [op, ch, repo] = make_source();
   auto batch          = make_numeric_batch<int32_t>(*gpu_space, {1, 2}, cudf::type_id::INT32);
-  auto batch_id       = batch->get_batch_id();
   push_batch(repo, *ch, batch);
 
   REQUIRE(repo->total_size() == 1);
@@ -700,4 +718,88 @@ TEST_CASE("streaming_source SRC-21: concurrent input-data pulls deliver each bat
 
   REQUIRE(received.load() == K);
   REQUIRE(static_cast<int>(ids.size()) == K);
+}
+
+// ============================================================================
+// BUG-1 (Finding 1a, reproduction): closing an empty stream must finish a
+// zero-task pipeline. See docs/super-sirius/streaming-source-p1-p3-fix-plan.md,
+// Finding 1, "Empty stream" failure mode.
+//
+// These BUG-* tests exercise the real sirius_pipeline completion predicate
+// (update_pipeline_status() / is_pipeline_finished()), not just the operator's
+// own hint/all_ports_empty() methods, because the bug is in what *calls*
+// update_pipeline_status() (or rather, what fails to), not in the predicate
+// itself.
+// ============================================================================
+
+TEST_CASE(
+  "streaming_source BUG-1 (Finding 1a): closing an empty stream finishes a zero-task pipeline",
+  "[streaming_source][pipeline_completion]")
+{
+  auto [op, ch, repo] = make_source();
+  auto pipeline       = make_single_op_pipeline(*op);
+
+  REQUIRE_FALSE(pipeline->is_pipeline_finished());
+
+  // Stream closes with zero batches ever pushed: tasks_created == tasks_completed
+  // == 0 forever, and the source is now exhausted (closed + drained).
+  ch->close();
+  REQUIRE(op->all_ports_empty());
+  REQUIRE(pipeline->get_tasks_created() == 0);
+  REQUIRE(pipeline->get_tasks_completed() == 0);
+
+  // BUG: nothing in the current architecture re-evaluates pipeline status when a
+  // source's stream closes without ever needing a task — task_creator's
+  // manager_loop silently drops the request when get_operator_for_next_task()
+  // resolves to nullptr, so update_pipeline_status() is never called here. The
+  // finish predicate is already satisfiable (0 == 0 tasks, source exhausted) but
+  // nobody asks it to check.
+  REQUIRE(pipeline->is_pipeline_finished());
+}
+
+// ============================================================================
+// BUG-2 (Finding 1b, reproduction): closing the stream after the last task has
+// already completed must finish the pipeline. See streaming-source-p1-p3-fix-
+// plan.md, Finding 1, "Late close" failure mode.
+// ============================================================================
+
+TEST_CASE(
+  "streaming_source BUG-2 (Finding 1b): late close after last task completed finishes "
+  "the pipeline",
+  "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto [op, ch, repo] = make_source();
+  auto pipeline       = make_single_op_pipeline(*op);
+
+  auto batch = make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32);
+  push_batch(repo, *ch, batch);
+
+  // Simulate the one real task the task-creator would have made for this batch:
+  // mark_task_created()/mark_task_completed() are the same production calls made
+  // by gpu_pipeline_task's constructor/destructor.
+  pipeline->mark_task_created();
+  auto pod = op->get_next_task_input_data();
+  REQUIRE(pod != nullptr);
+
+  // Task completes while the channel is still OPEN (more data could still
+  // arrive): correctly not finished yet.
+  pipeline->mark_task_completed();
+  REQUIRE_FALSE(op->all_ports_empty());
+  REQUIRE_FALSE(pipeline->is_pipeline_finished());
+
+  // Later: the producer closes the stream. No more tasks will ever run, and the
+  // last one already completed (tasks_created == tasks_completed == 1).
+  ch->close();
+  REQUIRE(op->all_ports_empty());
+  REQUIRE(pipeline->get_tasks_created() == pipeline->get_tasks_completed());
+
+  // BUG: the close happens with no task in flight, so nothing calls
+  // mark_task_completed() -> update_pipeline_status() to notice the pipeline can
+  // now finish. The pipeline is stuck even though its finish predicate is
+  // satisfied.
+  REQUIRE(pipeline->is_pipeline_finished());
 }

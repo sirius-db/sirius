@@ -37,6 +37,11 @@ namespace sirius::op {
 ///   - get_next_task_input_data(): non-blocking try_pop + repo resolve; one batch per task.
 ///   - execute(): pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
 ///   - no_history_peak_memory_estimate(): returns stats.bytes (pass-through allocates nothing).
+///   - Completion: wires the channel's on-close callback (constructor) to
+///     pipeline->update_pipeline_status(), so an empty or already-drained-by-the-last-task
+///     stream still finishes its pipeline even though no task is left in flight to trigger
+///     re-evaluation via mark_task_completed(). See streaming-source-p1-fix-plan-v2-no-task-
+///     creator.md, Finding 1.
 class sirius_physical_streaming_source : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SOURCE;
@@ -46,6 +51,10 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
     std::size_t estimated_cardinality,
     std::shared_ptr<exec::exchange_channel> input_channel,
     std::shared_ptr<cucascade::shared_data_repository> input_repository);
+
+  /// Clears the channel's on-close callback before this operator is destroyed, since the
+  /// channel (owned jointly with the producer side) may outlive it.
+  ~sirius_physical_streaming_source() override;
 
   // -----------------------------------------------------------------------
   // Source interface

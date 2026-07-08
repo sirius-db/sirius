@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_streaming_source.hpp"
 
+#include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
@@ -35,6 +36,28 @@ sirius_physical_streaming_source::sirius_physical_streaming_source(
     _input_channel(std::move(input_channel)),
     _input_repository(std::move(input_repository))
 {
+  // Close is the only event that can make this pipeline finish without a task in flight to
+  // call mark_task_completed() -> update_pipeline_status() for it (empty stream, or the last
+  // task already completed while the channel was still open). Wire close directly to a
+  // re-evaluation instead of relying on task_creator to notice a dropped nullopt hint — see
+  // docs/super-sirius/streaming-source-p1-fix-plan-v2-no-task-creator.md, Finding 1.
+  //
+  // get_pipeline() is resolved lazily (at callback-fire time, not here at construction time):
+  // set_pipeline() runs once per operator during query::build_indices(), which happens after
+  // every operator is constructed but before any channel activity starts in production, so by
+  // the time close() is actually called the pipeline is always set. The null check makes this
+  // safe even if that ordering assumption is ever violated (e.g. in tests that never wire a
+  // pipeline at all).
+  _input_channel->set_on_close([this] {
+    if (auto pipeline = get_pipeline()) { pipeline->update_pipeline_status(); }
+  });
+}
+
+sirius_physical_streaming_source::~sirius_physical_streaming_source()
+{
+  // The channel may outlive this operator (e.g. held by a producer on another thread); clear
+  // the callback before `this` becomes dangling, per exchange_channel's documented contract.
+  _input_channel->set_on_close(nullptr);
 }
 
 std::optional<task_creation_hint> sirius_physical_streaming_source::get_next_task_hint()

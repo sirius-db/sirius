@@ -337,6 +337,57 @@ TEST_CASE("exchange_channel: hooks fire outside the lock", "[exchange_channel]")
 }
 
 // ============================================================================
+// CH-16 (Finding 1): on_close fires exactly once, outside the lock, only on the
+// first successful close().
+// ============================================================================
+
+TEST_CASE("exchange_channel: on_close fires exactly once outside the lock (Finding 1)",
+          "[exchange_channel][pipeline_completion]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4});
+
+  std::atomic<int> close_count{0};
+  std::atomic<bool> was_closed_in_cb{false};
+  ch.set_on_close([&] {
+    close_count.fetch_add(1, std::memory_order_relaxed);
+    // closed() acquires the mutex; if the callback fired inside the lock this would deadlock.
+    was_closed_in_cb.store(ch.closed(), std::memory_order_relaxed);
+  });
+
+  REQUIRE(close_count.load() == 0);  // not fired before close() is ever called
+
+  ch.close();
+  REQUIRE(close_count.load() == 1);
+  REQUIRE(was_closed_in_cb.load());
+
+  // Repeated close() calls must not re-fire the callback.
+  ch.close();
+  ch.close();
+  REQUIRE(close_count.load() == 1);
+}
+
+// ============================================================================
+// CH-17 (Finding 1): on_close fires even for a channel that closes with items
+// still queued (close-then-drain — the callback signals "no more pushes will
+// ever happen", not "the queue is empty").
+// ============================================================================
+
+TEST_CASE("exchange_channel: on_close fires even when items remain queued (Finding 1)",
+          "[exchange_channel][pipeline_completion]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4});
+
+  std::atomic<int> close_count{0};
+  ch.set_on_close([&] { close_count.fetch_add(1, std::memory_order_relaxed); });
+
+  REQUIRE(ch.try_push(make_handle(0)));
+  ch.close();
+
+  REQUIRE(close_count.load() == 1);
+  REQUIRE_FALSE(ch.drained());  // item still queued — on_close still fired
+}
+
+// ============================================================================
 // CH-12 (Finding 3a, reproduction): a push that would push the cumulative total
 // past capacity_bytes must be rejected. full_unlocked() only inspects bytes
 // already queued, not the incoming candidate, so a 40-byte handle is wrongly
