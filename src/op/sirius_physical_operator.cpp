@@ -71,7 +71,7 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     if (leave_locked) {
       _read_only_data_batches = std::move(ro_batches);
     } else {
-      return std::move(ro_batches);
+      return ro_batches;
     }
   }
   return *_read_only_data_batches;

@@ -117,7 +117,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         "[expression_evaluator:function]: Expected an owned column after executing function "
         "expression.");
     }
-    return materialize_as_ast_column(std::move(result.release_column()));
+    return materialize_as_ast_column(result.release_column());
   }
   auto const output_type = sirius::get_cudf_type(alt.return_type());
 
