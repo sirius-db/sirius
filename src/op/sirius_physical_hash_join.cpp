@@ -852,10 +852,7 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
 /// @brief Whether any column of @p keys carries at least one NULL value.
 static bool table_has_any_null(cudf::table_view const& keys)
 {
-  for (auto const& col : keys) {
-    if (col.null_count() > 0) { return true; }
-  }
-  return false;
+  return std::ranges::any_of(keys, [](auto const& col) { return col.null_count() > 0; });
 }
 
 /// @brief the MARK join output from the semi_join matching row indices.
