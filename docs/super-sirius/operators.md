@@ -62,6 +62,39 @@ The pipeline converter rewrites a DuckDB parquet or DuckDB-native table scan int
 
 See [Scan](scan.md) for the full scan subsystem (scan manager, `gpu_ingestible`, pinned-table caching, and the IO layer).
 
+### `sirius_physical_streaming_source` — `STREAMING_SOURCE`
+**File:** `src/include/op/sirius_physical_streaming_source.hpp`
+
+Source operator that marks the bottom boundary of an intermediate pipeline fragment. It pulls
+`exchange_batch_handle` records (batch-id + size) from a bounded `exec::exchange_channel`, resolves
+each handle via a `cucascade::shared_data_repository`, and publishes the batch into the pipeline
+as a `pipelineable_operator_data`. Used only when a fragment's input arrives from another node
+over exchange; a leaf fragment keeps its normal `GPU_SCAN` source.
+
+Key design invariants (design §3/§7):
+- The channel carries **handles**, not `shared_ptr`s — the repository owns the batch so queued
+  items remain spill-visible to the downgrade executor.
+- Engine workers use `try_pop` only (non-blocking); `push`/`pop` are provided for the wrapper/test side.
+- EOS is **close-then-drain**: `close()` forbids new pushes; queued handles stay poppable;
+  `drained()` (= `closed() && empty()`) is the terminal predicate.
+- `execute()` is a pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
+- `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
+
+Hint table:
+
+| Channel state | `get_next_task_hint()` |
+|---|---|
+| non-empty (open or closed) | `READY{this}` |
+| open, empty | `WAITING{nullptr}` — re-armable by the session on push (#839) |
+| closed && drained | `std::nullopt` — EOS |
+
+`all_ports_empty()` is overridden to `_input_channel->drained()`, driving both the task-creation
+loop guard and the port-less source pipeline-finish predicate.
+
+**Producer contract**: register the incoming batch in the input repository (`add_data_batch`) *first*,
+then push the handle. The session (#839) owns edge-triggered re-scheduling; the plan generator (#838)
+owns channel wiring.
+
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
 
@@ -312,6 +345,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | DUCKDB_SCAN | Scan | DuckDB table function (CPU / DuckDB-source path) |
 | PARQUET_SCAN | Scan | Parquet reading (CPU / DuckDB-source path) |
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
+| STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
