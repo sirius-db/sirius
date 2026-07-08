@@ -65,8 +65,10 @@ namespace sirius::scan_manager {
 namespace {
 
 struct cached_databatch_provider : public databatch_provider {
-  explicit cached_databatch_provider(pinned_entry const& entry, std::span<size_t> selected_columns)
-    : _entry(entry)
+  cached_databatch_provider(pinned_entry const& entry,
+                            std::span<size_t> selected_columns,
+                            const telemetry::batch_telemetry_info& telemetry_info)
+    : _entry(entry), _telemetry_info(telemetry_info)
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -103,8 +105,12 @@ struct cached_databatch_provider : public databatch_provider {
     if (index >= _entry.host_chunks.size()) { return nullptr; }
     const auto& chunk = _entry.host_chunks.at(index);
     if (!chunk) { return nullptr; }
-    auto data_rep = chunk->slice(_column_indices);
-    return cucascade::data_batch::make(get_next_batch_id(), std::move(data_rep));
+    auto data_rep       = chunk->slice(_column_indices);
+    const auto batch_id = get_next_batch_id();
+    return cucascade::data_batch::make(
+      batch_id,
+      std::move(data_rep),
+      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
   std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
@@ -125,20 +131,27 @@ struct cached_databatch_provider : public databatch_provider {
                                                             : _entry.memory_space;
     auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
       view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-    return ::cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
+    const auto batch_id = ::sirius::get_next_batch_id();
+    return ::cucascade::data_batch::make(
+      batch_id,
+      std::move(gpu_repr),
+      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
   std::size_t _n_chunks;
   std::vector<std::string> _column_names;
   std::vector<size_t> _column_indices;
   const pinned_entry& _entry;
+  telemetry::batch_telemetry_info _telemetry_info;
   std::atomic<std::size_t> _index{0};
 };
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry, std::span<size_t> selected_columns)
+  pinned_entry const& entry,
+  std::span<size_t> selected_columns,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
-  return std::make_unique<cached_databatch_provider>(entry, selected_columns);
+  return std::make_unique<cached_databatch_provider>(entry, selected_columns, telemetry_info);
 }
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
@@ -378,16 +391,29 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(st
   // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
   if (_io_ctx && _io_ctx->type() == *type) { return _io_ctx; }
 
-  std::lock_guard lk{_routed_io_ctxs_mtx};
-  if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+  }
+  // Build outside the map mutex: make_ioctx/start spawn reactor threads and
+  // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
+  // park every concurrent lookup behind one long critical section. The build
+  // mutex serializes builders instead, so two first-touches of the same type
+  // never construct twice (a losing ioctx would need drain/stop teardown).
+  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+  }
   auto io_ctx = _ioctx_registry.make_ioctx(*type);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.enable_prefetch_cache && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
   }
-  _routed_io_ctxs.emplace(*type, io_ctx);
-  return io_ctx;
+  std::lock_guard lk{_routed_io_ctxs_mtx};
+  auto [it, inserted] = _routed_io_ctxs.emplace(*type, std::move(io_ctx));
+  return it->second;
 }
 
 void sirius_scan_manager::reset()
@@ -710,7 +736,7 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
       auto cols = gather_by_primary_index(entry.cache_info.column_ids,
                                           op->get_ingestible().materialized_column_order());
       if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
-      auto provider = make_provider_for_pinned_entry(entry, cols);
+      auto provider = make_provider_for_pinned_entry(entry, cols, op->batch_telemetry());
       _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
       spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
                    pinned_name,

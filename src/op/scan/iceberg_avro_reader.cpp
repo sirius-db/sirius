@@ -419,7 +419,6 @@ struct JsonParser {
 
 // Forward declarations
 static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t* end);
-static int64_t skip_avro_block_items(const uint8_t*& p, const uint8_t* end);
 
 static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t* end)
 {
@@ -658,7 +657,6 @@ std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::s
   bool mp_first  = (mp_idx < ct_idx);
 
   std::vector<std::pair<std::string, int>> result;
-  std::array<uint8_t, 16> block_sync{};
 
   // Data blocks
   // OCF data blocks: count (zigzag long), byte_count (zigzag long, ALWAYS present),

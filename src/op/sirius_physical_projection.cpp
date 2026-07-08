@@ -114,7 +114,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     // ---- Path 1: every output column is an evaluated expression ----
     if (all_evaluated) {
       auto projected_table = evaluator->evaluate(input_view);
-      output_batches.push_back(sirius::make_data_batch(std::move(projected_table), mem, stream));
+      output_batches.push_back(
+        sirius::make_data_batch(std::move(projected_table), mem, stream, batch_telemetry()));
       continue;
     }
 
@@ -134,7 +135,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
       // Owner = the input read-only lock: keeps the source columns alive AND pinned read-only for
       // the output batch's lifetime, so the view can never be freed/downgraded out from under us.
       output_batches.push_back(sirius::make_data_batch_from_view(
-        out_view, std::move(input_ro), referenced_bytes, mem, stream));
+        out_view, std::move(input_ro), referenced_bytes, mem, stream, batch_telemetry()));
       continue;
     }
 
@@ -174,8 +175,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
       cucascade::read_only_data_batch input_lock;
     };
     projection_owner owner{std::move(evaluated), std::move(input_ro)};
-    output_batches.push_back(
-      sirius::make_data_batch_from_view(out_view, std::move(owner), referenced_bytes, mem, stream));
+    output_batches.push_back(sirius::make_data_batch_from_view(
+      out_view, std::move(owner), referenced_bytes, mem, stream, batch_telemetry()));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }

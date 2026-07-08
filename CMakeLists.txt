@@ -93,6 +93,37 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
+
+# --- cuCollections (cuco) --- #
+
+# libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from
+# the overlay port (vcpkg_ports/cuco); configure-time downloads are disabled
+# there. Otherwise (pixi build) fetch the same commit cudf is built against
+# (populate sources without add_subdirectory; CCCL comes from cudf). Either way
+# cuco is header-only and exposed as the cuco::cuco target, so both paths
+# consume it identically below.
+if(VCPKG_BUILD)
+  find_package(cuco CONFIG REQUIRED)
+else()
+  include(FetchContent)
+  FetchContent_Declare(
+    cuco
+    URL https://github.com/NVIDIA/cuCollections/archive/f517bbb1277753b1852dfd388993383e401eaa38.tar.gz
+    URL_HASH
+      SHA256=d17e2f6d58cfb2cd473efcbd741c633e7607717102cedc08173a4a69bb2a8ba9
+    SOURCE_SUBDIR do-not-build)
+  FetchContent_MakeAvailable(cuco)
+  # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
+  # so no target is created. Define the same header-only cuco::cuco the vcpkg
+  # port exports (CCCL still comes from cudf) so both build paths consume cuco
+  # identically below.
+  if(NOT TARGET cuco::cuco)
+    add_library(cuco::cuco INTERFACE IMPORTED)
+    set_target_properties(cuco::cuco PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                                "${cuco_SOURCE_DIR}/include")
+  endif()
+endif()
+
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
@@ -233,6 +264,8 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_native_decoder.cpp
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
+    src/op/scan/dynamic_filter_merge.cpp
+    src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/positional_delete_filter.cpp
@@ -241,12 +274,13 @@ set(EXTENSION_SOURCES
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
-    src/op/scan/cpu_source_task.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/sirius_gpu_scan_operator_data.cpp
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/dynamic_filter_publish_plan.cpp
+    src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
@@ -321,6 +355,7 @@ set(EXTENSION_SOURCES
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
+    src/telemetry/memory_context.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
@@ -328,8 +363,12 @@ set(EXTENSION_SOURCES
 # cmake-format: on
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
+
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
+    src/cuda/dynamic_filter_replica_transfer.cu
+    src/cuda/sirius_dynamic_bloom_filter.cu
+    src/cuda/sirius_dynamic_in_list_filter.cu
     src/op/scan/equality_delete_mask.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
@@ -394,6 +433,12 @@ foreach(_target sirius_extension sirius_loadable_extension)
                CUDA_SEPARABLE_COMPILATION ON
                CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+  # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own
+  # consumers (tests/benchmarks) with --expt-extended-lambda.
+  target_compile_options(
+    ${_target}
+    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>)
+
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
@@ -433,6 +478,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   target_link_libraries(
     ${_target}
     cudf::cudf
+    cuco::cuco
     rmm::rmm
     spdlog::spdlog
     cuCascade::cucascade
@@ -591,8 +637,11 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
+    test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
+    test/cpp/planner/test_dynamic_filter_router.cpp
+    test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
@@ -607,6 +656,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
+    test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
@@ -614,8 +664,10 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
+    test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
+    test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)

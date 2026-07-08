@@ -17,6 +17,7 @@
 #include "sirius_context.hpp"
 
 #include "config.hpp"
+#include "cucascade/memory/memory_reservation_manager.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -32,6 +33,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/physical_sirius_execution.hpp"
+#include "transparent/sirius_optimizer_extension.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -282,8 +284,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
-  config_            = config;
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(config_.get_telemetry_config());
+  config_ = config;
 
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
@@ -306,6 +307,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(config_.get_telemetry_config(),
+                                                                    memory_manager_.get());
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
@@ -395,12 +399,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
-  cucascade::memory::fixed_size_host_memory_resource* host_fsmr = nullptr;
   {
     auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!host_spaces.empty()) {
-      host_fsmr = host_spaces[0]
-                    ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
       std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
         per_node_pools;
       int fallback_node = -1;
@@ -901,7 +902,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
     bool plan_is_copyable = true;
     try {
-      validation_plan = logical_plan->Copy(context);
+      // Preserve LogicalComparisonJoin::filter_pushdown / LogicalGet::dynamic_filters across
+      // the Copy round-trip — these fields are not in DuckDB's serialization schema, so a plain
+      // Copy strips them. Without this, downstream Sirius wiring would not see runtime-computed
+      // dynamic filters even when DuckDB's optimizer produced them.
+      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
     } catch (NotImplementedException&) {
       plan_is_copyable = false;
     }

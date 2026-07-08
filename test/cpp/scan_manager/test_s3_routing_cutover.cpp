@@ -53,6 +53,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -213,8 +214,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_tab
   return info;
 }
 
-std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_table_info(
-  std::string uri)
+[[maybe_unused]] std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info>
+make_nation_table_info(std::string uri)
 {
   std::vector<std::string> uris;
   uris.push_back(std::move(uri));
@@ -520,6 +521,72 @@ TEST_CASE("scan_manager create_datasource resolves s3 paths to restful ioctx",
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
   CHECK(datasource->io_ctx()->type() == io_context_type::restful);
+}
+
+TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
+          "[s3][routing][scan_manager]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{
+    make_s3_scan_config(server.endpoint(), true), *fixture.memory, fixture.topology};
+
+  auto constexpr kThreads = std::size_t{16};
+  auto const uri          = std::string{"s3://routing-bucket/data.parquet"};
+  std::atomic<std::size_t> ready{0};
+  std::atomic<bool> go{false};
+  std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs(kThreads);
+  std::vector<std::exception_ptr> errors(kThreads);
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+
+  for (std::size_t i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&, i] {
+      try {
+        ready.fetch_add(1, std::memory_order_acq_rel);
+        while (!go.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+
+        auto datasource = manager.create_datasource(uri);
+        if (datasource == nullptr) {
+          throw std::runtime_error("create_datasource returned nullptr");
+        }
+        if (datasource->io_ctx() == nullptr) {
+          throw std::runtime_error("datasource has no ioctx");
+        }
+        ioctxs[i] = datasource->io_ctx();
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+    });
+  }
+
+  while (ready.load(std::memory_order_acquire) != kThreads) {
+    std::this_thread::yield();
+  }
+  go.store(true, std::memory_order_release);
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (auto const& error : errors) {
+    if (error) { std::rethrow_exception(error); }
+  }
+
+  REQUIRE(ioctxs[0] != nullptr);
+  auto* const expected = ioctxs[0].get();
+  REQUIRE(ioctxs[0]->type() == io_context_type::restful);
+  for (auto const& ioctx : ioctxs) {
+    REQUIRE(ioctx != nullptr);
+    CHECK(ioctx->type() == io_context_type::restful);
+    CHECK(ioctx.get() == expected);
+  }
+
+  auto datasource = manager.create_datasource(uri);
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  CHECK(datasource->io_ctx().get() == expected);
 }
 
 TEST_CASE("scan_manager create_datasource normalizes file URI paths before routing",

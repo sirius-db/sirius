@@ -511,6 +511,13 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   std::size_t input_basis          = ls.get_task_consumption_basis();
   std::size_t bytes_to_materialize = ls.get_estimated_bytes_to_materialize_input();
   auto peak_opt                    = gs.get_memory_history().estimate_peak_memory(input_basis);
+  const auto input_type =
+    ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
+  const bool input_resident = ls._input_data && ls._input_data->is_resident();
+  auto working_set_bytes    = input_basis;
+  if (input_type == op::operator_data_type::GPU_SCAN && !input_resident && ls._input_data) {
+    working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
+  }
 
   pipeline::reservation_size_info info;
   info.input_basis                = input_basis;
@@ -519,15 +526,16 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
 
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
+    if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
+      info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
+    }
   } else {
     std::size_t num_batches = 0;
     if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
       num_batches = pd->get_data_batches().size();
     }
-    const auto input_type =
-      ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
-    const bool input_resident = ls._input_data && ls._input_data->is_resident();
-    const op::input_stats stats{num_batches, input_basis, input_type, input_resident};
+    const op::input_stats stats{
+      num_batches, input_basis, input_type, input_resident, working_set_bytes};
 
     std::size_t max_estimate = 0;
     if (auto* pipeline = gs.get_pipeline()) {

@@ -55,7 +55,7 @@ static constexpr size_t NUM_CHUNKS = 64;  // max concurrent device reads, i.e. r
 namespace {
 
 /// True iff @p v is a multiple of IO_BLOCK_SIZE (O_DIRECT page size).
-[[nodiscard]] constexpr bool is_block_aligned(size_t v) noexcept
+[[maybe_unused]] [[nodiscard]] constexpr bool is_block_aligned(size_t v) noexcept
 {
   return (v & (static_cast<size_t>(IO_BLOCK_SIZE) - 1)) == 0;
 }

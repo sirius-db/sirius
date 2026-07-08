@@ -85,6 +85,16 @@ class stub_operator : public sirius::op::sirius_physical_operator {
   bool acts_as_sink = false;
 };
 
+class scan_sizing_input : public sirius::op::operator_data {
+ public:
+  [[nodiscard]] sirius::op::operator_data_type get_type() const override
+  {
+    return sirius::op::operator_data_type::GPU_SCAN;
+  }
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override { return 100; }
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override { return 500; }
+};
+
 //------------------------------------------------------------------------------
 // Test fixture: memory manager setup and data creation helpers.
 //------------------------------------------------------------------------------
@@ -133,7 +143,8 @@ struct pipeline_task_history_fixture {
                                                  gpu_mr);
     stream.synchronize();
 
-    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
     auto& registry = sirius::converter_registry::get();
     {
@@ -163,7 +174,8 @@ struct pipeline_task_history_fixture {
                                                  gpu_mr);
     stream.synchronize();
 
-    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
     return batch;
   }
 };
@@ -180,7 +192,7 @@ struct pipeline_context {
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_source = std::make_unique<stub_operator>();
@@ -268,6 +280,27 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
   return task;
 }
 }  // namespace
+
+TEST_CASE("scan working set is a lower bound for history-based reservations",
+          "[gpu_pipeline_task][history][scan]")
+{
+  auto ctx          = create_pipeline_context();
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  global_state->get_memory_history().record({100, 200, 100});
+
+  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    1,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+      std::make_unique<scan_sizing_input>()),
+    std::move(global_state));
+
+  auto const estimate = task->get_estimated_reservation_size_info();
+  CHECK(estimate.had_history);
+  CHECK(estimate.peak_memory_estimate == 500);
+  CHECK(estimate.reservation_size == 500);
+}
 
 // ---------------------------------------------------------------------------
 // Test: OOM during lock_or_prepare_batch records to pipeline memory history.
