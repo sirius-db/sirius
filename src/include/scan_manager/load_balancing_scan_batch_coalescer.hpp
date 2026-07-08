@@ -81,8 +81,8 @@ class load_balancing_scan_batch_coalescer {
       : op_id(op_id),
         pipeline_id(pipeline_id),
         coalescer(std::move(coalescer)),
-        connector(std::move(connector)),
-        balancer(std::move(balancer))
+        balancer(std::move(balancer)),
+        connector(std::move(connector))
     {
       assert(this->coalescer);
       assert(this->connector);
