@@ -119,6 +119,13 @@ void pipelineable_operator_data::prepare_for_processing(
   }
 
   _read_only_data_batches = std::move(ro_batches);
+  // lock_or_prepare_batch may have returned an accessor to a clone (cross-GPU inputs), so
+  // accessor i can reference a different batch than _data_batches[i]. Reset the idle vector so
+  // get_data_batches() lazily rebuilds it from the accessors, restoring the invariant that
+  // _data_batches[i] is the batch underlying accessor i. Downstream forwarding (dynamic_filter,
+  // sink) and OOM reschedule (remove_read_only_lock materializes from the accessors) then all
+  // see the prepared batch, not a stale original.
+  _data_batches = std::nullopt;
 }
 
 std::string sirius_physical_operator::get_name() const

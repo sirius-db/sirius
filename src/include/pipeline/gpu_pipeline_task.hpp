@@ -98,14 +98,26 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     return _input_data ? _input_data->get_estimated_size_in_bytes() : 0;
   }
 
-  [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input() const
+  /**
+   * @brief Estimate the bytes prepare_for_processing will allocate in the target space.
+   *
+   * Counts inputs that are not GPU-resident (host/disk upgrades) and, when @p target_space is
+   * given, GPU-resident inputs living in a different memory space — those are cloned into the
+   * target space by lock_or_prepare_batch, so their bytes are part of the task's footprint.
+   */
+  [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input(
+    const cucascade::memory::memory_space* target_space) const
   {
     std::size_t input_size = 0;
     auto* pipelineable_input =
       dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
     if (pipelineable_input) {
       for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
-        if (ro.get_data() && ro.get_current_tier() != cucascade::memory::Tier::GPU) {
+        if (!ro.get_data()) { continue; }
+        const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
+        const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
+                                 ro.get_memory_space()->get_id() != target_space->get_id();
+        if (non_gpu || cross_space) {
           input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
         }
       }
@@ -202,8 +214,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   std::size_t get_input_size() const;
 
-  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info()
-    const override;
+  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* target_space) const override;
 
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
@@ -243,9 +255,21 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
     uint64_t task_id, std::unique_ptr<sirius_pipeline_task_local_state> local_state);
 
  private:
+  /**
+   * @brief Unsubscribe from and release the pinned input data_batches.
+   *
+   * Called once prepare_for_processing has materialized this task's inputs in the target memory
+   * space: from then on the pin is redundant (the operator_data owns the prepared batches), and
+   * releasing it lets a single-consumer original that was cloned cross-GPU free its source-GPU
+   * memory immediately instead of at task destruction. Batches other consumers still need stay
+   * alive via their own owners (repositories, other tasks). Also called by the destructor for
+   * tasks that never executed.
+   */
+  void release_input_batches();
+
   std::vector<cucascade::shared_data_repository*> _data_repos;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
-  /// Input data_batches held for subscribe/unsubscribe lifecycle
+  /// Input data_batches held for subscribe/unsubscribe lifecycle until prepare completes
   std::vector<std::shared_ptr<cucascade::data_batch>> _input_batches;
 };
 

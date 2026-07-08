@@ -209,20 +209,29 @@ gpu_pipeline_task::gpu_pipeline_task(
   }
 }
 
-gpu_pipeline_task::~gpu_pipeline_task()
+void gpu_pipeline_task::release_input_batches()
 {
-  // Unsubscribe from all input data_batches
+  // Unsubscribe from all input data_batches and drop this task's references to them. Any batch
+  // whose last owner this was (e.g. a popped single-consumer original that prepare replaced with
+  // a cross-GPU clone) is destroyed here, freeing its memory in its source space.
   for (const auto& batch : _input_batches) {
     if (batch) {
       try {
         batch->unsubscribe();
       } catch (...) {
-        // Destructor must not throw; log if possible
+        // Also runs from the destructor, which must not throw; log if possible
         SIRIUS_LOG_WARN("gpu_pipeline_task: unsubscribe failed for batch {}",
                         batch->get_batch_id());
       }
     }
   }
+  _input_batches.clear();
+}
+
+gpu_pipeline_task::~gpu_pipeline_task()
+{
+  // Covers tasks destroyed without executing; a no-op after execute() released the pin.
+  release_input_batches();
 
   if (_global_state == nullptr ||
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
@@ -414,9 +423,16 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     // is accurate.
     stream.synchronize();
   } catch (const rmm::out_of_memory& oom) {
-    auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
-    auto input_basis = local_state.get_reservation_size_info()->input_basis;
-    auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
+    auto peak_bytes           = allocator->get_peak_allocated_bytes(stream);
+    const auto& res_info      = local_state.get_reservation_size_info();
+    auto bytes_to_materialize = res_info->bytes_to_materialize_input;
+    auto input_basis          = res_info->input_basis;
+    // Keep the recorded peak clean of materialization overhead (host/disk upgrades and
+    // cross-GPU clones — prepare's allocations are almost entirely those), consistent with
+    // the success and compute-OOM record paths; the estimator re-adds
+    // bytes_to_materialize_input on top of the history-based estimate.
+    peak_bytes   = peak_bytes > bytes_to_materialize ? peak_bytes - bytes_to_materialize : 0;
+    auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
     SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
@@ -440,6 +456,12 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
                    first_op.get_name(),
                    first_op.get_operator_id(),
                    prepare_duration.count() / 1000.0);
+
+  // Inputs are materialized in this task's memory space (cross-GPU inputs as clones owned by
+  // local_state._input_data), so drop the redundant pin on the original batches: a popped
+  // single-consumer original freed of all other owners releases its source-GPU memory now
+  // rather than at task destruction, while shared batches stay alive via their other owners.
+  release_input_batches();
 
   // All input batches are now locked for reading via _read_only_data_batches inside
   // local_state._input_data. The locks are released when the pipelineable_operator_data
@@ -504,12 +526,13 @@ std::size_t gpu_pipeline_task::get_input_size() const
   return input_size;
 }
 
-pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_size_info() const
+pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_size_info(
+  const cucascade::memory::memory_space* target_space) const
 {
   auto& ls                         = _local_state->cast<gpu_pipeline_task_local_state>();
   auto& gs                         = _global_state->cast<gpu_pipeline_task_global_state>();
   std::size_t input_basis          = ls.get_task_consumption_basis();
-  std::size_t bytes_to_materialize = ls.get_estimated_bytes_to_materialize_input();
+  std::size_t bytes_to_materialize = ls.get_estimated_bytes_to_materialize_input(target_space);
   auto peak_opt                    = gs.get_memory_history().estimate_peak_memory(input_basis);
   const auto input_type =
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
