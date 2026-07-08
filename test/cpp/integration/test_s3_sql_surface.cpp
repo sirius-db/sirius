@@ -307,6 +307,8 @@ struct sirius_memory_limits {
   std::optional<std::size_t> rest_max_connections;
   std::optional<bool> use_sirius_datasource;
   std::optional<std::string> rest_footer_probe_bytes;
+  std::optional<std::size_t> rest_list_max_matches;
+  std::optional<std::size_t> rest_list_max_scanned;
   bool rest_perf_instrumentation{false};
 };
 
@@ -421,6 +423,12 @@ class sirius_config_env_guard {
            "        request_timeout_s: 30\n";
     if (limits.rest_footer_probe_bytes.has_value()) {
       out << "        footer_probe_bytes: " << yaml_quote(*limits.rest_footer_probe_bytes) << "\n";
+    }
+    if (limits.rest_list_max_matches.has_value()) {
+      out << "        list_max_matches: " << *limits.rest_list_max_matches << "\n";
+    }
+    if (limits.rest_list_max_scanned.has_value()) {
+      out << "        list_max_scanned: " << *limits.rest_list_max_scanned << "\n";
     }
     if (limits.rest_perf_instrumentation) { out << "        perf_instrumentation: true\n"; }
     out.close();
@@ -2624,6 +2632,22 @@ TEST_CASE("transparent S3 glob reports no-files and GPU-only errors clearly",
     INFO(error);
     CHECK(error.find("S3 is GPU-only") != std::string::npos);
     CHECK(error.find("SET gpu_execution=true") != std::string::npos);
+  }
+
+  SECTION("configured glob match cap rejects overly broad matches")
+  {
+    sirius_memory_limits limits;
+    limits.rest_list_max_matches = 1;
+    s3_sql_fixture fixture(*env, limits);
+    set_gpu_execution(fixture.con, true);
+
+    auto result = fixture.con.Query("SELECT count(n_nationkey) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("narrow the glob prefix") != std::string::npos);
   }
 }
 

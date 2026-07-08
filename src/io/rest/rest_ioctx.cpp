@@ -64,10 +64,12 @@ void rest_ioctx::list_objects_paged(
   std::string_view prefix,
   std::size_t page_size,
   std::function<bool(s3::list_objects_v2_page const&)> const& sink,
-  std::size_t max_scanned)
+  std::optional<std::size_t> max_scanned)
 {
   if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::list_objects: no reactors"); }
   std::size_t const clamped = (page_size == 0 || page_size > 1000) ? 1000 : page_size;
+  std::size_t const scanned_cap =
+    max_scanned.value_or(_reactors.front()->get_config().list_max_scanned);
 
   std::size_t scanned = 0;
   std::string token;
@@ -90,9 +92,9 @@ void rest_ioctx::list_objects_paged(
       s3::parse_list_objects_v2(_reactors.front()->list_page(bucket, prefix, query));
 
     scanned += page.entries.size();
-    if (scanned > max_scanned) {
+    if (scanned > scanned_cap) {
       throw std::runtime_error("rest_ioctx::list_objects: scanned more than " +
-                               std::to_string(max_scanned) + " objects under s3://" +
+                               std::to_string(scanned_cap) + " objects under s3://" +
                                std::string(bucket) + "/" + std::string(prefix) +
                                " — narrow the glob prefix");
     }
@@ -111,12 +113,13 @@ void rest_ioctx::list_objects_paged(
 std::vector<s3::list_entry> rest_ioctx::list_objects(std::string_view bucket,
                                                      std::string_view prefix,
                                                      std::size_t page_size,
-                                                     std::size_t max_keys)
+                                                     std::optional<std::size_t> max_keys)
 {
+  std::size_t const keys_cap = max_keys.value_or(list_max_matches());
   std::vector<s3::list_entry> out;
   list_objects_paged(bucket, prefix, page_size, [&](s3::list_objects_v2_page const& page) {
-    if (out.size() + page.entries.size() > max_keys) {
-      throw std::runtime_error("rest_ioctx::list_objects: more than " + std::to_string(max_keys) +
+    if (out.size() + page.entries.size() > keys_cap) {
+      throw std::runtime_error("rest_ioctx::list_objects: more than " + std::to_string(keys_cap) +
                                " objects under s3://" + std::string(bucket) + "/" +
                                std::string(prefix) + " — narrow the glob prefix");
     }
@@ -124,6 +127,12 @@ std::vector<s3::list_entry> rest_ioctx::list_objects(std::string_view bucket,
     return true;
   });
   return out;
+}
+
+std::size_t rest_ioctx::list_max_matches() const
+{
+  return _reactors.empty() ? s3::default_max_list_objects
+                           : _reactors.front()->get_config().list_max_matches;
 }
 
 std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path)

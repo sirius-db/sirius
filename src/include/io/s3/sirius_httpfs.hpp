@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace sirius::scan_manager {
@@ -119,10 +120,11 @@ class sirius_httpfs : public duckdb::FileSystem {
 /// (@c *, @c ?, @c […] never cross a segment; @c ** crosses). Matches carry
 /// their LIST size in @c extended_info->options["file_size"]. Throws (never
 /// truncates) once more than @p max_matches keys match — "narrow the glob
-/// prefix"; wildcards in the bucket segment are rejected.
+/// prefix"; wildcards in the bucket segment are rejected. @p max_matches unset
+/// → the backend's configured cap (@c rest.list_max_matches).
 duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::string const& pattern,
   sirius::scan_manager::sirius_scan_manager& scan_manager,
-  std::size_t max_matches = default_max_list_objects);
+  std::optional<std::size_t> max_matches = std::nullopt);
 
 }  // namespace sirius::io::s3

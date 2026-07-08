@@ -333,7 +333,7 @@ duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path
 duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::string const& pattern,
   sirius::scan_manager::sirius_scan_manager& scan_manager,
-  std::size_t max_matches)
+  std::optional<std::size_t> max_matches)
 {
   constexpr std::string_view k_scheme = "s3://";
   if (pattern.size() <= k_scheme.size()) {
@@ -363,7 +363,8 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   split_segments(key_pattern, pattern_segments);
   bool const has_crawl =
     std::find(pattern_segments.begin(), pattern_segments.end(), "**") != pattern_segments.end();
-  std::string const list_uri = "s3://" + std::string{bucket} + "/" + std::string{prefix};
+  std::string const list_uri  = "s3://" + std::string{bucket} + "/" + std::string{prefix};
+  std::size_t const match_cap = max_matches.value_or(scan_manager.s3_list_max_matches(list_uri));
 
   // Stream the pages, keeping only matches: peak memory = one page (≤1000
   // entries) + the matched set, regardless of the prefix's population. The
@@ -386,9 +387,9 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
           matched = match_glob_no_crawl(key_segments, pattern_segments);
         }
         if (!matched) { continue; }
-        if (matches.size() >= max_matches) {
+        if (matches.size() >= match_cap) {
           throw duckdb::IOException("[sirius_httpfs] glob '" + pattern + "' matched more than " +
-                                    std::to_string(max_matches) +
+                                    std::to_string(match_cap) +
                                     " objects — narrow the glob prefix");
         }
         duckdb::OpenFileInfo info("s3://" + std::string{bucket} + "/" + entry.key);

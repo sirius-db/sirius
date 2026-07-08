@@ -796,6 +796,58 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
                       Catch::Contains("narrow the glob prefix"));
   }
 
+  SECTION("primitive uses configured scanned cap unless an explicit override is passed")
+  {
+    auto cfg             = direct_rest_test_config();
+    cfg.list_max_scanned = 2;
+
+    range_http_server capped_server(deterministic_payload(16), {}, objects);
+    auto capped_ctx = make_direct_rest_ioctx(capped_server.endpoint(), cfg);
+
+    CHECK_THROWS_WITH(capped_ctx->list_objects_paged(
+                        "bucket",
+                        "data/",
+                        /*page_size=*/1,
+                        [](sirius::io::s3::list_objects_v2_page const&) { return true; }),
+                      Catch::Contains("narrow the glob prefix"));
+
+    range_http_server override_server(deterministic_payload(16), {}, objects);
+    auto override_ctx = make_direct_rest_ioctx(override_server.endpoint(), cfg);
+
+    std::size_t pages = 0;
+    override_ctx->list_objects_paged(
+      "bucket",
+      "data/",
+      /*page_size=*/1,
+      [&](sirius::io::s3::list_objects_v2_page const& page) {
+        ++pages;
+        REQUIRE(page.entries.size() == 1);
+        return true;
+      },
+      /*max_scanned=*/3);
+    CHECK(pages == 3);
+    CHECK(override_server.list_count() == 3);
+  }
+
+  SECTION("wrapper uses configured matched cap unless an explicit override is passed")
+  {
+    auto cfg             = direct_rest_test_config();
+    cfg.list_max_matches = 2;
+
+    range_http_server capped_server(deterministic_payload(16), {}, objects);
+    auto capped_ctx = make_direct_rest_ioctx(capped_server.endpoint(), cfg);
+
+    CHECK_THROWS_WITH(capped_ctx->list_objects("bucket", "data/", /*page_size=*/1000),
+                      Catch::Contains("narrow the glob prefix"));
+
+    range_http_server override_server(deterministic_payload(16), {}, objects);
+    auto override_ctx = make_direct_rest_ioctx(override_server.endpoint(), cfg);
+
+    auto all = override_ctx->list_objects("bucket", "data/", /*page_size=*/1000, /*max_keys=*/3);
+    CHECK(all.size() == 3);
+    CHECK(override_server.list_count() == 1);
+  }
+
   SECTION("empty prefix returns an empty vector")
   {
     range_http_server server(deterministic_payload(16), {}, objects);

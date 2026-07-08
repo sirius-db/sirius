@@ -419,7 +419,7 @@ void sirius_scan_manager::list_objects_paged(
   std::string const& s3_prefix_uri,
   std::size_t page_size,
   std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
-  std::size_t max_scanned)
+  std::optional<std::size_t> max_scanned)
 {
   // Hand-split rather than uri_parser::parse — a LIST prefix URI legitimately
   // has an EMPTY key part (bucket-root glob: "s3://bucket/"), which parse()
@@ -451,6 +451,31 @@ void sirius_scan_manager::list_objects_paged(
                              "' does not route to an object-store backend that supports LIST");
   }
   rest->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
+}
+
+std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
+{
+  // Route by scheme only (no LIST call) to read the backend's configured cap.
+  // Same bucket-root-safe placeholder-key probe as list_objects_paged.
+  constexpr std::string_view k_scheme = "s3://";
+  if (s3_uri.size() <= k_scheme.size() || s3_uri.compare(0, k_scheme.size(), k_scheme) != 0) {
+    throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
+                             "'");
+  }
+  auto const rest_uri     = std::string_view{s3_uri}.substr(k_scheme.size());
+  auto const bucket_slash = rest_uri.find('/');
+  auto const bucket       = rest_uri.substr(0, bucket_slash);
+  auto const prefix =
+    bucket_slash == std::string_view::npos ? std::string_view{} : rest_uri.substr(bucket_slash + 1);
+  auto const route_probe =
+    "s3://" + std::string(bucket) + "/" + (prefix.empty() ? "_" : std::string(prefix));
+  auto io_ctx = ioctx_for_path(route_probe);
+  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  if (rest == nullptr) {
+    throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
+                             "' does not route to an object-store backend that supports LIST");
+  }
+  return rest->list_max_matches();
 }
 
 std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
