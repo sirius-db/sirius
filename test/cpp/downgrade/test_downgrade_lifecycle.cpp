@@ -112,11 +112,11 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
 downgrade_executor make_test_executor(cucascade::shared_data_repository_manager& repo_mgr,
                                       cucascade::memory::memory_space* gpu_space,
                                       sirius::memory::sirius_memory_reservation_manager& mem_mgr,
-                                      uint64_t monitor_period_ms = 0)
+                                      std::chrono::milliseconds monitor_period = {})
 {
   sirius::exec::downgrade_executor_config config{
-    .thread_pool       = {.num_threads = 1, .thread_name_prefix = "downgrade"},
-    .monitor_period_ms = monitor_period_ms};
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = monitor_period};
   return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 
@@ -278,7 +278,8 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
   REQUIRE(get_batch_tier(*batch3) == cucascade::memory::Tier::GPU);
 
   // Start executor with monitor enabled (non-zero period)
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr, /*monitor_period_ms=*/10);
+  auto executor = make_test_executor(
+    repo_mgr, gpu_space, *mem_mgr, /*monitor_period=*/std::chrono::milliseconds{10});
   executor.start();
 
   // Wait up to 2s for the monitor to detect pressure and trigger downgrade.

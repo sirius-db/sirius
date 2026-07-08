@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <cstdint>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <vector>
@@ -34,9 +34,9 @@ struct thread_pool_config {
 struct downgrade_executor_config {
   exec::thread_pool_config thread_pool{.num_threads = 4, .thread_name_prefix = "downgrade"};
 
-  /// Period in milliseconds for the memory pressure monitor loop.
+  /// Period for the memory pressure monitor loop.
   /// Set to 0 to disable the monitor loop entirely.
-  uint64_t monitor_period_ms{10};
+  std::chrono::milliseconds monitor_period{std::chrono::milliseconds{10}};
 
   /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
   /// When set, the GPU->HOST downgrade dispatch uses

@@ -18,7 +18,7 @@ sirius:
       num_threads: 2
     downgrade:
       num_threads: 1
-      monitor_period_ms: 10
+      monitor_period: 10ms
   operator_params:
     scan_task_batch_size: 100000000
     default_scan_task_varchar_size: 256

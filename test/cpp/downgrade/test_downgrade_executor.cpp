@@ -39,6 +39,7 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -122,7 +123,8 @@ downgrade_executor make_test_executor(cucascade::shared_data_repository_manager&
                                       sirius::memory::sirius_memory_reservation_manager& mem_mgr)
 {
   sirius::exec::downgrade_executor_config config{
-    .thread_pool = {.num_threads = 1, .thread_name_prefix = "downgrade"}, .monitor_period_ms = 0};
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = std::chrono::milliseconds{0}};
   return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 
