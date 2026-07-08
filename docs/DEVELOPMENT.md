@@ -72,6 +72,10 @@ pixi run build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache
 
 ## Using CLion for development
 
+> **Only need code indexing/navigation (no build/debug from the IDE)?** The much simpler
+> compilation-database setup in [clion.md](clion.md) indexes everything with the real build flags
+> and skips the toolchain configuration below entirely.
+
 CLion does not natively support pixi environments. One way to circumvent that is to create a custom
 toolchain for sirius and load the pixi environment via an environment file. This allows a consistent use of CLion, both
 when using natively on a system, or via the remote development workflow. To support this, we create a

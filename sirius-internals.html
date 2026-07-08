@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sirius Internals — How the GPU Engine Fits Together</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F6F7F4;
+  --panel:#FFFFFF;
+  --ink:#161B17;
+  --muted:#59645C;
+  --line:#DCE1DA;
+  --accent:#76B900;
+  --accent-ink:#3E7000;
+  --accent-soft:#EEF6DC;
+  --amber:#B26A00;
+  --amber-soft:#FBF1DF;
+  --red:#B3341F;
+  --red-soft:#FBE9E4;
+  --blue:#2A5D8F;
+  --blue-soft:#E7F0F8;
+  --code-bg:#14190F;
+  --code-ink:#D9E7C4;
+  --shadow:0 1px 2px rgba(22,27,23,.05),0 6px 20px -8px rgba(22,27,23,.12);
+  --r:12px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;scroll-padding-top:80px}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+body{
+  font-family:"Source Sans 3",system-ui,-apple-system,sans-serif;
+  background:var(--paper);
+  color:var(--ink);
+  font-size:16.5px;
+  line-height:1.62;
+}
+::selection{background:var(--accent);color:#10150B}
+
+/* ---------- layout ---------- */
+.wrap{display:grid;grid-template-columns:230px minmax(0,1fr);max-width:1220px;margin:0 auto;gap:0}
+main{min-width:0;padding:0 44px 96px;border-left:1px solid var(--line)}
+@media(max-width:960px){
+  .wrap{display:block}
+  main{padding:0 20px 72px;border-left:none}
+}
+
+/* ---------- side nav ---------- */
+.sidenav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;padding:36px 18px 36px 24px}
+.sidenav .brand{font-family:"JetBrains Mono",monospace;font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent-ink);margin-bottom:20px}
+.sidenav a{display:block;font-size:.86rem;color:var(--muted);text-decoration:none;padding:5px 10px;border-left:2px solid transparent;border-radius:0 6px 6px 0}
+.sidenav a:hover{color:var(--ink);background:var(--accent-soft)}
+.sidenav a.active{color:var(--accent-ink);border-left-color:var(--accent);font-weight:600;background:var(--accent-soft)}
+.sidenav .grp{font-family:"JetBrains Mono",monospace;font-size:.64rem;letter-spacing:.12em;text-transform:uppercase;color:#9AA59D;margin:18px 0 6px 10px}
+@media(max-width:960px){
+  .sidenav{position:sticky;top:0;height:auto;display:flex;gap:6px;overflow-x:auto;background:var(--paper);border-bottom:1px solid var(--line);padding:10px 16px;z-index:50}
+  .sidenav .brand,.sidenav .grp{display:none}
+  .sidenav a{white-space:nowrap;border:1px solid var(--line);border-radius:999px;padding:5px 12px;font-size:.8rem}
+  .sidenav a.active{border-color:var(--accent);border-left-color:var(--accent)}
+}
+
+/* ---------- hero ---------- */
+.hero{padding:64px 0 40px;border-bottom:1px solid var(--line)}
+.eyebrow{font-family:"JetBrains Mono",monospace;font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--accent-ink);display:flex;align-items:center;gap:10px}
+.eyebrow::before{content:"";width:26px;height:2px;background:var(--accent)}
+.hero h1{font-family:"Bricolage Grotesque",sans-serif;font-weight:800;font-size:clamp(2.1rem,5vw,3.3rem);line-height:1.05;letter-spacing:-.02em;margin:16px 0 14px;max-width:16ch}
+.hero h1 em{font-style:normal;color:var(--accent-ink)}
+.hero .lede{font-size:1.12rem;color:var(--muted);max-width:62ch}
+.hero .lede strong{color:var(--ink)}
+.srcstrip{display:flex;gap:10px;margin-top:28px;flex-wrap:wrap}
+.srcchip{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;flex:1 1 200px;min-width:190px}
+.srcchip .n{font-family:"JetBrains Mono",monospace;font-size:.68rem;color:var(--accent-ink);letter-spacing:.1em;text-transform:uppercase}
+.srcchip .t{font-weight:600;font-size:.92rem;margin-top:2px}
+.srcchip .d{font-size:.8rem;color:var(--muted);margin-top:2px}
+.chron{margin-top:14px;font-size:.86rem;color:var(--muted);background:var(--blue-soft);border:1px solid #C9DCEC;border-radius:10px;padding:10px 14px}
+.chron b{color:var(--blue)}
+
+/* ---------- sections ---------- */
+section{padding-top:56px}
+.sec-eyebrow{font-family:"JetBrains Mono",monospace;font-size:.7rem;letter-spacing:.15em;text-transform:uppercase;color:var(--accent-ink)}
+h2{font-family:"Bricolage Grotesque",sans-serif;font-weight:700;font-size:1.7rem;letter-spacing:-.015em;margin:6px 0 8px}
+.sec-sub{color:var(--muted);max-width:66ch;margin-bottom:22px}
+h3{font-family:"Bricolage Grotesque",sans-serif;font-weight:600;font-size:1.12rem;margin:26px 0 8px}
+p{max-width:72ch}
+code{font-family:"JetBrains Mono",monospace;font-size:.84em;background:#EBEEE7;border:1px solid var(--line);border-radius:5px;padding:.08em .35em;white-space:nowrap}
+pre{background:var(--code-bg);color:var(--code-ink);border-radius:10px;padding:14px 16px;overflow-x:auto;font-family:"JetBrains Mono",monospace;font-size:.83rem;line-height:1.55;position:relative}
+pre code{background:none;border:none;padding:0;color:inherit;white-space:pre}
+.copybtn{position:absolute;top:8px;right:8px;font-family:"JetBrains Mono",monospace;font-size:.66rem;letter-spacing:.06em;background:rgba(255,255,255,.08);color:#B9C9A2;border:1px solid rgba(255,255,255,.15);border-radius:6px;padding:3px 9px;cursor:pointer}
+.copybtn:hover{background:rgba(255,255,255,.16);color:#fff}
+
+/* ---------- callouts ---------- */
+.callout{border-radius:var(--r);padding:14px 18px;margin:16px 0;font-size:.94rem;border:1px solid var(--line);background:var(--panel)}
+.callout .ct{font-family:"JetBrains Mono",monospace;font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;display:block;margin-bottom:4px}
+.callout.key{border-color:#BFDB86;background:var(--accent-soft)}
+.callout.key .ct{color:var(--accent-ink)}
+.callout.warn{border-color:#E7C68C;background:var(--amber-soft)}
+.callout.warn .ct{color:var(--amber)}
+.callout.danger{border-color:#EBB4A6;background:var(--red-soft)}
+.callout.danger .ct{color:var(--red)}
+.callout.info{border-color:#C9DCEC;background:var(--blue-soft)}
+.callout.info .ct{color:var(--blue)}
+
+/* ---------- architecture explorer ---------- */
+.arch{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr);gap:20px;margin-top:18px}
+@media(max-width:860px){.arch{grid-template-columns:1fr}}
+.arch-stack{display:flex;flex-direction:column;gap:0}
+.layer{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:12px 14px;box-shadow:var(--shadow)}
+.layer .lt{font-family:"JetBrains Mono",monospace;font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.layer .lt .own{color:var(--accent-ink);text-align:right}
+.layer h4{font-family:"Bricolage Grotesque",sans-serif;font-size:1.02rem;font-weight:700;margin:2px 0 8px}
+.blocks{display:flex;flex-wrap:wrap;gap:8px}
+.blk{font-size:.82rem;font-weight:600;border:1.5px solid var(--line);background:var(--paper);border-radius:8px;padding:6px 11px;cursor:pointer;transition:border-color .15s,background .15s;font-family:"Source Sans 3",sans-serif;color:var(--ink)}
+.blk:hover{border-color:var(--accent)}
+.blk.sel{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-ink)}
+.blk:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.conn{display:flex;align-items:center;gap:8px;padding:6px 4px 6px 18px;font-family:"JetBrains Mono",monospace;font-size:.7rem;color:var(--muted)}
+.conn::before{content:"↓";color:var(--accent-ink);font-size:.9rem}
+.arch-detail{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:18px 20px;box-shadow:var(--shadow);align-self:start;position:sticky;top:76px}
+@media(max-width:960px){.arch-detail{position:static}}
+.arch-detail .dt{font-family:"JetBrains Mono",monospace;font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent-ink)}
+.arch-detail h4{font-family:"Bricolage Grotesque",sans-serif;font-size:1.15rem;margin:4px 0 10px}
+.arch-detail ul{padding-left:18px;font-size:.9rem;display:grid;gap:7px}
+.arch-detail .empty{color:var(--muted);font-size:.92rem}
+
+/* ---------- toggle panels ---------- */
+.toggle{display:inline-flex;border:1px solid var(--line);border-radius:999px;background:var(--panel);padding:3px;margin:14px 0 18px}
+.toggle button{border:none;background:none;font-family:"Source Sans 3",sans-serif;font-weight:600;font-size:.88rem;padding:7px 18px;border-radius:999px;cursor:pointer;color:var(--muted)}
+.toggle button.on{background:var(--ink);color:#fff}
+.toggle button:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.modelpanel{display:none;border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:20px 22px;box-shadow:var(--shadow)}
+.modelpanel.show{display:block}
+.flowline{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px;margin:12px 0 16px}
+.fnode{border:1.5px solid var(--line);border-radius:9px;padding:8px 12px;font-size:.8rem;font-weight:600;background:var(--paper);display:flex;align-items:center;text-align:center}
+.fnode.hot{border-color:var(--amber);background:var(--amber-soft);color:var(--amber)}
+.fnode.good{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-ink)}
+.farrow{align-self:center;color:var(--muted);font-size:.9rem}
+.mp-notes{font-size:.9rem;display:grid;gap:8px;padding-left:18px}
+
+/* ---------- steppers ---------- */
+.bp{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:22px;box-shadow:var(--shadow);margin-top:16px}
+.pipe{display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;margin-bottom:18px}
+.pnode{border:1.5px solid var(--line);border-radius:9px;background:var(--paper);padding:8px 10px;font-size:.76rem;font-weight:600;text-align:center;display:flex;flex-direction:column;justify-content:center;min-width:86px;flex:1 1 auto;transition:border-color .2s,background .2s}
+.pnode .sub{font-family:"JetBrains Mono",monospace;font-weight:400;font-size:.62rem;color:var(--muted);margin-top:2px}
+.pnode.stall{border-color:var(--red);background:var(--red-soft)}
+.pnode.stall .sub{color:var(--red)}
+.pnode.full{border-color:var(--amber);background:var(--amber-soft)}
+.pnode.full .sub{color:var(--amber)}
+.pnode.ok{border-color:var(--accent);background:var(--accent-soft)}
+.parrow{align-self:center;color:#AEB8B0;font-size:.85rem;flex:0 0 auto}
+.bp-cap{min-height:110px;border-top:1px dashed var(--line);padding-top:14px}
+.bp-cap .step-n{font-family:"JetBrains Mono",monospace;font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent-ink)}
+.bp-cap h4{font-family:"Bricolage Grotesque",sans-serif;font-size:1.05rem;margin:3px 0 6px}
+.bp-cap p{font-size:.92rem;color:#3C4740;max-width:none}
+.bp-ctl{display:flex;align-items:center;gap:10px;margin-top:14px;flex-wrap:wrap}
+.bp-ctl button{font-family:"Source Sans 3",sans-serif;font-weight:600;font-size:.88rem;border:1.5px solid var(--ink);background:var(--ink);color:#fff;border-radius:8px;padding:7px 16px;cursor:pointer}
+.bp-ctl button.ghost{background:none;color:var(--ink)}
+.bp-ctl button:disabled{opacity:.35;cursor:default}
+.bp-ctl button:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.bp-dots{display:flex;gap:5px;margin-left:auto}
+.bp-dots i{width:8px;height:8px;border-radius:50%;background:#D8DDD8}
+.bp-dots i.on{background:var(--accent)}
+
+/* ---------- chat ---------- */
+.chat{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:20px 22px;box-shadow:var(--shadow);margin-top:16px;max-width:680px}
+.chat .chead{display:flex;align-items:center;gap:10px;border-bottom:1px dashed var(--line);padding-bottom:10px;margin-bottom:12px}
+.chat .chead .ct2{font-family:"JetBrains Mono",monospace;font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.chat .chead button{margin-left:auto;font-size:.78rem;font-weight:600;border:1.5px solid var(--line);background:var(--paper);border-radius:8px;padding:4px 12px;cursor:pointer;color:var(--ink)}
+.chat .chead button:hover{border-color:var(--accent)}
+.msg{display:flex;flex-direction:column;align-items:flex-start;margin:9px 0;opacity:0;transform:translateY(6px);transition:opacity .3s,transform .3s;max-width:86%}
+.msg.show{opacity:1;transform:none}
+.msg.right{align-self:flex-end;align-items:flex-end;margin-left:auto}
+.chatbody{display:flex;flex-direction:column}
+.msg .who{font-family:"JetBrains Mono",monospace;font-size:.64rem;letter-spacing:.08em;color:var(--muted);margin:0 6px 2px}
+.msg .bub{border:1px solid var(--line);background:#F1F3EE;border-radius:12px;padding:8px 13px;font-size:.87rem;line-height:1.5}
+.msg.right .bub{background:var(--accent-soft);border-color:#BFDB86}
+.msg.warnb .bub{background:var(--amber-soft);border-color:#E7C68C}
+.msg .bub code{background:rgba(255,255,255,.6)}
+
+/* ---------- tables ---------- */
+table{border-collapse:collapse;width:100%;font-size:.88rem;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin:14px 0}
+table{display:block;overflow-x:auto}
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top;min-width:120px}
+th{font-family:"JetBrains Mono",monospace;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);background:#F1F3EE}
+tr:last-child td{border-bottom:none}
+td code{white-space:nowrap}
+
+/* ---------- details ---------- */
+details{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);margin:10px 0;overflow:hidden}
+summary{cursor:pointer;padding:13px 18px;font-weight:600;font-size:.95rem;list-style:none;display:flex;align-items:center;gap:12px}
+summary::-webkit-details-marker{display:none}
+summary .stepnum{font-family:"JetBrains Mono",monospace;font-size:.72rem;color:var(--accent-ink);border:1px solid #BFDB86;background:var(--accent-soft);border-radius:6px;padding:2px 8px;flex-shrink:0}
+summary::after{content:"+";margin-left:auto;font-family:"JetBrains Mono",monospace;color:var(--muted)}
+details[open] summary::after{content:"−"}
+details[open] summary{border-bottom:1px solid var(--line)}
+.dbody{padding:14px 18px 18px;font-size:.92rem}
+.dbody ul,.dbody ol{padding-left:20px;display:grid;gap:6px;margin:8px 0}
+.dbody pre{margin:10px 0}
+
+/* ---------- quiz ---------- */
+.quizmeta{display:flex;align-items:center;gap:14px;margin:14px 0;flex-wrap:wrap}
+.quizmeta .qc{font-family:"JetBrains Mono",monospace;font-size:.74rem;color:var(--muted)}
+.quizmeta button{font-size:.8rem;font-weight:600;border:1.5px solid var(--line);background:var(--panel);border-radius:8px;padding:5px 12px;cursor:pointer;color:var(--ink)}
+.quizmeta button:hover{border-color:var(--accent)}
+.qgrid{display:grid;gap:12px}
+.qcard{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);box-shadow:var(--shadow);overflow:hidden}
+.qcard .qhead{width:100%;text-align:left;border:none;background:none;padding:14px 18px;cursor:pointer;display:flex;gap:12px;align-items:baseline;font-family:"Source Sans 3",sans-serif;font-size:.95rem;font-weight:600;color:var(--ink)}
+.qcard .qhead:focus-visible{outline:2px solid var(--accent-ink);outline-offset:-2px}
+.qcard .qid{font-family:"JetBrains Mono",monospace;font-size:.72rem;color:var(--accent-ink);flex-shrink:0}
+.qcard .qtag{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:.6rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 8px;flex-shrink:0}
+.qans{display:none;border-top:1px dashed var(--line);padding:13px 18px 16px;font-size:.9rem;background:#FBFCF9;color:#333D36}
+.qcard.open .qans{display:block}
+.qcard.open .qhead .qid::after{content:" ✓";color:var(--accent-ink)}
+.openq{border-left:3px solid var(--amber);background:var(--panel);border-top:1px solid var(--line);border-right:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:0 var(--r) var(--r) 0;padding:12px 16px;margin:10px 0;font-size:.9rem}
+.openq .oqid{font-family:"JetBrains Mono",monospace;font-size:.7rem;color:var(--amber);letter-spacing:.08em}
+.openq b{display:block;margin:2px 0 4px}
+
+/* ---------- misc ---------- */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:14px 0}
+@media(max-width:760px){.two{grid-template-columns:1fr}}
+.mini{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:16px 18px;font-size:.9rem}
+.mini h4{font-family:"Bricolage Grotesque",sans-serif;font-size:1rem;margin-bottom:8px}
+.mini ul{padding-left:18px;display:grid;gap:6px}
+.klist{padding-left:20px;display:grid;gap:9px;margin:12px 0;max-width:76ch}
+footer{border-top:1px solid var(--line);margin-top:72px;padding-top:20px;font-size:.8rem;color:var(--muted);font-family:"JetBrains Mono",monospace}
+.kbd{font-family:"JetBrains Mono",monospace;font-size:.72em;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 6px;background:var(--panel)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="sidenav" aria-label="Sections">
+  <div class="brand">Sirius · Internals</div>
+  <div class="grp">Mental model</div>
+  <a href="#model">Architecture</a>
+  <a href="#lifecycle">Life of a query</a>
+  <div class="grp">Deep dives</div>
+  <a href="#planner">Plan generation</a>
+  <a href="#pipelines">Pipelines</a>
+  <a href="#tasks">Tasks &amp; scheduling</a>
+  <a href="#operators">Operators</a>
+  <a href="#expressions">Expressions</a>
+  <a href="#memory">Memory &amp; spilling</a>
+  <a href="#scan">Scan &amp; I/O</a>
+  <a href="#streaming">Exchange &amp; streaming</a>
+  <div class="grp">Reference</div>
+  <a href="#map">Codebase map</a>
+  <a href="#quiz">Self-check</a>
+  <a href="#glossary">Glossary</a>
+</nav>
+
+<main>
+
+<!-- ================= HERO ================= -->
+<header class="hero" id="top">
+  <div class="eyebrow">Engine internals · interactive edition</div>
+  <h1>How <em>Sirius</em> runs SQL on the GPU</h1>
+  <p class="lede"><strong>Super Sirius, end to end.</strong> One idea governs everything on this page: <strong>DuckDB owns SQL and remains the executor of last resort; Sirius quietly copies the optimized logical plan, and <code>create_plan()</code> is the single gate</strong> — if every operator translates, the physical plan is swapped for a GPU pipeline program; if anything throws, the CPU plan runs untouched and the user never notices.</p>
+  <div class="srcstrip">
+    <div class="srcchip"><span class="n">src/op</span><div class="t">~30 operators</div><div class="d">One base class, <code>sirius_physical_operator</code>. Blocking operators are the sink of one pipeline and the source of the next.</div></div>
+    <div class="srcchip"><span class="n">src/planner</span><div class="t">15 plan builders</div><div class="d">One generator class, 15 <code>create_plan()</code> overloads. Anything else throws — which <i>is</i> the CPU-fallback mechanism.</div></div>
+    <div class="srcchip"><span class="n">cuCascade</span><div class="t">3 memory tiers</div><div class="d">GPU, pinned host (per NUMA node), disk. Every byte lives in exactly one <code>memory_space</code> = (tier, device).</div></div>
+    <div class="srcchip"><span class="n">runtime</span><div class="t">6 thread families</div><div class="d">Query thread, management loop, per-GPU executors, task creator, scan manager + I/O reactors, downgrade executors.</div></div>
+  </div>
+  <div class="chron"><b>Scope rule:</b> this page covers <b>Super Sirius only</b> — namespace <code>sirius</code>, snake_case classes, everything under <code>src/</code>. If you're reading CamelCase (<code>GPUPhysicalHashJoin</code>, <code>GPUBufferManager</code>…), you've wandered into <code>src/legacy/</code> — the dead <code>gpu_processing</code> path. Back away slowly.</div>
+</header>
+
+<!-- ================= ARCHITECTURE ================= -->
+<section id="model">
+  <div class="sec-eyebrow">01 · Mental model</div>
+  <h2>Five layers, one boundary that matters</h2>
+  <p class="sec-sub">Sirius is a DuckDB extension that swaps the <i>physical plan</i>, not the database. DuckDB keeps parsing, binding, optimizing, and returning results; Sirius owns everything between the optimized logical plan and the materialized result. Click any component to see its responsibilities.</p>
+
+  <div class="arch">
+    <div class="arch-stack">
+      <div class="layer">
+        <div class="lt"><span>Layer</span><span class="own">Owns SQL &amp; the fallback</span></div>
+        <h4>DuckDB frontend</h4>
+        <div class="blocks">
+          <button class="blk" data-c="d-parse">Parse &amp; bind</button>
+          <button class="blk" data-c="d-opt">Optimizer (3 rules disabled)</button>
+          <button class="blk" data-c="d-cpu">CPU engine = fallback</button>
+        </div>
+      </div>
+      <div class="conn"><code>OptimizerExtension</code> hooks · <code>LogicalOperator::Copy()</code> · <code>OnFinalizePrepare</code></div>
+      <div class="layer">
+        <div class="lt"><span>Layer · src/transparent/</span><span class="own">Owns the handoff</span></div>
+        <h4>Interception boundary</h4>
+        <div class="blocks">
+          <button class="blk" data-c="i-load">LoadInternal</button>
+          <button class="blk" data-c="i-set">gpu_execution gate</button>
+          <button class="blk" data-c="i-final">OnFinalizePrepare</button>
+          <button class="blk" data-c="i-exec">PhysicalSiriusExecution</button>
+        </div>
+      </div>
+      <div class="conn"><code>create_plan()</code> → <code>unique_ptr&lt;sirius_physical_operator&gt;</code> tree — or throw → CPU</div>
+      <div class="layer">
+        <div class="lt"><span>Layer · src/planner/ + sirius_engine.cpp</span><span class="own">Owns plan → pipelines</span></div>
+        <h4>Plan &amp; pipeline construction</h4>
+        <div class="blocks">
+          <button class="blk" data-c="p-gen">Plan generator</button>
+          <button class="blk" data-c="p-meta">Meta-pipelines</button>
+          <button class="blk" data-c="p-conv">Pipeline converter</button>
+          <button class="blk" data-c="p-repo">Repositories &amp; ports</button>
+        </div>
+      </div>
+      <div class="conn"><code>query</code> object: pipelines wired sink→source by <code>shared_data_repository</code> ports</div>
+      <div class="layer">
+        <div class="lt"><span>Layer · src/creator/ + src/pipeline/ + src/exec/</span><span class="own">Owns execution</span></div>
+        <h4>Execution runtime</h4>
+        <div class="blocks">
+          <button class="blk" data-c="r-creator">task_creator</button>
+          <button class="blk" data-c="r-sched">task_scheduler</button>
+          <button class="blk" data-c="r-exec">gpu_pipeline_executor ×GPU</button>
+          <button class="blk" data-c="r-scan">scan manager + I/O</button>
+        </div>
+      </div>
+      <div class="conn"><code>make_reservation()</code> · <code>data_batch</code> locks · cuDF/RMM calls on exclusive CUDA streams</div>
+      <div class="layer">
+        <div class="lt"><span>Layer · cuCascade / cuDF / RMM + src/memory/ + src/downgrade/ + src/cuda/</span><span class="own">Owns bytes</span></div>
+        <h4>GPU data &amp; memory substrate</h4>
+        <div class="blocks">
+          <button class="blk" data-c="g-batch">data_batch &amp; repository</button>
+          <button class="blk" data-c="g-mem">Reservation manager</button>
+          <button class="blk" data-c="g-down">downgrade_executor</button>
+          <button class="blk" data-c="g-kern">cuDF + custom kernels</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="arch-detail" id="archDetail" aria-live="polite">
+      <span class="dt">Component detail</span>
+      <h4 id="adTitle">Pick a component</h4>
+      <div id="adBody" class="empty">Click any block on the left. Start with <b>OnFinalizePrepare</b> — everything below it is a consequence of that one swap.</div>
+    </div>
+  </div>
+
+  <div class="callout key"><span class="ct">The single most important idea</span><code>SiriusContext::OnFinalizePrepare</code> fires <b>after DuckDB has already built its CPU physical plan</b>. It tries <code>sirius_physical_plan_generator::create_plan()</code> on the stored logical-plan copy — the single source of truth for GPU support. Success → the prepared statement's physical plan is replaced with a <code>PhysicalSiriusExecution</code>. Any throw → the CPU plan is still sitting there, so fallback is <b>free and silent</b>. There is no capability table, no per-feature flag — support <i>is</i> whatever <code>create_plan()</code> can translate.</div>
+
+  <div class="callout info"><span class="ct">Where to read more</span>The curated internals docs live in <code>docs/super-sirius/</code> — suggested order: <code>architecture-overview → execution-flow → physical-plan-generation → operators → expression-executor → pipeline-execution → task-creator → scan → memory-management → data-management</code>. This page is a map; those are the territory.</div>
+</section>
+
+<!-- ================= LIFECYCLE ================= -->
+<section id="lifecycle">
+  <div class="sec-eyebrow">02 · Execution flow</div>
+  <h2>Life of a query, step by step</h2>
+  <p class="sec-sub">From <code>SELECT</code> to <code>MaterializedQueryResult</code> on the transparent path (there's also a legacy explicit entry point, <code>CALL gpu_execution('…')</code>, which re-parses the inner SQL and joins the same road at plan generation). Step through it — the highlighted nodes show where the query lives at each moment.</p>
+
+  <div class="bp" data-stepper="lc">
+    <div class="pipe" aria-hidden="true">
+      <div class="pnode" id="lc-sql">SQL<span class="sub">client</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="lc-opt">Optimizer<span class="sub">+ 2 hooks</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="lc-fin">OnFinalizePrepare<span class="sub">the swap</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="lc-plan">create_plan()<span class="sub">the gate</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="lc-eng">sirius_engine<span class="sub">build + convert</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="lc-run">scheduler + GPUs<span class="sub">task loop</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="lc-col">RESULT_COLLECTOR<span class="sub">sink</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="lc-res">DuckDB result<span class="sub">future resolves</span></div>
+    </div>
+    <div class="bp-cap">
+      <span class="step-n" data-sn>Step 0</span>
+      <h4 data-st></h4>
+      <p data-sp></p>
+    </div>
+    <div class="bp-ctl">
+      <button class="ghost" data-prev>← Back</button>
+      <button data-next>Next →</button>
+      <button class="ghost" data-reset>Reset</button>
+      <div class="bp-dots" data-dots aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="ct">Why three optimizers get disabled</span>The pre-optimizer hook (<code>sirius_pre_optimizer_hook</code>) snapshots the connection's disabled-optimizer set and turns off <code>IN_CLAUSE</code>, <code>COMPRESSED_MATERIALIZATION</code>, and <code>STATISTICS_PROPAGATION</code> — they produce DuckDB-internal plan shapes the transparent rebind path can't execute yet. The post-hook restores the snapshot, so the connection is never permanently altered.</div>
+
+  <p>Registration happens once at <code>LOAD</code>: <code>LoadInternal</code> (<code>src/sirius_extension.cpp:1877</code>) attaches a <code>SiriusContext</code> to every connection (key <code>"sirius_state"</code>), initializes the converter registry and GPU settings, and registers the hooks:</p>
+  <pre><code>OptimizerExtension opt_ext;
+opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;   // stores LogicalOperator::Copy()
+OptimizerExtension::Register(config, std::move(opt_ext));</code></pre>
+  <p>The <code>gpu_execution</code> setting is checked in exactly one helper — <code>gpu_execution_enabled</code> (<code>src/transparent/sirius_optimizer_extension.cpp:34</code>, mirrored at <code>src/sirius_context.cpp:774</code>) — a literal <code>TryGetCurrentSetting("gpu_execution", …)</code>. <code>SET gpu_execution = false</code> and the hooks stand down.</p>
+</section>
+
+<!-- ================= PLANNER ================= -->
+<section id="planner">
+  <div class="sec-eyebrow">03 · Plan generation</div>
+  <h2>One generator, fifteen builders, throw = fallback</h2>
+  <p class="sec-sub"><code>sirius::planner::sirius_physical_plan_generator</code> (<code>src/planner/sirius_physical_plan_generator.cpp</code>) resolves types and column bindings (<code>ColumnBindingResolver</code>), then dispatches on <code>op.type</code> to one <code>create_plan()</code> overload per supported DuckDB logical operator. The unsupported ones are literally commented out in the header — hitting one throws <code>NotImplementedException</code>, which <i>is</i> the fallback mechanism.</p>
+
+  <table>
+    <thead><tr><th>DuckDB logical</th><th>Sirius physical</th><th>Builder</th></tr></thead>
+    <tbody>
+      <tr><td><code>LOGICAL_GET</code></td><td><code>TABLE_SCAN</code> (→ <code>GPU_SCAN</code> later)</td><td><code>sirius_plan_get.cpp</code></td></tr>
+      <tr><td><code>LOGICAL_FILTER</code></td><td><code>FILTER</code></td><td><code>sirius_plan_filter.cpp</code></td></tr>
+      <tr><td><code>LOGICAL_PROJECTION</code></td><td><code>PROJECTION</code> (often elided/folded)</td><td><code>sirius_plan_projection.cpp</code></td></tr>
+      <tr><td><code>LOGICAL_AGGREGATE_AND_GROUP_BY</code></td><td><code>HASH_GROUP_BY</code> / <code>UNGROUPED_AGGREGATE</code></td><td><code>sirius_plan_aggregate.cpp</code></td></tr>
+      <tr><td><code>LOGICAL_COMPARISON_JOIN</code></td><td><code>HASH_JOIN</code> / <code>NESTED_LOOP_JOIN</code></td><td><code>sirius_plan_comparison_join.cpp</code></td></tr>
+      <tr><td><code>LOGICAL_DELIM_JOIN</code></td><td><code>LEFT_DELIM_JOIN</code> / <code>RIGHT_DELIM_JOIN</code></td><td><code>sirius_plan_comparison_join.cpp</code></td></tr>
+      <tr><td><code>LOGICAL_ORDER_BY</code> · <code>LOGICAL_TOP_N</code> · <code>LOGICAL_LIMIT</code></td><td><code>ORDER_BY</code> · <code>TOP_N</code> · <code>STREAMING_LIMIT</code></td><td><code>sirius_plan_order.cpp</code> · <code>_top_n.cpp</code> · <code>_limit.cpp</code></td></tr>
+      <tr><td><code>LOGICAL_MATERIALIZED_CTE</code> / <code>LOGICAL_CTE_REF</code></td><td><code>CTE</code> / <code>CTE_SCAN</code></td><td>generator</td></tr>
+      <tr><td><code>CHUNK_GET</code> · <code>EXPRESSION_GET</code> · <code>DELIM_GET</code> · <code>DUMMY_SCAN</code> · <code>EMPTY_RESULT</code></td><td><code>COLUMN_DATA_SCAN</code> · <code>DELIM_SCAN</code> · <code>DUMMY_SCAN</code> · <code>EMPTY_RESULT</code></td><td>generator</td></tr>
+      <tr><td><code>WINDOW</code> · <code>UNNEST</code> · <code>SAMPLE</code> · <code>ANY_JOIN</code> · <code>ASOF_JOIN</code> · <code>CROSS_PRODUCT</code> · <code>RECURSIVE_CTE</code> · set ops · DML</td><td colspan="2"><b>throw → silent CPU fallback</b></td></tr>
+    </tbody>
+  </table>
+
+  <h3>The decisions that shape the plan</h3>
+  <ul class="klist">
+    <li><b>Hash vs. nested-loop join</b> — at least one equality condition → <code>HASH_JOIN</code> (checked by <code>are_conditions_supported()</code> for mixed equality+inequality on disjoint columns, created with a <code>max_build_hash_table_bytes</code> cap); pure-inequality joins take <code>NESTED_LOOP_JOIN</code> when <code>PhysicalNestedLoopJoin::IsSupported()</code>. Convention: <b>left = probe (streamed), right = build (materialized)</b>.</li>
+    <li><b>cuDF gaps rewritten at plan time</b> — <code>AVG</code> decomposes into <code>SUM</code> + <code>COUNT_VALID</code> (finalized on-device with <code>cudf::binary_operation</code>); <code>COUNT(DISTINCT)</code> goes through <code>COLLECT_SET</code>; <code>HUGEINT</code> downcasts to <code>BIGINT</code> (no int128 in cuDF).</li>
+    <li><b>Filter pushdown</b> — with <code>FILTER_PUSHDOWN</code> support, filters move into <code>sirius_physical_table_scan</code>, filter columns join <code>projection_ids</code>, and a residual <code>sirius_physical_filter</code> covers what the table function can't evaluate.</li>
+    <li><b>Projection folding</b> — passthrough projections are elided; a final <code>fold_adjacent_projections()</code> + <code>push_projection()</code> pass composes stacked <code>PROJECTION → PROJECTION</code> pairs into one select list, so each batch pays <b>one</b> <code>expression_evaluator</code> stage. Folding refuses when a select-list slot is null or a non-trivial inner expression would be duplicated across outer references — and only immediate parent/child pairs fold.</li>
+    <li><b>Dynamic-filter channels</b> — <code>get_or_create_dynamic_filter_channel()</code> keys a <code>sirius_dynamic_filter_set</code> by the <code>DynamicTableFilterSet*</code> pointer DuckDB plants on both the join (producer) and the scan (consumer); the channel is how a <code>BUILD_PROBE</code> join's build side later feeds membership filters into parquet scans.</li>
+  </ul>
+
+  <div class="callout warn"><span class="ct">Per-operation fallbacks are plan-time too</span>Some individually supported shapes still route to CPU on purpose: <b><code>BIGINT SUM / ADD / SUB / MUL</code></b> fall back because there's no INT128 accumulator on the GPU path — falling back prevents <i>silent overflow</i>, not a crash. <code>DECIMAL SUM</code> instead widens (32→64→128). And the reverse exists: <code>read_parquet('s3://…')</code> is rewritten to <code>sirius_read_parquet</code> (<code>sirius_sql_rewrite.hpp</code>), a <b>GPU-only path with no CPU fallback at all</b>.</div>
+</section>
+
+<!-- ================= PIPELINES ================= -->
+<section id="pipelines">
+  <div class="sec-eyebrow">04 · Pipelines</div>
+  <h2>From operator tree to pipeline graph</h2>
+  <p class="sec-sub">Two passes build the executable form. First <code>sirius_meta_pipeline::build()</code> walks the plan — streaming operators (FILTER, PROJECTION, LIMIT) append to the current pipeline; blocking operators (HASH_JOIN, ORDER_BY, aggregates) become sinks and spawn child meta-pipelines (build side before probe side). Then <code>sirius_pipeline_converter</code> rewrites the graph into its final GPU form.</p>
+
+  <div class="callout key"><span class="ct">Sirius ≠ DuckDB here</span>In DuckDB, source and sink live <i>outside</i> the operators list. In Sirius, <code>finalize_pipeline_structure()</code> pushes the sink <b>into</b> <code>operators</code> and sets <code>source = &amp;operators[0]</code> — afterwards <code>operators</code> contains <i>every</i> operator, and a task's <code>compute_task()</code> simply calls <code>execute()</code> on each one, source→sink, then <code>publish_output()</code> calls the last one's <code>sink()</code>. Blocking operators are therefore <b>the sink of one pipeline and the source of the next</b>.</div>
+
+  <p>The converter (<code>src/pipeline/sirius_pipeline_converter.cpp</code>) runs seven phases — <code>schedule_and_copy_pipelines → split_pipelines → wire_data_repositories → setup_pipeline_parents → finalize_pipeline_structure → link_join_partition_siblings → log_pipeline_debug_info</code> — leaving <code>sirius_engine::initialize_internal()</code> a ~35-line orchestrator. The interesting work is in the rewrites:</p>
+
+  <details>
+    <summary><span class="stepnum">rewrite 1</span>TABLE_SCAN → GPU_SCAN, in place</summary>
+    <div class="dbody">
+      <p>No separate scan pipeline. The scan is rewritten to a unified <code>sirius_gpu_scan_operator</code> at <code>operators[0]</code>; <code>insert_parquet_scan_operator()</code> / <code>insert_duckdb_native_scan_operator()</code> capture the DuckDB bind data into <code>parquet_ingestible_table_info</code> / <code>duckdb_native_ingestible_table_info</code> and build the per-format <code>gpu_ingestible</code> via <code>make_ingestible()</code>. The scan is a normal pipeline source running on GPU-executor workers — scans are <i>not</i> a separate executor.</p>
+    </div>
+  </details>
+  <details>
+    <summary><span class="stepnum">rewrite 2</span>HASH_JOIN → breaker + PARTITION → CONCAT on both sides</summary>
+    <div class="dbody">
+      <ul>
+        <li>A <code>PARTITION</code>/<code>CONCAT</code> pipeline pair is inserted before the join on <b>both</b> probe and build inputs; a pipeline breaker precedes PARTITION <b>so the total input size is known when picking the partition count</b> (<code>determine_num_partitions()</code> from <code>hash_partition_bytes</code>).</li>
+        <li>Barriers: PARTITION → CONCAT is <code>PARTIAL</code> (incremental); CONCAT → join is <code>FULL</code>, with the build side landing in the join's <code>"build"</code> port.</li>
+        <li>Probe and build PARTITIONs are <b>sibling-linked</b> (<code>link_join_partition_siblings()</code>) so both sides agree on the partition count.</li>
+      </ul>
+    </div>
+  </details>
+  <details>
+    <summary><span class="stepnum">rewrite 3</span>Aggregates and TOP_N get merge stages</summary>
+    <div class="dbody">
+      <p><code>HASH_GROUP_BY</code> → <code>PARTITION</code> → <code>MERGE_GROUP_BY</code> (all <code>FULL</code> barriers): each partition is aggregated independently, then merged. <code>UNGROUPED_AGGREGATE</code> → <code>MERGE_AGGREGATE</code> with no PARTITION (there's only one group). <code>TOP_N</code> → <code>MERGE_TOP_N</code>. The merge operators drain <b>one whole partition per task</b>.</p>
+    </div>
+  </details>
+  <details>
+    <summary><span class="stepnum">rewrite 4</span>ORDER_BY → a three-pipeline sample sort</summary>
+    <div class="dbody">
+      <p><code>[scan … ORDER]</code> —<code>PIPELINE</code>→ <code>[SORT_SAMPLE, SORT_PARTITION]</code> —<code>FULL</code>→ <code>[MERGE_SORT]</code>. Each batch is locally ordered (<code>cudf::order_by</code>), SORT_SAMPLE overrides <code>get_next_task_hint()</code> to wait until it has seen enough byte-based samples to compute range boundaries, SORT_PARTITION reads them via <code>_sample_op</code> and range-partitions, MERGE_SORT k-way merges one partition per task (<code>gpu_merge_impl::merge_order_by()</code>).</p>
+      <p style="margin-top:8px;font-size:.85rem;color:var(--muted)">Doc trivia: <code>execution-flow.md</code> calls this the "4-phase sort" (counting operators), <code>physical-plan-generation.md</code> the "3-Phase Sort" (counting pipelines — SORT_SAMPLE and SORT_PARTITION share one task). Same machinery.</p>
+    </div>
+  </details>
+  <details>
+    <summary><span class="stepnum">rewrite 5</span>DELIM_JOIN — correlated subqueries</summary>
+    <div class="dbody">
+      <ul>
+        <li>The delim join wraps an internal <code>join</code> plus an embedded <code>sirius_physical_grouped_aggregate</code> (the <code>distinct</code>), both fed simultaneously by <code>sink()</code> pushes.</li>
+        <li><b>RIGHT</b> variant: RHS replaced with <code>dummy_scan</code>; build via <code>partition_join</code> → CONCAT into the <code>"build"</code> port (breaker only if intermediates exist).</li>
+        <li><b>LEFT</b> variant: LHS replaced with <code>column_data_scan</code> (never a breaker); build via a standard child meta-pipeline.</li>
+      </ul>
+    </div>
+  </details>
+
+  <h3>Ports and barriers — how pipelines connect</h3>
+  <p>Pipelines never share operators; they share <b>repositories</b>. <code>insert_repository()</code> (<code>src/sirius_engine.cpp</code>) creates a <code>cucascade::shared_data_repository</code> keyed by <code>(operator_id, port_id)</code> for every sink→source edge — <b>repositories are never placed mid-pipeline</b>. The consuming operator sees it as a <code>port</code> (named <code>"default"</code>, or <code>"build"</code> for a hash join's build input) with a barrier type the base <code>get_next_task_hint()</code> enforces:</p>
+  <table>
+    <thead><tr><th>Barrier</th><th>Semantics</th><th>Canonical user</th></tr></thead>
+    <tbody>
+      <tr><td><code>FULL</code></td><td>Downstream waits until the entire upstream pipeline has finished</td><td>Hash-join build port, merge stages</td></tr>
+      <tr><td><code>PARTIAL</code></td><td>Downstream may consume incrementally, with coordination</td><td>CONCAT after PARTITION (inner joins)</td></tr>
+      <tr><td><code>PIPELINE</code></td><td>Pure streaming — consume as produced</td><td>ORDER → SORT_SAMPLE edge, streaming chains</td></tr>
+    </tbody>
+  </table>
+  <p>Pipeline completion (<code>update_pipeline_status()</code>): the source reports <code>is_source_pipeline_finished()</code>, <code>all_ports_empty()</code> holds, and <code>tasks_created == tasks_completed</code> — or an operator exhausts a <code>LIMIT</code> early.</p>
+</section>
+
+<!-- ================= TASKS ================= -->
+<section id="tasks">
+  <div class="sec-eyebrow">05 · Tasks &amp; scheduling</div>
+  <h2>Data-driven task creation, reservation-gated dispatch</h2>
+  <p class="sec-sub">Nothing polls operators on a timer. Work exists only when data does: after every task, downstream consumers are offered to the <code>task_creator</code>, which walks the <b>hint chain</b> to find something actually ready to run.</p>
+
+  <div class="two">
+    <div class="mini">
+      <h4>task_creator — the hint chain</h4>
+      <ul>
+        <li><code>schedule(op)</code> enqueues; <code>manager_loop()</code> pops and asks <code>get_operator_for_next_task()</code>.</li>
+        <li>Each operator's <code>get_next_task_hint()</code> answers <code>READY{producer}</code> or <code>WAITING_FOR_INPUT_DATA{producer}</code> — on WAITING the creator <b>recurses into the producer</b>, so data flows from the deepest ready producer first.</li>
+        <li>The base hint checks ports in order: a <code>FULL</code>-barrier port requires its source pipeline finished; every port needs data. Base <code>get_next_task_input_data()</code> pops one batch per port.</li>
+        <li><code>pipeline.mark_task_created()</code> is called <b>before</b> popping input — otherwise a pipeline can look finished mid-pop (a real race, now an invariant).</li>
+        <li>Scan policy: at most <b>2 scans scheduled at startup</b>; continuous rescheduling on exhaustion only when the plan has a single scan.</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>task_scheduler + gpu_pipeline_executor</h4>
+      <ul>
+        <li><code>management_eventloop()</code> matches two signals — executors publish <code>device_ready</code>, <code>schedule()</code> publishes <code>task_available</code> — and per ready device picks: (a) a dynamic-filter <b>build-subtree</b> task, (b) an exact <b>preferred-device</b> match, (c) anything else.</li>
+        <li>Preference-less tasks round-robin across GPUs (<code>_no_pref_rr_counter</code>, reset per query — the <code>cache=table_gpu</code> warm path depends on that reset).</li>
+        <li>Per-GPU executor manager loop: reserve a worker slot → send <code>task_request</code> → pop task → <b>clamp the memory ask to <code>get_max_memory()</code></b> → <code>make_reservation()</code> → attach → acquire an exclusive CUDA stream → dispatch.</li>
+        <li>Worker: <code>lock_or_prepare_batch()</code> colocates inputs, <code>compute_task()</code> runs <code>execute()</code> on every operator, <code>publish_output()</code> calls the sink's <code>sink()</code>.</li>
+        <li>Completion is checked <b>before</b> downstream scheduling — never mint tasks against destroyed operators. Errors: <code>report_error()</code> then <code>drain_after_error()</code> (stop creator → drain queues → drain executors → restart creator).</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout danger"><span class="ct">The SCHED-RR contract — multi-GPU correctness</span>"Every operator's input batches MUST arrive on the task's reservation device." The <i>only</i> thing that makes <code>batches[0]->get_memory_space()</code> a safe alias for the target space is that <code>prepare_for_processing()</code> → <code>lock_or_prepare_batch()</code> colocated <b>every</b> batch — all or nothing (<code>std::nullopt</code> → reschedule). History: preference-less tasks used to be accidentally pinned to one GPU by <code>unordered_map</code> iteration order; real round-robin destroyed that accidental safety, and 11 read sites had to be audited. New operators that read <code>get_memory_space()</code> on a batch they didn't construct must carry an <code>INVARIANT (SCHED-RR contract)</code> comment (pattern: <code>src/op/sirius_physical_concat.cpp:193</code>), and <code>test/cpp/operator/test_mgpu_stress.cpp</code> guards it with 500 runs.</div>
+
+  <h3>The runtime, in its own words</h3>
+  <p>One OOM-and-recover episode, as a conversation between the actual components:</p>
+  <div class="chat" id="chatBox">
+    <div class="chead"><span class="ct2">group chat · query 42, pipeline 7</span><button id="chatReplay">▶ replay</button></div>
+    <div class="chatbody" id="chatBody"></div>
+  </div>
+</section>
+
+<!-- ================= OPERATORS ================= -->
+<section id="operators">
+  <div class="sec-eyebrow">06 · Operators</div>
+  <h2>One base class, thirty shapes</h2>
+  <p class="sec-sub">Every operator derives from <code>sirius::op::sirius_physical_operator</code> (<code>src/include/op/sirius_physical_operator.hpp</code>). The surface splits into four roles — execute, source, sink, and pipeline-build — and most operators implement only the slice they need.</p>
+
+  <div class="two">
+    <div class="mini" style="padding:0;overflow:hidden"><pre style="border-radius:0;margin:0;height:100%"><code>// operator role
+unique_ptr&lt;operator_data&gt; execute(
+    const operator_data&amp; input,
+    rmm::cuda_stream_view stream);
+size_t no_history_peak_memory_estimate(
+    const input_stats&amp;);      // default: 2× input
+
+// source role
+bool is_source();
+optional&lt;task_creation_hint&gt;
+    get_next_task_hint();     // READY | WAITING
+unique_ptr&lt;operator_data&gt;
+    get_next_task_input_data();
+bool can_create_more_tasks();
+bool all_ports_empty();
+
+// sink role
+void sink(const operator_data&amp;,
+          rmm::cuda_stream_view);
+bool is_sink();
+
+// pipeline build
+void build_pipelines(sirius_pipeline&amp;,
+                     sirius_meta_pipeline&amp;);
+void finalize_operator();     // → on_finalize_operator()</code></pre></div>
+    <div class="mini">
+      <h4>…in English</h4>
+      <ul>
+        <li><b>execute</b> — pure batch-in → batch-out on a given CUDA stream. Called on <i>every</i> operator of the pipeline, per task.</li>
+        <li><b>memory estimate</b> — feeds the reservation system; defaults to 2× input bytes until <code>pipeline_memory_history</code> has real samples.</li>
+        <li><b>source</b> — decides when a new task can exist (<code>get_next_task_hint</code>) and assembles its input (<code>get_next_task_input_data</code>). This is where barriers, channels, and split connectors surface.</li>
+        <li><b>sink</b> — receives the pipeline's final batch: push into a repository port, accumulate build state, or collect results.</li>
+        <li><b>build_pipelines</b> — the plan-time walk that decides append-vs-break (streaming vs blocking).</li>
+        <li>Input arrives as <code>operator_data</code> → <code>pipelineable_operator_data</code> (locked <code>data_batch</code>es) → <code>partitioned_operator_data</code> (adds <code>partition_idx</code>).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Two kinds of source</h3>
+  <p>The classic source is storage-driven; the new one (this branch) is arrival-driven. Toggle:</p>
+  <div class="toggle" role="tablist">
+    <button id="tgScan" class="on" role="tab" aria-selected="true">GPU_SCAN — storage-driven</button>
+    <button id="tgStream" role="tab" aria-selected="false">STREAMING_SOURCE — arrival-driven</button>
+  </div>
+  <div class="modelpanel show" id="mpScan" role="tabpanel">
+    <div class="flowline">
+      <div class="fnode">split_provider<br><span style="font-weight:400;font-size:.72rem">enumerates row groups / segments</span></div><span class="farrow">→</span>
+      <div class="fnode">coalescer<br><span style="font-weight:400;font-size:.72rem">512&nbsp;MB batches · device stamp · prefetch</span></div><span class="farrow">→</span>
+      <div class="fnode">split_connector</div><span class="farrow">→</span>
+      <div class="fnode good">GPU_SCAN<br><span style="font-weight:400;font-size:.72rem">gpu_ingestible → cudf::table</span></div><span class="farrow">→</span>
+      <div class="fnode">repository</div>
+    </div>
+    <ul class="mp-notes">
+      <li>The split set is <b>finite and known up front</b>; <code>get_next_task_hint()</code> is READY while splits remain.</li>
+      <li><code>execute()</code> does the heavy lifting: the per-format <code>gpu_ingestible</code> materializes each split (<code>cudf::io::read_parquet</code>, or custom CUDA decoders for DuckDB-native segments) plus conditional <code>post_filter_and_project</code>.</li>
+      <li>Splits carry a <code>preferred_device_id</code> stamped by the coalescer's round-robin — that's how multi-GPU locality starts.</li>
+    </ul>
+  </div>
+  <div class="modelpanel" id="mpStream" role="tabpanel">
+    <div class="flowline">
+      <div class="fnode">external producer<br><span style="font-weight:400;font-size:.72rem">repo.add_data_batch first!</span></div><span class="farrow">→</span>
+      <div class="fnode hot">exchange_channel<br><span style="font-weight:400;font-size:.72rem">bounded · items + bytes</span></div><span class="farrow">→</span>
+      <div class="fnode good">STREAMING_SOURCE<br><span style="font-weight:400;font-size:.72rem">try_pop → resolve handle</span></div><span class="farrow">→</span>
+      <div class="fnode">pipeline<br><span style="font-weight:400;font-size:.72rem">execute() = pass-through</span></div>
+    </div>
+    <ul class="mp-notes">
+      <li>The work set is <b>unbounded and arrival-driven</b>: hint is READY when the channel is non-empty, WAITING while open-but-empty, and <code>nullopt</code> at EOS — defined as <code>closed() &amp;&amp; drained()</code>.</li>
+      <li>Port-less: <code>all_ports_empty()</code> is true only at EOS, driving both the task-creation guard and the pipeline-finish predicate.</li>
+      <li><code>no_history_peak_memory_estimate()</code> returns plain input bytes — a pass-through shouldn't pay the default 2× reservation.</li>
+      <li>Full story in <a href="#streaming">section 10</a>.</li>
+    </ul>
+  </div>
+
+  <h3>Inventory</h3>
+  <table>
+    <thead><tr><th>Kind</th><th>Operator</th><th>Mechanism</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="4">Sources</td><td><code>GPU_SCAN</code> — <code>sirius_gpu_scan_operator</code></td><td>Unified GPU source; splits → <code>gpu_ingestible</code> (parquet via cuDF, native via <code>src/cuda/scan/</code> kernels)</td></tr>
+      <tr><td><code>STREAMING_SOURCE</code></td><td>Exchange input; pops handles from a bounded <code>exec::exchange_channel</code></td></tr>
+      <tr><td><code>COLUMN_DATA_SCAN</code> / <code>CTE_SCAN</code> / <code>DELIM_SCAN</code></td><td>Reads a pre-materialized DuckDB <code>ColumnDataCollection</code></td></tr>
+      <tr><td><code>DUMMY_SCAN</code> · <code>EMPTY_RESULT</code> · CPU-side <code>DUCKDB_SCAN</code>/<code>PARQUET_SCAN</code> wrappers</td><td>Constant row; empty; CPU scan bridges (plus <code>iceberg_scan</code>, <code>cpu_source</code> variants)</td></tr>
+      <tr><td rowspan="3">Streaming</td><td><code>FILTER</code></td><td><code>expression_evaluator::select()</code> → cuDF row compaction</td></tr>
+      <tr><td><code>PROJECTION</code></td><td><code>evaluate()</code>; three paths — all-evaluated (owned table), <b>all-passthrough (zero-copy <code>table_view</code> held by the input's read lock)</b>, mixed</td></tr>
+      <tr><td><code>STREAMING_LIMIT</code></td><td>Atomic <code>claim()</code> on remaining limit/offset — no GPU work at all</td></tr>
+      <tr><td rowspan="4">Blocking</td><td><code>HASH_JOIN</code></td><td>Three modes: <code>STANDARD</code> (<code>cudf::*_join</code>), <code>BUILD_PROBE</code> (cached <code>cudf::hash_join</code>; <code>distinct_hash_join</code> when keys proven unique; build state machine NOT_BUILT→…→BUILT), <code>MIXED_JOIN</code> (cuDF AST). MARK joins via <code>filtered_join</code>/<code>mark_join</code></td></tr>
+      <tr><td><code>NESTED_LOOP_JOIN</code></td><td>Pure-inequality fallback</td></tr>
+      <tr><td><code>ORDER_BY</code> · <code>TOP_N</code></td><td><code>cudf::order_by()</code> · <code>cudf::top_k_order()</code> + <code>sort_by_key()</code></td></tr>
+      <tr><td><code>HASH_GROUP_BY</code> · <code>UNGROUPED_AGGREGATE</code></td><td><code>cudf::groupby()</code> · <code>cudf::reduce()</code>; AVG = SUM + COUNT_VALID; COUNT(DISTINCT) = COLLECT_SET</td></tr>
+      <tr><td rowspan="3">Breakers (Sirius-injected)</td><td><code>PARTITION</code></td><td>HASH/RANGE/EVENLY; adaptive <code>determine_num_partitions()</code>; probe/build sibling coordination</td></tr>
+      <tr><td><code>CONCAT</code></td><td><code>_concat_all</code> for LEFT/ANTI/OUTER; byte-threshold streaming (<code>_concat_batch_bytes</code>) for INNER</td></tr>
+      <tr><td><code>SORT_SAMPLE</code> · <code>SORT_PARTITION</code> · <code>MERGE_SORT</code> · <code>MERGE_GROUP_BY</code> · <code>MERGE_AGGREGATE</code> · <code>MERGE_TOP_N</code></td><td>Sample-sort phases and per-partition merges; merges drain one partition per task</td></tr>
+      <tr><td rowspan="2">CTE / correlated</td><td><code>CTE</code></td><td>Materializes once, serves many readers</td></tr>
+      <tr><td><code>LEFT_DELIM_JOIN</code> / <code>RIGHT_DELIM_JOIN</code></td><td>Wrap an inner join + embedded <code>grouped_aggregate</code> dedup; <code>partition_consumer</code> interface adds <code>push_data_batch_partitioned()</code></td></tr>
+      <tr><td rowspan="2">Sinks &amp; extras</td><td><code>RESULT_COLLECTOR</code> / <code>materialized_collector</code></td><td>Materializes to <code>ColumnDataCollection</code>; the executor keys <b>query completion</b> off this type</td></tr>
+      <tr><td><code>sirius_physical_dynamic_filter</code></td><td>Post-decode membership filtering on scans (cuco static_set / bloom_filter, chosen by L2 fit), behind an adaptive selectivity gate</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ================= EXPRESSIONS ================= -->
+<section id="expressions">
+  <div class="sec-eyebrow">07 · Expressions</div>
+  <h2>One AST, three ways to run it</h2>
+  <p class="sec-sub">Scalar expressions have a single currency across planner, operators, and evaluator: <code>sirius::ast::node</code> (<code>src/include/expression/ast/node.hpp</code>) — a <code>std::variant</code> translated from DuckDB expressions <b>once, at plan time</b> via <code>sirius::ast::from_duckdb()</code>. Operators never see a DuckDB expression again.</p>
+
+  <pre><code>using node = std::variant&lt;
+  reference, constant,            // leaves
+  comparison, conjunction,        // predicates
+  between, in_list, case_expr,    // control shapes
+  cast, unary_op, coalesce,
+  function_call, aggregate&gt;;      // calls
+// alternative order is ABI — append-only.
+// every alternative implements cudf_ast_op_count()</code></pre>
+
+  <p><code>expression_evaluator</code> (<code>src/expression_evaluator/</code>) exposes exactly two verbs — <code>evaluate(input)</code> for PROJECTION and <code>select(input)</code> for FILTER — and dispatches per-alternative through one specialization file each (<code>specializations/{comparison,case,cast,…}.cpp</code>). The strategy is a session setting:</p>
+
+  <table>
+    <thead><tr><th>Strategy</th><th>How it runs</th><th>Trade-off</th></tr></thead>
+    <tbody>
+      <tr><td><code>MATERIALIZE</code></td><td>One cuDF kernel per node (<code>unary_operation</code>/<code>binary_operation</code>), intermediates materialized</td><td>Most compatible, most memory traffic</td></tr>
+      <tr><td><code>AST_INTERPRET</code> <b>(default)</b></td><td>Build a <code>cudf::ast::tree</code>, run one monolithic <code>cudf::compute_column</code></td><td>One kernel for the whole tree</td></tr>
+      <tr><td><code>AST_JIT</code></td><td><code>cudf::compute_column_jit</code></td><td>JIT compile cost, best steady-state</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout key"><span class="ct">AST breakers — the tree of trees</span>Nodes with no cuDF-AST equivalent — <b>CASE, LIKE, SUBSTRING, non-fixed-width CAST</b> — are <i>materialized</i> into columns and re-referenced from the enclosing AST subtree, producing a "tree of AST trees": maximal AST islands stitched together by materialized columns. Tiny islands aren't worth it: <code>min_ast_size</code> (default 2, measured via <code>cudf_ast_op_count()</code>) demotes them back to MATERIALIZE. String <code>concat</code>/<code>||</code> is materialize-only (<code>cudf::strings::concatenate</code> with a null narep for SQL null propagation), and <code>coalesce</code> is iterative <code>cudf::replace_nulls</code>.</div>
+
+  <p>A separate translator, <code>gpu_expression_translator</code>, converts Sirius AST → standalone cuDF AST for two consumers that bypass the evaluator: <code>MIXED_JOIN</code> conditions and parquet reader pushdown (emitting <code>column_name_reference</code> nodes). It refuses — returns <code>nullopt</code> — on <code>case_expr</code>, <code>coalesce</code>, and VARCHAR casts.</p>
+</section>
+
+<!-- ================= MEMORY ================= -->
+<section id="memory">
+  <div class="sec-eyebrow">08 · Memory &amp; spilling</div>
+  <h2>Reserve first, spill under pressure, reschedule as a last resort</h2>
+  <p class="sec-sub">cuCascade gives Sirius three tiers — <b>GPU</b>, <b>pinned host (per NUMA node)</b>, <b>disk</b> — and every byte lives in exactly one <code>memory_space</code>. <code>sirius_memory_reservation_manager</code> installs each GPU's <code>cuda_async_memory_resource</code> as cuDF's device resource, so every cuDF allocation is visible to the budget. Tasks don't allocate hopefully; they <b>reserve first</b>.</p>
+
+  <div class="two">
+    <div class="mini">
+      <h4>How much to reserve? Ask history.</h4>
+      <ul>
+        <li><code>pipeline_memory_history</code>: a 64-entry ring of <code>{estimated, peak, output}</code> per pipeline; <code>estimate_peak_memory()</code> is a log-ratio-weighted average of past peak/estimate ratios.</li>
+        <li>No history yet? <code>no_history_peak_memory_estimate()</code> — default 2× input bytes.</li>
+        <li>Add <code>bytes_to_materialize_input</code> (inputs that must be upgraded back to GPU), then <b>clamp to <code>get_max_memory()</code></b> — the clamp kills a real livelock where an over-capacity estimate gets a partial grant while spilling demands the full size, forever.</li>
+        <li>OOM'd records <b>ratchet the estimate upward</b> (<code>record_on_failure</code>) so the same task asks for more next time.</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>Enforcement</h4>
+      <ul>
+        <li>A <code>reservation_aware_resource_adaptor</code> wraps the RMM resource: allocations beyond the grant fail gracefully instead of taking down the pool.</li>
+        <li>First response is not spilling but <b>defragmentation</b>: <code>defragmenter_oom_policy</code> detects pool fragmentation (<code>reserved &gt; used + 10× requested</code> via <code>cudaMemPoolGetAttribute</code>), trims with <code>cudaMemPoolTrimTo</code>, retries.</li>
+        <li>Hard OOM raises <code>oom_reschedule_exception</code> carrying the intermediates <i>and</i> a resume operator index — up to <code>MAX_OOM_RETRIES</code> = 10 with 5&nbsp;ms backoff, then the query dies.</li>
+        <li>Pinned host side: <code>small_pinned_host_memory_resource</code> — 64&nbsp;MB blocks, 1024 per pool, NUMA-affine.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>What actually happens under pressure</h3>
+  <div class="bp" data-stepper="mm">
+    <div class="pipe" aria-hidden="true">
+      <div class="pnode" id="mm-est">Estimate<span class="sub">history ring</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="mm-resv">make_reservation<span class="sub">memory_space</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="mm-defrag">Defrag policy<span class="sub">pool trim</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="mm-down">Downgrade sweep<span class="sub">idle batches</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="mm-tasks">Queued tasks<span class="sub">mutable_pop_if</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="mm-host">Host / disk<span class="sub">tiers 1–2</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="mm-oom">OOM reschedule<span class="sub">≤ 10 retries</span></div>
+    </div>
+    <div class="bp-cap">
+      <span class="step-n" data-sn>Step 0</span>
+      <h4 data-st></h4>
+      <p data-sp></p>
+    </div>
+    <div class="bp-ctl">
+      <button class="ghost" data-prev>← Back</button>
+      <button data-next>Next →</button>
+      <button class="ghost" data-reset>Reset</button>
+      <div class="bp-dots" data-dots aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div class="callout danger"><span class="ct">"Downgrade" ≠ CPU fallback — don't conflate them</span>In Super Sirius, <b>downgrade means data-tier demotion</b>: the <code>downgrade_executor</code> (one per memory space, <code>src/downgrade/downgrade_executor.cpp</code>) moves <i>data</i> GPU→host→disk. It never routes <i>execution</i> to the CPU. CPU fallback is a <b>plan-time</b> decision (section 03: <code>create_plan()</code> throws, or per-op cases like BIGINT SUM). Even the top-level CLAUDE.md blurs this — the docs (<code>memory-management.md</code>) are the authority.</div>
+
+  <h3>Anatomy of the downgrade executor</h3>
+  <ul class="klist">
+    <li><b>Three thread roles</b> — a processing thread dequeues <code>downgrade_request</code>s sequentially; an optional monitor fires on <code>should_downgrade_memory()</code> <i>and</i> a stateless viability gate <code>has_viable_downgrade_target()</code> (disk always viable; GPU→host viability probed with a chunk-sized <code>make_reservation_or_null</code>, released immediately; otherwise back off and warn once); a bounded worker pool does the byte movement.</li>
+    <li><b>Requests are predicates, not sizes</b> — <code>request_downgrade(predicate)</code> returns a <code>future&lt;size_t&gt;</code>; on a reservation shortfall the predicate is "does <code>make_reservation_or_null(bytes_needed)</code> succeed now?" — so spilling <b>stops the moment the reservation fits</b>. No over-freeing, and the monitor is never on the correctness path.</li>
+    <li><b>Candidates, lazily, in tiers</b> — (1) idle GPU-resident batches from data repositories (<code>convertible_data_batch_provider</code>, partitions back-to-front), then (2) whole queued tasks pulled from the pipeline task queue (<code>convertible_gpu_pipeline_task_provider</code>, <code>mutable_pop_if</code> with RAII return). Each converts via <code>convertible_data::convert()</code> — atomic lock + reservation + tier conversion + rollback on failure — through the <code>sirius_converter_registry</code>.</li>
+    <li><b>The return trip is lazy</b> — nothing eagerly promotes spilled data; the next task that needs it upgrades it in <code>prepare_for_processing()</code> → <code>lock_or_prepare_batch()</code>, which also enforces the SCHED-RR colocation contract.</li>
+  </ul>
+
+  <p>The unit being spilled is the same unit everything else uses: <code>cucascade::data_batch</code>, with its three-state lock <code>idle ↔ read_only ↔ mutable_locked</code>. An idle <code>shared_ptr&lt;data_batch&gt;</code> grants <b>no data access</b> — data is reachable only through RAII lock accessors, which is exactly what makes "idle = spillable" safe. Batches can be <b>owned</b> (a real <code>cudf::table</code>) or <b>view-backed</b> (<code>owning_table_view</code>: a <code>table_view</code> plus a type-erased owner) — the basis of zero-copy projection passthrough.</p>
+</section>
+
+<!-- ================= SCAN ================= -->
+<section id="scan">
+  <div class="sec-eyebrow">09 · Scan &amp; I/O</div>
+  <h2>From files to GPU-resident tables</h2>
+  <p class="sec-sub"><code>sirius_scan_manager::prepare_for_query()</code> either matches a <b>pinned-table cache</b> entry or builds a <code>split_provider</code> per scan. A single per-query sequencer — the <code>load_balancing_scan_batch_coalescer</code> — then drives metadata tasks, coalesces splits up to <code>scan_task_batch_size</code> (512&nbsp;MB default), stamps each with a <code>preferred_device_id</code> (round-robin), fires prefetch hints, and pushes onto each scan's <code>split_connector</code>.</p>
+
+  <div class="two">
+    <div class="mini">
+      <h4>Two ingestibles</h4>
+      <ul>
+        <li><b>Parquet</b> — <code>cudf::io::read_parquet</code> over coalesced row-group slices; footer caching in <code>metadata_store</code>; stats-based row-group pruning (<code>filter_row_groups_with_stats()</code>); reader-side predicate pushdown via <code>set_filter</code>, decided per split.</li>
+        <li><b>DuckDB-native</b> — custom CUDA kernels decode <code>.duckdb</code> segments <i>on the GPU</i>: <code>gpu_decode_table()</code> for fixed-width (UNCOMPRESSED / CONSTANT / RLE / BITPACKING / ALP), <code>gpu_decode_strings_column()</code> for strings (DICTIONARY / FSST / DICT_FSST) — <code>src/cuda/scan/*.cu</code>.</li>
+        <li>A non-viable native scan (unsupported codec/type, or all row groups pruned) throws <b>before any per-segment I/O</b> — triggering clean CPU fallback.</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>The I/O stack (src/io/)</h4>
+      <ul>
+        <li><code>sirius_datasource</code> implements <code>cudf::io::datasource</code>; per-GPU <code>sirius_ioctx</code> picks a reactor by URI scheme: <b>io_uring</b> for local files, <b>REST/libcurl + SigV4</b> for <code>s3://</code>, <b>kvikio</b> fallback.</li>
+        <li>In front: the pinned-memory <code>prefetching_cache</code> — packed atomic chunk state machine, partial-read + populate-on-read, tiered-LRU eviction, <code>admission_control</code> budget of 2048 in-flight chunks.</li>
+        <li>Multi-GPU mode is deliberately <b>kvikio-free</b> (<code>enforce_sirius_datasource_for_multi_gpu()</code>) — kvikio binds file handles to one CUDA context.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Pinned tables — the warm path</h3>
+  <p><code>CALL pin_table('lineitem', tier =&gt; 'gpu')</code> drives the ingestible to completion and keeps the table resident: GPU tier round-robins chunks across GPU memory spaces; host tier converts each batch to a NUMA-local <code>host_data_representation</code> and frees the GPU copy (peak GPU residency ≈ one batch). Cache serving is layout-identical to a fresh read — <code>can_serve_with_columns()</code> matches format + identity + column superset, and columns come back in <code>materialized_column_order()</code>. Re-pinning merges when row counts and per-chunk placement match, otherwise replaces.</p>
+
+  <div class="callout info"><span class="ct">Dynamic filters ride the scan</span>A <code>BUILD_PROBE</code> hash join's build side publishes runtime predicates through the plan-time channel (section 03) into parquet scans: <b>zone-map filters</b> lowered into the reader's <code>set_filter</code> (off by default) and <b>membership filters</b> — <code>cuco::static_set</code> in-list or <code>cuco::bloom_filter</code>, chosen by L2-cache fit — applied post-decode behind an adaptive selectivity gate (on by default, <code>enable_dynamic_filter_pushdown</code>). Filters are always redundant with the authoritative join, so they can never change results — measured 1.65× on SF300 with 2 GPUs.</div>
+</section>
+
+<!-- ================= STREAMING ================= -->
+<section id="streaming">
+  <div class="sec-eyebrow">10 · Exchange &amp; streaming</div>
+  <h2>The exchange channel: bytes-bounded, handle-based, close-then-drain</h2>
+  <p class="sec-sub">The streaming layer (this branch) lets an <b>external producer</b> feed batches into a running pipeline — the foundation for distributed exchange. Two pieces: <code>exec::exchange_channel</code> (<code>src/include/exec/exchange_channel.hpp</code>), a bounded MPMC handoff, and the port-less <code>STREAMING_SOURCE</code> operator that drains it.</p>
+
+  <div class="two">
+    <div class="mini" style="padding:0;overflow:hidden"><pre style="border-radius:0;margin:0;height:100%"><code>// can_push_unlocked — the byte bound
+if (_queue.size() >= _cfg.capacity_items)
+    return false;
+if (_cfg.capacity_bytes == 0)
+    return true;                  // unbounded bytes
+if (_queue.empty())
+    return true;                  // oversized-batch rule
+if (_total_bytes >= _cfg.capacity_bytes)
+    return false;
+return h.size_bytes
+    <= _cfg.capacity_bytes - _total_bytes;
+// subtraction, not addition — no overflow</code></pre></div>
+    <div class="mini">
+      <h4>…in English</h4>
+      <ul>
+        <li>Two independent caps: <b>items</b> and <b>bytes</b> (<code>config{capacity_items, capacity_bytes}</code>).</li>
+        <li>A push is rejected if it would <b>cross</b> the byte bound — not merely when the queue is already over it (commit <code>6cb48fae</code>).</li>
+        <li><b>Except into an empty channel</b>: a single batch larger than the whole byte budget must still be admittable, or the stream wedges forever.</li>
+        <li>Comparing via subtraction avoids integer overflow on huge <code>size_bytes</code>.</li>
+      </ul>
+    </div>
+  </div>
+
+  <ul class="klist">
+    <li><b>API</b> — blocking <code>push()</code> / non-blocking <code>try_push()</code> for producers; <code>pop()</code> / <code>try_pop()</code> for consumers; <code>close()</code>; observers <code>closed()</code>, <code>empty()</code>, <code>size_bytes()</code>; end-of-stream is <b><code>drained() = closed() &amp;&amp; empty()</code></b> — close-then-drain, never close-and-discard.</li>
+    <li><b>Callbacks</b> — <code>set_on_push</code> / <code>set_on_pop</code> / <code>set_on_close</code>. The on-close callback is what lets an <b>empty or late-closed</b> pipeline finish: without it, a source that went WAITING on an empty-but-open channel would never be re-scheduled after <code>close()</code> (commit <code>fa01e9d4</code>).</li>
+    <li><b>Engine-side discipline</b> — GPU workers only ever <code>try_pop()</code>. A full or empty channel parks <i>task creation</i> (the hint goes WAITING), never a GPU worker thread.</li>
+    <li><b>Lifetime</b> — the channel may outlive the operator, so <code>~sirius_physical_streaming_source</code> clears the on-close callback it registered.</li>
+  </ul>
+
+  <div class="callout key"><span class="ct">Why the channel carries handles, not owners</span>The item type is <code>exchange_batch_handle</code> — a repository reference, not an owning <code>shared_ptr&lt;data_batch&gt;</code>. The producer must <code>add_data_batch()</code> into the <code>shared_data_repository</code> <b>before</b> pushing the handle. Consequence: batches queued in the channel remain <b>accounted and idle</b> — which means the downgrade executor can spill them under memory pressure exactly like any other repository batch. An owning channel would make queued data invisible to the memory system.</div>
+
+  <p>Inside the operator: <code>get_next_task_hint()</code> maps channel state to the task machine — non-empty → READY, open-but-empty → WAITING_FOR_INPUT_DATA, <code>drained()</code> → <code>nullopt</code> (EOS). <code>get_next_task_input_data()</code> resolves the popped handle through the repository into a <code>pipelineable_operator_data</code>; <code>execute()</code> is a pure pass-through; the peak-memory estimate is plain input bytes rather than the default 2×.</p>
+</section>
+
+<!-- ================= MAP ================= -->
+<section id="map">
+  <div class="sec-eyebrow">Reference</div>
+  <h2>Codebase map</h2>
+  <p class="sec-sub">Everything lives under <code>src/</code>, namespace <code>sirius</code>. The submodules that matter: <b>cuDF</b> (columnar kernels), <b>cuCascade</b> (memory spaces, <code>data_batch</code>, repositories — its <code>memory_space.hpp</code> is the most-imported header in the whole graph), <b>RMM</b> (allocators, streams), <b>DuckDB</b> (the host).</p>
+
+  <table>
+    <thead><tr><th>Directory</th><th>Role</th><th>Anchor symbols</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/</code> root</td><td>Extension shell, per-connection state</td><td><code>SiriusExtension::Load</code> → <code>LoadInternal</code>; <code>SiriusContext</code>; <code>sirius_sql_rewrite.hpp</code></td></tr>
+      <tr><td><code>src/transparent/</code></td><td>Interception: optimizer hooks, plan swap</td><td><code>sirius_pre_optimizer_hook</code>, <code>sirius_optimizer_hook</code>, <code>gpu_execution_enabled</code>, <code>PhysicalSiriusExecution</code></td></tr>
+      <tr><td><code>src/planner/</code></td><td>Logical plan → Sirius physical plan</td><td><code>sirius_physical_plan_generator</code> + 15 builders</td></tr>
+      <tr><td><code>src/op/</code></td><td>~30 physical operators + per-op GPU impls</td><td><code>sirius_physical_operator</code>; <code>op/scan/</code>; <code>op/{aggregate,merge,order,partition}/gpu_*_impl</code></td></tr>
+      <tr><td><code>src/pipeline/</code></td><td>Pipelines, converter, scheduler, executors</td><td><code>sirius_pipeline</code>, <code>sirius_pipeline_converter</code>, <code>task_scheduler</code>, <code>gpu_pipeline_executor</code>, <code>gpu_pipeline_task</code></td></tr>
+      <tr><td><code>src/creator/</code></td><td>Data-availability-driven task minting</td><td><code>sirius::creator::task_creator</code>, the hint chain</td></tr>
+      <tr><td><code>src/exec/</code></td><td>Concurrency primitives</td><td><code>exchange_channel</code>, <code>bounded_thread_pool</code>, <code>interruptible_mpmc</code>, <code>semi_future</code>, <code>admission_control</code></td></tr>
+      <tr><td><code>src/memory/</code></td><td>Reservations, allocators, OOM policy</td><td><code>sirius_memory_reservation_manager</code>, <code>defragmenter_oom_policy</code>, <code>numa_small_pinned_mr</code></td></tr>
+      <tr><td><code>src/downgrade/</code></td><td>Tier demotion (spilling), one per memory space</td><td><code>downgrade_executor</code>, <code>downgrade_request</code></td></tr>
+      <tr><td><code>src/scan_manager/</code> + <code>src/io/</code></td><td>Splits, coalescing, prefetch, uring/S3/kvikio</td><td><code>sirius_scan_manager</code>, <code>gpu_ingestible</code>, <code>io_context</code>, <code>prefetching_cache</code></td></tr>
+      <tr><td><code>src/data/</code></td><td>Representation conversion between tiers</td><td><code>convertible_data_batch</code>, <code>sirius_converter_registry</code></td></tr>
+      <tr><td><code>src/expression/</code> + <code>src/expression_evaluator/</code></td><td>Engine-neutral AST + GPU evaluation</td><td><code>sirius::ast::node</code>, <code>from_duckdb</code>, <code>expression_evaluator</code>, <code>gpu_expression_translator</code></td></tr>
+      <tr><td><code>src/cuda/</code></td><td>Hand-written kernels (12 <code>.cu</code>)</td><td><code>sirius::cuda::scan</code> decoders; dynamic-filter kernels</td></tr>
+      <tr><td><code>src/legacy/</code></td><td><b>Dead.</b> Do not modify, do not learn from</td><td><code>GPUPhysical*</code>, <code>GPUBufferManager</code> (legacy-only!)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Hands-on</h3>
+  <pre><code># build &amp; test (always through pixi)
+pixi run make                    # full build
+pixi run make test               # C++ unit tests (Catch2) — what CI runs
+
+# one SQLLogic file / one Catch2 tag
+pixi run build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"</code></pre>
+  <pre><code>-- use it
+LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+SELECT ...;                        -- transparently routed to the GPU
+SET gpu_execution = false;         -- stand down
+CALL pin_table('lineitem', tier => 'gpu');   -- warm path
+-- SET expression_evaluator_strategy = 'AST_JIT';</code></pre>
+  <p>Telemetry: enable <code>sirius.telemetry.enable_quent</code> in <code>~/.sirius/sirius.yaml</code> to emit ndjson traces (engine, operators, ports, task queues), label queries with <code>CALL sirius_set_query_label(…)</code>, and explore with <code>pixi run quent</code> (timeline UI on :8080).</p>
+</section>
+
+<!-- ================= QUIZ ================= -->
+<section id="quiz">
+  <div class="sec-eyebrow">Reference</div>
+  <h2>Self-check</h2>
+  <p class="sec-sub">If you can answer these cold, you understand the engine. Click to reveal.</p>
+  <div class="quizmeta">
+    <span class="qc" id="quizCount"></span>
+    <button id="qRevealAll">Reveal all</button>
+    <button id="qHideAll">Hide all</button>
+  </div>
+  <div class="qgrid" id="quizGrid"></div>
+
+  <h3>Nuances &amp; footguns</h3>
+  <div id="openQs"></div>
+</section>
+
+<!-- ================= GLOSSARY ================= -->
+<section id="glossary">
+  <div class="sec-eyebrow">Reference</div>
+  <h2>Glossary</h2>
+  <table>
+    <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>data_batch</code></td><td>cuCascade's unit of data flow — Sirius's "morsel". Has a memory space, a 3-state lock (<code>idle / read_only / mutable_locked</code>), and tier conversions. Owned (a real <code>cudf::table</code>) or view-backed (zero-copy).</td></tr>
+      <tr><td><code>shared_data_repository</code></td><td>Inter-pipeline buffer keyed by <code>(operator_id, port_id)</code>; the only place batches rest between pipelines; idle contents are spill candidates.</td></tr>
+      <tr><td>port / barrier</td><td>An operator's input endpoint (<code>"default"</code> or <code>"build"</code>) with a <code>MemoryBarrierType</code>: <code>FULL</code>, <code>PARTIAL</code>, or <code>PIPELINE</code>.</td></tr>
+      <tr><td>meta-pipeline</td><td>Plan-time grouping of pipelines sharing a sink; created per blocking operator during <code>build_pipelines()</code>.</td></tr>
+      <tr><td>pipeline breaker</td><td>A Sirius-injected boundary (e.g. before PARTITION) forcing full upstream materialization — usually to learn total input size.</td></tr>
+      <tr><td>hint chain</td><td><code>task_creator</code>'s recursive walk of <code>get_next_task_hint()</code> answers (READY / WAITING_FOR_INPUT_DATA) toward the deepest ready producer.</td></tr>
+      <tr><td>reservation</td><td>A per-task GPU memory grant from <code>memory_space::make_reservation()</code>, sized by history and enforced by an RMM adaptor.</td></tr>
+      <tr><td>downgrade</td><td><b>Tier demotion of data</b> (GPU→host→disk) by the <code>downgrade_executor</code>. Not CPU fallback.</td></tr>
+      <tr><td>CPU fallback</td><td>Plan-time routing to DuckDB's own engine — <code>create_plan()</code> throws, or a per-op rule (BIGINT SUM…) declines the GPU.</td></tr>
+      <tr><td>split / ingestible</td><td>A scan work unit (row groups / segments), materialized to GPU by a per-format <code>gpu_ingestible</code>.</td></tr>
+      <tr><td>SCHED-RR</td><td>Round-robin placement of preference-less tasks across GPUs, plus the contract that all task inputs are colocated on the reservation device.</td></tr>
+      <tr><td><code>exchange_channel</code></td><td>Bounded (items + bytes) MPMC handoff carrying repository <i>handles</i> between an external producer and a STREAMING_SOURCE.</td></tr>
+      <tr><td>AST breaker</td><td>An expression node with no cuDF-AST equivalent (CASE, LIKE, SUBSTRING, some CASTs) — materialized, then referenced by the enclosing AST island.</td></tr>
+      <tr><td>pinned table</td><td>A table cached resident via <code>pin_table</code> (GPU or host tier), served layout-identical to a fresh scan.</td></tr>
+      <tr><td>cuCascade</td><td>The tiered-memory substrate: memory spaces, <code>data_batch</code>, repositories, reservation manager base.</td></tr>
+      <tr><td>cuDF / RMM</td><td>GPU dataframe kernels / GPU memory-resource layer, both from RAPIDS.</td></tr>
+      <tr><td><code>completion_handler</code></td><td>Promise/future pair distributed through a query; first <code>mark_completed()</code>/<code>report_error()</code> wins (CAS), resolving the blocked DuckDB thread.</td></tr>
+      <tr><td>Quent</td><td>Experimental ndjson telemetry + timeline UI for engine/operator/task traces.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<footer>
+  Generated 2026-07-08 from <code>docs/super-sirius/</code> + the gortex-indexed code graph (branch <code>feat-streaming-source</code>). Sibling page: <a href="starrock-sirius-integration.html">Sirius × StarRocks integration</a>.
+</footer>
+
+</main>
+</div>
+<script>
+/* ---------- architecture explorer ---------- */
+const ARCH = {
+  "d-parse":{t:"DuckDB · Parse & bind",b:["DuckDB parses, binds, and catalogs exactly as it would without Sirius — the extension never touches SQL text.","One exception: <code>sirius_sql_rewrite.hpp</code> rewrites <code>read_parquet('s3://…')</code> → <code>sirius_read_parquet</code>, a GPU-only scan path with <b>no CPU fallback</b>.","Result plumbing is also DuckDB's: Sirius ultimately hands back a <code>MaterializedQueryResult</code>."]},
+  "d-opt":{t:"DuckDB · Optimizer, with 3 rules disabled",b:["<code>sirius_pre_optimizer_hook</code> snapshots the connection's disabled-optimizer set, then disables <code>IN_CLAUSE</code>, <code>COMPRESSED_MATERIALIZATION</code>, <code>STATISTICS_PROPAGATION</code> — they emit plan shapes the transparent rebind path can't execute yet.","<code>sirius_optimizer_hook</code> (post) restores the snapshot and stores <code>LogicalOperator::Copy()</code> in <code>SiriusContext</code> — preserving <code>DynamicTableFilterSet</code> metadata via <code>detail::preserved_counts</code>.","Files: <code>src/transparent/sirius_optimizer_extension.cpp:94,139</code>."]},
+  "d-cpu":{t:"DuckDB · CPU engine = the fallback",b:["By the time Sirius decides anything, DuckDB has <i>already built</i> its CPU physical plan — fallback is doing nothing.","Whole-query fallback: <code>create_plan()</code> throws (WINDOW, UNNEST, ASOF joins, set ops, DML, unsupported types…).","Per-op fallback: BIGINT SUM/ADD/SUB/MUL decline the GPU — no INT128 accumulator, so falling back prevents <i>silent overflow</i>."]},
+  "i-load":{t:"Interception · LoadInternal",b:["<code>src/sirius_extension.cpp:1877</code> — runs once at <code>LOAD</code>.","Registers <code>SiriusContextExtensionCallback</code>: every connection gets a <code>SiriusContext</code> (a <code>ClientContextState</code>, key <code>\"sirius_state\"</code>) owning config, memory manager, repositories, scheduler, scan manager, downgrade executors, task creator.","Initializes the converter registry, defines the GPU settings (<code>InitialGPUConfigs</code>), registers functions, and installs the two <code>OptimizerExtension</code> hooks."]},
+  "i-set":{t:"Interception · gpu_execution gate",b:["<code>gpu_execution_enabled</code> — <code>src/transparent/sirius_optimizer_extension.cpp:34</code> — is a literal <code>TryGetCurrentSetting(\"gpu_execution\", …)</code>; mirrored at <code>src/sirius_context.cpp:774</code>.","<code>SET gpu_execution = false</code> → hooks stand down, pure DuckDB.","Config file: <code>~/.sirius/sirius.yaml</code> (thread counts, memory sizes, operator params)."]},
+  "i-final":{t:"Interception · OnFinalizePrepare — the swap",b:["Fires after DuckDB generates its CPU physical plan; calls <code>sirius_physical_plan_generator::create_plan()</code> on the stored logical copy — <b>the single source of truth for GPU support</b>.","Success → <code>prepared.physical_plan</code> is replaced with a <code>PhysicalSiriusExecution</code>.","Throw → the CPU plan is left untouched: fallback is silent and free.","Legacy explicit path (<code>CALL gpu_execution('…')</code>) re-parses the inner SQL and joins here."]},
+  "i-exec":{t:"Interception · PhysicalSiriusExecution",b:["A DuckDB <code>PhysicalOperator</code> subclass (<code>src/transparent/physical_sirius_execution.cpp</code>) — the only thing DuckDB's executor sees.","<code>GetData()</code> lazily creates a <code>sirius_interface</code>, wraps the plan in <code>sirius_prepared_statement_data</code>, and calls <code>sirius_execute_query()</code>.","From there: <code>begin_query_internal()</code> → <code>sirius_engine</code> + a <code>sirius_physical_materialized_collector</code> as the result sink."]},
+  "p-gen":{t:"Plan · sirius_physical_plan_generator",b:["<code>src/planner/</code>, namespace <code>sirius::planner</code>. Resolves types + column bindings (<code>ColumnBindingResolver</code>), dispatches on <code>op.type</code>.","15 <code>create_plan()</code> overloads + <code>plan_comparison_join</code>/<code>plan_delim_join</code>; unsupported operators are commented out in the header — hitting one throws.","Also owns <code>dynamic_filter_channels</code>, keyed by the <code>DynamicTableFilterSet*</code> DuckDB plants on both join and scan."]},
+  "p-meta":{t:"Plan · Meta-pipelines",b:["<code>sirius_meta_pipeline::build()</code> recursively calls each operator's <code>build_pipelines()</code>.","Streaming operators (FILTER, PROJECTION, LIMIT) append to the current pipeline; blocking operators (joins, aggregates, sorts) become sinks and spawn child meta-pipelines.","Ordering rules: join build side before probe side; children depend on the current streaming pipeline and their siblings.","<code>sirius_pipeline_build_state</code> tracks delim-join and CTE dependencies."]},
+  "p-conv":{t:"Plan · sirius_pipeline_converter",b:["Seven phases: schedule/copy → split → wire repositories → parents → finalize → link join-partition siblings → debug log (<code>src/pipeline/sirius_pipeline_converter.cpp</code>).","Rewrites TABLE_SCAN → <code>GPU_SCAN</code> in place; injects PARTITION/CONCAT around joins, MERGE_* after aggregates, the three-pipeline sample sort for ORDER_BY.","After <code>finalize_pipeline_structure()</code>, a pipeline's <code>operators</code> vector contains <i>everything</i>: <code>source = &operators[0]</code>, sink = last."]},
+  "p-repo":{t:"Plan · Repositories & ports",b:["<code>insert_repository()</code> creates a <code>cucascade::shared_data_repository</code> per sink→source edge, keyed <code>(operator_id, port_id)</code> — never mid-pipeline.","Consumers see a <code>port</code> — <code>\"default\"</code> or <code>\"build\"</code> — with a barrier: <code>FULL</code> (wait for whole upstream), <code>PARTIAL</code> (incremental), <code>PIPELINE</code> (streaming).","The base <code>get_next_task_hint()</code> enforces barrier readiness; batches resting here in <code>idle</code> state are spill candidates."]},
+  "r-creator":{t:"Runtime · task_creator",b:["<code>src/creator/task_creator.cpp</code>, namespace <code>sirius::creator</code>. Converts scheduling requests into scan or GPU pipeline tasks.","The hint chain: <code>get_next_task_hint()</code> returns READY or WAITING_FOR_INPUT_DATA{producer}; the creator recurses upstream to the deepest ready producer.","<code>mark_task_created()</code> <i>before</i> popping input (pipeline-finish race).","Resolves each task's preferred device: scan-split stamp → partition pin (<code>partition_idx % active_gpus</code>) → byte locality → NUMA. At most 2 scans scheduled at startup."]},
+  "r-sched":{t:"Runtime · task_scheduler",b:["<code>src/include/pipeline/task_scheduler.hpp:63</code>. Owns the shared queue + one executor per GPU; <code>management_eventloop()</code> matches <code>device_ready</code> × <code>task_available</code>.","Pick order per ready device: dynamic-filter build-subtree task → exact preferred-device match → anything.","Preference-less tasks round-robin (<code>_no_pref_rr_counter</code>), reset per query — the <code>cache=table_gpu</code> warm path depends on it.","Errors: <code>report_error()</code> (idempotent, CAS) then <code>drain_after_error()</code>."]},
+  "r-exec":{t:"Runtime · gpu_pipeline_executor (one per GPU)",b:["Built on <code>itask_executor</code>: a bounded worker pool with reserve→dispatch RAII slots, an <code>interruptible_mpmc</code> queue, and an <code>exclusive_stream_pool</code>.","Manager loop: reserve slot → <code>task_request</code> → pop task → clamp ask to <code>get_max_memory()</code> → <code>make_reservation()</code> → attach → acquire stream → dispatch.","Worker: <code>lock_or_prepare_batch()</code> colocates inputs (SCHED-RR contract), <code>compute_task()</code> runs <code>execute()</code> on every operator, <code>publish_output()</code> calls the sink's <code>sink()</code>.","OOM → preserve intermediates, resume from the failing operator index; ≤10 retries, 5 ms backoff."]},
+  "r-scan":{t:"Runtime · scan manager + I/O",b:["<code>sirius_scan_manager::prepare_for_query()</code>: pinned-cache match or <code>split_provider</code> per scan; a driver thread runs providers sequentially.","<code>load_balancing_scan_batch_coalescer</code>: 512 MB split batches, <code>preferred_device_id</code> stamps, prefetch hints, <code>split_connector</code> push.","I/O reactors behind <code>io_context</code>: io_uring (local), REST/libcurl + SigV4 (<code>s3://</code>), kvikio fallback — fronted by the pinned <code>prefetching_cache</code> (admission budget 2048 chunks).","Scans are <i>not</i> a separate executor — <code>GPU_SCAN</code> tasks run on the normal GPU executors."]},
+  "g-batch":{t:"Substrate · data_batch & shared_data_repository",b:["<code>cucascade::data_batch</code> is the unit of everything: scan output, task I/O, spill candidate. Three-state lock: <code>idle ↔ read_only ↔ mutable_locked</code>; an idle <code>shared_ptr</code> grants <b>no data access</b>.","Owned (<code>unique_ptr&lt;cudf::table&gt;</code>) or view-backed (<code>owning_table_view</code> — a <code>table_view</code> + type-erased owner): the zero-copy projection path.","Repositories hold idle batches between pipelines; that's precisely the spillable set."]},
+  "g-mem":{t:"Substrate · sirius_memory_reservation_manager",b:["Inherits cuCascade's manager; initializes every <code>memory_space</code> = (tier, device): GPU / pinned host per NUMA / disk (~1 TB default).","Installs each GPU's <code>cuda_async_memory_resource</code> as cuDF's device resource — every cuDF allocation is budget-visible; restored on destruction with a per-GPU <code>cudaDeviceSynchronize</code>.","Thresholds: reservation limit 0.9; downgrade trigger GPU 1.0 / host 0.8; stop 0.7.","<code>reservation_aware_resource_adaptor</code> turns over-grant allocation into a graceful failure."]},
+  "g-down":{t:"Substrate · downgrade_executor (per memory space)",b:["Spills <b>data</b> down tiers under pressure — GPU→host→disk. <b>Not CPU fallback.</b>","<code>request_downgrade(predicate)</code> → <code>future&lt;size_t&gt;</code>; stops the moment the caller's reservation would succeed.","Candidates lazily: idle repository batches (partitions back-to-front), then whole queued tasks (<code>mutable_pop_if</code>).","Movement via <code>sirius_converter_registry</code>; upgrade back is lazy, in <code>lock_or_prepare_batch()</code>."]},
+  "g-kern":{t:"Substrate · cuDF + custom kernels",b:["Operators call cuDF through thin impls: <code>op/{aggregate,merge,order,partition}/gpu_*_impl.*</code> — <code>groupby</code>, <code>reduce</code>, <code>order_by</code>, joins, <code>compute_column</code> for expressions.","<code>src/cuda/</code> holds the hand-written pieces: 8 scan decoders (ALP, RLE, bit-packing, FSST/dictionary strings…) + dynamic-filter kernels (cuco bloom / in-list) + multi-GPU replica transfer.","Streams: every <code>execute()</code>/<code>sink()</code> takes an <code>rmm::cuda_stream_view</code> from the executor's exclusive pool. House rule HYG-02: zero new <code>rmm::cuda_stream_default</code> outside legacy."]}
+};
+const adTitle=document.getElementById('adTitle'),adBody=document.getElementById('adBody');
+document.querySelectorAll('.blk').forEach(b=>{
+  b.addEventListener('click',()=>{
+    document.querySelectorAll('.blk').forEach(x=>x.classList.remove('sel'));
+    b.classList.add('sel');
+    const d=ARCH[b.dataset.c];
+    adTitle.textContent=d.t;
+    adBody.classList.remove('empty');
+    adBody.innerHTML='<ul>'+d.b.map(x=>'<li>'+x+'</li>').join('')+'</ul>';
+  });
+});
+
+/* ---------- steppers ---------- */
+const STEPPERS={
+ lc:{nodes:["lc-sql","lc-opt","lc-fin","lc-plan","lc-eng","lc-run","lc-col","lc-res"],steps:[
+  {t:"A query walks in",p:"A plain SELECT arrives on a connection that LOADed the extension. A SiriusContext is already attached (key \"sirius_state\") — config, memory manager, scheduler, scan manager, downgrade executors, all per connection. Nothing Sirius-specific has happened to the SQL.",
+   s:{"lc-sql":"full"}},
+  {t:"DuckDB optimizes — two hooks watching",p:"The pre-optimizer hook disables IN_CLAUSE, COMPRESSED_MATERIALIZATION and STATISTICS_PROPAGATION (plan shapes the rebind path can't execute), the post-hook restores them and stores LogicalOperator::Copy() in the context. DuckDB then builds its own CPU physical plan as if nothing happened.",
+   s:{"lc-sql":"ok","lc-opt":"full"}},
+  {t:"OnFinalizePrepare — the swap point",p:"Fires once the CPU physical plan exists. Both plans are now on the table: DuckDB's physical plan, and Sirius's stored logical copy. Nothing has executed yet — this is the only moment where the two worlds touch.",
+   s:{"lc-sql":"ok","lc-opt":"ok","lc-fin":"full"}},
+  {t:"create_plan() — the gate",p:"Fifteen overloads translate the logical tree into sirius_physical_operators. Any NotImplementedException — unsupported operator, unsupported type, BIGINT SUM — and the CPU plan simply stays in place: silent fallback. Success: prepared.physical_plan is replaced with a PhysicalSiriusExecution.",
+   s:{"lc-sql":"ok","lc-opt":"ok","lc-fin":"ok","lc-plan":"full"}},
+  {t:"GetData() → sirius_execute_query()",p:"DuckDB's executor pulls on PhysicalSiriusExecution like any operator. It lazily creates the sirius_interface, wraps the plan, and enters the engine; a sirius_physical_materialized_collector is created as the result sink.",
+   s:{"lc-sql":"ok","lc-opt":"ok","lc-fin":"ok","lc-plan":"ok","lc-eng":"full"}},
+  {t:"Build & convert pipelines — still single-threaded",p:"sirius_meta_pipeline::build() walks the operator tree (streaming ops append, blocking ops break), then the converter's seven phases rewrite it: TABLE_SCAN→GPU_SCAN in place, PARTITION/CONCAT around joins, MERGE_* stages, the three-pipeline sample sort, repositories wired at every boundary.",
+   s:{"lc-sql":"ok","lc-opt":"ok","lc-fin":"ok","lc-plan":"ok","lc-eng":"full"}},
+  {t:"start_query() — the DuckDB thread goes to sleep",p:"A completion_handler (promise/future) is distributed through the query. The scan manager builds split providers or matches pinned-cache entries. Exactly one thing is scheduled: the first scan operator. The DuckDB query thread blocks on future.get() — from here on, Sirius threads do all the work.",
+   s:{"lc-sql":"ok","lc-opt":"ok","lc-fin":"ok","lc-plan":"ok","lc-eng":"ok","lc-run":"full"}},
+  {t:"Scan phase",p:"The driver thread runs split providers; io_context (io_uring locally, REST+SigV4 for s3://, kvikio fallback) pulls bytes through the pinned prefetching cache; GPU_SCAN tasks hand each 512 MB split batch to its gpu_ingestible, which materializes a cudf::table and publishes it to a repository.",
+   s:{"lc-sql":"ok","lc-opt":"ok","lc-fin":"ok","lc-plan":"ok","lc-eng":"ok","lc-run":"full"}},
+  {t:"The task loop",p:"After every task, downstream consumers are offered to the task_creator, whose hint chain finds the deepest READY operator. The scheduler matches tasks to ready GPUs (build-subtree first, then preferred device, then round-robin). Executors reserve memory, then a worker runs compute_task() — execute() on every operator, source to sink — and publish_output() pushes to the next repository.",
+   s:{"lc-sql":"ok","lc-opt":"ok","lc-fin":"ok","lc-plan":"ok","lc-eng":"ok","lc-run":"full"}},
+  {t:"Results flow home",p:"The RESULT_COLLECTOR pipeline finishes; mark_completed() resolves the future (first caller wins, CAS); the collector's ColumnDataCollection is wrapped into a MaterializedQueryResult and handed back through DuckDB. Cleanup resets per-query state — including the round-robin counter the warm cache path depends on.",
+   s:{"lc-sql":"ok","lc-opt":"ok","lc-fin":"ok","lc-plan":"ok","lc-eng":"ok","lc-run":"ok","lc-col":"ok","lc-res":"full"}}
+ ]},
+ mm:{nodes:["mm-est","mm-resv","mm-defrag","mm-down","mm-tasks","mm-host","mm-oom"],steps:[
+  {t:"Size the ask",p:"pipeline_memory_history keeps a 64-entry ring of {estimated, peak, output} per pipeline; the estimate is a log-ratio-weighted average of past peak/estimate ratios (default 2× input with no history), plus bytes_to_materialize_input for spilled inputs that must come back — then clamped to get_max_memory(), which kills the partial-grant livelock.",
+   s:{"mm-est":"full"}},
+  {t:"Reserve before dispatch",p:"The executor's manager loop calls memory_space.make_reservation() before the task ever touches a worker. The reservation_aware_resource_adaptor charges every cuDF allocation against the grant. If it fits — dispatch, and none of the following steps exist.",
+   s:{"mm-est":"ok","mm-resv":"full"}},
+  {t:"Shortfall? Trim the pool first",p:"defragmenter_oom_policy checks whether the CUDA pool is fragmented rather than full: reserved > used + 10× requested (cudaMemPoolGetAttribute). If so, cudaMemPoolTrimTo and retry. Cheapest possible fix — no data moves.",
+   s:{"mm-est":"ok","mm-resv":"stall","mm-defrag":"full"}},
+  {t:"Ask the downgrade executor — with a predicate",p:"request_downgrade(predicate) where the predicate retries make_reservation_or_null(bytes_needed). The sweep walks idle repository batches (partitions back-to-front) and converts them down a tier, re-testing the predicate after each — it stops the moment the reservation fits. No over-freeing, and the background monitor is never on the correctness path.",
+   s:{"mm-est":"ok","mm-resv":"stall","mm-defrag":"ok","mm-down":"full"}},
+  {t:"Escalate to queued tasks",p:"Still short? Whole not-yet-running gpu_pipeline_tasks are pulled from the queue (mutable_pop_if, RAII return) and their input batches demoted too. Each conversion is atomic: lock + reservation + tier move + rollback on failure, via the sirius_converter_registry.",
+   s:{"mm-est":"ok","mm-resv":"stall","mm-defrag":"ok","mm-down":"ok","mm-tasks":"full"}},
+  {t:"Bytes land in host, then disk",p:"GPU → pinned host (per NUMA node, 64 MB blocks) → spill files (~1 TB budget). The return trip is lazy: nothing promotes data eagerly — the next task that needs a spilled batch upgrades it in lock_or_prepare_batch(), which also colocates it on the task's reservation device (SCHED-RR).",
+   s:{"mm-est":"ok","mm-resv":"stall","mm-defrag":"ok","mm-down":"ok","mm-tasks":"ok","mm-host":"full"}},
+  {t:"Hard OOM: reschedule, don't crash",p:"If an allocation still fails mid-task, oom_reschedule_exception carries the intermediate results and a resume operator index; the executor preserves them and reschedules from the failure point — up to 10 retries with 5 ms backoff. The history record ratchets upward so the next attempt asks for more up front. Only past 10 does the query die.",
+   s:{"mm-est":"ok","mm-resv":"ok","mm-defrag":"ok","mm-down":"ok","mm-tasks":"ok","mm-host":"ok","mm-oom":"stall"}}
+ ]}
+};
+document.querySelectorAll('[data-stepper]').forEach(root=>{
+  const cfg=STEPPERS[root.dataset.stepper];
+  const sn=root.querySelector('[data-sn]'),st=root.querySelector('[data-st]'),sp=root.querySelector('[data-sp]');
+  const prev=root.querySelector('[data-prev]'),next=root.querySelector('[data-next]'),reset=root.querySelector('[data-reset]');
+  const dots=root.querySelector('[data-dots]');
+  cfg.steps.forEach(()=>{const i=document.createElement('i');dots.appendChild(i)});
+  let idx=0;
+  function render(){
+    const s=cfg.steps[idx];
+    cfg.nodes.forEach(id=>{
+      const el=document.getElementById(id);
+      el.classList.remove('stall','full','ok');
+      if(s.s[id])el.classList.add(s.s[id]);
+    });
+    sn.textContent='Step '+idx+' / '+(cfg.steps.length-1);
+    st.textContent=s.t;sp.textContent=s.p;
+    prev.disabled=idx===0;next.disabled=idx===cfg.steps.length-1;
+    [...dots.children].forEach((d,i)=>d.classList.toggle('on',i<=idx));
+  }
+  prev.addEventListener('click',()=>{if(idx>0){idx--;render()}});
+  next.addEventListener('click',()=>{if(idx<cfg.steps.length-1){idx++;render()}});
+  reset.addEventListener('click',()=>{idx=0;render()});
+  render();
+});
+
+/* ---------- source toggle ---------- */
+const tgScan=document.getElementById('tgScan'),tgStream=document.getElementById('tgStream');
+const mpScan=document.getElementById('mpScan'),mpStream=document.getElementById('mpStream');
+function setSrc(stream){
+  tgScan.classList.toggle('on',!stream);tgStream.classList.toggle('on',stream);
+  tgScan.setAttribute('aria-selected',!stream);tgStream.setAttribute('aria-selected',stream);
+  mpScan.classList.toggle('show',!stream);mpStream.classList.toggle('show',stream);
+}
+tgScan.addEventListener('click',()=>setSrc(false));
+tgStream.addEventListener('click',()=>setSrc(true));
+
+/* ---------- group chat ---------- */
+const CHAT=[
+ {w:"task_creator",r:false,m:"HASH_JOIN, anything to do?"},
+ {w:"hash_join (op 12)",r:true,m:"WAITING_FOR_INPUT_DATA — my <code>\"build\"</code> port has a FULL barrier and the build pipeline isn't finished. Ask my producer."},
+ {w:"task_creator",r:false,m:"Walking the hint chain… CONCAT(build) says READY. <code>mark_task_created()</code> first, <i>then</i> popping its input batches — I've been burned by that race before."},
+ {w:"task_scheduler",r:false,m:"task_available × device_ready(GPU1). Task prefers GPU1 — its scan splits were stamped there by the coalescer. Matched."},
+ {w:"executor · GPU1",r:false,m:"History says this pipeline peaks at 1.4× its estimate. Asking for 3.2 GB, clamped to max… <code>make_reservation()</code>."},
+ {w:"memory_space GPU1",r:true,warn:true,m:"Denied. 1.1 GB short."},
+ {w:"downgrade_executor",r:true,m:"<code>request_downgrade</code> received. Sweeping idle repository batches, partitions back-to-front… 1.4 GB now on pinned host. Your predicate passes — stopping early. No over-freeing."},
+ {w:"memory_space GPU1",r:true,m:"Reservation granted."},
+ {w:"executor · GPU1",r:false,m:"Worker 3, exclusive stream. <code>lock_or_prepare_batch()</code> colocated every input on me — SCHED-RR contract honored. <code>compute_task()</code>: execute() on each operator, source→sink… <code>publish_output()</code> → sink()."},
+ {w:"hash_join (op 12)",r:true,m:"Build batch received in my build port. When that pipeline finishes, the FULL barrier lifts and I go READY for the probe side."},
+ {w:"task_creator",r:false,m:"Task complete. Completion check <i>first</i> — pipeline's still live — now offering downstream consumers."},
+ {w:"task_scheduler",r:false,m:"Next one has no preference. Round-robin says GPU0 — and yes, the counter resets every query, or the warm-cache path breaks."}
+];
+const chatBody=document.getElementById('chatBody');
+let chatPlayed=false,chatTimers=[];
+function playChat(){
+  chatTimers.forEach(t=>clearTimeout(t));chatTimers=[];
+  chatBody.innerHTML='';
+  CHAT.forEach((c,i)=>{
+    const d=document.createElement('div');
+    d.className='msg'+(c.r?' right':'')+(c.warn?' warnb':'');
+    d.innerHTML='<span class="who">'+c.w+'</span><div class="bub">'+c.m+'</div>';
+    chatBody.appendChild(d);
+    chatTimers.push(setTimeout(()=>d.classList.add('show'),350+i*520));
+  });
+}
+document.getElementById('chatReplay').addEventListener('click',playChat);
+new IntersectionObserver((es,obs)=>{
+  es.forEach(e=>{if(e.isIntersecting&&!chatPlayed){chatPlayed=true;playChat();obs.disconnect()}});
+},{threshold:.35}).observe(document.getElementById('chatBox'));
+
+/* ---------- quiz ---------- */
+const QUIZ=[
+ {id:"Q1",tag:"interception",q:"Where is the GPU-vs-CPU decision made, and what is the fallback mechanism?",
+  a:"SiriusContext::OnFinalizePrepare, after DuckDB has already built its CPU physical plan. It calls create_plan() on the stored logical-plan copy — the single source of truth for GPU support. Success replaces prepared.physical_plan with a PhysicalSiriusExecution; any throw leaves the CPU plan in place, so fallback is silent and costs nothing. The whole path is gated by gpu_execution_enabled (src/transparent/sirius_optimizer_extension.cpp:34)."},
+ {id:"Q2",tag:"interception",q:"Why does the pre-optimizer hook disable IN_CLAUSE, COMPRESSED_MATERIALIZATION, and STATISTICS_PROPAGATION?",
+  a:"Those optimizers produce DuckDB-internal plan shapes the transparent rebind path cannot yet execute. The hook snapshots the connection's disabled-optimizer set first and the post-hook restores it, so the connection is never permanently altered."},
+ {id:"Q3",tag:"memory",q:"What's the difference between downgrade and CPU fallback?",
+  a:"Downgrade is data-tier demotion: the downgrade_executor moves data_batches GPU→host→disk under memory pressure — execution stays on the GPU. CPU fallback is a plan-time decision: create_plan() throws (or a per-op rule like BIGINT SUM declines) and DuckDB's own engine runs the query. They share zero machinery."},
+ {id:"Q4",tag:"pipelines",q:"Why does a pipeline breaker sit immediately before every PARTITION?",
+  a:"So PARTITION can see the total input size when picking the partition count (determine_num_partitions() from hash_partition_bytes). Probe and build PARTITIONs are additionally sibling-linked so both sides of a hash join agree on the count."},
+ {id:"Q5",tag:"pipelines",q:"Name the three barrier types and a canonical user of each.",
+  a:"FULL — downstream waits for the entire upstream pipeline (hash-join build port, merge stages). PARTIAL — incremental consumption with coordination (CONCAT after PARTITION for inner joins). PIPELINE — pure streaming (ORDER → SORT_SAMPLE edge). The base get_next_task_hint() enforces them."},
+ {id:"Q6",tag:"pipelines",q:"Why are repositories only ever placed at pipeline boundaries, never mid-pipeline?",
+  a:"Because a task executes its whole pipeline in one go: compute_task() calls execute() on every operator source→sink, so there is nowhere mid-pipeline for data to rest. Repositories exist to decouple task lifetimes across pipelines — and batches idling in them are exactly the spillable set."},
+ {id:"Q7",tag:"multi-gpu",q:"State the SCHED-RR contract and who enforces it.",
+  a:"Every operator's input batches MUST arrive on the task's reservation device. Enforced by prepare_for_processing() → lock_or_prepare_batch(), which colocates all batches or none (std::nullopt → reschedule). Operators reading get_memory_space() on batches they didn't construct must carry an INVARIANT (SCHED-RR contract) comment. Related: the no-preference round-robin counter resets per query, or iteration N+1 starts on a different GPU and misses the per-device pinned cache."},
+ {id:"Q8",tag:"memory",q:"Order the responses to a memory shortfall, from cheapest to last resort.",
+  a:"(1) defragmenter_oom_policy: detect pool fragmentation (reserved > used + 10× requested), cudaMemPoolTrimTo, retry. (2) request_downgrade(predicate): spill idle repository batches back-to-front, then whole queued tasks, stopping the moment make_reservation_or_null succeeds. (3) oom_reschedule_exception: preserve intermediates + resume index, ≤10 retries with 5 ms backoff, history ratchets the estimate. Then the query dies."},
+ {id:"Q9",tag:"streaming",q:"Why does the exchange channel carry handles instead of owning shared_ptrs?",
+  a:"The producer registers the batch in the shared_data_repository first, then pushes only a handle. Queued batches therefore remain accounted and idle — visible to the downgrade executor as spill candidates like any other repository batch. An owning channel would hide queued data from the memory system entirely."},
+ {id:"Q10",tag:"streaming",q:"A batch bigger than the channel's whole byte budget arrives. What happens?",
+  a:"If the queue is non-empty, the push is rejected — a push may not cross capacity_bytes. But into an empty channel it is admitted unconditionally (the oversized-batch rule): otherwise a single huge batch could never enter and the stream would wedge forever. The bound check subtracts rather than adds to avoid integer overflow."},
+ {id:"Q11",tag:"planner",q:"How do AVG, COUNT(DISTINCT), and HUGEINT survive cuDF's gaps?",
+  a:"All rewritten at plan time: AVG decomposes into SUM + COUNT_VALID, finalized on-device with cudf::binary_operation; COUNT(DISTINCT) goes through COLLECT_SET then unique-counting; HUGEINT downcasts to BIGINT (cuDF has no int128). Meanwhile BIGINT SUM/ADD/SUB/MUL fall back to CPU outright — no INT128 accumulator means silent overflow otherwise."},
+ {id:"Q12",tag:"expressions",q:"What is an AST breaker, and what happens to one?",
+  a:"An expression node with no cuDF-AST equivalent: CASE, LIKE, SUBSTRING, non-fixed-width CAST. The evaluator materializes it into a column and re-references that column from the enclosing cuDF AST subtree — producing a tree of AST trees. Islands smaller than min_ast_size (default 2, via cudf_ast_op_count()) aren't worth the AST and run as plain MATERIALIZE kernels."}
+];
+const OPENQ=[
+ {id:"N1",t:"“3-phase” or “4-phase” sort — both, depending who you ask",d:"execution-flow.md says 4-phase (counting operators: ORDER → SORT_SAMPLE → SORT_PARTITION → MERGE_SORT); physical-plan-generation.md says 3-Phase (counting pipelines — SORT_SAMPLE and SORT_PARTITION share one task). Same machinery; don't let the names confuse a grep."},
+ {id:"N2",t:"Even CLAUDE.md conflates downgrade with CPU fallback",d:"The repo's top-level instructions say the downgrade executor handles “memory spilling / CPU fallback.” The deep docs (memory-management.md) are precise: downgrade = tier demotion of data; CPU fallback = plan-time routing. Trust the deep docs."},
+ {id:"N3",t:"GPUBufferManager will lie to you",d:"It exists only under src/legacy/ (the dead gpu_processing path). The live engine has no buffer manager class — it's the reservation manager + cuCascade memory spaces + repositories. If your search results are CamelCase, you're in the graveyard."},
+ {id:"N4",t:"“Morsel” here means bytes, not rows",d:"The unit of flow is a cucascade::data_batch — typically a 512 MB coalesced scan batch, not a fixed row-count chunk. Sizing knobs are byte-driven throughout: scan_task_batch_size, hash_partition_bytes, _concat_batch_bytes."}
+];
+const quizGrid=document.getElementById('quizGrid'),quizCount=document.getElementById('quizCount');
+QUIZ.forEach(q=>{
+  const card=document.createElement('div');card.className='qcard';
+  card.innerHTML='<button class="qhead" aria-expanded="false"><span class="qid">'+q.id+'</span><span>'+q.q+'</span><span class="qtag">'+q.tag+'</span></button><div class="qans">'+q.a+'</div>';
+  card.querySelector('.qhead').addEventListener('click',()=>{
+    card.classList.toggle('open');
+    card.querySelector('.qhead').setAttribute('aria-expanded',card.classList.contains('open'));
+    updQuiz();
+  });
+  quizGrid.appendChild(card);
+});
+function updQuiz(){quizCount.textContent=document.querySelectorAll('.qcard.open').length+' / '+QUIZ.length+' revealed'}
+updQuiz();
+document.getElementById('qRevealAll').addEventListener('click',()=>{document.querySelectorAll('.qcard').forEach(c=>c.classList.add('open'));updQuiz()});
+document.getElementById('qHideAll').addEventListener('click',()=>{document.querySelectorAll('.qcard').forEach(c=>c.classList.remove('open'));updQuiz()});
+const openQs=document.getElementById('openQs');
+OPENQ.forEach(o=>{
+  const d=document.createElement('div');d.className='openq';
+  d.innerHTML='<span class="oqid">'+o.id+'</span><b>'+o.t+'</b>'+o.d;
+  openQs.appendChild(d);
+});
+
+/* ---------- copy buttons ---------- */
+document.querySelectorAll('pre').forEach(pre=>{
+  const btn=document.createElement('button');btn.className='copybtn';btn.textContent='copy';
+  btn.addEventListener('click',()=>{
+    const txt=pre.querySelector('code').innerText;
+    navigator.clipboard&&navigator.clipboard.writeText(txt).then(()=>{btn.textContent='copied';setTimeout(()=>btn.textContent='copy',1400)}).catch(()=>{});
+  });
+  pre.appendChild(btn);
+});
+
+/* ---------- scroll spy ---------- */
+const navLinks=[...document.querySelectorAll('.sidenav a')];
+const secs=navLinks.map(a=>document.querySelector(a.getAttribute('href'))).filter(Boolean);
+const spy=new IntersectionObserver(es=>{
+  es.forEach(e=>{
+    if(e.isIntersecting){
+      navLinks.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+e.target.id));
+    }
+  });
+},{rootMargin:'-20% 0px -70% 0px'});
+secs.forEach(s=>spy.observe(s));
+</script>
+</body>
+</html>

@@ -1,0 +1,1039 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sirius as a StarRocks Compute Node — Interactive Onboarding</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F6F7F4;
+  --panel:#FFFFFF;
+  --ink:#161B17;
+  --muted:#59645C;
+  --line:#DCE1DA;
+  --accent:#76B900;
+  --accent-ink:#3E7000;
+  --accent-soft:#EEF6DC;
+  --amber:#B26A00;
+  --amber-soft:#FBF1DF;
+  --red:#B3341F;
+  --red-soft:#FBE9E4;
+  --blue:#2A5D8F;
+  --blue-soft:#E7F0F8;
+  --code-bg:#14190F;
+  --code-ink:#D9E7C4;
+  --shadow:0 1px 2px rgba(22,27,23,.05),0 6px 20px -8px rgba(22,27,23,.12);
+  --r:12px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;scroll-padding-top:80px}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+body{
+  font-family:"Source Sans 3",system-ui,-apple-system,sans-serif;
+  background:var(--paper);
+  color:var(--ink);
+  font-size:16.5px;
+  line-height:1.62;
+}
+::selection{background:var(--accent);color:#10150B}
+
+/* ---------- layout ---------- */
+.wrap{display:grid;grid-template-columns:230px minmax(0,1fr);max-width:1220px;margin:0 auto;gap:0}
+main{min-width:0;padding:0 44px 96px;border-left:1px solid var(--line)}
+@media(max-width:960px){
+  .wrap{display:block}
+  main{padding:0 20px 72px;border-left:none}
+}
+
+/* ---------- side nav ---------- */
+.sidenav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;padding:36px 18px 36px 24px}
+.sidenav .brand{font-family:"JetBrains Mono",monospace;font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent-ink);margin-bottom:20px}
+.sidenav a{display:block;font-size:.86rem;color:var(--muted);text-decoration:none;padding:5px 10px;border-left:2px solid transparent;border-radius:0 6px 6px 0}
+.sidenav a:hover{color:var(--ink);background:var(--accent-soft)}
+.sidenav a.active{color:var(--accent-ink);border-left-color:var(--accent);font-weight:600;background:var(--accent-soft)}
+.sidenav .grp{font-family:"JetBrains Mono",monospace;font-size:.64rem;letter-spacing:.12em;text-transform:uppercase;color:#9AA59D;margin:18px 0 6px 10px}
+@media(max-width:960px){
+  .sidenav{position:sticky;top:0;height:auto;display:flex;gap:6px;overflow-x:auto;background:var(--paper);border-bottom:1px solid var(--line);padding:10px 16px;z-index:50}
+  .sidenav .brand,.sidenav .grp{display:none}
+  .sidenav a{white-space:nowrap;border:1px solid var(--line);border-radius:999px;padding:5px 12px;font-size:.8rem}
+  .sidenav a.active{border-color:var(--accent);border-left-color:var(--accent)}
+}
+
+/* ---------- hero ---------- */
+.hero{padding:64px 0 40px;border-bottom:1px solid var(--line)}
+.eyebrow{font-family:"JetBrains Mono",monospace;font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--accent-ink);display:flex;align-items:center;gap:10px}
+.eyebrow::before{content:"";width:26px;height:2px;background:var(--accent)}
+.hero h1{font-family:"Bricolage Grotesque",sans-serif;font-weight:800;font-size:clamp(2.1rem,5vw,3.3rem);line-height:1.05;letter-spacing:-.02em;margin:16px 0 14px;max-width:15ch}
+.hero h1 em{font-style:normal;color:var(--accent-ink)}
+.hero .lede{font-size:1.12rem;color:var(--muted);max-width:60ch}
+.hero .lede strong{color:var(--ink)}
+.srcstrip{display:flex;gap:10px;margin-top:28px;flex-wrap:wrap}
+.srcchip{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;flex:1 1 200px;min-width:190px}
+.srcchip .n{font-family:"JetBrains Mono",monospace;font-size:.68rem;color:var(--accent-ink);letter-spacing:.1em;text-transform:uppercase}
+.srcchip .t{font-weight:600;font-size:.92rem;margin-top:2px}
+.srcchip .d{font-size:.8rem;color:var(--muted);margin-top:2px}
+.chron{margin-top:14px;font-size:.86rem;color:var(--muted);background:var(--blue-soft);border:1px solid #C9DCEC;border-radius:10px;padding:10px 14px}
+.chron b{color:var(--blue)}
+
+/* ---------- sections ---------- */
+section{padding-top:56px}
+.sec-eyebrow{font-family:"JetBrains Mono",monospace;font-size:.7rem;letter-spacing:.15em;text-transform:uppercase;color:var(--accent-ink)}
+h2{font-family:"Bricolage Grotesque",sans-serif;font-weight:700;font-size:1.7rem;letter-spacing:-.015em;margin:6px 0 8px}
+.sec-sub{color:var(--muted);max-width:66ch;margin-bottom:22px}
+h3{font-family:"Bricolage Grotesque",sans-serif;font-weight:600;font-size:1.12rem;margin:26px 0 8px}
+p{max-width:72ch}
+code{font-family:"JetBrains Mono",monospace;font-size:.84em;background:#EBEEE7;border:1px solid var(--line);border-radius:5px;padding:.08em .35em;white-space:nowrap}
+pre{background:var(--code-bg);color:var(--code-ink);border-radius:10px;padding:14px 16px;overflow-x:auto;font-family:"JetBrains Mono",monospace;font-size:.83rem;line-height:1.55;position:relative}
+pre code{background:none;border:none;padding:0;color:inherit;white-space:pre}
+.copybtn{position:absolute;top:8px;right:8px;font-family:"JetBrains Mono",monospace;font-size:.66rem;letter-spacing:.06em;background:rgba(255,255,255,.08);color:#B9C9A2;border:1px solid rgba(255,255,255,.15);border-radius:6px;padding:3px 9px;cursor:pointer}
+.copybtn:hover{background:rgba(255,255,255,.16);color:#fff}
+
+/* ---------- callouts ---------- */
+.callout{border-radius:var(--r);padding:14px 18px;margin:16px 0;font-size:.94rem;border:1px solid var(--line);background:var(--panel)}
+.callout .ct{font-family:"JetBrains Mono",monospace;font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;display:block;margin-bottom:4px}
+.callout.key{border-color:#BFDB86;background:var(--accent-soft)}
+.callout.key .ct{color:var(--accent-ink)}
+.callout.warn{border-color:#E7C68C;background:var(--amber-soft)}
+.callout.warn .ct{color:var(--amber)}
+.callout.danger{border-color:#EBB4A6;background:var(--red-soft)}
+.callout.danger .ct{color:var(--red)}
+.callout.info{border-color:#C9DCEC;background:var(--blue-soft)}
+.callout.info .ct{color:var(--blue)}
+
+/* ---------- architecture explorer ---------- */
+.arch{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr);gap:20px;margin-top:18px}
+@media(max-width:860px){.arch{grid-template-columns:1fr}}
+.arch-stack{display:flex;flex-direction:column;gap:0}
+.layer{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:12px 14px;box-shadow:var(--shadow)}
+.layer+.layer{margin-top:0}
+.layer .lt{font-family:"JetBrains Mono",monospace;font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+.layer .lt .own{color:var(--accent-ink)}
+.layer h4{font-family:"Bricolage Grotesque",sans-serif;font-size:1.02rem;font-weight:700;margin:2px 0 8px}
+.blocks{display:flex;flex-wrap:wrap;gap:8px}
+.blk{font-size:.82rem;font-weight:600;border:1.5px solid var(--line);background:var(--paper);border-radius:8px;padding:6px 11px;cursor:pointer;transition:border-color .15s,background .15s;font-family:"Source Sans 3",sans-serif;color:var(--ink)}
+.blk:hover{border-color:var(--accent)}
+.blk.sel{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-ink)}
+.blk:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.conn{display:flex;align-items:center;gap:8px;padding:6px 4px 6px 18px;font-family:"JetBrains Mono",monospace;font-size:.7rem;color:var(--muted)}
+.conn::before{content:"↓";color:var(--accent-ink);font-size:.9rem}
+.arch-detail{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:18px 20px;box-shadow:var(--shadow);align-self:start;position:sticky;top:76px}
+@media(max-width:960px){.arch-detail{position:static}}
+.arch-detail .dt{font-family:"JetBrains Mono",monospace;font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent-ink)}
+.arch-detail h4{font-family:"Bricolage Grotesque",sans-serif;font-size:1.15rem;margin:4px 0 10px}
+.arch-detail ul{padding-left:18px;font-size:.9rem;display:grid;gap:7px}
+.arch-detail .empty{color:var(--muted);font-size:.92rem}
+
+/* ---------- toggle (Doris vs StarRocks) ---------- */
+.toggle{display:inline-flex;border:1px solid var(--line);border-radius:999px;background:var(--panel);padding:3px;margin:14px 0 18px}
+.toggle button{border:none;background:none;font-family:"Source Sans 3",sans-serif;font-weight:600;font-size:.88rem;padding:7px 18px;border-radius:999px;cursor:pointer;color:var(--muted)}
+.toggle button.on{background:var(--ink);color:#fff}
+.toggle button:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.modelpanel{display:none;border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:20px 22px;box-shadow:var(--shadow)}
+.modelpanel.show{display:block}
+.flowline{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px;margin:12px 0 16px}
+.fnode{border:1.5px solid var(--line);border-radius:9px;padding:8px 12px;font-size:.8rem;font-weight:600;background:var(--paper);display:flex;align-items:center;text-align:center}
+.fnode.hot{border-color:var(--amber);background:var(--amber-soft);color:var(--amber)}
+.farrow{align-self:center;color:var(--muted);font-size:.9rem}
+.lanes{display:grid;gap:6px;margin:12px 0 16px;font-family:"JetBrains Mono",monospace;font-size:.72rem}
+.lane{display:grid;grid-template-columns:110px 1fr;align-items:center;gap:10px}
+.lane .ll{color:var(--muted)}
+.lane .bar{height:22px;border-radius:6px;position:relative;background:#EDF0EA;overflow:hidden}
+.lane .seg{position:absolute;top:0;bottom:0;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#10150B;font-weight:600}
+.seg.g{background:var(--accent)}
+.seg.g2{background:#A5D45C}
+.seg.g3{background:#CBE79B}
+.mp-notes{font-size:.9rem;display:grid;gap:8px;padding-left:18px}
+
+/* ---------- backpressure simulator ---------- */
+.bp{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:22px;box-shadow:var(--shadow);margin-top:16px}
+.pipe{display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;margin-bottom:18px}
+.pnode{border:1.5px solid var(--line);border-radius:9px;background:var(--paper);padding:8px 10px;font-size:.76rem;font-weight:600;text-align:center;display:flex;flex-direction:column;justify-content:center;min-width:86px;flex:1 1 auto;transition:border-color .2s,background .2s}
+.pnode .sub{font-family:"JetBrains Mono",monospace;font-weight:400;font-size:.62rem;color:var(--muted);margin-top:2px}
+.pnode.stall{border-color:var(--red);background:var(--red-soft)}
+.pnode.stall .sub{color:var(--red)}
+.pnode.full{border-color:var(--amber);background:var(--amber-soft)}
+.pnode.full .sub{color:var(--amber)}
+.pnode.ok{border-color:var(--accent);background:var(--accent-soft)}
+.parrow{align-self:center;color:#AEB8B0;font-size:.85rem;flex:0 0 auto}
+.bp-cap{min-height:96px;border-top:1px dashed var(--line);padding-top:14px}
+.bp-cap .step-n{font-family:"JetBrains Mono",monospace;font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent-ink)}
+.bp-cap h4{font-family:"Bricolage Grotesque",sans-serif;font-size:1.05rem;margin:3px 0 6px}
+.bp-cap p{font-size:.92rem;color:#3C4740;max-width:none}
+.bp-ctl{display:flex;align-items:center;gap:10px;margin-top:14px;flex-wrap:wrap}
+.bp-ctl button{font-family:"Source Sans 3",sans-serif;font-weight:600;font-size:.88rem;border:1.5px solid var(--ink);background:var(--ink);color:#fff;border-radius:8px;padding:7px 16px;cursor:pointer}
+.bp-ctl button.ghost{background:none;color:var(--ink)}
+.bp-ctl button:disabled{opacity:.35;cursor:default}
+.bp-ctl button:focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
+.bp-dots{display:flex;gap:5px;margin-left:auto}
+.bp-dots i{width:8px;height:8px;border-radius:50%;background:#D8DDD8}
+.bp-dots i.on{background:var(--accent)}
+
+/* ---------- tables ---------- */
+table{border-collapse:collapse;width:100%;font-size:.88rem;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin:14px 0}
+table{display:block;overflow-x:auto}
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top;min-width:120px}
+th{font-family:"JetBrains Mono",monospace;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);background:#F1F3EE}
+tr:last-child td{border-bottom:none}
+td code{white-space:nowrap}
+
+/* ---------- PR stack ---------- */
+.prstack{display:grid;gap:0;margin:16px 0;max-width:620px}
+.pr{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:14px 18px;box-shadow:var(--shadow);display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center}
+.pr .num{font-family:"JetBrains Mono",monospace;font-weight:600;font-size:1rem;color:var(--accent-ink)}
+.pr .what{font-size:.9rem}
+.pr .chip{font-family:"JetBrains Mono",monospace;font-size:.62rem;letter-spacing:.08em;text-transform:uppercase;border-radius:999px;padding:4px 10px;white-space:nowrap}
+.chip.ready{background:var(--accent-soft);color:var(--accent-ink);border:1px solid #BFDB86}
+.chip.stacked{background:var(--blue-soft);color:var(--blue);border:1px solid #C9DCEC}
+.chip.test{background:var(--amber-soft);color:var(--amber);border:1px solid #E7C68C}
+.prlink{display:flex;justify-content:center;padding:4px 0;color:var(--muted);font-size:.85rem}
+
+/* ---------- details / tutorial ---------- */
+details{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);margin:10px 0;overflow:hidden}
+summary{cursor:pointer;padding:13px 18px;font-weight:600;font-size:.95rem;list-style:none;display:flex;align-items:center;gap:12px}
+summary::-webkit-details-marker{display:none}
+summary .stepnum{font-family:"JetBrains Mono",monospace;font-size:.72rem;color:var(--accent-ink);border:1px solid #BFDB86;background:var(--accent-soft);border-radius:6px;padding:2px 8px;flex-shrink:0}
+summary::after{content:"+";margin-left:auto;font-family:"JetBrains Mono",monospace;color:var(--muted)}
+details[open] summary::after{content:"−"}
+details[open] summary{border-bottom:1px solid var(--line)}
+.dbody{padding:14px 18px 18px;font-size:.92rem}
+.dbody ul,.dbody ol{padding-left:20px;display:grid;gap:6px;margin:8px 0}
+.dbody pre{margin:10px 0}
+
+/* ---------- action items ---------- */
+.progress{display:flex;align-items:center;gap:12px;margin:14px 0 6px}
+.pbar{flex:1;height:8px;border-radius:999px;background:#E5E9E2;overflow:hidden}
+.pbar i{display:block;height:100%;width:0%;background:var(--accent);border-radius:999px;transition:width .25s}
+.pcount{font-family:"JetBrains Mono",monospace;font-size:.74rem;color:var(--muted);white-space:nowrap}
+.tasklist{list-style:none;display:grid;gap:8px;margin:12px 0 4px}
+.task{border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:10px 14px;display:flex;gap:12px;align-items:flex-start;font-size:.9rem}
+.task input{margin-top:4px;width:16px;height:16px;accent-color:var(--accent-ink);flex-shrink:0;cursor:pointer}
+.task label{cursor:pointer}
+.task.done label{color:var(--muted);text-decoration:line-through;text-decoration-color:#B7C0B9}
+.persistnote{font-size:.78rem;color:var(--muted);font-family:"JetBrains Mono",monospace;margin-top:8px}
+
+/* ---------- quiz ---------- */
+.quizmeta{display:flex;align-items:center;gap:14px;margin:14px 0;flex-wrap:wrap}
+.quizmeta .qc{font-family:"JetBrains Mono",monospace;font-size:.74rem;color:var(--muted)}
+.quizmeta button{font-size:.8rem;font-weight:600;border:1.5px solid var(--line);background:var(--panel);border-radius:8px;padding:5px 12px;cursor:pointer;color:var(--ink)}
+.quizmeta button:hover{border-color:var(--accent)}
+.qgrid{display:grid;gap:12px}
+.qcard{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);box-shadow:var(--shadow);overflow:hidden}
+.qcard .qhead{width:100%;text-align:left;border:none;background:none;padding:14px 18px;cursor:pointer;display:flex;gap:12px;align-items:baseline;font-family:"Source Sans 3",sans-serif;font-size:.95rem;font-weight:600;color:var(--ink)}
+.qcard .qhead:focus-visible{outline:2px solid var(--accent-ink);outline-offset:-2px}
+.qcard .qid{font-family:"JetBrains Mono",monospace;font-size:.72rem;color:var(--accent-ink);flex-shrink:0}
+.qcard .qtag{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:.6rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 8px;flex-shrink:0}
+.qans{display:none;border-top:1px dashed var(--line);padding:13px 18px 16px;font-size:.9rem;background:#FBFCF9;color:#333D36}
+.qcard.open .qans{display:block}
+.qcard.open .qhead .qid::after{content:" ✓";color:var(--accent-ink)}
+.openq{border-left:3px solid var(--amber);background:var(--panel);border-top:1px solid var(--line);border-right:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:0 var(--r) var(--r) 0;padding:12px 16px;margin:10px 0;font-size:.9rem}
+.openq .oqid{font-family:"JetBrains Mono",monospace;font-size:.7rem;color:var(--amber);letter-spacing:.08em}
+.openq b{display:block;margin:2px 0 4px}
+
+/* ---------- misc ---------- */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:14px 0}
+@media(max-width:760px){.two{grid-template-columns:1fr}}
+.mini{border:1px solid var(--line);border-radius:var(--r);background:var(--panel);padding:16px 18px;font-size:.9rem}
+.mini h4{font-family:"Bricolage Grotesque",sans-serif;font-size:1rem;margin-bottom:8px}
+.mini ul{padding-left:18px;display:grid;gap:6px}
+.klist{padding-left:20px;display:grid;gap:9px;margin:12px 0;max-width:76ch}
+footer{border-top:1px solid var(--line);margin-top:72px;padding-top:20px;font-size:.8rem;color:var(--muted);font-family:"JetBrains Mono",monospace}
+.kbd{font-family:"JetBrains Mono",monospace;font-size:.72em;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 6px;background:var(--panel)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="sidenav" aria-label="Sections">
+  <div class="brand">Sirius × StarRocks</div>
+  <div class="grp">Mental model</div>
+  <a href="#model">Architecture</a>
+  <a href="#ownership">Your mandate</a>
+  <a href="#evolution">Doris → StarRocks</a>
+  <a href="#operators">Source &amp; sink</a>
+  <a href="#backpressure">Backpressure</a>
+  <a href="#nixl">Nixl transport</a>
+  <a href="#memory">Memory (#840)</a>
+  <div class="grp">State of the world</div>
+  <a href="#state">PR stack &amp; blockers</a>
+  <a href="#tutorial">Setup tutorial</a>
+  <a href="#goals">Goals &amp; timeline</a>
+  <div class="grp">Your work</div>
+  <a href="#actions">Action items</a>
+  <a href="#quiz">Self-check</a>
+  <a href="#glossary">Glossary</a>
+</nav>
+
+<main>
+
+<!-- ================= HERO ================= -->
+<header class="hero" id="top">
+  <div class="eyebrow">Onboarding digest · interactive edition</div>
+  <h1>Sirius as a <em>StarRocks</em> compute node</h1>
+  <p class="lede"><strong>Owner: Alexander Ocsa</strong> — second engineer, streaming &amp; exchange operators. One idea governs everything on this page: <strong>StarRocks owns everything distributed; Sirius executes one fragment at a time and never knows it's distributed; the Rust wrapper moves bytes between them.</strong></p>
+  <div class="srcstrip">
+    <div class="srcchip"><span class="n">Source 01</span><div class="t">Engineering sync</div><div class="d">Matthijs, William, Bobbi, Rod — day-one orientation. Decisions: Doris deprecation, Nixl-vs-UCXX, staffing, timeline. Confirms the spelling <b>cuCascade</b>.</div></div>
+    <div class="srcchip"><span class="n">Source 02</span><div class="t">Design proposal</div><div class="d"><code>exchange-design.md</code> @ <code>c8593116</code>, <code>experimental/starrocks/docs/</code> — the spec PR #914 refers to. Tracks #826 and sub-issues #835–#841.</div></div>
+    <div class="srcchip"><span class="n">Source 03</span><div class="t">Pairing session</div><div class="d">With Matthijs (Felipe joined ~20 min in). Most recent snapshot: task handoff, environment setup, PR stack #1021 → #1022 → #1024.</div></div>
+  </div>
+  <div class="chron"><b>Chronology rule:</b> where sources disagree on <b>current state</b>, the pairing session wins; where they disagree on <b>spec</b>, the committed design doc wins over transcript-derived notes.</div>
+</header>
+
+<!-- ================= ARCHITECTURE ================= -->
+<section id="model">
+  <div class="sec-eyebrow">01 · Mental model</div>
+  <h2>Who owns what</h2>
+  <p class="sec-sub">Not a distributed Sirius, not a Theseus rebuild. Sirius is embedded as the execution engine <b>inside</b> StarRocks, replacing CPU stage execution with GPU execution. Click any component to see its responsibilities.</p>
+
+  <div class="arch">
+    <div class="arch-stack">
+      <div class="layer">
+        <div class="lt"><span>Layer</span><span class="own">Owns everything distributed</span></div>
+        <h4>StarRocks Frontend (FE)</h4>
+        <div class="blocks">
+          <button class="blk" data-c="fe-plan">SQL parse &amp; plan</button>
+          <button class="blk" data-c="fe-route">Fragment routing</button>
+          <button class="blk" data-c="fe-meta">Metadata &amp; registration</button>
+        </div>
+      </div>
+      <div class="conn"><code>TExecPlanFragmentParams</code> (Thrift) + heartbeats, per fragment</div>
+      <div class="layer">
+        <div class="lt"><span>Layer · same process, FFI — no separate process</span><span class="own">Owns the exchange</span></div>
+        <h4>Rust compute-node wrapper</h4>
+        <div class="blocks">
+          <button class="blk" data-c="cn-rpc">RPC server</button>
+          <button class="blk" data-c="cn-nixl">Nixl endpoint</button>
+          <button class="blk" data-c="cn-chan">push / pull channels</button>
+          <button class="blk" data-c="cn-trans">translate_fragment (#841)</button>
+        </div>
+      </div>
+      <div class="conn">bounded channels over the cxx FFI — the wrapper⇄engine boundary <b>is</b> the channel</div>
+      <div class="layer">
+        <div class="lt"><span>Layer</span><span class="own">Owns per-fragment execution only</span></div>
+        <h4>Sirius engine (GPU)</h4>
+        <div class="blocks">
+          <button class="blk" data-c="s-src">Streaming source #836</button>
+          <button class="blk" data-c="s-pipe">Pipeline executor</button>
+          <button class="blk" data-c="s-sink">Streaming sink #837</button>
+          <button class="blk" data-c="s-repo">shared_data_repository</button>
+          <button class="blk" data-c="s-down">downgrade_executor</button>
+          <button class="blk" data-c="s-sess">Stream session #839</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="arch-detail" id="archDetail" aria-live="polite">
+      <span class="dt">Component detail</span>
+      <h4 id="adTitle">Pick a component</h4>
+      <div id="adBody" class="empty">Click any block on the left. Start with the FE — everything downstream is a consequence of it owning the plan.</div>
+    </div>
+  </div>
+
+  <div class="callout key"><span class="ct">The single most important idea</span>A plan fragment already encodes <b>"this partition → compute node X."</b> Matthijs: <i>"It's very dumb. We just translate, execute, exchange, move on."</i> Sirius is deliberately kept unaware it's being used for distributed execution so the same context can be embedded in any engine — a design goal, not a limitation.</div>
+
+  <div class="callout info"><span class="ct">Consequence for your Theseus experience</span>Custom distributed algorithms with bespoke worker synchronization are out of scope by design — the FE dictates the plan. Your distributed-systems depth applies at a different layer: the <b>exchange, backpressure, and GPU-memory machinery</b> (cuCascade + Nixl) inside a fragment's streaming session — exactly where #838/#839/#840 sit.</div>
+
+  <p style="margin-top:14px">Translation path per fragment: <code>TExecPlanFragmentParams</code> → <code>translate_fragment()</code> (#841) → Substrait <code>Plan</code> → DuckDB plan → Sirius streaming plan. The data repository is owned by Sirius but exposed through an API so external code can push/pull batches — longer term this decouples Sirius from requiring DuckDB.</p>
+</section>
+
+
+<!-- ================= OWNERSHIP ================= -->
+<section id="ownership">
+  <div class="sec-eyebrow">02 · Task ownership</div>
+  <h2>Your mandate: five issues under #826</h2>
+  <p class="sec-sub">Matthijs has been doing the "plumbing" — structure that requires no design work, intentionally not tracked as issues. The parts that need real design judgment are explicitly yours, because they benefit from deeper C++ / distributed-systems experience than he has.</p>
+
+  <table>
+    <thead><tr><th>Issue</th><th>Task</th><th>Why it's yours</th></tr></thead>
+    <tbody>
+      <tr><td><code>#836</code></td><td>Streaming source operator — <b>build first</b></td><td>Needs a Sirius operator author; no code yet.</td></tr>
+      <tr><td><code>#837</code></td><td>Streaming sink operator — build second</td><td>Follows the source. Per the committed spec, includes the partitioned variant.</td></tr>
+      <tr><td><code>#838</code></td><td><b>Scope in dispute:</b> the pairing-session table says "streaming sink partitioning support"; the committed spec defines #838 as <b>backpressure policy</b> (partitioning lives in #837). Spec beats transcript-derived notes — confirm the one-liner with Matthijs (open Q12).</td><td>Design-sensitive either way.</td></tr>
+      <tr><td><code>#839</code></td><td>Stream session support</td><td>Blocked on #836/#837.</td></tr>
+      <tr><td><code>#840</code></td><td>Resource management API</td><td>Ties deeply into cuCascade memory management — wants your design input.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="two">
+    <div class="mini">
+      <h4>The question you asked — settled</h4>
+      <ul>
+        <li>You asked directly about the distributed sorting algorithm you built in Theseus — workers synchronized, one worker checking target GPU memory before sending the next task.</li>
+        <li>Matthijs: <i>"This is actually completely out of our control in the case of StarRocks, because StarRocks is the frontend and it drives the planning and creation of plan fragments. It simply follows directly from that… it's not a thing that we control."</i></li>
+        <li>So the flexibility question is answered: <b>no, by design.</b> Custom distributed algorithms with bespoke synchronization are not implemented at the Sirius layer.</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>Backpressure survives — different mechanism</h4>
+      <ul>
+        <li>Nixl provides a <b>side channel between agents</b> to announce/request transfers, plus a <b>notification callback</b> on the receiving side — the receiver knows when a transfer is complete and the bytes can be interpreted.</li>
+        <li>Under GPU pressure, strategies like <b>staging into host memory</b> are possible.</li>
+        <li>Exchange-queued data stays in a <b>cuCascade data repository with a separate channel</b>, so it can be downgraded/spilled while the CN handles the exchange and coordinates backpressure with peers.</li>
+        <li>Matthijs deferred the detailed design <b>to you</b>, as the person with the deeper cuCascade/Sirius-internals grasp — full mechanism in PR #914 and stepped through in the simulator below.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout key"><span class="ct">Board ownership</span>You volunteered to reorganize the GitHub project board — all tasks currently P2, nobody sure the board reflects reality (maintained ad hoc by Bobbi, Rodrigo, and William). Matthijs: "just go for it… make sure we're tracking things better than what currently exists." Review the reorg with him — and first confirm whether the Rod + William board working session already happened (sync item), folding its output in rather than duplicating it.</div>
+</section>
+
+<!-- ================= EVOLUTION ================= -->
+<section id="evolution">
+  <div class="sec-eyebrow">03 · Why streaming</div>
+  <h2>Doris → StarRocks: old model vs. new model</h2>
+  <p class="sec-sub">Toggle between the two exchange models. Understanding what made the Doris experiment slow is the fastest way to see why the streaming design looks the way it does.</p>
+
+  <div class="toggle" role="tablist">
+    <button id="tgDoris" class="on" role="tab" aria-selected="true">origin/doris — materialize-then-shuffle</button>
+    <button id="tgSR" role="tab" aria-selected="false">StarRocks — streaming</button>
+  </div>
+
+  <div class="modelpanel show" id="mpDoris" role="tabpanel">
+    <div class="flowline">
+      <div class="fnode hot">Fragment runs<br>to completion</div><span class="farrow">→</span>
+      <div class="fnode">ExchangeArtifact<br><span style="font-weight:400;font-size:.72rem">fully-materialized packed cuDF tables</span></div><span class="farrow">→</span>
+      <div class="fnode">Rust hash-partition<br><span style="font-weight:400;font-size:.72rem">compute_dest_assignments, CRC32</span></div><span class="farrow">→</span>
+      <div class="fnode">Ship via bRPC<br><span style="font-weight:400;font-size:.72rem">nixl GPU-direct fast path</span></div>
+    </div>
+    <ul class="mp-notes">
+      <li><b>Exchange cannot begin until the fragment finishes.</b> This was one of the two reasons the Doris experiment was only marginally faster than CPU — the other: Amin's I/O overhaul wasn't in yet.</li>
+      <li><b>Status: paused / effectively deprecated</b> (decided at the sync). Alibaba only cares about StarRocks; combining both up front is extra work with little payoff. William's only concern was making the deprecation explicit.</li>
+      <li>StarRocks is a Doris fork — architecturally similar, different implementation details (e.g., different Thrift definitions). Picking Doris back up later is low-cost.</li>
+    </ul>
+  </div>
+
+  <div class="modelpanel" id="mpSR" role="tabpanel">
+    <div class="lanes" aria-label="Overlapping streaming lanes">
+      <div class="lane"><span class="ll">receive</span><div class="bar"><span class="seg g3" style="left:44%;width:26%">N+1</span></div></div>
+      <div class="lane"><span class="ll">compute</span><div class="bar"><span class="seg g2" style="left:24%;width:26%">N</span></div></div>
+      <div class="lane"><span class="ll">send</span><div class="bar"><span class="seg g" style="left:4%;width:26%">N−1</span></div></div>
+    </div>
+    <ul class="mp-notes">
+      <li>A stage accepts input batches over its lifetime and emits output incrementally, so <b>receive(N+1), compute(N), and send(N−1) overlap</b> — per-device <code>exclusive_stream_pool</code> for async copies; reserve-before-dispatch via <code>make_reservation</code> keeps the working set within budget.</li>
+      <li><b>Partition and coalesce move into the engine.</b> The hash partition is the same GPU operation as Sirius's existing <code>PARTITION</code> operator; the partitioned sink reuses that machinery. The "Rust hash-partition" belongs to the old model.</li>
+      <li><b>Long-term "walk, crawl, run"</b> toward a Velox-like, engine-pluggable Sirius: (1) StarRocks-specific implementation → (2) extract common/reusable components (Substrait translation, exchange components, public Sirius APIs) → (3) generic layer, then rebuild Doris on top if desired.</li>
+    </ul>
+    <div class="callout warn" style="margin-bottom:0"><span class="ct">Implication for your operators</span>Build for StarRocks now, don't over-generalize prematurely — the generic layer is a later extraction step, not a v1 requirement.</div>
+  </div>
+</section>
+
+<!-- ================= OPERATORS ================= -->
+<section id="operators">
+  <div class="sec-eyebrow">04 · Your operators</div>
+  <h2>Streaming source #836 &amp; streaming sink #837</h2>
+  <p class="sec-sub">Fragment boundaries become a streaming source at the bottom and a streaming sink at the top. Both are ordinary <code>sirius_physical_operator</code> subclasses — not a separate subsystem.</p>
+
+  <div class="two">
+    <div class="mini">
+      <h4>Streaming source — #836 (build first)</h4>
+      <ul>
+        <li><b>Used only for exchange</b> — when a fragment's input comes from another compute node.</li>
+        <li>A <b>leaf fragment</b> reading parquet uses the normal existing source (<code>DUCKDB_SCAN</code> / <code>GPU_PARQUET_SCAN</code>) — it may still have a streaming sink. A trivial single-node <code>SELECT *</code> has neither.</li>
+        <li><b>Multi-shot:</b> publishes a task each time a batch arrives on its input channel, until <code>close_input</code> — unlike today's one-shot scan.</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>Streaming sink — #837 (build second)</h4>
+      <ul>
+        <li>Final operator of its pipeline; runs inside a normal <code>gpu_pipeline_task</code> on the existing <code>gpu_pipeline_executor</code> — like <code>RESULT_COLLECTOR</code> or <code>MERGE_GROUP_BY</code> today. <b>No dedicated thread pool</b>; <code>nixl</code>'s own threads live in the wrapper.</li>
+        <li><b>Incremental:</b> pushes each output batch per <code>sink()</code> call instead of materializing a <code>ColumnDataCollection</code> (as <code>sirius_physical_materialized_collector</code> does today).</li>
+        <li><b>Sink output stays on the GPU</b> (cuCascade data repository), so Nixl can pick the fast path when moving GPU-resident data between nodes.</li>
+        <li><b>Partitioned variant:</b> per-destination output channels (one slow receiver cannot head-of-line-block the rest) + <b>bounded coalescing</b> of small slices up to a size/time threshold — otherwise you ship a flood of tiny RDMA transfers. Coalescing state is bounded, accounted, repository-visible.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>The data unit and why channels don't own it</h3>
+  <p><code>shared_ptr&lt;cucascade::data_batch&gt;</code> wrapping a <code>cudf::table</code>, guarded by a 3-state lock (<code>idle</code> / <code>read_only</code> / <code>mutable_locked</code>). <b>Channels carry handles (repository batch-ids), not owning <code>shared_ptr</code>s</b> — the channel is deliberately not an owner, so queued batches stay accounted/spillable via the <code>shared_data_repository</code> and <code>use_count()</code> reflects only real owners. That is what makes the sink's zero-copy steal possible.</p>
+
+  <h3>Partition-hash parity — correctness-critical</h3>
+  <p>The sink must reproduce StarRocks' hash <b>bit-exactly, per partition type</b> (<code>be/src/exec/pipeline/exchange/exchange_sink_operator.cpp</code>). Getting this wrong silently corrupts shuffle joins and aggregations. Validate against <code>test/sql/test_exchange_hash_function</code>.</p>
+  <table>
+    <thead><tr><th>Partition type</th><th>Hash</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>HASH_PARTITIONED</code></td><td><b>fnv_hash</b> (v0, default) or <b>xxh3_hash</b> (v1)</td><td>Dispatched on <code>exchange_hash_function_version</code>. Only regime where deviating is ever safe — and only with all-Sirius CNs and no native hash-bucketed tables.</td></tr>
+      <tr><td><code>BUCKET_SHUFFLE_HASH_PARTITIONED</code> (no bucket properties)</td><td><b>CRC32</b>, seeded 0</td><td>Anchored to the on-disk bucket layout computed at ingest time — never deviate.</td></tr>
+      <tr><td><code>BUCKET_SHUFFLE_HASH_PARTITIONED</code> (with bucket properties)</td><td>Bucket-id mapping</td><td><code>_calc_hash_values_and_bucket_ids</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="two">
+    <div class="mini">
+      <h4>Distributed GROUP BY shape</h4>
+      <ul>
+        <li><code>HASH_GROUP_BY</code> (partial) → <b>partitioned streaming sink</b> — the shuffle <i>is</i> the partition, no separate local <code>PARTITION</code> → nixl → streaming source → <code>MERGE_AGGREGATE</code> (final).</li>
+        <li>No StarRocks-specific merge operator: both ends are Sirius, so shipped partial-aggregate state is Sirius's own format; <code>nixl</code> routes opaque bytes.</li>
+        <li>Sirius does not choose the phasing — the FE plans the partial/final fragment structure.</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>Ordering caveat</h4>
+      <ul>
+        <li><b>Order is not preserved</b> — incremental emission + coalescing reorder rows.</li>
+        <li>v1 targets order-insensitive exchanges only.</li>
+        <li>A merging exchange (<code>ORDER BY</code> / top-N) is future work (open Q14).</li>
+      </ul>
+    </div>
+  </div>
+</section>
+<!-- ================= BACKPRESSURE ================= -->
+<section id="backpressure">
+  <div class="sec-eyebrow">05 · Stream session #839</div>
+  <h2>Backpressure, step by step</h2>
+  <p class="sec-sub">The public entry point builds a streaming plan and starts it on the existing <code>task_scheduler</code> without blocking. The wrapper feeds inputs with <code>push(stream_id, batch)</code>, signals end-of-stream with <code>close_input(stream_id)</code>, drains outputs with <code>pull()</code> / <code>wait()</code>. Channels are <b>bounded</b> and are the flow-control mechanism, not just buffers. Step through what happens when a downstream compute node slows down — the chain propagates <b>backwards</b>.</p>
+
+  <div class="bp">
+    <div class="pipe" aria-hidden="true">
+      <div class="pnode" id="n-up">Upstream CN<span class="sub">sender</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="n-recv">Wrapper recv<span class="sub">nixl drain</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="n-inch">Input channel<span class="sub">bounded</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="n-src">Source #836<span class="sub">multi-shot</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="n-repo">Pipeline + repo<span class="sub">port barriers</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="n-sink">Sink #837<span class="sub">task hint</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="n-outch">Output channel<span class="sub">bounded</span></div>
+      <span class="parrow">→</span>
+      <div class="pnode" id="n-down">Downstream CN<span class="sub">receiver</span></div>
+    </div>
+    <div class="bp-cap">
+      <span class="step-n" id="bpStepN">Step 0 / 7</span>
+      <h4 id="bpTitle"></h4>
+      <p id="bpText"></p>
+    </div>
+    <div class="bp-ctl">
+      <button class="ghost" id="bpPrev">← Back</button>
+      <button id="bpNext">Next →</button>
+      <button class="ghost" id="bpReset">Reset</button>
+      <div class="bp-dots" id="bpDots" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="ct">Edge-triggered re-arming — know the race</span>Task creation is triggered by <code>schedule(op)</code>, so when the wrapper <code>pull()</code>s a batch it must re-schedule the sink. A narrow race remains; the fallback is that a sink finding the channel full keeps its result <b>idle</b> in the repository (still spillable) and yields its worker rather than blocking it.</div>
+
+  <p>Two existing throttles compose with this: GPU memory <b>reservations block</b> when the budget is exhausted, and the GPU executor dispatches through a <b>bounded worker pool</b>. For the <b>root</b> fragment, the output channels <i>are</i> the query result — drained and returned to the FE via <code>fetch_data</code>. Routing everywhere is by stream id.</p>
+</section>
+
+<!-- ================= NIXL ================= -->
+<section id="nixl">
+  <div class="sec-eyebrow">06 · Transport</div>
+  <h2>Nixl — how bytes actually move</h2>
+  <p class="sec-sub">A high-level, agent-based, point-to-point GPU data-transfer API from the Dynamo project. You hand it data; it picks the fastest path: <code>cudaMemcpy</code> intra-GPU, NVLink-class intra-box, UCX (among others) remote. The appeal: plan fragments already encode partition routing, so the CN just tells Nixl where partitions go — no custom transport logic.</p>
+
+  <h3>Transfer protocol (this <em>is</em> a sequence)</h3>
+  <div class="mini" style="margin:12px 0">
+    <ol style="padding-left:20px;display:grid;gap:8px">
+      <li><b>Startup:</b> each CN creates one agent and computes local metadata (<code>get_local_md</code>).</li>
+      <li><b>First contact:</b> first transfer to a new peer exchanges agent metadata over the side-channel, cached per peer (invalidated on restart).</li>
+      <li><b>Per transfer:</b> buffer metadata via <code>NixlMetadataService::exchange_metadata</code>.</li>
+      <li>Receiver leases a <b>pre-registered staging buffer</b> (bump-allocated, RAII lease).</li>
+      <li>Sender issues <code>create_xfer_req</code> + <code>post_xfer_req</code>, polls <code>get_xfer_status</code>.</li>
+      <li><code>transfer_complete</code> handshake.</li>
+      <li>Receiver wraps the bytes as a repository-registered <code>data_batch</code> and enqueues a <b>handle</b> on the input channel.</li>
+    </ol>
+  </div>
+
+  <div class="two">
+    <div class="mini">
+      <h4>Path preference</h4>
+      <ul>
+        <li><b>GPUDirect RDMA GPU staging is preferred.</b></li>
+        <li><b>Host staging</b> is a deployment/tier choice — not a failure path.</li>
+        <li><b>bRPC/CPU</b> is the true last-resort fallback.</li>
+        <li><b>Same-CN exchange skips the network entirely</b> — in-process channel hand-off, no serialization (StarRocks' local-exchange equivalent).</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>Why Nixl, not UCXX directly (sync decision)</h4>
+      <ul>
+        <li>Good abstraction for plan-fragment-encoded routing/partitioning.</li>
+        <li>Built-in side channel for backpressure/metadata; out-of-the-box spilling to host memory or disk.</li>
+        <li>Nixl <b>wraps UCXX internally</b> — swapping to UCXX later fits the same architecture.</li>
+        <li>Heavy internal investment via Dynamo; NV Research wants a Dynamo-powered distributed query engine with Sirius underneath.</li>
+        <li>Direct UCXX would take multiple weeks — Rod and William cited a long history of painful UCX integrations at BlazingDB.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ================= MEMORY ================= -->
+<section id="memory">
+  <div class="sec-eyebrow">07 · Resource management #840</div>
+  <h2>One GPU, two tenants, one budget</h2>
+  <p class="sec-sub">The wrapper (nixl staging/receive buffers) and Sirius (compute + spill) share one physical GPU. Three budget models were considered; the recommendation is <b>option A — a shared cuCascade <code>memory_reservation_manager</code></b>, owned by the wrapper, borrowed by Sirius.</p>
+
+  <div class="callout key"><span class="ct">Why option A wins</span>It is the only option where in/out exchange batches can be <b>spill candidates alongside compute</b> via the existing <code>downgrade_executor</code> — whose sweep walks registered <code>shared_data_repository</code> batches and filters on <code>idle</code> state, not origin.</div>
+
+  <div class="two">
+    <div class="mini">
+      <h4>Two required changes</h4>
+      <ul>
+        <li><code>sirius_context</code> borrows the wrapper's manager instead of constructing its own (<code>sirius_context::sirius_context</code> in <code>src/sirius_context.cpp</code>).</li>
+        <li>Exchange memory made visible: queued batches held as repository-registered <code>data_batch</code>es, and the nixl staging arena reserved <b>once</b> against the budget at startup. Per-transfer leases are sub-allocations — no further reservation; only the <code>cuMemAlloc</code>-and-register fallback needs fresh reservations.</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>Four constraints for all-to-all exchange</h4>
+      <ul>
+        <li><b>Lease-aware spill</b> — copying a staging-backed batch out returns the lease.</li>
+        <li><b>Reserved receive-staging floor.</b></li>
+        <li><b>Reserved copy-out credit.</b></li>
+        <li><b>Reserved send-copy credit</b> — the last two prevent "must free memory to send, but the send needs memory" deadlocks.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout info"><span class="ct">The sync already settled the v1 direction</span>Agreed simplest first version: keep the queue <b>inside Sirius</b> so the existing downgrade executor handles memory pressure, <b>accepting some leaking of dependency types initially</b>. Option A is that agreement, formalized. William's pluggable-downgrade proposal (register external data repositories with a priority) is the <b>future</b> direction, not v1. Also deferred: exposing resource info on the streaming session so the receiving side can make backpressure and host-memory/disk placement decisions — fold this into your #839/#840 config scoping.</div>
+</section>
+
+<!-- ================= STATE ================= -->
+<section id="state">
+  <div class="sec-eyebrow">08 · Current implementation state</div>
+  <h2>The PR stack &amp; the known blocker</h2>
+  <p class="sec-sub">What works today: a single self-contained fragment dispatched, translated (StarRocks thrift → Substrait → DuckDB → Sirius physical), executed on GPU, and returned via the result collector — end to end, minimal, only on the draft stack. <b>No cross-node exchange exists yet.</b> That's the clock your operators sit on.</p>
+
+  <div class="prstack">
+    <div class="pr"><span class="num">#1021</span><span class="what">Translator emits <code>local_files</code> for parquet scans — unblocks real file scans</span><span class="chip ready">Ready for review</span></div>
+    <div class="prlink">↑ stacked on ↑</div>
+    <div class="pr"><span class="num">#1022</span><span class="what">FFI: "execute these Substrait bytes, return Arrow" (one-shot) + result collector</span><span class="chip stacked">Stacked on #1021</span></div>
+    <div class="prlink">↑ stacked on ↑</div>
+    <div class="pr"><span class="num">#1024</span><span class="what">Connects the final bits so a real <code>SELECT *</code> returns rows</span><span class="chip test">Check out to test</span></div>
+  </div>
+
+  <p><b>FFI today is tiny:</b> <code>make_context</code> / <code>make_context_from_config</code> returning a <code>unique_ptr</code> context. #1022 adds one-shot Substrait execution. The streaming-session FFI (create session, push to source, pull from sink, destroy) is the future extension. Related plumbing from the design doc: CN RPC skeleton (PR #856), plan translator (PR #852, #841), cxx bindings (#835, PR #908). Matthijs's current plumbing is intentionally not tracked as issues.</p>
+
+  <details>
+    <summary>Earlier snapshot from the sync — superseded by the stack above</summary>
+    <div class="dbody">
+      <ul>
+        <li>Implemented then: CN registers with the FE (the FE does a <b>MySQL insert into a backend table</b>), then the FE connects back and sends <b>heartbeats</b>.</li>
+        <li>Open then: a ~4000-line plan-fragment→Substrait translation PR (touches nothing in Sirius core), an additional-Thrift-RPC-methods PR, Rust bindings in progress (create context → run a Substrait plan end-to-end).</li>
+        <li>The sync gives no PR numbers, but these plausibly map to the design doc's #852 (translator), #856 (CN RPC skeleton), #908 (cxx bindings).</li>
+      </ul>
+    </div>
+  </details>
+
+  <h3>Repo layout &amp; CI</h3>
+  <ul class="klist">
+    <li>All work lives in the Sirius repo under <code>experimental/starrocks/</code>. A <b>StarRocks submodule pinned to the latest release</b> exists for (a) RPC/Thrift definitions used to generate interop code, (b) reusing the StarRocks front end.</li>
+    <li>A separate <code>experimental</code> CI workflow builds and tests <b>without GPU</b>, plus <code>fmt</code> / <code>clippy</code> — currently failing on a formatting issue, deliberately not fixed while PRs are stacked. The GPU-linked path is validated manually on a GPU box.</li>
+  </ul>
+
+  <div class="callout danger"><span class="ct">Known environment blocker</span><code>pixi run cluster</code> / <code>pixi run cn run</code> fail to load the Sirius DuckDB extension: the build wants a <b>static</b> lib but only the shared object (<code>sirius.duckdb_extension</code>, an <code>.so</code>) is present. <b>Workaround:</b> set <code>LD_LIBRARY_PATH</code> to the <b>absolute</b> folder path of the built extension (<code>…/build/release/extension/sirius</code>) for the <code>pixi run cn run</code> invocation only — do <b>not</b> persist it; Matthijs will fix the <code>sirius-sys</code> cxx crate build.</div>
+
+  <div class="callout warn"><span class="ct">Review dynamics — plan for the slow lane</span>Review throughput is the biggest slowdown. Experimental-folder changes touch nothing in Sirius core and land fast. <b>#836/#837 are new operators in <code>src/</code> whose FFI exposure becomes public Sirius API</b> — the category the sync flagged for careful review. Compensate with small, isolated, well-tested standalone PRs.</div>
+</section>
+
+<!-- ================= TUTORIAL ================= -->
+<section id="tutorial">
+  <div class="sec-eyebrow">09 · Hands-on</div>
+  <h2>From clone to end-to-end verification</h2>
+  <p class="sec-sub">Eight steps. Run all Pixi tasks from <code>experimental/starrocks/</code> — it has its own Pixi workspace, separate from the main repo's manifest, and running elsewhere picks up the wrong one.</p>
+
+  <details open>
+    <summary><span class="stepnum">Step 0</span>Orient yourself in the layout</summary>
+    <div class="dbody">
+      <p>Four Pixi environments: <code>fe</code> (JDK 17 + Maven), <code>cn</code> (Rust), <code>client</code> (mysql CLI), <code>engine</code> (CUDA/cudf/rmm/duckdb). The build chain:</p>
+      <ol>
+        <li>Build <b>DuckDB, then Sirius on top</b> → a DuckDB CLI with Sirius preloaded and <code>sirius.duckdb_extension</code> (an <code>.so</code>). A distributable CPack extension exists but isn't needed locally.</li>
+        <li><code>sirius_ffi.hpp</code> / <code>sirius_ffi.cpp</code> add symbols to that <code>.so</code> so external code can call into Sirius (today: just the <code>unique_ptr</code> wrapper around the DuckDB Sirius context).</li>
+        <li>Rust crates: <code>sirius-sys</code> (low-level <code>cxx</code> bindings) → <code>sirius</code> (safe API: <code>SiriusContext::new()</code> / <code>from_config_file()</code>, RAII teardown). A telemetry crate exists — ignore it.</li>
+        <li>StarRocks CN = plain <code>cargo</code> project; FE = plain Maven/Java project. <code>sccache</code> speeds up rebuilds after the first.</li>
+      </ol>
+      <p style="margin-top:8px"><b>Long-term direction:</b> DuckDB is still tightly integrated into Sirius, but decoupling from DuckDB-internal APIs has begun — the goal is for the DuckDB extension to become a <b>thin shim around the Sirius library</b>, mirroring how StarRocks embeds Sirius. The embedded telemetry/profiling component (single-node, Sirius-only, no StarRocks integration yet) is out of scope for now.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="stepnum">Step 1</span>Initialize submodules — non-optional</summary>
+    <div class="dbody">
+      <pre><code>git submodule update --init --recursive</code></pre>
+      <p>The repo carries a StarRocks submodule pinned to the latest release, needed for the RPC/Thrift definitions and for reusing the StarRocks front end. Skip it and the FE/CN builds have nothing to build against.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="stepnum">Step 2</span>Enter the workspace, start the cluster</summary>
+    <div class="dbody">
+      <pre><code>cd experimental/starrocks
+pixi run cluster    # builds FE + CN, starts one FE + one compute node</code></pre>
+      <p>Expect the first run to be <b>slow</b> — Maven/Java build of the FE.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="stepnum">Step 3</span>Apply the known-blocker workaround</summary>
+    <div class="dbody">
+      <p>Set <code>LD_LIBRARY_PATH</code> to the <b>absolute</b> path of <code>…/build/release/extension/sirius</code>, as an env var <b>for the <code>pixi run cn run</code> invocation only</b>. No shell profile, no committed config — the workaround dies when Matthijs fixes <code>sirius-sys</code>.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="stepnum">Step 4</span>Connect a client, verify registration</summary>
+    <div class="dbody">
+      <pre><code>cd experimental/starrocks
+pixi run client     # mysql client → the cluster</code></pre>
+      <pre><code>SHOW COMPUTE NODES;</code></pre>
+      <p><b>Debugging an empty list:</b> registration = the FE does a MySQL insert into a backend table when the CN registers, then connects back and sends heartbeats. No row → the CN never registered (usually the extension-load failure from Step 3). Row present but node unhealthy → heartbeats aren't flowing.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="stepnum">Step 5</span>Check out the top of the PR stack</summary>
+    <div class="dbody"><p>Check out <b>#1024</b> (stacked on #1021 + #1022) and rebuild — the PR that connects the final bits so a real <code>SELECT *</code> returns rows.</p></div>
+  </details>
+
+  <details>
+    <summary><span class="stepnum">Step 6</span>Verify end-to-end execution</summary>
+    <div class="dbody">
+      <pre><code>SELECT * FROM 'file:///abs/path/to.parquet';</code></pre>
+      <p>Use the <code>file://</code> scheme with an <b>absolute path</b> (three slashes). <b>Success:</b> rows come back — the full dispatch → thrift → Substrait → DuckDB → Sirius physical → GPU execution → result collector path works.</p>
+      <div class="callout warn" style="margin-bottom:0"><span class="ct">Known-good failure mode</span>On <b>#1021 alone</b> the query fails with <b>"plan node type 9 not supported"</b> — expected, it needs #1022/#1024. If you see this, you're on the wrong branch, not facing a new bug.</div>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="stepnum">Step 7</span>Start your actual work</summary>
+    <div class="dbody">
+      <ol>
+        <li>Read <b>PR #914</b> end to end (the design proposal).</li>
+        <li>Study the operator interface: <code>execute</code> / <code>sink</code> / <code>is_source</code> / <code>is_sink</code> / <code>get_next_task_hint</code> / <code>get_next_task_input_data</code> in <code>src/include/op/sirius_physical_operator.hpp</code>; task creation in <code>task_creator.cpp</code> / <code>gpu_pipeline_task.cpp</code> / <code>sirius_pipeline.cpp</code>; reserve-before-dispatch in <code>gpu_pipeline_executor.cpp</code>; the data unit in <code>cucascade/include/cucascade/data/data_batch.hpp</code>; the spill sweep in <code>src/downgrade/downgrade_executor.cpp</code>.</li>
+        <li>Build the <b>streaming source (#836)</b> first — isolated operator + unit tests in a standalone PR. Then the <b>sink (#837)</b>. Do not wire them into the CN; wiring (FFI → Rust <code>sirius</code> crate → plan translation → execution) comes in later follow-ups, with stream session (#839) on top.</li>
+      </ol>
+    </div>
+  </details>
+</section>
+
+<!-- ================= GOALS ================= -->
+<section id="goals">
+  <div class="sec-eyebrow">10 · Why this matters</div>
+  <h2>Goals, timeline, staffing</h2>
+
+  <div class="two">
+    <div class="mini">
+      <h4>North star</h4>
+      <ul>
+        <li>Get <b>Alibaba to buy in</b> — they told the team to do StarRocks instead of making Doris faster. Work happens on <code>dev</code>, so every Sirius improvement lands in the StarRocks path too.</li>
+        <li>Other interested customers: Trend Micro and <b>RM Labs</b> (blockchain analysis). Both already use StarRocks — currently the fastest distributed open-source database; performance-focused users are the natural target (analogous to DuckDB adoption).</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>First internal goal</h4>
+      <ul>
+        <li>Execute <b>all of TPC-H across multiple compute nodes</b> — possibly single-node multi-GPU first; real target: <b>multi-node on an NVL72</b> — with StarRocks as the driver, <b>correctly</b>.</li>
+        <li>Only then measure speedup and go back to Alibaba. No benchmark baseline yet; implied baseline is standalone CPU StarRocks.</li>
+      </ul>
+    </div>
+  </div>
+
+  <ul class="klist">
+    <li><b>Sync-era ETA (under Rod's "healthy pressure"):</b> ~1–2 weeks to first queries — <b>since achieved</b>: the #1024 stack runs a single fragment end to end. ~1 more week to a working exchange — <b>still outstanding; this is the clock your #836/#837 work sits on.</b> Then iterate on operators and performance.</li>
+    <li><b>Deployment config (sync-era):</b> single-node multi-GPU, configurable as one compute node per GPU or per node — tuned experimentally.</li>
+    <li><b>Staffing / bus factor:</b> Matthijs was the sole engineer; you were added as the second full-time engineer specifically to reduce that risk (plus time-zone alignment). The team is deliberately not swarming more people — TPC-H benchmark deadlines and benchmark politics take priority until one "home run" lands. Akhil is absorbing Sirius work from William.</li>
+    <li><b>Sequencing philosophy:</b> <i>"Make it work first, then make it fast."</i> Don&rsquo;t optimize early — conceptually nothing should make this much slower than direct Sirius execution <b>except the exchange</b>, and Nixl handles path selection there. <b>Always keep it demoable</b> — if Alibaba wants to try it early, it should just work.</li>
+  </ul>
+</section>
+<!-- ================= ACTIONS ================= -->
+<section id="actions">
+  <div class="sec-eyebrow">11 · Execution</div>
+  <h2>Action items</h2>
+  <p class="sec-sub">Checkboxes persist where the environment supports it. Yours first — the wiring sequence to agree with Matthijs is at the bottom.</p>
+
+  <div class="progress"><div class="pbar"><i id="pbarFill"></i></div><span class="pcount" id="pcount">0 / 10 done</span></div>
+
+  <h3>Mine (Alexander)</h3>
+  <ul class="tasklist" id="myTasks">
+    <li class="task"><input type="checkbox" id="t1"><label for="t1"><b>Read PR #914</b> carefully — the reference for the operators, the cuCascade data repository + channel model, and Nixl backpressure.</label></li>
+    <li class="task"><input type="checkbox" id="t2"><label for="t2">Implement the <b>streaming source operator (#836)</b> as a completely isolated <code>sirius_physical_operator</code> subclass with its own unit tests, in a <b>standalone PR</b> — not wired into the CN, not stacked on Matthijs's PRs.</label></li>
+    <li class="task"><input type="checkbox" id="t3"><label for="t3">Then implement the <b>streaming sink operator (#837)</b>, same pattern — source first, then sink (Matthijs's explicit sequencing).</label></li>
+    <li class="task"><input type="checkbox" id="t4"><label for="t4">Read the <b>StarRocks documentation</b> (Matthijs says it's good) for FE/plan-fragment background; go deeper on <b>Nixl</b> (Dynamo/Nixl docs) — you're new to it.</label></li>
+    <li class="task"><input type="checkbox" id="t5"><label for="t5">Finish local setup: apply the <code>LD_LIBRARY_PATH</code> workaround; get <code>pixi run cluster</code> (or <code>fe</code> + <code>cn run</code> + <code>client</code>) working; verify <code>SHOW COMPUTE NODES;</code>.</label></li>
+    <li class="task"><input type="checkbox" id="t6"><label for="t6"><b>Check out #1024, rebuild, and confirm</b> <code>SELECT * FROM 'file:///…parquet'</code> returns rows end to end.</label></li>
+    <li class="task"><input type="checkbox" id="t7"><label for="t7"><b>Take ownership of the project board / issue #826:</b> review priorities (everything is P2), add/refine sub-issues and detail, propose better tracking (the board was maintained ad hoc by Bobbi, Rodrigo, and William) — then review with Matthijs. His words: "just go for it… make sure we're tracking things better than what currently exists."</label></li>
+    <li class="task"><input type="checkbox" id="t8"><label for="t8">Scope the <b>streaming-session/exchange configuration</b> (e.g. min/max exchange batch size), keeping it <b>additive</b> so it does not affect the non-distributed path (feeds #839/#840). Include the deferred sync item: exposing resource info on the streaming session for receiving-side backpressure and host-memory/disk placement decisions.</label></li>
+    <li class="task"><input type="checkbox" id="t9"><label for="t9">When drafting the <b>#840 design</b>, anchor it to the sync agreement: v1 keeps the queue inside Sirius so the existing downgrade executor handles pressure (dependency-type leakage accepted initially); William's pluggable-downgrade-repositories proposal is the documented <i>future</i> direction — don't design v1 around it.</label></li>
+    <li class="task"><input type="checkbox" id="t10"><label for="t10">Before finalizing the board reorg: <b>confirm whether the Rod + William roadmap/project-board working session already happened</b>, and fold its output into your reorg instead of duplicating it — it was scheduled at the sync, before the board was handed to you.</label></li>
+  </ul>
+  <div class="persistnote" id="persistNote"></div>
+
+  <div class="two" style="margin-top:26px">
+    <div class="mini">
+      <h4>Matthijs</h4>
+      <ul>
+        <li>Land the stack: <b>#1021 → #1022 → #1024</b>.</li>
+        <li>Fix the <code>sirius-sys</code> cxx crate build so it links a local Sirius build correctly — removes the <code>LD_LIBRARY_PATH</code> workaround.</li>
+        <li>Fix the failing CI formatting issue (low priority while PRs are stacked).</li>
+        <li>Continue building the <b>Nixl agent into the compute node</b> (started locally, no PR yet — the Nixl build is non-trivial).</li>
+        <li>Add the <b>streaming-session FFI surface</b> (create session, push to source, pull from sink, destroy) and the Rust <code>sirius</code> crate wrappers — the follow-ups that wire your operators in.</li>
+        <li>Finish the <b>FE↔CN integration test harness</b> (draft PR exists).</li>
+        <li>Finish and share the <b>architecture diagrams</b> (open sync item; likely realized as the design-doc Mermaid diagrams — confirm nothing further is owed).</li>
+        <li>Closed since the sync: sub-issues #835–#841 populated under #826; starter tasks prepared (#836/#837 handed over at the pairing session); demo offered.</li>
+      </ul>
+    </div>
+    <div class="mini">
+      <h4>Team context (affects you)</h4>
+      <ul>
+        <li><b>Bobbi:</b> reviews/approves Matthijs's open PRs on a fast cadence — the review pipeline your PRs will <i>not</i> get; yours touch core and public API, expect the careful track. Also interviewing a DevRel candidate.</li>
+        <li><b>William:</b> your onboarding buddy (introduction done); ran/runs a working session with Rod to clean up the roadmap/project board — coordinate with your board-reorg ownership.</li>
+        <li><b>Rodrigo (Rod):</b> checks Matthijs against stated dates ("healthy pressure"); following up with Rita on the Alibaba conversations; following up with a startup trialing Sirius (per-commit extension builds on <code>dev</code>, loaded via <code>LOAD sirius</code> as an unsigned extension).</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Shared / align later</h3>
+  <ul class="klist">
+    <li>Agree the <b>wiring sequence:</b> source op → sink op → expose via FFI → add to the Rust <code>sirius</code> crate → hook into plan translation → hook into execution. Stream session (#839) is blocked on the operators.</li>
+    <li><b>Review the project-board reorg</b> together once drafted.</li>
+    <li>Confirm the <b>additive-config approach</b> for streaming sessions so the single generic Sirius context stays engine-agnostic — no StarRocks-special context variant.</li>
+    <li><b>Close out the #838 scoping question:</b> the committed spec puts partitioning in #837 and defines #838 as backpressure policy; the pairing-session table ("#838 = streaming sink partitioning support") is a transcript-derived outlier. Treat the spec as authoritative; a one-line confirmation with Matthijs still costs nothing.</li>
+  </ul>
+</section>
+
+<!-- ================= QUIZ ================= -->
+<section id="quiz">
+  <div class="sec-eyebrow">12 · Verify your understanding</div>
+  <h2>Self-check questions</h2>
+  <p class="sec-sub">Fourteen settled questions — answer each in your head before revealing. If a reveal surprises you, re-read the linked section. The genuinely open design questions follow: for those, the document states a leaning, not a decision — they're the ones to discuss with Matthijs.</p>
+
+  <div class="quizmeta">
+    <span class="qc" id="quizCount">0 / 14 revealed</span>
+    <button id="qRevealAll">Reveal all</button>
+    <button id="qHideAll">Hide all</button>
+  </div>
+
+  <div class="qgrid" id="quizGrid"></div>
+
+  <h3 style="margin-top:34px">Genuinely open — discuss with Matthijs</h3>
+  <div id="openQs"></div>
+</section>
+
+<!-- ================= GLOSSARY ================= -->
+<section id="glossary">
+  <div class="sec-eyebrow">13 · Reference</div>
+  <h2>Glossary</h2>
+  <table>
+    <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><b>FE / CN</b></td><td>StarRocks Frontend (Java: plans, coordinates) / Compute Node (here, the Rust process embedding Sirius).</td></tr>
+      <tr><td><b>Leaf vs. intermediate fragment</b></td><td>Leaf reads a source (e.g. parquet, via Sirius's normal source); intermediate receives its input from an exchange, via the streaming source operator.</td></tr>
+      <tr><td><b>Streaming source / sink</b></td><td>Sirius operators marking a fragment's boundaries; the source is used only when input comes from another node over an exchange.</td></tr>
+      <tr><td><b>Nixl</b></td><td>High-level, agent-based, point-to-point GPU data-transfer library; picks the fast path (cudaMemcpy / NVLink / UCX). From the Dynamo project.</td></tr>
+      <tr><td><b>cuCascade</b></td><td>Sirius's GPU memory-management / data-repository + downgrade (spill) framework; exchange-queued batches live here so they can spill under pressure.</td></tr>
+      <tr><td><b>Substrait</b></td><td>The common plan format between StarRocks thrift plans and DuckDB/Sirius physical plans.</td></tr>
+      <tr><td><b><code>sirius_ffi.hpp</code> / <code>sirius-sys</code> / <code>sirius</code></b></td><td>The C++ public surface → low-level <code>cxx</code> bindings → safe Rust API, respectively.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<footer>
+  Compiled from: engineering sync · exchange-design.md @ c8593116 · pairing session with Matthijs Brobbel. Chronology rule: pairing session wins on current state; committed design doc wins on spec.
+</footer>
+
+</main>
+</div>
+<script>
+/* ---------- architecture explorer ---------- */
+const ARCH = {
+  "fe-plan":{t:"FE · SQL parse & plan",b:["Owns SQL parsing, planning, coordination — everything distributed.","Creates plan fragments, including where each partition goes: a fragment already encodes “this partition → compute node X.”","Sirius does not choose aggregation phasing either — the FE plans the partial/final fragment structure."]},
+  "fe-route":{t:"FE · Fragment routing",b:["Partition routing is “completely out of our control” at the Sirius layer, by design.","Matthijs: “It's very dumb. We just translate, execute, exchange, move on.”","The CN just tells Nixl where partitions go — no custom transport logic needed."]},
+  "fe-meta":{t:"FE · Metadata & registration",b:["When a CN registers, the FE does a MySQL insert into a backend table.","The FE then connects back and sends heartbeats.","Debugging SHOW COMPUTE NODES: no row → CN never registered (usually the extension-load failure); row but unhealthy → heartbeats aren't flowing."]},
+  "cn-rpc":{t:"Wrapper · RPC server",b:["Talks to the FE: receives TExecPlanFragmentParams (Thrift) per fragment.","CN RPC skeleton landed as PR #856; additional Thrift RPC methods were a sync-era PR.","The StarRocks submodule (pinned to the latest release) supplies the Thrift definitions for generated interop code."]},
+  "cn-nixl":{t:"Wrapper · Nixl endpoint",b:["One agent per CN, created at startup; computes local metadata (get_local_md).","Receives batches from other nodes and pushes them into the right streaming source operator by stream id.","nixl's own threads live here, in the wrapper — never in Sirius's worker pool.","The wrapper does no GPU compute. Partition and coalesce happen inside Sirius."]},
+  "cn-chan":{t:"Wrapper · push / pull channels",b:["push(stream_id, batch) feeds inputs; close_input(stream_id) signals end-of-stream; pull()/wait() drain outputs.","The wrapper⇄engine boundary is the channel itself, exposed over the cxx FFI.","Channels are bounded and are the flow-control mechanism, not just buffers.","For the root fragment, the output channels are the query result — drained and returned to the FE via fetch_data."]},
+  "cn-trans":{t:"Wrapper · translate_fragment (#841)",b:["TExecPlanFragmentParams → translate_fragment() → Substrait Plan → DuckDB plan → Sirius streaming plan.","Sync-era: a ~4000-line plan-fragment→Substrait translation PR touching nothing in Sirius core (plausibly the design doc's #852).","Translator emitting local_files for parquet scans is PR #1021 — the base of the current stack."]},
+  "s-src":{t:"Sirius · Streaming source #836 — yours, build first",b:["An ordinary sirius_physical_operator subclass — not a separate subsystem.","Used only for exchange: when a fragment's input comes from another CN. Leaf fragments keep the normal parquet source.","Multi-shot: publishes a task each time a batch arrives on its input channel, until close_input — unlike today's one-shot scan.","Build as an isolated operator + unit tests in a standalone PR; wiring comes later."]},
+  "s-pipe":{t:"Sirius · Pipeline executor",b:["A single pipeline per fragment, front to back, no sideways information passing during a streaming session.","Sink tasks run as normal gpu_pipeline_tasks on the existing gpu_pipeline_executor — no dedicated thread pool.","Reserve-before-dispatch (make_reservation) keeps the working set within budget; per-device exclusive_stream_pool enables async copy overlap.","Study: task_creator.cpp, gpu_pipeline_task.cpp, sirius_pipeline.cpp, gpu_pipeline_executor.cpp."]},
+  "s-sink":{t:"Sirius · Streaming sink #837 — yours, build second",b:["Final operator of its pipeline, like RESULT_COLLECTOR or MERGE_GROUP_BY today.","Incremental: pushes each output batch per sink() call instead of materializing a ColumnDataCollection.","Partitioned variant: per-destination output channels + bounded coalescing of small slices before flushing one combined batch.","Must reproduce StarRocks' hash bit-exactly per partition type — silent shuffle corruption otherwise."]},
+  "s-repo":{t:"Sirius · shared_data_repository",b:["Data unit: shared_ptr<cucascade::data_batch> wrapping a cudf::table, 3-state lock (idle / read_only / mutable_locked).","Channels carry handles (repository batch-ids), not owning shared_ptrs — queued batches stay accounted and spillable.","use_count() reflects only real owners, which is what makes the sink's zero-copy steal possible.","Owned by Sirius but exposed through an API so external code can push/pull batches — long-term this decouples Sirius from DuckDB."]},
+  "s-down":{t:"Sirius · downgrade_executor",b:["Its spill sweep walks registered shared_data_repository batches and filters on idle state, not origin.","That's why option A (#840) works: exchange batches become spill candidates alongside compute for free.","William's future proposal: pluggable external repositories registered with a priority — documented future direction, not v1.","Code: src/downgrade/downgrade_executor.cpp."]},
+  "s-sess":{t:"Sirius · Stream session #839 — blocked on your operators",b:["Public entry point: builds a streaming plan and starts it on the existing task_scheduler without blocking.","Routing is by stream id.","Blocked on #836/#837; the streaming-session FFI (create/push/pull/destroy) is Matthijs's follow-up.","Your config scoping (min/max exchange batch size, additive-only) feeds here — plus the deferred receiving-side resource-info item."]}
+};
+const adTitle=document.getElementById('adTitle'),adBody=document.getElementById('adBody');
+document.querySelectorAll('.blk').forEach(b=>{
+  b.addEventListener('click',()=>{
+    document.querySelectorAll('.blk').forEach(x=>x.classList.remove('sel'));
+    b.classList.add('sel');
+    const d=ARCH[b.dataset.c];
+    adTitle.textContent=d.t;
+    adBody.classList.remove('empty');
+    adBody.innerHTML='<ul>'+d.b.map(x=>'<li>'+x+'</li>').join('')+'</ul>';
+  });
+});
+
+/* ---------- Doris / StarRocks toggle ---------- */
+const tgD=document.getElementById('tgDoris'),tgS=document.getElementById('tgSR');
+const mpD=document.getElementById('mpDoris'),mpS=document.getElementById('mpSR');
+function setModel(sr){
+  tgD.classList.toggle('on',!sr);tgS.classList.toggle('on',sr);
+  tgD.setAttribute('aria-selected',!sr);tgS.setAttribute('aria-selected',sr);
+  mpD.classList.toggle('show',!sr);mpS.classList.toggle('show',sr);
+}
+tgD.addEventListener('click',()=>setModel(false));
+tgS.addEventListener('click',()=>setModel(true));
+
+/* ---------- backpressure simulator ---------- */
+const BP_STEPS=[
+ {t:"Steady state",p:"receive(N+1), compute(N), and send(N−1) overlap. Bounded channels on both ends; batches live as repository-registered handles; reserve-before-dispatch keeps the working set within budget.",
+  s:{}},
+ {t:"Downstream CN slows down",p:"The downstream receiver stops draining. Nothing upstream knows yet — the signal has to propagate backwards through the bounded machinery.",
+  s:{"n-down":"stall"}},
+ {t:"Output channel fills",p:"The sink's bounded output channel reaches capacity. The channel is the flow-control mechanism — this is the first backpressure signal inside this CN.",
+  s:{"n-down":"stall","n-outch":"full"}},
+ {t:"Task creation stops — not task blocking",p:"The sink's get_next_task_hint() reports not-ready, so the task creator (task_creator::get_operator_for_next_task) stops creating sink tasks — the same shape as CONCAT gating on a byte threshold. No GPU worker is parked on a full channel.",
+  s:{"n-down":"stall","n-outch":"full","n-sink":"stall"}},
+ {t:"Repository fills, upstream backs up",p:"With the sink idle, results accumulate in the repository and upstream operators back up via existing port barriers — MemoryBarrierType { PIPELINE, PARTIAL, FULL }. Queued batches stay idle-state and spillable.",
+  s:{"n-down":"stall","n-outch":"full","n-sink":"stall","n-repo":"full","n-src":"full"}},
+ {t:"Input channel fills, push() blocks",p:"The bounded input channel reaches capacity, so the wrapper's push(stream_id, batch) blocks.",
+  s:{"n-down":"stall","n-outch":"full","n-sink":"stall","n-repo":"full","n-src":"full","n-inch":"full"}},
+ {t:"Wrapper stops draining nixl receives",p:"With push() blocked, the wrapper stops draining nixl receives — the pressure now crosses the process boundary.",
+  s:{"n-down":"stall","n-outch":"full","n-sink":"stall","n-repo":"full","n-src":"full","n-inch":"full","n-recv":"stall"}},
+ {t:"Upstream sender throttled",p:"End-to-end, cross-node flow control with a bounded in-flight working set. Recovery is edge-triggered: when the downstream pull()s a batch, it must re-schedule the sink — schedule(op) re-arms task creation and the chain unwinds forwards.",
+  s:{"n-down":"stall","n-outch":"full","n-sink":"stall","n-repo":"full","n-src":"full","n-inch":"full","n-recv":"stall","n-up":"stall"}}
+];
+let bpI=0;
+const bpNodes=["n-up","n-recv","n-inch","n-src","n-repo","n-sink","n-outch","n-down"];
+const bpTitle=document.getElementById('bpTitle'),bpText=document.getElementById('bpText'),bpStepN=document.getElementById('bpStepN');
+const bpPrev=document.getElementById('bpPrev'),bpNext=document.getElementById('bpNext'),bpReset=document.getElementById('bpReset');
+const bpDots=document.getElementById('bpDots');
+BP_STEPS.forEach(()=>{const i=document.createElement('i');bpDots.appendChild(i)});
+function bpRender(){
+  const st=BP_STEPS[bpI];
+  bpNodes.forEach(id=>{
+    const el=document.getElementById(id);
+    el.classList.remove('stall','full','ok');
+    if(st.s[id])el.classList.add(st.s[id]);
+    else if(bpI===0)el.classList.add('ok');
+  });
+  bpStepN.textContent='Step '+bpI+' / '+(BP_STEPS.length-1);
+  bpTitle.textContent=st.t;bpText.textContent=st.p;
+  bpPrev.disabled=bpI===0;bpNext.disabled=bpI===BP_STEPS.length-1;
+  [...bpDots.children].forEach((d,i)=>d.classList.toggle('on',i<=bpI));
+}
+bpPrev.addEventListener('click',()=>{if(bpI>0){bpI--;bpRender()}});
+bpNext.addEventListener('click',()=>{if(bpI<BP_STEPS.length-1){bpI++;bpRender()}});
+bpReset.addEventListener('click',()=>{bpI=0;bpRender()});
+bpRender();
+
+/* ---------- quiz ---------- */
+const QUIZ=[
+ {id:"Q1",tag:"ownership",q:"Who decides which partition of a shuffle goes to which compute node?",
+  a:"The StarRocks FE. Plan fragments already encode partition routing; the CN just translates, executes, and tells Nixl where partitions go. This is “completely out of our control” at the Sirius layer, by design — Sirius stays unaware of distribution so the same context works in any engine."},
+ {id:"Q2",tag:"operators",q:"When does a fragment use the streaming source (#836) vs. the normal scan?",
+  a:"Only when the fragment's input comes from another CN over an exchange (an intermediate fragment). A leaf fragment reading parquet uses Sirius's normal existing source (DUCKDB_SCAN / GPU_PARQUET_SCAN) — it may still have a streaming sink, but no streaming source. A trivial single-node SELECT * has neither."},
+ {id:"Q3",tag:"operators",q:"In a distributed GROUP BY, what replaces the local PARTITION operator?",
+  a:"The partitioned streaming sink — the shuffle is the partition, so there is no separate local PARTITION before the sink and no StarRocks-specific merge operator. HASH_GROUP_BY partial state is shipped in Sirius's own format and consumed directly by MERGE_AGGREGATE; nixl routes opaque bytes by hash. Sirius does not choose the phasing — the FE plans the partial/final fragment structure."},
+ {id:"Q4",tag:"memory",q:"Why is the bounded channel deliberately not an owner of the data_batch?",
+  a:"The channel carries a repository batch-id handle, not a shared_ptr. This keeps queued batches accounted and spillable via the registered shared_data_repository, and keeps use_count() reflecting only real owners (repository, in-flight accessor, downgrade executor transiently, nixl send path) — which is the only way the sink's zero-copy steal can ever observe use_count()==1."},
+ {id:"Q5",tag:"backpressure",q:"How does backpressure stop the sink without parking a GPU worker on a full channel?",
+  a:"Enqueuing to a channel is a task-creation condition: the sink overrides get_next_task_hint() to report not-ready when its output channel is full, so the task creator never builds the task (same shape as CONCAT gating on a byte threshold). Re-arming is edge-triggered: the wrapper's pull() re-schedules the sink. The race fallback: a sink finding the channel full at push time keeps its result idle (spillable) in the repository and yields its worker."},
+ {id:"Q6",tag:"correctness",q:"Which hash does the partitioned sink use, and when could an all-Sirius topology deviate?",
+  a:"Three regimes, dispatched on partition type and version: HASH_PARTITIONED → fnv_hash (v0, default) or xxh3_hash (v1) per exchange_hash_function_version; BUCKET_SHUFFLE_HASH_PARTITIONED without bucket properties → CRC32 seeded 0; with bucket properties → the bucket-id mapping (_calc_hash_values_and_bucket_ids). Deviating is safe only for HASH_PARTITIONED (any consistent hash co-locates keys), and only with all-Sirius CNs and no native hash-bucketed tables — bucket shuffle is anchored to the on-disk bucket layout computed by CRC32 at ingest time. Matching StarRocks stays the default."},
+ {id:"Q7",tag:"memory",q:"Why is option A (shared cuCascade manager) recommended for #840, and what does it take?",
+  a:"It is the only option where in/out exchange batches can spill alongside compute via the existing downgrade_executor (its sweep sees only registered repository batches in the idle state). It takes two changes — Sirius borrows the wrapper's memory_reservation_manager, and exchange memory becomes visible (batches in registered repositories; the nixl staging arena reserved once at startup) — plus four constraints: lease-aware spill, a reserved receive-staging floor, a reserved copy-out credit, and a reserved send-copy credit."},
+ {id:"Q8",tag:"streaming",q:"What exactly overlaps in the streaming model, and what made the Doris experiment slow?",
+  a:"receive(N+1) overlaps compute(N) overlaps send(N−1), enabled by the multi-shot source, the incremental sink, the per-device exclusive_stream_pool, and reserve-before-dispatch. Doris was materialize-then-shuffle — exchange could not begin until the fragment finished — which, together with the missing I/O overhaul, is why it was only marginally faster than CPU."},
+ {id:"Q9",tag:"ownership",q:"Does the Rust wrapper ever run GPU compute?",
+  a:"No. Partition and coalesce are GPU operations inside Sirius (reusing the existing PARTITION machinery under the shared cuCascade budget); the wrapper only moves already-partitioned, already-coalesced byte buffers over nixl. The “Rust hash-partition” (compute_dest_assignments) belongs to the old Doris model."},
+ {id:"Q19",tag:"strategy",q:"What is the status of the Doris work, and what is the long-term plan?",
+  a:"Paused / effectively deprecated — Alibaba only cares about StarRocks, and combining both up front is extra work with little payoff. Long term, “walk, crawl, run”: StarRocks-specific implementation → extract common/reusable components (Substrait translation, exchange components, public Sirius APIs) → move StarRocks onto a generic, Velox-like engine-pluggable layer, then rebuild Doris on top if desired. Picking Doris back up later is low-cost because the reusable blocks emerge regardless."},
+ {id:"Q20",tag:"transport",q:"Why Nixl instead of UCXX directly?",
+  a:"Four reasons: (1) it's a good abstraction for plan-fragment-encoded routing/partitioning and finds the fast path between nodes; (2) built-in side channel for backpressure/metadata plus out-of-the-box spilling to host memory or disk; (3) Nixl wraps UCXX internally, so swapping to UCXX later fits the same architecture; (4) it gets heavy internal investment via Dynamo, and NV Research wants a Dynamo-powered distributed query engine with Sirius underneath. Direct UCXX would take multiple weeks — Rod and William have a long history of painful UCX integrations at BlazingDB."},
+ {id:"Q21",tag:"memory",q:"What did the team agree as the simplest first version for resource management, and how does that relate to option A?",
+  a:"Keep the exchange queue inside Sirius so the existing downgrade executor handles memory pressure, accepting some leaking of dependency types initially. That is exactly what option A formalizes (queued batches as repository-registered data_batches; wrapper depends on cuCascade for now). William's pluggable-downgrade proposal (external repositories registered with a priority) and receiving-side resource info on the streaming session are both documented as future work, not v1."},
+ {id:"Q22",tag:"process",q:"Which review track will your PRs be on?",
+  a:"The careful one. Experimental-folder changes land fast because they touch nothing in Sirius core, but #836/#837 are new operators in src/ whose FFI exposure becomes public Sirius API — the category the sync explicitly flagged as warranting more careful review. Compensate with small, isolated, well-tested standalone PRs."},
+ {id:"Q23",tag:"timeline",q:"What was the sync-era timeline, and where does it stand now?",
+  a:"~1–2 weeks to first queries, ~1 more week to a working exchange, then iterate — with Rod checking in against those dates. First queries have since landed (the #1024 stack runs a single fragment end to end); the exchange has not, which is precisely the work your operators unblock. Sync-era hardware target: single-node multi-GPU, configurable as one CN per GPU or per node (tuned experimentally); the pairing session extends the real goal to multi-node NVL72."}
+];
+const OPENQ=[
+ {id:"Q10",t:"Backpressure policy details",d:"Propagation mechanism is settled (design doc §4); still open: the channel bound/size, whether a full input channel blocks push or spills the queued batch, and how a persistently slow destination's partition is kept from starving shared input."},
+ {id:"Q11",t:"Cross-CN completion (EOS)",d:"close_input is local only. Open: carrying end-of-stream across nixl/bRPC as a terminal marker, and wiring the sender count from the plan so a source finalizes only after seeing that many EOS markers. Fan-in routing alone does not settle completion."},
+ {id:"Q12",t:"Issue scoping of #838 — largely resolved",d:"The pairing-session table says “#838 = streaming sink partitioning support”; the committed spec puts partitioning in #837 and defines #838 as backpressure policy. A committed spec beats transcript-derived notes: treat #837 = sink incl. partitioning, #838 = backpressure policy as authoritative — and spend one Slack line confirming with Matthijs."},
+ {id:"Q13",t:"Sink → nixl ownership",d:"How the sink obtains an owning cudf::table for the transfer. Proposed: data_batch::release_or_copy_table() (cuCascade PR #148, not in the current tree) — zero-copy steal at use_count()==1, deep copy otherwise. Open tension: staying repository-registered for spill means use_count()>1 at send time → copy (paid from the send-copy credit); a steal gives up spill-eligibility during the in-flight send. The transfer_complete handshake finally releases the batch."},
+ {id:"Q14",t:"Order-preserving (merging) exchange",d:"v1 emits and coalesces out of order. Open: support StarRocks' merging exchange (ORDER BY / top-N) by disabling coalescing plus a receiver-side k-way merge, or keep merging exchanges on the CPU/bRPC path for now."},
+ {id:"Q15",t:"Partial-aggregate wire representation",d:"Pin down the format so upstream HASH_GROUP_BY partial state is exactly what downstream MERGE_AGGREGATE consumes (#837/#841) — same concern for any partial/final split the FE plans (distinct, multi-phase agg)."},
+ {id:"Q16",t:"Nixl fallback accounting & arena sizing",d:"The staging arena is reserved once; leases skip cuCascade. Open: accounting the fallback allocations (cuMemAlloc + register when the arena is full) and sizing the arena so the fallback stays rare. Related: copy-out credit sizing (max receive batch vs. chunked unit vs. topology profile; HOST-before-DISK preference)."},
+ {id:"Q17",t:"Deadlock / liveness",d:"(a) Thread/queue stalls — handled primarily by the admission-control rule (no sink task created while its output channel is full). (b) Staging-lease cycle — a logical plan DAG does not rule out a physical lease cycle (A's staging full of B's batches while B holds pinned output for A, and vice versa). Fix: lease-aware spill + reserved receive-staging floor + a stall/credit watchdog that flags “no forward progress” instead of hanging. Also open: transport retry policy — retry once over nixl, then bRPC/CPU fallback, fail the query only if that also fails (cf. Doris TransferHealth)."},
+ {id:"Q18",t:"Shared-manager mechanics (#840)",d:"Borrow/lifetime and reentrancy of the shared manager across concurrent queries, and where cross-domain stream-sync points fall during a spill."}
+];
+const quizGrid=document.getElementById('quizGrid'),quizCount=document.getElementById('quizCount');
+QUIZ.forEach(q=>{
+  const card=document.createElement('div');card.className='qcard';
+  card.innerHTML='<button class="qhead" aria-expanded="false"><span class="qid">'+q.id+'</span><span>'+q.q+'</span><span class="qtag">'+q.tag+'</span></button><div class="qans">'+q.a+'</div>';
+  card.querySelector('.qhead').addEventListener('click',()=>{
+    card.classList.toggle('open');
+    card.querySelector('.qhead').setAttribute('aria-expanded',card.classList.contains('open'));
+    updQuiz();
+  });
+  quizGrid.appendChild(card);
+});
+function updQuiz(){quizCount.textContent=document.querySelectorAll('.qcard.open').length+' / '+QUIZ.length+' revealed'}
+document.getElementById('qRevealAll').addEventListener('click',()=>{document.querySelectorAll('.qcard').forEach(c=>c.classList.add('open'));updQuiz()});
+document.getElementById('qHideAll').addEventListener('click',()=>{document.querySelectorAll('.qcard').forEach(c=>c.classList.remove('open'));updQuiz()});
+const openQs=document.getElementById('openQs');
+OPENQ.forEach(o=>{
+  const d=document.createElement('div');d.className='openq';
+  d.innerHTML='<span class="oqid">'+o.id+'</span><b>'+o.t+'</b>'+o.d;
+  openQs.appendChild(d);
+});
+
+/* ---------- action-item persistence ---------- */
+const TKEY='sirius-onboarding-checks';
+const boxes=[...document.querySelectorAll('#myTasks input')];
+const pFill=document.getElementById('pbarFill'),pCount=document.getElementById('pcount'),pNote=document.getElementById('persistNote');
+let hasStorage=typeof window!=='undefined'&&window.storage&&typeof window.storage.get==='function';
+function updProgress(){
+  const done=boxes.filter(b=>b.checked).length;
+  pFill.style.width=(done/boxes.length*100)+'%';
+  pCount.textContent=done+' / '+boxes.length+' done';
+  boxes.forEach(b=>b.closest('.task').classList.toggle('done',b.checked));
+}
+async function saveChecks(){
+  if(!hasStorage)return;
+  try{await window.storage.set(TKEY,JSON.stringify(boxes.map(b=>b.checked)))}catch(e){}
+}
+async function loadChecks(){
+  if(!hasStorage){pNote.textContent='// checks are session-only in this environment';return}
+  try{
+    const r=await window.storage.get(TKEY);
+    if(r&&r.value){JSON.parse(r.value).forEach((v,i)=>{if(boxes[i])boxes[i].checked=v})}
+    pNote.textContent='// checks persist across sessions';
+  }catch(e){pNote.textContent='// checks persist across sessions'}
+  updProgress();
+}
+boxes.forEach(b=>b.addEventListener('change',()=>{updProgress();saveChecks()}));
+updProgress();loadChecks();
+
+/* ---------- copy buttons ---------- */
+document.querySelectorAll('pre').forEach(pre=>{
+  const btn=document.createElement('button');btn.className='copybtn';btn.textContent='copy';
+  btn.addEventListener('click',()=>{
+    const txt=pre.querySelector('code').innerText;
+    navigator.clipboard&&navigator.clipboard.writeText(txt).then(()=>{btn.textContent='copied';setTimeout(()=>btn.textContent='copy',1400)}).catch(()=>{});
+  });
+  pre.appendChild(btn);
+});
+
+/* ---------- scroll spy ---------- */
+const navLinks=[...document.querySelectorAll('.sidenav a')];
+const secs=navLinks.map(a=>document.querySelector(a.getAttribute('href'))).filter(Boolean);
+const spy=new IntersectionObserver(es=>{
+  es.forEach(e=>{
+    if(e.isIntersecting){
+      navLinks.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+e.target.id));
+    }
+  });
+},{rootMargin:'-20% 0px -70% 0px'});
+secs.forEach(s=>spy.observe(s));
+</script>
+</body>
+</html>
