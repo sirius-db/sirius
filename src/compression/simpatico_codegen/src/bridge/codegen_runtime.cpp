@@ -263,6 +263,10 @@ const char* dtype_to_cxx(const char* dtype)
   // SIGNED int8_t: zigzag's shift = elem_size*8-1 relies on sign-extension.
   // The output column retains the original UINT8 type_id.
   if (s == "uint8" || s == "uint8_t" || s == "int8" || s == "int8_t") return "int8_t";
+  // Unsigned 32/64-bit process as their same-width signed integer (bit-level
+  // codecs roundtrip either way); the output column keeps the original UINT type.
+  if (s == "uint32" || s == "uint32_t") return "int32_t";
+  if (s == "uint64" || s == "uint64_t") return "int64_t";
   return nullptr;
 }
 
@@ -1305,6 +1309,8 @@ bool jit_encode_subtree(PlanTree const& tree,
     case cudf::type_id::UINT8: dtype = "uint8"; break;
     case cudf::type_id::INT32: dtype = "int32"; break;
     case cudf::type_id::INT64: dtype = "int64"; break;
+    case cudf::type_id::UINT32: dtype = "uint32"; break;
+    case cudf::type_id::UINT64: dtype = "uint64"; break;
     case cudf::type_id::FLOAT32: dtype = "float32"; break;
     case cudf::type_id::FLOAT64: dtype = "float64"; break;
     case cudf::type_id::DECIMAL32:
@@ -1335,7 +1341,11 @@ bool jit_encode_subtree(PlanTree const& tree,
       dtype           = "int64";
       storage_type_id = cudf::type_id::INT64;
       break;
-    default: return false;  // non-fusable type
+    default:
+      if (error_out)
+        *error_out = "non-fusable input dtype (cudf type_id=" +
+                     std::to_string(static_cast<int>(input_col.type().id())) + ")";
+      return false;
   }
   const char* cxx_dtype = dtype_to_cxx(dtype);
   if (cxx_dtype == nullptr) return false;  // shouldn't happen, but guard
@@ -1358,7 +1368,10 @@ bool jit_encode_subtree(PlanTree const& tree,
   int rc = encode_subtree_impl(
     *head_opt, original_type, cxx_dtype, input_col.size(), data_ptr, &builder, stream, mr);
   if (rc == 1) return true;
-  if (rc == 0) return false;
+  if (rc == 0) {
+    if (error_out) *error_out = "encode declined (non-fusable subtree shape)";
+    return false;
+  }
   if (error_out) *error_out = err.empty() ? "jit_encode_subtree failed" : err;
   return false;
 }

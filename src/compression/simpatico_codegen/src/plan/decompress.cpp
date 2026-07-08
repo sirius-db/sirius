@@ -53,6 +53,8 @@ const char* codegen_dtype_str_for(cudf::data_type type)
     case cudf::type_id::UINT8: return "uint8";
     case cudf::type_id::INT32: return "int32";
     case cudf::type_id::INT64: return "int64";
+    case cudf::type_id::UINT32: return "uint32";
+    case cudf::type_id::UINT64: return "uint64";
     case cudf::type_id::FLOAT32: return "float32";
     case cudf::type_id::FLOAT64: return "float64";
     default: return nullptr;
