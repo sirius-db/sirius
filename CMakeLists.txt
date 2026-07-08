@@ -273,7 +273,6 @@ set(EXTENSION_SOURCES
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
-    src/op/scan/cpu_source_task.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/sirius_gpu_scan_operator_data.cpp
     src/op/scan/gpu_ingestible.cpp
