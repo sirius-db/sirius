@@ -49,13 +49,13 @@ namespace sirius::scan_manager {
  * (first-writer-wins via atomic CAS) is forwarded so consumers see the
  * failure through @ref split_connector::get_next_split.
  *
- * Historical note: this class was abstract pre-gpu_ingestible refactor.
- * Legacy subclasses (parquet_split_provider, duckdb_native_split_provider,
- * cached_split_provider) override @ref has_more_splits and
- * @ref next_split_provider; they are scheduled for deletion in step 10 of
- * the refactor. The default (concrete) construction path takes a
- * @c shared_ptr<io::gpu_ingestible> and uses the base's default
- * implementations to delegate to it.
+ * Concrete class — per-format (and pinned-cache) behavior lives in the
+ * composed @c gpu_ingestible, not in provider subclasses: the construction
+ * path takes the operator's ingestible and @ref has_more_splits /
+ * @ref next_split_provider delegate to it. A pinned-cache hit switches the
+ * ingestible into pinned-serving mode (see
+ * @c gpu_ingestible::serve_from_pinned_chunks); the provider is none the
+ * wiser.
  */
 class split_provider {
  public:

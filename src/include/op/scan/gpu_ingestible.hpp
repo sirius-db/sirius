@@ -54,6 +54,9 @@ class gpu_ingestible;
 // Forward-declared to break the gpu_ingestible.hpp <-> sirius_gpu_scan_operator_data.hpp
 // include cycle; only used by const-reference below. Full definition pulled in by .cpp.
 class scan_operator_input;
+// Forward-declared to keep this header light; implementations that accept
+// pinned serving include op/scan/pinned_chunk_source.hpp in their .cpp.
+class pinned_chunk_source;
 
 //===----------------------------------------------------------------------===//
 // gpu_ingestible
@@ -68,7 +71,11 @@ class scan_operator_input;
  * on each split it pulls off its connector.
  *
  * Implementations today: @c parquet_gpu_ingestible,
- * @c duckdb_native_gpu_ingestible, @c cached_parquet_gpu_ingestible.
+ * @c duckdb_native_gpu_ingestible. Both also accept pinned-cache serving
+ * (@ref serve_from_pinned_chunks): on a pin hit the scan manager switches the
+ * operator's ingestible into pinned mode, and the three serving methods
+ * deliver the already-resident chunks as work items instead of walking
+ * metadata — same machinery, no disk read.
  */
 class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  public:
@@ -85,6 +92,23 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
                                    rmm::cuda_stream_view stream);
 
   virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
+
+  /**
+   * @brief Switch this ingestible into pinned-cache serving mode.
+   *
+   * Called by the scan manager (before the pipeline slot and split_provider
+   * are built) when a pinned entry can serve the scan. In pinned mode the
+   * SERVING surface — @ref has_processed_all_metadata,
+   * @ref next_split_provider, @ref create_batch_coalescer — delivers the
+   * source's already-resident chunks as work items instead of walking
+   * metadata; the OPERATOR surface (@ref post_filter_and_project,
+   * @ref materialized_column_order, @ref table_info) is unaffected, so a
+   * cached batch is filtered/assembled exactly like a fresh read.
+   *
+   * Default: this format does not support pinned serving — the source is
+   * discarded and false is returned (the caller falls back to the disk read).
+   */
+  virtual bool serve_from_pinned_chunks(std::unique_ptr<pinned_chunk_source> source);
 
   /**
    * @brief Snapshot check for remaining work. Thread-safe.

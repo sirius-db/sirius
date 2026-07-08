@@ -17,7 +17,6 @@
 #pragma once
 
 #include "blockingconcurrentqueue.h"
-#include "cucascade/data/data_batch.hpp"
 #include "exec/try.hpp"
 #include "op/scan/batch_coalescer.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
@@ -34,11 +33,6 @@
 #include <stop_token>
 
 namespace sirius::scan_manager {
-
-struct databatch_provider {
-  virtual ~databatch_provider()                                   = default;
-  virtual std::shared_ptr<cucascade::data_batch> get_next_batch() = 0;
-};
 
 /**
  * @brief Pipeline-ordered sequencer for @c fadvise(opportunistic) calls.
@@ -58,10 +52,12 @@ struct databatch_provider {
  *
  * Usage:
  *   - scan_manager calls @c register_pipeline(scan_op, balancer) once per
- *     pipeline that needs opportunistic prefetching; the returned slot pointer
- *     drives that pipeline's splits.  Its split provider is wired up via
- *     @c get_split_provider_bridge (live metadata scan) or
- *     @c use_cached_entries_for_pipeline (cached-batch replay).
+ *     pipeline; the returned slot pointer drives that pipeline's splits.  Its
+ *     split provider is wired up via @c get_split_provider_bridge — the same
+ *     plain provider whether the ingestible walks disk metadata or serves
+ *     pinned chunks; a pinned-mode ingestible supplies the pass-through
+ *     cached coalescer so its resident splits bypass the disk-format
+ *     coalescing.
  *   - scan_manager calls @c spawn_workers(dispatcher) once, after all slots
  *     have been registered, to launch the sequencer task.  The task processes
  *     slots in registration order until either all slots are drained or the
@@ -89,11 +85,6 @@ class load_balancing_scan_batch_coalescer {
       assert(this->balancer);
     }
 
-    void attach_batch_provider(std::unique_ptr<databatch_provider> provider)
-    {
-      batch_provider = std::move(provider);
-    }
-
     std::size_t op_id{0};
     std::size_t pipeline_id{0};
     using provider_value_t = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
@@ -101,7 +92,6 @@ class load_balancing_scan_batch_coalescer {
     std::shared_ptr<op::scan::batch_coalescer> coalescer;
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
-    std::unique_ptr<databatch_provider> batch_provider;
   };
 
   load_balancing_scan_batch_coalescer()                                           = default;
@@ -113,11 +103,11 @@ class load_balancing_scan_batch_coalescer {
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
+  /// The slot's batch coalescer comes from the operator ingestible's
+  /// create_batch_coalescer() — a pinned-mode ingestible supplies the
+  /// pass-through cached coalescer, a disk one its format coalescer.
   metadata_processing_state* register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
                                                std::shared_ptr<balancing_strategy> balancer);
-
-  void use_cached_entries_for_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                       std::unique_ptr<databatch_provider> provider);
 
   std::function<void(exec::try_t<std::unique_ptr<op::scan::scan_info>>&&)>
   get_split_provider_bridge(op::scan::sirius_gpu_scan_operator* scan_op);
@@ -138,8 +128,6 @@ class load_balancing_scan_batch_coalescer {
   void worker_loop(std::stop_token const& stop);
 
   void process_provider_inputs(metadata_processing_state& state, std::stop_token const& stop);
-
-  void process_cached_entries(metadata_processing_state& state, std::stop_token const& stop);
 
   /// unique_ptr storage: the slot contains a semaphore and a moodycamel
   /// queue, both of which are non-movable, so we need stable addresses

@@ -145,6 +145,13 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
 
+  /// Pinned-cache serving mode: the three serving methods above deliver the
+  /// source's resident chunks instead of walking the row-group metadata (no
+  /// disk read). MVCC serving (issue #819) extends THIS class's pinned mode —
+  /// visibility work items, mask join, delta staging — since it needs the
+  /// DuckDB table handles this class already owns.
+  bool serve_from_pinned_chunks(std::unique_ptr<pinned_chunk_source> source) override;
+
   op::scan::filtered_table materialize_metadata_to_table(
     scan_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
@@ -170,6 +177,10 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     1;  ///< The number of row groups to chunk together for each metadata scan task.
   std::size_t _num_ranges = 0;
   std::atomic<std::size_t> _next_range_idx{0};
+
+  /// Pinned-cache serving mode (null = normal disk walk). Set once by
+  /// @ref serve_from_pinned_chunks before the split_provider runs.
+  std::unique_ptr<pinned_chunk_source> _pinned;
 };
 
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(

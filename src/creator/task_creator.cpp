@@ -359,8 +359,8 @@ void task_creator::manager_loop()
             // scheduler and triggers a peer DMA or host staging when the
             // consumer GPU differs from the chunk's home GPU. The pinned
             // chunk's GPU residency is preserved on the batch
-            // (cached_parquet_gpu_ingestible pins each chunk_memory_space
-            // into the gpu_table_representation), so we just read it here.
+            // (pinned_chunk_source stamps each chunk's memory_space into
+            // the gpu_table_representation), so we just read it here.
             if (!preferred_device_id.has_value()) {
               if (auto* cached =
                     dynamic_cast<op::scan::scan_operator_input*>(local_state->_input_data.get())) {

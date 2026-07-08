@@ -16,7 +16,6 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
-#include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
@@ -28,13 +27,13 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/pinned_chunk_source.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
-#include <cudf/column/column_view.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -47,7 +46,6 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -63,96 +61,6 @@
 namespace sirius::scan_manager {
 
 namespace {
-
-struct cached_databatch_provider : public databatch_provider {
-  cached_databatch_provider(pinned_entry const& entry,
-                            std::span<size_t> selected_columns,
-                            const telemetry::batch_telemetry_info& telemetry_info)
-    : _entry(entry), _telemetry_info(telemetry_info)
-  {
-    auto const& entry_column_names = _entry.cache_info.column_names();
-    std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
-      _column_names.emplace_back(entry_column_names[idx]);
-      _column_indices.push_back(idx);
-    });
-
-    if (_entry.tier == cucascade::memory::Tier::GPU) {
-      if (_entry.data_batches_by_column.empty()) {
-        _n_chunks = 0;
-      } else {
-        _n_chunks = _entry.data_batches_by_column.begin()->second.size();
-      }
-    } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      _n_chunks = _entry.host_chunks.size();
-    }
-  }
-
-  std::shared_ptr<cucascade::data_batch> get_next_batch() override
-  {
-    auto index = _index.fetch_add(1);
-    if (index >= _n_chunks) { return nullptr; }
-    if (_entry.tier == cucascade::memory::Tier::GPU) {
-      return get_device_databatch(index);
-    } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      return get_host_databatch(index);
-    }
-    return nullptr;
-  }
-
- private:
-  std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
-  {
-    if (index >= _entry.host_chunks.size()) { return nullptr; }
-    const auto& chunk = _entry.host_chunks.at(index);
-    if (!chunk) { return nullptr; }
-    auto data_rep       = chunk->slice(_column_indices);
-    const auto batch_id = get_next_batch_id();
-    return cucascade::data_batch::make(
-      batch_id,
-      std::move(data_rep),
-      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
-  }
-
-  std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
-  {
-    if (index >= _entry.chunk_memory_spaces.size()) { return nullptr; }
-    std::vector<std::shared_ptr<cudf::column>> columns;
-    std::vector<cudf::column_view> column_views;
-    std::size_t alloc_size = 0;
-    for (const auto& col_idx : _column_names) {
-      const auto& col_chunks = _entry.data_batches_by_column.at(col_idx);
-      if (index >= col_chunks.size()) { return nullptr; }
-      columns.push_back(col_chunks.at(index));
-      column_views.emplace_back(columns.back()->view());
-      alloc_size += columns.back()->alloc_size();
-    }
-    cudf::table_view view(column_views);
-    auto* chunk_space = !_entry.chunk_memory_spaces.empty() ? _entry.chunk_memory_spaces.at(index)
-                                                            : _entry.memory_space;
-    auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-      view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-    const auto batch_id = ::sirius::get_next_batch_id();
-    return ::cucascade::data_batch::make(
-      batch_id,
-      std::move(gpu_repr),
-      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
-  }
-
-  std::size_t _n_chunks;
-  std::vector<std::string> _column_names;
-  std::vector<size_t> _column_indices;
-  const pinned_entry& _entry;
-  telemetry::batch_telemetry_info _telemetry_info;
-  std::atomic<std::size_t> _index{0};
-};
-
-std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry,
-  std::span<size_t> selected_columns,
-  const telemetry::batch_telemetry_info& telemetry_info)
-{
-  return std::make_unique<cached_databatch_provider>(entry, selected_columns, telemetry_info);
-}
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
 /// resolved by a local-file backend.
@@ -329,14 +237,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
+    // Probe the pinned cache first: on a hit the operator's format ingestible
+    // enters pinned-serving mode (resident-chunk work items + the pass-through
+    // cached coalescer), so the plain split_provider below serves the cache
+    // and no disk read is issued. On a miss the ingestible keeps its normal
+    // metadata walk — the serving tail is identical either way.
+    try_enter_pinned_serving(op);
     _metadata_processor->register_pipeline(op, round_robin);
-    // On a pinned-cache hit the coalescer serves this operator from the cached
-    // batch_provider (process_cached_entries); skip the disk-reading
-    // split_provider entirely so no read is issued for the cached scan.
-    if (try_assign_cached_entries(op)) {
-      _scan_op_order.push_back(op);
-      continue;
-    }
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
       [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
@@ -615,8 +522,8 @@ void sirius_scan_manager::insert_pinned_entry(
       // Decide which column INDICES are new BEFORE iterating chunks. Doing
       // the contains() check per-chunk would let chunk 0 install a new
       // column and then chunks 1..N-1 see contains()==true and skip — leaving
-      // the new column with only chunk 0 and tripping cached_split_provider's
-      // "mismatched chunk count across requested columns" invariant.
+      // the new column with only chunk 0 and tripping build_pinned_chunk_source's
+      // "column does not cover every chunk" validation.
       std::vector<bool> is_new_col(column_names.size(), false);
       for (std::size_t i = 0; i < column_names.size(); ++i) {
         is_new_col[i] = !entry.data_batches_by_column.contains(column_names[i]);
@@ -721,7 +628,68 @@ void sirius_scan_manager::visit_pinned_entries(
   }
 }
 
-bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
+std::unique_ptr<op::scan::pinned_chunk_source> build_pinned_chunk_source(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  telemetry::batch_telemetry_info telemetry_info)
+{
+  auto const& entry_column_names = entry.cache_info.column_names();
+
+  if (entry.tier == cucascade::memory::Tier::GPU) {
+    std::vector<op::scan::pinned_chunk_source::gpu_chunk> chunks;
+    if (entry.data_batches_by_column.empty()) {
+      // Legitimate zero-chunk entry: nothing to serve, nothing to validate.
+      return std::make_unique<op::scan::pinned_chunk_source>(std::move(chunks), telemetry_info);
+    }
+    auto const n_chunks = entry.data_batches_by_column.begin()->second.size();
+    if (!entry.chunk_memory_spaces.empty() && entry.chunk_memory_spaces.size() != n_chunks) {
+      throw std::runtime_error(
+        "pinned entry's chunk_memory_spaces does not cover every chunk of the entry");
+    }
+    // Resolve the selected columns' chunk vectors once, validating coverage —
+    // a malformed entry throws here (the caller falls back to the disk read)
+    // instead of silently truncating the scan mid-stream.
+    std::vector<std::vector<std::shared_ptr<cudf::column>> const*> selected;
+    selected.reserve(selected_columns.size());
+    for (auto idx : selected_columns) {
+      auto const& name = entry_column_names.at(idx);
+      auto it          = entry.data_batches_by_column.find(name);
+      if (it == entry.data_batches_by_column.end() || it->second.size() != n_chunks) {
+        throw std::runtime_error("pinned column '" + name +
+                                 "' does not cover every chunk of the entry");
+      }
+      selected.push_back(&it->second);
+    }
+    chunks.reserve(n_chunks);
+    for (std::size_t c = 0; c < n_chunks; ++c) {
+      op::scan::pinned_chunk_source::gpu_chunk chunk;
+      chunk.columns.reserve(selected.size());
+      for (auto const* col_chunks : selected) {
+        chunk.columns.push_back(col_chunks->at(c));
+      }
+      chunk.memory_space =
+        !entry.chunk_memory_spaces.empty() ? entry.chunk_memory_spaces.at(c) : entry.memory_space;
+      chunks.push_back(std::move(chunk));
+    }
+    return std::make_unique<op::scan::pinned_chunk_source>(std::move(chunks), telemetry_info);
+  }
+
+  if (entry.tier == cucascade::memory::Tier::HOST) {
+    std::vector<op::scan::pinned_chunk_source::host_chunk> chunks;
+    chunks.reserve(entry.host_chunks.size());
+    for (auto const& chunk : entry.host_chunks) {
+      chunks.push_back({chunk});  // null chunks are rejected by the source ctor
+    }
+    return std::make_unique<op::scan::pinned_chunk_source>(
+      std::move(chunks),
+      std::vector<std::size_t>(selected_columns.begin(), selected_columns.end()),
+      telemetry_info);
+  }
+
+  throw std::runtime_error("pinned entry has an unsupported tier");
+}
+
+bool sirius_scan_manager::try_enter_pinned_serving(op::scan::sirius_gpu_scan_operator* op)
 {
   const auto& table_info = op->get_ingestible().table_info();
 
@@ -736,11 +704,25 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
       auto cols = gather_by_primary_index(entry.cache_info.column_ids,
                                           op->get_ingestible().materialized_column_order());
       if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
-      auto provider = make_provider_for_pinned_entry(entry, cols, op->batch_telemetry());
-      _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
+      auto source         = build_pinned_chunk_source(entry, cols, op->batch_telemetry());
+      auto const n_chunks = source->num_chunks();
+      if (!op->get_ingestible().serve_from_pinned_chunks(std::move(source))) {
+        // This format's ingestible has no pinned-serving mode; keep the disk read.
+        spdlog::warn(
+          "[sirius_scan_manager] pinned entry '{}' matched operator '{}' but its "
+          "ingestible does not support pinned serving; using the disk read",
+          pinned_name,
+          op->get_operator_id());
+        return false;
+      }
       spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
                    pinned_name,
                    op->get_operator_id());
+      spdlog::info(
+        "[sirius_scan_manager] pinned entry '{}' served via pinned chunks "
+        "({} chunks) on the metadata dispatcher",
+        pinned_name,
+        n_chunks);
       return true;
     }
   } catch (...) {

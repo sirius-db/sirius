@@ -240,10 +240,12 @@ void SiriusContext::QueryEnd()
       }
     }
 
-    // Drop scan-manager providers for this query. Each cached_split_provider
-    // holds shared_ptr copies of the pinned entry's host_chunks; if kept past
-    // the query, those refs prevent fixed_size_host_memory_resource blocks from
-    // returning to the pool even after unpin_table runs. Repositories are
+    // Drop scan-manager providers for this query. A pinned-mode ingestible's
+    // pinned_chunk_source holds shared_ptr copies of the pinned chunks, and
+    // batches it emitted hold host-chunk slices while in flight; resetting
+    // here (and tearing down the per-query operators) keeps per-query serving
+    // state from outliving the query, so fixed_size_host_memory_resource
+    // blocks return to the pool once unpin_table runs. Repositories are
     // already cleared above, so downstream data_batches that referenced
     // sliced host_data_representation are gone before we drop the providers.
     if (scan_manager_) { scan_manager_->reset(); }

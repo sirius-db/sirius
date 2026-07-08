@@ -25,6 +25,7 @@
 #include <log/logging.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
+#include <op/scan/pinned_chunk_source.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
@@ -256,14 +257,25 @@ duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 // split-provider interface
 //===----------------------------------------------------------------------===//
+bool duckdb_native_gpu_ingestible::serve_from_pinned_chunks(
+  std::unique_ptr<pinned_chunk_source> source)
+{
+  _pinned = std::move(source);
+  return true;
+}
+
 bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 {
+  if (_pinned) { return !_pinned->has_more(); }
   return _next_range_idx.load(std::memory_order_relaxed) >= _num_ranges;
 }
 
 duckdb_native_gpu_ingestible::metadata_scan_task_t
 duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 {
+  // Pinned mode: serve resident chunks; no ioctx, no metadata walk.
+  if (_pinned) { return _pinned->next_work_item(); }
+
   auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _num_ranges) { return nullptr; }  // lost the race for the final range
 
@@ -321,6 +333,11 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
 //===----------------------------------------------------------------------===//
 std::unique_ptr<batch_coalescer> duckdb_native_gpu_ingestible::create_batch_coalescer() const
 {
+  // Pinned mode: resident chunks were already coalesced to batch size at pin
+  // time — the slot gets the pass-through coalescer instead of the row-group
+  // byte-budget one (which would drop cached_scan_info splits).
+  if (_pinned) { return std::make_unique<cached_batch_coalescer>(); }
+
   std::vector<bool> is_varchar;
   is_varchar.reserve(_info->projected_types.size());
   for (auto const& t : _info->projected_types) {

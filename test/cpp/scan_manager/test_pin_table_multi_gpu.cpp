@@ -244,14 +244,12 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
     if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
     REQUIRE_FALSE(pin->HasError());
 
-    // Run a SELECT through the cached split provider. The scan_manager
-    // matches incoming parquet_scan_info::file_paths against the pinned
-    // entry's file_paths (sirius_scan_manager.cpp matches_scan_info
-    // lambda), so we reuse the same glob in read_parquet. Sirius's
-    // task_creator + cached_split_provider then emit one
-    // scan_cached_operator_data per chunk tagged with that chunk's
-    // memory_space, which the [mgpu-audit] hook in pipeline_executor.cpp
-    // and duckdb_scan_executor.cpp records.
+    // Run a SELECT through the pinned-chunk serving path. The scan_manager
+    // matches the incoming scan's file_paths against the pinned entry's
+    // file_paths, so we reuse the same glob in read_parquet. The pinned-mode
+    // ingestible then emits one resident scan_operator_input per chunk tagged
+    // with that chunk's memory_space, which the [mgpu-audit] hook in
+    // pipeline_executor.cpp and duckdb_scan_executor.cpp records.
     auto select_sql = "CALL gpu_execution(\"SELECT k, count(*) FROM read_parquet('" + glob +
                       "') WHERE k % 2 = 0 GROUP BY k LIMIT 10\");";
     auto select = con.Query(select_sql);
@@ -296,8 +294,8 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   // [mgpu-audit] has two emission sites in the codebase:
   //   - task_scheduler.cpp:275 emits "pipeline_task dispatched to GPU N
   //     task_id=K" — fires for EVERY pipeline_task dispatched. The
-  //     scan_cached_operator_data emitted per chunk by cached_split_provider
-  //     drives a pipeline_task on the chunk's home GPU, so this is the
+  //     resident scan_operator_input emitted per chunk by the pinned serving
+  //     path drives a pipeline_task on the chunk's home GPU, so this is the
   //     correct emission for the cached-pin routing gate.
   //   - duckdb_scan_executor.cpp:264 emits "scan_batch assigned to GPU N
   //     batch_id=K" — fires ONLY for the DuckDB-attach scan path
@@ -579,7 +577,7 @@ TEST_CASE("pin_table - host-tier cached path serves MAX(k) after overwrite (mult
 
   // Sanity check: query BEFORE overwriting to confirm pin → cached SELECT works
   // in this scenario. Use MAX(k) instead of count(*) — count(*) has a separate
-  // metadata-only optimization that bypasses the cached_split_provider's
+  // metadata-only optimization that bypasses the pinned serving's
   // column-selection path; MAX(k) requires the cached chunks to actually
   // surface the k column's values, which is exactly what host-tier caching
   // must serve.
@@ -784,8 +782,8 @@ TEST_CASE("pin_table - host-tier cached path serves SUM(v) after overwrite (mult
 // checked `entry.data_batches_by_column.contains(col_name)` per chunk —
 // after chunk 0 installed C, contains() returned true and chunks 1..N were
 // dropped. The pinned entry then had uneven chunk counts across columns,
-// which trips the cached_split_provider invariant and silently falls back
-// to uncached reads.
+// which trips build_pinned_chunk_source's coverage validation and silently
+// falls back to uncached reads.
 //
 // This gate generates a multi-chunk surface (large enough that the cudf
 // chunked_parquet_reader emits >=2 chunks per file at the default 100 MB

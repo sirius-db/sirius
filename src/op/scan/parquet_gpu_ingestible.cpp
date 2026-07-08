@@ -28,6 +28,7 @@
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
+#include <op/scan/pinned_chunk_source.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_dynamic_filter.hpp>
@@ -397,6 +398,11 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
+  // Pinned mode: resident chunks were already coalesced to batch size at pin
+  // time — the slot gets the pass-through coalescer instead of the file
+  // byte-budget one (which would drop cached_scan_info splits).
+  if (_pinned) { return std::make_unique<cached_batch_coalescer>(); }
+
   return std::make_unique<parquet_batch_coalescer>(
     _info->approximate_batch_size, _reader_options, _plan);
 }
@@ -404,14 +410,24 @@ std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer(
 //===----------------------------------------------------------------------===//
 // split-provider interface
 //===----------------------------------------------------------------------===//
+bool parquet_gpu_ingestible::serve_from_pinned_chunks(std::unique_ptr<pinned_chunk_source> source)
+{
+  _pinned = std::move(source);
+  return true;
+}
+
 bool parquet_gpu_ingestible::has_processed_all_metadata() const
 {
+  if (_pinned) { return !_pinned->has_more(); }
   return _next_file_idx.load(std::memory_order_relaxed) >= _file_paths.size();
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
   io::ioctx_resolver resolve)
 {
+  // Pinned mode: serve resident chunks; no ioctx, no footer read.
+  if (_pinned) { return _pinned->next_work_item(); }
+
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
   if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file

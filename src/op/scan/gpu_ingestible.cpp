@@ -18,9 +18,15 @@
 
 #include <data/data_batch_utils.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/pinned_chunk_source.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 namespace sirius::op::scan {
+
+bool gpu_ingestible::serve_from_pinned_chunks(std::unique_ptr<pinned_chunk_source> /*source*/)
+{
+  return false;  // this format has no pinned-serving mode; caller falls back to the disk read
+}
 
 filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_input& split,
                                                  rmm::cuda_stream_view stream)

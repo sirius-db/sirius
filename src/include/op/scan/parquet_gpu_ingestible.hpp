@@ -271,6 +271,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
 
+  /// Pinned-cache serving mode: the three serving methods above deliver the
+  /// source's resident chunks instead of reading footers (no disk read).
+  /// Stays trivial permanently — MVCC serving is duckdb-only.
+  bool serve_from_pinned_chunks(std::unique_ptr<pinned_chunk_source> source) override;
+
   filtered_table materialize_metadata_to_table(scan_info const& info,
                                                const cucascade::memory::memory_space& mem_space,
                                                rmm::cuda_stream_view stream) override;
@@ -314,6 +319,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in
   // the downstream dynamic-filter operator.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _sirius_dynamic_filters;
+
+  /// Pinned-cache serving mode (null = normal footer walk). Set once by
+  /// @ref serve_from_pinned_chunks before the split_provider runs.
+  std::unique_ptr<pinned_chunk_source> _pinned;
 };
 
 std::shared_ptr<parquet_gpu_ingestible> make_ingestible(

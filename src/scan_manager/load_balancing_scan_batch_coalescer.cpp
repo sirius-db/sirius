@@ -18,6 +18,7 @@
 
 #include "exec/try.hpp"
 #include "log/logging.hpp"
+#include "op/scan/pinned_chunk_source.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 
 #include <stop_token>
@@ -44,17 +45,6 @@ load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan
   return state_ptr;
 }
 
-void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
-  op::scan::sirius_gpu_scan_operator* scan_op, std::unique_ptr<databatch_provider> provider)
-{
-  if (!scan_op) return;
-  auto uid = scan_op->get_operator_id();
-  auto it  = _slots.find(uid);
-  if (it == _slots.end()) { return; }
-  auto& state = *it->second;
-  state.attach_batch_provider(std::move(provider));
-}
-
 std::function<void(exec::try_t<std::unique_ptr<op::scan::scan_info>>&&)>
 load_balancing_scan_batch_coalescer::get_split_provider_bridge(
   op::scan::sirius_gpu_scan_operator* scan_op)
@@ -72,12 +62,7 @@ void load_balancing_scan_batch_coalescer::worker_loop([[maybe_unused]] std::stop
 {
   for (auto pipeline_id : _pipeline_order) {
     if (stop.stop_requested()) { break; }
-    auto& state = *_slots.at(pipeline_id);
-    if (state.batch_provider) {
-      process_cached_entries(state, stop);
-    } else {
-      process_provider_inputs(state, stop);
-    }
+    process_provider_inputs(*_slots.at(pipeline_id), stop);
   }
 }
 
@@ -91,6 +76,17 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 
   // Balance one coalesced batch onto a GPU and hand it to the connector.
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
+    if (auto* cached = dynamic_cast<op::scan::cached_scan_info*>(batch.get())) {
+      // Pinned-cache chunk: already resident, so no fadvise/prefetch, and no
+      // balancer stamping — task_creator routes cached scans off the batch's
+      // memory_space (its cached-scan locality branch), which a
+      // preferred_device_id stamped here would override. Skipping the
+      // get_next_gpu call also keeps the shared round-robin cursor untouched
+      // for the disk pipelines of a mixed cached+disk query.
+      state.connector->push_split(
+        std::make_unique<op::scan::scan_operator_input>(cached->take_batch()));
+      return;
+    }
     auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
     auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
     SIRIUS_LOG_INFO("[coalesce-debug] load_balancer emit pipeline={} -> preferred GPU {}",
@@ -158,21 +154,6 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
   }
 
   // Stop requested between iterations — close so downstream consumers unblock.
-  state.connector->close();
-}
-
-void load_balancing_scan_batch_coalescer::process_cached_entries(
-  metadata_processing_state& state, [[maybe_unused]] std::stop_token const& stop)
-{
-  bool is_closed = false;
-  while (!is_closed) {
-    auto databatch = state.batch_provider->get_next_batch();
-    is_closed      = databatch == nullptr;
-    if (!is_closed) {
-      auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(databatch));
-      state.connector->push_split(std::move(op_data));
-    }
-  }
   state.connector->close();
 }
 

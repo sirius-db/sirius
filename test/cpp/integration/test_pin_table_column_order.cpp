@@ -171,8 +171,8 @@ TEST_CASE("pin_table - cached scan serves columns in materialized order (column-
     REQUIRE(fb);
     REQUIRE_FALSE(fb->HasError());
 
-    // The cached-scan column ordering is tier-agnostic (both tiers share
-    // cached_databatch_provider), so exercise both. 'host' matches the originally reported
+    // The cached-scan column ordering is tier-agnostic (both tiers share the
+    // pinned-chunk serving path), so exercise both. 'host' matches the originally reported
     // configuration; 'gpu' is the tier the other pin tests use.
     for (auto const* tier : {"host", "gpu"}) {
       DYNAMIC_SECTION("pin tier = " << tier)

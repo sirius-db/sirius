@@ -24,9 +24,10 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
-// used by prepare_for_query / create_provider_for.
+// used by prepare_for_query.
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -67,6 +68,7 @@ class buffer_pool;
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
 class gpu_ingestible;
+class pinned_chunk_source;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
@@ -84,7 +86,7 @@ namespace sirius::scan_manager {
 /// Captures only what serving needs — the table's identity (parquet file set OR
 /// duckdb catalog/schema/table name), the cached columns (by primary/storage
 /// index), and their names (aligned with @c column_ids) for the GPU gather — and
-/// owns the match logic that @ref sirius_scan_manager::try_assign_cached_entries consults.
+/// owns the match logic that @ref sirius_scan_manager::try_enter_pinned_serving consults.
 class cache_entry_info {
  public:
   std::vector<std::string> resolved_file_paths;    ///< parquet identity (file set)
@@ -135,20 +137,34 @@ struct pinned_entry {
   /// chunked_parquet_reader::read_chunk() call.
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   /// HOST-tier storage: one host_data_representation per chunk, each holding all
-  /// pinned columns. The cached_split_provider slices these by column index when
+  /// pinned columns. The pinned_chunk_source slices these by column index when
   /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   /// Tier the pinned data resides in. Drives which storage member above is used
-  /// and which cached_split_provider variant @ref create_provider_for builds.
+  /// and which per-chunk assembly path the pinned_chunk_source takes.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
-  /// Memory space the pinned data resides in. Captured at pin time so the
-  /// cached_split_provider can wrap copied tables as data_batch instances.
+  /// Memory space the pinned data resides in. Captured at pin time so pinned
+  /// serving can wrap the cached chunks as data_batch instances.
   cucascade::memory::memory_space* memory_space{nullptr};
   /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
 };
+
+/// Extract @p entry's chunks — gathered down to @p selected_columns (positions
+/// into the entry's column layout), in that order — into a self-contained
+/// pinned_chunk_source ready to hand to
+/// gpu_ingestible::serve_from_pinned_chunks. @p telemetry_info attributes the
+/// served batches to the scanning pipeline (default: no-op probes, e.g. unit
+/// tests). Throws on a malformed entry (per-column chunk counts that disagree,
+/// short chunk_memory_spaces, a null host chunk, or an unsupported tier); @ref
+/// sirius_scan_manager::try_enter_pinned_serving treats that as a cache miss
+/// and falls back to the disk read.
+[[nodiscard]] std::unique_ptr<op::scan::pinned_chunk_source> build_pinned_chunk_source(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  telemetry::batch_telemetry_info telemetry_info = {});
 
 /**
  * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
@@ -199,15 +215,16 @@ class sirius_scan_manager {
 
   /// \brief Prepare per-scan state for the given query.
   ///
-  /// Walks @p query 's pipelines in scan-operator order. For each GPU parquet
-  /// scan source, the factory builds a split_provider from the operator's
-  /// scan_info, installs a fresh split_connector on the operator, and stores
-  /// the provider in a map keyed by the operator. A driver thread then runs
-  /// the providers SEQUENTIALLY in registration order: provider[0] starts,
-  /// when its future completes provider[1] starts, and so on. Consumers (the
-  /// gpu scan operators) block in split_connector::get_next_split until splits
-  /// arrive or the connector is closed, so no separate wake-up channel is
-  /// needed.
+  /// Walks @p query 's pipelines in scan-operator order. Each GPU scan gets a
+  /// slot in the metadata sequencer and a plain split_provider over its
+  /// ingestible in @c _providers_by_op. When a pinned entry can serve the scan
+  /// (probed first), the ingestible is switched into pinned-serving mode so
+  /// the same provider delivers the resident chunks and no disk read is
+  /// issued. All providers then run on the metadata dispatcher, while the
+  /// sequencer drains their slots in registration order. Consumers (the gpu
+  /// scan operators) block in
+  /// split_connector::get_next_split until splits arrive or the connector is
+  /// closed, so no separate wake-up channel is needed.
   ///
   /// @param query        The query whose scan operators must be prepared.
   void prepare_for_query(const sirius::planner::query& query);
@@ -262,7 +279,7 @@ class sirius_scan_manager {
   ///
   /// Each entry in @p host_chunks describes one batch's worth of pinned data
   /// (covering all pinned columns) as a host_data_representation. The
-  /// cached_split_provider built from this entry slices each chunk by column
+  /// pinned_chunk_source built from this entry slices each chunk by column
   /// index at scan time. This path always REPLACES any existing entry for @p name
   /// — there is no per-column merge analog to the GPU path because the
   /// chunk-vs-column dimensions are flipped (each chunk already holds every column).
@@ -302,10 +319,13 @@ class sirius_scan_manager {
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
-  /// \brief Attach a cached batch_provider to @p op if a pinned entry can serve
-  ///        it. Returns true when a cache hit was assigned (the caller then skips
-  ///        the disk-reading split_provider for this operator).
-  bool try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op);
+  /// \brief Switch @p op 's ingestible into pinned-serving mode if a pinned
+  ///        entry can serve it (via gpu_ingestible::serve_from_pinned_chunks).
+  ///        Returns false on a cache miss — the ingestible keeps its normal
+  ///        disk walk. Any matching/extraction error is swallowed and treated
+  ///        as a miss, so a malformed entry falls back to the disk read
+  ///        instead of failing the query.
+  bool try_enter_pinned_serving(op::scan::sirius_gpu_scan_operator* op);
 
   /// Resolve the ioctx that should serve @p path (normalized internally, so callers
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
@@ -338,9 +358,10 @@ class sirius_scan_manager {
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
-  /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
-  /// parquet scan (allocated by @ref create_provider_for when it builds
-  /// a parquet_split_provider).  The sequencer task is enqueued on the
+  /// in @ref prepare_for_query, gets one slot per GPU scan (the slot
+  /// coalescer comes from the ingestible: pass-through cached coalescer
+  /// in pinned mode, format coalescer otherwise).  The sequencer task is
+  /// enqueued on the
   /// per-query @c _dispatcher, which injects its own stop_token; the
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
