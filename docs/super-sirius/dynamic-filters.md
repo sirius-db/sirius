@@ -193,7 +193,7 @@ sequenceDiagram
     P->>P: read_parquet, then membership post-filter
 ```
 
-### Transitive scan targets and build-task priority
+### Transitive scan targets and publication timing
 
 DuckDB may route the same join filter through operators on the probe side, including intervening comparison joins, until it reaches a base scan. Such a scan is a **transitive probe target**: it contributes to the producing join's probe subtree, but it does not directly feed that join's probe port. The producing join's build hint therefore does not gate the scan.
 
@@ -222,18 +222,23 @@ The filter is still redundant and safe: every `lineitem` row that survives `J_pa
 2. The task creator can enqueue many `lineitem` GPU scan tasks. Enqueuing does not snapshot the dynamic-filter channel.
 3. Probe `PARTITION` and non-`concat_all` `CONCAT` may stream enough `J_supplier` output toward `J_part` while more `lineitem` tasks remain queued or in flight.
 4. Once task creation reaches `J_part`, its missing build causes the `part` build subtree to be created.
-5. For each ready device, the scheduler dispatches a device-compatible queued task from that build subtree ahead of ordinary GPU tasks. The `part` build can therefore publish before the remaining `lineitem` tasks materialize.
+5. The scheduler dispatches the resulting tasks through its normal device-affinity and queue-order policy. There is no filter-specific preference or readiness barrier.
 
-The preference is deliberately soft and best-effort. It only reorders tasks already present in the GPU task queue; it does not create a missing build task, preempt a running scan, or impose a readiness wait at the consumer. If no compatible build-subtree task is queued for a ready device, normal dispatch resumes. With no plan-wired filter publisher, no build pipelines are marked and the mechanism is inert. If an intervening join produces no partial output until its input scan drains, task creation reaches the outer build too late for prioritization to help. If a build task does become queued, it may overtake undispatched scan tasks, while splits already past the relevant consumer check are not revisited.
+The transitive consumer remains deliberately opportunistic. It does not create a missing build
+task, preempt a running scan, or wait for filter readiness. Splits already past a consumer
+checkpoint are not revisited. DuckDB's consumer-routing walk still follows the producing join's
+probe subtree through intervening operators to attach the channel to a base scan; the scheduler
+does not perform a second filter-specific topology walk.
 
-For a direct probe scan, this preference does not provide the ordering guarantee: the join hint already supplies that guarantee, so prioritization is redundant for filter coverage. Its Phase 1 purpose is the transitive case above. Completing a plan-wired filtered/selective build early can keep that join's build state—and, once its probe resumes, its hash table—resident longer than demand-driven execution would. The simple priority is specific to Phase 1; Phase 2's broader producer/consumer topology needs a more general coordination design.
+Issue [#1124](https://github.com/sirius-db/sirius/issues/1124) compared filters disabled, the former
+build-subtree preference, and normal scheduling at SF300. Every measured scan consumed zero rows
+before publication in both filter-enabled configurations, while normal scheduling improved wall
+time by 9–25% and substantially reduced variance with bit-identical results and unchanged peak
+memory. The preference was therefore deleted. This result motivates the policy but does not create
+an ordering guarantee for other workloads; any future consumer that requires ordering must express
+that dependency explicitly outside the global scheduler.
 
-There are two distinct transitive walks:
-
-- **Consumer routing:** DuckDB walks down the producing join's probe subtree through intervening operators to attach the channel to a base scan.
-- **Build-subtree marking:** Sirius walks backward from every filter-producing join's `build` port and marks all pipelines needed to produce that build, including both sides of any intervening joins in the build subtree.
-
-Metadata preparation is independent of both walks. Footer parsing, split coalescing, and background prefetch preparation may happen before publication; those activities do not decode or materialize table rows and do not snapshot the channel. A queued GPU scan task also has not necessarily consumed the filter yet. Zone maps are selected immediately before `read_parquet`, while membership filters are selected by the following fused post-decode operator. Publication after either check cannot make that check run again, although publication during decode may still be observed by the later membership stage.
+Metadata preparation is independent of consumer routing and task scheduling. Footer parsing, split coalescing, and background prefetch preparation may happen before publication; those activities do not decode or materialize table rows and do not snapshot the channel. A queued GPU scan task also has not necessarily consumed the filter yet. Zone maps are selected immediately before `read_parquet`, while membership filters are selected by the following fused post-decode operator. Publication after either check cannot make that check run again, although publication during decode may still be observed by the later membership stage.
 
 The channel therefore remains opportunistic and never waits on readiness. A direct target normally observes the completed fan-out. A transitive target racing publication may observe no filter, a subset while `push_filter` appends the individually complete filters, or the full set after publication reaches `FINISHED`; every filter becomes visible only after its own device replicas are ready. An intentionally empty publication, an unsupported or policy-gated key, an unavailable local replica, or a filter disabled by the selectivity gate is always a safe pass-through because the join remains authoritative.
 
@@ -280,7 +285,7 @@ flowchart TB
 **Producer:** `BUILD_PROBE` hash-join build side.
 **Consumer:** parquet GPU scan (`parquet_gpu_ingestible`).
 **Routing:** DuckDB-paired (`DynamicTableFilterSet*` route key).
-**Coordination:** synchronous build-side CONCAT publication strictly precedes the producing join's immediate probe data scan; transitive scan targets remain nonblocking and benefit opportunistically from soft build-subtree dispatch priority.
+**Coordination:** synchronous build-side CONCAT publication strictly precedes the producing join's immediate probe data scan; transitive scan targets remain nonblocking and race publication under normal scheduler order.
 
 ### 1.1 Foundational wiring
 
@@ -293,19 +298,22 @@ Plan-gen / type plumbing:
 - `dynamic_filter_publish_plan::probe_target` entries plus non-owning paired GPU/HOST replica spaces (producer endpoint, held privately by the hash join)
 - Plan-gen wiring in `sirius_plan_get.cpp` and `sirius_plan_comparison_join.cpp`; the join attaches a channel per target
 
-#### Ordered build-port publication and soft dispatch priority
+#### Ordered build-port publication
 
 Publishing from `finalize_operator()` or from the hash-table build would be too late because the `BUILD_PROBE` hash table is constructed only after the first probe batch arrives. The implemented producer instead uses the complete build batch delivered by build-side `CONCAT`; it requires no probe batch and does not depend on the hash-table state machine.
 
 The normal path is deliberately ordered:
 
-1. Pipeline construction places the build child before the probe child. For every plan-wired filter producer, the task scheduler also marks all pipelines that transitively feed its `build` port. The remainder of this sequence applies when partitioning selects `BUILD_PROBE`.
+1. Pipeline construction places the build child before the probe child. The remainder of this sequence applies when partitioning selects `BUILD_PROBE`.
 2. Build `PARTITION` selects `BUILD_PROBE` only when a build-side CONCAT can fold the input, then sets that CONCAT to `concat_all`.
 3. Build CONCAT waits for its source pipeline, folds the complete build side to one GPU batch, and synchronously calls `push_data_batch_partitioned("build", batch)`.
 4. The hook acquires the batch's read-only accessor before routing it — once deposited into a repository the batch becomes a downgrade candidate, and the shared lock pins its GPU representation until publication completes. It then waits for the representation's writer event, claims `OPEN -> PUBLISHING`, constructs the selected filters, completes device replication, pushes the immutable filters into every accepting channel, and stores `FINISHED` before returning.
 5. Only after the CONCAT task returns does downstream task creation ask the join for its next hint and follow `WAITING_FOR_INPUT_DATA` into the immediate probe producer. A scan on that edge therefore cannot run while normal build-port publication is in progress.
 
-That sequence does not gate a scan reached transitively through an intervening join. For those targets, the management loop first looks for a device-compatible queued task in the marked build subtrees whenever a GPU becomes ready, then falls through to normal locality-aware dispatch if none exists. The preference can advance publication relative to undispatched transitive scan splits, but it does not preempt work or turn the channel into a barrier. See [Transitive scan targets and build-task priority](#transitive-scan-targets-and-build-task-priority).
+That sequence does not gate a scan reached transitively through an intervening join. Those targets
+run under normal locality-aware dispatch and may observe no filter, a partial fan-out, or the
+complete publication at their checkpoints. See
+[Transitive scan targets and publication timing](#transitive-scan-targets-and-publication-timing).
 
 The publication attempt may intentionally emit no filter—for example, for an empty build, a cast or unsupported key, a domain-covering key, or a non-selective zone range. That successful no-op is still `FINISHED`. Allocation pressure may also leave an optional replica unavailable. Consumers need no readiness protocol: they test the channel and local device availability and pass the batch through when nothing useful can apply. Replica materialization for every filter kind treats a per-target failure (reservation denial, cloning, copy, or completion synchronize) as best-effort: it is logged and that target's replica is omitted.
 
@@ -324,7 +332,7 @@ Replica bytes use direct peer DMA where empirically verified, otherwise they bor
 - **SF50, full TPC-H (22 queries), regression guard — OFF vs ON:** aggregate **+0.2 %** (136.17 s → 136.39 s), i.e. net-zero within the per-query noise floor (~±9 % on the small queries; the large queries are all ≤ ±3 %). **All 22 results bit-identical** OFF vs ON. `pruned=0` on every query because TPC-H's scattered keys span the key domain; the gated/default-off paths bound that cost. Full unit suite passes.
 - **SF30, `lineitem ⋈ keyset` on clustered `l_orderkey`** (the case the zone-map is *for*): the zone-map excludes the non-overlapping row groups, ≈1.6× — preserved by the row-group path. This requires the keyset's narrow range be *runtime*-determined: for a literal/range-derivable build, DuckDB's static transitive pushdown already prunes (measured feature-OFF == ON on SF50), so the dynamic zone-map adds nothing — hence it is gated off by default (`enable_dynamic_zone_map_filter`).
 
-Zone-map pruning only pays off when the build-side join key is range-restricted on a *clustered* fact (e.g. `l_orderkey`). An immediate probe read is ordered after publication. A transitive target may materialize early splits first, so build-subtree priority improves coverage without guaranteeing it; for every split that does observe the zone map, key distribution determines whether row groups can be rejected. TPC-H joins on scattered keys (`l_partkey` in Q14/Q17/Q19) prune nothing — those are handled by the membership filters below.
+Zone-map pruning only pays off when the build-side join key is range-restricted on a *clustered* fact (e.g. `l_orderkey`). An immediate probe read is ordered after publication. A transitive target may materialize early splits first and observes filters opportunistically; for every split that does observe the zone map, key distribution determines whether row groups can be rejected. TPC-H joins on scattered keys (`l_partkey` in Q14/Q17/Q19) prune nothing — those are handled by the membership filters below.
 
 ### 1.3–1.4 Membership filters (IN-list + Bloom)
 
@@ -431,7 +439,7 @@ An incrementally refined producer/consumer pair, or a consumer that requires a f
 
 ## Open questions
 
-1. ~~**Build/probe publication ordering.**~~ **Resolved with two cases.** For the normal GPU-resident `BUILD_PROBE` path, build-side CONCAT calls the publication hook synchronously and the attempt reaches `FINISHED` before downstream scheduling follows that join into its immediate probe producer. A scan reached transitively through an intervening join is not covered by that edge ordering; soft build-subtree priority improves the chance that later splits observe the filter, but early splits may materialize unfiltered. Metadata preparation may occur before either case and does not snapshot the channel.
+1. ~~**Build/probe publication ordering.**~~ **Resolved with two cases.** For the normal GPU-resident `BUILD_PROBE` path, build-side CONCAT calls the publication hook synchronously and the attempt reaches `FINISHED` before downstream scheduling follows that join into its immediate probe producer. A scan reached transitively through an intervening join is not covered by that edge ordering and observes publication opportunistically under normal scheduler order. Metadata preparation may occur before either case and does not snapshot the channel.
 2. **AST-size threshold for multi-zone maps.** Phase 1.2's fallback-to-global threshold should be tuned with a microbenchmark on TPC-H Q14 / Q19 once 1.2 lands.
 3. **Bloom build-cost gate.** Phase 1.3 sizes bloom against L2, but a separate lower bound on build cardinality (below which bloom is dominated by zone-map / IN-list) is unspecified. Candidate: skip bloom when build cardinality < 10k.
 
@@ -441,6 +449,6 @@ An incrementally refined producer/consumer pair, or a consumer that requires a f
 - `src/cuda/sirius_dynamic_in_list_filter.cu`, `src/cuda/sirius_dynamic_bloom_filter.cu` — device-backed membership filters and replica construction
 - `src/include/op/scan/dynamic_filter_merge.hpp`, `src/op/scan/dynamic_filter_merge.cpp`, `test/cpp/scan/test_dynamic_filter_merge.cpp` — consumer-side merge/apply helpers (`merge_dynamic_filters_into_ast`, `apply_dynamic_filters_to_view`, `apply_dynamic_filters_gated_view`)
 - `src/planner/sirius_plan_comparison_join.cpp`, `src/planner/sirius_plan_get.cpp`, `test/cpp/planner/test_dynamic_filter_router.cpp` — producer/consumer plan-gen wiring and router
-- `src/pipeline/task_scheduler.cpp`, `src/op/sirius_physical_concat.cpp`, `src/op/sirius_physical_hash_join.cpp` — soft build-subtree dispatch priority, synchronous build-port publication, and fan-out
+- `src/op/sirius_physical_concat.cpp`, `src/op/sirius_physical_hash_join.cpp` — synchronous build-port publication and fan-out
 - `src/include/expression_evaluator/gpu_expression_translator_internal.hpp` — existing AST construction patterns (`cudf::ast::tree::emplace`, scalar lifetime)
 - `duckdb/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp` — `JoinFilterPushdownInfo`, `JoinFilterPushdownFilter` (consumed by Phase 1.1)

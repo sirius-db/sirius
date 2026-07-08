@@ -36,8 +36,7 @@ The publication and application contracts are distinct:
   execution begins.
 - A base scan reached transitively through an intervening join can execute
   earlier. It snapshots whatever fully ready filters are visible at its
-  reader and post-decode checkpoints; soft build-subtree task priority improves
-  the coverage of later splits without imposing a barrier.
+  reader and post-decode checkpoints under normal scheduler order.
 - A scan never waits for a dynamic filter and never assumes one was emitted.
 - An empty or policy-gated publication and an allocation-unavailable local
   replica are safe pass-through cases; the authoritative join guarantees
@@ -52,7 +51,7 @@ For an immediate probe, the actual `read_parquet`/decode task starts after the
 ordered build-port publication attempt has returned. A transitive target may
 start sooner: it selects zone maps immediately before `read_parquet` and selects
 membership filters in the following post-decode operator. See
-[Transitive scan targets and build-task priority](dynamic-filters.md#transitive-scan-targets-and-build-task-priority).
+[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ## Reproduction and diagnosis
 
@@ -332,8 +331,8 @@ legs to overlap on three or more GPUs. For an immediate probe, publication
 completion is upstream of data-scan execution, so replica latency is on the
 probe-start critical path. For a transitive target, earlier work may proceed
 unfiltered while replication is in progress; replica latency instead delays
-filter availability and reduces the number of splits it can prune. Soft
-build-subtree priority minimizes that window. The representations are compact
+filter availability and reduces the number of splits it can prune. The scheduler
+does not reorder work to minimize that window. The representations are compact
 and copied rather than rebuilt; for a two-GPU query this is one remote replica
 per emitted filter.
 
