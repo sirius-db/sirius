@@ -57,16 +57,22 @@ struct list_objects_v2_page {
  * @brief Parse one ListObjectsV2 XML response body.
  *
  * Hand-rolled (no XML dependency): the S3 ListObjectsV2 schema is small and
- * fixed. Tolerant of the `xmlns` attribute on `<ListBucketResult>`, leading /
- * trailing whitespace, and a self-closing `<ListBucketResult/>`. XML entities
- * (`&amp; &lt; &gt; &quot; &apos;`) in key / token text are unescaped.
+ * fixed. Tolerant of the `xmlns` attribute on `<ListBucketResult>` and leading /
+ * trailing whitespace. XML entities (`&amp; &lt; &gt; &quot; &apos;`) in key /
+ * token text are unescaped.
  *
- * @throw std::runtime_error when @p xml is not a recognizable ListObjectsV2
- *        response (no `<ListBucketResult>` — e.g. an S3 `<Error>` body or an
- *        empty string), or when a `<Contents>` block lacks a parseable
- *        non-negative `<Size>` (a silently-zeroed size would defeat the
- *        no-HEAD open path downstream). `<Size>0</Size>` is legal — S3 allows
- *        zero-byte objects.
+ * The body must be a COMPLETE response — a truncated / partial (but
+ * transport-complete) body must not parse as a silently-incomplete listing, so
+ * both the root close tag and every `<Contents>` block are required to close.
+ *
+ * @throw std::runtime_error when @p xml is not a recognizable, complete
+ *        ListObjectsV2 response: no `<ListBucketResult>` open tag (e.g. an S3
+ *        `<Error>` body or an empty string), a missing `</ListBucketResult>`
+ *        close tag, or a `<Contents>` opened without a `</Contents>` close (both
+ *        signal a truncated body); or a `<Contents>` whose `<Size>` is missing /
+ *        non-numeric / overflows `uint64_t` (a silently-zeroed or wrapped size
+ *        would defeat the no-HEAD open path downstream). `<Size>0</Size>` is
+ *        legal — S3 allows zero-byte objects.
  */
 list_objects_v2_page parse_list_objects_v2(std::string_view xml);
 

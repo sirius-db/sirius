@@ -187,6 +187,23 @@ bool match_glob_segments(std::vector<std::string_view> const& keys,
   return result;
 }
 
+/// Fast path for a pattern with NO `**`: every pattern segment matches exactly
+/// one key segment (`*`/`?`/`[…]` never cross a '/'), so the match reduces to a
+/// length check plus a per-segment duckdb::Glob — no recursion, no memo. This is
+/// the common glob (`root_*.parquet`, `nation_[ab].parquet`), so keeping it off
+/// the memoized path avoids a per-listed-key memo write on a broad listing.
+bool match_glob_no_crawl(std::vector<std::string_view> const& keys,
+                         std::vector<std::string_view> const& pats)
+{
+  if (keys.size() != pats.size()) { return false; }
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    if (!duckdb::Glob(keys[i].data(), keys[i].size(), pats[i].data(), pats[i].size())) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 bool sirius_httpfs::CanHandleFile(const std::string& fpath)
@@ -344,13 +361,16 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
 
   std::vector<std::string_view> pattern_segments;
   split_segments(key_pattern, pattern_segments);
+  bool const has_crawl =
+    std::find(pattern_segments.begin(), pattern_segments.end(), "**") != pattern_segments.end();
   std::string const list_uri = "s3://" + std::string{bucket} + "/" + std::string{prefix};
 
   // Stream the pages, keeping only matches: peak memory = one page (≤1000
   // entries) + the matched set, regardless of the prefix's population. The
   // match cap throws rather than truncating — a shortened file list would
   // silently change query results. `key_segments` / `memo` are reused across
-  // keys so a broad listing does not heap-allocate per key.
+  // keys so a broad listing does not heap-allocate per key; the `**` memo is
+  // only touched when the pattern actually has a crawl segment.
   duckdb::vector<duckdb::OpenFileInfo> matches;
   std::vector<std::string_view> key_segments;
   std::vector<std::int8_t> memo;
@@ -358,8 +378,14 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
     list_uri, /*page_size=*/1000, [&](sirius::io::s3::list_objects_v2_page const& page) {
       for (auto const& entry : page.entries) {
         split_segments(entry.key, key_segments);
-        memo.assign((key_segments.size() + 1) * (pattern_segments.size() + 1), -1);
-        if (!match_glob_segments(key_segments, 0, pattern_segments, 0, memo)) { continue; }
+        bool matched;
+        if (has_crawl) {
+          memo.assign((key_segments.size() + 1) * (pattern_segments.size() + 1), -1);
+          matched = match_glob_segments(key_segments, 0, pattern_segments, 0, memo);
+        } else {
+          matched = match_glob_no_crawl(key_segments, pattern_segments);
+        }
+        if (!matched) { continue; }
         if (matches.size() >= max_matches) {
           throw duckdb::IOException("[sirius_httpfs] glob '" + pattern + "' matched more than " +
                                     std::to_string(max_matches) +
