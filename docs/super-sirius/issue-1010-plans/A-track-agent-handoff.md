@@ -18,17 +18,21 @@ stop and ask for them):
 
 ## Definition of done
 
-1. PR A1 merged (instrumentation, split as A1a/A1b if review size demands).
-2. PR A2 merged (`dynamic_filter_build_priority={legacy,off}`, default `legacy`).
-3. The three-config measurement executed per the runbook, results posted as a comment on #1124
+1. **One Track A PR merged**, containing A1 (instrumentation) and A2 (the
+   `dynamic_filter_build_priority={legacy,off}` switch, default `legacy`) as clean, separately
+   revertible commits: A1a, A1b, A2. Both stages are zero-behavior-change at defaults; the PR
+   body carries each stage's gate evidence.
+2. The three-config measurement executed per the runbook, results posted as a comment on #1124
    with the raw data attached.
-4. **Stop for human sign-off.** If the human approves and the gate passed: PR A3 (default flip,
-   ~10 LOC). A4 is out of scope regardless.
+3. **Stop for human sign-off.** If the human approves and the gate passed: PR A3 (default flip,
+   ~10 LOC — separate because it is decision-gated on the measurement). A4 is out of scope
+   regardless (release-gated).
 
 ## Ground rules
 
-- Branch off `dev`; PRs against `sirius-db/sirius` `dev` via `gh`. One PR per stage. Reference
-  #1124 in each PR body and check off its task list as you go.
+- Branch off `dev`; PRs against `sirius-db/sirius` `dev` via `gh`. A1+A2 ship as one PR with
+  stage-per-commit history; A3 is its own small PR after sign-off. Reference #1124 in each PR
+  body and check off its task list as you go.
 - Baseline for all file:line citations in the plan is commit `506a1d9f`. `dev` may have moved —
   verify each cited site before editing it; if a site has materially changed, stop and report
   rather than guessing.
@@ -69,9 +73,9 @@ Machine notes (apply if this is the GB10 box `pdx02-zeno-01`; otherwise adapt):
 - Log analysis: run with `SIRIUS_LOG_LEVEL=trace` + `SIRIUS_LOG_DIR`, then
   `python3 tools/log_analyzer/parse_logs.py <log>`.
 
-## Stage 1 — PR A1 (instrumentation)
+## Stage 1 — commits A1a/A1b (instrumentation)
 
-Implement exactly per `A-1014-priority-pass.md` § "PR A1". Recommended split: **A1a** (IDs +
+Implement exactly per `A-1014-priority-pass.md` § "A1", as two clean commits: **A1a** (IDs +
 outcome/channel/coverage events + analyzer) then **A1b** (high-water sampler + feeder/lifecycle
 counters + summary) — each ~450–550 LOC and independently revertible.
 
@@ -92,15 +96,15 @@ them:
   line carries the `[dynf] ` anchor. The analyzer (`tools/log_analyzer`) gets its module +
   `SHAPE_VERSION` bump **in the same PR**.
 
-**Merge gate (prove all of it, put the evidence in the PR body):** full `pixi run make test`
+**Stage gate (prove all of it, put the evidence in the PR body):** full `pixi run make test`
 green; one TPC-H A/B run (A1 vs base) with identical results and identical
 `Pushed {} dynamic filter(s)` line multisets; `[dynf_summary] feeder running_end=0` on every
 query; log_analyzer reports no `FormatWarnings` for the new patterns — this last check requires
 **one untimed DEBUG-level run** so the per-batch patterns actually appear in the log.
 
-## Stage 2 — PR A2 (the switch)
+## Stage 2 — commit A2 (the switch), then open the PR
 
-Implement per `A-1014-priority-pass.md` § "PR A2". The one thing that matters most:
+Implement per `A-1014-priority-pass.md` § "A2" as the final commit, then open the single Track A PR. The one thing that matters most:
 
 - The flag gates **only** the priority `pop_if` dispatch branch. `collect_filter_build_pipelines`
   and the feeder-telemetry install run unconditionally in both modes — the measurement needs
@@ -108,7 +112,7 @@ Implement per `A-1014-priority-pass.md` § "PR A2". The one thing that matters m
 - Mode is snapshotted once per query at `prepare_for_query` (`_priority_dispatch_enabled`), so a
   mid-query `SET` cannot tear the dispatch loop.
 
-**Merge gate:** default `legacy` is behaviorally identical; the CPU unit tests + the GPU
+**Stage gate (also in the PR body):** default `legacy` is behaviorally identical; the CPU unit tests + the GPU
 integration test from the plan pass (`filter_build_pipeline_count_for_testing() > 0` in both
 modes; `priority_dispatch_enabled_for_testing()` flips).
 

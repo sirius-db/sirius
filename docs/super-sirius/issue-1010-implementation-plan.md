@@ -10,7 +10,7 @@ reviewed against the code at the baseline commit, and corrected (each cluster do
 
 | Cluster doc | PRs | One line |
 |---|---|---|
-| [A-1014-priority-pass.md](issue-1010-plans/A-1014-priority-pass.md) | A1–A4 | Instrumentation (IDs, waiter-free publication outcomes, resident high-water, lifecycle counters, coverage), then measure → disable → delete the build-priority pass |
+| [A-1014-priority-pass.md](issue-1010-plans/A-1014-priority-pass.md) | A1–A4 | Instrumentation (IDs, waiter-free publication outcomes, resident high-water, lifecycle counters, coverage), then measure → disable → delete the build-priority pass. Packaging: A1+A2 = one PR (stage-per-commit); A3/A4 separate (decision- and release-gated) |
 | [B-phase0-duckdb-backport.md](issue-1010-plans/B-phase0-duckdb-backport.md) | B1 | **Deferred** (decision 2026-07-08): no fork/backport; executes as the pin-bump playbook when a released DuckDB contains duckdb#22963 (sirius-db/sirius#1123) |
 | [C1ab-adapter-foundation.md](issue-1010-plans/C1ab-adapter-foundation.md) | C1a, C1b | Version-pinned DuckDB candidate adapter, Sirius value snapshots, publisher + claim decoupling; strong target-key types, materialization telemetry, shadow selectivity signal |
 | [C1cde-producer-flags.md](issue-1010-plans/C1cde-producer-flags.md) | C1c–C1e | Target-key entry restructure (fail-closed arity retained), selectivity-gate enforcement A/B, blanket `build_side_has_filter` gate removal A/B |

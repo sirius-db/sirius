@@ -1,7 +1,10 @@
 # Track A implementation plan — A1 (instrumentation), A2 (`dynamic_filter_build_priority`), A3 (default flip), A4 (pass deletion)
 
 Companion to [issue-1010-dynamic-filter-sip-design.md](../issue-1010-dynamic-filter-sip-design.md); baseline dev 506a1d9f.
-PR IDs covered: **A1** (optionally split A1a/A1b), **A2**, **A3**, **A4**.
+Work items: **A1** (commits A1a/A1b) and **A2** ship together as **one PR** with stage-per-commit
+history (each commit independently revertible; both are zero-behavior-change at defaults, so no
+review or timing boundary separates them). **A3** and **A4** are separate PRs because they are
+gated on the measurement outcome and on a release cycle respectively, not on code volume.
 
 ## Cluster goal + non-goals
 
@@ -17,7 +20,7 @@ Deliver the design's #1014 sequence (design doc `docs/super-sirius/issue-1010-dy
 
 ---
 
-## PR A1 — instrumentation
+## A1 — instrumentation (commits A1a/A1b of the Track A PR)
 
 ### Goal
 
@@ -226,7 +229,7 @@ Register every new file in `TEST_SOURCES` (CMakeLists.txt:562; enforced by `scri
 
 ### Size
 
-Prod ~700-850 LOC C++ (new module ~280 incl. channel-coverage map; ids header ~60; publisher/hash-join/channel/merge/scan/scheduler/executor edits ~310; context hooks ~50) + ~220 LOC Python (analyzer module + patterns) + ~500 LOC tests. **Split recommendation**: A1a = IDs + outcome/channel/coverage events + analyzer; A1b = high-water sampler + feeder/lifecycle counters + summary. Each independently revertible and reviewable (~450-550 LOC).
+Prod ~700-850 LOC C++ (new module ~280 incl. channel-coverage map; ids header ~60; publisher/hash-join/channel/merge/scan/scheduler/executor edits ~310; context hooks ~50) + ~220 LOC Python (analyzer module + patterns) + ~500 LOC tests. **Commit split**: A1a = IDs + outcome/channel/coverage events + analyzer; A1b = high-water sampler + feeder/lifecycle counters + summary. Each an independently revertible commit (~450-550 LOC).
 
 ### Risks
 
@@ -241,7 +244,7 @@ Prod ~700-850 LOC C++ (new module ~280 incl. channel-coverage map; ids header ~6
 
 ---
 
-## PR A2 — `dynamic_filter_build_priority` switch
+## A2 — `dynamic_filter_build_priority` switch (final commit of the Track A PR)
 
 ### Goal
 
@@ -316,7 +319,7 @@ A1 → A2: A2's gate evidence uses A1 counters and the `[dynf_summary]` channel-
 
 ### Size
 
-Prod ~130 LOC, tests ~160 LOC. Single PR.
+Prod ~130 LOC, tests ~160 LOC. Final commit of the Track A PR.
 
 ### Risks
 
@@ -325,12 +328,12 @@ Prod ~130 LOC, tests ~160 LOC. Single PR.
 
 ---
 
-## PR A3 — default flip (after gate passes)
+## A3 — default flip (separate PR, after gate passes)
 
 - Flip the in-struct default to `OFF` (sirius_config.hpp field from A2-1). SQL-option default follows automatically (fresh `operator_params{}` convention, sirius_extension.cpp:1847-style). Update the doc paragraph + release note: rollback = `SET dynamic_filter_build_priority='legacy'` or YAML, kept exactly one release (design :177-178).
 - **Gate**: the A2→A3 measurement protocol above has passed. **Rollback**: `SET`/YAML, no rebuild; revert = one-line default flip. **Size**: ~10 LOC + docs.
 
-## PR A4 — pass deletion (after one default-off release)
+## A4 — pass deletion (separate PR, after one default-off release)
 
 - Delete: `collect_filter_build_pipelines` + namespace block (task_scheduler.cpp:154-216), the assignment (:241), the `_priority_dispatch_enabled` snapshot + `filter_build_priority_enabled` gate function, `_filter_build_pipelines` member (task_scheduler.hpp:224-228), the priority `pop_if` branch incl. the A2 guard (task_scheduler.cpp:400-416), the now-unused `#include "op/sirius_physical_hash_join.hpp"` (task_scheduler.cpp:24) — this removes the scheduler's filter knowledge (`publishes_dynamic_filters()` use at :190), resolving the layering violation (design :166-168). (Deletion inventory verified complete: the only uses of `sirius_physical_hash_join` in task_scheduler.cpp are the include at :24 and the `dynamic_cast`/`publishes_dynamic_filters()` at :189-190.)
 - Delete the A2 flag end-to-end (enum, field, yaml line, setter, registration, ctor param, test seams) and A1's feeder counters/`set_feeder_pipelines`/`feeder_running_scope` (their source set is gone); keep all other A1 telemetry. Note in the PR: YAML files carrying the key now fail at startup via `reject_unknown` (sirius_config.cpp:180) — intended, loud.
@@ -338,7 +341,7 @@ Prod ~130 LOC, tests ~160 LOC. Single PR.
 
 ## Cluster dependencies & ordering
 
-- A1 → A2 (A2's gate evidence uses A1 counters + summary aggregates) → protocol run → A3 → one release → A4.
+- Commit order A1a → A1b → A2 within the Track A PR (A2's gate evidence uses A1 counters + summary aggregates) → merge → protocol run → A3 PR → one release → A4 PR.
 - The three-config protocol is valid on the current pin because configs 2 and 3 share identical Phase 1 publication behavior.
 - Track C coordination and the analyzer freshness contract as stated in PR A1 Dependencies.
 
