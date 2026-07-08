@@ -81,7 +81,6 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
                                          int num_groups)
 {
   using vec_t               = int4;
-  auto constexpr VEC_BYTES  = sizeof(vec_t);
   auto constexpr WORD_BYTES = sizeof(uint32_t);
   auto constexpr WORD_BITS  = ::cuda::std::numeric_limits<uint32_t>::digits;
 

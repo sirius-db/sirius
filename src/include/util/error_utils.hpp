@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 
 #include <exception>
 #include <source_location>
