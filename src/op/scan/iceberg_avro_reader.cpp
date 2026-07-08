@@ -419,7 +419,6 @@ struct JsonParser {
 
 // Forward declarations
 static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t* end);
-static int64_t skip_avro_block_items(const uint8_t*& p, const uint8_t* end);
 
 static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t* end)
 {

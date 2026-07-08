@@ -214,8 +214,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_tab
   return info;
 }
 
-std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_table_info(
-  std::string uri)
+[[maybe_unused]] std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info>
+make_nation_table_info(std::string uri)
 {
   std::vector<std::string> uris;
   uris.push_back(std::move(uri));
