@@ -210,7 +210,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         // in that case we just return the node
         if (filter) {
           filter->children.push_back(std::move(node));
-          return std::move(filter);
+          return filter;
         }
         return std::move(node);
       }
@@ -269,7 +269,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
   if (filter) {
     filter->children.push_back(std::move(node));
-    return std::move(filter);
+    return filter;
   }
   return std::move(node);
 }
