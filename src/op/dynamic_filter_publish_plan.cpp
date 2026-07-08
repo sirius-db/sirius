@@ -33,8 +33,8 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   : _probe_targets(std::move(probe_targets)),
     _emit_zone_map_filters(emit_zone_map_filters),
     _build_key_domain_cardinalities(std::move(build_key_domain_cardinalities)),
-    _replica_spaces(std::move(replica_spaces)),
-    _domain_coverage_threshold(domain_coverage_threshold)
+    _domain_coverage_threshold(domain_coverage_threshold),
+    _replica_spaces(std::move(replica_spaces))
 {
   if (!_probe_targets.empty() && _replica_spaces.empty()) {
     throw std::invalid_argument(
