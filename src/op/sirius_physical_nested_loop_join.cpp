@@ -405,11 +405,15 @@ cudf::table_view sirius_physical_nested_loop_join::select_left_output(
 /// all-false and gets true scattered at every position in @p semi_indices. Callers pass the
 /// projection-selected left view; @p semi_indices index rows of the original left table, which
 /// stay valid because selection drops columns only.
+///
+/// @p telemetry_info is threaded through to the emitted batch so it stays linked into the query's
+/// telemetry lineage (callers pass the operator's batch_telemetry()).
 static std::unique_ptr<operator_data> resolve_mark_join_result(
   const rmm::device_uvector<cudf::size_type>& semi_indices,
   const cudf::table_view& left_view,
   cucascade::memory::memory_space& space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   out_cols.reserve(left_view.num_columns() + 1);
@@ -439,7 +443,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   auto output_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{
-      make_data_batch(std::move(output_table), space, stream)});
+      make_data_batch(std::move(output_table), space, stream, telemetry_info)});
 }
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_empty_result(
@@ -456,7 +460,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
     // Both empty-side MARK cases are "no matches": an empty left side emits 0 rows with the
     // mark column still in the schema; an empty right side marks every left row false.
     rmm::device_uvector<cudf::size_type> no_matches(0, stream);
-    return resolve_mark_join_result(no_matches, select_left_output(left), space, stream);
+    return resolve_mark_join_result(
+      no_matches, select_left_output(left), space, stream, batch_telemetry());
   }
 
   // Gather maps per the §3 semantics table, filled on the task stream (cudf::sequence /
@@ -507,7 +512,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
                                    mr);
       return std::make_unique<pipelineable_operator_data>(
         std::vector<std::shared_ptr<cucascade::data_batch>>{
-          make_data_batch(std::move(gathered), space, stream)});
+          make_data_batch(std::move(gathered), space, stream, batch_telemetry())});
     }
     default:
       throw std::runtime_error("sirius_physical_nested_loop_join: unsupported join type: " +
@@ -773,7 +778,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         auto left_indices = cudf::conditional_left_semi_join(
           left_effective, right_effective, predicate, std::nullopt, stream, mr);
         SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
-        return resolve_mark_join_result(*left_indices, select_left_output(left), *space, stream);
+        return resolve_mark_join_result(
+          *left_indices, select_left_output(left), *space, stream, batch_telemetry());
       }
       case duckdb::JoinType::OUTER:
         join_result =

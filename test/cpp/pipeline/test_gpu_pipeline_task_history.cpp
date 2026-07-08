@@ -133,7 +133,8 @@ struct pipeline_task_history_fixture {
                                                  gpu_mr);
     stream.synchronize();
 
-    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
     auto& registry = sirius::converter_registry::get();
     {
@@ -163,7 +164,8 @@ struct pipeline_task_history_fixture {
                                                  gpu_mr);
     stream.synchronize();
 
-    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
     return batch;
   }
 };
