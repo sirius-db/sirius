@@ -14,9 +14,18 @@
  * limitations under the License.
  */
 
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/block_manager.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/segment/uncompressed.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
@@ -93,6 +102,46 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   if (!op.projected_input.empty()) {
     throw duckdb::InternalException(
       "LogicalGet::project_input can only be set for table-in-out functions");
+  }
+
+  // Plan-time viability probe for the duckdb-native seq_scan path: a varchar column
+  // containing a string whose length reaches StringUncompressed::GetStringBlockLimit
+  // (a PER-VALUE limit — such strings live in overflow blocks the GPU string decoder
+  // cannot resolve) must refuse HERE, where OnFinalizePrepare's create_plan() gate
+  // turns the throw into a clean DuckDB CPU fallback. The exact per-row-group check
+  // in prepare_duckdb_native_walk still runs at pipeline conversion, but by then the
+  // transparent path has committed to GPU execution and a refusal surfaces as a
+  // mid-query InternalException with no fallback. Table-level stats are coarser than
+  // the walker's (no pruning awareness) — acceptable for a fast-refusal layer.
+  if (op.function.name == "seq_scan" && op.bind_data) {
+    auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
+    if (table_scan_bind != nullptr && table_scan_bind->table.IsDuckTable()) {
+      auto& table   = table_scan_bind->table.Cast<duckdb::DuckTableEntry>();
+      auto& storage = table.GetStorage();
+      auto const block_size =
+        storage.GetAttached().GetStorageManager().GetBlockManager().GetBlockSize();
+      auto const overflow_limit = duckdb::StringUncompressed::GetStringBlockLimit(block_size);
+      for (auto const& col_idx : column_ids) {
+        if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() || col_idx.IsVirtualColumn() ||
+            col_idx.IsEmptyColumn()) {
+          continue;
+        }
+        auto const primary = col_idx.GetPrimaryIndex();
+        if (primary >= op.returned_types.size() ||
+            op.returned_types[primary].id() != duckdb::LogicalTypeId::VARCHAR) {
+          continue;
+        }
+        auto stats = table.GetStatistics(context, primary);
+        if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats) ||
+            duckdb::StringStats::MaxStringLength(*stats) >= overflow_limit) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: varchar column {} may contain strings at/over the "
+            "overflow-block limit ({} bytes); overflow strings are not GPU-decodable",
+            primary,
+            overflow_limit);
+        }
+      }
+    }
   }
 
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;

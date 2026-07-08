@@ -28,6 +28,7 @@
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/block_manager.hpp>
+#include <duckdb/storage/segment/uncompressed.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 #include <duckdb/storage/storage_manager.hpp>
@@ -296,6 +297,16 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
                std::to_string(rg_idx) + ": Max String Length stat absent from segment stats";
       }
       desc.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+      // Defense-in-depth for the prepare-time overflow refusal (stats-drift guard): a
+      // marker-bearing segment must never reach the GPU string decoder, which cannot
+      // resolve BIG_STRING_MARKERs and would emit the marker bytes as string content.
+      if (*desc.max_string_length >=
+          duckdb::StringUncompressed::GetStringBlockLimit(segment.GetBlockSize())) {
+        return "varchar segment on column " + std::to_string(column_id) + " row group " +
+               std::to_string(rg_idx) +
+               ": max string length reaches the overflow-block limit; overflow strings are not "
+               "GPU-decodable";
+      }
     }
     col_md.data_segments.push_back(std::move(desc));
   }
@@ -568,6 +579,41 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
       "[duckdb_native_metadata] all {} row groups stats-pruned; scan yields an "
       "empty result via the coalescer fallback",
       plan.n_row_groups);
+  }
+
+  // Overflow (big-string) refusal. DuckDB stores any SINGLE string whose length
+  // reaches StringUncompressed::GetStringBlockLimit(block_size) — a per-value limit,
+  // not a per-row-group aggregate — in a separate overflow block, leaving only a
+  // negative offset + BIG_STRING_MARKER (block id + offset) in the segment
+  // dictionary. The GPU string decoder cannot resolve those markers and the
+  // overflow blocks are never staged, so decoding would silently emit the marker
+  // bytes as string content. Refuse here — before any per-segment IO — so the query
+  // falls back to the DuckDB CPU scan. The row-group max-string-length stat is the
+  // longest INDIVIDUAL string in the row group, so the check is exact: stat >= limit
+  // iff some surviving row group contains at least one overflow string.
+  auto const overflow_limit = duckdb::StringUncompressed::GetStringBlockLimit(plan.block_size);
+  for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+    if (projected_cols[ci].is_rowid || !projected_types[ci].is_varchar()) { continue; }
+    auto const& storage_idx = projected_cols[ci].storage_idx;
+    for (std::size_t rg = 0; rg < plan.n_row_groups; ++rg) {
+      if (plan.row_group_pruned_by_stats[rg]) { continue; }  // pruned -> never decoded
+      if (rg >= plan.partition_row_groups.size() || !plan.partition_row_groups[rg]) { continue; }
+      auto stats = plan.partition_row_groups[rg]->GetColumnStatistics(storage_idx);
+      if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats)) {
+        refuse("row group " + std::to_string(rg) + " varchar column " +
+               std::to_string(storage_idx.GetPrimaryIndex()) +
+               ": max-string-length stat absent; cannot rule out overflow strings");
+        return plan;
+      }
+      auto const max_len = duckdb::StringStats::MaxStringLength(*stats);
+      if (max_len >= overflow_limit) {
+        refuse("row group " + std::to_string(rg) + " varchar column " +
+               std::to_string(storage_idx.GetPrimaryIndex()) + ": max string length " +
+               std::to_string(max_len) + " reaches the overflow-block limit (" +
+               std::to_string(overflow_limit) + "); overflow strings are not GPU-decodable");
+        return plan;
+      }
+    }
   }
 
   plan.viable = true;
