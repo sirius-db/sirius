@@ -255,22 +255,13 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
     uint64_t task_id, std::unique_ptr<sirius_pipeline_task_local_state> local_state);
 
  private:
-  /**
-   * @brief Unsubscribe from and release the pinned input data_batches.
-   *
-   * Called once prepare_for_processing has materialized this task's inputs in the target memory
-   * space: from then on the pin is redundant (the operator_data owns the prepared batches), and
-   * releasing it lets a single-consumer original that was cloned cross-GPU free its source-GPU
-   * memory immediately instead of at task destruction. Batches other consumers still need stay
-   * alive via their own owners (repositories, other tasks). Also called by the destructor for
-   * tasks that never executed.
-   */
-  void release_input_batches();
-
   std::vector<cucascade::shared_data_repository*> _data_repos;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
-  /// Input data_batches held for subscribe/unsubscribe lifecycle until prepare completes
-  std::vector<std::shared_ptr<cucascade::data_batch>> _input_batches;
+  /// Non-owning subscription ledger: the input data_batches this task subscribed to in its
+  /// constructor so that the downgrade_executor can know that the data_baches are in a task.
+  /// weak_ptr so that memory can be released as soon as the last owner drops.
+  /// This is used in the destructor to unsubscribe.
+  std::vector<std::weak_ptr<cucascade::data_batch>> _subscribed_batches;
 };
 
 }  // namespace pipeline

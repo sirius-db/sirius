@@ -199,7 +199,7 @@ gpu_pipeline_task::gpu_pipeline_task(
       for (const auto& batch : pipelineable_input->get_data_batches()) {
         if (batch) {
           batch->subscribe();
-          _input_batches.push_back(batch);
+          _subscribed_batches.push_back(batch);
         }
       }
     }
@@ -209,29 +209,19 @@ gpu_pipeline_task::gpu_pipeline_task(
   }
 }
 
-void gpu_pipeline_task::release_input_batches()
-{
-  // Unsubscribe from all input data_batches and drop this task's references to them. Any batch
-  // whose last owner this was (e.g. a popped single-consumer original that prepare replaced with
-  // a cross-GPU clone) is destroyed here, freeing its memory in its source space.
-  for (const auto& batch : _input_batches) {
-    if (batch) {
-      try {
-        batch->unsubscribe();
-      } catch (...) {
-        // Also runs from the destructor, which must not throw; log if possible
-        SIRIUS_LOG_WARN("gpu_pipeline_task: unsubscribe failed for batch {}",
-                        batch->get_batch_id());
-      }
-    }
-  }
-  _input_batches.clear();
-}
-
 gpu_pipeline_task::~gpu_pipeline_task()
 {
-  // Covers tasks destroyed without executing; a no-op after execute() released the pin.
-  release_input_batches();
+  for (const auto& weak_batch : _subscribed_batches) {
+    auto batch = weak_batch.lock();
+    if (!batch) { continue; }
+    try {
+      batch->unsubscribe();
+    } catch (...) {
+      // The destructor must not throw; log if possible.
+      SIRIUS_LOG_WARN("gpu_pipeline_task: unsubscribe failed for batch {}", batch->get_batch_id());
+    }
+  }
+  _subscribed_batches.clear();
 
   if (_global_state == nullptr ||
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
@@ -456,12 +446,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
                    first_op.get_name(),
                    first_op.get_operator_id(),
                    prepare_duration.count() / 1000.0);
-
-  // Inputs are materialized in this task's memory space (cross-GPU inputs as clones owned by
-  // local_state._input_data), so drop the redundant pin on the original batches: a popped
-  // single-consumer original freed of all other owners releases its source-GPU memory now
-  // rather than at task destruction, while shared batches stay alive via their other owners.
-  release_input_batches();
 
   // All input batches are now locked for reading via _read_only_data_batches inside
   // local_state._input_data. The locks are released when the pipelineable_operator_data
