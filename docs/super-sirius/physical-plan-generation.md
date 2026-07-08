@@ -279,9 +279,9 @@ For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to 
 its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and
 channel publication before downstream task creation follows that join into its **immediate** probe
 producer. This edge ordering does not gate a base scan reached transitively through an intervening
-join; soft build-subtree dispatch priority only makes earlier publication more likely for the
-remaining splits of such a scan. See [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering)
-and [Transitive scan targets and build-task priority](dynamic-filters.md#transitive-scan-targets-and-build-task-priority).
+join; such a scan samples the channel opportunistically under normal scheduler order. See
+[Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
+[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ### ORDER_BY → 3-Phase Sort
 
