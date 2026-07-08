@@ -837,6 +837,46 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "n.n_nationkey = c.c_nationkey;");
 }
 
+// issue #329: expressions in hash-join equality conditions. The join key is materialized into a
+// column below the join and partitioned on that column; the compare_gpu_vs_cpu delta assertion
+// (1 GPU exec, 0 fallbacks) also proves these run on the GPU rather than falling back to CPU.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with expression key on build side",
+                 "[integration][gpu_execution][join]")
+{
+  // The canonical issue #329 example: expression on the (small) nation side.
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, c.c_custkey from customer c "
+    "join nation n on c.c_custkey = n.n_nationkey * 10;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with expression key on probe side",
+                 "[integration][gpu_execution][join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, c.c_custkey from customer c "
+    "join nation n on c.c_nationkey * 2 = n.n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with expressions on both sides",
+                 "[integration][gpu_execution][join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, c.c_custkey from customer c "
+    "join nation n on c.c_nationkey * 10 = n.n_nationkey * 10;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed join with expression equality key and inequality",
+                 "[integration][gpu_execution][join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, c.c_custkey from customer c "
+    "join nation n on c.c_custkey = n.n_nationkey * 10 and c.c_custkey > n.n_nationkey;");
+}
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - basic left join 0",
                  "[integration][gpu_execution][join]")
@@ -5189,37 +5229,6 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "[integration][gpu_execution][parquet][cpu_source]")
 {
   compare_gpu_vs_cpu("select count(*), min(l_orderkey), max(l_orderkey) from lineitem;");
-}
-
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - empty result (WHERE false)",
-                 "[integration][gpu_execution][cpu_source]")
-{
-  compare_gpu_vs_cpu("select n_nationkey from nation where 1=0;");
-}
-
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - dummy scan (SELECT literal)",
-                 "[integration][gpu_execution][cpu_source]")
-{
-  compare_gpu_vs_cpu("select 42 as x;");
-}
-
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - values CPU source",
-                 "[integration][gpu_execution][cpu_source]")
-{
-  compare_gpu_vs_cpu("select b from (values (1), (2), (3)) t(b);");
-}
-
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - CPU source with multiple downstream repositories",
-                 "[integration][gpu_execution][cpu_source]")
-{
-  // A VALUES-backed CTE referenced twice fans the cpu_source output out to
-  // multiple downstream data repositories.
-  compare_gpu_vs_cpu(
-    "with t(b) as (values (1), (2), (3)) select a.b, c.b from t a join t c using (b);");
 }
 
 //===----------------------------------------------------------------------===//

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::fragment_executor::{FragmentExecutor, StubExecutor};
+use crate::fragment_executor::FragmentExecutor;
+#[cfg(test)]
+use crate::fragment_executor::StubExecutor;
 use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
@@ -31,10 +33,8 @@ use tracing::{info, instrument};
 pub(crate) struct SiriusComputeNodeService {
     /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
-    /// Executes a translated fragment into Arrow result batches.
-    ///
-    /// TODO(starrocks-execute): this is a [`StubExecutor`] until the GPU-backed executor lands.
-    /// The real executor will hold the `Arc<sirius::SiriusContext>` brought up in `main`.
+    /// Executes a translated fragment into Arrow result batches. Production injects the GPU-backed
+    /// `SiriusEngine` (via [`with_executor`](Self::with_executor)); tests use a stub.
     executor: Arc<dyn FragmentExecutor>,
     /// Buffers executed-fragment results for FE `fetch_data` collection. Shared across BRPC
     /// connections so a `fetch_data` poll sees what an `exec_plan_fragment` buffered.
@@ -42,11 +42,19 @@ pub(crate) struct SiriusComputeNodeService {
 }
 
 impl SiriusComputeNodeService {
-    /// Builds the Sirius compute-node service with its current RPC task dependencies.
+    /// Test-only constructor with the placeholder [`StubExecutor`]. Production injects a real
+    /// executor via [`with_executor`](Self::with_executor).
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_executor(Arc::new(StubExecutor))
+    }
+
+    /// Builds the service with a caller-provided fragment executor (e.g. the GPU-backed
+    /// `SiriusEngine`), shared across BRPC connections via the `Arc`.
+    pub(crate) fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
         Self {
             translator: PlanTranslator::new(),
-            executor: Arc::new(StubExecutor),
+            executor,
             results: Arc::new(ResultStore::default()),
         }
     }
@@ -62,35 +70,52 @@ impl PInternalService for SiriusComputeNodeService {
         request: PExecPlanFragmentRequest,
         attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PExecPlanFragmentResult>, crate::prpc::Error> {
-        let status = match self
-            .exec_single_attachment(request.attachment_protocol.as_deref(), &attachment)
-        {
-            Ok(()) => Self::ok_status(),
-            Err(err) => Self::internal_error(err),
+        // Translate + execute on a blocking worker, not the BRPC current-thread runtime: a real GPU
+        // executor blocks for the whole query, so running it inline would stall fetch_data,
+        // connection cleanup, and shutdown cancellation until it returns.
+        let protocol = request.attachment_protocol;
+        let service = self.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            service.exec_single_attachment(protocol.as_deref(), &attachment)
+        })
+        .await;
+        let status = match outcome {
+            Ok(Ok(())) => Self::ok_status(),
+            Ok(Err(err)) => Self::internal_error(err),
+            Err(join_err) => {
+                Self::internal_error(format!("fragment execution task panicked: {join_err}"))
+            }
         };
         Ok(Self::exec_plan_result(status).into())
     }
 
-    /// Handles FE batch fragment dispatch by translating every per-instance fragment.
+    /// Handles FE batch fragment dispatch: translate every per-instance fragment and execute the
+    /// RESULT_SINK roots among them.
     #[instrument(skip_all)]
     async fn exec_batch_plan_fragments(
         &self,
         request: PExecBatchPlanFragmentsRequest,
         attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PExecBatchPlanFragmentsResult>, crate::prpc::Error> {
-        // TODO(starrocks-execute): execute + buffer results for batch dispatch too. For the
-        // single-fragment milestone only `exec_plan_fragment` runs the RESULT_SINK fragment.
-        let result = match self
-            .translate_batch_attachment(request.attachment_protocol.as_deref(), &attachment)
-        {
-            Ok(()) => PExecBatchPlanFragmentsResult {
-                status: Some(Self::ok_status()),
-            },
-            Err(err) => PExecBatchPlanFragmentsResult {
-                status: Some(Self::internal_error(err)),
-            },
+        // Like `exec_plan_fragment`, an instance can run a RESULT_SINK fragment on the GPU, so
+        // offload to a blocking worker rather than blocking the BRPC current-thread runtime.
+        let protocol = request.attachment_protocol;
+        let service = self.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            service.translate_batch_attachment(protocol.as_deref(), &attachment)
+        })
+        .await;
+        let status = match outcome {
+            Ok(Ok(())) => Self::ok_status(),
+            Ok(Err(err)) => Self::internal_error(err),
+            Err(join_err) => Self::internal_error(format!(
+                "batch fragment execution task panicked: {join_err}"
+            )),
         };
-        Ok(result.into())
+        Ok(PExecBatchPlanFragmentsResult {
+            status: Some(status),
+        }
+        .into())
     }
 
     /// Returns buffered fragment results to the FE, which polls this until end-of-stream. The

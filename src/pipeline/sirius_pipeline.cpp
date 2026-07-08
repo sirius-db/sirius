@@ -38,7 +38,7 @@ namespace sirius {
 namespace pipeline {
 
 sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
-  : build_ctx_(ctx), ready(false), initialized(false), source(nullptr), sink(nullptr)
+  : ready(false), initialized(false), source(nullptr), sink(nullptr), build_ctx_(ctx)
 {
 }
 
@@ -332,10 +332,6 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // no parent pipeline whose status needs updating. Returning early avoids
   // racing with engine teardown after mark_completed() signals the future.
   if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    // If the pipeline finished with zero tasks (e.g. WHERE 1=0 empty result or
-    // DUMMY_SCAN), gpu_pipeline_executor is never invoked and mark_completed()
-    // would never be called — signal completion here instead.
-    if (tasks_created.load() == 0 && _task_creator) { _task_creator->signal_query_complete(); }
     return;
   }
 
