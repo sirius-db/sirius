@@ -39,8 +39,13 @@ struct exchange_batch_handle {
 ///
 /// Semantics (design §3/§7):
 ///   - full()    ≡  items == capacity_items  OR  (byte_bound set AND bytes ≥ bound AND non-empty)
+///     — a state-only query with no candidate handle. Push admission is decided separately (see
+///     can_push_unlocked()) because a specific incoming handle can cross the byte bound even
+///     while full() would still report false (e.g. 40 queued + a 40-byte handle against a
+///     50-byte bound).
 ///   - Oversized-batch rule: a handle whose size_bytes > capacity_bytes is admitted into an
-///     *empty* channel so the stream never wedges.
+///     *empty* channel so the stream never wedges. A non-empty channel never admits a handle
+///     that would push the cumulative total past capacity_bytes.
 ///   - close()   forbids further pushes; already-queued items remain poppable.
 ///   - drained() ≡  closed() && empty()  — terminal EOS predicate.
 ///   - Engine workers use try_push / try_pop only (non-blocking). Blocking push / pop are
@@ -64,13 +69,14 @@ class exchange_channel {
   // Producer side
   // -----------------------------------------------------------------------
 
-  /// Non-blocking push. Returns false when full or closed; never blocks.
+  /// Non-blocking push. Returns false when the handle can't be admitted (item/byte bound would
+  /// be crossed) or the channel is closed; never blocks.
   [[nodiscard]] bool try_push(exchange_batch_handle h)
   {
     std::function<void()> cb;
     {
       std::unique_lock<std::mutex> lock(_mutex);
-      if (_closed || full_unlocked()) return false;
+      if (_closed || !can_push_unlocked(h)) return false;
       _queue.push_back(h);
       _total_bytes += h.size_bytes;
       cb = _on_push;
@@ -80,13 +86,14 @@ class exchange_channel {
     return true;
   }
 
-  /// Blocking push. Blocks while full; returns false once closed (and stays false).
+  /// Blocking push. Blocks while the handle can't be admitted; returns false once closed (and
+  /// stays false).
   bool push(exchange_batch_handle h)
   {
     std::function<void()> cb;
     {
       std::unique_lock<std::mutex> lock(_mutex);
-      _cv.wait(lock, [&] { return !full_unlocked() || _closed; });
+      _cv.wait(lock, [&] { return can_push_unlocked(h) || _closed; });
       if (_closed) return false;
       _queue.push_back(h);
       _total_bytes += h.size_bytes;
@@ -217,6 +224,22 @@ class exchange_channel {
     if (_cfg.capacity_bytes > 0 && !_queue.empty() && _total_bytes >= _cfg.capacity_bytes)
       return true;
     return false;
+  }
+
+  /// True when the specific candidate handle `h` may be admitted right now. Caller must hold
+  /// _mutex. Unlike full_unlocked() (a state-only query), this inspects the incoming handle so
+  /// a push that would cross capacity_bytes is rejected even when the queue isn't yet at/over
+  /// the bound (e.g. 40 queued + a 40-byte handle against a 50-byte bound).
+  [[nodiscard]] bool can_push_unlocked(const exchange_batch_handle& h) const
+  {
+    if (_queue.size() >= _cfg.capacity_items) return false;
+    if (_cfg.capacity_bytes == 0) return true;
+    // Oversized-batch rule: always admit into an empty channel so the stream never wedges.
+    if (_queue.empty()) return true;
+    if (_total_bytes >= _cfg.capacity_bytes) return false;
+    // Subtraction (rather than _total_bytes + h.size_bytes) avoids overflow when the incoming
+    // handle reports an implausibly large size.
+    return h.size_bytes <= _cfg.capacity_bytes - _total_bytes;
   }
 
   config _cfg;

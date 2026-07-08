@@ -335,3 +335,111 @@ TEST_CASE("exchange_channel: hooks fire outside the lock", "[exchange_channel]")
   REQUIRE(pop_count.load() == 1);
   REQUIRE(size_in_pop_cb.load() == 1);
 }
+
+// ============================================================================
+// CH-12 (Finding 3a, reproduction): a push that would push the cumulative total
+// past capacity_bytes must be rejected. full_unlocked() only inspects bytes
+// already queued, not the incoming candidate, so a 40-byte handle is wrongly
+// admitted on top of 40 already-queued bytes in a 50-byte-bound channel.
+// See docs/super-sirius/streaming-source-p1-p3-fix-plan.md, Finding 3.
+// ============================================================================
+
+TEST_CASE("exchange_channel: cumulative push crossing byte bound is rejected (Finding 3a)",
+          "[exchange_channel][byte_admission]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 10, .capacity_bytes = 50});
+
+  REQUIRE(ch.try_push(make_handle(0, 40)));
+  REQUIRE_FALSE(ch.full());  // 40 < 50 — current full() correctly reports not-full here.
+
+  // BUG: the incoming 40-byte handle would bring the total to 80 (> 50), but
+  // full_unlocked() only compares the *already-queued* 40 bytes against the bound,
+  // so this push is wrongly admitted today.
+  REQUIRE_FALSE(ch.try_push(make_handle(1, 40)));
+  REQUIRE(ch.size_bytes() == 40);
+}
+
+// ============================================================================
+// CH-13 (Finding 3b, reproduction): the oversized-batch rule is documented to
+// admit an oversized handle only into an *empty* channel. A non-empty channel
+// must reject an oversized handle instead of wedging past its byte bound.
+// ============================================================================
+
+TEST_CASE("exchange_channel: oversized handle rejected while queue is non-empty (Finding 3b)",
+          "[exchange_channel][byte_admission]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 10, .capacity_bytes = 50});
+
+  REQUIRE(ch.try_push(make_handle(0, 1)));  // 1 byte queued — far under the bound.
+
+  // BUG: full_unlocked() only compares the queued total (1) against the bound (50),
+  // so this 200-byte handle is wrongly admitted even though the queue is non-empty.
+  REQUIRE_FALSE(ch.try_push(make_handle(1, 200)));
+  REQUIRE(ch.size_bytes() == 1);
+}
+
+// ============================================================================
+// CH-14 (Finding 3c, must-not-regress): the same oversized handle IS accepted
+// once the queue drains back to empty — the oversized-batch rule must keep
+// working for a channel that becomes empty again, not just a freshly-built one.
+// ============================================================================
+
+TEST_CASE("exchange_channel: oversized handle accepted once queue becomes empty (Finding 3c)",
+          "[exchange_channel][byte_admission]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 10, .capacity_bytes = 50});
+
+  REQUIRE(ch.try_push(make_handle(0, 1)));
+  auto h = ch.try_pop();
+  REQUIRE(h.has_value());
+  REQUIRE(ch.empty());
+
+  REQUIRE(ch.try_push(make_handle(1, 200)));
+  REQUIRE(ch.size_bytes() == 200);
+}
+
+// ============================================================================
+// CH-15 (Finding 3, blocking push): a blocking push() whose candidate would
+// cross the byte bound must wait rather than being admitted immediately, and
+// must succeed once popping frees enough byte capacity.
+// ============================================================================
+
+TEST_CASE("exchange_channel: blocking push waits for byte headroom (Finding 3, blocking path)",
+          "[exchange_channel][byte_admission]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 10, .capacity_bytes = 50});
+
+  REQUIRE(ch.try_push(make_handle(0, 40)));  // 40 queued, 10 bytes of headroom left.
+
+  std::atomic<bool> unblocked{false};
+  std::atomic<bool> push_ok{false};
+  std::thread producer([&] {
+    // A 40-byte handle would cross the 50-byte bound on top of the 40 already
+    // queued; with a correct admission check this call must block instead of
+    // returning immediately. Today's buggy full_unlocked()-only check admits it
+    // right away, so this thread will observe `unblocked` flip to true before the
+    // pop below ever runs.
+    //
+    // Assertions here use CHECK (non-throwing) rather than REQUIRE: a throwing
+    // assertion on this thread would propagate as an unhandled exception across
+    // the thread boundary and crash the whole test binary via std::terminate.
+    bool ok = ch.push(make_handle(1, 40));
+    push_ok.store(ok, std::memory_order_release);
+    unblocked.store(true, std::memory_order_release);
+  });
+
+  // CHECK (not REQUIRE): if this fails, `producer` must still be joined below —
+  // a REQUIRE failure here would throw and unwind past producer.join(), and a
+  // still-joinable std::thread's destructor calls std::terminate().
+  std::this_thread::sleep_for(10ms);
+  CHECK_FALSE(unblocked.load());
+
+  // Popping the first handle frees all 40 bytes, leaving 50 bytes of headroom —
+  // enough for the pending 40-byte push to proceed.
+  auto h = ch.pop();
+  CHECK(h.has_value());
+
+  producer.join();
+  REQUIRE(unblocked.load());
+  REQUIRE(push_ok.load());
+}
