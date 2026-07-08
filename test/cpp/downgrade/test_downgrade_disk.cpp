@@ -147,7 +147,8 @@ downgrade_executor make_monitoring_executor(cucascade::shared_data_repository_ma
                                             sirius::memory::sirius_memory_reservation_manager& mgr)
 {
   sirius::exec::downgrade_executor_config config{
-    .thread_pool = {.num_threads = 1, .thread_name_prefix = "downgrade"}, .monitor_period_ms = 10};
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = std::chrono::milliseconds{10}};
   return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mgr);
 }
 
@@ -314,7 +315,7 @@ TEST_CASE("Downgrade task returns false when HOST full and no DISK tier", "[down
 }
 
 // Regression: before the fix, the monitor thread fired a downgrade request every
-// monitor_period_ms (10ms) whenever GPU memory was under pressure -- even when nothing could be
+// monitor_period (10ms) whenever GPU memory was under pressure -- even when nothing could be
 // downgraded (HOST full, no DISK configured) -- spinning forever (~100 fruitless full repo+queue
 // scans and warnings per second). The stateless viability gate must back off instead.
 TEST_CASE("monitor backs off when no downgrade target is viable (no disk)", "[downgrade_disk]")
@@ -467,8 +468,8 @@ TEST_CASE("HOST-source monitor backs off when no disk is configured", "[downgrad
   REQUIRE(host_space->should_downgrade_memory());
 
   sirius::exec::downgrade_executor_config config{
-    .thread_pool       = {.num_threads = 1, .thread_name_prefix = "downgrade-host"},
-    .monitor_period_ms = 10};
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade-host"},
+    .monitor_period = std::chrono::milliseconds{10}};
   cucascade::shared_data_repository_manager repo_mgr;
   downgrade_executor executor(config, repo_mgr, host_space->get_id(), host_space, *mem_mgr);
   executor.start();
