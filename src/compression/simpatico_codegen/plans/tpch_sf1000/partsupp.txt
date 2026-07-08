@@ -14,16 +14,7 @@ bitpack.chunk_count.runs -> rle -> runs, values
 ---
 # column: ps_suppkey  dtype: i32  ratio: 1.321x  depth: 10
 # comp: 56.64 GB/s  decomp: 166.09 GB/s
-input -> delta -> differences
-delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-delta.differences.packed -> lz4
-delta.differences.chunk_count -> rle -> runs, values
-delta.differences.chunk_bits -> bitcomp
-delta.differences.chunk_min -> rle -> runs, values
-delta.differences.chunk_count.values -> rle -> runs, values
-delta.differences.chunk_count.runs -> rle -> runs, values
-delta.differences.chunk_min.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-delta.differences.chunk_min.values -> rle -> runs, values
+identity
 
 ---
 # column: ps_availqty  dtype: i32  ratio: 2.272x  depth: 10

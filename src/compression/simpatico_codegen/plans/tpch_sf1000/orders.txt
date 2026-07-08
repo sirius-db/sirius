@@ -7,16 +7,7 @@ zigzag.zigzag.differences -> lz4
 ---
 # column: o_custkey  dtype: i32  ratio: 1.138x  depth: 10
 # comp: 69.62 GB/s  decomp: 183.28 GB/s
-input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_min.packed -> deflate
-bitpack.chunk_min.chunk_count -> rle -> runs, values
-bitpack.chunk_count.runs -> rle -> runs, values
-bitpack.chunk_min.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min.chunk_bits -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+identity
 
 ---
 # column: o_orderstatus  dtype: str  ratio: 12.281x  depth: 10
@@ -40,16 +31,7 @@ input -> ans
 ---
 # column: o_orderdate  dtype: t12  ratio: 1.334x  depth: 10
 # comp: 27.92 GB/s  decomp: 98.01 GB/s
-input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.packed -> deflate
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_min.packed -> deflate
-bitpack.chunk_count.runs -> rle -> runs, values
-bitpack.chunk_min.chunk_min -> rle -> runs, values
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_min.chunk_count -> rle -> runs, values
+identity
 
 ---
 # column: o_orderpriority  dtype: str  ratio: 15.325x  depth: 10

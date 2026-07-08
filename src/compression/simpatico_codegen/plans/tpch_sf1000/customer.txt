@@ -23,10 +23,7 @@ str_split.offsets.differences.runs.chunk_bits -> rle -> runs, values
 ---
 # column: c_address  dtype: str  ratio: 1.445x  depth: 4
 # comp: 20.59 GB/s  decomp: 130.80 GB/s
-input -> str_split -> offsets, chars
-str_split.offsets -> delta -> differences
-str_split.chars -> deflate
-str_split.offsets.differences -> ans
+identity
 
 ---
 # column: c_nationkey  dtype: i32  ratio: 3.190x  depth: 10
@@ -45,16 +42,7 @@ bitpack.chunk_count.runs -> rle -> runs, values
 ---
 # column: c_phone  dtype: str  ratio: 1.367x  depth: 10
 # comp: 39.23 GB/s  decomp: 171.38 GB/s
-input -> str_split -> offsets, chars
-str_split.offsets -> delta -> differences
-str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-str_split.offsets.differences -> rle -> runs, values
-str_split.chars.packed -> deflate
-str_split.chars.chunk_count -> rle -> runs, values
-str_split.chars.chunk_bits -> bitcomp
-str_split.chars.chunk_min -> rle -> runs, values
-str_split.offsets.differences.runs -> bitcomp
-str_split.offsets.differences.values -> deflate
+identity
 
 ---
 # column: c_acctbal  dtype: t26  ratio: 1.979x  depth: 1
