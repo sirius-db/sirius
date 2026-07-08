@@ -16,11 +16,18 @@
 
 #pragma once
 
+#include "io/s3/s3_list_parser.hpp"
+
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+
+namespace sirius::scan_manager {
+class sirius_scan_manager;
+}  // namespace sirius::scan_manager
 
 namespace sirius::io::s3 {
 
@@ -62,6 +69,17 @@ class sirius_httpfs : public duckdb::FileSystem {
     duckdb::FileOpenFlags flags,
     duckdb::optional_ptr<duckdb::FileOpener> opener = nullptr) override;
 
+  /// Extended open: when @p file carries a @c "file_size" option (a
+  /// non-negative BIGINT — the LIST-provided size @ref Glob attaches), the
+  /// datasource is opened through the known-size seam with ZERO network (no
+  /// HEAD). A missing / wrong-typed / negative option silently falls back to
+  /// the plain open path — third-party-populated @c OpenFileInfo must not
+  /// break the open.
+  duckdb::unique_ptr<duckdb::FileHandle> OpenFileExtended(
+    const duckdb::OpenFileInfo& file,
+    duckdb::FileOpenFlags flags,
+    duckdb::optional_ptr<duckdb::FileOpener> opener) override;
+
   void Read(duckdb::FileHandle& handle,
             void* buffer,
             int64_t nr_bytes,
@@ -71,8 +89,14 @@ class sirius_httpfs : public duckdb::FileSystem {
   int64_t GetFileSize(duckdb::FileHandle& handle) override;
   duckdb::timestamp_t GetLastModifiedTime(duckdb::FileHandle& handle) override;
 
-  /// Concrete-object only: returns @c {path} when @ref CanHandleFile, else empty.
-  /// Rejects glob/wildcard patterns (no S3 LIST) with a clear error.
+  /// Exact key: returns @c {path} when @ref CanHandleFile, else empty. A
+  /// glob/wildcard pattern expands via one paginated S3 LIST (through the
+  /// connection's scan_manager — see @ref expand_glob), gated like @ref
+  /// OpenFile: requires a resolvable @c ClientContext, @c gpu_execution
+  /// enabled, and no active CPU-fallback replay. Each match carries its
+  /// LIST-provided size in the extended info so the subsequent open needs no
+  /// HEAD. Zero matches yield an empty vector (DuckDB raises its standard
+  /// no-files error).
   duckdb::vector<duckdb::OpenFileInfo> Glob(const std::string& path,
                                             duckdb::FileOpener* opener = nullptr) override;
 
@@ -82,6 +106,23 @@ class sirius_httpfs : public duckdb::FileSystem {
   bool OnDiskFile(duckdb::FileHandle& /*handle*/) override { return false; }
 
   std::string GetName() const override { return "SiriusHttpFS"; }
+
+ protected:
+  bool SupportsOpenFileExtended() const override { return true; }
 };
+
+/// Expand an @c s3:// glob @p pattern into concrete object URIs via one
+/// paginated ListObjectsV2 sweep, streamed page-by-page (peak memory = one
+/// page + the matches). The LIST prefix is everything up to the last '/'
+/// before the first wildcard, so the sweep is server-side-narrowed to the
+/// table's prefix. Matching follows DuckDB's glob semantics per '/'-segment
+/// (@c *, @c ?, @c […] never cross a segment; @c ** crosses). Matches carry
+/// their LIST size in @c extended_info->options["file_size"]. Throws (never
+/// truncates) once more than @p max_matches keys match — "narrow the glob
+/// prefix"; wildcards in the bucket segment are rejected.
+duckdb::vector<duckdb::OpenFileInfo> expand_glob(
+  std::string const& pattern,
+  sirius::scan_manager::sirius_scan_manager& scan_manager,
+  std::size_t max_matches = default_max_list_objects);
 
 }  // namespace sirius::io::s3

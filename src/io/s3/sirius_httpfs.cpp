@@ -24,14 +24,19 @@
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/common/types/value.hpp>
+#include <duckdb/function/scalar/string_common.hpp>
 #include <duckdb/main/client_context.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace sirius::io::s3 {
 
@@ -66,6 +71,106 @@ sirius_httpfs_file_handle& as_httpfs_handle(duckdb::FileHandle& handle)
   return static_cast<sirius_httpfs_file_handle&>(handle);
 }
 
+/// Shared gate for every s3:// access through this FileSystem (open AND glob
+/// expansion): resolve the connection's SiriusContext and enforce the GPU-only
+/// contract — reject when gpu_execution is off or a CPU-fallback replay is
+/// active. @p verb only shapes the error text.
+duckdb::shared_ptr<duckdb::SiriusContext> resolve_gated_sirius_context(
+  duckdb::optional_ptr<duckdb::FileOpener> opener, std::string const& path, char const* verb)
+{
+  // The ClientFileSystem (OpenerFileSystem) layer injects the connection's
+  // FileOpener even though the parquet reader passes none.
+  auto client = duckdb::FileOpener::TryGetClientContext(opener);
+  if (!client) {
+    throw std::runtime_error(std::string("[sirius_httpfs] no ClientContext while ") + verb + " '" +
+                             path + "'; S3 reads require a Sirius-enabled connection");
+  }
+  // Transparent S3 is GPU-only. If gpu_execution is off there is no GPU
+  // consumer, so serving here would be a CPU read of s3:// — which Sirius does
+  // not support. Refuse with a clear message instead of silently serving a CPU
+  // fallback. Applies to glob expansion too: an expanded file list is only ever
+  // consumed by a scan that would hit this same wall at open.
+  {
+    duckdb::Value gpu_exec;
+    auto have         = client->TryGetCurrentSetting("gpu_execution", gpu_exec);
+    bool const gpu_on = have && !gpu_exec.IsNull() && gpu_exec.GetValue<bool>();
+    if (!gpu_on) {
+      throw duckdb::IOException(std::string("[sirius_httpfs] ") + verb + " '" + path +
+                                "' over S3 requires GPU execution: S3 is GPU-only and has no CPU "
+                                "fallback; SET gpu_execution=true");
+    }
+  }
+  auto sirius_ctx = client->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw std::runtime_error(std::string("[sirius_httpfs] Sirius is not initialized on this "
+                                         "connection while ") +
+                             verb + " '" + path + "'");
+  }
+  // No S3 CPU fallback. A CPU-fallback replay active here means the GPU plan
+  // failed and we are replaying on CPU (run_internal_cpu_fallback_query wraps
+  // the replay in a CpuFallbackGuard). Refuse so s3:// data is never served to
+  // a CPU plan, even when reached indirectly through a view. Uses the narrow
+  // CpuFallbackGuard flag (not the broad is_internal_query_active), so a
+  // legitimate internal s3:// read is not blocked.
+  if (sirius_ctx->is_cpu_fallback_active()) {
+    throw duckdb::IOException(std::string("[sirius_httpfs] ") + verb + " '" + path +
+                              "' on a CPU execution path: S3 CPU fallback is not supported (S3 is "
+                              "GPU-only); Sirius has no CPU fallback for S3 data sources");
+  }
+  return sirius_ctx;
+}
+
+/// The LIST-provided size Glob attaches ("file_size", duckdb-httpfs convention).
+/// Wrong type / null / negative → nullopt: a third-party-populated OpenFileInfo
+/// must degrade to the plain (HEAD) open path, never break the open.
+std::optional<std::uint64_t> extract_known_size(duckdb::OpenFileInfo const& file)
+{
+  if (!file.extended_info) { return std::nullopt; }
+  auto const it = file.extended_info->options.find("file_size");
+  if (it == file.extended_info->options.end()) { return std::nullopt; }
+  auto const& value = it->second;
+  if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) { return std::nullopt; }
+  auto const size = value.GetValue<int64_t>();
+  if (size < 0) { return std::nullopt; }
+  return static_cast<std::uint64_t>(size);
+}
+
+/// Split @p s into its '/'-separated segments (S3 keys are flat strings; the
+/// segment view only exists for glob matching).
+std::vector<std::string_view> split_segments(std::string_view s)
+{
+  std::vector<std::string_view> out;
+  for (std::size_t b = 0;;) {
+    auto const slash = s.find('/', b);
+    if (slash == std::string_view::npos) {
+      out.push_back(s.substr(b));
+      return out;
+    }
+    out.push_back(s.substr(b, slash - b));
+    b = slash + 1;
+  }
+}
+
+/// DuckDB glob semantics over a flat key: `*` / `?` / `[…]` match within one
+/// '/'-segment (duckdb::Glob, the same matcher LocalFileSystem applies per
+/// directory entry); `**` matches zero or more whole segments (the crawl).
+bool match_glob_segments(std::vector<std::string_view> const& keys,
+                         std::size_t ki,
+                         std::vector<std::string_view> const& pats,
+                         std::size_t pi)
+{
+  if (pi == pats.size()) { return ki == keys.size(); }
+  if (pats[pi] == "**") {
+    for (std::size_t skip = ki; skip <= keys.size(); ++skip) {
+      if (match_glob_segments(keys, skip, pats, pi + 1)) { return true; }
+    }
+    return false;
+  }
+  return ki < keys.size() &&
+         duckdb::Glob(keys[ki].data(), keys[ki].size(), pats[pi].data(), pats[pi].size()) &&
+         match_glob_segments(keys, ki + 1, pats, pi + 1);
+}
+
 }  // namespace
 
 bool sirius_httpfs::CanHandleFile(const std::string& fpath)
@@ -96,49 +201,7 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
     throw duckdb::IOException("[sirius_httpfs] '" + path +
                               "' is read-only; S3 writes (COPY TO) are not supported");
   }
-  // The ClientFileSystem (OpenerFileSystem) layer injects the connection's
-  // FileOpener even though the parquet reader passes none.
-  auto client = duckdb::FileOpener::TryGetClientContext(opener);
-  if (!client) {
-    throw std::runtime_error("[sirius_httpfs] no ClientContext while opening '" + path +
-                             "'; S3 reads require a Sirius-enabled connection");
-  }
-  // Transparent S3 is GPU-only. The GPU scan reads column data through the routed
-  // ioctx, so this FileSystem only ever serves the bind-time footer read for the
-  // GPU path. If gpu_execution is off there is no GPU consumer, so opening here
-  // would be a CPU read of s3:// — which Sirius does not support. Refuse with a
-  // clear message instead of silently serving a CPU fallback.
-  {
-    duckdb::Value gpu_exec;
-    auto have         = client->TryGetCurrentSetting("gpu_execution", gpu_exec);
-    bool const gpu_on = have && !gpu_exec.IsNull() && gpu_exec.GetValue<bool>();
-    if (!gpu_on) {
-      throw duckdb::IOException("[sirius_httpfs] reading '" + path +
-                                "' over S3 requires GPU execution: S3 is GPU-only and has no CPU "
-                                "fallback; SET gpu_execution=true");
-    }
-  }
-  auto sirius_ctx = client->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    throw std::runtime_error(
-      "[sirius_httpfs] Sirius is not initialized on this connection while opening '" + path + "'");
-  }
-  // No S3 CPU fallback. This FileSystem is only meant to serve the bind-time
-  // footer read for the transparent GPU path (the GPU scan then reads via the
-  // routed ioctx, not here). A CPU-fallback replay active here means the GPU
-  // plan failed and we are replaying on CPU (run_internal_cpu_fallback_query
-  // wraps the replay in a CpuFallbackGuard) — e.g. gpu_execution('SELECT ...
-  // FROM v_s3') whose view body reads s3:// and whose GPU plan failed. Refuse
-  // the read so s3:// data is never served to a CPU plan, even when reached
-  // indirectly through a view. Uses the narrow CpuFallbackGuard flag (not the
-  // broad is_internal_query_active), so a legitimate internal s3:// read is not
-  // blocked.
-  if (sirius_ctx->is_cpu_fallback_active()) {
-    throw duckdb::IOException(
-      "[sirius_httpfs] reading '" + path +
-      "' on a CPU execution path: S3 CPU fallback is not supported (S3 is GPU-only); "
-      "Sirius has no CPU fallback for S3 data sources");
-  }
+  auto sirius_ctx = resolve_gated_sirius_context(opener, path, "reading");
   // Resolve through the scan_manager's datasource factory (the routed seam):
   // the returned sirius_datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
@@ -148,6 +211,28 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + path + "'");
   }
   return duckdb::make_uniq<sirius_httpfs_file_handle>(*this, path, flags, std::move(datasource));
+}
+
+duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
+  const duckdb::OpenFileInfo& file,
+  duckdb::FileOpenFlags flags,
+  duckdb::optional_ptr<duckdb::FileOpener> opener)
+{
+  auto const known_size = extract_known_size(file);
+  if (!known_size) { return OpenFile(file.path, flags, opener); }
+  if (flags.OpenForWriting()) {
+    throw duckdb::IOException("[sirius_httpfs] '" + file.path +
+                              "' is read-only; S3 writes (COPY TO) are not supported");
+  }
+  auto sirius_ctx = resolve_gated_sirius_context(opener, file.path, "reading");
+  // The size rode the ListObjectsV2 response that expanded the glob, so this
+  // open costs zero network (no HEAD).
+  auto datasource = sirius_ctx->get_scan_manager().create_datasource(file.path, *known_size);
+  if (!datasource) {
+    throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
+  }
+  return duckdb::make_uniq<sirius_httpfs_file_handle>(
+    *this, file.path, flags, std::move(datasource));
 }
 
 void sirius_httpfs::Read(duckdb::FileHandle& handle,
@@ -197,19 +282,82 @@ duckdb::timestamp_t sirius_httpfs::GetLastModifiedTime(duckdb::FileHandle& /*han
 }
 
 duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path,
-                                                         duckdb::FileOpener* /*opener*/)
+                                                         duckdb::FileOpener* opener)
 {
-  // No S3 LIST: reject glob/wildcard patterns with a clear error instead of
-  // treating '*' as a literal key and failing later on object open.
-  if (duckdb::FileSystem::HasGlob(path)) {
-    throw duckdb::IOException(
-      "[sirius_httpfs] glob/wildcard patterns are not supported for s3:// "
-      "(no S3 LIST); specify an exact object key: '" +
-      path + "'");
+  if (!duckdb::FileSystem::HasGlob(path)) {
+    duckdb::vector<duckdb::OpenFileInfo> result;
+    if (CanHandleFile(path)) { result.emplace_back(path); }
+    return result;
   }
-  duckdb::vector<duckdb::OpenFileInfo> result;
-  if (CanHandleFile(path)) { result.emplace_back(path); }
-  return result;
+  // Wildcard expansion needs the connection's backend (one paginated LIST) and
+  // is gated exactly like OpenFile: expansion is metadata-only, but its file
+  // list is only ever consumed by a GPU-only scan, so failing here gives the
+  // clear error at the earliest point.
+  auto sirius_ctx = resolve_gated_sirius_context(opener, path, "glob-expanding");
+  return expand_glob(path, sirius_ctx->get_scan_manager());
+}
+
+duckdb::vector<duckdb::OpenFileInfo> expand_glob(
+  std::string const& pattern,
+  sirius::scan_manager::sirius_scan_manager& scan_manager,
+  std::size_t max_matches)
+{
+  constexpr std::string_view k_scheme = "s3://";
+  if (pattern.size() <= k_scheme.size()) {
+    throw duckdb::IOException("[sirius_httpfs] malformed s3:// glob pattern: '" + pattern + "'");
+  }
+  auto const rest         = std::string_view{pattern}.substr(k_scheme.size());
+  auto const bucket_slash = rest.find('/');
+  auto const bucket       = rest.substr(0, bucket_slash);
+  if (bucket.find_first_of("*?[") != std::string_view::npos) {
+    throw duckdb::IOException(
+      "[sirius_httpfs] wildcards in the bucket segment are not supported: '" + pattern + "'");
+  }
+  if (bucket.empty() || bucket_slash == std::string_view::npos) {
+    throw duckdb::IOException("[sirius_httpfs] malformed s3:// glob pattern: '" + pattern + "'");
+  }
+  auto const key_pattern = rest.substr(bucket_slash + 1);
+
+  // LIST prefix = everything up to the last '/' before the first wildcard —
+  // ListObjectsV2 is prefix-indexed, so the sweep is server-side-narrowed to
+  // the table's prefix before any keys flow.
+  auto const first_wild = key_pattern.find_first_of("*?[");
+  auto const last_slash = key_pattern.rfind('/', first_wild);
+  auto const prefix     = last_slash == std::string_view::npos ? std::string_view{}
+                                                               : key_pattern.substr(0, last_slash + 1);
+
+  auto const pattern_segments = split_segments(key_pattern);
+  std::string const list_uri  = "s3://" + std::string{bucket} + "/" + std::string{prefix};
+
+  // Stream the pages, keeping only matches: peak memory = one page (≤1000
+  // entries) + the matched set, regardless of the prefix's population. The
+  // match cap throws rather than truncating — a shortened file list would
+  // silently change query results.
+  duckdb::vector<duckdb::OpenFileInfo> matches;
+  scan_manager.list_objects_paged(
+    list_uri, /*page_size=*/1000, [&](sirius::io::s3::list_objects_v2_page const& page) {
+      for (auto const& entry : page.entries) {
+        auto const key_segments = split_segments(entry.key);
+        if (!match_glob_segments(key_segments, 0, pattern_segments, 0)) { continue; }
+        if (matches.size() >= max_matches) {
+          throw duckdb::IOException("[sirius_httpfs] glob '" + pattern + "' matched more than " +
+                                    std::to_string(max_matches) +
+                                    " objects — narrow the glob prefix");
+        }
+        duckdb::OpenFileInfo info("s3://" + std::string{bucket} + "/" + entry.key);
+        if (entry.size <= static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max())) {
+          info.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
+          info.extended_info->options["file_size"] =
+            duckdb::Value::BIGINT(static_cast<int64_t>(entry.size));
+        }
+        matches.push_back(std::move(info));
+      }
+      return true;
+    });
+
+  std::sort(
+    matches.begin(), matches.end(), [](auto const& a, auto const& b) { return a.path < b.path; });
+  return matches;
 }
 
 void sirius_httpfs::Seek(duckdb::FileHandle& handle, duckdb::idx_t location)

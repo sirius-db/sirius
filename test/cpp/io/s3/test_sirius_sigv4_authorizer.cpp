@@ -18,6 +18,7 @@
 #include "io/io_errors.hpp"
 #include "io/object_store_config.hpp"
 #include "io/s3/mock_request_authorizer.hpp"
+#include "io/s3/s3_list_parser.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 
@@ -107,7 +108,166 @@ bool is_lower_hex_64(std::string_view value)
          });
 }
 
+std::vector<std::string> query_keys(std::string_view url)
+{
+  auto query = query_string(url);
+  std::vector<std::string> keys;
+  std::size_t pos = 0;
+  while (pos < query.size()) {
+    auto amp = query.find('&', pos);
+    if (amp == std::string::npos) { amp = query.size(); }
+    auto eq = query.find('=', pos);
+    REQUIRE(eq != std::string::npos);
+    REQUIRE(eq <= amp);
+    keys.push_back(query.substr(pos, eq - pos));
+    pos = amp + 1;
+  }
+  return keys;
+}
+
+class object_only_authorizer final : public sirius::io::s3::s3_request_authorizer {
+ public:
+  s3_authorized_request authorize(s3_object_ref const& /*obj*/,
+                                  s3_request_method /*method*/,
+                                  std::chrono::seconds /*timeout*/) override
+  {
+    return {"https://example.invalid/object", {}};
+  }
+};
+
 }  // namespace
+
+TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "[s3][list_parser]")
+{
+  using sirius::io::s3::parse_list_objects_v2;
+
+  auto page = parse_list_objects_v2(
+    R"(<?xml version="1.0" encoding="UTF-8"?>)"
+    R"(<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">)"
+    R"(<Name>bucket</Name><Prefix>lake/</Prefix>)"
+    R"(<Contents><Key>lake/a&amp;b.parquet</Key><Size>12</Size></Contents>)"
+    R"(<Contents><Key>lake/year=2024/file.parquet</Key><Size>0</Size></Contents>)"
+    R"(<IsTruncated>true</IsTruncated>)"
+    R"(<NextContinuationToken>token/with+chars=</NextContinuationToken>)"
+    R"(</ListBucketResult>)");
+
+  REQUIRE(page.entries.size() == 2);
+  CHECK(page.entries[0].key == "lake/a&b.parquet");
+  CHECK(page.entries[0].size == 12);
+  CHECK(page.entries[1].key == "lake/year=2024/file.parquet");
+  CHECK(page.entries[1].size == 0);
+  CHECK(page.is_truncated);
+  CHECK(page.next_continuation_token == "token/with+chars=");
+}
+
+TEST_CASE("ListObjectsV2 parser ignores non-object keys and preserves flat-key order",
+          "[s3][list_parser]")
+{
+  using sirius::io::s3::parse_list_objects_v2;
+
+  auto page = parse_list_objects_v2(
+    R"(<ListBucketResult>)"
+    R"(<Key>not-an-object.parquet</Key>)"
+    R"(<CommonPrefixes><Prefix>lake/year=2024/</Prefix><Key>also-not-object</Key></CommonPrefixes>)"
+    R"(<Contents><Key>lake/part-000.parquet</Key><Size>7</Size></Contents>)"
+    R"(<Contents><Key>lake/nested/year=2025/part-001.parquet</Key><Size>8</Size></Contents>)"
+    R"(<IsTruncated>false</IsTruncated>)"
+    R"(</ListBucketResult>)");
+
+  REQUIRE(page.entries.size() == 2);
+  CHECK(page.entries[0].key == "lake/part-000.parquet");
+  CHECK(page.entries[0].size == 7);
+  CHECK(page.entries[1].key == "lake/nested/year=2025/part-001.parquet");
+  CHECK(page.entries[1].size == 8);
+  CHECK_FALSE(page.is_truncated);
+  CHECK(page.next_continuation_token.empty());
+}
+
+TEST_CASE("ListObjectsV2 parser rejects non-list bodies and malformed sizes", "[s3][list_parser]")
+{
+  using sirius::io::s3::parse_list_objects_v2;
+
+  auto empty = parse_list_objects_v2(
+    R"(<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>)");
+  CHECK(empty.entries.empty());
+
+  CHECK_THROWS_AS(parse_list_objects_v2(
+                    R"(<Error><Code>NoSuchBucket</Code><Message>no bucket</Message></Error>)"),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse_list_objects_v2(
+                    R"(<ListBucketResult><Contents><Key>a</Key></Contents></ListBucketResult>)"),
+                  std::runtime_error);
+  CHECK_THROWS_AS(
+    parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Key>a</Key><Size>not-a-size</Size></Contents></ListBucketResult>)"),
+    std::runtime_error);
+}
+
+TEST_CASE("s3_request_authorizer base rejects LIST until implementations opt in",
+          "[s3][authorizer]")
+{
+  object_only_authorizer provider;
+
+  CHECK_THROWS_AS(
+    provider.authorize_list("bucket", "list-type=2&max-keys=1000&prefix=p%2F", k_presign_timeout),
+    credential_error);
+}
+
+TEST_CASE("sirius_sigv4_presigned_authorizer signs sorted ListObjectsV2 query params",
+          "[s3][authorizer]")
+{
+  auto creds          = example_static_credentials();
+  creds.session_token = "temporary/session+token=";
+  sirius_sigv4_presigned_authorizer provider(
+    creds, "us-east-1", "https://s3.us-east-1.amazonaws.com");
+
+  auto request =
+    provider.authorize_list("bucket", "list-type=2&max-keys=1000&prefix=p%2F", k_presign_timeout);
+
+  REQUIRE(request.headers.empty());
+  CHECK(starts_with(request.url, "https://s3.us-east-1.amazonaws.com/bucket?"));
+  CHECK(contains(request.url, "list-type=2"));
+  CHECK(contains(request.url, "max-keys=1000"));
+  CHECK(contains(request.url, "prefix=p%2F"));
+  CHECK(contains(request.url, "X-Amz-Security-Token=temporary%2Fsession%2Btoken%3D"));
+  CHECK(is_lower_hex_64(query_value(request.url, "X-Amz-Signature")));
+
+  auto keys = query_keys(request.url);
+  CHECK(std::is_sorted(keys.begin(), keys.end()));
+}
+
+TEST_CASE("sirius_sigv4_header_authorizer signs ListObjectsV2 canonical queries",
+          "[s3][authorizer]")
+{
+  sirius_sigv4_header_authorizer provider(
+    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+
+  auto request =
+    provider.authorize_list("bucket",
+                            "continuation-token=page%2F1%2B%3D&list-type=2&max-keys=1&prefix=p%2F",
+                            k_presign_timeout);
+
+  CHECK(request.url ==
+        "http://minio.local:9000/bucket?continuation-token=page%2F1%2B%3D&list-type=2&max-keys=1&"
+        "prefix=p%2F");
+  CHECK_FALSE(contains(request.url, "X-Amz-Signature"));
+  CHECK(starts_with(header_value(request.headers, "Authorization"), "AWS4-HMAC-SHA256 "));
+  CHECK_FALSE(header_value(request.headers, "x-amz-date").empty());
+  CHECK_FALSE(header_value(request.headers, "x-amz-content-sha256").empty());
+}
+
+TEST_CASE("SigV4 LIST rejects X-Amz query smuggling", "[s3][authorizer]")
+{
+  sirius_sigv4_presigned_authorizer presigned(
+    example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
+  sirius_sigv4_header_authorizer header(
+    example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
+
+  CHECK_THROWS(presigned.authorize_list(
+    "bucket", "list-type=2&X-Amz-Signature=evil&prefix=p%2F", k_presign_timeout));
+  CHECK_THROWS(header.authorize_list(
+    "bucket", "list-type=2&x-amz-credential=evil&prefix=p%2F", k_presign_timeout));
+}
 
 TEST_CASE("sirius_sigv4_presigned_authorizer normalizes HTTPS endpoint", "[s3][authorizer]")
 {

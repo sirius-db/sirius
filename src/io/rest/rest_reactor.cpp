@@ -97,6 +97,15 @@ size_t write_discard(char* /*ptr*/, size_t size, size_t nmemb, void* /*userdata*
   return size * nmemb;
 }
 
+/// Accumulate the whole response body into a std::string (small control-plane
+/// responses only — e.g. one ListObjectsV2 XML page).
+size_t write_string(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+  auto* out = static_cast<std::string*>(userdata);
+  out->append(ptr, size * nmemb);
+  return size * nmemb;
+}
+
 /// Lowercase a byte.
 char ascii_lower(char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
 
@@ -861,6 +870,66 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
   _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
   throw std::runtime_error("rest_reactor::head_object_size: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
+}
+
+std::string rest_reactor::list_page(std::string_view bucket,
+                                    std::string_view prefix,
+                                    std::string_view canonical_query)
+{
+  std::string const bucket_s{bucket};
+  std::string const prefix_s{prefix};
+  std::string last_error;
+  for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
+    header_capture hc;
+    auto const authd = _ctx->authorizer()->authorize_list(
+      bucket_s, std::string{canonical_query}, presign_ttl(_config));
+
+    curl_easy_ptr h{curl_easy_init()};
+    if (!h) { throw std::runtime_error("rest_reactor::list_page: curl_easy_init failed"); }
+    configure_easy_handle(h.get(), global_curl_context::instance().share_handle());
+    apply_request_opts(h.get(), _config);
+
+    std::string body;
+    curl_slist_ptr hdrs = build_header_list(authd.headers, nullptr);
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPGET, 1L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_string));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEDATA, &body));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &capture_header));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
+
+    CURLcode const rc = curl_easy_perform(h.get());
+    long status       = 0;
+    curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+
+    // Control-plane response: the XML body is deliberately NOT credited to
+    // chunk_get_count / payload_bytes_read_total — those budget object reads.
+    if (rc == CURLE_OK && status == 200) { return body; }
+
+    last_error =
+      rc != CURLE_OK ? std::string(curl_easy_strerror(rc)) : ("HTTP " + std::to_string(status));
+    bool const retriable =
+      (rc != CURLE_OK && is_retriable_curl(rc)) || (rc == CURLE_OK && is_retriable_status(status));
+    if (!retriable) {
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+      throw std::runtime_error("rest_reactor::list_page: " + last_error + " for " + bucket_s + "/" +
+                               prefix_s);
+    }
+    if (attempt + 1 < _config.max_retry_attempts) {
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
+      SIRIUS_LOG_WARN("rest_reactor::list_page: retrying {}/{} after {} (attempt {}/{})",
+                      bucket_s,
+                      prefix_s,
+                      last_error,
+                      attempt + 1,
+                      _config.max_retry_attempts);
+      std::this_thread::sleep_for(compute_backoff(attempt, hc.retry_after, _config));
+    }
+  }
+  _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+  throw std::runtime_error("rest_reactor::list_page: exhausted retries (" + last_error + ") for " +
+                           bucket_s + "/" + prefix_s);
 }
 
 footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,

@@ -20,6 +20,7 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
+#include "io/s3/s3_list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
@@ -45,6 +46,8 @@ namespace cucascade::memory {
 class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -377,6 +380,24 @@ class sirius_scan_manager {
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
+
+  /// \brief Known-size open: the object's size is already known (e.g. from an
+  ///        S3 ListObjectsV2 response), so a backend whose size discovery costs
+  ///        a round-trip builds the datasource with zero network.
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
+    std::string_view path, std::uint64_t known_size);
+
+  /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
+  ///        to @p sink, one call per page; @p sink returns false to stop early.
+  ///        Routes via @ref ioctx_for_path to the object-store backend (throws a
+  ///        clear error when the path does not resolve to one). page_size /
+  ///        early-stop / @p max_scanned semantics are the backend's
+  ///        (@c rest_ioctx::list_objects_paged).
+  void list_objects_paged(
+    std::string const& s3_prefix_uri,
+    std::size_t page_size,
+    std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+    std::size_t max_scanned = sirius::io::s3::default_max_scanned_objects);
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.

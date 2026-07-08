@@ -17,11 +17,16 @@
 #pragma once
 
 #include "io/rest/rest_reactor.hpp"
+#include "io/s3/s3_list_parser.hpp"
 #include "io/templated_ioctx.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace sirius::io::rest {
 
@@ -54,6 +59,30 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// non-zero reactor value.  Lock-free; drives the s3-bench JSON baseline.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
+  /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
+  /// per page (a page holds at most 1000 entries, so peak memory is one page
+  /// regardless of bucket population).  @p sink returns false to stop early —
+  /// no further LIST requests are issued.  @p page_size is clamped to [1,1000]
+  /// (0 and >1000 mean 1000).  Throws (never truncates) on a truncated page
+  /// without a continuation token, and once more than @p max_scanned entries
+  /// have been scanned across pages (bounds time / request count on a prefix
+  /// whose population dwarfs the caller's matches).
+  void list_objects_paged(std::string_view bucket,
+                          std::string_view prefix,
+                          std::size_t page_size,
+                          std::function<bool(s3::list_objects_v2_page const&)> const& sink,
+                          std::size_t max_scanned = s3::default_max_scanned_objects);
+
+  /// Whole-listing convenience over @c list_objects_paged: every object under
+  /// @p prefix, in document order, with sizes.  Throws (never truncates) when
+  /// the accumulated entries would exceed @p max_keys — a partial key set would
+  /// resolve a glob to a silently incomplete table.
+  [[nodiscard]] std::vector<s3::list_entry> list_objects(
+    std::string_view bucket,
+    std::string_view prefix,
+    std::size_t page_size = 1000,
+    std::size_t max_keys  = s3::default_max_list_objects);
+
  protected:
   /// Backend hook invoked by @c sirius_ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
@@ -64,6 +93,12 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// parquet footer together via a single suffix-range GET, carried on the
   /// returned io_object; every other hint falls back to the plain HEAD path above.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint) override;
+
+  /// Known-size open: the caller already learned the object's size (e.g. from a
+  /// ListObjectsV2 response), so the io_object is built with ZERO network — no
+  /// HEAD, no probe.
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path,
+                                                     std::uint64_t known_size) override;
 
  private:
   /// Resolve @p path with a single suffix-range GET: it discovers the size and

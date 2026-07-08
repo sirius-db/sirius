@@ -274,6 +274,19 @@ std::shared_ptr<sirius::io::sirius_datasource> require_rest_datasource(
   return datasource;
 }
 
+duckdb::SiriusContext& require_sirius_context(sirius_httpfs_fixture& fixture)
+{
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  return *sirius_ctx;
+}
+
+class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
+ public:
+  using sirius::io::s3::sirius_httpfs::SupportsOpenFileExtended;
+};
+
 }  // namespace
 
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
@@ -288,19 +301,37 @@ TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
   CHECK(fs.CanSeek());
 }
 
-TEST_CASE("sirius_httpfs rejects glob patterns but accepts exact keys", "[s3][filesystem]")
+TEST_CASE("sirius_httpfs accepts exact keys and gates wildcard expansion on a Sirius opener",
+          "[s3][filesystem]")
 {
-  sirius::io::s3::sirius_httpfs fs;
+  exposed_sirius_httpfs fs;
+  CHECK(fs.SupportsOpenFileExtended());
 
-  CHECK_THROWS_AS(fs.Glob("s3://bucket/prefix/*.parquet"), duckdb::IOException);
-  CHECK_THROWS_AS(fs.Glob("s3://bucket/a?.parquet"), duckdb::IOException);
-  CHECK_THROWS_AS(fs.Glob("s3://bucket/[ab].parquet"), duckdb::IOException);
+  auto wildcard_message = thrown_message([&] { (void)fs.Glob("s3://bucket/prefix/*.parquet"); });
+  REQUIRE_FALSE(wildcard_message.empty());
+  CHECK(wildcard_message.find("no ClientContext") != std::string::npos);
+  CHECK(wildcard_message.find("glob/wildcard patterns are not supported") == std::string::npos);
 
   auto exact = fs.Glob("s3://bucket/key.parquet");
   REQUIRE(exact.size() == 1);
   CHECK(exact[0].path == "s3://bucket/key.parquet");
 
   CHECK(fs.Glob("s3://bucket").empty());
+}
+
+TEST_CASE("sirius_httpfs glob helper throws instead of silently truncating matched files",
+          "[.][s3][integration][filesystem][glob]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  sirius_httpfs_fixture fixture(*env);
+  auto& manager = require_sirius_context(fixture).get_scan_manager();
+
+  CHECK_THROWS_WITH(sirius::io::s3::expand_glob(s3_uri(env->bucket, "glob/multi/nation_*.parquet"),
+                                                manager,
+                                                /*max_matches=*/1),
+                    Catch::Contains("narrow the glob prefix"));
 }
 
 TEST_CASE("sirius_httpfs rejects write opens before opener resolution", "[s3][filesystem]")

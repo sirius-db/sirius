@@ -276,6 +276,17 @@ class rest_reactor {
   /// falls back to a HEAD.  @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
 
+  /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML
+  /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
+  /// request query (no auth params — authorization is added via
+  /// @c authorize_list).  @p prefix is only for retry-log / error text.
+  /// Control-plane op: retries/terminals are counted (and retries WARN-logged)
+  /// like every retry loop here, but the XML body never touches the
+  /// chunk-GET / payload byte counters.
+  std::string list_page(std::string_view bucket,
+                        std::string_view prefix,
+                        std::string_view canonical_query);
+
   /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
   /// loads); safe to call while the reactor is running.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;

@@ -28,13 +28,17 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -637,10 +641,25 @@ std::string local_parquet_file_scan(fs::path const& path)
   return "read_parquet(" + sql_quote(path.string()) + ")";
 }
 
+std::string local_parquet_glob_scan(s3_test_env const& env,
+                                    std::string_view pattern,
+                                    std::string_view options = {})
+{
+  return "read_parquet(" + sql_quote((env.local_dir / std::string{pattern}).string()) +
+         std::string{options} + ")";
+}
+
 std::string s3_parquet_scan(s3_test_env const& env, std::string_view table)
 {
   auto const key = "parquet/" + std::string{table} + ".parquet";
   return "read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
+}
+
+std::string s3_parquet_glob_scan(s3_test_env const& env,
+                                 std::string_view pattern,
+                                 std::string_view options = {})
+{
+  return "read_parquet(" + sql_quote(s3_uri(env.bucket, pattern)) + std::string{options} + ")";
 }
 
 std::string s3_sirius_parquet_scan(s3_test_env const& env, std::string_view table)
@@ -697,6 +716,20 @@ std::uint64_t rest_chunk_get_count(s3_sql_fixture& fixture, std::string const& u
 std::uint64_t rest_terminal_failures(s3_sql_fixture& fixture, std::string const& uri)
 {
   return require_rest_ioctx(fixture, uri).perf_snapshot().terminal_failures_total;
+}
+
+bool wait_for_child(pid_t pid, std::chrono::milliseconds timeout, int& status)
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto const result = ::waitpid(pid, &status, WNOHANG);
+    if (result == pid) { return true; }
+    if (result < 0 && errno != EINTR) {
+      throw std::runtime_error("waitpid failed while watching known issue repro");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  }
+  return false;
 }
 
 struct large_lineitem_fixture {
@@ -2433,6 +2466,154 @@ TEST_CASE("transparent read_parquet over S3 keeps REST routing when local Sirius
     require_query_ok(fixture.con, "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")");
   REQUIRE(result->RowCount() == 1);
   CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const s3_scan    = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query   = "SELECT n_nationkey, n_name, n_regionkey FROM " + s3_scan +
+                        " ORDER BY n_nationkey, n_name, n_regionkey";
+  auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " + local_scan +
+                           " ORDER BY n_nationkey, n_name, n_regionkey";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob preserves hive partition columns",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const options    = ", hive_partitioning=true";
+  auto const s3_scan    = s3_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
+  auto const local_scan = local_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
+  auto const s3_query   = "SELECT year, count(*), min(n_nationkey), max(n_nationkey) FROM " +
+                        s3_scan + " GROUP BY year ORDER BY year";
+  auto const local_query = "SELECT year, count(*), min(n_nationkey), max(n_nationkey) FROM " +
+                           local_scan + " GROUP BY year ORDER BY year";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto check_count =
+    [&](std::string_view s3_pattern, std::string_view local_pattern, std::int64_t expected) {
+      auto const s3_query =
+        "SELECT count(n_nationkey) FROM " + s3_parquet_glob_scan(*env, s3_pattern);
+      auto const local_query =
+        "SELECT count(n_nationkey) FROM " + local_parquet_glob_scan(*env, local_pattern);
+      compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+      auto result = require_query_ok(fixture.con, s3_query);
+      REQUIRE(result->RowCount() == 1);
+      CHECK(result->GetValue(0, 0).GetValue<int64_t>() == expected);
+    };
+
+  check_count("glob/multi/nation_?.parquet", "glob/multi/nation_?.parquet", 50);
+  check_count("glob/multi/nation_[ab].parquet", "glob/multi/nation_[ab].parquet", 50);
+  check_count("glob/hive/**/nation.parquet", "glob/hive/**/nation.parquet", 50);
+  check_count("root_*.parquet", "root_*.parquet", 50);
+
+  auto wildcard_bucket =
+    fixture.con.Query("SELECT count(*) FROM read_parquet('s3://*/glob/multi/nation_*.parquet')");
+  REQUIRE(wildcard_bucket);
+  REQUIRE(wildcard_bucket->HasError());
+  INFO(wildcard_bucket->GetError());
+  CHECK(wildcard_bucket->GetError().find("bucket") != std::string::npos);
+}
+
+TEST_CASE("known issue: transparent hive-layout glob count star hangs",
+          "[.][s3][integration][known-issue][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  INFO("Known issue: /Users/tengyu/code/doc/s3support/issue-hive-glob-count-star-hang.md");
+
+  auto const pid = ::fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    try {
+      s3_sql_fixture fixture(*env);
+      set_gpu_execution(fixture.con, true);
+      auto result = fixture.con.Query("SELECT count(*) FROM " +
+                                      s3_parquet_glob_scan(*env, "glob/hive/**/*.parquet"));
+      if (result && !result->HasError()) { ::_exit(0); }
+      ::_exit(2);
+    } catch (...) {
+      ::_exit(3);
+    }
+  }
+
+  int status = 0;
+  if (!wait_for_child(pid, std::chrono::seconds{10}, status)) {
+    (void)::kill(pid, SIGKILL);
+    (void)::waitpid(pid, &status, 0);
+    SUCCEED("Known issue reproduced: hive-layout glob count(*) did not return before watchdog");
+    return;
+  }
+
+  INFO("child status=" << status);
+  FAIL("Known issue no longer reproduces; remove or update this tracker");
+}
+
+TEST_CASE("transparent S3 glob reports no-files and GPU-only errors clearly",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  SECTION("zero-match glob reports a no-files class error")
+  {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, true);
+
+    auto result = fixture.con.Query("SELECT count(*) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/no-match-*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(
+      (error.find("No files") != std::string::npos || error.find("no files") != std::string::npos));
+    CHECK(error.find("glob/wildcard patterns are not supported") == std::string::npos);
+    CHECK(error.find("No filesystem") == std::string::npos);
+    CHECK(error.find("no filesystem") == std::string::npos);
+  }
+
+  SECTION("gpu_execution=false rejects globbed S3 at the filesystem gate")
+  {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, false);
+
+    auto result = fixture.con.Query("SELECT count(*) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("S3 is GPU-only") != std::string::npos);
+    CHECK(error.find("SET gpu_execution=true") != std::string::npos);
+  }
 }
 
 TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",

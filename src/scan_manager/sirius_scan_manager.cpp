@@ -21,6 +21,7 @@
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
+#include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
@@ -403,6 +404,53 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
   return io_ctx->open_datasource(file_path, hint);
+}
+
+std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
+  std::string_view path, std::uint64_t known_size)
+{
+  auto file_path = normalize_path(std::string(path));
+  auto io_ctx    = ioctx_for_path(file_path);
+  if (!io_ctx) { return nullptr; }
+  return io_ctx->open_datasource(file_path, known_size);
+}
+
+void sirius_scan_manager::list_objects_paged(
+  std::string const& s3_prefix_uri,
+  std::size_t page_size,
+  std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+  std::size_t max_scanned)
+{
+  // Hand-split rather than uri_parser::parse — a LIST prefix URI legitimately
+  // has an EMPTY key part (bucket-root glob: "s3://bucket/"), which parse()
+  // rejects as an object URI.
+  constexpr std::string_view k_scheme = "s3://";
+  if (s3_prefix_uri.size() <= k_scheme.size() ||
+      s3_prefix_uri.compare(0, k_scheme.size(), k_scheme) != 0) {
+    throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
+                             s3_prefix_uri + "'");
+  }
+  auto const rest_uri     = std::string_view{s3_prefix_uri}.substr(k_scheme.size());
+  auto const bucket_slash = rest_uri.find('/');
+  auto const bucket       = rest_uri.substr(0, bucket_slash);
+  auto const prefix =
+    bucket_slash == std::string_view::npos ? std::string_view{} : rest_uri.substr(bucket_slash + 1);
+  if (bucket.empty()) {
+    throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
+                             s3_prefix_uri + "'");
+  }
+  // Routing probe only (scheme dispatch, never touches the network): the
+  // backend checkers parse() their input and reject an empty object key, so a
+  // bucket-root prefix routes via a placeholder key.
+  auto const route_probe =
+    "s3://" + std::string(bucket) + "/" + (prefix.empty() ? "_" : std::string(prefix));
+  auto io_ctx = ioctx_for_path(route_probe);
+  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  if (rest == nullptr) {
+    throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
+                             "' does not route to an object-store backend that supports LIST");
+  }
+  rest->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
 }
 
 std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)

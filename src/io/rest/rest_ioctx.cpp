@@ -16,6 +16,7 @@
 
 #include "io/rest/rest_ioctx.hpp"
 
+#include "io/s3/sigv4.hpp"
 #include "io/uri_parser.hpp"
 
 #include <algorithm>
@@ -58,6 +59,73 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
   return agg;
 }
 
+void rest_ioctx::list_objects_paged(
+  std::string_view bucket,
+  std::string_view prefix,
+  std::size_t page_size,
+  std::function<bool(s3::list_objects_v2_page const&)> const& sink,
+  std::size_t max_scanned)
+{
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::list_objects: no reactors"); }
+  std::size_t const clamped = (page_size == 0 || page_size > 1000) ? 1000 : page_size;
+
+  std::size_t scanned = 0;
+  std::string token;
+  bool truncated = false;
+  do {
+    // SigV4 canonical order = byte order of the encoded keys; for these params
+    // that is continuation-token < list-type < max-keys < prefix.
+    std::string query;
+    if (!token.empty()) {
+      query += "continuation-token=";
+      query += s3::uri_encode(token, /*encode_slash=*/true);
+      query += '&';
+    }
+    query += "list-type=2&max-keys=";
+    query += std::to_string(clamped);
+    query += "&prefix=";
+    query += s3::uri_encode(prefix, /*encode_slash=*/true);
+
+    auto const page =
+      s3::parse_list_objects_v2(_reactors.front()->list_page(bucket, prefix, query));
+
+    scanned += page.entries.size();
+    if (scanned > max_scanned) {
+      throw std::runtime_error("rest_ioctx::list_objects: scanned more than " +
+                               std::to_string(max_scanned) + " objects under s3://" +
+                               std::string(bucket) + "/" + std::string(prefix) +
+                               " — narrow the glob prefix");
+    }
+    if (page.is_truncated && page.next_continuation_token.empty()) {
+      throw std::runtime_error(
+        "rest_ioctx::list_objects: truncated ListObjectsV2 page without a continuation token for "
+        "s3://" +
+        std::string(bucket) + "/" + std::string(prefix));
+    }
+    truncated = page.is_truncated;
+    token     = page.next_continuation_token;
+    if (!sink(page)) { return; }
+  } while (truncated);
+}
+
+std::vector<s3::list_entry> rest_ioctx::list_objects(std::string_view bucket,
+                                                     std::string_view prefix,
+                                                     std::size_t page_size,
+                                                     std::size_t max_keys)
+{
+  std::vector<s3::list_entry> out;
+  list_objects_paged(bucket, prefix, page_size, [&](s3::list_objects_v2_page const& page) {
+    if (out.size() + page.entries.size() > max_keys) {
+      throw std::runtime_error("rest_ioctx::list_objects: more than " + std::to_string(max_keys) +
+                               " objects under s3://" + std::string(bucket) + "/" +
+                               std::string(prefix) + " — narrow the glob prefix");
+    }
+    out.insert(out.end(), page.entries.begin(), page.entries.end());
+    return true;
+  });
+  return out;
+}
+
 std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path)
 {
   auto parsed = sirius::io::parse(path);
@@ -81,6 +149,22 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
     return create_footer_probe_object(std::move(path));
   }
   return create_io_object(std::move(path));
+}
+
+std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
+                                                               std::uint64_t known_size)
+{
+  auto parsed = sirius::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  // The size came from a ListObjectsV2 response: build the io_object with zero
+  // network — no HEAD, no probe.
+  return std::make_shared<rest_io_object>(std::move(path),
+                                          std::move(parsed.host),
+                                          std::move(parsed.path),
+                                          static_cast<size_t>(known_size));
 }
 
 std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::string path)

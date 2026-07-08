@@ -267,7 +267,8 @@ std::string presign_url(std::string_view method,
                         std::string_view canonical_uri,
                         sigv4_signer_config const& creds,
                         std::time_t timestamp_utc,
-                        std::chrono::seconds ttl)
+                        std::chrono::seconds ttl,
+                        std::string_view extra_canonical_query)
 {
   if (creds.access_key.empty() || creds.secret_key.empty() || creds.region.empty() ||
       creds.service.empty()) {
@@ -306,16 +307,39 @@ std::string presign_url(std::string_view method,
   //         encode_slash=true (per AWS query-encoding rules). The
   //         X-Amz-Signature itself is appended *after* signing — it is not
   //         part of the canonical request. ----
+  //         Stored already-encoded so the X-Amz-* parameters and any
+  //         caller-supplied request parameters (@p extra_canonical_query, which
+  //         arrives pre-encoded) can be merged and sorted together by encoded
+  //         key — AWS signs the combined, sorted set.
   std::vector<std::pair<std::string, std::string>> qparams;
-  qparams.reserve(6);
-  qparams.emplace_back("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
-  qparams.emplace_back("X-Amz-Credential", credential_qparam);
-  qparams.emplace_back("X-Amz-Date", amz_date);
-  qparams.emplace_back("X-Amz-Expires", std::to_string(ttl.count()));
-  if (!creds.session_token.empty()) {
-    qparams.emplace_back("X-Amz-Security-Token", creds.session_token);
+  auto add_amz = [&qparams](std::string_view k, std::string_view v) {
+    qparams.emplace_back(uri_encode(k, /*encode_slash=*/true),
+                         uri_encode(v, /*encode_slash=*/true));
+  };
+  add_amz("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
+  add_amz("X-Amz-Credential", credential_qparam);
+  add_amz("X-Amz-Date", amz_date);
+  add_amz("X-Amz-Expires", std::to_string(ttl.count()));
+  if (!creds.session_token.empty()) { add_amz("X-Amz-Security-Token", creds.session_token); }
+  add_amz("X-Amz-SignedHeaders", "host");
+
+  // Merge the caller's pre-encoded request params (e.g. ListObjectsV2's
+  // list-type / prefix / max-keys / continuation-token), taken verbatim.
+  for (std::size_t b = 0; b < extra_canonical_query.size();) {
+    auto const amp  = extra_canonical_query.find('&', b);
+    auto const pair = extra_canonical_query.substr(
+      b, amp == std::string_view::npos ? std::string_view::npos : amp - b);
+    if (!pair.empty()) {
+      auto const eq = pair.find('=');
+      if (eq == std::string_view::npos) {
+        qparams.emplace_back(std::string{pair}, std::string{});
+      } else {
+        qparams.emplace_back(std::string{pair.substr(0, eq)}, std::string{pair.substr(eq + 1)});
+      }
+    }
+    if (amp == std::string_view::npos) { break; }
+    b = amp + 1;
   }
-  qparams.emplace_back("X-Amz-SignedHeaders", "host");
 
   std::sort(
     qparams.begin(), qparams.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
@@ -323,9 +347,9 @@ std::string presign_url(std::string_view method,
   std::string canonical_query;
   for (std::size_t i = 0; i < qparams.size(); ++i) {
     if (i != 0) canonical_query += '&';
-    canonical_query += uri_encode(qparams[i].first, /*encode_slash=*/true);
+    canonical_query += qparams[i].first;
     canonical_query += '=';
-    canonical_query += uri_encode(qparams[i].second, /*encode_slash=*/true);
+    canonical_query += qparams[i].second;
   }
 
   // ---- 4. Canonical headers (host only) and signed headers list. ----
@@ -376,19 +400,42 @@ std::string presign_url(std::string_view method,
 
   std::string signature_hex = hex_encode(sig.data(), sig.size());
 
-  // ---- 8. Assemble the final URL:
-  //         scheme://host<canonical_uri>?<canonical_query>&X-Amz-Signature=<sig>. ----
+  // ---- 8. Assemble the final URL.  S3 accepts the query params in any order
+  //         (only the canonical query fed into the signature must be sorted,
+  //         and X-Amz-Signature is never part of it), so the placement of the
+  //         signature is presentation-only.  Two shapes:
+  //         - pure X-Amz query (no extra params): append the signature LAST —
+  //           byte-for-byte the layout of AWS's published query-auth vector,
+  //           which a golden test pins.
+  //         - merged query (extra request params present): insert the
+  //           signature in sorted position, so the final URL mirrors the
+  //           canonical order end to end. ----
+  std::string final_query;
+  if (extra_canonical_query.empty()) {
+    final_query = canonical_query;
+    final_query += "&X-Amz-Signature=";
+    final_query += signature_hex;
+  } else {
+    qparams.emplace_back("X-Amz-Signature", std::move(signature_hex));
+    std::sort(qparams.begin(), qparams.end(), [](auto const& a, auto const& b) {
+      return a.first < b.first;
+    });
+    for (std::size_t i = 0; i < qparams.size(); ++i) {
+      if (i != 0) final_query += '&';
+      final_query += qparams[i].first;
+      final_query += '=';
+      final_query += qparams[i].second;
+    }
+  }
+
   std::string out;
-  out.reserve(scheme.size() + 3 + host.size() + canonical_uri.size() + 1 + canonical_query.size() +
-              /* &X-Amz-Signature= */ 18 + signature_hex.size());
+  out.reserve(scheme.size() + 3 + host.size() + canonical_uri.size() + 1 + final_query.size());
   out.append(scheme.data(), scheme.size());
   out += "://";
   out.append(host.data(), host.size());
   out.append(canonical_uri.data(), canonical_uri.size());
   out += '?';
-  out += canonical_query;
-  out += "&X-Amz-Signature=";
-  out += signature_hex;
+  out += final_query;
   return out;
 }
 
