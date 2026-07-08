@@ -20,6 +20,7 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
+#include "log/logging.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -209,7 +210,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         // in that case we just return the node
         if (filter) {
           filter->children.push_back(std::move(node));
-          return std::move(filter);
+          return filter;
         }
         return std::move(node);
       }
@@ -261,9 +262,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.virtual_columns));
   node->named_parameters = std::move(op.named_parameters);
   node->dynamic_filters  = op.dynamic_filters;
+  if (op.dynamic_filters) {
+    node->sirius_dynamic_filters = get_or_create_dynamic_filter_channel(op.dynamic_filters.get());
+    SIRIUS_LOG_INFO("[sirius_plan_get] LogicalGet has dynamic_filters attached (channel key={}).",
+                    static_cast<void const*>(op.dynamic_filters.get()));
+  }
   if (filter) {
     filter->children.push_back(std::move(node));
-    return std::move(filter);
+    return filter;
   }
   return std::move(node);
 }

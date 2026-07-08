@@ -21,8 +21,11 @@
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
+#include "planner/query.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -32,7 +35,10 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -145,6 +151,70 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Dynamic table filters
+//===----------------------------------------------------------------------===//
+namespace {
+
+/// Collect the pipelines that transitively feed a plan-wired dynamic-filter join's build input.
+/// The management loop gives queued tasks from these pipelines soft dispatch priority, improving
+/// the chance that later splits of a transitive scan target observe the published filter. A join's
+/// immediate probe edge is already ordered independently. The walk follows build-input edges
+/// backward from each wired join, passing through any intervening joins.
+std::unordered_set<const sirius_pipeline*> collect_filter_build_pipelines(
+  planner::query const& query)
+{
+  auto const& pipelines = query.get_pipelines();
+
+  // Reverse edges: a receiving (operator, port) maps to the pipelines whose sink feeds it.
+  struct in_edge {
+    std::string_view port;
+    sirius_pipeline* from;
+  };
+  std::unordered_map<op::sirius_physical_operator const*, std::vector<in_edge>> incoming;
+  for (auto const& p : pipelines) {
+    auto sink = p->get_sink();
+    if (!sink) { continue; }
+    for (auto const& next : sink->get_next_ports_after_sink()) {
+      if (next.next_operator) {
+        incoming[next.next_operator].push_back({next.next_operator_port_name, p.get()});
+      }
+    }
+  }
+
+  // Seed the walk with the build port of every filter-producing join.
+  std::vector<std::pair<op::sirius_physical_operator const*, std::string_view>> work;
+  for (auto const& p : pipelines) {
+    for (auto const& op_ref : p->get_operators()) {
+      auto* join = dynamic_cast<op::sirius_physical_hash_join*>(&op_ref.get());
+      if (join && join->publishes_dynamic_filters()) {
+        work.emplace_back(&op_ref.get(), std::string_view{"build"});
+      }
+    }
+  }
+
+  // Add each feeding pipeline, then recurse into its source operator's input ports.
+  std::unordered_set<const sirius_pipeline*> result;
+  while (!work.empty()) {
+    auto [node, port] = work.back();
+    work.pop_back();
+    auto it = incoming.find(node);
+    if (it == incoming.end()) { continue; }
+    for (auto const& edge : it->second) {
+      if (edge.port != port) { continue; }
+      if (!result.insert(edge.from).second) { continue; }
+      auto source = edge.from->get_source();
+      if (!source) { continue; }
+      for (auto const& source_port : source->get_port_ids()) {
+        work.emplace_back(source.get(), source_port);
+      }
+    }
+  }
+  return result;
+}
+
+}  // namespace
+//===----------------------------------------------------------------------===//
 void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
   // Drain leftover tasks from previous query
@@ -167,6 +237,8 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   // entries by device_id; without this reset the second iteration's source
   // tasks would assign to a different GPU and miss the cache entries).
   _no_pref_rr_counter.store(0, std::memory_order_relaxed);
+
+  _filter_build_pipelines = collect_filter_build_pipelines(*_query);
 }
 
 std::future<void> task_scheduler::start_query()
@@ -183,11 +255,6 @@ void task_scheduler::terminate_query(std::exception_ptr error)
 {
   _completion_handler->report_error(std::move(error));
   stop();
-}
-
-void task_scheduler::signal_query_complete()
-{
-  if (_completion_handler) { _completion_handler->mark_completed(); }
 }
 
 void task_scheduler::drain_after_error()
@@ -323,15 +390,37 @@ void task_scheduler::management_eventloop()
     // binding to guarantee correctness.
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
-      // First try exact preference match.
-      auto task = _task_queue.pop_if(
-        [device_id](const sirius::parallel::itask& t) -> bool {
-          const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
-          if (!gpu_task) { return false; }
-          auto pref = gpu_task->get_preferred_device_id();
-          return pref.has_value() && pref.value() == device_id;
-        },
-        /*front_to_back=*/true);
+      std::unique_ptr<sirius::parallel::itask> task;
+
+      // Prefer queued tasks feeding a plan-wired dynamic-filter join's build input. This can make
+      // the filter available to later splits of a transitive scan target; an immediate probe is
+      // already ordered after publication by the join hint. Fall through to normal dispatch when
+      // no compatible build task is queued, so the preference never starves other work.
+      if (!_filter_build_pipelines.empty()) {
+        task = _task_queue.pop_if(
+          [this, device_id](const sirius::parallel::itask& t) -> bool {
+            const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
+            if (!gpu_task || _filter_build_pipelines.count(gpu_task->get_pipeline()) == 0) {
+              return false;
+            }
+            auto pref = gpu_task->get_preferred_device_id();
+            return !pref.has_value() || pref.value() == device_id ||
+                   _gpu_executors.count(pref.value()) == 0;
+          },
+          /*front_to_back=*/true);
+      }
+
+      // Exact preference match.
+      if (!task) {
+        task = _task_queue.pop_if(
+          [device_id](const sirius::parallel::itask& t) -> bool {
+            const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
+            if (!gpu_task) { return false; }
+            auto pref = gpu_task->get_preferred_device_id();
+            return pref.has_value() && pref.value() == device_id;
+          },
+          /*front_to_back=*/true);
+      }
       if (!task) {
         // Fallback: take the first task with NO preference, or whose preferred
         // device does not exist in _gpu_executors (a stale preference from a

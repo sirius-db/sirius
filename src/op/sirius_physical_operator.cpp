@@ -72,7 +72,7 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     if (leave_locked) {
       _read_only_data_batches = std::move(ro_batches);
     } else {
-      return std::move(ro_batches);
+      return ro_batches;
     }
   }
   return *_read_only_data_batches;
@@ -342,7 +342,11 @@ bool sirius_physical_operator::all_ports_empty()
 bool sirius_physical_operator::is_source_pipeline_finished()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (!port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
+    // A port with no src_pipeline cannot gate on an upstream pipeline — treat
+    // it as non-blocking, mirroring get_next_task_hint()'s null guards. The
+    // zero-task finish guard now calls this on source operators too
+    //.
+    if (port_ptr->src_pipeline && !port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
   }
   return true;
 }

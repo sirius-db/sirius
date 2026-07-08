@@ -92,9 +92,9 @@ void sirius_physical_result_collector::build_pipelines(
 sirius_physical_materialized_collector::sirius_physical_materialized_collector(
   ::sirius::sirius_prepared_statement_data& data, duckdb::ClientContext& client_ctx)
   : sirius_physical_result_collector(data),
-    _client_ctx(client_ctx),
     result_collection(
-      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, sirius::to_duckdb_vec(types)))
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, sirius::to_duckdb_vec(types))),
+    _client_ctx(client_ctx)
 {
 }
 

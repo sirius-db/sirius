@@ -274,8 +274,28 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     // should wait for the build sibling to determine it. This is because the build side will drive
     // the partitioning and the probe side needs to know the number of partitions to create the
     // correct number of tasks.
-    return _sibling_partition_op->get_next_task_hint();
-  } else if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
+    //
+    // Zero-build resolution: when the build side finished without ever producing
+    // a batch, the input-driven sibling negotiation that normally sets the
+    // partition count will never run, and deferring to the (exhausted) sibling
+    // returns no hint forever — the probe chain then never gets a task and the
+    // query hangs. Resolve the count from here instead: one partition is correct
+    // (partitioning is a performance split, and the join's zero-side path
+    // handles the empty build regardless), and control falls through to the
+    // probe pipeline-operator branch below.
+    auto& sibling              = _sibling_partition_op->Cast<sirius_physical_partition>();
+    bool build_exhausted_empty = false;
+    if (sibling.ports.size() == 1) {
+      auto sibling_port     = sibling.ports.begin()->second;
+      build_exhausted_empty = sibling_port->src_pipeline &&
+                              sibling_port->src_pipeline->is_pipeline_finished() &&
+                              sibling_port->repo && sibling_port->repo->total_size() == 0;
+    }
+    if (!build_exhausted_empty) { return _sibling_partition_op->get_next_task_hint(); }
+    _num_partitions = 1;
+    sibling.set_num_partitions(1);
+  }
+  if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
     // If this is part of a join and its on the probe side, and we have determined the number of
     // partitions, we have this behave as a pipeline operator and just schedule tasks
 
