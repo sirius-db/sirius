@@ -17,6 +17,7 @@
 #include "io/s3/s3_list_parser.hpp"
 
 #include <cctype>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -106,7 +107,14 @@ std::uint64_t parse_size(std::string_view raw)
       throw std::runtime_error("parse_list_objects_v2: non-numeric <Size> '" + std::string{text} +
                                "' in <Contents>");
     }
-    value = value * 10 + static_cast<std::uint64_t>(c - '0');
+    auto const digit = static_cast<std::uint64_t>(c - '0');
+    // Guard the accumulation: a wrapped-small size is later trusted to skip the
+    // HEAD in the known-size open, so an overflow would silently truncate reads.
+    if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+      throw std::runtime_error("parse_list_objects_v2: <Size> '" + std::string{text} +
+                               "' overflows uint64 in <Contents>");
+    }
+    value = value * 10 + digit;
   }
   return value;
 }
@@ -118,6 +126,15 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
   if (xml.find("<ListBucketResult") == std::string_view::npos) {
     throw std::runtime_error(
       "parse_list_objects_v2: not a ListObjectsV2 response (no <ListBucketResult>)");
+  }
+  // Require the root close tag: a body truncated before it (a malformed /
+  // partial 200 from an S3-compatible gateway) would otherwise parse as a
+  // "valid" page with is_truncated defaulting to false — the paged loop would
+  // believe the listing is complete and a glob would silently drop every object
+  // past the cut. Real S3/MinIO always close the root.
+  if (xml.find("</ListBucketResult>") == std::string_view::npos) {
+    throw std::runtime_error(
+      "parse_list_objects_v2: truncated ListObjectsV2 response (missing </ListBucketResult>)");
   }
 
   list_objects_v2_page page;
@@ -133,10 +150,15 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
   constexpr std::string_view k_contents_close = "</Contents>";
   for (std::size_t pos = 0;;) {
     auto const co = xml.find(k_contents_open, pos);
-    if (co == std::string_view::npos) { break; }
+    if (co == std::string_view::npos) { break; }  // no more objects — clean end
     auto const block_begin = co + k_contents_open.size();
     auto const ce          = xml.find(k_contents_close, block_begin);
-    if (ce == std::string_view::npos) { break; }
+    if (ce == std::string_view::npos) {
+      // An opened <Contents> with no close is a mid-block truncation — throw
+      // rather than silently returning the objects parsed so far.
+      throw std::runtime_error(
+        "parse_list_objects_v2: truncated ListObjectsV2 page (unclosed <Contents>)");
+    }
     auto const block = xml.substr(block_begin, ce - block_begin);
     if (auto const key = element_text(block, "Key"); key.has_value()) {
       auto const size = element_text(block, "Size");

@@ -26,6 +26,8 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -201,6 +203,22 @@ TEST_CASE("ListObjectsV2 parser rejects non-list bodies and malformed sizes", "[
     parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Key>a</Key><Size>not-a-size</Size></Contents></ListBucketResult>)"),
     std::runtime_error);
+  CHECK_THROWS_AS(
+    parse_list_objects_v2(R"(<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents>)"),
+    std::runtime_error);
+  CHECK_THROWS_AS(
+    parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><Contents><Key>b</Key>)"),
+    std::runtime_error);
+  CHECK_THROWS_AS(
+    parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Key>a</Key><Size>99999999999999999999999999</Size></Contents></ListBucketResult>)"),
+    std::runtime_error);
+
+  auto max_size = parse_list_objects_v2(
+    R"(<ListBucketResult><Contents><Key>a</Key><Size>18446744073709551615</Size></Contents></ListBucketResult>)");
+  REQUIRE(max_size.entries.size() == 1);
+  CHECK(max_size.entries[0].size == std::numeric_limits<std::uint64_t>::max());
 }
 
 TEST_CASE("s3_request_authorizer base rejects LIST until implementations opt in",

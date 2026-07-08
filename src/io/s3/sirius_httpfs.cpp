@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -135,16 +136,17 @@ std::optional<std::uint64_t> extract_known_size(duckdb::OpenFileInfo const& file
   return static_cast<std::uint64_t>(size);
 }
 
-/// Split @p s into its '/'-separated segments (S3 keys are flat strings; the
-/// segment view only exists for glob matching).
-std::vector<std::string_view> split_segments(std::string_view s)
+/// Split @p s into its '/'-separated segments into @p out (cleared first). The
+/// segment views alias @p s and exist only for glob matching. @p out is a
+/// reused scratch buffer so a broad listing does not heap-allocate per key.
+void split_segments(std::string_view s, std::vector<std::string_view>& out)
 {
-  std::vector<std::string_view> out;
+  out.clear();
   for (std::size_t b = 0;;) {
     auto const slash = s.find('/', b);
     if (slash == std::string_view::npos) {
       out.push_back(s.substr(b));
-      return out;
+      return;
     }
     out.push_back(s.substr(b, slash - b));
     b = slash + 1;
@@ -154,21 +156,35 @@ std::vector<std::string_view> split_segments(std::string_view s)
 /// DuckDB glob semantics over a flat key: `*` / `?` / `[…]` match within one
 /// '/'-segment (duckdb::Glob, the same matcher LocalFileSystem applies per
 /// directory entry); `**` matches zero or more whole segments (the crawl).
+/// Memoized on `(ki, pi)` — plain backtracking is exponential in the number of
+/// `**` segments, and the pattern is user-supplied on an external SQL surface.
+/// @p memo is a reused scratch buffer sized `(keys.size()+1)*(pats.size()+1)`,
+/// values -1 (unknown) / 0 (false) / 1 (true).
 bool match_glob_segments(std::vector<std::string_view> const& keys,
                          std::size_t ki,
                          std::vector<std::string_view> const& pats,
-                         std::size_t pi)
+                         std::size_t pi,
+                         std::vector<std::int8_t>& memo)
 {
-  if (pi == pats.size()) { return ki == keys.size(); }
-  if (pats[pi] == "**") {
+  auto const idx = ki * (pats.size() + 1) + pi;
+  if (memo[idx] != -1) { return memo[idx] != 0; }
+  bool result = false;
+  if (pi == pats.size()) {
+    result = ki == keys.size();
+  } else if (pats[pi] == "**") {
     for (std::size_t skip = ki; skip <= keys.size(); ++skip) {
-      if (match_glob_segments(keys, skip, pats, pi + 1)) { return true; }
+      if (match_glob_segments(keys, skip, pats, pi + 1, memo)) {
+        result = true;
+        break;
+      }
     }
-    return false;
+  } else {
+    result = ki < keys.size() &&
+             duckdb::Glob(keys[ki].data(), keys[ki].size(), pats[pi].data(), pats[pi].size()) &&
+             match_glob_segments(keys, ki + 1, pats, pi + 1, memo);
   }
-  return ki < keys.size() &&
-         duckdb::Glob(keys[ki].data(), keys[ki].size(), pats[pi].data(), pats[pi].size()) &&
-         match_glob_segments(keys, ki + 1, pats, pi + 1);
+  memo[idx] = static_cast<std::int8_t>(result ? 1 : 0);
+  return result;
 }
 
 }  // namespace
@@ -326,19 +342,24 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   auto const prefix     = last_slash == std::string_view::npos ? std::string_view{}
                                                                : key_pattern.substr(0, last_slash + 1);
 
-  auto const pattern_segments = split_segments(key_pattern);
-  std::string const list_uri  = "s3://" + std::string{bucket} + "/" + std::string{prefix};
+  std::vector<std::string_view> pattern_segments;
+  split_segments(key_pattern, pattern_segments);
+  std::string const list_uri = "s3://" + std::string{bucket} + "/" + std::string{prefix};
 
   // Stream the pages, keeping only matches: peak memory = one page (≤1000
   // entries) + the matched set, regardless of the prefix's population. The
   // match cap throws rather than truncating — a shortened file list would
-  // silently change query results.
+  // silently change query results. `key_segments` / `memo` are reused across
+  // keys so a broad listing does not heap-allocate per key.
   duckdb::vector<duckdb::OpenFileInfo> matches;
+  std::vector<std::string_view> key_segments;
+  std::vector<std::int8_t> memo;
   scan_manager.list_objects_paged(
     list_uri, /*page_size=*/1000, [&](sirius::io::s3::list_objects_v2_page const& page) {
       for (auto const& entry : page.entries) {
-        auto const key_segments = split_segments(entry.key);
-        if (!match_glob_segments(key_segments, 0, pattern_segments, 0)) { continue; }
+        split_segments(entry.key, key_segments);
+        memo.assign((key_segments.size() + 1) * (pattern_segments.size() + 1), -1);
+        if (!match_glob_segments(key_segments, 0, pattern_segments, 0, memo)) { continue; }
         if (matches.size() >= max_matches) {
           throw duckdb::IOException("[sirius_httpfs] glob '" + pattern + "' matched more than " +
                                     std::to_string(max_matches) +

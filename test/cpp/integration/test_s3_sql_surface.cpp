@@ -2533,6 +2533,17 @@ TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
   check_count("glob/hive/**/nation.parquet", "glob/hive/**/nation.parquet", 50);
   check_count("root_*.parquet", "root_*.parquet", 50);
 
+  auto uppercase_root_uri = s3_uri(env->bucket, "root_*.parquet");
+  uppercase_root_uri.replace(0, 2, "S3");
+  auto const uppercase_root_query =
+    "SELECT count(n_nationkey) FROM read_parquet(" + sql_quote(uppercase_root_uri) + ")";
+  auto const local_root_query =
+    "SELECT count(n_nationkey) FROM " + local_parquet_glob_scan(*env, "root_*.parquet");
+  compare_transparent_s3_gpu_to_local_cpu(fixture, uppercase_root_query, local_root_query);
+  auto uppercase_root = require_query_ok(fixture.con, uppercase_root_query);
+  REQUIRE(uppercase_root->RowCount() == 1);
+  CHECK(uppercase_root->GetValue(0, 0).GetValue<int64_t>() == 50);
+
   auto wildcard_bucket =
     fixture.con.Query("SELECT count(*) FROM read_parquet('s3://*/glob/multi/nation_*.parquet')");
   REQUIRE(wildcard_bucket);
