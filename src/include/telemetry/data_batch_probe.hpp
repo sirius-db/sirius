@@ -24,7 +24,7 @@
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/data/data_batch.hpp>
-#include <spdlog/fmt/bundled/core.h>
+#include <spdlog/fmt/fmt.h>
 
 #include <functional>
 #include <memory>
