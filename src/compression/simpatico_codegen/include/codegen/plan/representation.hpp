@@ -433,8 +433,8 @@ struct str_split_compressed_representation : compressed_representation {
     std::string* error_out);
 
   // The decomposed channels. mutable: decompress() moves them into make_strings_column.
-  mutable std::unique_ptr<cudf::column> offsets_;    // INT32, size num_rows+1
-  mutable std::unique_ptr<cudf::column> chars_;      // UINT8, total byte count
+  mutable std::unique_ptr<cudf::column> offsets_;    // INT32 (or INT64 for >2GB chars), size num_rows+1
+  mutable std::unique_ptr<cudf::column> chars_;      // UINT8, or widened (UINT32/UINT64) past 2GB
   mutable std::unique_ptr<cudf::column> null_mask_;  // UINT8 bitmask bytes, or null (no nulls)
 
   str_split_compressed_representation(cudf::size_type n_rows,

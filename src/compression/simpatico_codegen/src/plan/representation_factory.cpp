@@ -517,13 +517,18 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
   auto offsets   = std::move(outputs[0]);
   auto chars     = std::move(outputs[1]);
   auto null_mask = has_mask ? std::move(outputs[2]) : nullptr;
-  if (offsets->type().id() != cudf::type_id::INT32) {
-    if (error_out) *error_out = "str_split offsets must be INT32";
+  auto const off_tid = offsets->type().id();
+  if (off_tid != cudf::type_id::INT32 && off_tid != cudf::type_id::INT64) {
+    if (error_out) *error_out = "str_split offsets must be INT32 or INT64";
     return nullptr;
   }
-  if (chars->type().id() != cudf::type_id::UINT8 ||
-      (null_mask && null_mask->type().id() != cudf::type_id::UINT8)) {
-    if (error_out) *error_out = "str_split chars/null_mask must be UINT8";
+  // chars is UINT8 normally, or widened (UINT32/UINT64) to hold >2GB under the
+  // 2^31-element column cap (see str_split_compressor).
+  auto const chars_tid = chars->type().id();
+  bool const chars_ok  = chars_tid == cudf::type_id::UINT8 ||
+                        chars_tid == cudf::type_id::UINT32 || chars_tid == cudf::type_id::UINT64;
+  if (!chars_ok || (null_mask && null_mask->type().id() != cudf::type_id::UINT8)) {
+    if (error_out) *error_out = "str_split chars must be UINT8/UINT32/UINT64, null_mask UINT8";
     return nullptr;
   }
   cudf::size_type const n = offsets->size() > 0 ? offsets->size() - 1 : 0;

@@ -86,24 +86,38 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
 
   cudf::strings_column_view scv(src);
   auto const n = src.size();
-  if (scv.chars_size(stream) >
-      static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max())) {
-    throw std::runtime_error("str_split_compressor: chars > 2GB out of scope");
-  }
 
-  // offsets: owned INT32 copy (size n+1).
+  // offsets: owned copy, INT32 for normal strings or INT64 for cudf "large strings"
+  // (chars > 2GB); copy_column_view preserves the child's type.
   auto offsets = copy_column_view(scv.offsets(), stream, mr);
 
-  // chars: owned UINT8 copy.
-  auto const nc = static_cast<cudf::size_type>(scv.chars_size(stream));
-  auto chars    = cudf::make_fixed_width_column(
-    cudf::data_type(cudf::type_id::UINT8), nc, cudf::mask_state::UNALLOCATED, stream, mr);
-  if (nc > 0) {
-    cudaMemcpyAsync(chars->mutable_view().head<void>(),
+  // chars: a fixed-width column caps at 2^31 ELEMENTS, so >2GB chars can't be UINT8.
+  // Widen the element type (bytes = elements x sizeof) to fit under the cap; byte
+  // codecs are type-agnostic and decompress reads the raw buffer back via offsets.
+  std::int64_t const chars_bytes = scv.chars_size(stream);
+  std::int64_t const kElemCap    = std::numeric_limits<cudf::size_type>::max();
+  cudf::type_id chars_tid        = cudf::type_id::UINT8;
+  std::int64_t bpe               = 1;
+  if (chars_bytes > kElemCap) { chars_tid = cudf::type_id::UINT32, bpe = 4; }
+  if (chars_bytes > kElemCap * 4) { chars_tid = cudf::type_id::UINT64, bpe = 8; }
+  if (chars_bytes > kElemCap * 8) {
+    throw std::runtime_error("str_split_compressor: chars > 16GB out of scope");
+  }
+  auto const nelem = static_cast<cudf::size_type>((chars_bytes + bpe - 1) / bpe);
+  auto chars       = cudf::make_fixed_width_column(
+    cudf::data_type(chars_tid), nelem, cudf::mask_state::UNALLOCATED, stream, mr);
+  if (chars_bytes > 0) {
+    auto* dst = chars->mutable_view().head<std::uint8_t>();
+    cudaMemcpyAsync(dst,
                     scv.chars_begin(stream),
-                    static_cast<size_t>(nc),
+                    static_cast<size_t>(chars_bytes),
                     cudaMemcpyDeviceToDevice,
                     stream.value());
+    std::int64_t const padded = static_cast<std::int64_t>(nelem) * bpe;
+    if (padded > chars_bytes) {
+      cudaMemsetAsync(
+        dst + chars_bytes, 0, static_cast<size_t>(padded - chars_bytes), stream.value());
+    }
   }
 
   // null_mask: owned UINT8 bitmask bytes, copied only if the column has nulls.
