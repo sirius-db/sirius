@@ -15,3 +15,15 @@ static = ["sirius-sys/static"]
 [dependencies]
 cxx.workspace = true
 sirius-sys.workspace = true
+# Results are returned over the Arrow C Data Interface; pin to the same major as
+# the StarRocks CN consumer so the `ArrowArrayStreamReader` type unifies. The
+# `ffi` feature provides `ffi_stream` (FFI_ArrowArrayStream / reader).
+arrow-array = { version = "59", features = ["ffi"] }
+arrow-schema = "59"
+
+[dev-dependencies]
+# Building a `local_files` Substrait plan + a parquet fixture for the execute test.
+substrait = "0.63"
+prost = "0.14"
+parquet = "59"
+tempfile = "3"

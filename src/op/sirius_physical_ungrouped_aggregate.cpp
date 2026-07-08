@@ -308,7 +308,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           auto col = view.column(static_cast<cudf::size_type>(spec.input_idx));
           std::unique_ptr<cudf::scalar> first_scalar;
           if (col.size() == 0) {
-            first_scalar = cudf::make_fixed_width_scalar(
+            // FIRST over an empty input is NULL. make_fixed_width_scalar throws on
+            // non-fixed-width types (e.g. STRING), so build a typed, invalid scalar
+            // that works for any column type.
+            first_scalar = cudf::make_default_constructed_scalar(
               col.type(), stream, cudf::get_current_device_resource_ref());
             first_scalar->set_valid_async(false, stream);
           } else {

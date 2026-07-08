@@ -24,7 +24,6 @@
 #include <catch.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -161,6 +160,89 @@ TEST_CASE("sirius_dynamic_filter_set::push_filter is thread-safe", "[dynamic_fil
     total += set.filters_for_column(col).size();
   }
   REQUIRE(total == static_cast<std::size_t>(kThreads) * kPushesPerThread);
+}
+
+//===----------------------------------------------------------------------===//
+// Filter availability
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("has_filters reflects pushed filters and ignores null", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  REQUIRE_FALSE(set.has_filters());
+  set.push_filter(0, nullptr);
+  REQUIRE_FALSE(set.has_filters());
+  set.push_filter(0, make_single_zone_filter(0, 100));
+  REQUIRE(set.has_filters());
+}
+
+TEST_CASE("sirius_dynamic_filter_set rejects pushes after consumer close", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  REQUIRE(set.accepting_filters());
+
+  set.close_for_new_filters();
+
+  REQUIRE_FALSE(set.accepting_filters());
+  REQUIRE_FALSE(set.push_filter(0, make_single_zone_filter(0, 100)));
+  REQUIRE(set.empty());
+  REQUIRE_FALSE(set.has_filters());
+}
+
+TEST_CASE("sirius_dynamic_filter_set tracks wired producers", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  REQUIRE_FALSE(set.has_producers());
+
+  set.register_producer();
+
+  REQUIRE(set.has_producers());
+}
+
+TEST_CASE("set_consumer_column_remap translates producer column_ids to output positions",
+          "[dynamic_filter]")
+{
+  // Producers reference probe columns in the consumer's column_ids space, but the channel must
+  // key by output-column position (what the AST merge and post-decode apply index). The remap is
+  // column_ids index -> output position, with size_t(-1) (scan_plan::no_output_position) marking a
+  // column_ids entry that produces no output column.
+  constexpr auto kNoOutput = static_cast<std::size_t>(-1);
+
+  sirius_dynamic_filter_set set;
+  // column_ids = [A(0), B(1), C(2)]; output = [C, A] -> A(0)->out 1, B(1)->pruned, C(2)->out 0.
+  set.set_consumer_column_remap({1, kNoOutput, 0});
+
+  REQUIRE(set.push_filter(2, make_single_zone_filter(0, 100)));        // C -> output position 0
+  REQUIRE(set.push_filter(0, make_single_zone_filter(0, 100)));        // A -> output position 1
+  REQUIRE_FALSE(set.push_filter(1, make_single_zone_filter(0, 100)));  // B pruned from output
+  REQUIRE_FALSE(set.push_filter(9, make_single_zone_filter(0, 100)));  // out of column_ids range
+
+  auto cols = set.filtered_columns();
+  std::sort(cols.begin(), cols.end());
+  REQUIRE(cols == std::vector<std::size_t>{0, 1});  // output positions, not column_ids indices
+  REQUIRE(set.filters_for_column(0).size() == 1);   // C's filter, keyed by output position
+  REQUIRE(set.filters_for_column(1).size() == 1);   // A's filter, keyed by output position
+  REQUIRE(set.filters_for_column(2).empty());       // nothing keyed by the raw column_ids index
+}
+
+TEST_CASE("empty consumer column remap is identity", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  set.set_consumer_column_remap({});  // empty -> identity, indices stored unchanged
+  REQUIRE(set.push_filter(5, make_single_zone_filter(0, 100)));
+  REQUIRE(set.filters_for_column(5).size() == 1);
+}
+
+TEST_CASE("consumer column remap composes with ignore_columns in output-position space",
+          "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  set.set_consumer_column_remap({1, 0});  // column_ids 0 -> out 1, column_ids 1 -> out 0
+  set.ignore_columns({0});                // ignore output position 0
+
+  REQUIRE_FALSE(set.push_filter(1, make_single_zone_filter(0, 100)));  // -> out 0, ignored
+  REQUIRE(set.push_filter(0, make_single_zone_filter(0, 100)));        // -> out 1, kept
+  REQUIRE(set.filtered_columns() == std::vector<std::size_t>{1});
 }
 
 TEST_CASE("sirius_dynamic_zone_map_filter rejects empty zones", "[dynamic_filter]")

@@ -23,6 +23,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
 {
   switch (type) {
     case SiriusPhysicalOperatorType::TABLE_SCAN: return "TABLE_SCAN";
+    case SiriusPhysicalOperatorType::PARQUET_SCAN: return "PARQUET_SCAN";
     case SiriusPhysicalOperatorType::DUMMY_SCAN: return "DUMMY_SCAN";
     case SiriusPhysicalOperatorType::CHUNK_SCAN: return "CHUNK_SCAN";
     case SiriusPhysicalOperatorType::COLUMN_DATA_SCAN: return "COLUMN_DATA_SCAN";
@@ -115,6 +116,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::ICEBERG_SCAN: return "ICEBERG_SCAN";
     case SiriusPhysicalOperatorType::CPU_SOURCE: return "CPU_SOURCE";
     case SiriusPhysicalOperatorType::GPU_SCAN: return "GPU_SCAN";
+    case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";
     case SiriusPhysicalOperatorType::INVALID: break;
   }
   return "INVALID";
