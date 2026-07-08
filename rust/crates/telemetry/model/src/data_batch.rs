@@ -1,13 +1,6 @@
 use quent_model::{fsm, state};
 use uuid::Uuid;
 
-#[derive(Debug)]
-pub enum MemoryTier {
-    Gpu,
-    Host,
-    Storage,
-}
-
 state! {
     Constructed {
         attributes: {
@@ -53,6 +46,7 @@ fsm! {
             constructed => stationary,
             stationary => in_transit,
             in_transit => stationary,
+            stationary => stationary,
             stationary => destructed,
         },
     }

@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "cucascade/memory/topology_discovery.hpp"
 #include "duckdb/common/common.hpp"
 #include "log/logging.hpp"
 #include "telemetry-bridge/gen/context.rs.h"

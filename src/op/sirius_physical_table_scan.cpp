@@ -143,8 +143,11 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
       auto concat_rep   = std::make_unique<cucascade::gpu_table_representation>(
         std::move(concatenated), *space, stream);
-      single_batch = cucascade::data_batch::make(
-        0, std::move(concat_rep), telemetry::quent_data_batch_probe::create(batch_telemetry(), 0));
+      size_t const batch_id = get_next_batch_id();
+      single_batch          = cucascade::data_batch::make(
+        batch_id,
+        std::move(concat_rep),
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
     }
   }
 

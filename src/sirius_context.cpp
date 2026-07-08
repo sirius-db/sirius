@@ -304,9 +304,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(
-    config_.get_telemetry_config(),
-    dynamic_cast<cucascade::memory::memory_reservation_manager*>(memory_manager_.get()));
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(config_.get_telemetry_config(),
+                                                                    memory_manager_.get());
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);

@@ -290,35 +290,47 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         config,
                         long_entities_threshold,
                     )?;
-                    if req.entity_filter.entity_type_name.as_deref() == Some(DATA_BATCH_TYPE_NAME) {
-                        self.populate_keyed_builder(
-                            &mut builder,
-                            self.filtered_data_batches(
-                                &view,
-                                req.entity_filter,
-                                &fsm_filter,
-                                config.span,
-                            )?
-                            .into_iter()
-                            .filter(|db| db.usages().any(|u| u.resource_id() == req.resource_id)),
-                            |id| id == req.resource_id,
-                        )?;
-                    } else {
-                        self.populate_keyed_builder(
-                            &mut builder,
-                            self.filtered_tasks(
-                                &view,
-                                req.entity_filter,
-                                &fsm_filter,
-                                config.span,
-                            )?
-                            .into_iter()
-                            .filter(|task| {
-                                task.usages()
-                                    .any(|usage| usage.resource_id() == req.resource_id)
-                            }),
-                            |id| id == req.resource_id,
-                        )?;
+
+                    match req.entity_filter.entity_type_name.as_deref() {
+                        Some(TASK_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_tasks(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
+                                .into_iter()
+                                .filter(|task| {
+                                    task.usages()
+                                        .any(|usage| usage.resource_id() == req.resource_id)
+                                }),
+                                |id| id == req.resource_id,
+                            )?;
+                        }
+                        Some(DATA_BATCH_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_data_batches(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
+                                .into_iter()
+                                .filter(|db| {
+                                    db.usages().any(|u| u.resource_id() == req.resource_id)
+                                }),
+                                |id| id == req.resource_id,
+                            )?;
+                        }
+                        other => {
+                            Err(AnalyzerError::InvalidArgument(format!(
+                                "{:?} is not a known entity type in this model",
+                                other
+                            )))?;
+                        }
                     }
                     Ok(SingleTimelineResponse {
                         config: config_secs,
@@ -383,39 +395,50 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         config,
                         long_entities_threshold,
                     )?;
-                    if req.entity_filter.entity_type_name.as_deref() == Some(DATA_BATCH_TYPE_NAME) {
-                        self.populate_keyed_builder(
-                            &mut builder,
-                            self.filtered_data_batches(
-                                &view,
-                                req.entity_filter,
-                                &fsm_filter,
-                                config.span,
-                            )?
-                            .into_iter()
-                            .filter(|db| {
-                                db.usages()
-                                    .any(|usage| resource_ids.contains(&usage.resource_id()))
-                            }),
-                            |id| resource_ids.contains(&id),
-                        )?;
-                    } else {
-                        self.populate_keyed_builder(
-                            &mut builder,
-                            self.filtered_tasks(
-                                &view,
-                                req.entity_filter,
-                                &fsm_filter,
-                                config.span,
-                            )?
-                            .into_iter()
-                            .filter(|task| {
-                                task.usages()
-                                    .any(|usage| resource_ids.contains(&usage.resource_id()))
-                            }),
-                            |id| resource_ids.contains(&id),
-                        )?;
+
+                    match req.entity_filter.entity_type_name.as_deref() {
+                        Some(TASK_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_tasks(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
+                                .into_iter()
+                                .filter(|task| {
+                                    task.usages()
+                                        .any(|usage| resource_ids.contains(&usage.resource_id()))
+                                }),
+                                |id| resource_ids.contains(&id),
+                            )?;
+                        }
+                        Some(DATA_BATCH_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_data_batches(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
+                                .into_iter()
+                                .filter(|db| {
+                                    db.usages()
+                                        .any(|usage| resource_ids.contains(&usage.resource_id()))
+                                }),
+                                |id| resource_ids.contains(&id),
+                            )?;
+                        }
+                        other => {
+                            Err(AnalyzerError::InvalidArgument(format!(
+                                "{:?} is not a known entity type in this model",
+                                other
+                            )))?;
+                        }
                     }
+
                     Ok(SingleTimelineResponse {
                         config: config_secs,
                         data: self.timeline_to_ui_keyed(builder.build(), epoch)?,

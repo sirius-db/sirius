@@ -31,6 +31,7 @@ use quent_query_engine_analyzer::{
 };
 use quent_query_engine_model::QueryEngineEvent;
 use quent_simulator_ui::EntityRef;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -568,32 +569,36 @@ impl SiriusModelBuilder {
 
         let mut data_batches = HashMap::default();
         for (data_batch_id, data_batch_builder) in self.data_batches.into_iter() {
-            let data_batch = data_batch_builder.try_build()?;
-            for usage in data_batch.usages() {
-                let resource_type_name = resources
-                    .resource(usage.resource_id())?
-                    .type_name()
-                    .to_owned();
-                let set = &mut resources
-                    .resource_types
-                    .get_mut(&resource_type_name)
-                    .unwrap()
-                    .used_by;
-                if !set.contains(data_batch.type_name()) {
-                    set.insert(data_batch.type_name().to_owned());
-                }
-            }
-            if let Some(operator_id) = data_batch.producer_pipeline_uuid() // Sirius Pipeline Uuid is Quent Operator Id
-                && let Some(data_batch_span) = data_batch.active_span()
-                && let Some(operator) = query_engine.operators.get_mut(&operator_id)
-            {
-                operator.active_span = Some(match operator.active_span() {
-                    None => data_batch_span,
-                    Some(existing) => existing.extend(&data_batch_span),
-                });
-            }
+            match data_batch_builder.try_build() {
+                Ok(data_batch) => {
+                    for usage in data_batch.usages() {
+                        let resource_type_name = resources
+                            .resource(usage.resource_id())?
+                            .type_name()
+                            .to_owned();
+                        let set = &mut resources
+                            .resource_types
+                            .get_mut(&resource_type_name)
+                            .unwrap()
+                            .used_by;
+                        if !set.contains(data_batch.type_name()) {
+                            set.insert(data_batch.type_name().to_owned());
+                        }
+                    }
+                    if let Some(operator_id) = data_batch.producer_pipeline_uuid() // Sirius Pipeline Uuid is Quent Operator Id
+                        && let Some(data_batch_span) = data_batch.active_span()
+                        && let Some(operator) = query_engine.operators.get_mut(&operator_id)
+                    {
+                        operator.active_span = Some(match operator.active_span() {
+                            None => data_batch_span,
+                            Some(existing) => existing.extend(&data_batch_span),
+                        });
+                    }
 
-            data_batches.insert(data_batch_id, data_batch);
+                    data_batches.insert(data_batch_id, data_batch);
+                }
+                Err(e) => warn!("Invalid data_batch encountered {e}"),
+            }
         }
 
         // Construct the model without group type decls being populated yet, we

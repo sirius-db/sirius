@@ -99,7 +99,9 @@ memory_context::~memory_context()
 std::optional<std::reference_wrapper<const quent::memory::MemoryHandle>>
 memory_context::get_memory_handle(cucascade::memory::memory_space_id mem_space) const noexcept
 {
-  if (memory_handles_.contains(mem_space)) { return *(memory_handles_.at(mem_space)); }
+  if (auto it = memory_handles_.find(mem_space); it != memory_handles_.end()) {
+    return *(it->second);
+  }
   return std::nullopt;
 }
 
@@ -111,7 +113,7 @@ memory_context::get_channel_handle(cucascade::memory::memory_space_id source,
     .source      = source,
     .destination = destination,
   };
-  if (channel_handles_.contains(key)) { return *(channel_handles_.at(key)); }
+  if (auto it = channel_handles_.find(key); it != channel_handles_.end()) { return *(it->second); }
   return std::nullopt;
 }
 

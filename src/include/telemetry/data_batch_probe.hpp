@@ -87,94 +87,108 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
   }
 
   void created([[maybe_unused]] const uint64_t batch_id,
-               [[maybe_unused]] const cucascade::idata_representation& data) override
+               [[maybe_unused]] const cucascade::idata_representation& data) noexcept override
   {
-    auto maybe_memory_handle = memory_context_->get_memory_handle(data.get_memory_space().get_id());
-    if (not maybe_memory_handle) {
-      SIRIUS_LOG_WARN(
-        fmt::format("No quent memory handle found for {}", data.get_memory_space().to_string()));
-      return;
-    }
+    try {
+      auto maybe_memory_handle =
+        memory_context_->get_memory_handle(data.get_memory_space().get_id());
+      if (not maybe_memory_handle) {
+        SIRIUS_LOG_WARN(
+          fmt::format("No quent memory handle found for {}", data.get_memory_space().to_string()));
+        return;
+      }
 
-    handle_->stationary({
-      .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
-      .memory_capacity_bytes = data.get_size_in_bytes(),
-    });
+      handle_->stationary({
+        .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
+        .memory_capacity_bytes = data.get_size_in_bytes(),
+      });
+    } catch (...) {
+    }
   }
 
   void conversion_started(
     [[maybe_unused]] const cucascade::idata_representation& current_data,
-    [[maybe_unused]] const cucascade::memory::memory_space* target_memory_space) override
+    [[maybe_unused]] const cucascade::memory::memory_space* target_memory_space) noexcept override
   {
-    const size_t data_size = current_data.get_size_in_bytes();
+    try {
+      const size_t data_size = current_data.get_size_in_bytes();
 
-    auto maybe_source_memory_handle =
-      memory_context_->get_memory_handle(current_data.get_memory_space().get_id());
-    if (not maybe_source_memory_handle) {
-      SIRIUS_LOG_WARN(fmt::format("No quent memory handle found for {}",
-                                  current_data.get_memory_space().to_string()));
-      return;
+      auto maybe_source_memory_handle =
+        memory_context_->get_memory_handle(current_data.get_memory_space().get_id());
+      if (not maybe_source_memory_handle) {
+        SIRIUS_LOG_WARN(fmt::format("No quent memory handle found for {}",
+                                    current_data.get_memory_space().to_string()));
+        return;
+      }
+
+      auto maybe_dest_memory_handle =
+        memory_context_->get_memory_handle(target_memory_space->get_id());
+      if (not maybe_dest_memory_handle) {
+        SIRIUS_LOG_WARN(
+          fmt::format("No quent memory handle found for {}", target_memory_space->to_string()));
+        return;
+      }
+
+      auto maybe_channel_handle = memory_context_->get_channel_handle(
+        current_data.get_memory_space().get_id(), target_memory_space->get_id());
+      if (not maybe_channel_handle) {
+        SIRIUS_LOG_WARN(
+          fmt::format("No quent channel handle found for the channel between {} and {}",
+                      current_data.get_memory_space().to_string(),
+                      target_memory_space->to_string()));
+        return;
+      }
+
+      handle_->in_transit({
+        .source_memory_resource_id    = (*maybe_source_memory_handle).get().uuid(),
+        .source_memory_capacity_bytes = data_size,
+        .dest_memory_resource_id      = (*maybe_dest_memory_handle).get().uuid(),
+        .dest_memory_capacity_bytes   = data_size,
+        .channel_resource_id          = (*maybe_channel_handle).get().uuid(),
+        .channel_capacity_bytes       = data_size,
+      });
+    } catch (...) {
     }
-
-    auto maybe_dest_memory_handle =
-      memory_context_->get_memory_handle(target_memory_space->get_id());
-    if (not maybe_dest_memory_handle) {
-      SIRIUS_LOG_WARN(
-        fmt::format("No quent memory handle found for {}", target_memory_space->to_string()));
-      return;
-    }
-
-    auto maybe_channel_handle = memory_context_->get_channel_handle(
-      current_data.get_memory_space().get_id(), target_memory_space->get_id());
-    if (not maybe_channel_handle) {
-      SIRIUS_LOG_WARN(fmt::format("No quent channel handle found for the channel between {} and {}",
-                                  current_data.get_memory_space().to_string(),
-                                  target_memory_space->to_string()));
-      return;
-    }
-
-    handle_->in_transit({
-      .source_memory_resource_id    = (*maybe_source_memory_handle).get().uuid(),
-      .source_memory_capacity_bytes = data_size,
-      .dest_memory_resource_id      = (*maybe_dest_memory_handle).get().uuid(),
-      .dest_memory_capacity_bytes   = data_size,
-      .channel_resource_id          = (*maybe_channel_handle).get().uuid(),
-      .channel_capacity_bytes       = data_size,
-    });
   }
 
   void conversion_completed([[maybe_unused]] const cucascade::idata_representation& data,
-                            [[maybe_unused]] const bool success) override
+                            [[maybe_unused]] const bool success) noexcept override
   {
-    auto maybe_memory_handle = memory_context_->get_memory_handle(data.get_memory_space().get_id());
-    if (not maybe_memory_handle) {
-      SIRIUS_LOG_WARN(
-        fmt::format("No quent memory handle found for {}", data.get_memory_space().to_string()));
-      return;
-    }
+    try {
+      auto maybe_memory_handle =
+        memory_context_->get_memory_handle(data.get_memory_space().get_id());
+      if (not maybe_memory_handle) {
+        SIRIUS_LOG_WARN(
+          fmt::format("No quent memory handle found for {}", data.get_memory_space().to_string()));
+        return;
+      }
 
-    handle_->stationary({
-      .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
-      .memory_capacity_bytes = data.get_size_in_bytes(),
-    });
+      handle_->stationary({
+        .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
+        .memory_capacity_bytes = data.get_size_in_bytes(),
+      });
+    } catch (...) {
+    }
   }
-  void data_replaced([[maybe_unused]] const cucascade::idata_representation& new_data) override
+
+  void data_replaced(
+    [[maybe_unused]] const cucascade::idata_representation& new_data) noexcept override
   {
-    // auto maybe_memory_handle =
-    //   memory_context_->get_memory_handle(new_data.get_memory_space().get_id());
-    // if (not maybe_memory_handle) {
-    //   SIRIUS_LOG_WARN(fmt::format("No quent memory handle found for {}",
-    //                               new_data.get_memory_space().to_string()));
-    //   return;
-    // }
-    // handle_->stationary({
-    //   .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
-    //   .memory_capacity_bytes = new_data.get_size_in_bytes(),
-    // });
+    try {
+      auto maybe_memory_handle =
+        memory_context_->get_memory_handle(new_data.get_memory_space().get_id());
+      if (not maybe_memory_handle) {
+        SIRIUS_LOG_WARN(fmt::format("No quent memory handle found for {}",
+                                    new_data.get_memory_space().to_string()));
+        return;
+      }
+      handle_->stationary({
+        .memory_resource_id    = (*maybe_memory_handle).get().uuid(),
+        .memory_capacity_bytes = new_data.get_size_in_bytes(),
+      });
+    } catch (...) {
+    }
   }
-  void state_changed([[maybe_unused]] const cucascade::batch_state new_state) override {}
-  void subscriber_count_changed([[maybe_unused]] const size_t& new_subscriber_count) override {}
-  void reader_count_changed([[maybe_unused]] const size_t& new_read_only_count) override {}
 
  private:
   /**
