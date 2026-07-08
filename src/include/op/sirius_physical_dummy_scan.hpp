@@ -36,9 +36,6 @@ class sirius_physical_dummy_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
-
-  std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op
