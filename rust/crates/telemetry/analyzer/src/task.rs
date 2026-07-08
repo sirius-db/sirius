@@ -85,6 +85,7 @@ impl TaskExt for Task {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
+                    attributes: transition.attributes.clone(),
                 })
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;
