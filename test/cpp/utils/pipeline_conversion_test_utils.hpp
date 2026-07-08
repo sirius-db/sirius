@@ -19,7 +19,12 @@
 #include <duckdb/main/connection.hpp>
 
 #include <filesystem>
+#include <functional>
 #include <string>
+
+namespace sirius::pipeline {
+struct pipeline_conversion_result;
+}  // namespace sirius::pipeline
 
 namespace sirius::test {
 
@@ -47,6 +52,15 @@ namespace sirius::test {
 //! Throws on parse / bind / optimize errors. Iceberg queries are not supported
 //! (no engine-side prefetch is performed) — TPC-H queries are unaffected.
 std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query);
+
+//! Like `convert_query_to_dump`, but hands the raw `pipeline_conversion_result` to
+//! `consume` while the plan tree and meta-pipelines are still alive (see the dump
+//! overload's lifetime note — the result must not escape `consume`). Lets tests
+//! inspect the real schedule order, which the canonical dump deliberately sorts away.
+void with_conversion_result(
+  duckdb::Connection& con,
+  const std::string& query,
+  const std::function<void(pipeline::pipeline_conversion_result&)>& consume);
 
 //! RAII guard that captures and restores the value of
 //! `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD`. The flag is a process-wide

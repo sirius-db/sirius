@@ -67,6 +67,20 @@ struct Config {
   // overrides. Default true: a differential dump test confirms byte-identical pipeline
   // state vs the legacy converter on every TPC-H SF1 plan. Set false to fall back to the
   // legacy converter path (kept for rollback; planned for deletion in a follow-up).
+  //
+  // Operator IDs differ between the two paths for the same plan: they come from a
+  // global construction counter, and the tree path constructs the injected
+  // PARTITION/CONCAT/MERGE operators at plan generation while the legacy path
+  // constructs them during split_pipelines (the transparent path's validation plan
+  // also consumes a different number of IDs per path). Query results are unaffected,
+  // but the ID value feeds two placement heuristics, so the paths behave differently
+  // in:
+  //  - downgrade order: the downgrade executor's tier-1 spill visits data
+  //    repositories in ascending operator_id order (cucascade's repository map is
+  //    keyed by {operator_id, port_id}) and stops once enough bytes are freed, so
+  //    which batches spill to host/disk under GPU memory pressure differs;
+  //  - hash-join GPU placement: build-probe join tasks are pinned to
+  //    operator_id % num_gpus (multi-GPU only), so joins may land on different GPUs.
   static bool USE_TREE_BASED_PIPELINE_BUILD;
 
   // Whether to fall back to duckdb execution after an error is detected

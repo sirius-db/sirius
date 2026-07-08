@@ -203,6 +203,14 @@ After meta-pipeline construction, `sirius_pipeline_converter::convert()` applies
 
 `sirius_engine::initialize_internal()` is now a ~35-line orchestrator calling `sirius_pipeline_converter(*this, op_params).convert(*root_pipeline)`.
 
+Under `USE_TREE_BASED_PIPELINE_BUILD` (the default), step 2 does not run — operators are already
+inserted at plan generation — and `convert()` instead ends with
+`reorder_pipelines_topologically()`, which permutes the schedule into a strict leaf-first
+topological order (every pipeline after its producers) and renumbers pipeline IDs to match.
+Operator IDs still differ from the legacy path because they are assigned in construction order;
+the `USE_TREE_BASED_PIPELINE_BUILD` comment in `config.hpp` describes the two placement
+heuristics this affects (downgrade spill order and multi-GPU hash-join placement).
+
 Each split introduces new operators and **data repositories between pipelines**. Repositories are never placed in the middle of a pipeline — they always connect the sink of one pipeline to the source of the next.
 
 In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` (source), C is `operators.back()` (sink), and B is intermediate. After finalization, each operator appears **exactly once** in its pipeline's `operators` list. Solid edges denote data repositories connecting pipelines, labeled with the barrier type (e.g., `FULL`, `PARTIAL`, `PIPELINE`). Dashed edges indicate internal pushes within an operator's `sink()` method.

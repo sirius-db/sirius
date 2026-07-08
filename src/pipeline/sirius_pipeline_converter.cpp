@@ -154,11 +154,61 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   finalize_pipeline_structure();
   link_join_partition_siblings();
   configure_partition_min_partitions();
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    // Must run after finalize_pipeline_structure (which populates `dependencies`)
+    // and after link_join_partition_siblings (which reads dependencies[0]/[1]
+    // positionally in the pre-reorder order).
+    reorder_pipelines_topologically(scheduled_);
+  }
 
   return {std::move(scheduled_),
           std::move(inserted_operators_),
           std::move(repository_wirings_),
           meta_pipeline_count_};
+}
+
+void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+{
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> ordered;
+  ordered.reserve(pipelines.size());
+  std::unordered_set<const sirius_pipeline*> emitted;
+  std::unordered_set<const sirius_pipeline*> in_progress;
+
+  auto emit = [&](auto&& self, const duckdb::shared_ptr<sirius_pipeline>& pipeline) -> void {
+    // `in_progress` breaks dependency cycles (delim-join distribution edges) by
+    // skipping back-references; the pipeline is still emitted when its own frame
+    // completes.
+    if (emitted.contains(pipeline.get()) || in_progress.contains(pipeline.get())) { return; }
+    in_progress.insert(pipeline.get());
+    for (const auto& producer : pipeline->dependencies) {
+      self(self, producer);
+    }
+    in_progress.erase(pipeline.get());
+    emitted.insert(pipeline.get());
+    ordered.push_back(pipeline);
+  };
+
+  for (const auto& pipeline : pipelines) {
+    if (pipeline->get_parents().empty()) { emit(emit, pipeline); }
+  }
+  // Safety net for pipelines unreachable from a sink-side root.
+  for (const auto& pipeline : pipelines) {
+    emit(emit, pipeline);
+  }
+  D_ASSERT(ordered.size() == pipelines.size());
+  pipelines = std::move(ordered);
+
+  for (size_t i = 0; i < pipelines.size(); i++) {
+    pipelines[i]->set_pipeline_id(i);
+  }
+  for (const auto& pipeline : pipelines) {
+    std::sort(pipeline->dependencies.begin(),
+              pipeline->dependencies.end(),
+              [](const duckdb::shared_ptr<sirius_pipeline>& a,
+                 const duckdb::shared_ptr<sirius_pipeline>& b) {
+                return a->get_pipeline_id() < b->get_pipeline_id();
+              });
+  }
 }
 
 duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>

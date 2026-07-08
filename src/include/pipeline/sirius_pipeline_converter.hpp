@@ -77,6 +77,18 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
 //! shapes on the same plan tree).
 std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result);
 
+//! Reorders `pipelines` in place into a deterministic, strictly-topological schedule:
+//! every pipeline appears after all of its `dependencies` (producers). Emission is a
+//! post-order walk from the sink-side root (the pipeline nothing consumes, i.e. the
+//! result collector), descending `dependencies` in vector order. Renumbers
+//! `pipeline_id` to the new vector positions and re-sorts each pipeline's
+//! `dependencies` ascending by the new ids (the order the plan printer renders).
+//! Used by the tree-based conversion path, whose meta-sweep emission is not strictly
+//! topological (delim-join distribution pipelines precede the delim pipeline that
+//! feeds them). The legacy path already emits topologically and never runs this.
+void reorder_pipelines_topologically(
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
+
 class sirius_pipeline_converter {
  public:
   sirius_pipeline_converter(

@@ -114,7 +114,10 @@ duckdb::unique_ptr<duckdb::LogicalOperator> extract_logical_plan_sirius_order(
 
 }  // namespace
 
-std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query)
+void with_conversion_result(
+  duckdb::Connection& con,
+  const std::string& query,
+  const std::function<void(pipeline::pipeline_conversion_result&)>& consume)
 {
   auto& context = *con.context;
 
@@ -168,19 +171,27 @@ std::string convert_query_to_dump(duckdb::Connection& con, const std::string& qu
       build_ctx, op_params, &kEmptyIcebergCache, &context);
     auto result = converter.convert(*root_pipeline);
 
-    // Dump *here* while `sirius_plan`, `root_pipeline`, `result` are all in scope. The result's
-    // pipelines reference operators in the plan tree; if we returned the result and dumped at
-    // the caller, the plan tree would already be destroyed and the dump would read dangling
-    // pointers. Legacy (flag OFF) partially survives that hazard because its converter-inserted
+    // Consume *here* while `sirius_plan`, `root_pipeline`, `result` are all in scope. The
+    // result's pipelines reference operators in the plan tree; if the result escaped to the
+    // caller, the plan tree would already be destroyed and reads would hit dangling pointers.
+    // Legacy (flag OFF) partially survives that hazard because its converter-inserted
     // operators (PARTITION, CONCAT, MERGE_*) are owned by result.inserted_operators_, but the
     // tree path (flag ON) has no inserted_operators_ at all — everything dangles.
-    auto dump = pipeline::dump_pipeline_conversion_result(result);
+    consume(result);
     con.Rollback();
-    return dump;
   } catch (...) {
     con.Rollback();
     throw;
   }
+}
+
+std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query)
+{
+  std::string dump;
+  with_conversion_result(con, query, [&](pipeline::pipeline_conversion_result& result) {
+    dump = pipeline::dump_pipeline_conversion_result(result);
+  });
+  return dump;
 }
 
 tree_pipeline_flag_guard::tree_pipeline_flag_guard()
