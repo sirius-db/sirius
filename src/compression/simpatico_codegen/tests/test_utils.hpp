@@ -88,6 +88,50 @@ inline std::unique_ptr<cudf::table> make_int64_table(int num_cols, int num_rows,
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+// Unsigned tables spanning the full range (values above 2^31 / 2^63) so the
+// codegen's unsigned->signed reinterpretation is exercised, not just small keys.
+inline std::unique_ptr<cudf::table> make_uint32_table(int num_cols, int num_rows, int seed)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(static_cast<std::size_t>(num_cols));
+  for (int c = 0; c < num_cols; ++c) {
+    std::vector<std::uint32_t> host(static_cast<std::size_t>(num_rows));
+    for (int r = 0; r < num_rows; ++r)
+      host[static_cast<std::size_t>(r)] =
+        static_cast<std::uint32_t>(r) * 2654435761u + static_cast<std::uint32_t>(c * 1013 + seed);
+    auto col = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::UINT32}, num_rows, cudf::mask_state::UNALLOCATED);
+    if (cudaMemcpy(col->mutable_view().head<std::uint32_t>(),
+                   host.data(),
+                   host.size() * sizeof(std::uint32_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      throw std::runtime_error("make_uint32_table: cudaMemcpy failed");
+    cols.push_back(std::move(col));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+inline std::unique_ptr<cudf::table> make_uint64_table(int num_cols, int num_rows, int seed)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(static_cast<std::size_t>(num_cols));
+  for (int c = 0; c < num_cols; ++c) {
+    std::vector<std::uint64_t> host(static_cast<std::size_t>(num_rows));
+    for (int r = 0; r < num_rows; ++r)
+      host[static_cast<std::size_t>(r)] = static_cast<std::uint64_t>(r) * 0x9E3779B97F4A7C15ull +
+                                          static_cast<std::uint64_t>(c * 1013 + seed);
+    auto col = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::UINT64}, num_rows, cudf::mask_state::UNALLOCATED);
+    if (cudaMemcpy(col->mutable_view().head<std::uint64_t>(),
+                   host.data(),
+                   host.size() * sizeof(std::uint64_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      throw std::runtime_error("make_uint64_table: cudaMemcpy failed");
+    cols.push_back(std::move(col));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 inline std::unique_ptr<cudf::table> make_f32_table(int num_cols, int num_rows, int seed)
 {
   std::vector<std::unique_ptr<cudf::column>> cols;

@@ -165,6 +165,8 @@ std::vector<fixture> build_fixtures(rmm::cuda_stream_view stream, int n)
   };
   add_numeric("i32", make_int32_table(1, n, 1));
   add_numeric("i64", make_int64_table(1, n, 2));
+  add_numeric("u32", make_uint32_table(1, n, 7));
+  add_numeric("u64", make_uint64_table(1, n, 8));
   add_numeric("f32", make_f32_table(1, n, 3));
   add_numeric("f64", make_f64_table(1, n, 4));
   add_numeric("u8_binary", make_u8_table(n, 5));
