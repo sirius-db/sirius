@@ -163,12 +163,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();
 
-  /// @brief True when plan construction wired at least one dynamic-filter consumer.
-  [[nodiscard]] bool publishes_dynamic_filters() const noexcept
-  {
-    return _dynamic_filter_plan.enabled();
-  }
-
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

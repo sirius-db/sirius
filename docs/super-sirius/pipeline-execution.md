@@ -312,7 +312,7 @@ sub-executor or scan-priority queue owned here.
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
-| `prepare_for_query(query)` | Drains executor leftovers, installs query/completion state, and marks dynamic-filter build subtrees |
+| `prepare_for_query(query)` | Drains executor leftovers, installs query/completion state, and resets per-query scheduler state |
 | `start_query()` | Schedules `query.get_scan_operators().front()` through `task_creator` and returns the completion future |
 | `terminate_query(exception)` | Reports error to completion handler |
 | `drain_after_error()` | Multi-stage drain for clean shutdown |
@@ -327,9 +327,8 @@ task. Ready devices remain recorded until a compatible task arrives:
 while running:
     1. Wait for device_ready or task_available; drain the current event burst
     2. For each ready device, select a compatible queued task:
-       a. dynamic-filter build-subtree task, if available
-       b. exact preferred-device match
-       c. unpreferred task (or one with a stale preference)
+       a. exact preferred-device match
+       b. unpreferred task (or one with a stale preference)
     3. Dispatch the selected task to that device's GPU executor
 ```
 
@@ -343,29 +342,19 @@ device-local data.
 work is exposed by task hints and completion-driven downstream scheduling; there is no
 `schedule_next_scan_tasks()` or `_priority_scans` walk.
 
-### Build-subtree task prioritization
+### Dynamic-filter independence
 
-During `prepare_for_query`, the scheduler finds every hash join with a plan-wired dynamic-filter
-publication plan. From each join's `build` port it walks incoming pipeline edges backward and marks
-the complete build subtree, including both inputs needed by any intervening join. This is a
-different transitive walk from DuckDB's consumer routing, which walks down a producer join's probe
-subtree to attach a channel to a base scan.
+The scheduler is filter-agnostic: it does not inspect hash joins or reorder queued work to advance
+dynamic-filter publication. Immediate probes remain strictly ordered by synchronous build-CONCAT
+publication in the join pipeline. A scan reached transitively through an intervening join has no
+such edge and samples whatever complete filters are visible at its reader and post-decode
+checkpoints.
 
-For every ready device, the management matcher first searches the queue for a marked task that is
-compatible with that device. If none is queued, it immediately resumes normal locality-aware
-dispatch, so the preference cannot starve unrelated work. With no wired filter publisher, the
-marked set is empty and dispatch is unchanged. The preference does not create work, preempt a
-running task, or make a scan wait for filter readiness.
-
-The producing join already strictly orders its own immediate probe producer after synchronous
-build-CONCAT publication, so priority is redundant for that direct shape. It matters when DuckDB
-has pushed the filter through an intervening join to a deeper base scan: that transitive scan can
-have ordinary tasks queued or running before the outer build exists. Once build-subtree tasks are
-also queued, priority lets them overtake undispatched scan tasks and can make the filter available
-to later splits. Early splits are not revisited, and an intervening join that emits no partial
-output before its input drains can still expose the outer build too late. See
-[Transitive scan targets and build-task priority](dynamic-filters.md#transitive-scan-targets-and-build-task-priority)
-for the concrete join example and the scan's channel-snapshot checkpoints.
+Issue [#1124](https://github.com/sirius-db/sirius/issues/1124) measured the former build-subtree
+preference at SF300. It provided no coverage benefit; disabling it cut wall time by 9–25% and
+substantially reduced run-to-run variance, so it was removed. See
+[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing)
+for the consumer semantics.
 
 ## GPU Pipeline Executor
 
