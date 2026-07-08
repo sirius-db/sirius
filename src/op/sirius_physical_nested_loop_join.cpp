@@ -39,6 +39,7 @@
 #include <cudf/join/join.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/transform.hpp>
 
 #include <rmm/resource_ref.hpp>
 
@@ -399,17 +400,47 @@ cudf::table_view sirius_physical_nested_loop_join::select_left_output(
   return left.select(sel);
 }
 
-/// @brief MARK join output from semi-join matching row indices.
+/// @brief Scatter a single BOOL8 @p value into @p column at every position in @p indices.
+static std::unique_ptr<cudf::column> scatter_bool(
+  std::unique_ptr<cudf::column> column,
+  const rmm::device_uvector<cudf::size_type>& indices,
+  bool value,
+  rmm::cuda_stream_view stream)
+{
+  if (indices.size() == 0) { return column; }
+  cudf::numeric_scalar<bool> scalar(value, true, stream);
+  cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
+                                static_cast<cudf::size_type>(indices.size()),
+                                indices.data(),
+                                nullptr,
+                                0,
+                                0,
+                                {});
+  auto scattered = cudf::scatter({std::ref(static_cast<const cudf::scalar&>(scalar))},
+                                 scatter_map,
+                                 cudf::table_view({column->view()}),
+                                 stream);
+  return std::move(scattered->release()[0]);
+}
+
+/// @brief MARK join output implementing SQL three-valued logic.
 ///
-/// Every row of @p left_view passes through unchanged, plus a BOOL8 mark column that starts
-/// all-false and gets true scattered at every position in @p semi_indices. Callers pass the
-/// projection-selected left view; @p semi_indices index rows of the original left table, which
-/// stay valid because selection drops columns only.
+/// Every row of @p left_view passes through unchanged, plus a BOOL8 mark column. The mark VALUE is
+/// true at rows in @p true_indices (the predicate evaluated TRUE against some right row) and false
+/// elsewhere. The mark VALIDITY encodes NULL: an unmatched row is NULL when the predicate was never
+/// TRUE but was UNKNOWN (NULL) for some right row — i.e. it is in @p maybe_indices (the "predicate
+/// IS NOT FALSE" semi-join) but not in @p true_indices. Since true_indices is a subset of
+/// maybe_indices, validity == matched OR NOT maybe, built by scattering false at the maybe rows
+/// then true back at the matched rows.
+///
+/// Callers pass the projection-selected left view; both index sets index rows of the original left
+/// table, which stay valid because selection drops columns only.
 ///
 /// @p telemetry_info is threaded through to the emitted batch so it stays linked into the query's
 /// telemetry lineage (callers pass the operator's batch_telemetry()).
 static std::unique_ptr<operator_data> resolve_mark_join_result(
-  const rmm::device_uvector<cudf::size_type>& semi_indices,
+  const rmm::device_uvector<cudf::size_type>& true_indices,
+  const rmm::device_uvector<cudf::size_type>& maybe_indices,
   const cudf::table_view& left_view,
   cucascade::memory::memory_space& space,
   rmm::cuda_stream_view stream,
@@ -421,23 +452,23 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
     out_cols.push_back(std::make_unique<cudf::column>(left_view.column(i), stream));
   }
 
+  auto num_rows = left_view.num_rows();
+
+  // Mark values: all-false, scatter true at matched rows.
   cudf::numeric_scalar<bool> false_scalar(false, true, stream);
-  auto mark_column = cudf::make_column_from_scalar(false_scalar, left_view.num_rows(), stream);
-  if (semi_indices.size() > 0) {
-    cudf::numeric_scalar<bool> true_scalar(true, true, stream);
-    cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
-                                  static_cast<cudf::size_type>(semi_indices.size()),
-                                  semi_indices.data(),
-                                  nullptr,
-                                  0,
-                                  0,
-                                  {});
-    auto scattered = cudf::scatter({std::ref(static_cast<const cudf::scalar&>(true_scalar))},
-                                   scatter_map,
-                                   cudf::table_view({mark_column->view()}),
-                                   stream);
-    mark_column    = std::move(scattered->release()[0]);
-  }
+  auto mark_column = cudf::make_column_from_scalar(false_scalar, num_rows, stream);
+  mark_column      = scatter_bool(std::move(mark_column), true_indices, true, stream);
+
+  // Validity: all-valid, scatter invalid(false) at the maybe rows, then valid(true) back at the
+  // matched rows. A false cell in validity_col marks that mark row as NULL.
+  cudf::numeric_scalar<bool> true_scalar(true, true, stream);
+  auto validity_col = cudf::make_column_from_scalar(true_scalar, num_rows, stream);
+  validity_col      = scatter_bool(std::move(validity_col), maybe_indices, false, stream);
+  validity_col      = scatter_bool(std::move(validity_col), true_indices, true, stream);
+
+  auto [null_mask, null_count] = cudf::bools_to_mask(validity_col->view(), stream);
+  if (null_count > 0) { mark_column->set_null_mask(std::move(*null_mask), null_count); }
+
   out_cols.push_back(std::move(mark_column));
 
   auto output_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
@@ -458,10 +489,13 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
 
   if (join_type == duckdb::JoinType::MARK) {
     // Both empty-side MARK cases are "no matches": an empty left side emits 0 rows with the
-    // mark column still in the schema; an empty right side marks every left row false.
+    // mark column still in the schema; an empty right side marks every left row false. An empty
+    // right side is definitively false (the OR over an empty set of right rows is FALSE, never
+    // NULL), so both the matched and maybe index sets are empty and no row is NULL.
     rmm::device_uvector<cudf::size_type> no_matches(0, stream);
+    rmm::device_uvector<cudf::size_type> no_maybe(0, stream);
     return resolve_mark_join_result(
-      no_matches, select_left_output(left), space, stream, batch_telemetry());
+      no_matches, no_maybe, select_left_output(left), space, stream, batch_telemetry());
   }
 
   // Gather maps per the §3 semantics table, filled on the task stream (cudf::sequence /
@@ -775,11 +809,60 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
             make_data_batch(std::move(gathered), *space, stream, batch_telemetry())});
       }
       case duckdb::JoinType::MARK: {
-        auto left_indices = cudf::conditional_left_semi_join(
+        // Matched rows: predicate evaluated TRUE against some right row.
+        auto true_indices = cudf::conditional_left_semi_join(
           left_effective, right_effective, predicate, std::nullopt, stream, mr);
+
+        // SQL three-valued MARK: an unmatched left row is NULL (not false) when the predicate was
+        // never TRUE but was UNKNOWN (NULL) for some right row. To find those rows we run a second
+        // semi-join with "predicate IS NOT FALSE". A conjunction c1 AND ... AND cn is FALSE iff
+        // some ci is FALSE, so (AND ci) IS NOT FALSE == AND_i (ci IS NOT FALSE), and each
+        // comparison "ci IS NOT FALSE" == ci OR IS_NULL(left_i) OR IS_NULL(right_i) (true when ci
+        // is TRUE or NULL, false only when both operands are non-null and ci is FALSE).
+        // NULL_LOGICAL_OR gives Kleene OR so the result is a clean boolean with no NULLs. The
+        // vectors below own the AST nodes and are reserved to exact size — cudf::ast::operation
+        // stores operands by reference, so any reallocation would invalidate them.
+        std::vector<cudf::ast::operation> isnull_left_ops;
+        std::vector<cudf::ast::operation> isnull_right_ops;
+        std::vector<cudf::ast::operation> notfalse_inner_ops;
+        std::vector<cudf::ast::operation> notfalse_ops;
+        std::vector<cudf::ast::operation> notfalse_and_chain;
+        isnull_left_ops.reserve(cond_ops.size());
+        isnull_right_ops.reserve(cond_ops.size());
+        notfalse_inner_ops.reserve(cond_ops.size());
+        notfalse_ops.reserve(cond_ops.size());
+        notfalse_and_chain.reserve(cond_ops.size() > 1 ? cond_ops.size() - 1 : 0);
+        for (size_t i = 0; i < cond_ops.size(); i++) {
+          isnull_left_ops.emplace_back(cudf::ast::ast_operator::IS_NULL, left_refs[i]);
+          isnull_right_ops.emplace_back(cudf::ast::ast_operator::IS_NULL, right_refs[i]);
+          notfalse_inner_ops.emplace_back(
+            cudf::ast::ast_operator::NULL_LOGICAL_OR, cond_ops[i], isnull_left_ops.back());
+          notfalse_ops.emplace_back(cudf::ast::ast_operator::NULL_LOGICAL_OR,
+                                    notfalse_inner_ops.back(),
+                                    isnull_right_ops.back());
+        }
+        for (size_t i = 1; i < notfalse_ops.size(); i++) {
+          const cudf::ast::expression& lhs =
+            (i == 1) ? static_cast<const cudf::ast::expression&>(notfalse_ops[0])
+                     : notfalse_and_chain.back();
+          notfalse_and_chain.emplace_back(
+            cudf::ast::ast_operator::LOGICAL_AND,
+            lhs,
+            static_cast<const cudf::ast::expression&>(notfalse_ops[i]));
+        }
+        const cudf::ast::expression& not_false_predicate =
+          notfalse_and_chain.empty() ? static_cast<const cudf::ast::expression&>(notfalse_ops[0])
+                                     : notfalse_and_chain.back();
+        auto maybe_indices = cudf::conditional_left_semi_join(
+          left_effective, right_effective, not_false_predicate, std::nullopt, stream, mr);
+
         SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
-        return resolve_mark_join_result(
-          *left_indices, select_left_output(left), *space, stream, batch_telemetry());
+        return resolve_mark_join_result(*true_indices,
+                                        *maybe_indices,
+                                        select_left_output(left),
+                                        *space,
+                                        stream,
+                                        batch_telemetry());
       }
       case duckdb::JoinType::OUTER:
         join_result =

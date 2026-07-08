@@ -161,6 +161,52 @@ nlj_projection_fixture create_projected_nlj(duckdb::JoinType join_type,
   return f;
 }
 
+// Two-condition NLJ MARK fixture: (left.col0 OP right.col0) AND (left.col2 OP right.col1).
+// Left child {INT,INT,INT} (col0, payload col1, col2), right child {INT,INT}. Outputs the payload
+// column plus the mark. Used to exercise three-valued conjunction semantics (NULL AND FALSE=FALSE).
+nlj_projection_fixture create_projected_nlj_two_cond(duckdb::ExpressionType comparison)
+{
+  nlj_projection_fixture f;
+
+  f.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
+  f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
+
+  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+      duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER}),
+    0);
+  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::INTEGER}),
+    0);
+
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::JoinCondition cond0;
+  cond0.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond0.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond0.comparison = comparison;
+  conditions.push_back(std::move(cond0));
+  duckdb::JoinCondition cond1;
+  cond1.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 2);
+  cond1.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1);
+  cond1.comparison = comparison;
+  conditions.push_back(std::move(cond1));
+
+  f.nlj = duckdb::make_uniq<sirius_physical_nested_loop_join>(
+    *f.logical_join,
+    std::move(left_child),
+    std::move(right_child),
+    sirius::wrap_join_conditions(std::move(conditions)),
+    duckdb::JoinType::MARK,
+    1000,
+    duckdb::vector<std::size_t>{1},  // left_projection_map: output only payload column
+    duckdb::vector<std::size_t>{});
+
+  return f;
+}
+
 projected_nlj_result execute_projected_nlj(sirius_physical_nested_loop_join& nlj,
                                            std::shared_ptr<cucascade::data_batch> left,
                                            std::shared_ptr<cucascade::data_batch> right)
@@ -522,6 +568,135 @@ TEST_CASE("sirius_physical_nested_loop_join MARK empty side honors the left proj
 
     REQUIRE(out_view.num_columns() == 2);
     REQUIRE(out_view.num_rows() == 0);
+  }
+}
+
+// Issue #1119: the NLJ (conditional) MARK path must emit a NULL mark for an unmatched left row
+// when the predicate was never TRUE but was UNKNOWN (NULL) for some right row.
+TEST_CASE("sirius_physical_nested_loop_join MARK emits NULL under three-valued logic",
+          "[physical_nested_loop_join][projection][mark]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // Predicate is left.col0 < right.col0 (routes to NLJ since it is a pure inequality).
+  auto make_left = [&](const std::vector<int32_t>& a,
+                       const std::vector<bool>& a_valid,
+                       const std::vector<int32_t>& payload) {
+    auto col0 = a_valid.empty() ? make_numeric_batch<int32_t>(*space, a, cudf::type_id::INT32)
+                                : make_numeric_batch_with_nulls<int32_t>(
+                                    *space, a, a_valid, cudf::type_id::INT32);
+    auto col1 = make_numeric_batch<int32_t>(*space, payload, cudf::type_id::INT32);
+    auto col2 =
+      make_numeric_batch<int32_t>(*space, std::vector<int32_t>(a.size(), 0), cudf::type_id::INT32);
+    return concatenate_batches_horizontal({col0, col1, col2}, *space);
+  };
+
+  SECTION("right NULL taints an otherwise-false row to NULL")
+  {
+    auto left = make_left({1, 5, 10}, {}, {10, 20, 30});
+    auto right =
+      make_numeric_batch_with_nulls<int32_t>(*space, {8, 0}, {true, false}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::MARK, duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    REQUIRE(out_view.num_rows() == 3);
+    auto mark = out_view.column(1);
+    REQUIRE(mark.null_count() == 1);
+    REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{true, true, false});
+    auto values = copy_column_to_host<bool>(mark);
+    REQUIRE(values[0] == true);
+    REQUIRE(values[1] == true);
+  }
+
+  SECTION("NULL probe key is NULL, not false")
+  {
+    auto left  = make_left({1, 0, 20}, {true, false, true}, {10, 20, 30});
+    auto right = make_numeric_batch<int32_t>(*space, {10}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::MARK, duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    REQUIRE(out_view.num_rows() == 3);
+    auto mark = out_view.column(1);
+    REQUIRE(mark.null_count() == 1);
+    REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{true, false, true});
+    auto values = copy_column_to_host<bool>(mark);
+    REQUIRE(values[0] == true);   // 1 < 10
+    REQUIRE(values[2] == false);  // 20 < 10 is definitively false
+  }
+
+  SECTION("definitely-false rows with no nulls stay false")
+  {
+    auto left  = make_left({20, 30}, {}, {10, 20});
+    auto right = make_numeric_batch<int32_t>(*space, {10}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::MARK, duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    auto mark = out_view.column(1);
+    REQUIRE(mark.null_count() == 0);
+    REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{false, false});
+  }
+}
+
+// Issue #1119: with a conjunction, a NULL in one comparison must be absorbed by a FALSE in another
+// (NULL AND FALSE == FALSE) — a naive "any referenced null -> NULL" would be wrong here.
+TEST_CASE("sirius_physical_nested_loop_join MARK conjunction absorbs NULL with FALSE",
+          "[physical_nested_loop_join][projection][mark]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // Predicate: (left.col0 < right.col0) AND (left.col2 < right.col1).
+  auto make_left = [&](int32_t a, int32_t payload, int32_t c) {
+    auto col0 = make_numeric_batch<int32_t>(*space, {a}, cudf::type_id::INT32);
+    auto col1 = make_numeric_batch<int32_t>(*space, {payload}, cudf::type_id::INT32);
+    auto col2 = make_numeric_batch<int32_t>(*space, {c}, cudf::type_id::INT32);
+    return concatenate_batches_horizontal({col0, col1, col2}, *space);
+  };
+  auto make_right = [&](const std::vector<int32_t>& b,
+                        const std::vector<bool>& b_valid,
+                        const std::vector<int32_t>& d,
+                        const std::vector<bool>& d_valid) {
+    auto col0 = make_numeric_batch_with_nulls<int32_t>(*space, b, b_valid, cudf::type_id::INT32);
+    auto col1 = make_numeric_batch_with_nulls<int32_t>(*space, d, d_valid, cudf::type_id::INT32);
+    return concatenate_batches_horizontal({col0, col1}, *space);
+  };
+
+  SECTION("every right row has a FALSE conjunct -> mark FALSE despite the NULLs")
+  {
+    auto left = make_left(/*a*/ 100, /*payload*/ 10, /*c*/ 100);
+    // r0=(b=NULL,d=5): (100<NULL)=NULL AND (100<5)=FALSE -> FALSE
+    // r1=(b=10,d=NULL): (100<10)=FALSE AND (100<NULL)=NULL -> FALSE
+    auto right = make_right({0, 10}, {false, true}, {5, 0}, {true, false});
+
+    auto f        = create_projected_nlj_two_cond(duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    auto mark = out_view.column(1);
+    REQUIRE(mark.null_count() == 0);
+    REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{false});
+  }
+
+  SECTION("a right row that is TRUE-then-NULL (no FALSE conjunct) yields NULL")
+  {
+    auto left = make_left(/*a*/ 100, /*payload*/ 10, /*c*/ 1);
+    // r0=(b=NULL,d=5): (100<NULL)=NULL AND (1<5)=TRUE -> NULL, and there is no TRUE match anywhere.
+    auto right = make_right({0}, {false}, {5}, {true});
+
+    auto f        = create_projected_nlj_two_cond(duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    auto mark = out_view.column(1);
+    REQUIRE(mark.null_count() == 1);
+    REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false});
   }
 }
 
