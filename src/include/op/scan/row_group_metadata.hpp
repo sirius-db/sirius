@@ -48,13 +48,15 @@ struct row_group_slice {
   row_group_slice(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
                   std::string file_path,
                   std::vector<cudf::size_type> row_group_indices,
-                  std::size_t reserved_uncompressed_bytes,
+                  std::size_t estimated_output_bytes,
+                  std::size_t estimated_decode_working_bytes,
                   std::size_t reserved_compressed_bytes,
                   std::shared_ptr<io::sirius_datasource> datasource)
     : file_metadata(file_metadata),
       file_path(file_path),
       row_group_indices(std::move(row_group_indices)),
-      reserved_uncompressed_bytes(reserved_uncompressed_bytes),
+      estimated_output_bytes(estimated_output_bytes),
+      estimated_decode_working_bytes(estimated_decode_working_bytes),
       reserved_compressed_bytes(reserved_compressed_bytes),
       datasource(std::move(datasource))
   {
@@ -62,7 +64,8 @@ struct row_group_slice {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   std::string file_path;
   std::vector<cudf::size_type> row_group_indices;
-  std::size_t reserved_uncompressed_bytes;
+  std::size_t estimated_output_bytes;
+  std::size_t estimated_decode_working_bytes;
   std::size_t reserved_compressed_bytes;
   /// Pre-built datasource for this file. Created once by the split provider
   /// and reused by materialize_table. When null, materialize_table falls

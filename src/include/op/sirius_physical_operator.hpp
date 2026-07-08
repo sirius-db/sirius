@@ -35,6 +35,10 @@
 
 namespace sirius {
 
+namespace telemetry {
+struct batch_telemetry_info;
+}  // namespace telemetry
+
 namespace op {
 class sirius_physical_operator;
 }  // namespace op
@@ -147,6 +151,17 @@ class operator_data {
    * represent GPU-resident data should override to return a meaningful estimate.
    */
   [[nodiscard]] virtual std::size_t get_estimated_size_in_bytes() const { return 0; }
+
+  /**
+   * @brief Estimate the transient working set needed to materialize this data.
+   *
+   * Defaults to the data size. Inputs that materialize additional transient
+   * data can override this without changing the execution-history basis.
+   */
+  [[nodiscard]] virtual std::size_t get_estimated_working_set_size_in_bytes() const
+  {
+    return get_estimated_size_in_bytes();
+  }
 
   /**
    * @brief Record the GPU this data should be processed on.
@@ -300,6 +315,9 @@ struct input_stats {
   /// captured at stats-build time. Used by sirius_gpu_scan_operator's memory
   /// estimate to skip the decode-expansion factor on already-resident inputs.
   bool resident = false;
+  /// Transient working set needed to materialize the input. Defaults to zero
+  /// for callers that only provide the historical byte basis.
+  std::size_t working_set_bytes = 0;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
@@ -353,6 +371,11 @@ class sirius_physical_operator {
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }
+
+  //! Bundle this operator's telemetry attribution (context + producing pipeline)
+  //! for passing to the data_batch factories. Returns {nullptr, nil-UUID} if this
+  //! operator has no pipeline set.
+  [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 

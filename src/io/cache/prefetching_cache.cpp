@@ -365,7 +365,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
     work, _eviction_queue, _prefetch_queue));
   _preparation_queue.enqueue(std::move(work));
 
-  return std::move(handle);
+  return handle;
 }
 
 bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,

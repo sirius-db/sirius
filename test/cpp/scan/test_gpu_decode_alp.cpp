@@ -696,7 +696,7 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f64 bw=11 verify", "[scan][decode]
   auto col =
     one_codec_column(F64, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
-  verify_decoded_column<double>(stream.view(), mr, col, [mask](uint32_t row) {
+  verify_decoded_column<double>(stream.view(), mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<double>(static_cast<int64_t>((uint64_t{i} ^ uint64_t{v}) & mask));
@@ -717,7 +717,7 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f32 bw=20 verify", "[scan][decode]
   auto col =
     one_codec_column(F32, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
-  verify_decoded_column<float>(stream.view(), mr, col, [mask](uint32_t row) {
+  verify_decoded_column<float>(stream.view(), mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<float>(static_cast<int64_t>((uint64_t{i} ^ uint64_t{v}) & mask));
@@ -741,7 +741,7 @@ TEST_CASE("gpu_decode_table ALPRD bench-scale - f64 r48/l3 verify", "[scan][deco
 
   uint64_t const r_mask = (uint64_t{1} << RIGHT_BW) - 1u;
   uint16_t const l_mask = static_cast<uint16_t>((uint16_t{1} << LEFT_BW) - 1u);
-  verify_decoded_column<double>(stream.view(), mr, col, [&dict, r_mask, l_mask](uint32_t row) {
+  verify_decoded_column<double>(stream.view(), mr, col, [&dict](uint32_t row) {
     uint32_t const v          = row >> 10;
     uint32_t const i          = row & 1023u;
     uint32_t const left_idx   = (i ^ v) & l_mask;
@@ -771,7 +771,7 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f64 bw=8 verify", "[scan][decode][
   auto col =
     one_codec_column(F64, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
-  verify_decoded_column<double>(stream.view(), mr, col, [mask](uint32_t row) {
+  verify_decoded_column<double>(stream.view(), mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<double>(static_cast<int64_t>((uint64_t{i} ^ uint64_t{v}) & mask));
@@ -792,7 +792,7 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f64 bw=16 verify", "[scan][decode]
   auto col =
     one_codec_column(F64, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
-  verify_decoded_column<double>(stream.view(), mr, col, [mask](uint32_t row) {
+  verify_decoded_column<double>(stream.view(), mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
     return static_cast<double>(static_cast<int64_t>((uint64_t{i} ^ uint64_t{v}) & mask));
@@ -837,7 +837,7 @@ TEST_CASE("gpu_decode_table ALPRD bench-scale - f64 r56/l2 verify", "[scan][deco
 
   uint64_t const r_mask = (uint64_t{1} << RIGHT_BW) - 1u;
   uint16_t const l_mask = static_cast<uint16_t>((uint16_t{1} << LEFT_BW) - 1u);
-  verify_decoded_column<double>(stream.view(), mr, col, [&dict, r_mask, l_mask](uint32_t row) {
+  verify_decoded_column<double>(stream.view(), mr, col, [&dict](uint32_t row) {
     uint32_t const v          = row >> 10;
     uint32_t const i          = row & 1023u;
     uint32_t const left_idx   = (i ^ v) & l_mask;

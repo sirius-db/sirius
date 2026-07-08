@@ -58,7 +58,7 @@ duckdb::unique_ptr<sirius_physical_operator> make_dummy_two_child_join()
 
 TEST_CASE("yields nothing when no sink is set", "[pipeline][get_next_ports_after_sink]")
 {
-  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{});
+  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
   REQUIRE(not pipeline.get_sink());
 
   for ([[maybe_unused]] const auto& port : pipeline.get_next_ports_after_sink()) {
@@ -69,7 +69,7 @@ TEST_CASE("yields nothing when no sink is set", "[pipeline][get_next_ports_after
 TEST_CASE("returns sink ports for standard (non-delim) sink",
           "[pipeline][get_next_ports_after_sink]")
 {
-  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{});
+  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
 
   sirius_physical_operator sink_op;
   sirius_physical_operator consumer_a;
@@ -93,7 +93,7 @@ TEST_CASE("returns sink ports for standard (non-delim) sink",
 
 TEST_CASE("yields nothing for standard sink with no ports", "[pipeline][get_next_ports_after_sink]")
 {
-  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{});
+  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
 
   sirius_physical_operator sink_op;
   sirius_pipeline_build_state build_state;
@@ -107,7 +107,7 @@ TEST_CASE("yields nothing for standard sink with no ports", "[pipeline][get_next
 TEST_CASE("RIGHT_DELIM_JOIN: concatenates partition_join then distinct ports",
           "[pipeline][get_next_ports_after_sink]")
 {
-  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{});
+  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
   duckdb::vector<sirius::logical_type> empty_types;
 
   auto right_delim = duckdb::make_uniq<sirius_physical_right_delim_join>(
@@ -160,7 +160,7 @@ TEST_CASE("RIGHT_DELIM_JOIN: concatenates partition_join then distinct ports",
 TEST_CASE("LEFT_DELIM_JOIN: concatenates column_data_scan then distinct ports",
           "[pipeline][get_next_ports_after_sink]")
 {
-  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{});
+  sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
   duckdb::vector<sirius::logical_type> empty_types;
 
   auto left_delim = duckdb::make_uniq<sirius_physical_left_delim_join>(

@@ -273,7 +273,6 @@ set(EXTENSION_SOURCES
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
-    src/op/scan/cpu_source_task.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/sirius_gpu_scan_operator_data.cpp
     src/op/scan/gpu_ingestible.cpp
@@ -355,6 +354,7 @@ set(EXTENSION_SOURCES
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
+    src/telemetry/memory_context.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
@@ -639,6 +639,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
+    test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
@@ -661,6 +662,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
+    test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
