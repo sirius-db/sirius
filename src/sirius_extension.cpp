@@ -44,6 +44,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -63,6 +64,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
@@ -888,6 +890,24 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   return info;
 }
 
+// A duckdb-native pin is a positional snapshot of the table's last-checkpointed
+// disk image: a later checkpoint would compact tombstoned rows and flush transient
+// appends, silently shifting rowids out from under the cache (and compressing the
+// in-memory transient segments the query-time insert delta reads). Suppress both
+// WAL auto-checkpoint triggers — the size threshold and the entry count — before
+// the pin's metadata walk snapshots the on-disk row groups. The DBConfig is shared
+// by every attached database, so this covers them all. Idempotent, and deliberately
+// not restored on unpin (or when a later pin step fails): a restore would need pin
+// refcounting to be safe against other pins taken meanwhile. Manual CHECKPOINT —
+// and DETACH of the pinned database, whose close runs a shutdown checkpoint —
+// while pinned are outside the supported contract.
+void suppress_auto_checkpoint_for_pin(ClientContext& context)
+{
+  auto& config                       = DBConfig::GetConfig(context);
+  config.options.checkpoint_wal_size = NumericLimits<idx_t>::Maximum();
+  config.SetOptionByName("wal_autocheckpoint_entries", Value::UBIGINT(0));
+}
+
 // Resolve an attached duckdb table from the catalog and build its table_info for a
 // pin. The .db must be ATTACHed. The pin captures the table's (catalog, schema,
 // table) name from the resolved DuckTableEntry; that name tuple must match what a
@@ -1116,11 +1136,23 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // duckdb-native has no standalone reader, so both formats go through their
   // gpu_ingestible — one read path.
   std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
+  // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
+  // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
+  transaction_t duckdb_pin_v_base = 0;
 
   if (data.args.format == "duckdb") {
     auto info =
       build_duckdb_pin_info(context, data.args.name, data.args.schema, data.args.cols, batch_size);
-    ingestible = sirius::op::scan::make_ingestible(std::move(info));
+    // After the catalog resolution (so a bad table name fails without side
+    // effects) but before make_ingestible snapshots the on-disk row groups.
+    suppress_auto_checkpoint_for_pin(context);
+    // Not the default database's counter: each AttachedDatabase has its own MVCC
+    // start_time domain, and pins usually target an ATTACHed .db (the catalog
+    // resolved by build_duckdb_pin_info), so read the fence off that catalog's
+    // DuckTransaction.
+    auto& pinned_catalog = Catalog::GetCatalog(context, info->catalog_name);
+    duckdb_pin_v_base    = DuckTransaction::Get(context, pinned_catalog).start_time;
+    ingestible           = sirius::op::scan::make_ingestible(std::move(info));
   } else {  // parquet
     auto& fs   = FileSystem::GetFileSystem(context);
     auto files = fs.GlobFiles(data.args.path);
@@ -1147,22 +1179,37 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // GPU table before materializing the next. Peak GPU residency stays at ~one batch, so the
     // whole table never needs to fit in GPU memory. On multi-GPU the chunks land round-robin
     // across NUMA nodes; the cached-serve path then reads each chunk back on a NUMA-local GPU.
-    auto host_chunks = sirius::materialize_pin_to_host(
+    auto mat = sirius::materialize_pin_to_host(
       *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx());
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
-    scan_mgr.insert_pinned_entry_host(
-      data.args.name, std::move(cache_info), std::move(host_chunks), *representative_host_space);
+    scan_mgr.insert_pinned_entry_host(data.args.name,
+                                      std::move(cache_info),
+                                      std::move(mat.host_chunks),
+                                      *representative_host_space);
+    if (data.args.format == "duckdb") {
+      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
+      mvcc.v_base                   = duckdb_pin_v_base;
+      mvcc.base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
+      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+    }
   } else {
     // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
     // placement) and pin them in place.
     auto mat = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
+    auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),
                                  std::move(mat.tables),
                                  std::move(mat.chunk_memory_spaces));
+    if (data.args.format == "duckdb") {
+      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
+      mvcc.v_base                   = duckdb_pin_v_base;
+      mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
+      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+    }
   }
 
   output.SetCardinality(1);

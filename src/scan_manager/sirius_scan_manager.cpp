@@ -598,6 +598,33 @@ void sirius_scan_manager::insert_pinned_entry(
             std::to_string(i) + "] differs between existing and new entry");
         }
       }
+      // Per-chunk ROW counts must match too: the byte-budget coalescer can slice
+      // the same table at different row-group boundaries for a different column
+      // set (varchar byte budgets are data-dependent), which still yields equal
+      // chunk counts and — because round-robin placement is a function of chunk
+      // index alone — identical memory_spaces. Merging such chunks would corrupt
+      // the entry positionally (columns disagreeing on chunk boundaries) and
+      // silently invalidate the per-chunk MVCC row-count map a duckdb pin stamps
+      // via attach_mvcc_metadata. Reject loudly instead.
+      if (!entry.data_batches_by_column.empty()) {
+        auto const& existing_chunks = entry.data_batches_by_column.begin()->second;
+        if (existing_chunks.size() != data_tables.size()) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — existing entry has " +
+            std::to_string(existing_chunks.size()) + " chunks but the new materialization has " +
+            std::to_string(data_tables.size()));
+        }
+        for (std::size_t i = 0; i < data_tables.size(); ++i) {
+          if (!data_tables[i]) { continue; }
+          if (existing_chunks[i]->size() != data_tables[i]->num_rows()) {
+            throw std::runtime_error(
+              "[sirius_scan_manager::insert_pinned_entry] merge mismatch — chunk " +
+              std::to_string(i) + " has " + std::to_string(existing_chunks[i]->size()) +
+              " rows in the existing entry but " + std::to_string(data_tables[i]->num_rows()) +
+              " in the new materialization (same total, different chunk boundaries)");
+          }
+        }
+      }
       // Same row count → merge unique columns into the existing entry.
       // Decide which column INDICES are new BEFORE iterating chunks. Doing
       // the contains() check per-chunk would let chunk 0 install a new
@@ -693,6 +720,16 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.host_chunks  = std::move(host_chunks);
 
   _pinned_entries[name] = std::move(entry);
+}
+
+void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
+                                               duckdb_mvcc_metadata metadata)
+{
+  auto it = _pinned_entries.find(name);
+  if (it == _pinned_entries.end()) {
+    throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
+  }
+  it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
 }
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
