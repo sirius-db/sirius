@@ -288,7 +288,13 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
   plan_compound_builder builder;
   std::string jit_err;
   CodegenHead head;
-  if (!jit_encode_subtree(tree, n, col, stream, mr, builder, &jit_err, &head)) { return false; }
+  if (!jit_encode_subtree(tree, n, col, stream, mr, builder, &jit_err, &head)) {
+    // A codegen-only op (bitpack/delta/rle/...) has no generic compressor, so a
+    // real encode failure would otherwise surface as a misleading "unknown
+    // compressor" from the generic fallback. Report the actual reason.
+    if (!jit_err.empty()) set_error("fused encode of '" + root.op + "': " + jit_err);
+    return false;
+  }
   place_fused_leaves(tree, builder);
 
   // Build covered set early so the raw-passthrough loop can use it.

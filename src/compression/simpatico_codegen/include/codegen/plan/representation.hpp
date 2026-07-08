@@ -528,11 +528,12 @@ struct bitpack_compressed_representation : compressed_representation {
 
   PlanLeafKind kind() const override { return PlanLeafKind::Bitpack; }
 
-  /// Live byte count of the ``packed`` channel. O(1) — ``packed`` is the tight
-  /// Compact buffer for any stored rep, so this is simply its size.
+  /// Live byte count of the ``packed`` channel (UINT32 words: size x elem width).
   std::int64_t live_packed_bytes() const
   {
-    return static_cast<std::int64_t>(packed ? packed->size() : 0);
+    return packed ? static_cast<std::int64_t>(packed->size()) *
+                      static_cast<std::int64_t>(cudf::size_of(packed->type()))
+                  : 0;
   }
 
   /// Dense ctor. ``packed_data`` must already be tight/compact (no slot

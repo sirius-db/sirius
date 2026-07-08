@@ -260,8 +260,10 @@ void bitpack_compressed_representation::compact_in_place(rmm::cuda_stream_view s
   // dense rep contract) and degrade to a plain dense rep. The column's
   // logical size is the tight ``live`` byte count; the buffer carries the
   // extra readable gather slack past it.
-  packed                    = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT8),
-                                          static_cast<cudf::size_type>(live),
+  // packed is uint32 words; UINT32 (size = words) keeps a >2GB dense buffer under
+  // cudf's 2^31-element cap. `live` is a byte count and always a multiple of 4.
+  packed                    = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
+                                          static_cast<cudf::size_type>(live / 4),
                                           std::move(dense),
                                           rmm::device_buffer(0, stream, mr),
                                           0);

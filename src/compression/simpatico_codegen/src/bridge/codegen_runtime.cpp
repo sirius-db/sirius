@@ -833,7 +833,14 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           // the padded ``packed`` scratch tight before the rep is published.
           const std::int32_t stride_words = static_cast<std::int32_t>(
             spec.buffers[i_pkd].length / static_cast<std::size_t>(num_chunks));
-          const std::size_t packed_bytes = spec.buffers[i_pkd].length * 4;
+          // packed is uint32 words; a UINT32 column (size = word count) keeps a
+          // >2GB packed buffer under cudf's 2^31-element cap. Guard the >8GB edge.
+          if (spec.buffers[i_pkd].length > static_cast<std::size_t>(INT32_MAX)) {
+            std::fprintf(stderr,
+                         "simpatico::codegen: cpp encode: bitpack packed too large (%zu words)\n",
+                         spec.buffers[i_pkd].length);
+            return -1;
+          }
 
           // Construct the rep.  chunk_min's dtype follows the bitpack
           // channel's element size (from the renderer's emit_bitpack), not
@@ -860,9 +867,10 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                                          std::move(bufs[i_bits]),
                                                          rmm::device_buffer(0, stream),
                                                          0);
-          auto pkd_col  = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT8),
-                                                        static_cast<cudf::size_type>(packed_bytes),
-                                                        std::move(bufs[i_pkd]),
+          auto pkd_col  = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::UINT32),
+            static_cast<cudf::size_type>(spec.buffers[i_pkd].length),
+            std::move(bufs[i_pkd]),
                                                         rmm::device_buffer(0, stream),
                                                         0);
 
