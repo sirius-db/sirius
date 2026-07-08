@@ -15,6 +15,7 @@ use quent_analyzer::{
         events::{FsmEvents, FsmEventsBuilder},
     },
 };
+use quent_attributes::Attribute;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
 use quent_query_engine_ui::OperatorFilter;
@@ -32,7 +33,11 @@ pub trait TaskExt {
     fn executes_physical_operation(&self, physical_operator_id: u32) -> bool;
     fn matches_filter(&self, filter: &OperatorFilter) -> bool;
     fn active_span(&self) -> Option<SpanUnixNanoSec>;
-    fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine>;
+    fn try_to_ui_fsm(
+        &self,
+        epoch: TimeUnixNanoSec,
+        pipeline_name: Option<&str>,
+    ) -> AnalyzerResult<FiniteStateMachine>;
 }
 
 impl TaskExt for Task {
@@ -65,18 +70,39 @@ impl TaskExt for Task {
         SpanUnixNanoSec::try_new(start, end).ok()
     }
 
-    fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine> {
-        let transitions = self
-            .transitions()
+    fn try_to_ui_fsm(
+        &self,
+        epoch: TimeUnixNanoSec,
+        pipeline_name: Option<&str>,
+    ) -> AnalyzerResult<FiniteStateMachine> {
+        let raw = self.transitions();
+        let transitions = raw
             .iter()
-            .map(|transition| {
-                // Task-specific semantics live here: a Computing state's
-                // input_bytes is the quantity processed over the span, which
-                // lets the UI display a processing rate generically.
-                let processed_bytes = match &transition.data {
-                    ModelTaskTransition::Computing(data) => Some(data.input_bytes),
-                    _ => None,
-                };
+            .enumerate()
+            .map(|(i, transition)| {
+                let mut attributes = transition.attributes.clone();
+                // Task-specific semantics live here, emitted as plain
+                // attributes for the UI to render verbatim: a Computing
+                // state's input_bytes is the quantity processed over the
+                // span, so the processing rate can be derived from it.
+                if let ModelTaskTransition::Computing(data) = &transition.data
+                    && let Some(next) = raw.get(i + 1)
+                {
+                    let span_secs =
+                        (next.timestamp() - transition.timestamp()) as f64 / 1e9;
+                    if span_secs > 0.0 {
+                        attributes.push(Attribute::f64(
+                            "bytes_per_sec",
+                            data.input_bytes as f64 / span_secs,
+                        ));
+                    }
+                }
+                // The resolved pipeline chain rides along on every state so
+                // it shows on whichever span is hovered (created, which
+                // carries pipeline_uuid, is filtered off resource lanes).
+                if let Some(name) = pipeline_name {
+                    attributes.push(Attribute::string("pipeline", name));
+                }
                 Ok(FsmTransition {
                     name: transition.name().to_string(),
                     usages: transition
@@ -92,8 +118,7 @@ impl TaskExt for Task {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
-                    attributes: transition.attributes.clone(),
-                    processed_bytes,
+                    attributes,
                 })
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;
@@ -102,9 +127,6 @@ impl TaskExt for Task {
             id: self.id(),
             type_name: self.type_name().to_string(),
             instance_name: self.instance_name().to_string(),
-            // The pipeline the task executes is an Operator entity; linking it
-            // here lets the UI resolve and render the fused chain generically.
-            operator_id: self.pipeline_uuid(),
             transitions,
         })
     }
