@@ -183,13 +183,18 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   // Merge multiple batches, or use single batch directly if only one
   std::shared_ptr<::cucascade::data_batch> merged;
   if (input_batches.size() == 1) {
-    merged = input_batches[0].clone(sirius::get_next_batch_id(), stream);
+    const auto clone_batch_id = sirius::get_next_batch_id();
+    merged                    = input_batches[0].clone(
+      clone_batch_id,
+      stream,
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),
                                                      cudf_aggregates,
                                                      stream,
-                                                     *input_batches[0].get_memory_space());
+                                                     *input_batches[0].get_memory_space(),
+                                                     batch_telemetry());
   }
 
   // If no post-processing needed, return merged result directly
@@ -261,7 +266,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
-  auto result       = sirius::make_data_batch(std::move(output_table), *space, stream);
+  auto result = sirius::make_data_batch(std::move(output_table), *space, stream, batch_telemetry());
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }
