@@ -70,6 +70,13 @@ impl TaskExt for Task {
             .transitions()
             .iter()
             .map(|transition| {
+                // Task-specific semantics live here: a Computing state's
+                // input_bytes is the quantity processed over the span, which
+                // lets the UI display a processing rate generically.
+                let processed_bytes = match &transition.data {
+                    ModelTaskTransition::Computing(data) => Some(data.input_bytes),
+                    _ => None,
+                };
                 Ok(FsmTransition {
                     name: transition.name().to_string(),
                     usages: transition
@@ -86,6 +93,7 @@ impl TaskExt for Task {
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
                     attributes: transition.attributes.clone(),
+                    processed_bytes,
                 })
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;
@@ -94,6 +102,9 @@ impl TaskExt for Task {
             id: self.id(),
             type_name: self.type_name().to_string(),
             instance_name: self.instance_name().to_string(),
+            // The pipeline the task executes is an Operator entity; linking it
+            // here lets the UI resolve and render the fused chain generically.
+            operator_id: self.pipeline_uuid(),
             transitions,
         })
     }
