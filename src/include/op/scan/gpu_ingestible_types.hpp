@@ -86,15 +86,27 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
 
   /**
-   * @brief Estimated uncompressed byte count for the split.
+   * @brief Estimated decoded bytes for projected data columns before row filtering.
    *
    * Read by @c scan_operator_input::get_estimated_size_in_bytes for the
-   * reservation system; should reflect the GPU memory the materialize step
-   * will allocate (parquet: sum of reserved_uncompressed_bytes across the
-   * batch's row-group slices; duckdb-native: sum of row_group counts ×
-   * column widths). Returns 0 for splits with no a-priori size estimate.
+   * reservation system and execution history. A format may use decoded read
+   * columns as a nonzero history basis when no data column is projected.
+   * Returns 0 for splits with no a-priori size estimate.
    */
   [[nodiscard]] virtual std::size_t estimated_bytes() const noexcept { return 0; }
+
+  /**
+   * @brief Estimated decoded column buffers needed to materialize the split.
+   *
+   * Defaults to the projected-column estimate. Formats that decode additional
+   * transient columns, such as parquet pure-filter columns, override this to
+   * expose that memory separately from the execution-history basis. Decoder
+   * scratch and synthesized columns are not included.
+   */
+  [[nodiscard]] virtual std::size_t estimated_working_set_bytes() const noexcept
+  {
+    return estimated_bytes();
+  }
 };
 
 //===----------------------------------------------------------------------===//

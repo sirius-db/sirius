@@ -125,13 +125,13 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
 std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  // Match the legacy heuristics: pinned (cached) inputs are pass-throughs in the
-  // common case, so the estimate equals the input size. Fresh reads expand the
-  // input substantially (decompression + decode), so the parquet operator used
-  // an 8× factor. duckdb-native used 4×. Pick 8× as the safe upper bound — the
-  // reservation system clamps via downstream operator estimates anyway.
+  // Match the legacy 8x fresh-read heuristic for projected data, then add any
+  // filter-only columns that must also be decoded. Keeping the latter additive
+  // avoids applying the expansion factor twice to the transient working set.
   if (stats.resident) { return stats.bytes; }
-  return stats.bytes * 8;
+  auto const filter_only_bytes =
+    stats.working_set_bytes > stats.bytes ? stats.working_set_bytes - stats.bytes : 0;
+  return stats.bytes * 8 + filter_only_bytes;
 }
 
 }  // namespace sirius::op::scan

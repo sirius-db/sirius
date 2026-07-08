@@ -98,6 +98,8 @@ class scan_operator_input : public op::operator_data {
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override;
+
   [[nodiscard]] const scan_info& get_scan_info() const
   {
     if (!has_scan_metadata()) {

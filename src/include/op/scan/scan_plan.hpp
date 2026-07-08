@@ -146,9 +146,8 @@ struct scan_plan {
   [[nodiscard]] std::string batch_column_name(duckdb::idx_t batch_position) const;
 
   /// Batch positions of data columns that are read for filter evaluation but
-  /// not part of the output layout. The metadata scan uses this to exclude
-  /// pure-filter columns from the uncompressed-byte accounting that drives
-  /// row-group partitioning.
+  /// not part of the logical output layout. The metadata scan accounts for
+  /// these separately from projected data columns when estimating decode memory.
   [[nodiscard]] std::unordered_set<std::size_t> pure_filter_batch_positions() const;
 };
 
