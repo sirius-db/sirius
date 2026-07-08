@@ -91,20 +91,20 @@ scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_inf
   auto const file_working = file->estimated_working_set_bytes();
 
   auto coalescer = ingestible->create_batch_coalescer();
-  auto splits    = coalescer->push(std::move(file));
+  auto batches   = coalescer->push(std::move(file));
   auto tail      = coalescer->flush();
-  for (auto& split : tail) {
-    splits.push_back(std::move(split));
+  for (auto& batch : tail) {
+    batches.push_back(std::move(batch));
   }
-  REQUIRE(splits.size() == 1);
+  REQUIRE(batches.size() == 1);
 
-  auto* split = dynamic_cast<scan::parquet_split_info*>(splits.front().get());
-  REQUIRE(split);
-  CHECK(split->estimated_bytes() == file_output);
-  CHECK(split->estimated_working_set_bytes() == file_working);
-  return {split->estimated_bytes(),
-          split->estimated_working_set_bytes(),
-          split->plan->pure_filter_batch_positions().size()};
+  auto* batch = dynamic_cast<scan::parquet_split_info*>(batches.front().get());
+  REQUIRE(batch);
+  CHECK(batch->estimated_bytes() == file_output);
+  CHECK(batch->estimated_working_set_bytes() == file_working);
+  return {batch->estimated_bytes(),
+          batch->estimated_working_set_bytes(),
+          batch->plan->pure_filter_batch_positions().size()};
 }
 
 scan_estimates read_estimates(bool pure_filter, bool zero_output = false)
