@@ -138,8 +138,11 @@ TEST_CASE("count distinct: single batch, basic correctness",
   std::vector<int32_t> keys   = {0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2};
   std::vector<int32_t> values = {10, 20, 10, 30, 20, 40, 50, 40, 60, 60, 60};
 
-  auto input_batch = sirius::make_data_batch(
-    make_count_distinct_input<ValTraits>(keys, values, stream, mr), *space, stream);
+  auto input_batch =
+    sirius::make_data_batch(make_count_distinct_input<ValTraits>(keys, values, stream, mr),
+                            *space,
+                            stream,
+                            sirius::telemetry::batch_telemetry_info{});
 
   auto expected_table = make_count_distinct_expected({0, 1, 2}, {3, 2, 1}, stream, mr);
 
@@ -236,7 +239,8 @@ TEMPLATE_TEST_CASE("count distinct: multiple batches, randomly striped",
   // Run local aggregate on each split
   std::vector<std::shared_ptr<data_batch>> local_results;
   for (auto& split : splits) {
-    auto input_batch = sirius::make_data_batch(std::move(split), *space, stream);
+    auto input_batch = sirius::make_data_batch(
+      std::move(split), *space, stream, sirius::telemetry::batch_telemetry_info{});
     local_results.push_back(run_local(local_op, input_batch));
   }
 
@@ -286,17 +290,22 @@ TEST_CASE("count distinct: cross-batch duplicate deduplication within a partitio
   auto batch1 = sirius::make_data_batch(
     make_count_distinct_input<ValTraits>({0, 0, 1, 2}, {10, 20, 40, 60}, stream, mr),
     *space,
-    stream);
+    stream,
+    sirius::telemetry::batch_telemetry_info{});
 
   // Batch 2 — intentional cross-batch dups: (0,10), (1,40), (2,60)
   auto batch2 = sirius::make_data_batch(
     make_count_distinct_input<ValTraits>({0, 1, 1, 2}, {10, 50, 40, 60}, stream, mr),
     *space,
-    stream);
+    stream,
+    sirius::telemetry::batch_telemetry_info{});
 
   // Batch 3 — further cross-batch dups: (1,40), (2,60)
   auto batch3 = sirius::make_data_batch(
-    make_count_distinct_input<ValTraits>({0, 1, 2}, {30, 40, 60}, stream, mr), *space, stream);
+    make_count_distinct_input<ValTraits>({0, 1, 2}, {30, 40, 60}, stream, mr),
+    *space,
+    stream,
+    sirius::telemetry::batch_telemetry_info{});
 
   auto expected_table = make_count_distinct_expected({0, 1, 2}, {3, 2, 1}, stream, mr);
 
@@ -356,10 +365,14 @@ TEST_CASE("count distinct: mixed with regular aggregations, multiple batches",
   auto batch1 = sirius::make_data_batch(
     make_count_distinct_input<ValTraits>({0, 0, 0, 1, 1}, {10, 10, 20, 40, 40}, stream, mr),
     *space,
-    stream);
+    stream,
+    sirius::telemetry::batch_telemetry_info{});
 
   auto batch2 = sirius::make_data_batch(
-    make_count_distinct_input<ValTraits>({0, 0, 1}, {20, 30, 50}, stream, mr), *space, stream);
+    make_count_distinct_input<ValTraits>({0, 0, 1}, {20, 30, 50}, stream, mr),
+    *space,
+    stream,
+    sirius::telemetry::batch_telemetry_info{});
 
   // Build expected: [key(int32) | count_distinct(int64) | min(int32) | count(int64)]
   std::vector<std::unique_ptr<cudf::column>> exp_cols;
@@ -513,7 +526,9 @@ TEST_CASE("count distinct: multiple partitions with multiple batches per partiti
   std::vector<std::shared_ptr<data_batch>> local_p0;
   for (auto& split : splits0) {
     local_p0.push_back(
-      run_local(local_op, sirius::make_data_batch(std::move(split), *space, stream)));
+      run_local(local_op,
+                sirius::make_data_batch(
+                  std::move(split), *space, stream, sirius::telemetry::batch_telemetry_info{})));
   }
   auto result_p0 = merge_op.execute(pipelineable_operator_data(local_p0), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result_p0).get_data_batches().size() ==
@@ -529,7 +544,9 @@ TEST_CASE("count distinct: multiple partitions with multiple batches per partiti
   std::vector<std::shared_ptr<data_batch>> local_p1;
   for (auto& split : splits1) {
     local_p1.push_back(
-      run_local(local_op, sirius::make_data_batch(std::move(split), *space, stream)));
+      run_local(local_op,
+                sirius::make_data_batch(
+                  std::move(split), *space, stream, sirius::telemetry::batch_telemetry_info{})));
   }
   auto result_p1 = merge_op.execute(pipelineable_operator_data(local_p1), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result_p1).get_data_batches().size() ==
@@ -580,12 +597,18 @@ TEST_CASE("count distinct: multi-column struct expression",
   };
 
   // Batch 1
-  auto batch1 = sirius::make_data_batch(
-    make_3col_input({0, 0, 1, 1}, {10, 10, 30, 30}, {1, 1, 3, 3}), *space, stream);
+  auto batch1 =
+    sirius::make_data_batch(make_3col_input({0, 0, 1, 1}, {10, 10, 30, 30}, {1, 1, 3, 3}),
+                            *space,
+                            stream,
+                            sirius::telemetry::batch_telemetry_info{});
 
   // Batch 2 — introduces new combos and cross-batch dups
-  auto batch2 = sirius::make_data_batch(
-    make_3col_input({0, 0, 0, 1}, {10, 10, 20, 40}, {2, 1, 1, 3}), *space, stream);
+  auto batch2 =
+    sirius::make_data_batch(make_3col_input({0, 0, 0, 1}, {10, 10, 20, 40}, {2, 1, 1, 3}),
+                            *space,
+                            stream,
+                            sirius::telemetry::batch_telemetry_info{});
 
   // Expected: key=0 → 3 (combos: (10,1),(10,2),(20,1)), key=1 → 2 (combos: (30,3),(40,3))
   auto expected_table = make_count_distinct_expected({0, 1}, {3, 2}, stream, mr);

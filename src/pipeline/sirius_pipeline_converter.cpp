@@ -1210,7 +1210,7 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
   // min of 1 (no-op). For multi-GPU we force a floor equal to num_gpus on
   // big-enough inputs; small_table_bytes keeps tiny aggregations on a
   // single GPU to avoid cross-device overhead.
-  const int num_gpus = build_ctx_.num_gpus;
+  const int num_gpus = build_ctx_.num_gpus();
   if (num_gpus <= 1) return;
   // Heuristic threshold: below ~16 MiB per GPU the partition overhead
   // dominates. Configurable later if we find a workload where this matters.

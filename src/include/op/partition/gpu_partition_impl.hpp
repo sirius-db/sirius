@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "telemetry/data_batch_probe.hpp"
+
 #include <cudf/cudf_utils.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -26,6 +28,11 @@
 #include <vector>
 
 namespace sirius {
+
+namespace telemetry {
+class telemetry_context;
+}  // namespace telemetry
+
 namespace op {
 
 /**
@@ -57,7 +64,8 @@ class gpu_partition_impl {
     const std::vector<cudf::data_type>& partition_key_cast_types,
     int num_partitions,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
@@ -65,9 +73,11 @@ class gpu_partition_impl {
     const std::vector<int>& partition_key_idx,
     int num_partitions,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space)
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {})
   {
-    return hash_partition(input, partition_key_idx, {}, num_partitions, stream, memory_space);
+    return hash_partition(
+      input, partition_key_idx, {}, num_partitions, stream, memory_space, telemetry_info);
   }
 
   /**
@@ -84,7 +94,8 @@ class gpu_partition_impl {
     const cucascade::read_only_data_batch& input,
     int num_partitions,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 };
 
 }  // namespace op

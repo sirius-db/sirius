@@ -30,7 +30,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   const std::vector<cudf::data_type>& partition_key_cast_types,
   int num_partitions,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -95,7 +96,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
       std::make_unique<cudf::table>(sliced_partition_views[i].select(orig_col_indices),
                                     stream,
                                     memory_space.get_default_allocator());
-    output_batches.push_back(make_data_batch(std::move(output_partition), memory_space, stream));
+    output_batches.push_back(
+      make_data_batch(std::move(output_partition), memory_space, stream, telemetry_info));
   }
 
   return output_batches;
@@ -105,7 +107,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
   const cucascade::read_only_data_batch& input,
   int num_partitions,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -129,7 +132,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
   for (int i = 0; i < num_partitions; ++i) {
     auto output_partition = std::make_unique<cudf::table>(
       sliced_partition_views[i], stream, memory_space.get_default_allocator());
-    output_batches.push_back(make_data_batch(std::move(output_partition), memory_space, stream));
+    output_batches.push_back(
+      make_data_batch(std::move(output_partition), memory_space, stream, telemetry_info));
   }
 
   return output_batches;

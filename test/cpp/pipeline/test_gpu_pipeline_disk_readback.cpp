@@ -100,7 +100,8 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
 
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
-  return sirius::make_data_batch(std::move(table), gpu_space, stream);
+  return sirius::make_data_batch(
+    std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 }
 
 }  // namespace

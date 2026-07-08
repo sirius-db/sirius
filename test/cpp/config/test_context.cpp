@@ -459,7 +459,8 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
   auto table = sirius::create_cudf_table_with_random_data(
     /*num_rows=*/1024, col_types, ranges, build_stream, mr);
-  auto batch = sirius::make_data_batch(std::move(table), *gpu0, build_stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *gpu0, build_stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
   size_t original_bytes = 0;
   {

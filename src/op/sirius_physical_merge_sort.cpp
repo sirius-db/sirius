@@ -106,7 +106,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     }
     auto projected_table = std::make_unique<cudf::table>(
       cudf::table_view(projected_cols), stream, space->get_default_allocator());
-    return sirius::make_data_batch(std::move(projected_table), *space, stream);
+    return sirius::make_data_batch(std::move(projected_table), *space, stream, batch_telemetry());
   };
 
   // Single batch: no merge needed
@@ -140,7 +140,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   }
 
   auto merged_batch = gpu_merge_impl::merge_order_by(
-    input_batches, order_key_idx, column_order, null_precedence, stream, *space);
+    input_batches, order_key_idx, column_order, null_precedence, stream, *space, batch_telemetry());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (merged_batch) {

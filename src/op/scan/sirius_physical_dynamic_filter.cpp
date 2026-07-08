@@ -77,8 +77,8 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
                                        dynamic_filter_apply_mode::membership_masks_only,
                                        ro.get_memory_space()->get_device_id());
     if (filtered) {
-      output_batches.push_back(
-        sirius::make_data_batch(std::move(filtered), *ro.get_memory_space(), stream));
+      output_batches.push_back(sirius::make_data_batch(
+        std::move(filtered), *ro.get_memory_space(), stream, batch_telemetry()));
     } else {
       output_batches.push_back(idle_batches[i]);
     }

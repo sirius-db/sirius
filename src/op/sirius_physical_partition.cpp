@@ -181,16 +181,21 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                _partition_key_cast_types,
                                                                _num_partitions.value(),
                                                                stream,
-                                                               *space);
+                                                               *space,
+                                                               batch_telemetry());
       break;
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");
     case PartitionType::EVENLY:
       partitioned_results = gpu_partition_impl::evenly_partition(
-        input_batch_ro, _num_partitions.value(), stream, *space);
+        input_batch_ro, _num_partitions.value(), stream, *space, batch_telemetry());
       break;
     case PartitionType::NONE: {
-      partitioned_results = {input_batch_ro.clone(sirius::get_next_batch_id(), stream)};
+      const auto clone_batch_id = sirius::get_next_batch_id();
+      partitioned_results       = {input_batch_ro.clone(
+        clone_batch_id,
+        stream,
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id))};
       break;
     }
     case PartitionType::CUSTOM:

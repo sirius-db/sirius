@@ -143,7 +143,8 @@ struct pipeline_task_history_fixture {
                                                  gpu_mr);
     stream.synchronize();
 
-    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
     auto& registry = sirius::converter_registry::get();
     {
@@ -173,7 +174,8 @@ struct pipeline_task_history_fixture {
                                                  gpu_mr);
     stream.synchronize();
 
-    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
     return batch;
   }
 };
@@ -190,7 +192,7 @@ struct pipeline_context {
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_source = std::make_unique<stub_operator>();

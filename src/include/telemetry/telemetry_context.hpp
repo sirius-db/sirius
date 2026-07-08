@@ -26,6 +26,7 @@
 #include "telemetry-bridge/gen/task_queue.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry-bridge/gen/worker.rs.h"
+#include "telemetry/memory_context.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -47,7 +48,8 @@ namespace sirius::telemetry {
 class telemetry_context {
  public:
   [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
-    const sirius::telemetry_config& config);
+    const sirius::telemetry_config& config,
+    const cucascade::memory::memory_reservation_manager* manager = nullptr);
 
   ~telemetry_context();
 
@@ -62,9 +64,14 @@ class telemetry_context {
   /// The single, session-scoped query group that every query in this context is reported under.
   [[nodiscard]] const uuid::UUID& query_group_id() const { return query_group_uuid_; }
   [[nodiscard]] const quent::Context& context() const { return *context_; }
+  [[nodiscard]] const std::shared_ptr<const memory_context>& get_memory_context() const
+  {
+    return memory_context_;
+  }
 
  private:
-  explicit telemetry_context(const sirius::telemetry_config& config);
+  explicit telemetry_context(const sirius::telemetry_config& config,
+                             const cucascade::memory::memory_reservation_manager* manager);
 
   uuid::UUID engine_uuid_;
   uuid::UUID worker_uuid_;
@@ -73,6 +80,7 @@ class telemetry_context {
   rust::Box<quent::engine::EngineObserver> engine_observer_;
   rust::Box<quent::worker::WorkerObserver> worker_observer_;
   rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
+  std::shared_ptr<const memory_context> memory_context_;
 };
 
 // A POD to hold common identifiers for useful telemetry.

@@ -21,6 +21,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -368,6 +369,12 @@ void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_
 {
   assert(pipeline != nullptr);
   _pipeline = std::move(pipeline);
+}
+
+telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
+{
+  if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
+  return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
 }
 
 // implement get_all_ports

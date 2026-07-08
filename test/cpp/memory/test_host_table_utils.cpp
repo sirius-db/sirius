@@ -647,7 +647,8 @@ TEST_CASE("host_table_utils - metadata offsets match packed data",
   auto string_nulls = build_null_indices(num_rows, {1, 9, 64, 128, 256});
   apply_null_mask(table->get_column(1), int64_nulls, stream, mr);
   apply_null_mask(table->get_column(2), string_nulls, stream, mr);
-  auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
   expected_table_data expected;
   std::vector<uint8_t> expected_int64_mask;

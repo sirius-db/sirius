@@ -54,7 +54,7 @@ class wiring_test_env {
     return duckdb::make_shared_ptr<sirius_pipeline>(build_ctx);
   }
 
-  sirius::pipeline::pipeline_build_context build_ctx;
+  sirius::pipeline::pipeline_build_context build_ctx{nullptr};
 };
 
 // Build a pipeline with the given sink and operator list. `operators` may be

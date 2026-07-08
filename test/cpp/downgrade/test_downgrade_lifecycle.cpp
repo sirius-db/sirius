@@ -105,7 +105,8 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
 
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
 
-  return sirius::make_data_batch(std::move(table), gpu_space, stream);
+  return sirius::make_data_batch(
+    std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 }
 
 downgrade_executor make_test_executor(cucascade::shared_data_repository_manager& repo_mgr,

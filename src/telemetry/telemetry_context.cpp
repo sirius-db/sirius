@@ -34,12 +34,14 @@
 namespace sirius::telemetry {
 
 std::shared_ptr<const telemetry_context> telemetry_context::create(
-  const sirius::telemetry_config& config)
+  const sirius::telemetry_config& config,
+  const cucascade::memory::memory_reservation_manager* manager)
 {
-  return std::shared_ptr<telemetry_context>(new telemetry_context(config));
+  return std::shared_ptr<telemetry_context>(new telemetry_context(config, manager));
 }
 
-telemetry_context::telemetry_context(const sirius::telemetry_config& config)
+telemetry_context::telemetry_context(const sirius::telemetry_config& config,
+                                     const cucascade::memory::memory_reservation_manager* manager)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
     query_group_uuid_(uuid::now_v7()),
@@ -66,6 +68,8 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config)
                            .instance_name    = fmt::format("worker-{}", getpid()),
                          });
 
+  memory_context_ = std::make_shared<memory_context>(engine_uuid_, *context_, manager);
+
   // One session-scoped query group under this engine; every query in this context is reported
   // under it, so a whole run shows up as a single group rather than one group per query.
   query_group_observer_->declaration(
@@ -80,6 +84,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config)
 
 telemetry_context::~telemetry_context()
 {
+  memory_context_.reset();
   worker_observer_->exit(worker_uuid_);
   engine_observer_->exit(engine_uuid_);
 }
