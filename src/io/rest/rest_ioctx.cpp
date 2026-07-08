@@ -55,6 +55,10 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
     agg.terminal_failures_total += s.terminal_failures_total;
     agg.device_stream_sync_total += s.device_stream_sync_total;
     agg.payload_bytes_read_total += s.payload_bytes_read_total;
+    agg.native_footer_get_count += s.native_footer_get_count;
+    agg.native_footer_wall_ns_total += s.native_footer_wall_ns_total;
+    agg.native_footer_wall_ns_max =
+      std::max(agg.native_footer_wall_ns_max, s.native_footer_wall_ns_max);
   }
   return agg;
 }

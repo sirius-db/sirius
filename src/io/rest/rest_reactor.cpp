@@ -519,7 +519,8 @@ void rest_reactor::enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_requ
 
 rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_config_type& cfg,
                                                                   const io_object_type& file,
-                                                                  const io_object_segment& segment)
+                                                                  const io_object_segment& segment,
+                                                                  bool perf_footer_read)
 {
   if (segment.size == 0) { return rest_rx_request::create({}); }
 
@@ -556,12 +557,13 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   chunks.reserve(n_chunks);
   size_t pos = 0;  // byte offset within the segment
   for (size_t c = 0; c < n_chunks; ++c) {
-    size_t const piece = base + (c < rem ? 1 : 0);
-    auto req           = std::make_unique<rest_chunked_rx_request>();
-    req->object        = obj;
-    req->chunk         = io_object_segment{segment.offset + pos, piece, dst + pos};
-    req->file_size     = fsize;
-    req->manager       = manager;
+    size_t const piece    = base + (c < rem ? 1 : 0);
+    auto req              = std::make_unique<rest_chunked_rx_request>();
+    req->object           = obj;
+    req->chunk            = io_object_segment{segment.offset + pos, piece, dst + pos};
+    req->file_size        = fsize;
+    req->manager          = manager;
+    req->perf_footer_read = perf_footer_read;
     chunks.push_back(std::move(req));
     pos += piece;
   }
@@ -785,7 +787,8 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
   // full TCP+TLS handshake per call and duplicates the retry logic.  Build the
   // request, grab its future BEFORE enqueue (which moves the chunks out), then
   // block: get() rethrows the first reported error or returns the byte count.
-  auto req = prep_host_rx_request(_config, file, io_object_segment{offset, size, dst});
+  auto req = prep_host_rx_request(
+    _config, file, io_object_segment{offset, size, dst}, /*perf_footer_read=*/true);
   auto fut = req->get_future();
   enqueue(std::move(req));
   return std::move(fut).get();
@@ -794,19 +797,22 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
 rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
 {
   rest_perf_snapshot s;
-  s.chunk_get_ns_total       = _perf.chunk_get_ns_total.load(std::memory_order_relaxed);
-  s.chunk_get_count          = _perf.chunk_get_count.load(std::memory_order_relaxed);
-  s.chunk_get_ns_max         = _perf.chunk_get_ns_max.load(std::memory_order_relaxed);
-  s.queue_wait_ns_total      = _perf.queue_wait_ns_total.load(std::memory_order_relaxed);
-  s.queue_wait_count         = _perf.queue_wait_count.load(std::memory_order_relaxed);
-  s.ttfb_ns                  = _perf.ttfb_ns.load(std::memory_order_relaxed);
-  s.h2d_observed_ns_total    = _perf.h2d_observed_ns_total.load(std::memory_order_relaxed);
-  s.h2d_observed_count       = _perf.h2d_observed_count.load(std::memory_order_relaxed);
-  s.h2d_observed_ns_max      = _perf.h2d_observed_ns_max.load(std::memory_order_relaxed);
-  s.retries_total            = _perf.retries_total.load(std::memory_order_relaxed);
-  s.terminal_failures_total  = _perf.terminal_failures_total.load(std::memory_order_relaxed);
-  s.device_stream_sync_total = _perf.device_stream_sync_total.load(std::memory_order_relaxed);
-  s.payload_bytes_read_total = _perf.payload_bytes_read_total.load(std::memory_order_relaxed);
+  s.chunk_get_ns_total          = _perf.chunk_get_ns_total.load(std::memory_order_relaxed);
+  s.chunk_get_count             = _perf.chunk_get_count.load(std::memory_order_relaxed);
+  s.chunk_get_ns_max            = _perf.chunk_get_ns_max.load(std::memory_order_relaxed);
+  s.queue_wait_ns_total         = _perf.queue_wait_ns_total.load(std::memory_order_relaxed);
+  s.queue_wait_count            = _perf.queue_wait_count.load(std::memory_order_relaxed);
+  s.ttfb_ns                     = _perf.ttfb_ns.load(std::memory_order_relaxed);
+  s.h2d_observed_ns_total       = _perf.h2d_observed_ns_total.load(std::memory_order_relaxed);
+  s.h2d_observed_count          = _perf.h2d_observed_count.load(std::memory_order_relaxed);
+  s.h2d_observed_ns_max         = _perf.h2d_observed_ns_max.load(std::memory_order_relaxed);
+  s.retries_total               = _perf.retries_total.load(std::memory_order_relaxed);
+  s.terminal_failures_total     = _perf.terminal_failures_total.load(std::memory_order_relaxed);
+  s.device_stream_sync_total    = _perf.device_stream_sync_total.load(std::memory_order_relaxed);
+  s.payload_bytes_read_total    = _perf.payload_bytes_read_total.load(std::memory_order_relaxed);
+  s.native_footer_get_count     = _perf.native_footer_get_count.load(std::memory_order_relaxed);
+  s.native_footer_wall_ns_total = _perf.native_footer_wall_ns_total.load(std::memory_order_relaxed);
+  s.native_footer_wall_ns_max   = _perf.native_footer_wall_ns_max.load(std::memory_order_relaxed);
   return s;
 }
 
@@ -1536,11 +1542,23 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - req.t_submit)
                                          .count());
+          // chunk_get_count keeps its established meaning — every completed
+          // ranged GET, footer host_reads included (the #1087 s3-bench
+          // bind_chunk_get and the routing-perf tests depend on that).  The
+          // native_footer_* counters are an ADDITIONAL, footer-isolated view: a
+          // blocking single host_read (the native parquet binder's footer /
+          // metadata fetch) bumps both, so A0 can read the footer phase without
+          // changing chunk_get's semantics.
           _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
           _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
           atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
           std::uint64_t expected = 0;
           _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
+          if (req.perf_footer_read) {
+            _perf.native_footer_get_count.fetch_add(1, std::memory_order_relaxed);
+            _perf.native_footer_wall_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
+            atomic_max_relaxed(_perf.native_footer_wall_ns_max, get_ns);
+          }
         }
         if (req.is_device()) {
           // Issue the async H2D copy.  Bounce-staged reads need a CUDA event so

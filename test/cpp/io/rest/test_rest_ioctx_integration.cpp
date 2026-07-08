@@ -700,12 +700,13 @@ sirius::io::rest::config direct_rest_test_config()
 }
 
 std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint,
-                                                   sirius::io::rest::config cfg)
+                                                   sirius::io::rest::config cfg,
+                                                   std::size_t n_reactors = 1)
 {
   auto authorizer = std::make_shared<fixed_url_authorizer>(std::move(endpoint));
   auto ctx        = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
     cfg, std::move(authorizer), nullptr);
-  auto ioctx = std::make_shared<rest_ioctx>(1, std::move(ctx));
+  auto ioctx = std::make_shared<rest_ioctx>(n_reactors, std::move(ctx));
   ioctx->start();
   return ioctx;
 }
@@ -742,6 +743,133 @@ TEST_CASE("rest_ioctx lists S3 objects with sizes and follows encoded continuati
   CHECK(server.list_count() == 3);
   CHECK(server.get_count() == 0);
   CHECK(server.head_count() == 0);
+}
+
+TEST_CASE("rest perf snapshot attributes native footer reads separately from chunk reads",
+          "[s3][integration][rest][perf]")
+{
+  SECTION("native footer counters exist and default to zero")
+  {
+    sirius::io::rest::rest_perf_snapshot snapshot{};
+    CHECK(snapshot.native_footer_get_count == 0);
+    CHECK(snapshot.native_footer_wall_ns_total == 0);
+    CHECK(snapshot.native_footer_wall_ns_max == 0);
+  }
+
+  SECTION("blocking host_read network GETs are counted and pool-aggregated")
+  {
+    auto payload = deterministic_payload(16 * 1024);
+    range_http_server server(payload);
+    auto cfg                  = direct_rest_test_config();
+    cfg.perf_instrumentation  = true;
+    cfg.max_connections       = 1;
+    std::size_t const readers = 2;
+    auto ioctx                = make_direct_rest_ioctx(server.endpoint(), cfg, readers);
+    auto datasource           = ioctx->open_datasource("s3://footer-bucket/native-footer.bin",
+                                             static_cast<std::uint64_t>(payload.size()));
+
+    auto const before = ioctx->perf_snapshot();
+
+    std::array<std::uint8_t, 64> first{};
+    REQUIRE(datasource->host_read(17, first.size(), first.data()) == first.size());
+    require_bytes_equal(first, std::span<std::uint8_t const>(payload.data() + 17, first.size()));
+
+    std::array<std::uint8_t, 32> second{};
+    REQUIRE(datasource->host_read(4096, second.size(), second.data()) == second.size());
+    require_bytes_equal(second,
+                        std::span<std::uint8_t const>(payload.data() + 4096, second.size()));
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.native_footer_get_count == before.native_footer_get_count + readers);
+    CHECK(after.native_footer_wall_ns_total > before.native_footer_wall_ns_total);
+    CHECK(after.native_footer_wall_ns_max > 0);
+    CHECK(after.chunk_get_count == before.chunk_get_count + readers);
+    CHECK(server.get_count() == readers);
+  }
+
+  SECTION("stash-served parquet footer reads are not counted as native network footer reads")
+  {
+    auto const parquet    = read_binary_file(committed_parquet_fixture("nation.parquet"));
+    auto const footer_len = static_cast<std::size_t>(parquet_footer_len(parquet));
+    auto const footer_off = parquet.size() - 8 - footer_len;
+    range_http_server server(parquet);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = true;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource          = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+
+    auto const before = ioctx->perf_snapshot();
+
+    std::array<std::uint8_t, 8> trailer{};
+    REQUIRE(datasource->host_read(
+              parquet.size() - trailer.size(), trailer.size(), trailer.data()) == trailer.size());
+    require_bytes_equal(trailer,
+                        std::span<std::uint8_t const>(parquet.data() + parquet.size() - 8, 8));
+
+    std::vector<std::uint8_t> footer(footer_len);
+    REQUIRE(datasource->host_read(footer_off, footer.size(), footer.data()) == footer.size());
+    require_bytes_equal(footer,
+                        std::span<std::uint8_t const>(parquet.data() + footer_off, footer_len));
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.native_footer_get_count == before.native_footer_get_count);
+    CHECK(after.native_footer_wall_ns_total == before.native_footer_wall_ns_total);
+    CHECK(after.native_footer_wall_ns_max == before.native_footer_wall_ns_max);
+    CHECK(server.get_count() == 1);
+  }
+
+  SECTION("async chunk reads bump chunk counters without touching native footer counters")
+  {
+    auto payload = deterministic_payload(64 * 1024);
+    range_http_server server(payload);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = true;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource          = ioctx->open_datasource("s3://footer-bucket/chunk-data.bin",
+                                             static_cast<std::uint64_t>(payload.size()));
+
+    std::vector<std::uint8_t> a(257);
+    std::vector<std::uint8_t> b(1024);
+    std::array<sirius::io::io_object_segment, 2> segments{
+      sirius::io::io_object_segment{17, a.size(), a.data()},
+      sirius::io::io_object_segment{4096, b.size(), b.data()}};
+
+    auto const before = ioctx->perf_snapshot();
+    auto got =
+      std::move(ioctx->host_read_ranges_async_io(datasource->io_object(), segments)).get(5s);
+    auto const after = ioctx->perf_snapshot();
+
+    REQUIRE(got == a.size() + b.size());
+    require_bytes_equal(a, std::span<std::uint8_t const>(payload.data() + 17, a.size()));
+    require_bytes_equal(b, std::span<std::uint8_t const>(payload.data() + 4096, b.size()));
+    CHECK(after.chunk_get_count > before.chunk_get_count);
+    CHECK(after.native_footer_get_count == before.native_footer_get_count);
+    CHECK(after.native_footer_wall_ns_total == before.native_footer_wall_ns_total);
+    CHECK(after.native_footer_wall_ns_max == before.native_footer_wall_ns_max);
+  }
+
+  SECTION("native footer counters are gated off when perf instrumentation is disabled")
+  {
+    auto payload = deterministic_payload(4096);
+    range_http_server server(payload);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = false;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource          = ioctx->open_datasource("s3://footer-bucket/perf-off.bin",
+                                             static_cast<std::uint64_t>(payload.size()));
+
+    std::array<std::uint8_t, 128> out{};
+    REQUIRE(datasource->host_read(99, out.size(), out.data()) == out.size());
+    require_bytes_equal(out, std::span<std::uint8_t const>(payload.data() + 99, out.size()));
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.native_footer_get_count == 0);
+    CHECK(after.native_footer_wall_ns_total == 0);
+    CHECK(after.native_footer_wall_ns_max == 0);
+    CHECK(server.get_count() == 1);
+  }
 }
 
 TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",

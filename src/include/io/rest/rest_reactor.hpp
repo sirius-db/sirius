@@ -151,6 +151,15 @@ struct rest_perf_snapshot {
   // over every completed curl attempt incl. retries / partial / failed bodies.
   // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
   std::uint64_t payload_bytes_read_total{0};
+  // perf_instrumentation-gated: an ADDITIONAL, footer-isolated view of blocking
+  // host_read GETs that hit the network (the native parquet binder reads footers
+  // this way; column data goes through the async chunk path).  These GETs are
+  // ALSO counted in chunk_get_count above — native_footer_* does not remove them,
+  // it isolates the footer phase for A0.  Stash-served host_reads issue no GET
+  // and are counted by neither.
+  std::uint64_t native_footer_get_count{0};
+  std::uint64_t native_footer_wall_ns_total{0};
+  std::uint64_t native_footer_wall_ns_max{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -225,7 +234,8 @@ class rest_reactor {
 
   static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
                                                const io_object_type& file,
-                                               const io_object_segment& segment);
+                                               const io_object_segment& segment,
+                                               bool perf_footer_read = false);
 
   static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
                                                 const io_object_type& file,
@@ -358,6 +368,9 @@ class rest_reactor {
     std::atomic<std::uint64_t> terminal_failures_total{0};
     std::atomic<std::uint64_t> device_stream_sync_total{0};
     std::atomic<std::uint64_t> payload_bytes_read_total{0};
+    std::atomic<std::uint64_t> native_footer_get_count{0};
+    std::atomic<std::uint64_t> native_footer_wall_ns_total{0};
+    std::atomic<std::uint64_t> native_footer_wall_ns_max{0};
   };
   perf_counters _perf;
 

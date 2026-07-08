@@ -96,6 +96,12 @@ struct rest_chunked_rx_request {
   // take the event-synchronized recycle path (see needs_event_for_synchronization).
   bool staged_through_bounce{false};
 
+  // perf_instrumentation attribution: set on the blocking single host_read path
+  // (rest_reactor::host_read → prep_host_rx_request), the way DuckDB's native
+  // parquet binder reads footers.  finish() then counts this GET as a native
+  // footer read instead of an async scan chunk, keeping the two disjoint.
+  bool perf_footer_read{false};
+
   // perf (set only when the reactor's perf_instrumentation is on): t_enqueue at
   // queue insertion, t_submit at dequeue onto a connection; their delta is the
   // queue_wait sample (attempt 0 only), and t_submit anchors the chunk_get span.
