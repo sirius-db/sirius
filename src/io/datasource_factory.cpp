@@ -49,7 +49,7 @@ namespace {
 // the write side so callers don't need to remember which side does it. Used
 // by both register_ioctx and lookup so a register("S3", ...) is found by a
 // lookup("s3"), and vice versa.
-std::string to_lower_scheme(std::string_view s)
+[[maybe_unused]] std::string to_lower_scheme(std::string_view s)
 {
   std::string out;
   out.reserve(s.size());
