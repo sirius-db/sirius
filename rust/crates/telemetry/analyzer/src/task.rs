@@ -80,18 +80,18 @@ impl TaskExt for Task {
             .iter()
             .enumerate()
             .map(|(i, transition)| {
-                let mut attributes = transition.attributes.clone();
-                // Task-specific semantics live here, emitted as plain
+                // Task-specific semantics live here, emitted as derived
                 // attributes for the UI to render verbatim: a Computing
                 // state's input_bytes is the quantity processed over the
                 // span, so the processing rate can be derived from it.
+                let mut derived_attributes = vec![];
                 if let ModelTaskTransition::Computing(data) = &transition.data
                     && let Some(next) = raw.get(i + 1)
                 {
                     let span_secs =
                         (next.timestamp() - transition.timestamp()) as f64 / 1e9;
                     if span_secs > 0.0 {
-                        attributes.push(Attribute::f64(
+                        derived_attributes.push(Attribute::f64(
                             "bytes_per_sec",
                             data.input_bytes as f64 / span_secs,
                         ));
@@ -101,7 +101,7 @@ impl TaskExt for Task {
                 // it shows on whichever span is hovered (created, which
                 // carries pipeline_uuid, is filtered off resource lanes).
                 if let Some(name) = pipeline_name {
-                    attributes.push(Attribute::string("pipeline", name));
+                    derived_attributes.push(Attribute::string("pipeline", name));
                 }
                 Ok(FsmTransition {
                     name: transition.name().to_string(),
@@ -118,7 +118,11 @@ impl TaskExt for Task {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
-                    attributes,
+                    // The statically typed -> dynamically typed attribute
+                    // conversion happens only here, after long-entity
+                    // filtering — never for FSMs that won't be displayed.
+                    attributes: transition.attributes(),
+                    derived_attributes,
                 })
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;
