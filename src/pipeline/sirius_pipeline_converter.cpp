@@ -1167,21 +1167,26 @@ void sirius_pipeline_converter::link_join_partition_siblings()
     // for each hash join as a source, get the dependencies (concat) and get the dependencies of
     // concat (partition)
     if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
+      auto& hash_join               = pipeline->source->Cast<op::sirius_physical_hash_join>();
       auto build_concat_pipeline    = pipeline->dependencies[0];
       auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
       auto probe_concat_pipeline    = pipeline->dependencies[1];
       auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
-      // Change probe partition barrier to partial. The corresponding port doesn't exist
-      // yet (materialisation happens after `convert()` returns); mutate the descriptor
-      // so the materialiser creates the port with the correct barrier type.
+      bool const is_right_delim     = build_partition_pipeline->get_sink()->type ==
+                                  op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
+      // RIGHT_DELIM_JOIN must bootstrap its probe subtree from build-side distinct data.
+      bool const probe_drives_partition_count = hash_join.is_right_family() && !is_right_delim;
+
+      // Probe partitions normally stream through a partial barrier. A RIGHT-family join must
+      // size from the complete probe input because CONCAT retains the whole probe partition.
       auto wiring_it = std::find_if(
         repository_wirings_.begin(), repository_wirings_.end(), [&](const repository_wiring& w) {
           return w.dest_pipeline == probe_partition_pipeline && w.port_id == "default";
         });
       D_ASSERT(wiring_it != repository_wirings_.end());
-      wiring_it->barrier_type = op::MemoryBarrierType::PARTIAL;
-      if (build_partition_pipeline->get_sink()->type ==
-          op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+      wiring_it->barrier_type =
+        probe_drives_partition_count ? op::MemoryBarrierType::FULL : op::MemoryBarrierType::PARTIAL;
+      if (is_right_delim) {
         // partition pipeline only has one operator
         auto& right_delim_join_op =
           build_partition_pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
@@ -1198,6 +1203,10 @@ void sirius_pipeline_converter::link_join_partition_siblings()
           probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
         build_partition_op.set_sibling_partition_op(&probe_partition_op);
         probe_partition_op.set_sibling_partition_op(&build_partition_op);
+        if (probe_drives_partition_count) {
+          build_partition_op.set_drives_partition_count(false);
+          probe_partition_op.set_drives_partition_count(true);
+        }
       }
     }
   }

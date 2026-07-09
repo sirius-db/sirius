@@ -62,6 +62,8 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   bool is_build_partition();
 
+  void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }
+
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
   [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
@@ -120,6 +122,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   std::vector<cudf::data_type> _partition_key_cast_types;
   std::optional<int> _num_partitions;
   bool _is_build;
+  bool _drives_partition_count{false};
   bool _has_sibling_partition_op;
   PartitionType _partition_type;
   uint64_t s_partition_size;

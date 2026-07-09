@@ -140,6 +140,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * conditional table columns.
    */
   static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions);
+
+  [[nodiscard]] bool is_right_family() const
+  {
+    return join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI ||
+           join_type == duckdb::JoinType::RIGHT_ANTI;
+  }
+
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
