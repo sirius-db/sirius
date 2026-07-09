@@ -304,10 +304,8 @@ struct dictionary_compressed_representation : compressed_representation {
                                         cudf::mask_state::UNALLOCATED,
                                         stream,
                                         rmm::mr::get_current_device_resource_ref());
-        cudaMemsetAsync(keys_offsets_synth->mutable_view().head<void>(),
-                        0,
-                        sizeof(std::int32_t),
-                        stream.value());
+        cudaMemsetAsync(
+          keys_offsets_synth->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
         cudaStreamSynchronize(stream.value());
       }
       outputs.push_back({"keys_offsets", keys_offsets_synth->view()});
@@ -390,11 +388,8 @@ struct dictionary_compressed_representation : compressed_representation {
     rmm::device_buffer bits = cudf::copy_bitmask(source, stream, mr);
     auto const mask_bytes =
       static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(source.size()));
-    null_mask_copy = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
-                                                    mask_bytes,
-                                                    std::move(bits),
-                                                    rmm::device_buffer{},
-                                                    0);
+    null_mask_copy = std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::UINT8}, mask_bytes, std::move(bits), rmm::device_buffer{}, 0);
     cudaStreamSynchronize(stream.value());
   }
 };
@@ -433,8 +428,9 @@ struct str_split_compressed_representation : compressed_representation {
     std::string* error_out);
 
   // The decomposed channels. mutable: decompress() moves them into make_strings_column.
-  mutable std::unique_ptr<cudf::column> offsets_;    // INT32 (or INT64 for >2GB chars), size num_rows+1
-  mutable std::unique_ptr<cudf::column> chars_;      // UINT8, or widened (UINT32/UINT64) past 2GB
+  mutable std::unique_ptr<cudf::column>
+    offsets_;                                    // INT32 (or INT64 for >2GB chars), size num_rows+1
+  mutable std::unique_ptr<cudf::column> chars_;  // UINT8, or widened (UINT32/UINT64) past 2GB
   mutable std::unique_ptr<cudf::column> null_mask_;  // UINT8 bitmask bytes, or null (no nulls)
 
   str_split_compressed_representation(cudf::size_type n_rows,
@@ -647,48 +643,34 @@ struct bitpack_compressed_representation : compressed_representation {
 };
 
 // -----------------------------------------------------------------------------
-// nvcomp ANS / Bitcomp compressors
+// nvcomp-backed representations
 // -----------------------------------------------------------------------------
-
-struct ans_compressed_representation : compressed_representation {
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out,
-    leaf_meta_v const& meta = leaf_meta::none{});
-
-  size_t uncompressed_size;
+//
+// Every nvcomp codec (ans/bitcomp/cascaded and the simpler snappy/lz4/deflate)
+// stores the same thing: an opaque, worst-case-sized compressed byte payload
+// plus its actual size, surfaced as a single lazy "output" channel. This base
+// owns that storage and plumbing; concrete reps add codec-specific metadata
+// fields and supply kind()/describe_meta()/decompress().
+struct nvcomp_payload_rep : compressed_representation {
+  size_t uncompressed_size = 0;
   std::unique_ptr<rmm::device_buffer> compressed_data;  // worst-case sized
-  size_t compressed_size;                               // actual bytes used
-  // STRING path (original_type == STRING): compressed_data holds the offsets
-  // codec stream (first `offsets_compressed_size` bytes) followed by the chars
-  // stream; `uncompressed_size` is the chars byte count. Zero for fixed-width.
-  size_t offsets_compressed_size   = 0;
-  size_t offsets_uncompressed_size = 0;
-  cudf::data_type offsets_type{cudf::type_id::INT32};
+  size_t compressed_size = 0;                           // actual bytes used
   // Lazily built UINT8 column of exactly compressed_size bytes (trimmed
-  // payload, no header), exposed via named_channels() for downstream
-  // chaining (e.g. `ans.output -> bitcomp`).
+  // payload, no header), exposed via named_channels() for downstream chaining
+  // (e.g. `ans.output -> bitcomp`).
   mutable std::unique_ptr<cudf::column> serialized_output;
 
-  ans_compressed_representation(cudf::data_type t,
-                                cudf::size_type n,
-                                std::unique_ptr<rmm::device_buffer> data,
-                                size_t comp_size,
-                                size_t uncomp_size)
+  nvcomp_payload_rep(cudf::data_type t,
+                     cudf::size_type n,
+                     std::unique_ptr<rmm::device_buffer> data,
+                     size_t comp_sz,
+                     size_t uncomp_sz)
     : compressed_representation(t, n),
-      uncompressed_size(uncomp_size),
+      uncompressed_size(uncomp_sz),
       compressed_data(std::move(data)),
-      compressed_size(comp_size)
+      compressed_size(comp_sz)
   {
   }
-
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) const override;
-
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override;
 
   // compressed_size is known at construction — no need to build the lazy column.
   size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
@@ -698,6 +680,70 @@ struct ans_compressed_representation : compressed_representation {
     if (name == "output" && serialized_output) return std::move(serialized_output);
     return nullptr;
   }
+
+  // Single "output" channel: a lazy device→device copy of the compressed
+  // payload into a UINT8 column, built once and cached.
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override
+  {
+    if (!serialized_output) {
+      // The resulting column's device_buffer remembers ``stream`` for its own
+      // eventual deallocation, so the caller-supplied stream must stay valid
+      // for the column's lifetime (a private stream destroyed at the end of
+      // this scope would leave a dangling handle). The producing stream is
+      // always synced before named_channels() is called, so compressed_data
+      // is already coherent.
+      auto mr  = rmm::mr::get_current_device_resource_ref();
+      auto out = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
+                                               static_cast<cudf::size_type>(compressed_size),
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+      if (compressed_size > 0 && compressed_data) {
+        cudaMemcpyAsync(out->mutable_view().head<uint8_t>(),
+                        compressed_data->data(),
+                        compressed_size,
+                        cudaMemcpyDeviceToDevice,
+                        stream.value());
+      }
+      cudaStreamSynchronize(stream.value());
+      serialized_output = std::move(out);
+    }
+    return {{"output", serialized_output->view()}};
+  }
+};
+
+// -----------------------------------------------------------------------------
+// nvcomp ANS / Bitcomp compressors
+// -----------------------------------------------------------------------------
+
+struct ans_compressed_representation : nvcomp_payload_rep {
+  static std::unique_ptr<compressed_representation> from_outputs(
+    std::vector<std::string> const& output_names,
+    std::vector<std::unique_ptr<cudf::column>> outputs,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    std::string* error_out,
+    leaf_meta_v const& meta = leaf_meta::none{});
+
+  // STRING path (original_type == STRING): compressed_data holds the offsets
+  // codec stream (first `offsets_compressed_size` bytes) followed by the chars
+  // stream; `uncompressed_size` is the chars byte count. Zero for fixed-width.
+  size_t offsets_compressed_size   = 0;
+  size_t offsets_uncompressed_size = 0;
+  cudf::data_type offsets_type{cudf::type_id::INT32};
+
+  ans_compressed_representation(cudf::data_type t,
+                                cudf::size_type n,
+                                std::unique_ptr<rmm::device_buffer> data,
+                                size_t comp_size,
+                                size_t uncomp_size)
+    : nvcomp_payload_rep(t, n, std::move(data), comp_size, uncomp_size)
+  {
+  }
+
+  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr) const override;
+
   PlanLeafKind kind() const override { return PlanLeafKind::Ans; }
   leaf_meta_v describe_meta() const override
   {
@@ -729,7 +775,7 @@ struct ans_compressor : compressor {
 // any other suffix.
 bool parse_bitcomp_suffix(std::string_view suffix, int* algorithm);
 
-struct bitcomp_compressed_representation : compressed_representation {
+struct bitcomp_compressed_representation : nvcomp_payload_rep {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -738,9 +784,6 @@ struct bitcomp_compressed_representation : compressed_representation {
     std::string* error_out,
     leaf_meta_v const& meta = leaf_meta::none{});
 
-  size_t uncompressed_size;
-  std::unique_ptr<rmm::device_buffer> compressed_data;  // worst-case sized
-  size_t compressed_size;                               // actual bytes used
   // Algorithm used at compress time so decompress hits the same
   // Manager cache slot.
   int compress_algorithm;
@@ -750,10 +793,6 @@ struct bitcomp_compressed_representation : compressed_representation {
   size_t offsets_compressed_size   = 0;
   size_t offsets_uncompressed_size = 0;
   cudf::data_type offsets_type{cudf::type_id::INT32};
-  // Lazily built UINT8 column of exactly compressed_size bytes (trimmed
-  // payload, no header), exposed via named_channels() for downstream
-  // chaining (e.g. `bitcomp.output -> ans`).
-  mutable std::unique_ptr<cudf::column> serialized_output;
 
   bitcomp_compressed_representation(cudf::data_type t,
                                     cudf::size_type n,
@@ -761,10 +800,7 @@ struct bitcomp_compressed_representation : compressed_representation {
                                     size_t comp_size,
                                     size_t uncomp_size,
                                     int algorithm = 0)
-    : compressed_representation(t, n),
-      uncompressed_size(uncomp_size),
-      compressed_data(std::move(data)),
-      compressed_size(comp_size),
+    : nvcomp_payload_rep(t, n, std::move(data), comp_size, uncomp_size),
       compress_algorithm(algorithm)
   {
   }
@@ -772,16 +808,6 @@ struct bitcomp_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override;
-
-  // compressed_size is known at construction — no need to build the lazy column.
-  size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
-
-  std::unique_ptr<cudf::column> release_output(std::string const& name) override
-  {
-    if (name == "output" && serialized_output) return std::move(serialized_output);
-    return nullptr;
-  }
   PlanLeafKind kind() const override { return PlanLeafKind::Bitcomp; }
   leaf_meta_v describe_meta() const override
   {
@@ -830,7 +856,7 @@ struct bitcomp_compressor : compressor {
 // responsibility to fall back).
 bool parse_nvcomp_cascaded_suffix(std::string_view suffix, int* deltas, int* rles, int* bp);
 
-struct cascaded_compressed_representation : compressed_representation {
+struct cascaded_compressed_representation : nvcomp_payload_rep {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -839,16 +865,11 @@ struct cascaded_compressed_representation : compressed_representation {
     std::string* error_out,
     leaf_meta_v const& meta = leaf_meta::none{});
 
-  size_t uncompressed_size;
-  std::unique_ptr<rmm::device_buffer> compressed_data;
-  size_t compressed_size;
   // Opts used at compress time — stashed so decompress hits the same Manager
   // cache key.
   int compress_num_deltas;
   int compress_num_RLEs;
   int compress_use_bp;
-  // Lazily built UINT8 column of exactly compressed_size bytes.
-  mutable std::unique_ptr<cudf::column> serialized_output;
 
   cascaded_compressed_representation(cudf::data_type t,
                                      cudf::size_type n,
@@ -858,10 +879,7 @@ struct cascaded_compressed_representation : compressed_representation {
                                      int num_deltas,
                                      int num_RLEs,
                                      int use_bp)
-    : compressed_representation(t, n),
-      uncompressed_size(uncomp_size),
-      compressed_data(std::move(data)),
-      compressed_size(comp_size),
+    : nvcomp_payload_rep(t, n, std::move(data), comp_size, uncomp_size),
       compress_num_deltas(num_deltas),
       compress_num_RLEs(num_RLEs),
       compress_use_bp(use_bp)
@@ -871,15 +889,6 @@ struct cascaded_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override;
-
-  size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
-
-  std::unique_ptr<cudf::column> release_output(std::string const& name) override
-  {
-    if (name == "output" && serialized_output) return std::move(serialized_output);
-    return nullptr;
-  }
   PlanLeafKind kind() const override { return PlanLeafKind::NvcompCascaded; }
   leaf_meta_v describe_meta() const override
   {
@@ -914,71 +923,21 @@ struct cascaded_compressor : compressor {
 // -----------------------------------------------------------------------------
 // Simple nvcomp codecs: Snappy, LZ4, GDeflate ("deflate" in the DSL)
 //
-// All three share the same rep layout (compressed byte payload + sizes) and
-// the same metadata structure.  The template base holds all common fields and
-// methods; each concrete struct supplies:
-//  - named_channels() / decompress()  — defined in the matching .cu file
-//  - from_outputs()                   — defined in representation_factory.cpp
+// All three share the same rep layout (compressed byte payload + sizes, held by
+// nvcomp_payload_rep) and the same metadata structure. This template base fixes
+// kind()/describe_meta() from its parameters; each concrete struct supplies:
+//  - decompress()   — manager-specific, defined in the matching .cu file
+//  - from_outputs() — defined in representation_factory.cpp
 // -----------------------------------------------------------------------------
 
 template <PlanLeafKind K, typename MetaT>
-struct nvcomp_simple_rep_base : compressed_representation {
-  size_t uncompressed_size = 0;
-  std::unique_ptr<rmm::device_buffer> compressed_data;
-  size_t compressed_size = 0;
-  mutable std::unique_ptr<cudf::column> serialized_output;
+struct nvcomp_simple_rep_base : nvcomp_payload_rep {
+  using nvcomp_payload_rep::nvcomp_payload_rep;
 
-  nvcomp_simple_rep_base(cudf::data_type t,
-                         cudf::size_type n,
-                         std::unique_ptr<rmm::device_buffer> data,
-                         size_t comp_sz,
-                         size_t uncomp_sz)
-    : compressed_representation(t, n),
-      uncompressed_size(uncomp_sz),
-      compressed_data(std::move(data)),
-      compressed_size(comp_sz)
-  {
-  }
-
-  size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
-
-  std::unique_ptr<cudf::column> release_output(std::string const& name) override
-  {
-    if (name == "output" && serialized_output) return std::move(serialized_output);
-    return nullptr;
-  }
   PlanLeafKind kind() const override { return K; }
   leaf_meta_v describe_meta() const override
   {
     return MetaT{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
-  }
-
-  // named_channels() is identical for all simple nvcomp reps: lazy D2D copy
-  // of the compressed payload into a UINT8 column.
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override
-  {
-    if (!serialized_output) {
-      // The resulting column's device_buffer remembers ``stream`` for its own
-      // eventual deallocation, so the caller-supplied stream must stay valid
-      // for the column's lifetime (a private stream destroyed at the end of
-      // this scope would leave a dangling handle).
-      auto mr  = rmm::mr::get_current_device_resource_ref();
-      auto out = cudf::make_fixed_width_column(cudf::data_type(cudf::type_id::UINT8),
-                                               static_cast<cudf::size_type>(compressed_size),
-                                               cudf::mask_state::UNALLOCATED,
-                                               stream,
-                                               mr);
-      if (compressed_size > 0 && compressed_data) {
-        cudaMemcpyAsync(out->mutable_view().head<uint8_t>(),
-                        compressed_data->data(),
-                        compressed_size,
-                        cudaMemcpyDeviceToDevice,
-                        stream.value());
-      }
-      cudaStreamSynchronize(stream.value());
-      serialized_output = std::move(out);
-    }
-    return {{"output", serialized_output->view()}};
   }
 
   // decompress() is manager-specific — defined in the matching .cu file.
