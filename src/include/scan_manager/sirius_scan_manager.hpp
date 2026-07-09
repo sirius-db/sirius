@@ -150,6 +150,22 @@ struct pinned_entry {
   std::size_t num_rows{0};
 };
 
+/// Validate that @p entry can serve @p selected_columns (positions into
+/// @c entry.cache_info.column_ids) without truncation. GPU tier: every
+/// selected column must be present in @c data_batches_by_column with exactly
+/// n_chunks non-null chunks, and @c chunk_memory_spaces must cover every chunk
+/// with non-null spaces. HOST tier: every host chunk must be non-null.
+/// Zero-chunk entries are legitimate and pass. Throws std::runtime_error
+/// naming the offending column/condition.
+///
+/// Serve-time defense against malformed entries: the cached serving loop reads
+/// a nullptr batch as end-of-stream, so a column with fewer chunks (or a null
+/// chunk) would silently end the scan early — fewer rows than requested, no
+/// error. @ref sirius_scan_manager::try_assign_cached_entries calls this before
+/// attaching the provider and converts a throw into a disk-read fallback.
+void validate_pinned_entry_for_serving(pinned_entry const& entry,
+                                       std::span<std::size_t const> selected_columns);
+
 /**
  * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
  *

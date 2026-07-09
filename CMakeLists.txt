@@ -608,6 +608,7 @@ set(TEST_SOURCES
     test/cpp/io/rest/test_rest_reactor.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
+    test/cpp/scan_manager/test_cached_serving_hardening.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
