@@ -364,6 +364,105 @@ TEST_CASE("sirius_physical_hash_join mark join - build-on-left (cudf::mark_join)
           std::vector<bool>{false, true, false, true});
 }
 
+// Issue #1076: MARK joins must emit a NULL mark (not false) for an unmatched left row when the
+// build/right side contains a NULL join key. left {1,2,3} vs right {2, NULL} -> [NULL, true, NULL].
+TEST_CASE("sirius_physical_hash_join mark join - right side has NULL key", "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {1, 2, 3};
+  std::vector<int32_t> left_payload = {10, 20, 30};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  // Right key column = {2, NULL}: only 2 is a real key; the NULL taints every non-match to NULL.
+  auto right_batch =
+    make_numeric_batch_with_nulls<int32_t>(*space, {2, 0}, {true, false}, cudf::type_id::INT32);
+
+  auto f = create_mark_join();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(out_view.num_rows() == 3);
+
+  auto mark = out_view.column(2);
+  REQUIRE(mark.null_count() == 2);
+  REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false, true, false});
+  REQUIRE(copy_column_to_host<bool>(mark)[1] == true);  // the one matched row
+}
+
+// Issue #1076: an unmatched left row with a NULL probe key is NULL, not false, even when the build
+// side has no NULL key. left {1, NULL, 2} vs right {2} -> [false, NULL, true].
+TEST_CASE("sirius_physical_hash_join mark join - probe side has NULL key", "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // Left key column carries a NULL at row 1; payload is a plain column.
+  auto left_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 0, 2}, {true, false, true}, cudf::type_id::INT32);
+  auto left_payload = make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32);
+  auto left_batch   = concatenate_batches_horizontal({left_key, left_payload}, *space);
+
+  auto right_batch = make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32);
+
+  auto f = create_mark_join();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(out_view.num_rows() == 3);
+
+  auto mark = out_view.column(2);
+  REQUIRE(mark.null_count() == 1);
+  REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{true, false, true});
+  auto values = copy_column_to_host<bool>(mark);
+  REQUIRE(values[0] == false);  // 1 has no match, probe valid, right clean -> false
+  REQUIRE(values[2] == true);   // 2 matches -> true
+}
+
+// Issue #1076: the same NULL semantics must hold on the build-on-left (cudf::mark_join) path.
+TEST_CASE("sirius_physical_hash_join mark join - right NULL key on build-on-left path",
+          "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {10, 20, 30, 40};
+  std::vector<int32_t> left_payload = {1, 2, 3, 4};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  // Right (probe) side larger than left to trigger the switch; {20, 40} match and a NULL is
+  // present.
+  auto right_batch =
+    make_numeric_batch_with_nulls<int32_t>(*space,
+                                           {20, 40, 0, 11, 12, 13, 14},
+                                           {true, true, false, true, true, true, true},
+                                           cudf::type_id::INT32);
+
+  auto f                                    = create_mark_join();
+  f.hash_join->mark_join_build_switch_ratio = 1.0;
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(out_view.num_rows() == 4);
+
+  auto mark = out_view.column(2);
+  REQUIRE(mark.null_count() == 2);
+  REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false, true, false, true});
+}
+
 //===----------------------------------------------------------------------===//
 // Nested-loop join projection-map regression tests
 //===----------------------------------------------------------------------===//
