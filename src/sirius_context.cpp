@@ -957,6 +957,26 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   return RebindQueryInfo::DO_NOT_REBIND;
 }
 
+RebindQueryInfo SiriusContext::OnExecutePrepared(ClientContext& context,
+                                                 PreparedStatementCallbackInfo& info,
+                                                 RebindQueryInfo current_rebind)
+{
+  // GPU eligibility can drift with data alone (e.g. an insert pushes a varchar past
+  // the overflow-string limit) and data changes never trigger DuckDB's own rebind.
+  // By execute time the CPU plan has been discarded, so a stale
+  // PhysicalSiriusExecution would error with no fallback. Rebind instead:
+  // OnFinalizePrepare re-decides against current stats and keeps the fresh CPU plan
+  // when create_plan now refuses.
+  auto& prepared = info.prepared_statement;
+  if (!prepared.unbound_statement || !prepared.physical_plan) { return current_rebind; }
+  auto& root = prepared.physical_plan->Root();
+  if (root.type == sirius::transparent::PhysicalSiriusExecution::TYPE &&
+      dynamic_cast<sirius::transparent::PhysicalSiriusExecution*>(&root) != nullptr) {
+    return RebindQueryInfo::ATTEMPT_TO_REBIND;
+  }
+  return current_rebind;
+}
+
 void SiriusContext::throw_if_not_initialized() const
 {
   if (!is_initialized_) { throw std::runtime_error("Sirius context is not initialized."); }
