@@ -7,16 +7,16 @@ edition.workspace = true
 instrumentation-model = { path = "../model" }
 # TODO: flip back to rapidsai/quent once rapidsai/quent#323 merges — temporarily
 # tracks the PR branch on the felipeblazing fork (per-transition attributes).
-quent-attributes = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-simulator-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-analyzer = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-events = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-model = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-query-engine-analyzer = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-query-engine-model = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-query-engine-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-time = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
+quent-attributes = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-simulator-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-analyzer = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-events = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-model = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-query-engine-analyzer = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-query-engine-model = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-query-engine-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-time = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
 rustc-hash = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }

@@ -80,10 +80,7 @@ impl TaskExt for Task {
             .iter()
             .enumerate()
             .map(|(i, transition)| {
-                // Task-specific semantics live here, emitted as derived
-                // attributes for the UI to render verbatim: a Computing
-                // state's input_bytes is the quantity processed over the
-                // span, so the processing rate can be derived from it.
+                // Derive the processing rate from input_bytes over the span.
                 let mut derived_attributes = vec![];
                 if let ModelTaskTransition::Computing(data) = &transition.data
                     && let Some(next) = raw.get(i + 1)
@@ -97,9 +94,8 @@ impl TaskExt for Task {
                         ));
                     }
                 }
-                // The resolved pipeline chain rides along on every state so
-                // it shows on whichever span is hovered (created, which
-                // carries pipeline_uuid, is filtered off resource lanes).
+                // Stamped on every transition — created, which carries
+                // pipeline_uuid, is filtered off resource lanes.
                 if let Some(name) = pipeline_name {
                     derived_attributes.push(Attribute::string("pipeline", name));
                 }
@@ -118,9 +114,6 @@ impl TaskExt for Task {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
-                    // The statically typed -> dynamically typed attribute
-                    // conversion happens only here, after long-entity
-                    // filtering — never for FSMs that won't be displayed.
                     attributes: transition.attributes(),
                     derived_attributes,
                 })

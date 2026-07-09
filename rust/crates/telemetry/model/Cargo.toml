@@ -9,13 +9,13 @@ collector = ["quent-model/collector"]
 [dependencies]
 # TODO: flip back to rapidsai/quent once rapidsai/quent#323 merges — temporarily
 # tracks the PR branch on the felipeblazing fork (per-transition attributes).
-quent-attributes = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-model = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-query-engine-model = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
-quent-stdlib = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
+quent-attributes = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-model = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-query-engine-model = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
+quent-stdlib = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }
 uuid = "1"
 
 [build-dependencies]
 # Captures this crate's git provenance into QUENT_SOURCE_* so the model! macro's
 # generated ModelSource records Sirius (not quent) as the model's source.
-quent-build-info = { git = "https://github.com/felipeblazing/quent.git", rev = "1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05" }
+quent-build-info = { git = "https://github.com/felipeblazing/quent.git", rev = "1ec1c1418d324d3587f948374abf9435033ec65f" }

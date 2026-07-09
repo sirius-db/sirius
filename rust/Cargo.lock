@@ -1743,7 +1743,7 @@ dependencies = [
 [[package]]
 name = "quent-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-attributes",
  "quent-events",
@@ -1761,7 +1761,7 @@ dependencies = [
 [[package]]
 name = "quent-attributes"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "serde",
  "thiserror",
@@ -1771,7 +1771,7 @@ dependencies = [
 [[package]]
 name = "quent-build-info"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "serde",
  "serde_json",
@@ -1780,7 +1780,7 @@ dependencies = [
 [[package]]
 name = "quent-codegen"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "convert_case",
  "prettyplease",
@@ -1793,7 +1793,7 @@ dependencies = [
 [[package]]
 name = "quent-collector"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-collector-client",
  "quent-collector-proto",
@@ -1807,7 +1807,7 @@ dependencies = [
 [[package]]
 name = "quent-collector-client"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "ciborium",
  "http",
@@ -1826,7 +1826,7 @@ dependencies = [
 [[package]]
 name = "quent-collector-proto"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "prost",
  "tonic",
@@ -1837,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "quent-events"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-attributes",
  "quent-time",
@@ -1848,7 +1848,7 @@ dependencies = [
 [[package]]
 name = "quent-exporter"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "http",
  "quent-events",
@@ -1864,7 +1864,7 @@ dependencies = [
 [[package]]
 name = "quent-exporter-collector"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "async-trait",
  "http",
@@ -1878,7 +1878,7 @@ dependencies = [
 [[package]]
 name = "quent-exporter-msgpack"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1893,7 +1893,7 @@ dependencies = [
 [[package]]
 name = "quent-exporter-ndjson"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1908,7 +1908,7 @@ dependencies = [
 [[package]]
 name = "quent-exporter-postcard"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "async-trait",
  "postcard",
@@ -1923,7 +1923,7 @@ dependencies = [
 [[package]]
 name = "quent-exporter-types"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1933,7 +1933,7 @@ dependencies = [
 [[package]]
 name = "quent-instrumentation"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-attributes",
  "quent-build-info",
@@ -1950,7 +1950,7 @@ dependencies = [
 [[package]]
 name = "quent-model"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "ciborium",
  "quent-attributes",
@@ -1969,7 +1969,7 @@ dependencies = [
 [[package]]
 name = "quent-model-macros"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -1980,7 +1980,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-analyzer",
  "quent-attributes",
@@ -1997,7 +1997,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-model"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-attributes",
  "quent-model",
@@ -2008,7 +2008,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-server"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "axum",
  "mime_guess",
@@ -2040,7 +2040,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-ui"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-analyzer",
  "quent-attributes",
@@ -2055,7 +2055,7 @@ dependencies = [
 [[package]]
 name = "quent-simulator-ui"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-analyzer",
  "serde",
@@ -2066,7 +2066,7 @@ dependencies = [
 [[package]]
 name = "quent-stdlib"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-model",
  "serde",
@@ -2076,7 +2076,7 @@ dependencies = [
 [[package]]
 name = "quent-time"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "serde",
  "thiserror",
@@ -2086,7 +2086,7 @@ dependencies = [
 [[package]]
 name = "quent-ui"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05#1b43e55d56ee886ba13a4290f44d6b1f5ec3aa05"
+source = "git+https://github.com/felipeblazing/quent.git?rev=1ec1c1418d324d3587f948374abf9435033ec65f#1ec1c1418d324d3587f948374abf9435033ec65f"
 dependencies = [
  "quent-analyzer",
  "quent-attributes",
