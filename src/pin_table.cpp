@@ -18,6 +18,7 @@
 
 #include "data/sirius_converter_registry.hpp"
 #include "io/io_context.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
@@ -99,6 +100,35 @@ void clear_recorded_unpin_calls()
 
 namespace sirius {
 
+// A coalescer change that splits a row group across batches or reorders batches
+// must fail the pin loudly here instead of silently misaligning the per-chunk
+// visibility masks built over these boundaries (full contract in pin_table.hpp).
+void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
+                               std::size_t chunk_rows,
+                               std::size_t rows_before_chunk)
+{
+  auto const* native = dynamic_cast<const op::scan::duckdb_native_scan_info*>(&batch);
+  if (native == nullptr) { return; }
+
+  std::size_t next_row = rows_before_chunk;
+  for (auto const& rg : native->row_groups) {
+    if (static_cast<std::size_t>(rg.row_group_start) != next_row) {
+      throw std::runtime_error(
+        "[pin_table] duckdb-native batch breaks the whole-row-group contiguity invariant: row "
+        "group " +
+        std::to_string(rg.row_group_index) + " starts at row " +
+        std::to_string(rg.row_group_start) + " but the pin has materialized rows [0, " +
+        std::to_string(next_row) + ")");
+    }
+    next_row += rg.row_count;
+  }
+  if (next_row - rows_before_chunk != chunk_rows) {
+    throw std::runtime_error(
+      "[pin_table] duckdb-native chunk decoded " + std::to_string(chunk_rows) +
+      " rows but its row-group metadata covers " + std::to_string(next_row - rows_before_chunk));
+  }
+}
+
 namespace {
 
 /// Per-materialized-batch sink: receives one GPU-resident table, its GPU placement, and the
@@ -145,6 +175,10 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
 
   auto coalescer = ingestible.create_batch_coalescer();
 
+  // Rows materialized so far, in emission order — feeds the chunk-contiguity
+  // validation (duckdb-native pins only).
+  std::size_t rows_materialized = 0;
+
   // Materialize one coalesced batch into a GPU-resident cudf::table and hand it to on_batch
   // together with its GPU placement + the decode stream. Mirrors
   // load_balancing_scan_batch_coalescer::process_provider_inputs, minus the connector/balancer
@@ -174,8 +208,11 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
     // post_filter_and_project (which would only apply a row filter or re-project to a
     // query's output layout, neither of which a pin needs). `batch` is borrowed by const
     // ref and outlives the call.
-    auto materialized = ingestible.materialize_metadata_to_table(*batch, *target, stream);
-    auto tbl          = materialized.table.release(stream, target->get_default_allocator());
+    auto materialized     = ingestible.materialize_metadata_to_table(*batch, *target, stream);
+    auto tbl              = materialized.table.release(stream, target->get_default_allocator());
+    auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
+    validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
+    rows_materialized += chunk_rows;
     on_batch(std::move(tbl), target, stream);
   };
 
@@ -202,29 +239,31 @@ materialized_pin materialize_all_batches(
   io::sirius_ioctx& io_ctx)
 {
   materialized_pin out;
-  materialize_pin_batches(ingestible,
-                          gpu_spaces,
-                          io_ctx,
-                          [&](std::unique_ptr<cudf::table> tbl,
-                              cucascade::memory::memory_space* target,
-                              rmm::cuda_stream_view stream) {
-                            // Cached GPU batches are stored with a null writer stream, so the data
-                            // must be fully resident before it can be served or host-converted.
-                            stream.synchronize();
-                            out.tables.emplace_back(std::move(tbl));
-                            out.chunk_memory_spaces.push_back(target);
-                          });
+  materialize_pin_batches(
+    ingestible,
+    gpu_spaces,
+    io_ctx,
+    [&](std::unique_ptr<cudf::table> tbl,
+        cucascade::memory::memory_space* target,
+        rmm::cuda_stream_view stream) {
+      // Cached GPU batches are stored with a null writer stream, so the data
+      // must be fully resident before it can be served or host-converted.
+      stream.synchronize();
+      out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
+      out.tables.emplace_back(std::move(tbl));
+      out.chunk_memory_spaces.push_back(target);
+    });
   return out;
 }
 
-std::vector<std::shared_ptr<cucascade::host_data_representation>> materialize_pin_to_host(
+materialized_host_pin materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx)
 {
   auto& registry = converter_registry::get();
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  materialized_host_pin out;
 
   materialize_pin_batches(
     ingestible,
@@ -242,14 +281,15 @@ std::vector<std::shared_ptr<cucascade::host_data_representation>> materialize_pi
       // so the host copy is complete once convert() returns. The explicit sync below is
       // belt-and-suspenders before gpu_repr (which owns the GPU table's buffers) leaves scope.
       auto* target_host_space = host_space_by_gpu.at(src_space->get_device_id());
+      out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
       auto host_repr =
         registry.convert<cucascade::host_data_representation>(gpu_repr, target_host_space, stream);
       stream.synchronize();
-      host_chunks.emplace_back(std::move(host_repr));
+      out.host_chunks.emplace_back(std::move(host_repr));
     });
 
-  return host_chunks;
+  return out;
 }
 
 }  // namespace sirius
