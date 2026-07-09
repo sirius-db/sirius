@@ -15,8 +15,10 @@
  */
 
 #include <catch.hpp>
+#include <duckdb/common/constants.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 #include <filesystem>
@@ -112,6 +114,38 @@ scan_estimates read_estimates(bool pure_filter, bool zero_output = false)
   return read_estimates(make_nation_info(pure_filter, zero_output));
 }
 
+duckdb::vector<std::string> plan_names()
+{
+  return {"n_nationkey", "n_name", "n_regionkey", "n_comment", "year"};
+}
+
+duckdb::vector<std::string> data_plan_names()
+{
+  return {"n_nationkey", "n_name", "n_regionkey", "n_comment"};
+}
+
+duckdb::vector<sirius::logical_type> plan_types()
+{
+  return {sirius::logical_type::make(sirius::type_id::INTEGER),
+          sirius::logical_type::make(sirius::type_id::VARCHAR),
+          sirius::logical_type::make(sirius::type_id::INTEGER),
+          sirius::logical_type::make(sirius::type_id::VARCHAR),
+          sirius::logical_type::make(sirius::type_id::INTEGER)};
+}
+
+duckdb::vector<sirius::logical_type> data_plan_types()
+{
+  return {sirius::logical_type::make(sirius::type_id::INTEGER),
+          sirius::logical_type::make(sirius::type_id::VARCHAR),
+          sirius::logical_type::make(sirius::type_id::INTEGER),
+          sirius::logical_type::make(sirius::type_id::VARCHAR)};
+}
+
+duckdb::vector<duckdb::HivePartitioningIndex> year_partition()
+{
+  return {duckdb::HivePartitioningIndex("2024", 4)};
+}
+
 }  // namespace
 
 TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][sizing]")
@@ -168,4 +202,97 @@ TEST_CASE("parquet partition-only scans keep a nonzero history basis", "[scan][p
   REQUIRE(partition_only.pure_filter_columns == 1);
   CHECK(partition_only.output_bytes > 0);
   CHECK(partition_only.working_set_bytes == partition_only.output_bytes);
+}
+
+TEST_CASE("parquet scan plan avoids empty reader projection for hive count star",
+          "[scan][parquet][hive][scan_plan]")
+{
+  auto const names = plan_names();
+  auto const types = plan_types();
+
+  SECTION("virtual-only count star with hive partitions is not reader-projected")
+  {
+    duckdb::vector<duckdb::ColumnIndex> column_ids{
+      duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID)};
+    duckdb::vector<duckdb::idx_t> projection_ids;
+
+    auto plan = scan::build_scan_plan(column_ids,
+                                      projection_ids,
+                                      names,
+                                      types,
+                                      /*output_types_size=*/0,
+                                      year_partition());
+
+    CHECK_FALSE(plan.needs_reader_projection);
+    CHECK_FALSE(plan.is_projected());
+    CHECK(plan.data_columns.empty());
+    CHECK(plan.output_layout.empty());
+    CHECK_FALSE(plan.has_partitions());
+  }
+
+  SECTION("count star with a retained real filter column still projects the reader")
+  {
+    duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(3)};
+    duckdb::vector<duckdb::idx_t> projection_ids{0};
+
+    auto plan = scan::build_scan_plan(column_ids,
+                                      projection_ids,
+                                      names,
+                                      types,
+                                      /*output_types_size=*/0,
+                                      duckdb::vector<duckdb::HivePartitioningIndex>{});
+
+    CHECK(plan.needs_reader_projection);
+    CHECK(plan.is_projected());
+    REQUIRE(plan.data_columns.size() == 1);
+    CHECK(plan.data_columns[0].primary_idx == 3);
+    CHECK(plan.output_layout.empty());
+  }
+
+  SECTION("partition-only output injects partitions without projecting an empty data read")
+  {
+    duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(4)};
+    duckdb::vector<duckdb::idx_t> projection_ids;
+
+    auto plan = scan::build_scan_plan(column_ids,
+                                      projection_ids,
+                                      names,
+                                      types,
+                                      /*output_types_size=*/1,
+                                      year_partition());
+
+    CHECK_FALSE(plan.needs_reader_projection);
+    CHECK_FALSE(plan.is_projected());
+    CHECK(plan.data_columns.empty());
+    REQUIRE(plan.partition_columns.size() == 1);
+    CHECK(plan.partition_columns[0].primary_idx == 4);
+    CHECK(plan.partition_columns[0].name == "year");
+    CHECK(plan.has_partitions());
+    REQUIRE(plan.output_layout.size() == 1);
+    CHECK(plan.output_layout[0].source == scan::scan_plan::output_entry::PARTITION);
+  }
+
+  SECTION("select star over data columns remains an unprojected identity read")
+  {
+    auto const data_names = data_plan_names();
+    auto const data_types = data_plan_types();
+    duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0),
+                                                   duckdb::ColumnIndex(1),
+                                                   duckdb::ColumnIndex(2),
+                                                   duckdb::ColumnIndex(3)};
+    duckdb::vector<duckdb::idx_t> projection_ids;
+
+    auto plan = scan::build_scan_plan(column_ids,
+                                      projection_ids,
+                                      data_names,
+                                      data_types,
+                                      /*output_types_size=*/4,
+                                      duckdb::vector<duckdb::HivePartitioningIndex>{});
+
+    CHECK_FALSE(plan.needs_reader_projection);
+    CHECK_FALSE(plan.is_projected());
+    REQUIRE(plan.data_columns.size() == 4);
+    REQUIRE(plan.output_layout.size() == 4);
+    CHECK_FALSE(plan.has_partitions());
+  }
 }
