@@ -247,6 +247,7 @@ set(EXTENSION_SOURCES
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
     src/io/s3/sigv4.cpp
+    src/io/s3/sirius_httpfs.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
@@ -683,6 +684,7 @@ if(SIRIUS_BUILD_S3_TESTS)
     APPEND
     TEST_SOURCES
     test/cpp/utils/s3_container.cpp
+    test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp)
