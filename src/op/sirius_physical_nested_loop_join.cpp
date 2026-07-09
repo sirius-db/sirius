@@ -55,6 +55,14 @@ static bool nlj_is_equality(sirius::comparison_type c)
   return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
 }
 
+// Null-safe comparisons treat NULL as an ordinary value: a NULL operand yields a definite
+// TRUE/FALSE, never UNKNOWN.
+static bool nlj_is_null_safe(sirius::comparison_type c)
+{
+  return c == sirius::comparison_type::distinct_from ||
+         c == sirius::comparison_type::not_distinct_from;
+}
+
 void reorder_conditions(duckdb::vector<sirius::join_condition>& conditions)
 {
   bool is_ordered     = true;
@@ -352,14 +360,31 @@ cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
   switch (comparison) {
     case sirius::comparison_type::equal: return cudf::ast::ast_operator::EQUAL;
     case sirius::comparison_type::not_distinct_from: return cudf::ast::ast_operator::NULL_EQUAL;
-    case sirius::comparison_type::not_equal:
-    case sirius::comparison_type::distinct_from: return cudf::ast::ast_operator::NOT_EQUAL;
+    case sirius::comparison_type::not_equal: return cudf::ast::ast_operator::NOT_EQUAL;
+    case sirius::comparison_type::distinct_from:
+      // No single null-safe cuDF operator; the condition loop builds NOT(NULL_EQUAL) instead
+      // (NOT_EQUAL would be null-propagating and wrong for NULL operands).
+      break;
     case sirius::comparison_type::lt: return cudf::ast::ast_operator::LESS;
     case sirius::comparison_type::gt: return cudf::ast::ast_operator::GREATER;
     case sirius::comparison_type::le: return cudf::ast::ast_operator::LESS_EQUAL;
     case sirius::comparison_type::ge: return cudf::ast::ast_operator::GREATER_EQUAL;
   }
   throw std::runtime_error("sirius_physical_nested_loop_join: unsupported comparison type");
+}
+
+/// @brief Left-associative LOGICAL_AND over @p terms, appending the (terms.size()-1) AND nodes to
+/// @p chain, which must be reserved to at least that size — cudf::ast::operation stores operands by
+/// reference, so a reallocation would dangle them. Returns the root expression.
+const cudf::ast::expression& fold_logical_and(
+  const std::vector<std::reference_wrapper<const cudf::ast::expression>>& terms,
+  std::vector<cudf::ast::operation>& chain)
+{
+  for (size_t i = 1; i < terms.size(); i++) {
+    const cudf::ast::expression& lhs = (i == 1) ? terms[0].get() : chain.back();
+    chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND, lhs, terms[i].get());
+  }
+  return chain.empty() ? terms[0].get() : chain.back();
 }
 
 // Resolve table column index: BOUND_REF, BOUND_CAST(BOUND_REF), or BOUND_SUBQUERY (scalar
@@ -655,10 +680,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     std::vector<cudf::ast::column_reference> left_refs;
     std::vector<cudf::ast::column_reference> right_refs;
     std::vector<cudf::ast::operation> cond_ops;
+    std::vector<cudf::ast::operation> distinct_inner_ops;  // NULL_EQUAL nodes under distinct_from
     std::vector<cudf::ast::operation> and_chain;
     left_refs.reserve(conditions.size());
     right_refs.reserve(conditions.size());
     cond_ops.reserve(conditions.size());
+    distinct_inner_ops.reserve(conditions.size());
     and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
     std::vector<cudf::column_view> left_col_views, right_col_views;
     std::vector<std::unique_ptr<cudf::column>> intermediates_scope_holder;
@@ -736,25 +763,24 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
 
       left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
       right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);
-      cond_ops.emplace_back(to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
+      if (cond.comparison == sirius::comparison_type::distinct_from) {
+        // IS DISTINCT FROM is null-safe (NULL vs 5 is TRUE, NULL vs NULL is FALSE) but cuDF's
+        // NOT_EQUAL is null-propagating, so build NOT(NULL_EQUAL(l, r)) instead.
+        distinct_inner_ops.emplace_back(
+          cudf::ast::ast_operator::NULL_EQUAL, left_refs.back(), right_refs.back());
+        cond_ops.emplace_back(cudf::ast::ast_operator::NOT, distinct_inner_ops.back());
+      } else {
+        cond_ops.emplace_back(
+          to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
+      }
     }
 
     cudf::table_view left_effective(left_col_views);
     cudf::table_view right_effective(right_col_views);
 
-    // Build a left-associative AND chain referencing cond_ops elements directly — never copying
-    // operations, matching the cuDF test pattern. and_chain holds exactly (N-1) LOGICAL_AND nodes
-    // for N conditions; cond_ops[0] is the left leaf of the first AND node, not copied into
-    // and_chain.
-    for (size_t i = 1; i < cond_ops.size(); i++) {
-      const cudf::ast::expression& lhs =
-        (i == 1) ? static_cast<const cudf::ast::expression&>(cond_ops[0]) : and_chain.back();
-      and_chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND,
-                             lhs,
-                             static_cast<const cudf::ast::expression&>(cond_ops[i]));
-    }
-    const cudf::ast::expression& predicate =
-      and_chain.empty() ? static_cast<const cudf::ast::expression&>(cond_ops[0]) : and_chain.back();
+    const std::vector<std::reference_wrapper<const cudf::ast::expression>> cond_terms(
+      cond_ops.begin(), cond_ops.end());
+    const cudf::ast::expression& predicate = fold_logical_and(cond_terms, and_chain);
 
     std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
               std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
@@ -813,46 +839,47 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         auto true_indices = cudf::conditional_left_semi_join(
           left_effective, right_effective, predicate, std::nullopt, stream, mr);
 
-        // SQL three-valued MARK: an unmatched left row is NULL (not false) when the predicate was
-        // never TRUE but was UNKNOWN (NULL) for some right row. To find those rows we run a second
-        // semi-join with "predicate IS NOT FALSE". A conjunction c1 AND ... AND cn is FALSE iff
-        // some ci is FALSE, so (AND ci) IS NOT FALSE == AND_i (ci IS NOT FALSE), and each
-        // comparison "ci IS NOT FALSE" == ci OR IS_NULL(left_i) OR IS_NULL(right_i) (true when ci
-        // is TRUE or NULL, false only when both operands are non-null and ci is FALSE).
-        // NULL_LOGICAL_OR gives Kleene OR so the result is a clean boolean with no NULLs. The
-        // vectors below own the AST nodes and are reserved to exact size — cudf::ast::operation
-        // stores operands by reference, so any reallocation would invalidate them.
+        // SQL three-valued MARK: an unmatched left row is NULL (not false) only when the predicate
+        // was UNKNOWN (never TRUE) for some right row. We find those rows with a second semi-join
+        // on "predicate IS NOT FALSE". Since a conjunction is FALSE iff some conjunct is FALSE,
+        // (AND ci) IS NOT FALSE == AND_i (ci IS NOT FALSE), built per comparison as:
+        //   - null-propagating (=, <, >, <=, >=, !=): a NULL operand makes ci UNKNOWN, so
+        //     "ci IS NOT FALSE" == ci OR IS_NULL(left) OR IS_NULL(right) (NULL_LOGICAL_OR keeps it
+        //     a clean boolean).
+        //   - null-safe (IS [NOT] DISTINCT FROM): a NULL operand yields a definite TRUE/FALSE,
+        //     never UNKNOWN, so "ci IS NOT FALSE" is just ci — tainting it would wrongly emit NULL
+        //     for a definite FALSE (#1119 review).
+        // notfalse_terms holds the per-comparison term (a fresh OR node, or cond_ops[i] for the
+        // null-safe case). The owning vectors are reserved to an upper bound because
+        // cudf::ast::operation stores operands by reference, so a reallocation would dangle them.
         std::vector<cudf::ast::operation> isnull_left_ops;
         std::vector<cudf::ast::operation> isnull_right_ops;
         std::vector<cudf::ast::operation> notfalse_inner_ops;
-        std::vector<cudf::ast::operation> notfalse_ops;
+        std::vector<cudf::ast::operation> notfalse_or_ops;
         std::vector<cudf::ast::operation> notfalse_and_chain;
+        std::vector<std::reference_wrapper<const cudf::ast::expression>> notfalse_terms;
         isnull_left_ops.reserve(cond_ops.size());
         isnull_right_ops.reserve(cond_ops.size());
         notfalse_inner_ops.reserve(cond_ops.size());
-        notfalse_ops.reserve(cond_ops.size());
+        notfalse_or_ops.reserve(cond_ops.size());
         notfalse_and_chain.reserve(cond_ops.size() > 1 ? cond_ops.size() - 1 : 0);
+        notfalse_terms.reserve(cond_ops.size());
         for (size_t i = 0; i < cond_ops.size(); i++) {
+          if (nlj_is_null_safe(conditions[i].comparison)) {
+            notfalse_terms.emplace_back(cond_ops[i]);
+            continue;
+          }
           isnull_left_ops.emplace_back(cudf::ast::ast_operator::IS_NULL, left_refs[i]);
           isnull_right_ops.emplace_back(cudf::ast::ast_operator::IS_NULL, right_refs[i]);
           notfalse_inner_ops.emplace_back(
             cudf::ast::ast_operator::NULL_LOGICAL_OR, cond_ops[i], isnull_left_ops.back());
-          notfalse_ops.emplace_back(cudf::ast::ast_operator::NULL_LOGICAL_OR,
-                                    notfalse_inner_ops.back(),
-                                    isnull_right_ops.back());
-        }
-        for (size_t i = 1; i < notfalse_ops.size(); i++) {
-          const cudf::ast::expression& lhs =
-            (i == 1) ? static_cast<const cudf::ast::expression&>(notfalse_ops[0])
-                     : notfalse_and_chain.back();
-          notfalse_and_chain.emplace_back(
-            cudf::ast::ast_operator::LOGICAL_AND,
-            lhs,
-            static_cast<const cudf::ast::expression&>(notfalse_ops[i]));
+          notfalse_or_ops.emplace_back(cudf::ast::ast_operator::NULL_LOGICAL_OR,
+                                       notfalse_inner_ops.back(),
+                                       isnull_right_ops.back());
+          notfalse_terms.emplace_back(notfalse_or_ops.back());
         }
         const cudf::ast::expression& not_false_predicate =
-          notfalse_and_chain.empty() ? static_cast<const cudf::ast::expression&>(notfalse_ops[0])
-                                     : notfalse_and_chain.back();
+          fold_logical_and(notfalse_terms, notfalse_and_chain);
         auto maybe_indices = cudf::conditional_left_semi_join(
           left_effective, right_effective, not_false_predicate, std::nullopt, stream, mr);
 

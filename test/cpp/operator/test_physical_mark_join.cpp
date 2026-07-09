@@ -161,10 +161,12 @@ nlj_projection_fixture create_projected_nlj(duckdb::JoinType join_type,
   return f;
 }
 
-// Two-condition NLJ MARK fixture: (left.col0 OP right.col0) AND (left.col2 OP right.col1).
+// Two-condition NLJ MARK fixture: (left.col0 <cmp0> right.col0) AND (left.col2 <cmp1> right.col1).
 // Left child {INT,INT,INT} (col0, payload col1, col2), right child {INT,INT}. Outputs the payload
-// column plus the mark. Used to exercise three-valued conjunction semantics (NULL AND FALSE=FALSE).
-nlj_projection_fixture create_projected_nlj_two_cond(duckdb::ExpressionType comparison)
+// column plus the mark. Used to exercise three-valued conjunction semantics (NULL AND FALSE=FALSE)
+// and mixed null-safe/null-propagating conjunctions.
+nlj_projection_fixture create_projected_nlj_two_cond(duckdb::ExpressionType comparison0,
+                                                     duckdb::ExpressionType comparison1)
 {
   nlj_projection_fixture f;
 
@@ -186,12 +188,12 @@ nlj_projection_fixture create_projected_nlj_two_cond(duckdb::ExpressionType comp
   duckdb::JoinCondition cond0;
   cond0.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
   cond0.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond0.comparison = comparison;
+  cond0.comparison = comparison0;
   conditions.push_back(std::move(cond0));
   duckdb::JoinCondition cond1;
   cond1.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 2);
   cond1.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1);
-  cond1.comparison = comparison;
+  cond1.comparison = comparison1;
   conditions.push_back(std::move(cond1));
 
   f.nlj = duckdb::make_uniq<sirius_physical_nested_loop_join>(
@@ -675,7 +677,8 @@ TEST_CASE("sirius_physical_nested_loop_join MARK conjunction absorbs NULL with F
     // r1=(b=10,d=NULL): (100<10)=FALSE AND (100<NULL)=NULL -> FALSE
     auto right = make_right({0, 10}, {false, true}, {5, 0}, {true, false});
 
-    auto f        = create_projected_nlj_two_cond(duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto f        = create_projected_nlj_two_cond(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                           duckdb::ExpressionType::COMPARE_LESSTHAN);
     auto result   = execute_projected_nlj(*f.nlj, left, right);
     auto out_view = result.view;
 
@@ -690,7 +693,130 @@ TEST_CASE("sirius_physical_nested_loop_join MARK conjunction absorbs NULL with F
     // r0=(b=NULL,d=5): (100<NULL)=NULL AND (1<5)=TRUE -> NULL, and there is no TRUE match anywhere.
     auto right = make_right({0}, {false}, {5}, {true});
 
-    auto f        = create_projected_nlj_two_cond(duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto f        = create_projected_nlj_two_cond(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                           duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    auto mark = out_view.column(1);
+    REQUIRE(mark.null_count() == 1);
+    REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false});
+  }
+}
+
+// Issue #1119 (review): a null-safe comparison (IS NOT DISTINCT FROM) is never UNKNOWN, so a NULL
+// operand yields a definite TRUE/FALSE. Such rows must NOT be tainted into NULL marks.
+TEST_CASE("sirius_physical_nested_loop_join MARK null-safe comparisons yield definite marks",
+          "[physical_nested_loop_join][projection][mark]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // Left col0 (the key) = {NULL, 5}, payload = {10, 20}; predicate col0 <cmp> right.col0 where
+  // <cmp> is a null-safe comparison (IS [NOT] DISTINCT FROM): a NULL operand yields a definite
+  // TRUE/FALSE, never UNKNOWN, so the mark column must have no NULLs.
+  auto make_left = [&](const std::vector<int32_t>& a,
+                       const std::vector<bool>& a_valid,
+                       const std::vector<int32_t>& payload) {
+    auto col0 = make_numeric_batch_with_nulls<int32_t>(*space, a, a_valid, cudf::type_id::INT32);
+    auto col1 = make_numeric_batch<int32_t>(*space, payload, cudf::type_id::INT32);
+    auto col2 =
+      make_numeric_batch<int32_t>(*space, std::vector<int32_t>(a.size(), 0), cudf::type_id::INT32);
+    return concatenate_batches_horizontal({col0, col1, col2}, *space);
+  };
+  auto run = [&](duckdb::ExpressionType cmp, std::shared_ptr<cucascade::data_batch> right) {
+    auto left = make_left({0, 5}, {false, true}, {10, 20});  // col0 = {NULL, 5}
+    auto f    = create_projected_nlj(duckdb::JoinType::MARK, cmp);
+    return execute_projected_nlj(*f.nlj, std::move(left), std::move(right));
+  };
+
+  SECTION("IS NOT DISTINCT FROM, right {5}: NULL vs 5 FALSE, 5 vs 5 TRUE")
+  {
+    auto result = run(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+                      make_numeric_batch<int32_t>(*space, {5}, cudf::type_id::INT32));
+    auto mark   = result.view.column(1);
+    REQUIRE(mark.null_count() == 0);
+    REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{false, true});
+  }
+
+  SECTION("IS NOT DISTINCT FROM, right {NULL}: NULL vs NULL TRUE, 5 vs NULL FALSE")
+  {
+    auto result =
+      run(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+          make_numeric_batch_with_nulls<int32_t>(*space, {0}, {false}, cudf::type_id::INT32));
+    auto mark = result.view.column(1);
+    REQUIRE(mark.null_count() == 0);
+    REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{true, false});
+  }
+
+  SECTION("IS DISTINCT FROM, right {5}: NULL vs 5 TRUE, 5 vs 5 FALSE")
+  {
+    auto result = run(duckdb::ExpressionType::COMPARE_DISTINCT_FROM,
+                      make_numeric_batch<int32_t>(*space, {5}, cudf::type_id::INT32));
+    auto mark   = result.view.column(1);
+    REQUIRE(mark.null_count() == 0);
+    REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{true, false});
+  }
+
+  SECTION("IS DISTINCT FROM, right {NULL}: NULL vs NULL FALSE, 5 vs NULL TRUE")
+  {
+    auto result =
+      run(duckdb::ExpressionType::COMPARE_DISTINCT_FROM,
+          make_numeric_batch_with_nulls<int32_t>(*space, {0}, {false}, cudf::type_id::INT32));
+    auto mark = result.view.column(1);
+    REQUIRE(mark.null_count() == 0);
+    REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{false, true});
+  }
+}
+
+// Issue #1119 (review): the realistic reachable path — a mixed conjunction that pairs a null-safe
+// comparison (IS NOT DISTINCT FROM) with a null-propagating one (<). Only the propagating conjunct
+// may be null-tainted; the null-safe conjunct must keep its definite TRUE/FALSE.
+TEST_CASE("sirius_physical_nested_loop_join MARK mixed null-safe + null-propagating conjunction",
+          "[physical_nested_loop_join][projection][mark]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // Predicate: (left.col0 IS NOT DISTINCT FROM right.col0) AND (left.col2 < right.col1).
+  auto make_left = [&](int32_t a, bool a_valid, int32_t payload, int32_t c, bool c_valid) {
+    auto col0 =
+      make_numeric_batch_with_nulls<int32_t>(*space, {a}, {a_valid}, cudf::type_id::INT32);
+    auto col1 = make_numeric_batch<int32_t>(*space, {payload}, cudf::type_id::INT32);
+    auto col2 =
+      make_numeric_batch_with_nulls<int32_t>(*space, {c}, {c_valid}, cudf::type_id::INT32);
+    return concatenate_batches_horizontal({col0, col1, col2}, *space);
+  };
+  auto make_right = [&](int32_t b, int32_t d) {
+    auto col0 = make_numeric_batch<int32_t>(*space, {b}, cudf::type_id::INT32);
+    auto col1 = make_numeric_batch<int32_t>(*space, {d}, cudf::type_id::INT32);
+    return concatenate_batches_horizontal({col0, col1}, *space);
+  };
+
+  SECTION("null-safe conjunct is a definite FALSE -> whole predicate FALSE, mark FALSE")
+  {
+    // (NULL IS NOT DISTINCT FROM 5) = FALSE, (1 < 100) = TRUE -> FALSE AND TRUE = FALSE.
+    auto left  = make_left(/*a*/ 0, /*a_valid*/ false, /*payload*/ 10, /*c*/ 1, /*c_valid*/ true);
+    auto right = make_right(/*b*/ 5, /*d*/ 100);
+
+    auto f        = create_projected_nlj_two_cond(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+                                           duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    auto mark = out_view.column(1);
+    REQUIRE(mark.null_count() == 0);
+    REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{false});
+  }
+
+  SECTION("null-safe conjunct TRUE but propagating conjunct UNKNOWN -> mark NULL")
+  {
+    // (5 IS NOT DISTINCT FROM 5) = TRUE, (NULL < 100) = UNKNOWN -> TRUE AND UNKNOWN = UNKNOWN.
+    auto left  = make_left(/*a*/ 5, /*a_valid*/ true, /*payload*/ 10, /*c*/ 0, /*c_valid*/ false);
+    auto right = make_right(/*b*/ 5, /*d*/ 100);
+
+    auto f        = create_projected_nlj_two_cond(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+                                           duckdb::ExpressionType::COMPARE_LESSTHAN);
     auto result   = execute_projected_nlj(*f.nlj, left, right);
     auto out_view = result.view;
 
