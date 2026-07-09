@@ -364,7 +364,11 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // materialize_table on a copy of these options.
   _reader_options = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
-  if (_plan->is_projected()) { _reader_options->set_column_names(_plan->data_column_names()); }
+  // Never hand cuDF an empty column list — a zero-column read over live row groups
+  // hangs. is_projected() already excludes it; this pins the invariant here.
+  if (_plan->is_projected() && !_plan->data_columns.empty()) {
+    _reader_options->set_column_names(_plan->data_column_names());
+  }
 
   _sirius_dynamic_filters = bind.sirius_dynamic_filters;
 
