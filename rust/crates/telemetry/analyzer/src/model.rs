@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use instrumentation_model::{SiriusEvent, channel, memory, task};
+use instrumentation_model::{SiriusEvent, channel, gpu_device, memory, task, thread_group};
 use quent_time::TimeUnixNanoSec;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -40,6 +40,8 @@ use crate::{
     view::SiriusModelQueryView,
 };
 
+const GPU_DEVICE_GROUP_TYPE_NAME: &str = "gpu_device";
+const THREAD_GROUP_TYPE_NAME: &str = "thread_group";
 const TASK_QUEUE_TYPE_NAME: &str = "task_queue";
 const TASK_MANAGER_LOOP_THREAD_TYPE_NAME: &str = "task_manager_loop_thread";
 const EXECUTOR_THREAD_TYPE_NAME: &str = "executor_thread";
@@ -322,6 +324,26 @@ impl SiriusModelBuilder {
             SiriusEvent::Port(e) => {
                 self.query_engine
                     .try_push(Event::new(id, timestamp, QueryEngineEvent::Port(e)))
+            }
+            SiriusEvent::GpuDevice(e) => {
+                let gpu_device::GpuDeviceEvent::Declaration(d) = e;
+                self.arbitrary_resources.push_group_raw(
+                    id,
+                    GPU_DEVICE_GROUP_TYPE_NAME,
+                    &d.instance_name,
+                    Some(d.parent_group_id),
+                );
+                Ok(())
+            }
+            SiriusEvent::ThreadGroup(e) => {
+                let thread_group::ThreadGroupEvent::Declaration(d) = e;
+                self.arbitrary_resources.push_group_raw(
+                    id,
+                    THREAD_GROUP_TYPE_NAME,
+                    &d.instance_name,
+                    Some(d.parent_group_id),
+                );
+                Ok(())
             }
             SiriusEvent::TaskQueue(e) => self.push_task_queue(id, timestamp, e),
             SiriusEvent::TaskManagerLoopThread(e) => {

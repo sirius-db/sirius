@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <thread>
 
 namespace sirius {
@@ -50,8 +51,13 @@ namespace parallel {
  */
 class itask_executor {
  public:
+  /**
+   * @param device_id GPU this executor is bound to, if any. Used to parent the
+   * task-queue telemetry under that GPU's device group instead of the engine.
+   */
   explicit itask_executor(exec::thread_pool_config config,
-                          std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
+                          std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+                          std::optional<int> device_id = std::nullopt);
 
   virtual ~itask_executor();
 

@@ -108,6 +108,16 @@ timeline.
 **Default view** — the query plan on the left and the per-resource execution timeline
 (executor threads, task-manager loops, task queues) on the right.
 
+Resources are grouped into a collapsible tree by GPU device: each `gpu-N` group (declared once per
+GPU at engine startup) contains per-thread-type buckets (`executor_thread`,
+`task_manager_loop_thread`) plus that executor's task queue, and a `shared` group under the engine
+holds threads with no single GPU (e.g. the task-scheduler thread). The tree shape is entirely
+data-driven via each resource's `parent_group_id`; to inspect it offline run:
+
+```bash
+pixi run bash -c "cd rust && cargo run -p sirius-telemetry-analyzer --example print_resource_tree -- <output_dir>/<session_uuid>"
+```
+
 ![Quent standard view](quent-screenshots/standard.png)
 
 **Operator timeline** — selecting an operator or pipeline highlights it in both the plan and the
