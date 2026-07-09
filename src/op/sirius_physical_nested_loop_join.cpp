@@ -46,6 +46,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <cstdio>
+#include <span>
 
 namespace sirius {
 namespace op {
@@ -358,14 +359,16 @@ namespace {
 cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
 {
   switch (comparison) {
-    case sirius::comparison_type::equal: return cudf::ast::ast_operator::EQUAL;
-    case sirius::comparison_type::not_distinct_from: return cudf::ast::ast_operator::NULL_EQUAL;
-    case sirius::comparison_type::not_equal: return cudf::ast::ast_operator::NOT_EQUAL;
-    case sirius::comparison_type::distinct_from: break;  // built as NOT(NULL_EQUAL) by the caller
-    case sirius::comparison_type::lt: return cudf::ast::ast_operator::LESS;
-    case sirius::comparison_type::gt: return cudf::ast::ast_operator::GREATER;
-    case sirius::comparison_type::le: return cudf::ast::ast_operator::LESS_EQUAL;
-    case sirius::comparison_type::ge: return cudf::ast::ast_operator::GREATER_EQUAL;
+    using enum sirius::comparison_type;
+    using enum cudf::ast::ast_operator;
+    case equal: return EQUAL;
+    case not_distinct_from: return NULL_EQUAL;
+    case not_equal: return NOT_EQUAL;
+    case distinct_from: break;  // built as NOT(NULL_EQUAL) by the caller
+    case lt: return LESS;
+    case gt: return GREATER;
+    case le: return LESS_EQUAL;
+    case ge: return GREATER_EQUAL;
   }
   throw std::runtime_error("sirius_physical_nested_loop_join: unsupported comparison type");
 }
@@ -373,7 +376,7 @@ cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
 /// @brief Left-associative LOGICAL_AND over @p terms; @p chain owns the AND nodes and must be
 /// pre-reserved to terms.size()-1.
 const cudf::ast::expression& fold_logical_and(
-  const std::vector<std::reference_wrapper<const cudf::ast::expression>>& terms,
+  std::span<const std::reference_wrapper<const cudf::ast::expression>> terms,
   std::vector<cudf::ast::operation>& chain)
 {
   for (size_t i = 1; i < terms.size(); i++) {
