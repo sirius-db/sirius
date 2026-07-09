@@ -441,9 +441,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   auto stream = cudf::get_default_stream();
 
   // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
-  // cached metadata). Fall back to a plain cudf datasource only for local paths
-  // no sirius backend claims.
-  std::shared_ptr<io::sirius_datasource> sirius_ds = io_ctx->open_datasource(file_path);
+  // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
+  // to one suffix-range GET that resolves the size and stashes the footer, so
+  // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
+  // GETs). Fall back to a plain cudf datasource only for local paths no sirius
+  // backend claims.
+  std::shared_ptr<io::sirius_datasource> sirius_ds =
+    io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }

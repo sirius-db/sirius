@@ -1351,6 +1351,36 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
+
+  SECTION("missing object fails the footer-probe open after HEAD fallback")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets    = true;
+    fault.fail_all_heads   = true;
+    fault.fail_status      = 404;
+    fault.fail_head_status = 404;
+    range_http_server server(parquet, fault);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint());
+
+    CHECK_THROWS_WITH(ioctx->open_datasource("s3://footer-bucket/missing.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe),
+                      Catch::Matchers::Contains("HTTP 404"));
+  }
+
+  SECTION("forbidden object fails the footer-probe open after HEAD fallback")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets    = true;
+    fault.fail_all_heads   = true;
+    fault.fail_status      = 403;
+    fault.fail_head_status = 403;
+    range_http_server server(parquet, fault);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint());
+
+    CHECK_THROWS_WITH(ioctx->open_datasource("s3://footer-bucket/forbidden.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe),
+                      Catch::Matchers::Contains("HTTP 403"));
+  }
 }
 
 TEST_CASE("footer suffix probe retries transient GET failures",

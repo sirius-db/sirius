@@ -258,9 +258,11 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
                               "' is read-only; S3 writes (COPY TO) are not supported");
   }
   auto sirius_ctx = resolve_gated_sirius_context(opener, file.path, "reading");
-  // The size rode the ListObjectsV2 response that expanded the glob, so this
-  // open costs zero network (no HEAD).
-  auto datasource = sirius_ctx->get_scan_manager().create_datasource(file.path, *known_size);
+  // A parquet_footer_probe open: one suffix-range GET resolves the size (== the
+  // LIST size that rode the glob expansion) and stashes the footer, so the
+  // binder's footer reads are served locally (no HEAD, no separate footer GETs).
+  auto datasource = sirius_ctx->get_scan_manager().create_datasource(
+    file.path, sirius::io::open_hint::parquet_footer_probe);
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
   }

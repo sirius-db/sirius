@@ -846,6 +846,11 @@ sirius::io::rest::rest_perf_snapshot delta_snapshot(
     sat_sub(after.device_stream_sync_total, before.device_stream_sync_total);
   out.payload_bytes_read_total =
     sat_sub(after.payload_bytes_read_total, before.payload_bytes_read_total);
+  out.native_footer_get_count =
+    sat_sub(after.native_footer_get_count, before.native_footer_get_count);
+  out.native_footer_wall_ns_total =
+    sat_sub(after.native_footer_wall_ns_total, before.native_footer_wall_ns_total);
+  out.native_footer_wall_ns_max = after.native_footer_wall_ns_max;
   return out;
 }
 
@@ -2485,14 +2490,17 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   s3_sql_fixture fixture(*env);
   set_gpu_execution(fixture.con, true);
 
-  auto const s3_scan    = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
-  auto const local_scan = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
-  auto const s3_query   = "SELECT n_nationkey, n_name, n_regionkey FROM " + s3_scan +
+  auto const before_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto const s3_scan      = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan   = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query     = "SELECT n_nationkey, n_name, n_regionkey FROM " + s3_scan +
                         " ORDER BY n_nationkey, n_name, n_regionkey";
   auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " + local_scan +
                            " ORDER BY n_nationkey, n_name, n_regionkey";
 
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
 }
 
 TEST_CASE("transparent S3 glob preserves hive partition columns",
@@ -2504,8 +2512,9 @@ TEST_CASE("transparent S3 glob preserves hive partition columns",
   s3_sql_fixture fixture(*env);
   set_gpu_execution(fixture.con, true);
 
-  auto const options    = ", hive_partitioning=true";
-  auto const s3_scan    = s3_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
+  auto const before_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto const options      = ", hive_partitioning=true";
+  auto const s3_scan      = s3_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
   auto const local_scan = local_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
   auto const s3_query   = "SELECT year, count(*), min(n_nationkey), max(n_nationkey) FROM " +
                         s3_scan + " GROUP BY year ORDER BY year";
@@ -2513,6 +2522,76 @@ TEST_CASE("transparent S3 glob preserves hive partition columns",
                            local_scan + " GROUP BY year ORDER BY year";
 
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+TEST_CASE("transparent S3 glob scans use parquet footer probes",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_perf_instrumentation = true;
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto& rest = require_rest_ioctx(fixture, s3_uri(env->bucket, "glob/multi/nation_a.parquet"));
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  auto const before = rest.perf_snapshot();
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const delta = delta_snapshot(rest.perf_snapshot(), before);
+
+  CHECK(delta.native_footer_get_count == 0);
+}
+
+TEST_CASE("transparent S3 glob remains correct with a straddled footer-probe window",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_footer_probe_bytes = "512 B";
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob warm scan skips native footer reads",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_perf_instrumentation = true;
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto& rest = require_rest_ioctx(fixture, s3_uri(env->bucket, "glob/multi/nation_a.parquet"));
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const before_warm = rest.perf_snapshot();
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const warm_delta = delta_snapshot(rest.perf_snapshot(), before_warm);
+
+  CHECK(warm_delta.native_footer_get_count == 0);
 }
 
 TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
