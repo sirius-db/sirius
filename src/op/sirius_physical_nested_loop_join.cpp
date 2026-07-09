@@ -361,10 +361,7 @@ cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
     case sirius::comparison_type::equal: return cudf::ast::ast_operator::EQUAL;
     case sirius::comparison_type::not_distinct_from: return cudf::ast::ast_operator::NULL_EQUAL;
     case sirius::comparison_type::not_equal: return cudf::ast::ast_operator::NOT_EQUAL;
-    case sirius::comparison_type::distinct_from:
-      // No single null-safe cuDF operator; the condition loop builds NOT(NULL_EQUAL) instead
-      // (NOT_EQUAL would be null-propagating and wrong for NULL operands).
-      break;
+    case sirius::comparison_type::distinct_from: break;  // built as NOT(NULL_EQUAL) by the caller
     case sirius::comparison_type::lt: return cudf::ast::ast_operator::LESS;
     case sirius::comparison_type::gt: return cudf::ast::ast_operator::GREATER;
     case sirius::comparison_type::le: return cudf::ast::ast_operator::LESS_EQUAL;
@@ -373,9 +370,8 @@ cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
   throw std::runtime_error("sirius_physical_nested_loop_join: unsupported comparison type");
 }
 
-/// @brief Left-associative LOGICAL_AND over @p terms, appending the (terms.size()-1) AND nodes to
-/// @p chain, which must be reserved to at least that size — cudf::ast::operation stores operands by
-/// reference, so a reallocation would dangle them. Returns the root expression.
+/// @brief Left-associative LOGICAL_AND over @p terms; @p chain owns the AND nodes and must be
+/// pre-reserved to terms.size()-1.
 const cudf::ast::expression& fold_logical_and(
   const std::vector<std::reference_wrapper<const cudf::ast::expression>>& terms,
   std::vector<cudf::ast::operation>& chain)
@@ -425,7 +421,6 @@ cudf::table_view sirius_physical_nested_loop_join::select_left_output(
   return left.select(sel);
 }
 
-/// @brief Scatter a single BOOL8 @p value into @p column at every position in @p indices.
 static std::unique_ptr<cudf::column> scatter_bool(
   std::unique_ptr<cudf::column> column,
   const rmm::device_uvector<cudf::size_type>& indices,
@@ -448,21 +443,13 @@ static std::unique_ptr<cudf::column> scatter_bool(
   return std::move(scattered->release()[0]);
 }
 
-/// @brief MARK join output implementing SQL three-valued logic.
+/// @brief MARK join output with SQL three-valued logic: every row of @p left_view passes through,
+/// plus a BOOL8 mark that is true at @p true_indices, NULL at rows in @p maybe_indices (the
+/// "predicate IS NOT FALSE" semi-join) but not in @p true_indices, and false elsewhere.
 ///
-/// Every row of @p left_view passes through unchanged, plus a BOOL8 mark column. The mark VALUE is
-/// true at rows in @p true_indices (the predicate evaluated TRUE against some right row) and false
-/// elsewhere. The mark VALIDITY encodes NULL: an unmatched row is NULL when the predicate was never
-/// TRUE but was UNKNOWN (NULL) for some right row — i.e. it is in @p maybe_indices (the "predicate
-/// IS NOT FALSE" semi-join) but not in @p true_indices. Since true_indices is a subset of
-/// maybe_indices, validity == matched OR NOT maybe, built by scattering false at the maybe rows
-/// then true back at the matched rows.
-///
-/// Callers pass the projection-selected left view; both index sets index rows of the original left
-/// table, which stay valid because selection drops columns only.
-///
-/// @p telemetry_info is threaded through to the emitted batch so it stays linked into the query's
-/// telemetry lineage (callers pass the operator's batch_telemetry()).
+/// Callers pass the projection-selected left view; the index sets index original left rows, which
+/// stay valid because selection drops columns only. @p telemetry_info links the emitted batch into
+/// the query's telemetry lineage.
 static std::unique_ptr<operator_data> resolve_mark_join_result(
   const rmm::device_uvector<cudf::size_type>& true_indices,
   const rmm::device_uvector<cudf::size_type>& maybe_indices,
@@ -479,13 +466,11 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
 
   auto num_rows = left_view.num_rows();
 
-  // Mark values: all-false, scatter true at matched rows.
   cudf::numeric_scalar<bool> false_scalar(false, true, stream);
   auto mark_column = cudf::make_column_from_scalar(false_scalar, num_rows, stream);
   mark_column      = scatter_bool(std::move(mark_column), true_indices, true, stream);
 
-  // Validity: all-valid, scatter invalid(false) at the maybe rows, then valid(true) back at the
-  // matched rows. A false cell in validity_col marks that mark row as NULL.
+  // validity == matched OR NOT maybe; false cells become NULL via bools_to_mask.
   cudf::numeric_scalar<bool> true_scalar(true, true, stream);
   auto validity_col = cudf::make_column_from_scalar(true_scalar, num_rows, stream);
   validity_col      = scatter_bool(std::move(validity_col), maybe_indices, false, stream);
@@ -513,10 +498,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
   auto const num_surviving_rows = left_side_empty ? right.num_rows() : left.num_rows();
 
   if (join_type == duckdb::JoinType::MARK) {
-    // Both empty-side MARK cases are "no matches": an empty left side emits 0 rows with the
-    // mark column still in the schema; an empty right side marks every left row false. An empty
-    // right side is definitively false (the OR over an empty set of right rows is FALSE, never
-    // NULL), so both the matched and maybe index sets are empty and no row is NULL.
+    // Empty left emits 0 rows (schema kept); empty right marks every left row false — the OR over
+    // an empty set of right rows is FALSE, never NULL, so both index sets stay empty.
     rmm::device_uvector<cudf::size_type> no_matches(0, stream);
     rmm::device_uvector<cudf::size_type> no_maybe(0, stream);
     return resolve_mark_join_result(
@@ -835,23 +818,14 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
             make_data_batch(std::move(gathered), *space, stream, batch_telemetry())});
       }
       case duckdb::JoinType::MARK: {
-        // Matched rows: predicate evaluated TRUE against some right row.
         auto true_indices = cudf::conditional_left_semi_join(
           left_effective, right_effective, predicate, std::nullopt, stream, mr);
 
-        // SQL three-valued MARK: an unmatched left row is NULL (not false) only when the predicate
-        // was UNKNOWN (never TRUE) for some right row. We find those rows with a second semi-join
-        // on "predicate IS NOT FALSE". Since a conjunction is FALSE iff some conjunct is FALSE,
-        // (AND ci) IS NOT FALSE == AND_i (ci IS NOT FALSE), built per comparison as:
-        //   - null-propagating (=, <, >, <=, >=, !=): a NULL operand makes ci UNKNOWN, so
-        //     "ci IS NOT FALSE" == ci OR IS_NULL(left) OR IS_NULL(right) (NULL_LOGICAL_OR keeps it
-        //     a clean boolean).
-        //   - null-safe (IS [NOT] DISTINCT FROM): a NULL operand yields a definite TRUE/FALSE,
-        //     never UNKNOWN, so "ci IS NOT FALSE" is just ci — tainting it would wrongly emit NULL
-        //     for a definite FALSE (#1119 review).
-        // notfalse_terms holds the per-comparison term (a fresh OR node, or cond_ops[i] for the
-        // null-safe case). The owning vectors are reserved to an upper bound because
-        // cudf::ast::operation stores operands by reference, so a reallocation would dangle them.
+        // Three-valued MARK: an unmatched row is NULL only when the predicate was UNKNOWN (never
+        // TRUE) for some right row; a second semi-join on "predicate IS NOT FALSE" finds those.
+        // (AND ci) IS NOT FALSE == AND_i (ci IS NOT FALSE), where a null-propagating ci becomes
+        // ci OR IS_NULL(left) OR IS_NULL(right) (Kleene NULL_LOGICAL_OR) and a null-safe ci is
+        // never UNKNOWN, so it stays ci itself.
         std::vector<cudf::ast::operation> isnull_left_ops;
         std::vector<cudf::ast::operation> isnull_right_ops;
         std::vector<cudf::ast::operation> notfalse_inner_ops;

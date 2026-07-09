@@ -581,7 +581,8 @@ TEST_CASE("sirius_physical_nested_loop_join MARK emits NULL under three-valued l
   auto* space = get_shared_mem_space();
   REQUIRE(space);
 
-  // Predicate is left.col0 < right.col0 (routes to NLJ since it is a pure inequality).
+  // Predicate is left.col0 < right.col0 — a pure inequality, the shape that reaches the NLJ in
+  // production plans.
   auto make_left = [&](const std::vector<int32_t>& a,
                        const std::vector<bool>& a_valid,
                        const std::vector<int32_t>& payload) {
@@ -704,17 +705,16 @@ TEST_CASE("sirius_physical_nested_loop_join MARK conjunction absorbs NULL with F
   }
 }
 
-// Issue #1119 (review): a null-safe comparison (IS NOT DISTINCT FROM) is never UNKNOWN, so a NULL
-// operand yields a definite TRUE/FALSE. Such rows must NOT be tainted into NULL marks.
+// Issue #1119 (review): the null-safe comparisons IS [NOT] DISTINCT FROM yield a definite
+// TRUE/FALSE for NULL operands, never UNKNOWN — their rows must not be tainted into NULL marks.
 TEST_CASE("sirius_physical_nested_loop_join MARK null-safe comparisons yield definite marks",
           "[physical_nested_loop_join][projection][mark]")
 {
   auto* space = get_shared_mem_space();
   REQUIRE(space);
 
-  // Left col0 (the key) = {NULL, 5}, payload = {10, 20}; predicate col0 <cmp> right.col0 where
-  // <cmp> is a null-safe comparison (IS [NOT] DISTINCT FROM): a NULL operand yields a definite
-  // TRUE/FALSE, never UNKNOWN, so the mark column must have no NULLs.
+  // Left col0 (the key) = {NULL, 5}, payload = {10, 20}; predicate col0 <cmp> right.col0.
+  // Every section expects a mark column with no NULLs.
   auto make_left = [&](const std::vector<int32_t>& a,
                        const std::vector<bool>& a_valid,
                        const std::vector<int32_t>& payload) {
