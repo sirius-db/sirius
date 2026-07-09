@@ -387,13 +387,13 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
     const auto& dtype = column_types[c];
     switch (dtype.id()) {
       case cudf::type_id::INT32: {
-        cols.push_back(std::move(
-          create_numeric_column_with_random_data<int32_t>(num_rows, dtype, ranges[c], stream, mr)));
+        cols.push_back(
+          create_numeric_column_with_random_data<int32_t>(num_rows, dtype, ranges[c], stream, mr));
         break;
       }
       case cudf::type_id::INT64: {
-        cols.push_back(std::move(
-          create_numeric_column_with_random_data<int64_t>(num_rows, dtype, ranges[c], stream, mr)));
+        cols.push_back(
+          create_numeric_column_with_random_data<int64_t>(num_rows, dtype, ranges[c], stream, mr));
         break;
       }
       case cudf::type_id::STRING: {

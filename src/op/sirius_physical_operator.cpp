@@ -21,6 +21,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -71,7 +72,7 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     if (leave_locked) {
       _read_only_data_batches = std::move(ro_batches);
     } else {
-      return std::move(ro_batches);
+      return ro_batches;
     }
   }
   return *_read_only_data_batches;
@@ -118,6 +119,13 @@ void pipelineable_operator_data::prepare_for_processing(
   }
 
   _read_only_data_batches = std::move(ro_batches);
+  // lock_or_prepare_batch may have returned an accessor to a clone (cross-GPU inputs), so
+  // accessor i can reference a different batch than _data_batches[i]. Reset the idle vector so
+  // get_data_batches() lazily rebuilds it from the accessors, restoring the invariant that
+  // _data_batches[i] is the batch underlying accessor i. Downstream forwarding (dynamic_filter,
+  // sink) and OOM reschedule (remove_read_only_lock materializes from the accessors) then all
+  // see the prepared batch, not a stale original.
+  _data_batches = std::nullopt;
 }
 
 std::string sirius_physical_operator::get_name() const
@@ -341,7 +349,11 @@ bool sirius_physical_operator::all_ports_empty()
 bool sirius_physical_operator::is_source_pipeline_finished()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (!port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
+    // A port with no src_pipeline cannot gate on an upstream pipeline — treat
+    // it as non-blocking, mirroring get_next_task_hint()'s null guards. The
+    // zero-task finish guard now calls this on source operators too
+    //.
+    if (port_ptr->src_pipeline && !port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
   }
   return true;
 }
@@ -364,6 +376,12 @@ void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_
 {
   assert(pipeline != nullptr);
   _pipeline = std::move(pipeline);
+}
+
+telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
+{
+  if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
+  return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
 }
 
 // implement get_all_ports

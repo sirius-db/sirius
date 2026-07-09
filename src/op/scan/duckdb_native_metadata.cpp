@@ -350,9 +350,10 @@ void compute_segment_bytes_size(std::vector<duckdb_row_group_metadata>& row_grou
 
 /// @brief Check if the filter can be applied to row-group pruning.
 ///
-/// The only filter type we must exclude from statistics pruning is DYNAMIC_FILTER:
-/// its bounds come from a runtime source (e.g. a hash-join build) and are not
-/// currently populated at metadata-walk time.
+/// This DuckDB-native statistics walker only consumes the static payloads represented directly by
+/// DuckDB @c TableFilter nodes. @c DYNAMIC_FILTER is a routing placeholder, while Sirius runtime
+/// join filters use their own publication channel and scan-consumer paths, so it is not translated
+/// by this walker.
 bool filter_is_prunable(duckdb::TableFilterType t)
 {
   return t != duckdb::TableFilterType::DYNAMIC_FILTER;
@@ -557,9 +558,16 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
       plan.pruned_row_groups,
       plan.pruned_decoded_bytes);
   }
+  // A fully-pruned table (every row group removed by filter stats) is viable: the
+  // ranges walk yields empty row-group lists, and the coalescer's empty-batch
+  // fallback emits one schema-correct 0-row split so the scan still creates a task
+  // and the pipeline completes (mirrors the parquet all-pruned path). Refusing here
+  // instead throws "duckdb-native scan rejected query" and hangs the query.
   if (plan.n_row_groups > 0 && plan.pruned_row_groups == plan.n_row_groups) {
-    refuse("no row groups in table (empty or fully pruned)");
-    return plan;
+    SIRIUS_LOG_DEBUG(
+      "[duckdb_native_metadata] all {} row groups stats-pruned; scan yields an "
+      "empty result via the coalescer fallback",
+      plan.n_row_groups);
   }
 
   plan.viable = true;

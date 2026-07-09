@@ -32,18 +32,26 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -63,6 +71,19 @@ struct sirius_config_env_guard {
   }
   ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
+
+std::string sql_string_literal(std::string const& value)
+{
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  escaped.push_back('\'');
+  for (auto const c : value) {
+    if (c == '\'') { escaped.push_back('\''); }
+    escaped.push_back(c);
+  }
+  escaped.push_back('\'');
+  return escaped;
+}
 
 /**
  * @brief Base fixture providing compare_gpu_vs_cpu for multi-format tests.
@@ -971,17 +992,303 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
  * Partition columns (year, month) are NOT in the parquet files — their
  * values come from the directory paths.
  */
-class GPUExecutionHivePartitionFixture : public MultiFormatFixtureBase {
+class HivePartitionDataset {
  public:
-  GPUExecutionHivePartitionFixture()
+  HivePartitionDataset()
   {
-    hive_path =
-      (get_project_root() / "test/cpp/integration/data/hive_partitioned/**/*.parquet").string();
+    auto const source_root = get_project_root() / "test/cpp/integration/data/hive_partitioned";
+    auto const y2024_m01   = source_root / "year=2024/month=01/data.parquet";
+    auto const y2024_m02   = source_root / "year=2024/month=02/data.parquet";
+    auto const y2025_m01   = source_root / "year=2025/month=01/data.parquet";
+    REQUIRE(fs::exists(y2024_m01));
+    REQUIRE(fs::exists(y2024_m02));
+    REQUIRE(fs::exists(y2025_m01));
+
+    static std::atomic<std::uint64_t> next_fixture_id{0};
+    hive_dir = fs::temp_directory_path() /
+               ("sirius_hive_count_star_" + std::to_string(next_fixture_id.fetch_add(1)));
+    fs::remove_all(hive_dir);
+    fs::create_directories(hive_dir / "h/year=2024");
+    fs::create_directories(hive_dir / "h/year=2025");
+    fs::create_directories(hive_dir / "flat");
+
+    fs::copy_file(
+      y2024_m01, hive_dir / "h/year=2024/part_01.parquet", fs::copy_options::overwrite_existing);
+    fs::copy_file(
+      y2024_m02, hive_dir / "h/year=2024/part_02.parquet", fs::copy_options::overwrite_existing);
+    fs::copy_file(
+      y2025_m01, hive_dir / "h/year=2025/part_01.parquet", fs::copy_options::overwrite_existing);
+
+    fs::copy_file(
+      y2024_m01, hive_dir / "flat/part_2024_01.parquet", fs::copy_options::overwrite_existing);
+    fs::copy_file(
+      y2024_m02, hive_dir / "flat/part_2024_02.parquet", fs::copy_options::overwrite_existing);
+    fs::copy_file(
+      y2025_m01, hive_dir / "flat/part_2025_01.parquet", fs::copy_options::overwrite_existing);
+
+    hive_path   = (hive_dir / "h/year=*/*.parquet").string();
+    flat_path   = (hive_dir / "flat/*.parquet").string();
+    config_path = hive_dir / "watchdog_integration.yaml";
+    write_watchdog_config(config_path);
+    is_hive_available = true;
   }
 
+  ~HivePartitionDataset() { fs::remove_all(hive_dir); }
+
+  struct watchdog_result {
+    bool timed_out{false};
+    duckdb::idx_t row_count{0};
+    duckdb::idx_t column_count{0};
+    std::vector<std::vector<std::string>> rows;
+    std::string error;
+  };
+
+  std::string hive_scan() const
+  {
+    return "read_parquet(" + sql_string_literal(hive_path) + ", hive_partitioning=true)";
+  }
+
+  std::string flat_scan() const { return "read_parquet(" + sql_string_literal(flat_path) + ")"; }
+
+  static std::vector<std::string> split_row(std::string const& line)
+  {
+    std::vector<std::string> parts;
+    std::stringstream ss(line);
+    std::string part;
+    while (std::getline(ss, part, '\t')) {
+      parts.push_back(std::move(part));
+    }
+    return parts;
+  }
+
+  static void write_watchdog_result(fs::path const& path, watchdog_result const& result)
+  {
+    std::ofstream out(path);
+    out << "ERROR\t" << result.error << "\n";
+    out << "SHAPE\t" << result.row_count << "\t" << result.column_count << "\n";
+    for (auto const& row : result.rows) {
+      out << "ROW";
+      for (auto const& value : row) {
+        out << '\t' << value;
+      }
+      out << "\n";
+    }
+  }
+
+  static void write_watchdog_config(fs::path const& path)
+  {
+    std::ofstream out(path);
+    out << R"(sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.2
+      reservation_limit_fraction: 1.0
+    host:
+      capacity_bytes: 8000000000
+      initial_number_pools: 4
+      pool_size: 512
+      block_size: 1048576
+  executor:
+    pipeline:
+      num_threads: 2
+    task_creator:
+      num_threads: 1
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
+  operator_params:
+    scan_task_batch_size: 100000000
+    default_scan_task_varchar_size: 256
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 100000000
+    concat_batch_bytes: 100000000
+    max_build_hash_table_bytes: 90000000
+)";
+  }
+
+  static watchdog_result read_watchdog_result(fs::path const& path)
+  {
+    watchdog_result result;
+    std::ifstream in(path);
+    if (!in) {
+      result.error = "watchdog child did not write a result file";
+      return result;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+      auto parts = split_row(line);
+      if (parts.empty()) { continue; }
+      if (parts[0] == "ERROR") {
+        if (parts.size() > 1) { result.error = parts[1]; }
+      } else if (parts[0] == "SHAPE") {
+        if (parts.size() >= 3) {
+          result.row_count    = static_cast<duckdb::idx_t>(std::stoull(parts[1]));
+          result.column_count = static_cast<duckdb::idx_t>(std::stoull(parts[2]));
+        }
+      } else if (parts[0] == "ROW") {
+        parts.erase(parts.begin());
+        result.rows.push_back(std::move(parts));
+      }
+    }
+    return result;
+  }
+
+  watchdog_result run_gpu_query_with_watchdog(std::string const& query,
+                                              std::chrono::seconds timeout)
+  {
+    static std::atomic<std::uint64_t> next_child_id{0};
+    auto const output_path =
+      hive_dir / ("watchdog_result_" + std::to_string(next_child_id.fetch_add(1)) + ".txt");
+    auto const pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+      ::setenv("SIRIUS_HIVE_WATCHDOG_QUERY", query.c_str(), 1);
+      ::setenv("SIRIUS_HIVE_WATCHDOG_OUTPUT", output_path.string().c_str(), 1);
+      ::setenv("SIRIUS_HIVE_WATCHDOG_CONFIG", config_path.string().c_str(), 1);
+      ::setenv("SIRIUS_CONFIG_FILE", config_path.string().c_str(), 1);
+      ::execl("/proc/self/exe",
+              "sirius_unittest",
+              "gpu_execution hive partition watchdog child runner",
+              static_cast<char*>(nullptr));
+      ::_exit(127);
+    }
+
+    int status      = 0;
+    auto const stop = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < stop) {
+      auto const waited = ::waitpid(pid, &status, WNOHANG);
+      if (waited == pid) {
+        auto result = read_watchdog_result(output_path);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+          result.error = result.error.empty() ? "watchdog child exited abnormally" : result.error;
+        }
+        return result;
+      }
+      if (waited < 0) {
+        watchdog_result result;
+        result.error = "waitpid failed while waiting for watchdog child";
+        return result;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+
+    (void)::kill(pid, SIGKILL);
+    (void)::waitpid(pid, &status, 0);
+    watchdog_result out;
+    out.timed_out = true;
+    out.error     = "query timed out after " + std::to_string(timeout.count()) + " seconds";
+    return out;
+  }
+
+  void require_gpu_rows(std::string const& query,
+                        std::vector<std::vector<std::string>> const& expected_rows)
+  {
+    auto result = run_gpu_query_with_watchdog(query, std::chrono::seconds{60});
+    INFO(query);
+    INFO(result.error);
+    REQUIRE_FALSE(result.timed_out);
+    REQUIRE(result.error.empty());
+    CHECK(result.rows == expected_rows);
+  }
+
+  fs::path hive_dir;
+  fs::path config_path;
   std::string hive_path;
-  bool is_hive_available = false;  // Assume available; no extension needed for hive partitioning
+  std::string flat_path;
+  bool is_hive_available = false;  // No extension is needed for DuckDB hive partition discovery.
 };
+
+class GPUExecutionHivePartitionFixture : public MultiFormatFixtureBase,
+                                         public HivePartitionDataset {};
+
+TEST_CASE("gpu_execution hive partition watchdog child runner",
+          "[.][gpu_execution][hive_partition][watchdog_child]")
+{
+  auto const* query      = std::getenv("SIRIUS_HIVE_WATCHDOG_QUERY");
+  auto const* output_raw = std::getenv("SIRIUS_HIVE_WATCHDOG_OUTPUT");
+  if (query == nullptr || output_raw == nullptr) { return; }
+
+  HivePartitionDataset::watchdog_result out;
+  try {
+    auto const* config_raw = std::getenv("SIRIUS_HIVE_WATCHDOG_CONFIG");
+    if (config_raw == nullptr) { out.error = "watchdog child missing config path"; }
+
+    std::unique_ptr<sirius_config_env_guard> config_guard;
+    std::unique_ptr<duckdb::DuckDB> db;
+    std::unique_ptr<duckdb::Connection> con;
+    if (out.error.empty()) {
+      config_guard = std::make_unique<sirius_config_env_guard>(config_raw);
+      unsetenv("SIRIUS_DISABLE");
+      db  = std::make_unique<duckdb::DuckDB>(nullptr);
+      con = std::make_unique<duckdb::Connection>(*db);
+    }
+
+    auto set_gpu = out.error.empty() ? con->Query("SET gpu_execution = true;") : nullptr;
+    if (!set_gpu) {
+      out.error = "SET gpu_execution returned nullptr";
+    } else if (set_gpu->HasError()) {
+      out.error = set_gpu->GetError();
+    }
+
+    auto before_gpu_stats = out.error.empty()
+                              ? sirius::test::get_transparent_execution_stats(*con)
+                              : duckdb::SiriusContext::transparent_execution_stats{};
+    if (out.error.empty()) {
+      auto result = con->Query(query);
+      if (!result) {
+        out.error = "query returned nullptr";
+      } else if (result->HasError()) {
+        out.error = result->GetError();
+      } else {
+        out.row_count      = result->RowCount();
+        out.column_count   = result->ColumnCount();
+        auto& materialized = result->Cast<duckdb::MaterializedQueryResult>();
+        out.rows           = MultiFormatFixtureBase::collect_rows(materialized);
+      }
+    }
+
+    if (out.error.empty()) {
+      auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+      if (after_gpu_stats.successful_rebinds != before_gpu_stats.successful_rebinds + 1 ||
+          after_gpu_stats.fallbacks != before_gpu_stats.fallbacks ||
+          after_gpu_stats.executions != before_gpu_stats.executions + 1) {
+        out.error = "transparent execution stats delta mismatch";
+      }
+    }
+  } catch (std::exception const& e) {
+    out.error = e.what();
+  } catch (...) {
+    out.error = "query threw an unknown exception";
+  }
+
+  HivePartitionDataset::write_watchdog_result(output_raw, out);
+  REQUIRE(out.error.empty());
+}
+
+TEST_CASE_METHOD(HivePartitionDataset,
+                 "gpu_execution hive partition count star completes under watchdog",
+                 "[gpu_execution][hive_partition][count_star][watchdog]")
+{
+  SECTION("hive count star") { require_gpu_rows("SELECT count(*) FROM " + hive_scan(), {{"3"}}); }
+
+  SECTION("flat count star control")
+  {
+    require_gpu_rows("SELECT count(*) FROM " + flat_scan(), {{"3"}});
+  }
+
+  SECTION("partition-filtered count star")
+  {
+    require_gpu_rows("SELECT count(*) FROM " + hive_scan() + " WHERE year = 2024", {{"2"}});
+  }
+
+  SECTION("partition column select")
+  {
+    require_gpu_rows("SELECT year FROM " + hive_scan() + " ORDER BY year",
+                     {{"2024"}, {"2024"}, {"2025"}});
+  }
+}
 
 TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
                  "gpu_execution hive partition - basic scan with partition columns",

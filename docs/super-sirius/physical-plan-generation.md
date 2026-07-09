@@ -77,7 +77,7 @@ Projections are omitted when columns are already in the correct order (passthrou
 
 After the operator tree is built, `create_plan()` runs `fold_adjacent_projections()` over the whole plan as a final pass. Sirius routes every planner-created projection through `push_projection()`, which both elides identity passthrough projections and, when its child is already a projection, composes the two select lists into one. The standalone `fold_adjacent_projections()` post-pass then collapses any remaining `PROJECTION → PROJECTION` stacks anywhere in the tree — including projection pairs that arise from separate plan-builder steps (filter `projection_map` reordering, aggregate child/filter hoisting, table-scan unsupported-filter projections, and the user's `SELECT` list) and projections sitting under other operators such as joins.
 
-Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (an unsupported-expression fallback) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `gpu_expression_executor` over every batch.
+Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (an unsupported-expression fallback) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `expression_evaluator` over every batch.
 
 ## Part 2: Pipeline Structure
 
@@ -274,6 +274,14 @@ graph LR
 - PARTITION → CONCAT uses `PARTIAL` barrier (downstream is CONCAT — line 1014)
 - Build-side CONCAT pushes to the HASH_JOIN's `"build"` port with `FULL` barrier (default)
 - The probe and build PARTITION operators are linked as siblings for partition count coordination
+
+For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and
+its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and
+channel publication before downstream task creation follows that join into its **immediate** probe
+producer. This edge ordering does not gate a base scan reached transitively through an intervening
+join; such a scan samples the channel opportunistically under normal scheduler order. See
+[Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
+[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ### ORDER_BY → 3-Phase Sort
 

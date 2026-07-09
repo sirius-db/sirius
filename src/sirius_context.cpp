@@ -17,10 +17,13 @@
 #include "sirius_context.hpp"
 
 #include "config.hpp"
+#include "cucascade/memory/memory_reservation_manager.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
@@ -28,7 +31,9 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius_sql_rewrite.hpp"
 #include "transparent/physical_sirius_execution.hpp"
+#include "transparent/sirius_optimizer_extension.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -281,20 +286,6 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
   config_ = config;
-  // Declare one telemetry device group per GPU so thread/queue telemetry can
-  // nest under its device instead of piling up flat under the engine. The GPU
-  // memory space configs already reflect the configured topology.num_gpus /
-  // topology.gpu_ids selection, unlike the raw hardware topology.
-  std::vector<int> telemetry_gpu_ids;
-  for (auto const& space_config : config_.get_memory_space_configs()) {
-    if (auto const* gpu_config =
-          std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config)) {
-      telemetry_gpu_ids.push_back(gpu_config->device_id);
-    }
-  }
-  telemetry_context_ =
-    sirius::telemetry::telemetry_context::create(config_.get_telemetry_config(), telemetry_gpu_ids);
-
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
   // get_hw_topology() is the only authorised source of GPU/NUMA counts —
@@ -316,6 +307,20 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  // Declare one telemetry device group per GPU so thread/queue telemetry can
+  // nest under its device instead of piling up flat under the engine. The GPU
+  // memory space configs already reflect the configured topology.num_gpus /
+  // topology.gpu_ids selection, unlike the raw hardware topology.
+  std::vector<int> telemetry_gpu_ids;
+  for (auto const& space_config : config_.get_memory_space_configs()) {
+    if (auto const* gpu_config =
+          std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config)) {
+      telemetry_gpu_ids.push_back(gpu_config->device_id);
+    }
+  }
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(
+    config_.get_telemetry_config(), memory_manager_.get(), telemetry_gpu_ids);
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
@@ -405,12 +410,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
-  cucascade::memory::fixed_size_host_memory_resource* host_fsmr = nullptr;
   {
     auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!host_spaces.empty()) {
-      host_fsmr = host_spaces[0]
-                    ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
       std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
         per_node_pools;
       int fallback_node = -1;
@@ -775,6 +777,52 @@ void SiriusContext::record_transparent_execution() noexcept
   transparent_execution_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace {
+
+bool logical_plan_reads_s3(duckdb::LogicalOperator const& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto const& get = op.Cast<duckdb::LogicalGet>();
+    if (auto const* mf = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get())) {
+      if (mf->file_list) {
+        for (auto const& file : mf->file_list->GetAllFiles()) {
+          auto const& p = file.path;
+          if (p.size() > 5 && (p[0] == 's' || p[0] == 'S') && p[1] == '3' && p[2] == ':' &&
+              p[3] == '/' && p[4] == '/') {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  for (auto const& child : op.children) {
+    if (logical_plan_reads_s3(*child)) { return true; }
+  }
+  return false;
+}
+
+// S3 is GPU-only. When a transparent query that reads s3:// fails on the GPU
+// path, refuse to fall back to CPU: DuckDB's CPU read_parquet would re-read the
+// s3:// data through the bind-only Sirius FileSystem, which is exactly the CPU
+// fallback S3 does not support. Detection is plan-based (the SQL text is not
+// reliably available during prepare, and view bodies hide the s3:// literal);
+// references_sirius_owned_s3_parquet on the query text is a secondary signal.
+// Non-s3 (local) queries fall through to the normal CPU fallback. Surfaces the
+// same clear error the gpu_execution(...) path raises.
+void throw_if_s3_no_cpu_fallback(bool plan_reads_s3,
+                                 std::string const& query_sql,
+                                 std::string const& gpu_error)
+{
+  if (plan_reads_s3 || sirius::references_sirius_owned_s3_parquet(query_sql)) {
+    throw std::runtime_error(
+      "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
+      "Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
+      gpu_error);
+  }
+}
+
+}  // namespace
+
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
                                                  PreparedStatementMode mode)
@@ -832,16 +880,25 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       Optimizer optimizer(*planner.binder, context);
       logical_plan = optimizer.Optimize(std::move(planner.plan));
     } catch (NotImplementedException& e) {
+      // No captured plan to inspect on the replan path; guard on the SQL text so
+      // a direct read_parquet('s3://') that fails to re-plan does not CPU-fall-back.
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     }
     if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
   }
+
+  // Detect an s3:// read from the plan now, while logical_plan is still intact
+  // (create_plan below consumes it). S3 is GPU-only: if GPU translation fails we
+  // must NOT fall back to CPU for s3:// (see throw_if_s3_no_cpu_fallback).
+  bool const plan_reads_s3 = logical_plan_reads_s3(*logical_plan);
 
   try {
     // Validate that the captured logical plan is GPU-translatable before we
@@ -856,7 +913,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
     bool plan_is_copyable = true;
     try {
-      validation_plan = logical_plan->Copy(context);
+      // Preserve LogicalComparisonJoin::filter_pushdown / LogicalGet::dynamic_filters across
+      // the Copy round-trip — these fields are not in DuckDB's serialization schema, so a plain
+      // Copy strips them. Without this, downstream Sirius wiring would not see runtime-computed
+      // dynamic filters even when DuckDB's optimizer produced them.
+      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
     } catch (NotImplementedException&) {
       plan_is_copyable = false;
     }
@@ -884,9 +945,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
   } catch (NotImplementedException& e) {
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", e.what());
   } catch (std::exception& e) {
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback: {}", e.what());
   }

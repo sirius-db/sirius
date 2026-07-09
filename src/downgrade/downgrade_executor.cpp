@@ -101,7 +101,7 @@ void downgrade_executor::start()
 
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 
-  if (_memory_space && _config.monitor_period_ms > 0) {
+  if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
     _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
   }
 }
@@ -209,7 +209,8 @@ void downgrade_executor::processing_loop()
       if (req->satisfied.load()) break;
 
       convertible_data_batch_provider provider(repo);
-      auto candidates = provider.get_all_convertible(source_space, /*front_to_back=*/false);
+      auto candidates = provider.get_all_convertible(
+        source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
       for (auto& candidate : candidates) {
         if (req->satisfied.load()) break;
 
@@ -434,7 +435,7 @@ void downgrade_executor::monitor_loop()
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
       // re-firing would just re-scan every repository and the task queue, free nothing, and spam
-      // the log every monitor_period_ms (~100x/s by default) forever. Skipping the cycle backs
+      // the log every monitor_period (~100x/s by default) forever. Skipping the cycle backs
       // off cleanly; because this is re-checked every cycle the monitor resumes the instant host
       // frees or pressure drops -- there is no latched state to get wedged on.
       if (has_viable_downgrade_target()) {
@@ -465,9 +466,8 @@ void downgrade_executor::monitor_loop()
     }
     // Wait for the monitor period, but wake immediately on shutdown.
     std::unique_lock<std::mutex> lock(_monitor_cv_mutex);
-    _monitor_cv.wait_for(lock, std::chrono::milliseconds(_config.monitor_period_ms), [this]() {
-      return !_running.load(std::memory_order_relaxed);
-    });
+    _monitor_cv.wait_for(
+      lock, _config.monitor_period, [this]() { return !_running.load(std::memory_order_relaxed); });
   }
 }
 

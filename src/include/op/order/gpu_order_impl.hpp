@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "telemetry/data_batch_probe.hpp"
+
 #include <cudf/cudf_utils.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -26,6 +28,11 @@
 #include <vector>
 
 namespace sirius {
+
+namespace telemetry {
+class telemetry_context;
+}  // namespace telemetry
+
 namespace op {
 
 /**
@@ -56,7 +63,8 @@ class gpu_order_impl {
     const std::vector<cudf::null_order>& null_precedence,
     const std::vector<int>& projections,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 };
 
 }  // namespace op

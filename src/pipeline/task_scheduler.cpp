@@ -23,16 +23,19 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
+#include "planner/query.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -185,11 +188,6 @@ void task_scheduler::terminate_query(std::exception_ptr error)
   stop();
 }
 
-void task_scheduler::signal_query_complete()
-{
-  if (_completion_handler) { _completion_handler->mark_completed(); }
-}
-
 void task_scheduler::drain_after_error()
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
@@ -323,8 +321,10 @@ void task_scheduler::management_eventloop()
     // binding to guarantee correctness.
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
-      // First try exact preference match.
-      auto task = _task_queue.pop_if(
+      std::unique_ptr<sirius::parallel::itask> task;
+
+      // Exact preference match.
+      task = _task_queue.pop_if(
         [device_id](const sirius::parallel::itask& t) -> bool {
           const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
           if (!gpu_task) { return false; }

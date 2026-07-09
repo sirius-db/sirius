@@ -97,6 +97,7 @@ extern "C" int cudaProfilerStop();
 // <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
+#include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
@@ -151,7 +152,12 @@ unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return connection.Query(query); }
 
+  // CpuFallbackGuard marks this replay so sirius_httpfs refuses to serve s3://
+  // data reached indirectly (e.g. through a view) to the CPU plan — the
+  // string-level references_sirius_owned_s3_parquet check above only catches a
+  // literal read_parquet('s3://') in the query text.
   duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+  duckdb::SiriusContext::CpuFallbackGuard cpu_fallback_guard(*sirius_ctx);
   return connection.Query(query);
 }
 
@@ -672,9 +678,9 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   return;
 }
 
-static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
-                                                Planner& planner,
-                                                Connection& new_conn)
+[[maybe_unused]] static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
+                                                                 Planner& planner,
+                                                                 Connection& new_conn)
 {
   unique_ptr<LogicalOperator> plan;
   plan = std::move(planner.plan);
@@ -1316,7 +1322,10 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                     {LogicalType::VARCHAR},
                                     SiriusReadParquetFunction,
                                     SiriusReadParquetBind);
-  sirius_read_parquet.cardinality = SiriusReadParquetCardinality;
+  sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.projection_pushdown = true;
+  sirius_read_parquet.filter_pushdown     = true;
+  sirius_read_parquet.filter_prune        = true;
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
@@ -1598,6 +1607,54 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
+static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_dynamic_filter_pushdown = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_PUSHDOWN to {}",
+                   params->enable_dynamic_filter_pushdown);
+}
+
+static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_dynamic_zone_map_filter = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_ZONE_MAP_FILTER to {}",
+                   params->enable_dynamic_zone_map_filter);
+}
+
+static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double threshold = parameter.GetValue<double>();
+  if (threshold <= 0.0) {
+    throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
+                                threshold);
+  }
+  params->dynamic_filter_domain_coverage_threshold = threshold;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_DOMAIN_COVERAGE_THRESHOLD to {}",
+                   params->dynamic_filter_domain_coverage_threshold);
+}
+
+static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double threshold = parameter.GetValue<double>();
+  if (threshold < 0.0 || threshold > 1.0) {
+    throw InvalidInputException("dynamic_filter_keep_threshold must be in [0.0, 1.0], got %f",
+                                threshold);
+  }
+  params->dynamic_filter_keep_threshold = threshold;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_KEEP_THRESHOLD to {}",
+                   params->dynamic_filter_keep_threshold);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1786,6 +1843,41 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
+
+  config.AddExtensionOption(
+    "enable_dynamic_filter_pushdown",
+    "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
+    "runtime membership filter (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan "
+    "to drop non-matching rows before the join (on by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
+    SetEnableDynamicFilterPushdown);
+
+  config.AddExtensionOption(
+    "enable_dynamic_zone_map_filter",
+    "Additionally emit a runtime zone-map (build-key min/max) for read-time row-group pruning at "
+    "the "
+    "probe scan; requires enable_dynamic_filter_pushdown (off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
+    SetEnableDynamicZoneMapFilter);
+
+  config.AddExtensionOption(
+    "dynamic_filter_domain_coverage_threshold",
+    "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
+    "fraction of the key's domain; >= 1.0 effectively disables the gate",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_domain_coverage_threshold),
+    SetDynamicFilterDomainCoverageThreshold);
+
+  config.AddExtensionOption(
+    "dynamic_filter_keep_threshold",
+    "Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than "
+    "this fraction of its rows (too unselective to repay the mask kernel); in [0.0, 1.0], 1.0 "
+    "keeps filtering always on",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
+    SetDynamicFilterKeepThreshold);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -1801,12 +1893,14 @@ static void LoadInternal(ExtensionLoader& loader)
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
 
-  // S3 CPU fallback is not supported: there is no DuckDB CPU FileSystem for
-  // s3://. S3 parquet is read only on the GPU path (read_parquet('s3://…') is
-  // rewritten to sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx).
-  // A query that reads s3:// and fails on GPU surfaces a clear "S3 CPU fallback
-  // is not supported" error (see run_internal_cpu_fallback_query); local reads
-  // still fall back to DuckDB's CPU execution.
+  // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
+  // by reading the parquet footer through Sirius's routed REST ioctx. This makes
+  // the transparent form work — SET gpu_execution=true; SELECT ... FROM
+  // read_parquet('s3://...') — with the captured scan run on GPU. sirius_httpfs
+  // is read-only and GPU-only: it serves the bind-time footer read, never a CPU
+  // data path (a query that reads s3:// and fails on GPU still surfaces a clear
+  // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
+  db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
   // Register optimizer extension for transparent GPU execution.
   // Pre-hook disables incompatible optimizers; post-hook captures the plan.

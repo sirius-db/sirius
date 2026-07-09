@@ -24,6 +24,7 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_hash_join.hpp>
+#include <op/sirius_physical_nested_loop_join.hpp>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -45,6 +46,16 @@ using namespace sirius::test::operator_utils;
 struct mark_join_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
+};
+
+struct nlj_projection_fixture {
+  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
+  duckdb::unique_ptr<sirius_physical_nested_loop_join> nlj;
+};
+
+struct projected_nlj_result {
+  std::unique_ptr<operator_data> outputs;
+  cudf::table_view view;
 };
 
 /**
@@ -95,6 +106,71 @@ memory_space* get_shared_mem_space()
 {
   static auto manager = sirius::test::operator_utils::initialize_memory_manager();
   return manager->get_memory_space(Tier::GPU, 0);
+}
+
+std::shared_ptr<cucascade::data_batch> make_three_int32_batch(memory_space& space,
+                                                              const std::vector<int32_t>& col0,
+                                                              const std::vector<int32_t>& col1,
+                                                              const std::vector<int32_t>& col2)
+{
+  auto b0 = make_numeric_batch<int32_t>(space, col0, cudf::type_id::INT32);
+  auto b1 = make_numeric_batch<int32_t>(space, col1, cudf::type_id::INT32);
+  auto b2 = make_numeric_batch<int32_t>(space, col2, cudf::type_id::INT32);
+  return concatenate_batches_horizontal({b0, b1, b2}, space);
+}
+
+nlj_projection_fixture create_projected_nlj(duckdb::JoinType join_type,
+                                            duckdb::ExpressionType comparison)
+{
+  nlj_projection_fixture f;
+
+  f.logical_join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
+  if (join_type == duckdb::JoinType::MARK) {
+    f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
+  } else {
+    f.logical_join->types = {duckdb::LogicalType::INTEGER};
+  }
+
+  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+      duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER}),
+    0);
+  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    0);
+
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::JoinCondition cond;
+  cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond.comparison = comparison;
+  conditions.push_back(std::move(cond));
+
+  f.nlj = duckdb::make_uniq<sirius_physical_nested_loop_join>(
+    *f.logical_join,
+    std::move(left_child),
+    std::move(right_child),
+    sirius::wrap_join_conditions(std::move(conditions)),
+    join_type,
+    1000,
+    duckdb::vector<std::size_t>{1},  // left_projection_map: output only payload column
+    duckdb::vector<std::size_t>{});
+
+  return f;
+}
+
+projected_nlj_result execute_projected_nlj(sirius_physical_nested_loop_join& nlj,
+                                           std::shared_ptr<cucascade::data_batch> left,
+                                           std::shared_ptr<cucascade::data_batch> right)
+{
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{std::move(left), std::move(right)};
+  auto outputs = nlj.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto const& output_data = dynamic_cast<const pipelineable_operator_data&>(*outputs);
+  REQUIRE(output_data.get_data_batches().size() == 1);
+  auto view = sirius::get_cudf_table_view(*output_data.get_data_batches()[0]);
+  return projected_nlj_result{std::move(outputs), view};
 }
 
 }  // namespace
@@ -286,4 +362,227 @@ TEST_CASE("sirius_physical_hash_join mark join - build-on-left (cudf::mark_join)
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
   REQUIRE(copy_column_to_host<bool>(out_view.column(2)) ==
           std::vector<bool>{false, true, false, true});
+}
+
+// Issue #1076: MARK joins must emit a NULL mark (not false) for an unmatched left row when the
+// build/right side contains a NULL join key. left {1,2,3} vs right {2, NULL} -> [NULL, true, NULL].
+TEST_CASE("sirius_physical_hash_join mark join - right side has NULL key", "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {1, 2, 3};
+  std::vector<int32_t> left_payload = {10, 20, 30};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  // Right key column = {2, NULL}: only 2 is a real key; the NULL taints every non-match to NULL.
+  auto right_batch =
+    make_numeric_batch_with_nulls<int32_t>(*space, {2, 0}, {true, false}, cudf::type_id::INT32);
+
+  auto f = create_mark_join();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(out_view.num_rows() == 3);
+
+  auto mark = out_view.column(2);
+  REQUIRE(mark.null_count() == 2);
+  REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false, true, false});
+  REQUIRE(copy_column_to_host<bool>(mark)[1] == true);  // the one matched row
+}
+
+// Issue #1076: an unmatched left row with a NULL probe key is NULL, not false, even when the build
+// side has no NULL key. left {1, NULL, 2} vs right {2} -> [false, NULL, true].
+TEST_CASE("sirius_physical_hash_join mark join - probe side has NULL key", "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // Left key column carries a NULL at row 1; payload is a plain column.
+  auto left_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 0, 2}, {true, false, true}, cudf::type_id::INT32);
+  auto left_payload = make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32);
+  auto left_batch   = concatenate_batches_horizontal({left_key, left_payload}, *space);
+
+  auto right_batch = make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32);
+
+  auto f = create_mark_join();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(out_view.num_rows() == 3);
+
+  auto mark = out_view.column(2);
+  REQUIRE(mark.null_count() == 1);
+  REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{true, false, true});
+  auto values = copy_column_to_host<bool>(mark);
+  REQUIRE(values[0] == false);  // 1 has no match, probe valid, right clean -> false
+  REQUIRE(values[2] == true);   // 2 matches -> true
+}
+
+// Issue #1076: the same NULL semantics must hold on the build-on-left (cudf::mark_join) path.
+TEST_CASE("sirius_physical_hash_join mark join - right NULL key on build-on-left path",
+          "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {10, 20, 30, 40};
+  std::vector<int32_t> left_payload = {1, 2, 3, 4};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  // Right (probe) side larger than left to trigger the switch; {20, 40} match and a NULL is
+  // present.
+  auto right_batch =
+    make_numeric_batch_with_nulls<int32_t>(*space,
+                                           {20, 40, 0, 11, 12, 13, 14},
+                                           {true, true, false, true, true, true, true},
+                                           cudf::type_id::INT32);
+
+  auto f                                    = create_mark_join();
+  f.hash_join->mark_join_build_switch_ratio = 1.0;
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(out_view.num_rows() == 4);
+
+  auto mark = out_view.column(2);
+  REQUIRE(mark.null_count() == 2);
+  REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false, true, false, true});
+}
+
+//===----------------------------------------------------------------------===//
+// Nested-loop join projection-map regression tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("sirius_physical_nested_loop_join MARK honors the left projection map",
+          "[physical_nested_loop_join][projection][mark]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  auto left  = make_three_int32_batch(*space,
+                                     /*key*/ {1, 2, 3},
+                                     /*payload selected by left_projection_map*/ {10, 20, 30},
+                                     /*unprojected sentinel*/ {100, 200, 300});
+  auto right = make_numeric_batch<int32_t>(*space, {3}, cudf::type_id::INT32);
+
+  auto f = create_projected_nlj(duckdb::JoinType::MARK, duckdb::ExpressionType::COMPARE_LESSTHAN);
+  auto result   = execute_projected_nlj(*f.nlj, left, right);
+  auto out_view = result.view;
+
+  REQUIRE(out_view.num_columns() == 2);
+  REQUIRE(out_view.num_rows() == 3);
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == std::vector<int32_t>{10, 20, 30});
+  REQUIRE(copy_column_to_host<bool>(out_view.column(1)) == std::vector<bool>{true, true, false});
+}
+
+TEST_CASE("sirius_physical_nested_loop_join MARK empty side honors the left projection map",
+          "[physical_nested_loop_join][projection][mark]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  SECTION("empty right side marks projected left rows false")
+  {
+    auto left  = make_three_int32_batch(*space, {1, 2, 3}, {10, 20, 30}, {100, 200, 300});
+    auto right = make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::MARK, duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    REQUIRE(out_view.num_columns() == 2);
+    REQUIRE(out_view.num_rows() == 3);
+    REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == std::vector<int32_t>{10, 20, 30});
+    REQUIRE(copy_column_to_host<bool>(out_view.column(1)) ==
+            std::vector<bool>{false, false, false});
+  }
+
+  SECTION("empty left side still exposes the projected-left-plus-mark schema")
+  {
+    auto left  = make_three_int32_batch(*space, {}, {}, {});
+    auto right = make_numeric_batch<int32_t>(*space, {1, 2}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::MARK, duckdb::ExpressionType::COMPARE_LESSTHAN);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    REQUIRE(out_view.num_columns() == 2);
+    REQUIRE(out_view.num_rows() == 0);
+  }
+}
+
+TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left projection map",
+          "[physical_nested_loop_join][projection][semi][anti]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  SECTION("SEMI normal path projects only selected left columns")
+  {
+    auto left  = make_three_int32_batch(*space, {1, 2, 3}, {10, 20, 30}, {100, 200, 300});
+    auto right = make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::SEMI, duckdb::ExpressionType::COMPARE_EQUAL);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    REQUIRE(out_view.num_columns() == 1);
+    REQUIRE(out_view.num_rows() == 1);
+    REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == std::vector<int32_t>{20});
+  }
+
+  SECTION("ANTI normal path projects only selected left columns")
+  {
+    auto left  = make_three_int32_batch(*space, {1, 2, 3}, {10, 20, 30}, {100, 200, 300});
+    auto right = make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::ANTI, duckdb::ExpressionType::COMPARE_EQUAL);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    REQUIRE(out_view.num_columns() == 1);
+    REQUIRE(out_view.num_rows() == 2);
+    REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == std::vector<int32_t>{10, 30});
+  }
+
+  SECTION("SEMI empty-side arm keeps the projected schema")
+  {
+    auto left  = make_three_int32_batch(*space, {1, 2, 3}, {10, 20, 30}, {100, 200, 300});
+    auto right = make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::SEMI, duckdb::ExpressionType::COMPARE_EQUAL);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    REQUIRE(out_view.num_columns() == 1);
+    REQUIRE(out_view.num_rows() == 0);
+  }
+
+  SECTION("ANTI empty-side arm projects all preserved left rows")
+  {
+    auto left  = make_three_int32_batch(*space, {1, 2, 3}, {10, 20, 30}, {100, 200, 300});
+    auto right = make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32);
+
+    auto f = create_projected_nlj(duckdb::JoinType::ANTI, duckdb::ExpressionType::COMPARE_EQUAL);
+    auto result   = execute_projected_nlj(*f.nlj, left, right);
+    auto out_view = result.view;
+
+    REQUIRE(out_view.num_columns() == 1);
+    REQUIRE(out_view.num_rows() == 3);
+    REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == std::vector<int32_t>{10, 20, 30});
+  }
 }

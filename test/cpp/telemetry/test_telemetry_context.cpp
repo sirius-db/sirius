@@ -78,7 +78,7 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   std::string engine_id;
   std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id, shared_id;
   {
-    auto context = telemetry_context::create(config, {0, 1});
+    auto context = telemetry_context::create(config, /*manager=*/nullptr, {0, 1});
     engine_id    = uuid_str(context->engine_id());
     gpu0_id      = uuid_str(context->gpu_device_group_id(0));
     gpu1_id      = uuid_str(context->gpu_device_group_id(1));

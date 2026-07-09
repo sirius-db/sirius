@@ -107,7 +107,7 @@ class prefetching_handle {
 
  private:
   friend class prefetching_cache;
-  struct prefetch_lifecycle_manager;
+  class prefetch_lifecycle_manager;
 
   prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept;
 

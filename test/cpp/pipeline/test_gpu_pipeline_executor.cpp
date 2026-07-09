@@ -132,7 +132,8 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
     global.executed_count.fetch_add(1, std::memory_order_relaxed);
   }
 
-  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info() const override
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* /*target_space*/) const override
   {
     sirius::pipeline::reservation_size_info info;
     info.reservation_size = kReservationBytes;

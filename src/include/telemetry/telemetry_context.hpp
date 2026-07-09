@@ -28,6 +28,7 @@
 #include "telemetry-bridge/gen/thread_group.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry-bridge/gen/worker.rs.h"
+#include "telemetry/memory_context.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -53,7 +54,9 @@ class telemetry_context {
   /// `gpu_device_ids` declares one per-GPU resource group (plus per-thread-type
   /// child buckets) under the engine, so thread telemetry can nest per device.
   [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
-    const sirius::telemetry_config& config, const std::vector<int>& gpu_device_ids = {});
+    const sirius::telemetry_config& config,
+    const cucascade::memory::memory_reservation_manager* manager = nullptr,
+    const std::vector<int>& gpu_device_ids                       = {});
 
   ~telemetry_context();
 
@@ -77,9 +80,15 @@ class telemetry_context {
   /// The `shared` group under the engine, for threads with no single GPU.
   [[nodiscard]] const uuid::UUID& shared_group_id() const { return shared_group_uuid_; }
   [[nodiscard]] const quent::Context& context() const { return *context_; }
+  [[nodiscard]] const std::shared_ptr<const memory_context>& get_memory_context() const
+  {
+    return memory_context_;
+  }
 
  private:
-  telemetry_context(const sirius::telemetry_config& config, const std::vector<int>& gpu_device_ids);
+  telemetry_context(const sirius::telemetry_config& config,
+                    const cucascade::memory::memory_reservation_manager* manager,
+                    const std::vector<int>& gpu_device_ids);
 
   /// Telemetry group ids for one GPU: the `gpu-N` group and its per-thread-type
   /// child buckets.
@@ -98,6 +107,7 @@ class telemetry_context {
   rust::Box<quent::engine::EngineObserver> engine_observer_;
   rust::Box<quent::worker::WorkerObserver> worker_observer_;
   rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
+  std::shared_ptr<const memory_context> memory_context_;
 };
 
 // A POD to hold common identifiers for useful telemetry.

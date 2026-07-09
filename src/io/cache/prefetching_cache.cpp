@@ -329,8 +329,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
 {
   if (!_armed) { return prefetching_handle(nullptr); }
 
-  const auto& key = obj.raw_file_cache_id();
-  auto& file      = get_or_create_file_entry(obj);
+  auto& file = get_or_create_file_entry(obj);
 
   const size_t chunk_bytes = _chunk_size;
   auto coalesced_ranges    = _io_ctx->align_and_coalesce(ranges, chunk_bytes);
@@ -366,7 +365,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
     work, _eviction_queue, _prefetch_queue));
   _preparation_queue.enqueue(std::move(work));
 
-  return std::move(handle);
+  return handle;
 }
 
 bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
