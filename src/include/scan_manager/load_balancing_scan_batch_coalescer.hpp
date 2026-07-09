@@ -122,6 +122,19 @@ class load_balancing_scan_batch_coalescer {
   std::function<void(exec::try_t<std::unique_ptr<op::scan::scan_info>>&&)>
   get_split_provider_bridge(op::scan::sirius_gpu_scan_operator* scan_op);
 
+  /// Drain @p provider into @p connector: pull batches until the provider is
+  /// exhausted (or @p stop fires), wrapping each as a resident
+  /// scan_operator_input. Always closes the connector on exit — with the
+  /// pending exception when the provider throws, so the consumer's
+  /// get_next_split() rethrows a clean query error instead of blocking
+  /// forever (the dispatcher swallows task exceptions, so an unclosed
+  /// connector is a silent query hang). Static and public so the drain
+  /// behavior is unit-testable against a fake provider; production use is
+  /// the sequencer's cached-slot path.
+  static void drain_cached_provider(databatch_provider& provider,
+                                    split_connector& connector,
+                                    std::stop_token const& stop);
+
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when
   /// the callable asks for one (e.g. @c scoped_dispatcher).  Call once
@@ -141,9 +154,9 @@ class load_balancing_scan_batch_coalescer {
 
   void process_cached_entries(metadata_processing_state& state, std::stop_token const& stop);
 
-  /// unique_ptr storage: the slot contains a semaphore and a moodycamel
-  /// queue, both of which are non-movable, so we need stable addresses
-  /// in the vector.
+  /// shared_ptr storage: the slot contains a semaphore and a moodycamel
+  /// queue, both of which are non-movable, so slots need stable addresses —
+  /// and the split-provider bridge lambda shares ownership of its slot.
   std::vector<std::size_t> _pipeline_order;
   std::unordered_map<std::size_t, std::shared_ptr<metadata_processing_state>> _slots;
 };
