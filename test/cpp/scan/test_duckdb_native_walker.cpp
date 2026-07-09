@@ -41,8 +41,7 @@
 using namespace sirius;
 using namespace sirius::op::scan;
 
-// Shared helpers. Live outside the disabled block below so the overflow-string
-// cases (and future re-enabled cases) can use them.
+// Shared helpers, kept outside the disabled block below so live cases can use them.
 namespace {
 
 // `Connection::Query` returns a non-null result on failure (error lives in
@@ -117,12 +116,9 @@ walk_result walk_all(duckdb::DataTable& storage,
 }  // namespace
 
 //===--------------------------------------------------------------------===//
-// Overflow (big-string) refusal — a string whose length reaches
-// StringUncompressed::GetStringBlockLimit (4,096 B at the default block size)
-// is stored in an overflow block; the segment dictionary holds only a negative
-// offset + BIG_STRING_MARKER, which the GPU string decoder cannot resolve (it
-// would silently emit the marker bytes as string content). The walker must
-// refuse at prepare time so the scan routes to DuckDB CPU.
+// Overflow (big-string) refusal — strings at/over GetStringBlockLimit (4,096 B
+// at the default block size) live in overflow blocks the GPU string decoder
+// cannot resolve; the walker must refuse at prepare time.
 //===--------------------------------------------------------------------===//
 
 TEST_CASE("walker refuses varchar containing overflow-length strings",
@@ -145,8 +141,7 @@ TEST_CASE("walker refuses varchar containing overflow-length strings",
 TEST_CASE("walker refuses varchar exactly at the overflow limit",
           "[scan][duckdb_native_walker][overflow_string]")
 {
-  // DuckDB sends a string to an overflow block when its length REACHES the
-  // limit (>=), so the refusal boundary must match exactly.
+  // Overflow triggers at length >= limit, so the refusal boundary must match.
   auto [db_owner, con] = sirius::make_test_db_and_connection();
   exec_ok(con, "CREATE TABLE t(s VARCHAR)");
   exec_ok(con, "INSERT INTO t VALUES (repeat('x', 4096))");

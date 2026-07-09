@@ -104,15 +104,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       "LogicalGet::project_input can only be set for table-in-out functions");
   }
 
-  // Plan-time viability probe for the duckdb-native seq_scan path: a varchar column
-  // containing a string whose length reaches StringUncompressed::GetStringBlockLimit
-  // (a PER-VALUE limit — such strings live in overflow blocks the GPU string decoder
-  // cannot resolve) must refuse HERE, where OnFinalizePrepare's create_plan() gate
-  // turns the throw into a clean DuckDB CPU fallback. The exact per-row-group check
-  // in prepare_duckdb_native_walk still runs at pipeline conversion, but by then the
-  // transparent path has committed to GPU execution and a refusal surfaces as a
-  // mid-query InternalException with no fallback. Table-level stats are coarser than
-  // the walker's (no pruning awareness) — acceptable for a fast-refusal layer.
+  // Plan-time probe for the duckdb-native seq_scan path: strings at/over
+  // StringUncompressed::GetStringBlockLimit (a per-value limit) live in overflow
+  // blocks the GPU string decoder cannot resolve. Refuse HERE, where the throw still
+  // becomes a clean CPU fallback — the walker's refusal at pipeline conversion
+  // surfaces as a mid-query error with none. Conservative for DICT_FSST, which
+  // inlines strings up to 16 KiB (see prepare_duckdb_native_walk).
   if (op.function.name == "seq_scan" && op.bind_data) {
     auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (table_scan_bind != nullptr && table_scan_bind->table.IsDuckTable()) {

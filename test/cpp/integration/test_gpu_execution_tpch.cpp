@@ -5355,13 +5355,9 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   REQUIRE_FALSE(unpin_result->HasError());
 }
 
-// Overflow (big-string) refusal: a string whose length reaches
-// GetStringBlockLimit (4 KB at the default block size) lives in an overflow
-// block the GPU string decoder cannot resolve — pre-fix, a native GPU scan
-// silently returned the BIG_STRING_MARKER bytes as string content. The walker
-// now refuses such tables at prepare time: the query must route to DuckDB CPU
-// and return correct results, and pin_table must fail cleanly instead of
-// caching garbage.
+// Overflow (big-string) refusal: strings at/over GetStringBlockLimit (4 KB at the
+// default block size) live in overflow blocks the GPU scan cannot decode. The query
+// must route to DuckDB CPU and return correct results; pin_table must fail cleanly.
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - duckdb-native overflow strings fall back to CPU",
                  "[integration][gpu_execution][duckdb_native][overflow_string]")
@@ -5384,10 +5380,8 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     "FROM range(0, 1000);");
   exec("CHECKPOINT ovf;");
 
-  // Correctness through the interception path: the 5000-char string must come
-  // back intact (pre-fix this was 12 bytes of marker garbage). These queries are
-  // DESIGNED to fall back — the plan-time overflow probe refuses the GPU path —
-  // so assert the fallback counters positively instead of compare_gpu_vs_cpu
+  // The 5000-char string must come back intact. These queries are DESIGNED to fall
+  // back, so assert the fallback counters positively instead of compare_gpu_vs_cpu
   // (whose contract demands a successful GPU rebind).
   auto stats_before = sirius::test::get_transparent_execution_stats(*con);
 

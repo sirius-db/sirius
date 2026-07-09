@@ -297,9 +297,8 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
                std::to_string(rg_idx) + ": Max String Length stat absent from segment stats";
       }
       desc.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
-      // Defense-in-depth for the prepare-time overflow refusal (stats-drift guard): a
-      // marker-bearing segment must never reach the GPU string decoder, which cannot
-      // resolve BIG_STRING_MARKERs and would emit the marker bytes as string content.
+      // Stats-drift guard: a marker-bearing segment must never reach the GPU string
+      // decoder. Mirrors the refusal in prepare_duckdb_native_walk (see rationale there).
       if (*desc.max_string_length >=
           duckdb::StringUncompressed::GetStringBlockLimit(segment.GetBlockSize())) {
         return "varchar segment on column " + std::to_string(column_id) + " row group " +
@@ -581,16 +580,14 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
       plan.n_row_groups);
   }
 
-  // Overflow (big-string) refusal. DuckDB stores any SINGLE string whose length
-  // reaches StringUncompressed::GetStringBlockLimit(block_size) — a per-value limit,
-  // not a per-row-group aggregate — in a separate overflow block, leaving only a
-  // negative offset + BIG_STRING_MARKER (block id + offset) in the segment
-  // dictionary. The GPU string decoder cannot resolve those markers and the
-  // overflow blocks are never staged, so decoding would silently emit the marker
-  // bytes as string content. Refuse here — before any per-segment IO — so the query
-  // falls back to the DuckDB CPU scan. The row-group max-string-length stat is the
-  // longest INDIVIDUAL string in the row group, so the check is exact: stat >= limit
-  // iff some surviving row group contains at least one overflow string.
+  // Overflow (big-string) refusal. The UNCOMPRESSED codec stores any single string
+  // at/over StringUncompressed::GetStringBlockLimit in an overflow block, leaving a
+  // BIG_STRING_MARKER the GPU string decoder would silently emit as string content.
+  // The stat is a per-string max, so stat < limit proves a row group marker-free.
+  // Conservative for DICT_FSST, which inlines strings up to 16 KiB
+  // (DictFSSTCompression::STRING_SIZE_LIMIT) without markers — codecs are invisible
+  // in row-group stats, so its limit..16 KiB row groups are refused unnecessarily
+  // (rare in practice).
   auto const overflow_limit = duckdb::StringUncompressed::GetStringBlockLimit(plan.block_size);
   for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
     if (projected_cols[ci].is_rowid || !projected_types[ci].is_varchar()) { continue; }
