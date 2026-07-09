@@ -22,6 +22,7 @@
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -148,6 +149,10 @@ struct pinned_entry {
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
+  /// MVCC snapshot metadata for duckdb-native pins, attached by
+  /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
+  /// for parquet pins (immutable sources need no visibility reconciliation).
+  std::unique_ptr<duckdb_mvcc_metadata> mvcc;
 };
 
 /// Validate that @p entry can serve @p selected_columns (positions into
@@ -297,6 +302,17 @@ class sirius_scan_manager {
     cache_entry_info cache_info,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
     cucascade::memory::memory_space& memory_space);
+
+  /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
+  ///
+  /// Called by the duckdb-format pin path immediately after insert_pinned_entry /
+  /// insert_pinned_entry_host. Overwrites any previous metadata: on a re-pin that
+  /// merged into an existing entry, the refreshed (newer) v_base is the more
+  /// conservative snapshot fence for every cached column, and the refreshed
+  /// per-chunk counts stay valid for every column because the merge path rejects
+  /// materializations whose per-chunk row counts differ from the existing
+  /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
+  void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
