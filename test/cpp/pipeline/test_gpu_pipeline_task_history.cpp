@@ -267,7 +267,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
     std::move(global_state));
 
   if (reservation_size > 0) {
-    auto info        = task->get_estimated_reservation_size_info();
+    auto info        = task->get_estimated_reservation_size_info(f.gpu_space);
     auto reservation = f.manager->request_reservation(
       cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, reservation_size);
     REQUIRE(reservation != nullptr);
@@ -296,7 +296,9 @@ TEST_CASE("scan working set is a lower bound for history-based reservations",
       std::make_unique<scan_sizing_input>()),
     std::move(global_state));
 
-  auto const estimate = task->get_estimated_reservation_size_info();
+  // nullptr target space: scan inputs are not pipelineable, so no materialization is counted
+  // regardless; this test sizes from history + scan working set only.
+  auto const estimate = task->get_estimated_reservation_size_info(nullptr);
   CHECK(estimate.had_history);
   CHECK(estimate.peak_memory_estimate == 500);
   CHECK(estimate.reservation_size == 500);
@@ -315,7 +317,12 @@ TEST_CASE("scan working set is a lower bound for history-based reservations",
 // When execute() tries to convert the host data to GPU via lock_or_prepare_batch,
 // the 300 MB allocation exceeds the remaining ~100 MB -> rmm::out_of_memory.
 //
-// In the OOM catch handler, peak_bytes ~= 300 MB (requested) should be recorded to memory history.
+// The OOM catch handler records to memory history with bytes_to_materialize_input subtracted
+// from the observed peak (consistent with the success and compute-OOM record paths, so
+// materialization overhead never inflates operator peaks). Prepare's allocations here are
+// entirely input materialization (~300 MB == bytes_to_materialize_input), so the recorded
+// operator peak is 0 — a record still exists, and the estimator re-adds materialization cost
+// separately on top of the history-based estimate.
 // ---------------------------------------------------------------------------
 
 TEST_CASE(
@@ -366,11 +373,13 @@ TEST_CASE(
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
 
-  // Verify: memory history should have one record with the OOM peak_bytes
+  // Verify: one record exists, and its peak excludes materialization bytes. Prepare's
+  // allocations were entirely input materialization, so the recorded operator peak is 0
+  // (the estimator adds bytes_to_materialize_input back on top of the history estimate).
   REQUIRE(global_state->get_memory_history().size() == 1);
   auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
   REQUIRE(estimate.has_value());
-  REQUIRE(*estimate == kInputDataSize);
+  REQUIRE(*estimate == 0);
 
   // Cleanup: release the pressure allocation
   pressure_allocator->deallocate(
@@ -486,7 +495,7 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
 
   auto task2 = create_pipeline_task(f, global_state, input_batch2, 0, /*task_id=*/2);
 
-  auto info2       = task2->get_estimated_reservation_size_info();
+  auto info2       = task2->get_estimated_reservation_size_info(f.gpu_space);
   auto estimation2 = info2.reservation_size;
   REQUIRE(estimation2 ==
           ((float)kInputDataSize2 / (float)kInputDataSize1) * (kExecuteConsumptionSize1));

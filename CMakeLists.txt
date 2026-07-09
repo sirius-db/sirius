@@ -641,6 +641,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_projection_fold.cpp
+    test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
