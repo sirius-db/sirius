@@ -5364,6 +5364,66 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   REQUIRE_FALSE(unpin_result->HasError());
 }
 
+// Overflow (big-string) refusal: strings at/over GetStringBlockLimit (4 KB at the
+// default block size) live in overflow blocks the GPU scan cannot decode. The query
+// must route to DuckDB CPU and return correct results; pin_table must fail cleanly.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - duckdb-native overflow strings fall back to CPU",
+                 "[integration][gpu_execution][duckdb_native][overflow_string]")
+{
+  auto db_file = fs::temp_directory_path() / "sirius_overflow_strings_test.db";
+  fs::remove(db_file);
+  fs::remove(fs::path(db_file.string() + ".wal"));
+
+  auto exec = [&](const std::string& q) {
+    auto result = con->Query(q);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("query error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+
+  exec("ATTACH '" + db_file.string() + "' AS ovf;");
+  exec(
+    "CREATE TABLE ovf.main.bigstr AS SELECT range AS id, "
+    "CASE WHEN range = 7 THEN repeat('x', 5000) ELSE 'short_' || range END AS s "
+    "FROM range(0, 1000);");
+  exec("CHECKPOINT ovf;");
+
+  // The 5000-char string must come back intact. These queries are DESIGNED to fall
+  // back, so assert the fallback counters positively instead of compare_gpu_vs_cpu
+  // (whose contract demands a successful GPU rebind).
+  auto stats_before = sirius::test::get_transparent_execution_stats(*con);
+
+  auto check = con->Query("SELECT max(length(s)), count(*) FROM ovf.main.bigstr;");
+  REQUIRE(check);
+  if (check->HasError()) { UNSCOPED_INFO("intercepted query error: " << check->GetError()); }
+  REQUIRE_FALSE(check->HasError());
+  REQUIRE(check->GetValue(0, 0).GetValue<int64_t>() == 5000);
+  REQUIRE(check->GetValue(1, 0).GetValue<int64_t>() == 1000);
+
+  auto intact = con->Query("SELECT s = repeat('x', 5000) FROM ovf.main.bigstr WHERE id = 7;");
+  REQUIRE(intact);
+  REQUIRE_FALSE(intact->HasError());
+  REQUIRE(intact->GetValue(0, 0).GetValue<bool>());
+
+  auto stats_after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(stats_before,
+                                                    stats_after,
+                                                    /*expected_rebind_delta=*/0,
+                                                    /*expected_fallback_delta=*/2,
+                                                    /*expected_execution_delta=*/0);
+
+  // Pinning the table must fail with the refusal reason, not cache garbage.
+  auto pin_result =
+    con->Query("CALL pin_table(format='duckdb', name='ovf.main.bigstr', tier='gpu');");
+  REQUIRE(pin_result);
+  REQUIRE(pin_result->HasError());
+  REQUIRE(pin_result->GetError().find("overflow") != std::string::npos);
+
+  exec("DETACH ovf;");
+  fs::remove(db_file);
+}
+
 // Pin a column subset (cols=[...]) and then run a query that requests a strict
 // subset of those pinned columns — it must be served from the cache. A miss would
 // fall through to the separate (non-cached) scan path, so a passing run also

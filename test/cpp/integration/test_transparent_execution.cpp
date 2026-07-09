@@ -284,7 +284,9 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
   require_total(*second_result, "45");
 
   auto after_stats = sirius::test::get_transparent_execution_stats(*con);
-  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 2);
+  // 3 rebinds: one at Prepare, one per Execute (OnExecutePrepared re-decides GPU
+  // eligibility for Sirius-backed prepared statements on every execute).
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 3, 0, 2);
 }
 
 TEST_CASE_METHOD(TransparentExecutionFixture,
