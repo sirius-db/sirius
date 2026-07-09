@@ -159,12 +159,8 @@ std::unique_ptr<operator_data> sirius_physical_vss_ann_ivf_flat::execute(
   auto const num_rows = static_cast<int64_t>(pin->num_rows);
 
   auto emit = [&](std::unique_ptr<cudf::table> table) -> std::unique_ptr<operator_data> {
-    auto output_repr =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(table), *space, stream);
-    std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
     std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
-    outputs.push_back(
-      cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(output_data)));
+    outputs.push_back(make_data_batch(std::move(table), *space, stream, batch_telemetry()));
     return std::make_unique<pipelineable_operator_data>(std::move(outputs));
   };
 
