@@ -194,6 +194,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
   std::unique_ptr<cudf::filtered_join>
     _filtered_table;  // reusable build-on-right semi-join object for MARK joins in BUILD_PROBE mode
+  bool _build_has_null = false;  // whether the build/right side has a NULL in any join key column;
+                                 // needed for MARK three-valued logic in BUILD_PROBE mode
   std::optional<::cucascade::read_only_data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>

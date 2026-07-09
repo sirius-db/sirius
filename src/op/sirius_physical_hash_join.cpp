@@ -23,8 +23,10 @@
 #include "cudf/join/join.hpp"
 #include "cudf/join/mark_join.hpp"
 #include "cudf/join/mixed_join.hpp"
+#include "cudf/null_mask.hpp"
 #include "cudf/reduction.hpp"
 #include "cudf/table/table_view.hpp"
+#include "cudf/transform.hpp"
 #include "cudf/types.hpp"
 #include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
@@ -848,10 +850,27 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
       make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
 }
 
+/// @brief Whether any column of @p keys carries at least one NULL value.
+static bool table_has_any_null(cudf::table_view const& keys)
+{
+  return std::ranges::any_of(keys, [](auto const& col) { return col.null_count() > 0; });
+}
+
 /// @brief the MARK join output from the semi_join matching row indices.
 ///
 /// Copies all left output columns (all rows pass through, no gather), then creates a BOOL8 mark
-/// column initialized to false and scatters true at every position in semi_indices.
+/// column initialized to false and scatters true at every position in semi_indices. Finally applies
+/// SQL three-valued logic: an unmatched left row is NULL (not false) when its probe key is NULL, or
+/// when the build/right side contains a NULL join key.
+///
+/// The scattered values are already correct (true at matched rows, false elsewhere), so only a null
+/// mask is added. Because a NULL key never matches under null_equality::UNEQUAL, a matched row
+/// always has a valid probe key, so the desired validity reduces to two cases:
+///   - build_has_null == true : every unmatched row is NULL, so valid == matched. The mask is the
+///                              mark values themselves (cudf::bools_to_mask).
+///   - build_has_null == false: valid == probe row validity (all probe key columns valid). The mask
+///                              is cudf::bitmask_and over the probe keys (empty when none
+///                              nullable).
 ///
 /// @param semi_indices  Device vector of left-side row indices that matched the join condition,
 ///                      as returned by cuDF's semi-join. Used as the scatter map for the mark
@@ -859,6 +878,9 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
 /// @param left_full     Full left-side table view (all columns, all rows) before output projection.
 /// @param lhs_output_col_idxs  Column indices within @p left_full to include in the output.
 ///                             Drives the projection of the left side.
+/// @param probe_keys    Probe/left join key columns (post-cast); their per-row validity drives the
+///                      NULL mark when the build side has no NULL key.
+/// @param build_has_null  Whether the build/right side contains a NULL in any join key column.
 /// @param left_batch    The original left-side data batch; used to propagate memory space metadata
 ///                      to the returned operator_data.
 /// @param stream        CUDA stream on which all device operations are launched.
@@ -866,6 +888,8 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   rmm::device_uvector<cudf::size_type> const& semi_indices,
   cudf::table_view const& left_full,
   std::vector<cudf::size_type> const& lhs_output_col_idxs,
+  cudf::table_view const& probe_keys,
+  bool build_has_null,
   ::cucascade::read_only_data_batch const& left_batch,
   rmm::cuda_stream_view stream,
   const telemetry::batch_telemetry_info& telemetry_info = {})
@@ -902,6 +926,22 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
                                    stream);
     mark_column    = std::move(scattered->release()[0]);
   }
+
+  // Apply SQL three-valued logic by attaching a null mask: unmatched rows become NULL when the
+  // build side has a NULL key (valid == matched) or when the probe key is NULL (valid == probe key
+  // validity). See the function doc comment for the derivation.
+  rmm::device_buffer null_mask;
+  cudf::size_type null_count = 0;
+  if (build_has_null) {
+    auto [mask, count] = cudf::bools_to_mask(mark_column->view(), stream);
+    null_mask          = std::move(*mask);
+    null_count         = count;
+  } else {
+    auto [mask, count] = cudf::bitmask_and(probe_keys, stream);
+    null_mask          = std::move(mask);
+    null_count         = count;
+  }
+  if (null_count > 0) { mark_column->set_null_mask(std::move(null_mask), null_count); }
 
   mark_out_cols.push_back(std::move(mark_column));
   auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
@@ -953,6 +993,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           // batch's semi_join/anti_join returns left-row match indices (scattered into a BOOL8 mark
           // for MARK, gathered as the output rows for SEMI/ANTI).
           _filtered_table = make_right_filtered_join_ptr(build_keys, stream);
+          // Record whether the build keys contain a NULL; MARK three-valued logic needs it at probe
+          // time, but the build keys are not retained beyond this scope.
+          _build_has_null = table_has_any_null(build_keys);
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
                            duckdb::JoinTypeToString(join_type));
@@ -992,6 +1035,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         return resolve_mark_join_result(*semi_indices,
                                         left_full,
                                         lhs_output_columns.col_idxs,
+                                        probe_keys,
+                                        _build_has_null,
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -1101,6 +1146,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       return resolve_mark_join_result(*semi_indices,
                                       left_full,
                                       lhs_output_columns.col_idxs,
+                                      left_eq,
+                                      table_has_any_null(right_eq),
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
@@ -1301,6 +1348,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         return resolve_mark_join_result(*semi_indices,
                                         left_full,
                                         lhs_output_columns.col_idxs,
+                                        left_keys,
+                                        table_has_any_null(right_keys),
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -1310,6 +1359,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       return resolve_mark_join_result(*semi_indices,
                                       left_full,
                                       lhs_output_columns.col_idxs,
+                                      left_keys,
+                                      table_has_any_null(right_keys),
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
