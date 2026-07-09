@@ -122,6 +122,56 @@ void io_roundtrip(char const* label,
            (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
 }
 
+// In-memory (pinned-blob) roundtrip via the production pin-path entry points:
+// build_compressed_table_header enumerates payload buffers, we assemble the
+// payload host-side, then read_compressed_table_from_memory reconstructs
+// through the same fetch seam pin_table uses.
+void memory_roundtrip(char const* label, cudf::table_view input, std::string const& dsl)
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  simpatico::compressed_table ct = simpatico::compress_with_plan(input, dsl, stream, mr);
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  auto const herr =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  expect(herr.empty(), (std::string(label) + ": header error: " + herr).c_str());
+
+  std::vector<std::uint8_t> payload(payload_bytes);
+  stream.synchronize();
+  for (auto const& b : buffers) {
+    if (b.size_bytes == 0 || b.device_ptr == nullptr) continue;
+    expect(cudaMemcpy(payload.data() + b.offset,
+                      b.device_ptr,
+                      static_cast<std::size_t>(b.size_bytes),
+                      cudaMemcpyDeviceToHost) == cudaSuccess,
+           (std::string(label) + ": payload staging copy failed").c_str());
+  }
+
+  simpatico::payload_fetch_fn fetch =
+    [&payload](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+      if (cudaMemcpyAsync(dst, payload.data() + off, sz, cudaMemcpyHostToDevice, s.value()) !=
+          cudaSuccess)
+        throw std::runtime_error("memory_roundtrip: fetch copy failed");
+    };
+
+  std::string rerr;
+  simpatico::compressed_table ct2 =
+    simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &rerr);
+  expect(rerr.empty(), (std::string(label) + ": read error: " + rerr).c_str());
+
+  auto out = simpatico::decompress(ct2, stream, mr);
+  expect(out != nullptr, (std::string(label) + ": decompress returned null").c_str());
+  expect(out->num_columns() == input.num_columns(),
+         (std::string(label) + ": decompressed column count").c_str());
+  for (int i = 0; i < input.num_columns(); ++i)
+    expect(columns_equal_any(input.column(i), out->view().column(i), stream),
+           (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -346,6 +396,75 @@ void test_error_bad_version()
   expect(!err.empty(), "error_bad_version: expected non-empty error");
 }
 
+// Error: identity on a STRING column has no single contiguous payload buffer;
+// build_compressed_table_header must reject it loudly and clear its outputs.
+void test_identity_string_header_rejected()
+{
+  auto stream = cudf::get_default_stream();
+  auto input  = make_string_table(128, stream);
+  auto source = simpatico::compress_with_plan(
+    input->view(), "input -> identity\n", stream, rmm::mr::get_current_device_resource_ref());
+
+  std::vector<std::uint8_t> header{1, 2, 3};
+  std::vector<simpatico::payload_buffer_ref> buffers{{7, nullptr, 9}};
+  std::uint64_t payload_bytes = 11;
+  auto const error =
+    simpatico::build_compressed_table_header(source, header, buffers, payload_bytes, stream);
+  expect(!error.empty(), "identity_string_header: expected loud rejection");
+  expect(header.empty() && buffers.empty() && payload_bytes == 0,
+         "identity_string_header: outputs were not cleared on rejection");
+}
+
+// The two production STRING plan shapes from plans/tpch_sf1000 (customer/
+// supplier): variable-length "address" (offsets delta -> ans) and constant-
+// length "phone" (offsets delta -> rle with terminal runs/values). Exercised
+// through BOTH the file path and the in-memory pin path — the shapes the
+// rerouted sf1000 plans serialize in production.
+void test_str_split_plan_shapes_roundtrip()
+{
+  auto stream = cudf::get_default_stream();
+
+  std::vector<std::string> addresses;
+  std::vector<std::string> phones;
+  addresses.reserve(512);
+  phones.reserve(512);
+  for (int i = 0; i < 512; ++i) {
+    addresses.push_back("No. " + std::to_string((i * 37) % 990) + " Elm Street, Apt " +
+                        std::to_string(i % 97));
+    char buf[16];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "%02d-%03d-%03d-%03d",
+                  i % 100,
+                  (i * 7) % 1000,
+                  (i * 13) % 1000,
+                  (i * 31) % 1000);
+    phones.emplace_back(buf);  // constant length 14 — one RLE run of offset deltas
+  }
+  auto addr_tbl  = make_strings_table(addresses, {}, stream);
+  auto phone_tbl = make_strings_table(phones, {}, stream);
+
+  std::string const address_dsl =
+    "input -> str_split -> offsets, chars\n"
+    "str_split.offsets -> delta -> differences\n"
+    "str_split.chars -> deflate\n"
+    "str_split.offsets.differences -> ans\n";
+  std::string const phone_dsl =
+    "input -> str_split -> offsets, chars\n"
+    "str_split.offsets -> delta -> differences\n"
+    "str_split.offsets.differences -> rle -> runs, values\n"
+    "str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+    "str_split.chars.packed -> deflate\n"
+    "str_split.chars.chunk_count -> rle -> runs, values\n"
+    "str_split.chars.chunk_bits -> bitcomp\n"
+    "str_split.chars.chunk_min -> rle -> runs, values\n";
+
+  io_roundtrip("str_split_address_shape", addr_tbl->view(), address_dsl);
+  io_roundtrip("str_split_phone_shape", phone_tbl->view(), phone_dsl);
+  memory_roundtrip("str_split_address_shape_mem", addr_tbl->view(), address_dsl);
+  memory_roundtrip("str_split_phone_shape_mem", phone_tbl->view(), phone_dsl);
+}
+
 }  // namespace
 
 int main()
@@ -378,6 +497,8 @@ int main()
     {"error_garbage", test_error_garbage},
     {"error_bad_magic", test_error_bad_magic},
     {"error_bad_version", test_error_bad_version},
+    {"identity_string_header_rejected", test_identity_string_header_rejected},
+    {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
   };
 
   int failures = 0;

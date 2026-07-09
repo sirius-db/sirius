@@ -127,8 +127,13 @@ struct compressed_representation {
       // fast-mode "keys" channel is a raw STRING column) — account for
       // offsets + chars directly instead of calling it on a STRING view.
       if (o.view.type().id() == cudf::type_id::STRING) {
+        if (o.view.num_children() == 0) {
+          if (o.view.size() == 0) continue;
+          throw std::logic_error("non-empty STRING channel has no offsets child.");
+        }
         cudf::strings_column_view scv(o.view);
-        total += static_cast<size_t>(o.view.size() + 1) * sizeof(int32_t) +
+        auto const offsets_width = static_cast<size_t>(cudf::size_of(scv.offsets().type()));
+        total += static_cast<size_t>(o.view.size() + 1) * offsets_width +
                  static_cast<size_t>(scv.chars_size(stream));
       } else {
         total +=
@@ -304,10 +309,8 @@ struct dictionary_compressed_representation : compressed_representation {
                                         cudf::mask_state::UNALLOCATED,
                                         stream,
                                         rmm::mr::get_current_device_resource_ref());
-        cudaMemsetAsync(keys_offsets_synth->mutable_view().head<void>(),
-                        0,
-                        sizeof(std::int32_t),
-                        stream.value());
+        cudaMemsetAsync(
+          keys_offsets_synth->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
         cudaStreamSynchronize(stream.value());
       }
       outputs.push_back({"keys_offsets", keys_offsets_synth->view()});
@@ -390,11 +393,8 @@ struct dictionary_compressed_representation : compressed_representation {
     rmm::device_buffer bits = cudf::copy_bitmask(source, stream, mr);
     auto const mask_bytes =
       static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(source.size()));
-    null_mask_copy = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
-                                                    mask_bytes,
-                                                    std::move(bits),
-                                                    rmm::device_buffer{},
-                                                    0);
+    null_mask_copy = std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::UINT8}, mask_bytes, std::move(bits), rmm::device_buffer{}, 0);
     cudaStreamSynchronize(stream.value());
   }
 };
@@ -433,8 +433,9 @@ struct str_split_compressed_representation : compressed_representation {
     std::string* error_out);
 
   // The decomposed channels. mutable: decompress() moves them into make_strings_column.
-  mutable std::unique_ptr<cudf::column> offsets_;    // INT32 (or INT64 for >2GB chars), size num_rows+1
-  mutable std::unique_ptr<cudf::column> chars_;      // UINT8, or widened (UINT32/UINT64) past 2GB
+  mutable std::unique_ptr<cudf::column>
+    offsets_;                                    // INT32 (or INT64 for >2GB chars), size num_rows+1
+  mutable std::unique_ptr<cudf::column> chars_;  // UINT8, or widened (UINT32/UINT64) past 2GB
   mutable std::unique_ptr<cudf::column> null_mask_;  // UINT8 bitmask bytes, or null (no nulls)
 
   str_split_compressed_representation(cudf::size_type n_rows,

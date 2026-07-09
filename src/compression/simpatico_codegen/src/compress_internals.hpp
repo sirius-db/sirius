@@ -133,30 +133,39 @@ inline compressed_table compress_columns_parallel(cudf::table_view table,
   std::mutex err_mu;
 
   size_t const n_workers = pool.streams.size();
+  if (n_workers == 0) throw plan_error("stream_pool has no streams");
   std::vector<std::thread> workers;
   workers.reserve(n_workers);
   for (size_t w = 0; w < n_workers; ++w) {
     workers.emplace_back([&, w]() {
-      while (true) {
-        size_t i = next.fetch_add(1, std::memory_order_relaxed);
-        if (i >= plans.size()) break;
-        if (failed.load(std::memory_order_relaxed)) continue;
+      try {
+        while (true) {
+          size_t i = next.fetch_add(1, std::memory_order_relaxed);
+          if (i >= plans.size()) break;
+          if (failed.load(std::memory_order_relaxed)) continue;
 
-        rmm::cuda_stream_view stream{pool.streams[w % pool.streams.size()]};
-        std::string err;
-        auto compound = compress_column(
-          table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
-        if (!compound) {
-          std::lock_guard<std::mutex> lock(err_mu);
-          if (!failed.exchange(true)) err_msg = err;
-          continue;
+          rmm::cuda_stream_view stream{pool.streams[w % pool.streams.size()]};
+          std::string err;
+          auto compound = compress_column(
+            table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
+          if (!compound) {
+            std::lock_guard<std::mutex> lock(err_mu);
+            if (!failed.exchange(true)) err_msg = err;
+            continue;
+          }
+          compressed_column col;
+          col.dtype    = table.column(static_cast<cudf::size_type>(i)).type();
+          col.num_rows = table.num_rows();
+          col.compound = std::move(compound);
+          if (!column_names.empty()) col.name = column_names[i];
+          out.columns[i] = std::move(col);
         }
-        compressed_column col;
-        col.dtype    = table.column(static_cast<cudf::size_type>(i)).type();
-        col.num_rows = table.num_rows();
-        col.compound = std::move(compound);
-        if (!column_names.empty()) col.name = column_names[i];
-        out.columns[i] = std::move(col);
+      } catch (std::exception const& e) {
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!failed.exchange(true)) err_msg = e.what();
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!failed.exchange(true)) err_msg = "compression worker failed with an unknown exception";
       }
     });
   }

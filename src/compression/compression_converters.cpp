@@ -123,7 +123,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   const auto* payload_base = static_cast<const std::byte*>(rep.payload_device_ptr());
   simpatico::payload_fetch_fn fetch =
     [payload_base](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
-      cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyDeviceToDevice, s.value());
+      CUCASCADE_CUDA_TRY(
+        cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyDeviceToDevice, s.value()));
     };
 
   return reconstruct_and_decompress_to_gpu(

@@ -1232,6 +1232,12 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
 
+    // Currently, we do not support mixed compressed/uncompressed results: either all batches were
+    // compressed or none (HOST and DEVICE).
+    if (!host_result.compressed_chunks.empty() && !host_result.host_chunks.empty()) {
+      throw std::runtime_error(
+        "pin_table: unexpected result: both compressed and uncompressed host chunks present");
+    }
     if (!host_result.compressed_chunks.empty() && host_result.host_chunks.empty()) {
       scan_mgr.insert_pinned_entry_host_compressed(data.args.name,
                                                    std::move(cache_info),
@@ -1250,6 +1256,10 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     auto dev_result = sirius::materialize_pin_to_device_with_compression(
       *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
 
+    if (!dev_result.compressed_chunks.empty() && !dev_result.tables.empty()) {
+      throw std::runtime_error(
+        "pin_table: unexpected result: both compressed and uncompressed device chunks present");
+    }
     if (!dev_result.compressed_chunks.empty() && dev_result.tables.empty()) {
       scan_mgr.insert_pinned_entry_device_compressed(data.args.name,
                                                      std::move(cache_info),

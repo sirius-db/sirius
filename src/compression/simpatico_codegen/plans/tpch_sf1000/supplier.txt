@@ -23,7 +23,10 @@ str_split.offsets.differences.runs.chunk_count -> rle -> runs, values
 ---
 # column: s_address  dtype: str  ratio: 1.446x  depth: 4
 # comp: 19.10 GB/s  decomp: 95.71 GB/s
-identity
+input -> str_split -> offsets, chars
+str_split.offsets -> delta -> differences
+str_split.chars -> deflate
+str_split.offsets.differences -> ans
 
 ---
 # column: s_nationkey  dtype: i32  ratio: 3.194x  depth: 10
@@ -42,7 +45,15 @@ bitpack.chunk_count.runs -> rle -> runs, values
 ---
 # column: s_phone  dtype: str  ratio: 1.369x  depth: 10
 # comp: 20.97 GB/s  decomp: 69.57 GB/s
-identity
+# constant-length (15): offsets deltas are one RLE run, so the chain ends at rle
+input -> str_split -> offsets, chars
+str_split.offsets -> delta -> differences
+str_split.offsets.differences -> rle -> runs, values
+str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+str_split.chars.packed -> deflate
+str_split.chars.chunk_count -> rle -> runs, values
+str_split.chars.chunk_bits -> bitcomp
+str_split.chars.chunk_min -> rle -> runs, values
 
 ---
 # column: s_acctbal  dtype: t26  ratio: 1.962x  depth: 1
