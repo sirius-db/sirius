@@ -35,6 +35,7 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/common/limits.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/transaction/duck_transaction.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -255,6 +256,12 @@ TEST_CASE_METHOD(PinMvccFixture,
                  "pin_table mvcc - duckdb pin suppresses WAL auto-checkpoint",
                  "[integration][gpu_execution][pin_table_mvcc]")
 {
+  // This test is about WAL/checkpoint mechanics, not GPU serving — keep its
+  // statements off the transparent-interception path (the pin CALL is
+  // unaffected). A trivial intercepted SELECT here previously tripped a latent
+  // state-dependent engine hang ~960 tests into the CI suite.
+  run_ok("SET gpu_execution = false;");
+
   run_ok("CREATE TABLE mvcc_wal_t (a BIGINT);");
   run_ok("INSERT INTO mvcc_wal_t SELECT range FROM range(100000);");
   run_ok("CHECKPOINT;");
@@ -265,12 +272,11 @@ TEST_CASE_METHOD(PinMvccFixture,
   run_ok("CALL pin_table(format='duckdb', name='mvcc_wal_t', tier='gpu');");
 
   // The pin disables the size-based trigger outright (the DBConfig is shared by
-  // every attached database) and zeroes the entry-count trigger.
+  // every attached database) and zeroes the entry-count trigger. Read both back
+  // exactly the way SingleFileStorageManager::AutomaticCheckpoint reads them.
   auto& config = duckdb::DBConfig::GetConfig(*con->context);
   REQUIRE(config.options.checkpoint_wal_size == duckdb::NumericLimits<duckdb::idx_t>::Maximum());
-  auto entries_setting = con->Query("SELECT current_setting('wal_autocheckpoint_entries');");
-  REQUIRE_FALSE(entries_setting->HasError());
-  REQUIRE(entries_setting->GetValue(0, 0).GetValue<int64_t>() == 0);
+  REQUIRE(duckdb::Settings::Get<duckdb::WalAutocheckpointEntriesSetting>(config) == 0);
 
   // Write well past the 16 MiB default threshold across many commits. Under the
   // default config the commit crossing it would auto-checkpoint and truncate the
