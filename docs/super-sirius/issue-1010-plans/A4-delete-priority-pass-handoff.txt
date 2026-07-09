@@ -1,0 +1,63 @@
+You are finishing "Track A" of the dynamic-filters project in the Sirius repo (a
+GPU-native SQL engine that runs as a DuckDB extension). Track A resolves GitHub
+issue #1014. The one remaining task is to DELETE the build-scan prioritization pass
+from the scheduler.
+
+## Background
+Sirius's scheduler has a pass that prioritizes dispatching build-side scan tasks for
+hash joins that publish dynamic filters, so a filter publishes before probe-side scans
+start consuming it — intended to improve filter coverage. Issue #1014 suspected this
+pass "can probably just go away." We measured it (issue #1124): three configs
+(no filters / pass on / pass off) across TPC-H Q5,Q7,Q8,Q9,Q21 and a `many_join` query
+at SF300. Result: the pass gives ZERO coverage benefit (filters already publish before
+any probe row is consumed, even with the pass on) and costs 9–25% wall time plus large
+run-to-run variance. Verdict: delete it.
+
+## Read before touching code, in this order
+1. `CLAUDE.md` — build/test rules and conventions. Key ones: the default branch is
+   `dev` (branch and PR against it); run everything through `pixi run`; NEVER modify
+   anything under `src/legacy/` (dead code); all work targets Super Sirius.
+2. `docs/super-sirius/README.md`, then the design
+   `docs/super-sirius/issue-1010-dynamic-filter-sip-design.md`.
+3. `docs/super-sirius/issue-1010-implementation-plan.md` (program overview) and
+   `docs/super-sirius/issue-1010-plans/A-1014-priority-pass.md` — the Track A plan is
+   authoritative for what the pass consists of and the deletion sequencing.
+4. Results: `docs/super-sirius/issue-1124-results/track-a-sf300-gpu2/issue-1124-findings.md`
+   and `issue-1124-comment.md`.
+
+## Task
+1. Check git state FIRST. The measurement scaffolding (a `dynamic_filter_build_priority`
+   setting with values `legacy`/`off`, plus instrumentation) lives on branch
+   `fork/issue-1124-track-a` and is NOT merged to `dev`. `dev` currently has the original
+   pass with no toggle. So the deletion is a fresh change on top of `dev` — you do not
+   need to merge the scaffolding branch.
+2. Locate the pass. From the plan doc and by grepping, it is roughly a
+   `collect_filter_build_pipelines` helper plus a `pop_if` / dispatch-preference branch
+   in the task scheduler (`src/.../task_scheduler.cpp`). Treat those names as HINTS —
+   verify the exact symbols and locations yourself.
+3. Remove the prioritization so the scheduler dispatches tasks in its normal order, and
+   remove pass-only instrumentation (e.g. prioritized-dispatch counters). KEEP the
+   general dynamic-filter machinery intact (publication, channels, `[dynf_summary]`
+   logging, coverage counters) — you are removing only the *prioritization*, not
+   dynamic filters.
+4. Since the scaffolding never merged, there is no `dynamic_filter_build_priority`
+   setting in `dev` to remove — just delete the pass outright. If the plan doc instead
+   prescribes shipping the toggle first, follow the plan and flag the discrepancy in
+   your summary rather than guessing.
+5. Update any docs/comments that describe the pass as live.
+
+## Build & verify (all via `pixi run`)
+- `pixi run make`, then `pixi run make test` — must pass.
+- `pixi run pre-commit run -a`.
+
+## Deliver
+- Branch off `dev`. Commit with a clear message and the co-author trailer per repo
+  convention.
+- Open a PR against `dev` (e.g. "Remove build-scan prioritization pass (#1014)"). In the
+  body, put `Closes #1014`, justify with the #1124 result (no coverage benefit, 9–25%
+  faster, lower variance — cite `issue-1124-findings.md`), and note results are
+  bit-identical across all three configs.
+- Post a short comment on #1124 linking the PR.
+
+If you hit a genuine blocker, or the plan doc contradicts anything above, stop and
+summarize the conflict instead of guessing.

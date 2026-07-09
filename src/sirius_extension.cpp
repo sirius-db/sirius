@@ -290,13 +290,12 @@ struct SiriusTableFunctionData : public TableFunctionData {
         plan = optimizer.Optimize(std::move(plan));
       }
 
-      // After optimization, refresh types before column binding resolution
-      // to ensure types are consistent (some optimizers may have set stale types)
-      plan->ResolveOperatorTypes();
-
-      ColumnBindingResolver resolver;
-      ColumnBindingResolver::Verify(*plan);
-      resolver.VisitOperator(*plan);
+      // Deliberately NOT type/binding-resolved here: the plan flows into
+      // sirius_physical_plan_generator::create_plan(unique_ptr), which runs
+      // ResolveOperatorTypes and the sole ColumnBindingResolver pass itself — after capturing
+      // the pre-resolver dynamic-filter snapshot, which an early resolution here would make
+      // impossible (C1a-2). The identical legacy ExtractPlan below keeps its resolution: the
+      // legacy generator consumes the resolved plan directly.
     } catch (...) {
       CleanupConnection(context);
       throw;

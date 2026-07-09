@@ -69,11 +69,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
       plan = optimizer.Optimize(std::move(plan));
     }
 
-    plan->ResolveOperatorTypes();
-
-    ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
-    resolver.VisitOperator(*plan);
+    // Deliberately not resolved here: create_plan(unique_ptr) runs ResolveOperatorTypes and
+    // the sole ColumnBindingResolver pass itself, after capturing the pre-resolver
+    // dynamic-filter snapshot (C1a-2).
 
     sirius::planner::sirius_physical_plan_generator gen(context);
     result = gen.create_plan(std::move(plan));

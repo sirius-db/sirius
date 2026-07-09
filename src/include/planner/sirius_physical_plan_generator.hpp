@@ -21,6 +21,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "planner/dynamic_filter_candidate_cache.hpp"
 
 #include <memory>
 #include <unordered_map>
@@ -83,6 +84,11 @@ class sirius_physical_plan_generator {
   std::unordered_map<duckdb::DynamicTableFilterSet const*,
                      std::shared_ptr<sirius::op::sirius_dynamic_filter_set>>
     dynamic_filter_channels;
+
+  /// @brief One immutable dynamic-filter candidate per comparison join, extracted exactly once by
+  /// create_plan(unique_ptr) before recursive planning drains the joins (C1a-2). Consumed by
+  /// plan_comparison_join and, later, C3 route discovery via find().
+  dynamic_filter_candidate_cache candidate_cache;
 
  public:
   /// @brief Look up or create the dynamic filter channel keyed by @p key. Returns nullptr if @p key

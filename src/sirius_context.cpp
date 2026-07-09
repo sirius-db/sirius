@@ -848,7 +848,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       // the Copy round-trip — these fields are not in DuckDB's serialization schema, so a plain
       // Copy strips them. Without this, downstream Sirius wiring would not see runtime-computed
       // dynamic filters even when DuckDB's optimizer produced them.
-      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
+      validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context).plan;
     } catch (NotImplementedException&) {
       plan_is_copyable = false;
     }

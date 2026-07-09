@@ -121,7 +121,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         // LogicalGet::dynamic_filters survive the serialize/deserialize round-trip — they are
         // not in DuckDB's serialization schema and would otherwise be null on the fresh plan,
         // making downstream Sirius wiring silently miss runtime-computed dynamic filters.
-        fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
+        fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client).plan;
       } catch (duckdb::NotImplementedException&) {
         // Drop logical_plan_ — we know it can't be copied, so future executes
         // will skip straight to the replan path.

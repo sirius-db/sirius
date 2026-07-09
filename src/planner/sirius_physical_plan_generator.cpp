@@ -116,16 +116,28 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
+  // C1a-2 sequence: capture pre-resolver evidence first — this is the ONLY point where the
+  // unresolved plan is observable (C1b attaches its domain snapshot here), and it fences plans
+  // that some upstream path resolved early (see dynamic_filter_candidate_cache).
+  candidate_cache.capture_pre_resolver(*op, context);
+
   // Resolve the types of each operator.
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
   op->ResolveOperatorTypes();
   profiler.EndPhase();
 
-  // Resolve the column references.
+  // Resolve the column references (the sole ColumnBindingResolver pass on any supported path).
+  // Verify() is the debug-build binding check the removed pre-resolution sites used to run; it
+  // is verify-only (no BOUND_COLUMN_REF rewrite), so the captured pre-resolver evidence holds.
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
   duckdb::ColumnBindingResolver resolver;
+  duckdb::ColumnBindingResolver::Verify(*op); // debug-build-only binding check
   resolver.VisitOperator(*op);
   profiler.EndPhase();
+
+  // One immutable candidate extraction per join, before recursion drains op.conditions /
+  // op.filter_pushdown. plan_comparison_join and C3 discovery both consume the cache.
+  candidate_cache.extract_post_resolver(*op);
 
   // then create the main physical plan
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
