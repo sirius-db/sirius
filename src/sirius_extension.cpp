@@ -36,6 +36,8 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
@@ -1380,6 +1382,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 {
   auto& data = data_p.bind_data->CastNoConst<CreateAnnIndexData>();
   if (data.finished) { return; }
+
+  nvtx3::scoped_range nvtx_range{"SiriusCreateAnnIndexFunction"};
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
