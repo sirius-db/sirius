@@ -36,6 +36,7 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -268,10 +269,31 @@ void wrap_table_scan_source(
     // were lifted into the duckdb_native_ingestible_table_info).
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet") {
-    auto info       = build_parquet_table_info(scan, op_params);
+    auto info = build_parquet_table_info(scan, op_params);
+    // Dynamic filters: mirror the legacy converter's insert_parquet_scan_operator. The
+    // ingestible consumes them for read-time row-group pruning; the DYNAMIC_FILTER operator
+    // wrapped above the scan applies them post-decode. Elide both paths when no producer
+    // was wired during planning — the wrap runs after the whole plan tree is built, so
+    // has_producers() is as settled here as at legacy's convert-time check.
+    auto dynamic_filters = scan.sirius_dynamic_filters;
+    if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
+    info->sirius_dynamic_filters = dynamic_filters;
+
     auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
     leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(ingestible));
+    if (dynamic_filters) {
+      // Wrap the scan leaf: under a PARTITION parent the base is_sink/build_pipelines
+      // protocol emits the legacy [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as sink);
+      // in inline contexts both join the current pipeline in legacy's insertion order.
+      auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+        scan.types,
+        scan.estimated_cardinality,
+        std::move(dynamic_filters),
+        op_params.dynamic_filter_keep_threshold);
+      dynamic_filter_op->children.push_back(std::move(leaf));
+      leaf = std::move(dynamic_filter_op);
+    }
     // Parquet: legacy inlines GPU_SCAN into the current pipeline, so replace the TABLE_SCAN
     // in place rather than attaching as a child (which would make build_pipelines spin up a
     // separate wrap pipeline). The TABLE_SCAN object is dropped — its bind_data and metadata
