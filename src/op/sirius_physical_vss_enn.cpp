@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_vss.hpp"
+#include "op/sirius_physical_vss_enn.hpp"
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_physical_vss_merge.hpp"
+#include "op/sirius_physical_vss_enn_merge.hpp"
 #include "op/vss_top_k.hpp"
 #include "sirius/exception.hpp"
 #include "vss/brute_force_search.hpp"
@@ -142,7 +142,7 @@ std::unique_ptr<cudf::table> compute_vss_top_k(
     }
   }
 
-  // Assemble the output columns (local per-batch top-k handed to VSS_MERGE)
+  // Assemble the output columns (local per-batch top-k handed to MERGE_ENN)
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   out_cols.reserve(pattern.output_columns.size());
   for (auto const& oc : pattern.output_columns) {
@@ -193,23 +193,23 @@ std::unique_ptr<cudf::table> merge_vss_top_k(cudf::table_view input,
                            memory_resource);
 }
 
-sirius_physical_vss::sirius_physical_vss(duckdb::vector<sirius::logical_type> types_p,
-                                         sirius::vss::vss_top_k_pattern pattern_p,
-                                         std::size_t limit,
-                                         std::size_t offset,
-                                         std::size_t estimated_cardinality)
+sirius_physical_vss_enn::sirius_physical_vss_enn(duckdb::vector<sirius::logical_type> types_p,
+                                                 sirius::vss::vss_top_k_pattern pattern_p,
+                                                 std::size_t limit,
+                                                 std::size_t offset,
+                                                 std::size_t estimated_cardinality)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::VSS, std::move(types_p), estimated_cardinality),
+      SiriusPhysicalOperatorType::ENN, std::move(types_p), estimated_cardinality),
     pattern(std::move(pattern_p)),
     limit(limit),
     offset(offset)
 {
 }
 
-sirius_physical_vss::~sirius_physical_vss() {}
+sirius_physical_vss_enn::~sirius_physical_vss_enn() {}
 
-std::unique_ptr<operator_data> sirius_physical_vss::execute(const operator_data& input_data,
-                                                            rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_vss_enn::execute(const operator_data& input_data,
+                                                                rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_vss::execute"};
   auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -277,23 +277,24 @@ std::unique_ptr<operator_data> sirius_physical_vss::execute(const operator_data&
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
-sirius_physical_vss_merge::sirius_physical_vss_merge(sirius_physical_vss* vss)
-  : sirius_physical_vss_merge(vss->types,    // copied by value
-                              vss->pattern,  // deep copy
-                              vss->limit,
-                              vss->offset,
-                              vss->estimated_cardinality)
+sirius_physical_vss_enn_merge::sirius_physical_vss_enn_merge(sirius_physical_vss_enn* vss)
+  : sirius_physical_vss_enn_merge(vss->types,    // copied by value
+                                  vss->pattern,  // deep copy
+                                  vss->limit,
+                                  vss->offset,
+                                  vss->estimated_cardinality)
 {
   child_op = vss;
 }
 
-sirius_physical_vss_merge::sirius_physical_vss_merge(duckdb::vector<sirius::logical_type> types_p,
-                                                     sirius::vss::vss_top_k_pattern pattern_p,
-                                                     std::size_t limit,
-                                                     std::size_t offset,
-                                                     std::size_t estimated_cardinality)
+sirius_physical_vss_enn_merge::sirius_physical_vss_enn_merge(
+  duckdb::vector<sirius::logical_type> types_p,
+  sirius::vss::vss_top_k_pattern pattern_p,
+  std::size_t limit,
+  std::size_t offset,
+  std::size_t estimated_cardinality)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::MERGE_VSS, std::move(types_p), estimated_cardinality),
+      SiriusPhysicalOperatorType::MERGE_ENN, std::move(types_p), estimated_cardinality),
     pattern(std::move(pattern_p)),
     limit(limit),
     offset(offset),
@@ -301,10 +302,10 @@ sirius_physical_vss_merge::sirius_physical_vss_merge(duckdb::vector<sirius::logi
 {
 }
 
-std::unique_ptr<operator_data> sirius_physical_vss_merge::execute(const operator_data& input_data,
-                                                                  rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_vss_enn_merge::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_vss_merge::execute"};
+  nvtx3::scoped_range nvtx_range{"sirius_physical_vss_enn_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (limit == 0) {
@@ -368,7 +369,7 @@ std::unique_ptr<operator_data> sirius_physical_vss_merge::execute(const operator
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
-std::unique_ptr<operator_data> sirius_physical_vss_merge::get_next_task_input_data()
+std::unique_ptr<operator_data> sirius_physical_vss_enn_merge::get_next_task_input_data()
 {
   // Lock, drain all batches from the single partition, return them.
   std::lock_guard<std::mutex> lg(lock);

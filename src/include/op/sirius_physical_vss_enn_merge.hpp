@@ -17,7 +17,7 @@
 #pragma once
 
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_vss.hpp"
+#include "op/sirius_physical_vss_enn.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -31,18 +31,18 @@ namespace op {
  * Each local result already carries its cuVS distance so the merge is a plain
  * top-k SORT on that column.
  */
-class sirius_physical_vss_merge : public sirius_physical_operator {
+class sirius_physical_vss_enn_merge : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_VSS;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_ENN;
 
  public:
-  explicit sirius_physical_vss_merge(sirius_physical_vss* vss);
+  explicit sirius_physical_vss_enn_merge(sirius_physical_vss_enn* vss);
 
-  sirius_physical_vss_merge(duckdb::vector<sirius::logical_type> types_p,
-                            sirius::vss::vss_top_k_pattern pattern,
-                            std::size_t limit,
-                            std::size_t offset,
-                            std::size_t estimated_cardinality);
+  sirius_physical_vss_enn_merge(duckdb::vector<sirius::logical_type> types_p,
+                                sirius::vss::vss_top_k_pattern pattern,
+                                std::size_t limit,
+                                std::size_t offset,
+                                std::size_t estimated_cardinality);
 
   sirius::vss::vss_top_k_pattern pattern;
   std::size_t limit;

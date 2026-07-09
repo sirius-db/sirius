@@ -50,6 +50,10 @@ namespace cucascade::memory {
 class small_pinned_host_memory_resource;
 }  // namespace cucascade::memory
 
+namespace sirius::vss {
+class cuvs_index_cache;
+}  // namespace sirius::vss
+
 namespace sirius::memory {
 class numa_small_pinned_mr;
 }  // namespace sirius::memory
@@ -241,6 +245,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// \brief Get the session's cuVS ANN index cache (GPU-resident, pinned indexes).
+  [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
+  [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
+
   [[nodiscard]] std::shared_ptr<const sirius::telemetry::telemetry_context> get_telemetry_context()
     const;
 
@@ -318,6 +326,11 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
+  // Session-lifetime cache of GPU-resident, pinned cuVS ANN indexes. Declared
+  // after memory_manager_ so it is destroyed before it: each entry holds a
+  // reservation into the manager's GPU spaces, so the manager must outlive the
+  // cache. Also reset explicitly in terminate() before the manager is torn down.
+  std::unique_ptr<sirius::vss::cuvs_index_cache> cuvs_index_cache_;
   // P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
   // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
   // call per pair. Consumed by is_peer_access_enabled() and any Sirius-side

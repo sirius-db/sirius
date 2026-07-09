@@ -15,12 +15,12 @@
  */
 
 /**
- * @file test_gpu_execution_vss.cpp
+ * @file test_gpu_execution_vss_enn.cpp
  * @brief End-to-end tests for brute-force vector search through gpu_execution.
  *
  * `ORDER BY <array-distance>(vec, <const>) LIMIT k` over a stored FLOAT[dim]
  * column is fused into the VSS operator on the GPU native-scan path
- * (GPU_SCAN -> VSS -> MERGE_VSS). Each query runs through transparent GPU
+ * (GPU_SCAN -> ENN -> MERGE_ENN). Each query runs through transparent GPU
  * execution and through DuckDB CPU and the results are compared.
  *
  * compare_gpu_vs_cpu() also asserts exactly one GPU execution with zero
@@ -32,7 +32,7 @@
  * TopN path, so if VSS matching regressed the query would fall back and trip the
  * zero-fallback assertion here.
  *
- * The data must be CHECKPOINTed to disk: the native scan reads on-disk blocks,
+ * The data must be checkpointed to disk: the native scan reads on-disk blocks,
  * so rows still sitting in the WAL would be invisible to it.
  */
 
@@ -44,7 +44,7 @@ using VssFixture = sirius::test::GpuExecutionFixture;
 
 TEST_CASE_METHOD(VssFixture,
                  "gpu_execution vss - brute-force top-k (array_distance)",
-                 "[integration][gpu_execution][array][vss]")
+                 "[integration][gpu_execution][array][vss][enn]")
 {
   // vec=[i,i,i] as FLOAT[3]; distance to the origin is sqrt(3)*i, STRICTLY
   // increasing in i, so the k nearest are rows 0..k-1 with no distance ties:
@@ -77,7 +77,7 @@ TEST_CASE_METHOD(VssFixture,
 
 TEST_CASE_METHOD(VssFixture,
                  "gpu_execution vss - brute-force top-k (large-magnitude off-origin query)",
-                 "[integration][gpu_execution][array][vss]")
+                 "[integration][gpu_execution][array][vss][enn]")
 {
   // Regression for float32 catastrophic cancellation in the L2 distance
   run_ok(
@@ -94,7 +94,7 @@ TEST_CASE_METHOD(VssFixture,
 
 TEST_CASE_METHOD(VssFixture,
                  "gpu_execution vss - brute-force top-k (array_cosine_distance)",
-                 "[integration][gpu_execution][array][vss]")
+                 "[integration][gpu_execution][array][vss][enn]")
 {
   // Distinct directions so cosine distances to [1,0,0] rank unambiguously:
   // id0 (same dir, 0) < id3 (45 deg) < {id1, id2} (orthogonal, tie): the tie
