@@ -63,6 +63,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 namespace duckdb {
 
@@ -285,7 +286,6 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
   config_ = config;
-
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
   // get_hw_topology() is the only authorised source of GPU/NUMA counts —
@@ -308,8 +308,19 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(config_.get_telemetry_config(),
-                                                                    memory_manager_.get());
+  // Declare one telemetry device group per GPU so thread/queue telemetry can
+  // nest under its device instead of piling up flat under the engine. The GPU
+  // memory space configs already reflect the configured topology.num_gpus /
+  // topology.gpu_ids selection, unlike the raw hardware topology.
+  std::vector<int> telemetry_gpu_ids;
+  for (auto const& space_config : config_.get_memory_space_configs()) {
+    if (auto const* gpu_config =
+          std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config)) {
+      telemetry_gpu_ids.push_back(gpu_config->device_id);
+    }
+  }
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(
+    config_.get_telemetry_config(), memory_manager_.get(), telemetry_gpu_ids);
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);

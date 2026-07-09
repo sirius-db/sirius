@@ -1,7 +1,9 @@
 use quent_model::{instrumentation, model};
 
 pub mod data_batch;
+pub mod gpu_device;
 pub mod task;
+pub mod thread_group;
 
 model! {
     name: Sirius,
@@ -14,6 +16,8 @@ model! {
         quent_query_engine_model::plan::Plan,
         quent_query_engine_model::operator::Operator,
         quent_query_engine_model::port::Port,
+        gpu_device::GpuDevice,
+        thread_group::ThreadGroup,
         quent_stdlib::channel::Channel,
         quent_stdlib::memory::Memory,
         task::Task,

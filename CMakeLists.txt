@@ -668,6 +668,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
+    test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
