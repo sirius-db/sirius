@@ -11,7 +11,7 @@ This document catalogs Super Sirius performance optimizations by category. Each 
 **Mechanism:** `determine_num_partitions()` computes partition count from actual input data size:
 ```
 total_bytes = sum of all batch sizes from input repository
-num_partitions = max(1, total_bytes / hash_partition_bytes)
+num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 ```
 
 **Code path:** `src/op/sirius_physical_partition.cpp` — `determine_num_partitions()`

@@ -217,8 +217,8 @@ Repartitions data into N buckets based on partition keys.
 
 - **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
 - **Adaptive count:** `determine_num_partitions()` computes N from actual input data size and `hash_partition_bytes` config
-- **Sibling coordination:** Build-side partition determines count; probe-side waits for the result
-- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_sibling_partition_op`
+- **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
+- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`
 
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/include/op/sirius_physical_concat.hpp`
