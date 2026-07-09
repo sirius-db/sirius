@@ -39,9 +39,9 @@
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
-#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
+#include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
@@ -275,33 +275,40 @@ void wrap_table_scan_source(
   }
 }
 
-//! Attach a leaf CPU_SOURCE as the only child of a COLUMN_DATA_SCAN, EMPTY_RESULT, or
-//! DUMMY_SCAN node. A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk
-//! scan (filled at runtime) — left as-is.
-void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
+//! Replace a COLUMN_DATA_SCAN, EMPTY_RESULT, or DUMMY_SCAN slot in place with a GPU_VALUES
+//! source. Unlike the scan-companion wraps, no leaf child and no extra pipeline is created:
+//! GPU_VALUES is a first-class in-pipeline source driven by the normal task creation
+//! loop, exactly like GPU_SCAN (same shape as wrap_table_scan_source's replace path).
+//! A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan (filled
+//! at runtime) — left as-is. The type gate runs BEFORE the collection is moved out so an
+//! unsupported type falls back to DuckDB CPU with the source's data intact.
+void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 {
-  if (!source_op.children.empty()) { return; }
+  if (!slot->children.empty()) { return; }
 
-  duckdb::unique_ptr<sirius::op::sirius_physical_cpu_source> leaf;
-  switch (source_op.type) {
+  duckdb::unique_ptr<sirius::op::sirius_physical_gpu_values> gpu_values;
+  switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN: {
-      auto& col_scan = source_op.Cast<sirius::op::sirius_physical_column_data_scan>();
+      auto& col_scan = slot->Cast<sirius::op::sirius_physical_column_data_scan>();
       if (!col_scan.collection) { return; }  // LEFT_DELIM_JOIN cached chunk scan — skip
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, std::move(col_scan.collection));
+      sirius::op::sirius_physical_gpu_values::throw_if_unsupported_types(slot->types);
+      gpu_values = duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
+        slot->types, slot->estimated_cardinality, std::move(col_scan.collection));
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN:
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, /*produce_single_row=*/true);
+      sirius::op::sirius_physical_gpu_values::throw_if_unsupported_types(slot->types);
+      gpu_values = duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
+        slot->types, slot->estimated_cardinality, /*produce_single_row=*/true);
       break;
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, /*produce_single_row=*/false);
+      sirius::op::sirius_physical_gpu_values::throw_if_unsupported_types(slot->types);
+      gpu_values = duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
+        slot->types, slot->estimated_cardinality, /*produce_single_row=*/false);
       break;
     default: return;
   }
-  source_op.children.push_back(std::move(leaf));
+  slot = std::move(gpu_values);
 }
 
 //! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
@@ -574,12 +581,13 @@ void insert_gpu_pipeline_operators_recursive(
       wrap_table_scan_source(slot, op_params, context);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
-    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: wrap_cpu_source(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: replace_with_gpu_values(slot); break;
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
       // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data flow, so a
-      // CPU_SOURCE leaf would only materialize a phantom pipeline; real DUMMY_SCANs keep it.
+      // GPU_VALUES replacement would only materialize a phantom source; real DUMMY_SCANs
+      // are replaced.
       auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
-      if (!dummy.is_delim_join_placeholder()) { wrap_cpu_source(*slot); }
+      if (!dummy.is_delim_join_placeholder()) { replace_with_gpu_values(slot); }
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:

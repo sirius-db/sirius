@@ -5153,80 +5153,155 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 //===----------------------------------------------------------------------===//
-// cpu_source_task tests — STATISTICS_PROPAGATION / metadata-only queries
+// GPU_VALUES tests — plan-materialized sources
 //
-// When STATISTICS_PROPAGATION is enabled, DuckDB folds ungrouped count(*),
-// MIN, and MAX into constant expressions (EXPRESSION_GET -> DUMMY_SCAN),
-// which the Sirius planner converts to COLUMN_DATA_SCAN -> cpu_source_task.
-// These tests ensure that path works and doesn't regress.
+// The GPU_VALUES source operator serves COLUMN_DATA_SCAN (VALUES clauses,
+// materialized subqueries, STATISTICS_PROPAGATION constant folds), DUMMY_SCAN
+// (constant-only queries), and EMPTY_RESULT (WHERE false). When
+// STATISTICS_PROPAGATION is enabled, DuckDB folds ungrouped count(*), MIN,
+// and MAX into constant expressions (EXPRESSION_GET -> DUMMY_SCAN), which
+// the Sirius planner converts to a GPU_VALUES source. These tests ensure
+// those paths work and don't regress.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty result (WHERE false)",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select n_nationkey from nation where 1=0;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - aggregate over empty result",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select count(*) from nation where 1=0;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - dummy scan (SELECT literal)",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select 42 as x;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values source",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select b from (values (1), (2), (3)) t(b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values with varchar and nulls",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu(
+    "select a, b from (values (1, 'alpha'), (NULL, 'beta'), (3, NULL)) t(a, b) order by a nulls "
+    "first;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values spanning multiple chunks",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // > STANDARD_VECTOR_SIZE (2048) rows so the ColumnDataCollection scans
+  // multiple DataChunks through the GPU_VALUES staging path.
+  std::string query = "select count(*), min(i), max(i) from (values (0)";
+  for (int i = 1; i < 5000; i++) {
+    query += ", (" + std::to_string(i) + ")";
+  }
+  query += ") t(i);";
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values source fanned out to multiple consumers",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // A VALUES-backed CTE referenced twice fans the GPU_VALUES output out to
+  // multiple downstream data repositories.
+  compare_gpu_vs_cpu(
+    "with t(b) as (values (1), (2), (3)) select a.b, c.b from t a join t c using (b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values joined with base table",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // GPU_VALUES and GPU_SCAN sources in one plan: exercises kickoff when the
+  // task scheduler only schedules the first scan-like source directly.
+  compare_gpu_vs_cpu(
+    "select n.n_name from nation n join (values (0), (1), (2)) t(k) on n.n_nationkey = t.k order "
+    "by n.n_name;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped count(*)",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped count(*) parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped min",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped min parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select max(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped min and max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(n_nationkey), max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped min and max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(l_orderkey), max(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped count(*) with min and max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*), min(n_nationkey), max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped count(*) with min and max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*), min(l_orderkey), max(l_orderkey) from lineitem;");
 }

@@ -260,9 +260,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-    // STATISTICS_PROPAGATION is now enabled: cpu_source_task handles the
-    // COLUMN_DATA_SCAN / EXPRESSION_GET / DUMMY_SCAN sources that this
-    // optimizer produces (e.g. folding count(*), MIN, MAX to constants).
+    // STATISTICS_PROPAGATION is now enabled: the GPU_VALUES source operator
+    // handles the COLUMN_DATA_SCAN / EXPRESSION_GET / DUMMY_SCAN sources that
+    // this optimizer produces (e.g. folding count(*), MIN, MAX to constants).
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif

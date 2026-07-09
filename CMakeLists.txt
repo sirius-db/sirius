@@ -282,7 +282,6 @@ set(EXTENSION_SOURCES
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
-    src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
@@ -291,6 +290,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_dummy_scan.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
+    src/op/sirius_physical_gpu_values.cpp
     src/op/sirius_physical_grouped_aggregate.cpp
     src/op/sirius_physical_grouped_aggregate_merge.cpp
     src/op/sirius_physical_hash_join.cpp

@@ -189,9 +189,9 @@ std::string_view sirius_pipeline_converter::resolve_port_id(
   if (sink.type == T::CONCAT) {
     return sink.Cast<op::sirius_physical_concat>().is_build_concat() ? "build" : "default";
   }
-  // Leaf scans push splits onto the "scan" port of the next operator. GPU_SCAN is
-  // intentionally excluded — legacy wires it as a regular "default"-port operator.
-  if (sink.type == T::DUCKDB_SCAN || sink.type == T::CPU_SOURCE) { return "scan"; }
+  // Leaf scans push splits onto the "scan" port of the next operator. GPU_SCAN and
+  // GPU_VALUES are intentionally excluded — both are in-pipeline sources, never sinks.
+  if (sink.type == T::DUCKDB_SCAN) { return "scan"; }
   return "default";
 }
 
@@ -202,7 +202,7 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
   // Sort/scan sinks process batches as they arrive — no barrier required. GPU_SCAN is
   // intentionally excluded (legacy gives it FULL/PARTIAL, not PIPELINE); SORT_SAMPLE is
   // never a pipeline sink (it runs as an intermediate in the SORT_PARTITION pipeline).
-  if (sink.type == T::ORDER_BY || sink.type == T::DUCKDB_SCAN || sink.type == T::CPU_SOURCE) {
+  if (sink.type == T::ORDER_BY || sink.type == T::DUCKDB_SCAN) {
     return op::MemoryBarrierType::PIPELINE;
   }
   // Producers that feed CONCAT can drain incrementally (PARTIAL); otherwise wait

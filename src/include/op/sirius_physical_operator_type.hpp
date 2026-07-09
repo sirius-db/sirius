@@ -147,7 +147,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   SORT_SAMPLE,
   DUCKDB_SCAN,
   PARQUET_SCAN,
-  CPU_SOURCE,
+  GPU_VALUES,
   GPU_SCAN,
   DYNAMIC_FILTER,
   STREAMING_SOURCE
