@@ -600,7 +600,6 @@ set(TEST_SOURCES
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
-    test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_parquet_helpers.cpp
@@ -684,6 +683,7 @@ if(SIRIUS_BUILD_S3_TESTS)
     APPEND
     TEST_SOURCES
     test/cpp/utils/s3_container.cpp
+    test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp)
