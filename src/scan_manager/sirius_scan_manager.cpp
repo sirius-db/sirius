@@ -721,6 +721,45 @@ void sirius_scan_manager::visit_pinned_entries(
   }
 }
 
+void validate_pinned_entry_for_serving(pinned_entry const& entry,
+                                       std::span<std::size_t const> selected_columns)
+{
+  auto const& entry_column_names = entry.cache_info.column_names();
+
+  if (entry.tier == cucascade::memory::Tier::GPU) {
+    if (entry.data_batches_by_column.empty()) { return; }  // legitimate zero-chunk entry
+    auto const n_chunks = entry.data_batches_by_column.begin()->second.size();
+    if (entry.chunk_memory_spaces.size() != n_chunks) {
+      throw std::runtime_error(
+        "pinned entry's chunk_memory_spaces does not cover every chunk of the entry");
+    }
+    for (auto const* space : entry.chunk_memory_spaces) {
+      if (!space) { throw std::runtime_error("pinned entry has a null chunk memory_space"); }
+    }
+    for (auto idx : selected_columns) {
+      auto const& name = entry_column_names.at(idx);
+      auto it          = entry.data_batches_by_column.find(name);
+      if (it == entry.data_batches_by_column.end() || it->second.size() != n_chunks) {
+        throw std::runtime_error("pinned column '" + name +
+                                 "' does not cover every chunk of the entry");
+      }
+      for (auto const& chunk : it->second) {
+        if (!chunk) { throw std::runtime_error("pinned column '" + name + "' has a null chunk"); }
+      }
+    }
+    return;
+  }
+
+  if (entry.tier == cucascade::memory::Tier::HOST) {
+    for (auto const& chunk : entry.host_chunks) {
+      if (!chunk) { throw std::runtime_error("pinned entry has a null host chunk"); }
+    }
+    return;
+  }
+
+  throw std::runtime_error("pinned entry has an unsupported tier");
+}
+
 bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
 {
   const auto& table_info = op->get_ingestible().table_info();
@@ -736,6 +775,11 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
       auto cols = gather_by_primary_index(entry.cache_info.column_ids,
                                           op->get_ingestible().materialized_column_order());
       if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
+      // Serve-time defense: a malformed entry would end the cached batch stream
+      // early (nullptr mid-stream reads as end-of-stream) and silently truncate
+      // the scan; validate up front so it throws here and the catch below falls
+      // back to the disk read instead.
+      validate_pinned_entry_for_serving(entry, cols);
       auto provider = make_provider_for_pinned_entry(entry, cols, op->batch_telemetry());
       _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
       spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
@@ -743,6 +787,12 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
                    op->get_operator_id());
       return true;
     }
+  } catch (std::exception const& e) {
+    spdlog::error(
+      "[sirius_scan_manager] error while trying to assign cached entries to "
+      "operator '{}': {}",
+      op->get_operator_id(),
+      e.what());
   } catch (...) {
     spdlog::error(
       "[sirius_scan_manager] error while trying to assign cached entries to "
