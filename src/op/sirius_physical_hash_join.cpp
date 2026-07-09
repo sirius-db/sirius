@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/sirius_physical_hash_join.hpp"
+
 #include "cudf/aggregation.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
@@ -40,7 +42,6 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter_publisher.hpp"
 #include "op/sirius_dynamic_filter.hpp"
-#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
