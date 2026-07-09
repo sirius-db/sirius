@@ -82,11 +82,15 @@ class sirius_pipeline_itask : public parallel::itask {
    * reservation, then passes the struct to set_reservation() so execute() can read
    * the components without re-computing them.
    *
+   * @param target_space The memory space the task will execute in, so inputs residing outside it
+   *                     (host/disk tiers, or GPU data on a different device that prepare will
+   *                     clone) are counted in bytes_to_materialize_input. nullptr means no single
+   *                     target space is known; only non-GPU-tier inputs are counted.
    * @return reservation_size_info with input_basis, bytes_to_materialize_input,
    *         peak_memory_estimate, reservation_size, and had_history populated.
    */
-  [[nodiscard]] virtual pipeline::reservation_size_info get_estimated_reservation_size_info()
-    const = 0;
+  [[nodiscard]] virtual pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* target_space) const = 0;
 
   /// @brief Get the output consumer operators for this task.
   virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;

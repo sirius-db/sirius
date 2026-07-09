@@ -209,7 +209,8 @@ void downgrade_executor::processing_loop()
       if (req->satisfied.load()) break;
 
       convertible_data_batch_provider provider(repo);
-      auto candidates = provider.get_all_convertible(source_space, /*front_to_back=*/false);
+      auto candidates = provider.get_all_convertible(
+        source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
       for (auto& candidate : candidates) {
         if (req->satisfied.load()) break;
 

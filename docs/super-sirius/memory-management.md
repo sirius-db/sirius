@@ -142,7 +142,7 @@ Each GPU pipeline maintains a `pipeline_memory_history` — a thread-safe ring b
 
 ### Integration
 
-`gpu_pipeline_task::get_estimated_reservation_size()` uses `estimate_peak_memory()` for the reservation, adding `_bytes_to_materialize_input` (bytes to pull from HOST/disk to GPU) and subtracting it from recorded peak to keep operator history clean of I/O materialization overhead.
+`gpu_pipeline_task::get_estimated_reservation_size_info(target_space)` uses `estimate_peak_memory()` for the reservation, adding `_bytes_to_materialize_input` — the bytes needed to materialize inputs into the task's target memory space (HOST/disk upgrades plus cross-GPU clones) — and subtracting it from recorded peak to keep operator history clean of materialization overhead. Materialization allocations are charged to the task's reservation through the default per-thread allocation tracking; with the non-default `track_per_stream_reservation: true`, converter allocations made on internal pool streams bypass the task's reservation and are only checked against space capacity.
 
 ## Memory Pool Defragmentation
 

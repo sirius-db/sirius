@@ -40,8 +40,10 @@ namespace pipeline {
  * set_reservation() so that execute() can access all components without re-computing.
  */
 struct reservation_size_info {
-  std::size_t input_basis                = 0;  ///< Estimation basis (e.g. input data size)
-  std::size_t bytes_to_materialize_input = 0;  ///< Cost to bring non-GPU input to GPU; 0 for scans
+  std::size_t input_basis = 0;  ///< Estimation basis (e.g. input data size)
+  std::size_t bytes_to_materialize_input =
+    0;  ///< Cost to materialize input into the task's target space (host/disk upgrades plus
+        ///< cross-GPU clones); 0 for scans
   std::size_t peak_memory_estimate = 0;  ///< Predicted operator peak; 2*input_basis if no history
   std::size_t reservation_size     = 0;  ///< peak_memory_estimate + bytes_to_materialize_input
   bool had_history                 = false;  ///< True if estimate came from pipeline_memory_history

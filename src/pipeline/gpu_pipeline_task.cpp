@@ -199,7 +199,7 @@ gpu_pipeline_task::gpu_pipeline_task(
       for (const auto& batch : pipelineable_input->get_data_batches()) {
         if (batch) {
           batch->subscribe();
-          _input_batches.push_back(batch);
+          _subscribed_batches.push_back(batch);
         }
       }
     }
@@ -211,18 +211,17 @@ gpu_pipeline_task::gpu_pipeline_task(
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
-  // Unsubscribe from all input data_batches
-  for (const auto& batch : _input_batches) {
-    if (batch) {
-      try {
-        batch->unsubscribe();
-      } catch (...) {
-        // Destructor must not throw; log if possible
-        SIRIUS_LOG_WARN("gpu_pipeline_task: unsubscribe failed for batch {}",
-                        batch->get_batch_id());
-      }
+  for (const auto& weak_batch : _subscribed_batches) {
+    auto batch = weak_batch.lock();
+    if (!batch) { continue; }
+    try {
+      batch->unsubscribe();
+    } catch (...) {
+      // The destructor must not throw; log if possible.
+      SIRIUS_LOG_WARN("gpu_pipeline_task: unsubscribe failed for batch {}", batch->get_batch_id());
     }
   }
+  _subscribed_batches.clear();
 
   if (_global_state == nullptr ||
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
@@ -414,9 +413,16 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     // is accurate.
     stream.synchronize();
   } catch (const rmm::out_of_memory& oom) {
-    auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
-    auto input_basis = local_state.get_reservation_size_info()->input_basis;
-    auto& global     = _global_state->cast<gpu_pipeline_task_global_state>();
+    auto peak_bytes           = allocator->get_peak_allocated_bytes(stream);
+    const auto& res_info      = local_state.get_reservation_size_info();
+    auto bytes_to_materialize = res_info->bytes_to_materialize_input;
+    auto input_basis          = res_info->input_basis;
+    // Keep the recorded peak clean of materialization overhead (host/disk upgrades and
+    // cross-GPU clones — prepare's allocations are almost entirely those), consistent with
+    // the success and compute-OOM record paths; the estimator re-adds
+    // bytes_to_materialize_input on top of the history-based estimate.
+    peak_bytes   = peak_bytes > bytes_to_materialize ? peak_bytes - bytes_to_materialize : 0;
+    auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record_on_failure(input_basis, peak_bytes);
 
     SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
@@ -504,12 +510,13 @@ std::size_t gpu_pipeline_task::get_input_size() const
   return input_size;
 }
 
-pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_size_info() const
+pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_size_info(
+  const cucascade::memory::memory_space* target_space) const
 {
   auto& ls                         = _local_state->cast<gpu_pipeline_task_local_state>();
   auto& gs                         = _global_state->cast<gpu_pipeline_task_global_state>();
   std::size_t input_basis          = ls.get_task_consumption_basis();
-  std::size_t bytes_to_materialize = ls.get_estimated_bytes_to_materialize_input();
+  std::size_t bytes_to_materialize = ls.get_estimated_bytes_to_materialize_input(target_space);
   auto peak_opt                    = gs.get_memory_history().estimate_peak_memory(input_basis);
   const auto input_type =
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;

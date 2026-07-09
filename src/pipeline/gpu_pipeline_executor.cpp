@@ -127,7 +127,9 @@ void gpu_pipeline_executor::manager_loop()
       }
       break;
     }
-    auto reservation_info = gpu_task->get_estimated_reservation_size_info();
+    // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
+    // another device, which prepare clones into this space) are counted in the reservation.
+    auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
     auto bytes_needs      = reservation_info.reservation_size;
     gpu_task->telemetry_handle().reserving({
       .instance_name              = "",

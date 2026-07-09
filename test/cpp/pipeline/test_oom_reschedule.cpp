@@ -143,7 +143,8 @@ class oom_test_task_base : public sirius::pipeline::gpu_pipeline_task {
 
   void publish_output(sirius::op::operator_data&, rmm::cuda_stream_view) override {}
 
-  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info() const override
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* /*target_space*/) const override
   {
     sirius::pipeline::reservation_size_info info;
     info.reservation_size = kReservationSize;

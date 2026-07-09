@@ -278,7 +278,8 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
     telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
 }
 
-pipeline::reservation_size_info cpu_source_task::get_estimated_reservation_size_info() const
+pipeline::reservation_size_info cpu_source_task::get_estimated_reservation_size_info(
+  const cucascade::memory::memory_space* /*target_space*/) const
 {
   constexpr std::size_t kMinBytes = 64ULL * 1024;
   auto& g_state                   = _global_state->cast<cpu_source_task_global_state>();
