@@ -58,6 +58,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 namespace duckdb {
 
@@ -281,10 +282,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   config_ = config;
   // Declare one telemetry device group per GPU so thread/queue telemetry can
-  // nest under its device instead of piling up flat under the engine.
+  // nest under its device instead of piling up flat under the engine. The GPU
+  // memory space configs already reflect the configured topology.num_gpus /
+  // topology.gpu_ids selection, unlike the raw hardware topology.
   std::vector<int> telemetry_gpu_ids;
-  for (auto const& gpu : config_.get_hw_topology().gpus) {
-    telemetry_gpu_ids.push_back(gpu.id);
+  for (auto const& space_config : config_.get_memory_space_configs()) {
+    if (auto const* gpu_config =
+          std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config)) {
+      telemetry_gpu_ids.push_back(gpu_config->device_id);
+    }
   }
   telemetry_context_ =
     sirius::telemetry::telemetry_context::create(config_.get_telemetry_config(), telemetry_gpu_ids);
