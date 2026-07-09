@@ -34,7 +34,8 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::RESERVOIR_SAMPLE: return "RESERVOIR_SAMPLE";
     case SiriusPhysicalOperatorType::STREAMING_SAMPLE: return "STREAMING_SAMPLE";
     case SiriusPhysicalOperatorType::TOP_N: return "TOP_N";
-    case SiriusPhysicalOperatorType::VSS: return "VSS";
+    case SiriusPhysicalOperatorType::ENN: return "ENN";
+    case SiriusPhysicalOperatorType::ANN_IVF_FLAT: return "ANN_IVF_FLAT";
     case SiriusPhysicalOperatorType::WINDOW: return "WINDOW";
     case SiriusPhysicalOperatorType::STREAMING_WINDOW: return "STREAMING_WINDOW";
     case SiriusPhysicalOperatorType::UNNEST: return "UNNEST";
@@ -109,7 +110,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::MERGE_SORT: return "MERGE_SORT";
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY: return "MERGE_GROUP_BY";
     case SiriusPhysicalOperatorType::MERGE_TOP_N: return "MERGE_TOP_N";
-    case SiriusPhysicalOperatorType::MERGE_VSS: return "MERGE_VSS";
+    case SiriusPhysicalOperatorType::MERGE_ENN: return "MERGE_ENN";
     case SiriusPhysicalOperatorType::MERGE_AGGREGATE: return "MERGE_AGGREGATE";
     case SiriusPhysicalOperatorType::SORT_PARTITION: return "SORT_PARTITION";
     case SiriusPhysicalOperatorType::SORT_SAMPLE: return "SORT_SAMPLE";

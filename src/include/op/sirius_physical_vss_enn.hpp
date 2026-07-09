@@ -32,19 +32,19 @@ namespace op {
  * @brief Per-batch brute-force vector top-k.
  *
  * Each batch is reduced to its local k nearest rows and the global merge is
- * done via sirius_physical_vss_merge.
+ * done via sirius_physical_vss_enn_merge.
  */
-class sirius_physical_vss : public sirius_physical_operator {
+class sirius_physical_vss_enn : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::VSS;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ENN;
 
  public:
-  sirius_physical_vss(duckdb::vector<sirius::logical_type> types_p,
-                      sirius::vss::vss_top_k_pattern pattern,
-                      std::size_t limit,
-                      std::size_t offset,
-                      std::size_t estimated_cardinality);
-  ~sirius_physical_vss() override;
+  sirius_physical_vss_enn(duckdb::vector<sirius::logical_type> types_p,
+                          sirius::vss::vss_top_k_pattern pattern,
+                          std::size_t limit,
+                          std::size_t offset,
+                          std::size_t estimated_cardinality);
+  ~sirius_physical_vss_enn() override;
 
   sirius::vss::vss_top_k_pattern pattern;
   std::size_t limit;

@@ -372,6 +372,13 @@ class sirius_scan_manager {
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
+  /// \brief Look up a pinned table entry by its name (the key used by pin_table /
+  ///        @ref insert_pinned_entry), or nullptr if none is pinned under @p name.
+  ///        The returned pointer is owned by the scan manager and stable until the
+  ///        entry is removed or replaced. Used by the ANN search operator to gather
+  ///        output columns (GPU-resident, in pin/index-build order) for a query.
+  [[nodiscard]] const pinned_entry* find_pinned_entry(std::string_view name) const;
+
   parquet_bind_result describe_parquet(std::string const& uri);
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
