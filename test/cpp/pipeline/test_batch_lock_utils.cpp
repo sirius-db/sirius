@@ -61,9 +61,10 @@ namespace {
 // Enable CUDA driver-level peer access for every GPU pair, idempotently, with sticky-error
 // consumption. Adapted from test/cpp/config/test_context.cpp (anonymous namespace, not
 // reachable from this TU) — these tests build a bare memory manager and bypass the enable
-// loop in SiriusContext::initialize(). Returns true only when EVERY ordered pair enabled
-// peer access (i.e. all pairs are bidirectionally P2P-capable), since the tests transfer in
-// both directions.
+// loop in SiriusContext::initialize(). Best-effort, mirroring that init loop: pairs that
+// cannot enable peer access are left to cucascade's host-staged copy fallback, which is the
+// production transfer path on such hardware. Returns true only when EVERY ordered pair
+// enabled peer access, so callers can log which flavor a run exercised.
 bool enable_p2p_for_test(int num_gpus)
 {
   bool all_enabled = true;
@@ -90,7 +91,10 @@ bool enable_p2p_for_test(int num_gpus)
 }
 
 /// Skip idiom for multi-GPU tests (Catch2 v2): WARN + return true when fewer than two GPUs
-/// are present or the pair is not P2P-capable.
+/// are present. These tests validate lock/clone semantics, which hold on both cross-GPU
+/// transfer flavors, so P2P is enabled best-effort rather than required: with it the clone
+/// peer-DMAs, without it cucascade host-stages — exactly as production would on the same
+/// hardware. The WARN records which flavor a run exercised.
 bool skip_if_not_mgpu()
 {
   int device_count = 0;
@@ -100,8 +104,7 @@ bool skip_if_not_mgpu()
     return true;
   }
   if (!enable_p2p_for_test(2)) {
-    WARN("skipping: GPUs 0 and 1 are not P2P-capable");
-    return true;
+    WARN("GPUs 0 and 1 are not P2P-capable — cross-GPU copies will host-stage");
   }
   return false;
 }
@@ -182,14 +185,26 @@ struct batch_lock_utils_fixture {
   }
 };
 
-/// Copy a fixed-width column's payload to host for value comparison (works across devices).
+/// Copy a fixed-width column's payload to host for value comparison. The copy is issued with
+/// the payload's owning device current: without P2P, a cudaMemcpyAsync of another device's
+/// pool memory fails with cudaErrorInvalidValue, and an unchecked failure would silently
+/// return the zero-initialized vector.
 template <typename T>
 std::vector<T> column_values_to_host(const cudf::column_view& col, rmm::cuda_stream_view stream)
 {
   std::vector<T> out(static_cast<std::size_t>(col.size()));
-  cudaMemcpyAsync(
-    out.data(), col.data<T>(), out.size() * sizeof(T), cudaMemcpyDeviceToHost, stream.value());
+  if (out.empty()) { return out; }
   stream.synchronize();
+  cudaPointerAttributes attrs{};
+  REQUIRE(cudaPointerGetAttributes(&attrs, col.data<T>()) == cudaSuccess);
+  int prev = -1;
+  REQUIRE(cudaGetDevice(&prev) == cudaSuccess);
+  const bool switch_device = attrs.type == cudaMemoryTypeDevice && attrs.device != prev;
+  if (switch_device) { REQUIRE(cudaSetDevice(attrs.device) == cudaSuccess); }
+  const cudaError_t copy_err =
+    cudaMemcpy(out.data(), col.data<T>(), out.size() * sizeof(T), cudaMemcpyDeviceToHost);
+  if (switch_device) { REQUIRE(cudaSetDevice(prev) == cudaSuccess); }
+  REQUIRE(copy_err == cudaSuccess);
   return out;
 }
 
