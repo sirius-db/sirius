@@ -259,6 +259,11 @@ struct listed_object {
   std::uint64_t size{0};
 };
 
+struct generated_listing {
+  std::string prefix;
+  std::size_t total{0};
+};
+
 class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer {
  public:
   explicit fixed_url_authorizer(std::string endpoint) : _endpoint(std::move(endpoint)) {}
@@ -339,6 +344,11 @@ class range_http_server {
   [[nodiscard]] std::size_t list_count() const noexcept { return _list_count.load(); }
   [[nodiscard]] std::size_t body_bytes_sent() const noexcept { return _body_bytes_sent.load(); }
   [[nodiscard]] int peak_active_gets() const noexcept { return _peak_active_gets.load(); }
+
+  void set_generated_listing(std::string prefix, std::size_t total)
+  {
+    _generated_listing = generated_listing{std::move(prefix), total};
+  }
 
  private:
   struct active_get_guard {
@@ -571,24 +581,42 @@ class range_http_server {
     }
     auto start = page_start_from_token(token);
 
-    std::vector<listed_object> matching;
-    for (auto const& object : _listed) {
-      if (object.key.rfind(prefix, 0) == 0) { matching.push_back(object); }
-    }
-
-    if (start > matching.size()) { start = matching.size(); }
-    auto end              = std::min(start + max_keys, matching.size());
-    bool truncated        = end < matching.size();
-    std::string token_out = truncated ? continuation_token_for(end) : std::string{};
-
     std::ostringstream xml;
     xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-           "<IsTruncated>"
-        << (truncated ? "true" : "false") << "</IsTruncated>";
-    for (auto i = start; i < end; ++i) {
-      xml << "<Contents><Key>" << xml_escape(matching[i].key) << "</Key><Size>" << matching[i].size
-          << "</Size></Contents>";
+           "<IsTruncated>";
+
+    auto const emit_contents = [&](std::string_view key, std::uint64_t size) {
+      xml << "<Contents><Key>" << xml_escape(key) << "</Key><Size>" << size << "</Size></Contents>";
+    };
+
+    bool truncated        = false;
+    std::string token_out = {};
+    if (_generated_listing.has_value() && prefix == _generated_listing->prefix) {
+      auto const total = _generated_listing->total;
+      if (start > total) { start = total; }
+      auto const end = std::min(start + max_keys, total);
+      truncated      = end < total;
+      token_out      = truncated ? continuation_token_for(end) : std::string{};
+      xml << (truncated ? "true" : "false") << "</IsTruncated>";
+      for (std::size_t i = start; i < end; ++i) {
+        emit_contents(_generated_listing->prefix + std::to_string(i),
+                      static_cast<std::uint64_t>(i % 4096U));
+      }
+    } else {
+      std::vector<listed_object> matching;
+      for (auto const& object : _listed) {
+        if (object.key.rfind(prefix, 0) == 0) { matching.push_back(object); }
+      }
+
+      if (start > matching.size()) { start = matching.size(); }
+      auto const end = std::min(start + max_keys, matching.size());
+      truncated      = end < matching.size();
+      token_out      = truncated ? continuation_token_for(end) : std::string{};
+      xml << (truncated ? "true" : "false") << "</IsTruncated>";
+      for (auto i = start; i < end; ++i) {
+        emit_contents(matching[i].key, matching[i].size);
+      }
     }
     if (truncated) {
       xml << "<NextContinuationToken>" << xml_escape(token_out) << "</NextContinuationToken>";
@@ -675,6 +703,7 @@ class range_http_server {
   std::vector<std::uint8_t> _object;
   range_fault_policy _fault;
   std::vector<listed_object> _listed;
+  std::optional<generated_listing> _generated_listing;
   std::atomic<bool> _stop{false};
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
@@ -984,6 +1013,156 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
     auto none = ctx->list_objects("bucket", "missing/", /*page_size=*/1);
     CHECK(none.empty());
     CHECK(server.list_count() == 1);
+  }
+}
+
+TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumulating pages",
+          "[s3][integration][rest][list]")
+{
+  SECTION("scanned cap triggers page-by-page with one page held at a time")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 6000);
+    auto cfg               = direct_rest_test_config();
+    cfg.list_max_scanned   = 5000;
+    auto ctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+
+    bool threw = false;
+    try {
+      ctx->list_objects_paged("bucket",
+                              "big/",
+                              /*page_size=*/1000,
+                              [&](sirius::io::s3::list_objects_v2_page const& page) {
+                                max_seen = std::max(max_seen, page.entries.size());
+                                ++sink_calls;
+                                return true;
+                              });
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("scanned more than 5000") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+
+    CHECK(threw);
+    CHECK(max_seen <= 1000);
+    CHECK(sink_calls == 5);
+    CHECK(server.list_count() == 6);
+  }
+
+  SECTION("matched cap stops the accumulating wrapper")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 600);
+    auto cfg             = direct_rest_test_config();
+    cfg.list_max_matches = 500;
+    auto ctx             = make_direct_rest_ioctx(server.endpoint(), cfg);
+
+    bool threw = false;
+    try {
+      (void)ctx->list_objects("bucket", "big/", /*page_size=*/1000);
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("more than 500") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK(server.list_count() == 1);
+  }
+
+  SECTION("under the default caps succeeds and preserves generated key order")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 500);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto listed = ctx->list_objects("bucket", "big/", /*page_size=*/1000);
+
+    REQUIRE(listed.size() == 500);
+    CHECK(listed.front().key == "big/0");
+    CHECK(listed.front().size == 0);
+    CHECK(listed.back().key == "big/499");
+    CHECK(listed.back().size == 499);
+    CHECK(server.list_count() == 1);
+  }
+
+  SECTION("early stop returns after the first generated page even for a large prefix")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 100000);
+    auto ctx               = make_direct_rest_ioctx(server.endpoint());
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+
+    ctx->list_objects_paged("bucket",
+                            "big/",
+                            /*page_size=*/1000,
+                            [&](sirius::io::s3::list_objects_v2_page const& page) {
+                              max_seen = std::max(max_seen, page.entries.size());
+                              ++sink_calls;
+                              return false;
+                            });
+
+    CHECK(max_seen <= 1000);
+    CHECK(sink_calls == 1);
+    CHECK(server.list_count() == 1);
+  }
+}
+
+TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
+          "[.][s3][integration][rest][list][stress]")
+{
+  SECTION("default scanned cap trips at one million entries without retaining pages")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 1000001);
+    auto ctx               = make_direct_rest_ioctx(server.endpoint());
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+
+    bool threw = false;
+    try {
+      ctx->list_objects_paged("bucket",
+                              "big/",
+                              /*page_size=*/1000,
+                              [&](sirius::io::s3::list_objects_v2_page const& page) {
+                                max_seen = std::max(max_seen, page.entries.size());
+                                ++sink_calls;
+                                return true;
+                              });
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("scanned more than 1000000") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+
+    CHECK(threw);
+    CHECK(max_seen <= 1000);
+    CHECK(sink_calls == 1000);
+    CHECK(server.list_count() == 1001);
+  }
+
+  SECTION("default matched cap trips at one hundred thousand accumulated entries")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 100001);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    bool threw = false;
+    try {
+      (void)ctx->list_objects("bucket", "big/", /*page_size=*/1000);
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("more than 100000") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK(server.list_count() == 101);
   }
 }
 
