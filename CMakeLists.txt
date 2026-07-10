@@ -644,6 +644,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
+    test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
@@ -653,6 +654,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
+    test/cpp/pipeline/test_partition_build_pipelines.cpp
     test/cpp/pipeline/test_pipeline_conversion_differential.cpp
     test/cpp/pipeline/test_pipeline_conversion_parquet_differential.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
