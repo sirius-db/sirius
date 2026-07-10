@@ -16,7 +16,6 @@
 
 #include "utils/pipeline_conversion_test_utils.hpp"
 
-#include "config.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -176,22 +175,6 @@ std::string convert_query_to_dump(duckdb::Connection& con, const std::string& qu
     dump = pipeline::dump_pipeline_conversion_result(result);
   });
   return dump;
-}
-
-tree_pipeline_flag_guard::tree_pipeline_flag_guard()
-  : original_(duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD)
-{
-}
-
-tree_pipeline_flag_guard::~tree_pipeline_flag_guard()
-{
-  duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = original_;
-}
-
-std::string dump_under_flag(duckdb::Connection& con, const std::string& query, bool flag)
-{
-  duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = flag;
-  return convert_query_to_dump(con, query);
 }
 
 std::filesystem::path tpch_queries_dir()
