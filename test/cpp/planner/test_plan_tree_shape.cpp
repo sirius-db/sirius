@@ -83,7 +83,10 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
-/// Generate a Sirius physical plan from a SQL query string.
+/// Generate a Sirius physical plan from a SQL query string. Throws on any parse / plan /
+/// optimize / generation failure (after rolling back and restoring the optimizer settings):
+/// these fixtures are supported in CI, so a planner regression must fail the test rather
+/// than silently skip it.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& con,
                                                                   const std::string& query)
 {
@@ -124,10 +127,6 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
 
     sirius::planner::sirius_physical_plan_generator gen(context);
     result = gen.create_plan(std::move(plan));
-  } catch (duckdb::InternalException&) {
-    con.Query("ROLLBACK");
-    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
-    return nullptr;
   } catch (...) {
     con.Query("ROLLBACK");
     DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
@@ -325,10 +324,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "[plan_tree_shape][isolated_context]")
 {
   auto plan = generate_sirius_plan(*con, "SELECT val FROM big_left WHERE id > 5");
-  if (!plan) {
-    WARN("Plan generation failed (no DuckDB table scan support); skipping");
-    return;
-  }
   INFO(tree_to_string(plan.get()));
 
   CHECK(collect(plan.get(), SiriusPhysicalOperatorType::TABLE_SCAN).empty());
@@ -346,10 +341,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 {
   auto plan =
     generate_sirius_plan(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid");
-  if (!plan) {
-    WARN("Plan generation failed; skipping");
-    return;
-  }
   INFO(tree_to_string(plan.get()));
 
   auto* hj = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
@@ -371,10 +362,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("grouped aggregate gains a MERGE_GROUP_BY -> PARTITION fanout")
   {
     auto plan = generate_sirius_plan(*con, "SELECT val, count(*) FROM big_left GROUP BY val");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
@@ -392,10 +379,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
     auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
@@ -412,10 +395,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("order-by becomes MERGE_SORT -> SORT_PARTITION -> SORT_SAMPLE -> ORDER_BY")
   {
     auto plan = generate_sirius_plan(*con, "SELECT * FROM big_left ORDER BY val");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT);
@@ -433,10 +412,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("top-n becomes MERGE_TOP_N -> TOP_N")
   {
     auto plan = generate_sirius_plan(*con, "SELECT * FROM big_left ORDER BY val LIMIT 3");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_TOP_N);
@@ -457,10 +432,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       *con,
       "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
       "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
@@ -492,10 +463,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       *con,
       "SELECT l.id FROM big_left l "
       "WHERE EXISTS (SELECT 1 FROM small_right r WHERE r.rid = l.id AND r.other < l.val)");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::LEFT_DELIM_JOIN);
@@ -531,10 +498,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     DYNAMIC_SECTION("query: " << query)
     {
       auto plan = generate_sirius_plan(*con, query);
-      if (!plan) {
-        WARN("Plan generation failed; skipping");
-        return;
-      }
       INFO(tree_to_string(plan.get()));
 
       // Root has no parent; every other operator's parent is its tree position, including
