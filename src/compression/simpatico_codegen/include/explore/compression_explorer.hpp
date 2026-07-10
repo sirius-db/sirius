@@ -33,7 +33,8 @@ struct exploration_config {
 
   score_mode rerank_mode   = score_mode::Weighted;
   double rerank_weights[3] = {1.0, 1.0, 1.0};  ///< (ratio, comp, decomp) exponents
-  size_t rerank_top        = 8;                ///< finalists to time
+  size_t rerank_top        = 8;                ///< finalists to time (selected by ratio)
+  size_t simplicity_slots  = 4;  ///< top-N finalists injected per step-count depth level
 
   /// Ratio-guided BFS sample cap: when >0 and a column has more rows than this,
   /// the beam search runs on a contiguous prefix of this many rows instead of

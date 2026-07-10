@@ -207,25 +207,29 @@ static int run_benchmark(int argc, char** argv)
 
 static void usage_explore()
 {
-  std::fprintf(stderr,
-               "Usage: simpatico explore --input PATH [options]\n"
-               "\n"
-               "  --input PATH              Parquet, CSV/.tbl, or binary file (required)\n"
-               "  --col N                   Column index to explore (default: all)\n"
-               "  --format {parquet|csv|binary}\n"
-               "  --dtype {i32|i64|...}     Element type for binary input\n"
-               "  --beam-width N            BFS beam width (default: 100)\n"
-               "  --max-depth N             Maximum cascade depth (default: 10)\n"
-               "  --score {weighted|pareto} Ranking mode (default: weighted)\n"
-               "  --weight-ratio W          Compression-ratio exponent (default: 1.0)\n"
-               "  --weight-comp W           Compress-throughput exponent (default: 1.0)\n"
-               "  --weight-decomp W         Decompress-throughput exponent (default: 1.0)\n"
-               "  --rerank-top N            Number of finalists to time (default: 8)\n"
-               "  --sample-rows N           Approximate speedup: run the ratio search on an\n"
-               "                            N-row prefix (finalists still measured on the full\n"
-               "                            column). Default 0 = full column. May pick worse\n"
-               "                            plans for sorted/monotonic columns.\n"
-               "  --verbose                 Print BFS progress\n");
+  std::fprintf(
+    stderr,
+    "Usage: simpatico explore --input PATH [options]\n"
+    "\n"
+    "  --input PATH              Parquet, CSV/.tbl, or binary file (required)\n"
+    "  --col N                   Column index to explore (default: all)\n"
+    "  --format {parquet|csv|binary}\n"
+    "  --dtype {i32|i64|...}     Element type for binary input\n"
+    "  --beam-width N            BFS beam width (default: 100)\n"
+    "  --max-depth N             Maximum cascade depth (default: 10)\n"
+    "  --score {weighted|pareto} Ranking mode (default: weighted)\n"
+    "  --weight-ratio W          Compression-ratio exponent (default: 1.0)\n"
+    "  --weight-comp W           Compress-throughput exponent (default: 1.0)\n"
+    "  --weight-decomp W         Decompress-throughput exponent (default: 1.0)\n"
+    "  --rerank-top N            Number of finalists to time, selected by ratio (default: 8)\n"
+    "  --simplicity-slots N      Top-N completed plans per cascade-depth level\n"
+    "                            injected into the rerank pool, giving lighter-weight\n"
+    "                            plans a fair shot against deep cascades (default: 4)\n"
+    "  --sample-rows N           Approximate speedup: run the ratio search on an\n"
+    "                            N-row prefix (finalists still measured on the full\n"
+    "                            column). Default 0 = full column. May pick worse\n"
+    "                            plans for sorted/monotonic columns.\n"
+    "  --verbose                 Print BFS progress\n");
 }
 
 struct explore_cfg {
@@ -285,6 +289,8 @@ static int run_explore(int argc, char** argv)
       cfg.ecfg.rerank_weights[2] = std::stod(need("--weight-decomp"));
     } else if (arg == "--rerank-top") {
       cfg.ecfg.rerank_top = static_cast<std::size_t>(std::stoul(need("--rerank-top")));
+    } else if (arg == "--simplicity-slots") {
+      cfg.ecfg.simplicity_slots = static_cast<std::size_t>(std::stoul(need("--simplicity-slots")));
     } else if (arg == "--sample-rows") {
       cfg.ecfg.sample_rows = static_cast<std::size_t>(std::stoul(need("--sample-rows")));
     } else if (arg == "--verbose") {

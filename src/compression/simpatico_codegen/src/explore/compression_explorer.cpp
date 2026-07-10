@@ -298,8 +298,8 @@ exploration_result explore_column_compression(cudf::column_view input,
   }
   cudf::column_view const bfs_input =
     sample_owned ? sample_owned->view() : (sampled ? sample_slice[0] : input);
-  size_t original_size = column_size_bytes_ex(bfs_input, stream);
-  size_t max_candidates             = config.beam_width > 0 ? config.beam_width : 100;
+  size_t original_size  = column_size_bytes_ex(bfs_input, stream);
+  size_t max_candidates = config.beam_width > 0 ? config.beam_width : 100;
 
   if (config.verbose)
     std::cerr << "[explore] Input size: " << original_size
@@ -310,6 +310,18 @@ exploration_result explore_column_compression(cudf::column_view input,
   double best_ratio      = 1.0;
   size_t best_leaf_bytes = original_size;
   size_t best_depth      = 0;
+
+  // Completed plans (pending.empty()) at any depth get evicted from the beam
+  // once deeper cascades with better ratios arrive. Save the best ones here so
+  // they always reach the timed rerank pass, giving throughput-efficient
+  // lighter-weight plans a fair shot against deep but slow cascades.
+  struct shallow_candidate {
+    std::string dsl;
+    double compression_ratio;
+    size_t total_leaf_bytes;
+    size_t num_steps;
+  };
+  std::vector<shallow_candidate> saved_shallow;
 
   auto const& all_ops = all_compressor_names();
 
@@ -423,6 +435,13 @@ exploration_result explore_column_compression(cudf::column_view input,
             best_leaf_bytes = child->total_leaf_bytes;
             best_depth      = depth + 1;
           }
+          // Every BFS candidate is a valid complete plan: any uncovered sub-columns
+          // are implicitly stored as identity.  Save all candidates (terminal or
+          // not) so that simple, fast plans (e.g. bare bitpack) reach the rerank
+          // pass even when deep cascades beat them on ratio.
+          if (saved_shallow.size() < max_candidates)
+            saved_shallow.push_back(
+              {child->dsl, child->compression_ratio, child->total_leaf_bytes, child->steps.size()});
           if (next_beam.size() < max_candidates) {
             next_beam.push_back(std::move(child));
             std::push_heap(next_beam.begin(), next_beam.end(), ratio_gt);
@@ -494,19 +513,65 @@ exploration_result explore_column_compression(cudf::column_view input,
   beam.clear();
   cudaDeviceSynchronize();
 
-  size_t const rerank_top = config.rerank_top > 0 ? config.rerank_top : 8;
-  if (finalists.size() > rerank_top) {
-    auto id_it  = std::find_if(finalists.begin(), finalists.end(), [](auto const& f) {
+  size_t const rerank_top       = config.rerank_top > 0 ? config.rerank_top : 8;
+  size_t const simplicity_slots = config.simplicity_slots;
+
+  // Trim the ratio pool first, then append simplicity candidates so the trim
+  // cannot evict them. The identity plan rescue runs before the trim.
+  {
+    // Preserve identity plan if it would be evicted by the ratio trim
+    auto id_it = std::find_if(finalists.begin(), finalists.end(), [](auto const& f) {
       return f.plan_dsl == "input -> identity";
     });
-    bool had_id = id_it != finalists.end();
+    bool id_needs_rescue =
+      id_it != finalists.end() && id_it >= finalists.begin() + (std::ptrdiff_t)rerank_top;
     ranked_candidate id_kept;
-    if (had_id && id_it >= finalists.begin() + (std::ptrdiff_t)rerank_top) id_kept = *id_it;
-    finalists.resize(rerank_top);
-    if (had_id && std::none_of(finalists.begin(), finalists.end(), [](auto const& f) {
+    if (id_needs_rescue) id_kept = *id_it;
+
+    if (finalists.size() > rerank_top) finalists.resize(rerank_top);
+
+    if (id_needs_rescue && std::none_of(finalists.begin(), finalists.end(), [](auto const& f) {
           return f.plan_dsl == "input -> identity";
         }))
       finalists.back() = id_kept;
+  }
+
+  // Inject the top simplicity_slots completed plans per step-count level so
+  // every completion horizon gets fair representation in the timed rerank pass.
+  // Completed plans are evicted from the beam once deeper cascades arrive —
+  // saved_shallow preserves them across all depths.
+  if (simplicity_slots > 0 && !saved_shallow.empty()) {
+    // Sort by (step_count ASC, ratio DESC) so we iterate depth-by-depth,
+    // best-ratio-first within each depth.
+    std::sort(saved_shallow.begin(), saved_shallow.end(), [](auto const& a, auto const& b) {
+      return a.num_steps != b.num_steps ? a.num_steps < b.num_steps
+                                        : a.compression_ratio > b.compression_ratio;
+    });
+    size_t per_depth_count = 0;
+    size_t cur_steps       = 0;
+    bool first             = true;
+    for (auto const& s : saved_shallow) {
+      if (first || s.num_steps != cur_steps) {
+        cur_steps       = s.num_steps;
+        per_depth_count = 0;
+        first           = false;
+      }
+      if (per_depth_count >= simplicity_slots) continue;
+      bool already = std::any_of(
+        finalists.begin(), finalists.end(), [&](auto const& f) { return f.plan_dsl == s.dsl; });
+      if (!already) {
+        finalists.push_back({s.dsl, s.compression_ratio, s.total_leaf_bytes, 0.0, 0.0});
+        ++per_depth_count;
+      }
+    }
+  }
+
+  if (config.verbose) {
+    std::cerr << "[explore] Rerank pool (" << finalists.size() << " candidates):\n";
+    for (auto const& f : finalists)
+      std::cerr << "[explore]   ratio=" << std::fixed << std::setprecision(3) << f.compression_ratio
+                << "  steps=" << std::count(f.plan_dsl.begin(), f.plan_dsl.end(), '\n') + 1 << "  "
+                << f.plan_dsl.substr(0, f.plan_dsl.find('\n')) << "\n";
   }
 
   bool use_pareto      = config.rerank_mode == score_mode::Pareto;
@@ -646,6 +711,10 @@ exploration_result explore_column_compression(cudf::column_view input,
     result.compressed_size_bytes      = best_it->compressed_size_bytes;
     result.compress_throughput_gbps   = best_it->compress_throughput_gbps;
     result.decompress_throughput_gbps = best_it->decompress_throughput_gbps;
+    // Derive depth from the actual winning plan's line count, not from the
+    // BFS ratio-tracking variable (which reflects when the beam last improved).
+    result.cascade_depth =
+      static_cast<size_t>(std::count(result.plan_dsl.begin(), result.plan_dsl.end(), '\n') + 1);
     if (use_pareto && need_throughput) {
       std::ostringstream os;
       size_t alt_n = 0;
