@@ -81,7 +81,8 @@ struct row_group_slice {
  *
  * Used as the unit of work for the legacy parquet_scan_task path (byte-range preloading).
  *
- * @todo This needs to be deleted once Iceberg is integrated into scan manager framework.
+ * @todo This needs to be deleted once the remaining scan paths are integrated into the scan
+ * manager framework.
  */
 struct row_group_range {
   row_group_range(std::size_t file_idx,

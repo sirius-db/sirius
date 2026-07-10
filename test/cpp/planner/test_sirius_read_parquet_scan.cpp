@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 
-// Regression test: the tree-based pipeline build (USE_TREE_BASED_PIPELINE_BUILD, the
-// default) must plan `sirius_read_parquet` — the internal rewrite target for
-// read_parquet('s3://…') inside gpu_execution — like the legacy converter does.
+// Regression test: the plan generator must plan `sirius_read_parquet` — the internal
+// rewrite target for read_parquet('s3://…') inside gpu_execution.
 // Before the fix, wrap_table_scan_source threw "Unsupported scan function:
 // sirius_read_parquet", so S3 SQL failed during planning (and S3 has no CPU fallback;
 // the CPU-side table function only throws). The scan is URI-agnostic — the resolved

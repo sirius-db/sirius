@@ -54,9 +54,8 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
   }
 
   bool is_source() const override { return true; }
-  //! Mirrors DUCKDB_SCAN: under flag ON every CPU_SOURCE leaf is its own one-operator
-  //! pipeline. Under flag OFF the legacy converter handles boundary placement.
-  bool is_sink() const override { return duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD; }
+  //! Mirrors DUCKDB_SCAN: every CPU_SOURCE leaf is its own one-operator pipeline.
+  bool is_sink() const override { return true; }
 
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;

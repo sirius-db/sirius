@@ -16,7 +16,6 @@
 
 #include "utils/pipeline_conversion_test_utils.hpp"
 
-#include "config.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -116,8 +115,8 @@ void with_conversion_result(
 
   // The optimizer's catalog reads and the GPU-native seq_scan ingestible construction require
   // an active transaction (production inherits one from the bind callsite). Hold it across
-  // plan generation AND conversion — both flag paths build the ingestible eagerly — then roll
-  // back, since the path is read-only.
+  // plan generation AND conversion — the ingestible is built eagerly — then roll back, since
+  // the path is read-only.
   con.BeginTransaction();
   try {
     duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
@@ -148,14 +147,7 @@ void with_conversion_result(
     root_pipeline->build(*sirius_plan);
     root_pipeline->ready();
 
-    // The legacy (flag-OFF) converter requires a non-null iceberg cache; the tree path
-    // ignores it. TPC-H has no iceberg, so an empty map suffices.
-    static const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
-      kEmptyIcebergCache;
-    // The ClientContext lets the legacy converter build the GPU-native seq_scan operator;
-    // without it, any seq_scan query throws.
-    pipeline::sirius_pipeline_converter converter(
-      build_ctx, op_params, &kEmptyIcebergCache, &context);
+    pipeline::sirius_pipeline_converter converter(build_ctx, op_params);
     auto result = converter.convert(*root_pipeline);
 
     // Consume *here*, while the plan tree and pipelines are in scope: the result's pipelines
@@ -176,22 +168,6 @@ std::string convert_query_to_dump(duckdb::Connection& con, const std::string& qu
     dump = pipeline::dump_pipeline_conversion_result(result);
   });
   return dump;
-}
-
-tree_pipeline_flag_guard::tree_pipeline_flag_guard()
-  : original_(duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD)
-{
-}
-
-tree_pipeline_flag_guard::~tree_pipeline_flag_guard()
-{
-  duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = original_;
-}
-
-std::string dump_under_flag(duckdb::Connection& con, const std::string& query, bool flag)
-{
-  duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = flag;
-  return convert_query_to_dump(con, query);
 }
 
 std::filesystem::path tpch_queries_dir()

@@ -15,7 +15,7 @@
  */
 
 // Regression test for the duckdb-native pinned-cache identity under the tree-based
-// pipeline build (USE_TREE_BASED_PIPELINE_BUILD, the default).
+// pipeline build.
 //
 // The tree-path table-info builder (build_duckdb_native_table_info) omitted the
 // qualified-name identity fields (catalog_name / schema_name / table_name) that

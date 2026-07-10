@@ -79,10 +79,6 @@ bool sirius_physical_partition::is_sink() const { return true; }
 void sirius_physical_partition::build_pipelines(pipeline::sirius_pipeline& current,
                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    sirius_physical_operator::build_pipelines(current, meta_pipeline);
-    return;
-  }
   // PARTITION is always its own single-operator pipeline. The child is guaranteed to be
   // a sink (its `_parent_op` is this PARTITION, so the base `is_sink()` returns true), so
   // create our own meta and let the child's protocol build its own boundary.

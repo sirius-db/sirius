@@ -104,9 +104,8 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
-  //! Flag ON: every DUCKDB_SCAN terminates its own one-operator pipeline. Flag OFF: the
-  //! legacy converter owns source/sink boundaries, so is_sink stays false.
-  bool is_sink() const override { return duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD; }
+  //! Every DUCKDB_SCAN terminates its own one-operator pipeline.
+  bool is_sink() const override { return true; }
 
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;

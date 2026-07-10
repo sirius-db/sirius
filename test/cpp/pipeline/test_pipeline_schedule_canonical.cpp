@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "config.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
@@ -27,7 +27,6 @@
 #include <algorithm>
 #include <filesystem>
 #include <regex>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -50,8 +49,7 @@ fs::path integration_db_path()
 #endif
 }
 
-//! Operator chain with the `(id=N)` tokens stripped — operator IDs legitimately differ
-//! between the two flag paths.
+//! Operator chain with the `(id=N)` tokens stripped, for readable failure messages.
 std::string operator_chain(const sirius_pipeline& pipeline)
 {
   static const std::regex kIdToken{" \\(id=\\d+\\)"};
@@ -79,11 +77,12 @@ void require_strictly_topological(
 
 }  // namespace
 
-//! Gate for `reorder_pipelines_topologically`: the tree-based schedule must be strictly
-//! topological (the raw meta-sweep emission is not), deterministic, and structurally
-//! equivalent to legacy. Order is NOT compared against legacy — its interleaving comes
-//! from meta-sweep state absent from the final graph; the differential dumps prove equality.
-TEST_CASE("tree-based schedule is strictly topological and deterministic",
+//! Gate for `reorder_pipelines_topologically` and conversion determinism: the schedule must
+//! be strictly topological (the raw meta-sweep emission is not), join dependencies must stay
+//! build-side-first (dynamic filters publish before the probe-side scans they prune are
+//! launched), reordering an already-canonical schedule must be a no-op, and converting the
+//! same query twice must serialize byte-identically.
+TEST_CASE("pipeline schedule is strictly topological and deterministic",
           "[integration][pipeline][schedule_canonical]")
 {
   REQUIRE(sirius::test::g_integration_env != nullptr);
@@ -99,30 +98,16 @@ TEST_CASE("tree-based schedule is strictly topological and deterministic",
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
 
-  sirius::test::tree_pipeline_flag_guard flag_guard;
-
   for (int q = 1; q <= 22; ++q) {
     DYNAMIC_SECTION("q" << q)
     {
       auto query = sirius::test::read_tpch_query_file(q);
 
-      // Legacy reference property: its native emission is already strictly topological.
-      std::multiset<std::string> legacy_chains;
-      duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = false;
-      sirius::test::with_conversion_result(con, query, [&](pipeline_conversion_result& result) {
-        require_strictly_topological(result.scheduled_pipelines);
-        for (const auto& pipeline : result.scheduled_pipelines) {
-          legacy_chains.insert(operator_chain(*pipeline));
-        }
-      });
-
-      duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD = true;
       sirius::test::with_conversion_result(con, query, [&](pipeline_conversion_result& result) {
         auto& scheduled = result.scheduled_pipelines;
         require_strictly_topological(scheduled);
 
         // pipeline_id equals the vector position; `dependencies` sorted by it (printer order).
-        std::multiset<std::string> tree_chains;
         for (size_t i = 0; i < scheduled.size(); i++) {
           REQUIRE(scheduled[i]->get_pipeline_id() == i);
           REQUIRE(std::is_sorted(scheduled[i]->dependencies.begin(),
@@ -131,11 +116,25 @@ TEST_CASE("tree-based schedule is strictly topological and deterministic",
                                     const duckdb::shared_ptr<sirius_pipeline>& b) {
                                    return a->get_pipeline_id() < b->get_pipeline_id();
                                  }));
-          tree_chains.insert(operator_chain(*scheduled[i]));
         }
 
-        // Same pipelines as legacy, order aside.
-        REQUIRE(tree_chains == legacy_chains);
+        // Join dependencies are build-side-first: dependencies[0] is the build CONCAT
+        // (finalize_pipeline_structure front-inserts it; link_join_partition_siblings and
+        // dynamic-filter scheduling read the slots positionally).
+        for (const auto& pipeline : scheduled) {
+          auto source = pipeline->get_source();
+          if (!source ||
+              (source->type != sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&
+               source->type != sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN)) {
+            continue;
+          }
+          INFO("join pipeline [" << operator_chain(*pipeline) << "]");
+          REQUIRE(!pipeline->dependencies.empty());
+          auto build_sink = pipeline->dependencies[0]->get_sink();
+          REQUIRE(build_sink);
+          REQUIRE(build_sink->type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
+          CHECK(build_sink->Cast<sirius::op::sirius_physical_concat>().is_build_concat());
+        }
 
         // Reordering an already-canonical schedule is a no-op.
         std::vector<const sirius_pipeline*> before;
@@ -149,6 +148,13 @@ TEST_CASE("tree-based schedule is strictly topological and deterministic",
           REQUIRE(scheduled[i].get() == before[i]);
         }
       });
+
+      // Converting the same query twice serializes byte-identically (the dump is
+      // ID-normalized and signature-sorted, so this catches emission-order and
+      // container-iteration nondeterminism).
+      auto first_dump  = sirius::test::convert_query_to_dump(con, query);
+      auto second_dump = sirius::test::convert_query_to_dump(con, query);
+      REQUIRE(first_dump == second_dump);
     }
   }
 }

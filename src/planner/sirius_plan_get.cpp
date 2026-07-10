@@ -89,7 +89,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Only GPU-route known table scan functions; all others (pragma, system catalog
   // functions, etc.) must fall back to CPU.
   static const std::unordered_set<std::string> kSupportedScanFunctions = {
-    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet", "iceberg_scan"};
+    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet"};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
     throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
                                           op.function.name);

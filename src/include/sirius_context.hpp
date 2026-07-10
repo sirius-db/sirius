@@ -116,7 +116,7 @@ class SiriusContext : public ClientContextState {
   /**
    * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
    *
-   * Some code paths (e.g. iceberg metadata lookup) must open a second DuckDB
+   * Some code paths (e.g. internal metadata lookups) must open a second DuckDB
    * Connection to the same database.  Because OnConnectionOpened registers the
    * SAME SiriusContext on every connection, the new connection's query lifecycle
    * callbacks would fire QueryBegin (resetting next_operator_id and resetting
@@ -158,7 +158,7 @@ class SiriusContext : public ClientContextState {
    * Narrower than InternalQueryGuard: it fires ONLY around
    * run_internal_cpu_fallback_query, and is read ONLY by the sirius_httpfs
    * s3:// open guard, which must refuse serving s3:// data to a CPU plan. A
-   * legitimate internal s3:// read (e.g. future Iceberg-on-S3) runs under
+   * legitimate internal s3:// read (e.g. a future table-format metadata read) runs under
    * InternalQueryGuard but NOT this one, so it is not blocked.
    */
   struct CpuFallbackGuard {

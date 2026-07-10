@@ -452,19 +452,15 @@ class sirius_physical_operator {
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
-  //! Flag ON: an operator is a pipeline sink iff its tree parent is a PARTITION or
+  //! An operator is a pipeline sink iff its tree parent is a PARTITION or
   //! RIGHT_DELIM_JOIN — computed from `_parent_op` so it always reflects the final tree.
   //! Unconditional sinks (HGB, ORDER_BY, MERGE ops, scans) override to `true`; the
-  //! `delim.join` of a RIGHT_DELIM_JOIN overrides to `false`. Flag OFF: false — the
-  //! legacy converter owns sink semantics.
+  //! `delim.join` of a RIGHT_DELIM_JOIN overrides to `false`.
   virtual bool is_sink() const
   {
-    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      return _parent_op != nullptr &&
-             (_parent_op->type == SiriusPhysicalOperatorType::PARTITION ||
-              _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
-    }
-    return false;
+    return _parent_op != nullptr &&
+           (_parent_op->type == SiriusPhysicalOperatorType::PARTITION ||
+            _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
   }
 
   //! Whether or not the sink operator depends on the order of the input chunks

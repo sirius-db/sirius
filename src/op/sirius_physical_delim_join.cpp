@@ -147,7 +147,7 @@ void sirius_physical_left_delim_join::build_pipelines(pipeline::sirius_pipeline&
   }
   join->build_pipelines(current, meta_pipeline);
 
-  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && distinct_root) {
+  if (distinct_root) {
     // Spawn a child meta rooted at the distinct chain
     // (DISTINCT_MERGE -> PARTITION_DISTINCT -> DISTINCT); the standard walk produces its
     // three pipelines, sequenced after child_meta_pipeline by the data dependency on the
@@ -177,9 +177,8 @@ void sirius_physical_right_delim_join::build_pipelines(
       duckdb::reference<pipeline::sirius_pipeline>(*child_meta_pipeline.get_base_pipeline())));
   }
 
-  // Flag ON: wrap_join already inserted CONCAT_build → PARTITION_build → original_build
-  // as the inner join's children[1]; build_join_pipelines(build_rhs=true) consumes that
-  // chain via the plan tree. Flag OFF keeps the legacy runtime partition_join path.
+  // wrap_join already inserted CONCAT_build → PARTITION_build → original_build as the
+  // inner join's children[1]; build_join_pipelines consumes that chain via the plan tree.
   //
   // Nested RIGHT_DELIM_JOIN: `current` may already carry a barrier op (RDJ/PARTITION) as
   // its pre-populated sink; routing *join through it would fuse the inner join into that
@@ -187,7 +186,7 @@ void sirius_physical_right_delim_join::build_pipelines(
   // (PROJECTION, FILTER, ...) is correct.
   auto current_ops = current.get_operators();
   const bool needs_split =
-    duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && !current_ops.empty() &&
+    !current_ops.empty() &&
     (current_ops.front().get().type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
      current_ops.front().get().type == SiriusPhysicalOperatorType::PARTITION);
 
@@ -196,14 +195,12 @@ void sirius_physical_right_delim_join::build_pipelines(
     auto& join_base = *join_meta.get_base_pipeline();
     // Clear the pre-populated [join] so build_join_pipelines re-adds it within join_meta.
     meta_pipeline.get_state().set_pipeline_operators(join_base, {});
-    sirius_physical_hash_join::build_join_pipelines(
-      join_base, join_meta, *join, duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD);
+    sirius_physical_hash_join::build_join_pipelines(join_base, join_meta, *join);
   } else {
-    sirius_physical_hash_join::build_join_pipelines(
-      current, meta_pipeline, *join, duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD);
+    sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *join);
   }
 
-  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && distinct_root) {
+  if (distinct_root) {
     // Spawn the distinct-chain child meta; see LEFT_DELIM_JOIN above for why we build
     // from distinct_root's child rather than distinct_root itself.
     auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);

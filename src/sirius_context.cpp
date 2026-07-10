@@ -169,7 +169,7 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
 
 void SiriusContext::QueryBegin(ClientContext& context)
 {
-  // Suppress all state mutations for internal connections (e.g. iceberg metadata lookups).
+  // Suppress all state mutations for internal connections (e.g. internal metadata lookups).
   if (is_internal_query_active()) { return; }
 
   acquire_query_lifecycle_slot();
@@ -215,7 +215,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
 void SiriusContext::QueryEnd()
 {
-  // Suppress state mutations triggered by internal connections (e.g. iceberg metadata lookups).
+  // Suppress state mutations triggered by internal connections (e.g. internal metadata lookups).
   if (is_internal_query_active()) { return; }
 
   try {
@@ -850,8 +850,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     return RebindQueryInfo::DO_NOT_REBIND;
   }
 
-  // If the optimizer hook captured a plan, use it. Otherwise (e.g. iceberg_scan
-  // whose bind_data isn't serializable so plan->Copy() failed), re-plan from the
+  // If the optimizer hook captured a plan, use it. Otherwise (a LogicalGet whose
+  // bind_data isn't serializable, so plan->Copy() failed), re-plan from the
   // unbound SQL statement — this is what gpu_execution(...) does internally and
   // it works even when LogicalGet::Copy can't.
   unique_ptr<LogicalOperator> logical_plan = take_captured_logical_plan();
@@ -861,7 +861,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // ClientContext::GetCurrentQuery() unconditionally derefs active_query;
   // outside a query lifecycle (e.g. plain Prepare()) it would throw, so guard
   // it. When the SQL is unavailable we still proceed with the captured plan
-  // (which covers all non-iceberg cases including prepared statements).
+  // (which covers the common cases including prepared statements).
   std::string current_query_sql;
   try {
     current_query_sql = context.GetCurrentQuery();
@@ -904,8 +904,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // Validate that the captured logical plan is GPU-translatable before we
     // install a reusable transparent execution operator for prepared statements.
     //
-    // For plans whose LogicalGet does not implement Copy (e.g. iceberg_scan
-    // bind_data has no serializer), validation runs against `logical_plan`
+    // For plans whose LogicalGet does not implement Copy (bind_data has no
+    // serializer), validation runs against `logical_plan`
     // directly and consumes it; we then re-plan from `unbound_statement` for
     // the actual execution path. PhysicalSiriusExecution falls back to
     // re-planning per execute when its `logical_plan_` is null.
