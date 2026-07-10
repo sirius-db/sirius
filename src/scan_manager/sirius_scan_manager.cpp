@@ -259,7 +259,16 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  auto datasource = create_datasource(uri);
+  // Footer-probe only when we will actually read + parse the footer.  On a warm
+  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
+  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
+  auto const cache_key     = normalize_path(uri);
+  auto const io_ctx        = ioctx_for_path(uri);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+  auto const hint =
+    footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
+
+  auto datasource = create_datasource(uri, hint);
   if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
@@ -370,14 +379,14 @@ void sirius_scan_manager::start_metadata_processing()
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path)
+  std::string_view path, sirius::io::open_hint hint)
 {
   auto file_path = normalize_path(std::string(path));
   auto io_ctx    = ioctx_for_path(file_path);
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
-  return io_ctx->open_datasource(file_path);
+  return io_ctx->open_datasource(file_path, hint);
 }
 
 std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
