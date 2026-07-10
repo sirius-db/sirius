@@ -115,8 +115,8 @@ void with_conversion_result(
 
   // The optimizer's catalog reads and the GPU-native seq_scan ingestible construction require
   // an active transaction (production inherits one from the bind callsite). Hold it across
-  // plan generation AND conversion — both flag paths build the ingestible eagerly — then roll
-  // back, since the path is read-only.
+  // plan generation AND conversion — the ingestible is built eagerly — then roll back, since
+  // the path is read-only.
   con.BeginTransaction();
   try {
     duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
@@ -147,14 +147,7 @@ void with_conversion_result(
     root_pipeline->build(*sirius_plan);
     root_pipeline->ready();
 
-    // The legacy (flag-OFF) converter requires a non-null iceberg cache; the tree path
-    // ignores it. TPC-H has no iceberg, so an empty map suffices.
-    static const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
-      kEmptyIcebergCache;
-    // The ClientContext lets the legacy converter build the GPU-native seq_scan operator;
-    // without it, any seq_scan query throws.
-    pipeline::sirius_pipeline_converter converter(
-      build_ctx, op_params, &kEmptyIcebergCache, &context);
+    pipeline::sirius_pipeline_converter converter(build_ctx, op_params);
     auto result = converter.convert(*root_pipeline);
 
     // Consume *here*, while the plan tree and pipelines are in scope: the result's pipelines
