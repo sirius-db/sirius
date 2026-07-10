@@ -132,24 +132,6 @@ add_codegen_host_test(test_jit_kernel_cache)
 add_codegen_host_test(test_fused_operator_sweep)
 add_codegen_host_test(test_operator_sweep)
 
-# Benchmark harness (not registered as ctest; kept during transition)
-add_executable(compress_with_plan_benchmark
-               bench/compress_with_plan_benchmark.cpp)
-target_include_directories(compress_with_plan_benchmark
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(
-  compress_with_plan_benchmark
-  PRIVATE simpatico
-          cudf
-          rmm
-          cudart
-          nvcomp
-          nvrtc
-          cuda
-          dl)
-target_link_options(compress_with_plan_benchmark PRIVATE
-                    "-Wl,-rpath,${CONDA_PREFIX}/lib")
-
 # simpatico multi-mode CLI (benchmark / explore / compress / decompress /
 # verify) CMake target is simpatico_cli to avoid collision with the static
 # library target; the installed binary is named 'simpatico'.
