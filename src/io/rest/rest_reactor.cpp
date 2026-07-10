@@ -1272,7 +1272,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     }
 
     auto poll_copy_completions = [&]() {
-      using query_status = cucascade::cuda::cuda_event::query_status;
+      using query_status = cucascade::cuda::event::query_result;
       // Credit (or fail) each bounce-staged chunk only now that its H2D copy is
       // actually done — the device bytes were not valid until this point.  On
       // success report the chunk complete; on a copy error fail the request
