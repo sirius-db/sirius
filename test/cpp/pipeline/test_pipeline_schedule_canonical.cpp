@@ -39,8 +39,7 @@ using sirius::pipeline::sirius_pipeline;
 
 namespace {
 
-//! Path to the integration DuckDB with the TPC-H schema pre-loaded (same fixture as
-//! test_pipeline_conversion_differential.cpp).
+//! Path to the integration DuckDB with the SF1 TPC-H schema pre-loaded.
 fs::path integration_db_path()
 {
 #ifdef SIRIUS_PROJECT_ROOT
@@ -51,9 +50,8 @@ fs::path integration_db_path()
 #endif
 }
 
-//! Operator chain of a pipeline with the construction-order `(id=N)` tokens stripped —
-//! operator IDs legitimately differ between the two flag paths (see the
-//! USE_TREE_BASED_PIPELINE_BUILD note in config.hpp).
+//! Operator chain with the `(id=N)` tokens stripped — operator IDs legitimately differ
+//! between the two flag paths.
 std::string operator_chain(const sirius_pipeline& pipeline)
 {
   static const std::regex kIdToken{" \\(id=\\d+\\)"};
@@ -81,15 +79,10 @@ void require_strictly_topological(
 
 }  // namespace
 
-//! Gate for `reorder_pipelines_topologically`: under the tree-based flag the converter's
-//! schedule must be strictly topological (the raw meta-sweep emission is not — delim-join
-//! distribution pipelines precede the pipeline that feeds them), deterministic, and
-//! structurally equivalent to the legacy schedule.
-//!
-//! Schedule ORDER is intentionally not compared against legacy: legacy's emission
-//! interleaving comes from its meta-sweep readiness scan over the coarse pipeline tree,
-//! information that does not exist in the final pipeline graph. The differential dump
-//! tests already prove the two graphs are identical.
+//! Gate for `reorder_pipelines_topologically`: the tree-based schedule must be strictly
+//! topological (the raw meta-sweep emission is not), deterministic, and structurally
+//! equivalent to legacy. Order is NOT compared against legacy — its interleaving comes
+//! from meta-sweep state absent from the final graph; the differential dumps prove equality.
 TEST_CASE("tree-based schedule is strictly topological and deterministic",
           "[integration][pipeline][schedule_canonical]")
 {
@@ -128,8 +121,7 @@ TEST_CASE("tree-based schedule is strictly topological and deterministic",
         auto& scheduled = result.scheduled_pipelines;
         require_strictly_topological(scheduled);
 
-        // pipeline_id must equal the vector position, and each pipeline's
-        // `dependencies` must be sorted by it (the order the plan printer renders).
+        // pipeline_id equals the vector position; `dependencies` sorted by it (printer order).
         std::multiset<std::string> tree_chains;
         for (size_t i = 0; i < scheduled.size(); i++) {
           REQUIRE(scheduled[i]->get_pipeline_id() == i);

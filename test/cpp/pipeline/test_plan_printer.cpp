@@ -344,10 +344,9 @@ void create_tpch_schema(Connection& con)
 
 /// Generate a Sirius physical plan wrapped in a result collector.
 /// Returns the result collector operator that can be passed to engine.initialize().
-/// `out_prepared` receives the prepared-statement data that owns the physical plan (and the
-/// GPU-native ingestible's DuckDB RowGroups). The caller must keep it alive as long as the
-/// collector/engine and destroy it before its DuckDB instance — otherwise the RowGroups free
-/// block memory through an already-destroyed buffer manager.
+/// `out_prepared` owns the physical plan (and the GPU-native ingestible's DuckDB RowGroups):
+/// keep it alive as long as the collector/engine, and destroy it before the DuckDB instance
+/// so the RowGroups don't free block memory through a dead buffer manager.
 duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(
   Connection& con,
   const std::string& query,
@@ -402,9 +401,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(
   return gpu_collector;
 }
 
-/// On-disk single-file DuckDB path (RAII). The GPU-native seq_scan ingestible requires a
-/// single-file block manager, so these plan-construction tests need an on-disk database rather
-/// than :memory:. Mirrors scoped_temp_db_path in test/cpp/scan.
+/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
+/// block managers, so these tests need an on-disk database rather than :memory:.
 class scoped_temp_db_path {
  public:
   scoped_temp_db_path()
@@ -440,10 +438,8 @@ struct engine_test_state {
   duckdb::unique_ptr<DuckDB> db;
   duckdb::unique_ptr<Connection> con;
   duckdb::unique_ptr<sirius_interface> iface;
-  // Owns the physical plan, including the GPU-native ingestible's DuckDB RowGroups. Declared
-  // after `db` so it destructs BEFORE `db` (the RowGroups free block memory through the DuckDB
-  // buffer manager, which must still be alive), and before `engine` so the engine — which
-  // references the plan via its collector and new_scheduled — tears down first.
+  // Owns the physical plan and its DuckDB RowGroups. Must destruct after `engine` (which
+  // references the plan) but before `db` (RowGroups free blocks via db's buffer manager).
   duckdb::shared_ptr<sirius_prepared_statement_data> prepared;
   duckdb::unique_ptr<sirius_engine> engine;
 };
@@ -490,8 +486,7 @@ TEST_CASE("render_pipelines returns non-empty string for simple query", "[plan_p
   INFO("render_pipelines output:\n" << output);
   REQUIRE(!output.empty());
   REQUIRE(output.find("Pipeline #") != std::string::npos);
-  // Source is TABLE_SCAN / DUCKDB_SCAN on the legacy path, or GPU_SCAN under the unified
-  // tree pipeline (seq_scan lowers to the unified GPU_SCAN source-leaf).
+  // Source is TABLE_SCAN / DUCKDB_SCAN on the legacy path, or GPU_SCAN under the tree pipeline.
   bool has_scan = (output.find("TABLE_SCAN") != std::string::npos ||
                    output.find("DUCKDB_SCAN") != std::string::npos ||
                    output.find("GPU_SCAN") != std::string::npos);
@@ -724,11 +719,9 @@ TEST_CASE("enriched operator details show scan function name", "[plan_printer]")
   sirius_plan_printer printer(state.engine->new_scheduled);
   std::string dag = printer.render_dag();
   INFO("render_dag output:\n" << dag);
-  // Per D-02: legacy scan operators (TABLE_SCAN / PARQUET_SCAN) carry a
-  // "  scan: <function_name>" annotation. Under the unified tree pipeline the nation
-  // seq_scan lowers to a GPU_SCAN source, which carries no function.name annotation
-  // (reviving it for GPU_SCAN needs a scan-kind label on the ingestible -- separate
-  // follow-up). Accept either the legacy annotation or the unified GPU_SCAN source.
+  // Per D-02: legacy scan operators carry a "  scan: <function_name>" annotation. The tree
+  // pipeline's GPU_SCAN source has no function.name (restoring the annotation needs a
+  // scan-kind label on the ingestible), so accept either form.
   bool has_scan_detail = (dag.find("  scan: seq_scan") != std::string::npos ||
                           dag.find("GPU_SCAN") != std::string::npos);
   REQUIRE(has_scan_detail);

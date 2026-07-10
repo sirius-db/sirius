@@ -60,27 +60,20 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
-  // Switch the pipeline build path from the legacy sirius_pipeline_converter (which
-  // constructs ~12 operator types at runtime) to the tree-based path where
-  // sirius_physical_plan_generator inserts all operators into the plan tree and the
-  // converter becomes a pure topology pass driven by per-operator build_pipelines
-  // overrides. Default true: a differential dump test confirms byte-identical pipeline
-  // state vs the legacy converter on every TPC-H SF1 plan. Set false to fall back to the
-  // legacy converter path (kept for rollback; planned for deletion in a follow-up).
+  // Tree-based pipeline build: sirius_physical_plan_generator inserts all GPU pipeline
+  // operators into the plan tree and the converter becomes a pure topology pass driven by
+  // per-operator build_pipelines overrides (validated byte-identical to the legacy converter
+  // on every TPC-H SF1 plan). Set false to fall back to the legacy sirius_pipeline_converter,
+  // which constructs those operators at runtime (kept for rollback).
   //
-  // Operator IDs differ between the two paths for the same plan: they come from a
-  // global construction counter, and the tree path constructs the injected
-  // PARTITION/CONCAT/MERGE operators at plan generation while the legacy path
-  // constructs them during split_pipelines (the transparent path's validation plan
-  // also consumes a different number of IDs per path). Query results are unaffected,
-  // but the ID value feeds two placement heuristics, so the paths behave differently
-  // in:
-  //  - downgrade order: the downgrade executor's tier-1 spill visits data
-  //    repositories in ascending operator_id order (cucascade's repository map is
-  //    keyed by {operator_id, port_id}) and stops once enough bytes are freed, so
-  //    which batches spill to host/disk under GPU memory pressure differs;
-  //  - hash-join GPU placement: build-probe join tasks are pinned to
-  //    operator_id % num_gpus (multi-GPU only), so joins may land on different GPUs.
+  // Operator IDs (a global construction counter) differ per path because the injected
+  // operators are constructed at different times. Query results are unaffected, but the ID
+  // feeds two placement heuristics:
+  //  - downgrade order: tier-1 spill visits data repositories in ascending operator_id order
+  //    and stops once enough bytes are freed, so which batches spill to host/disk under GPU
+  //    memory pressure differs;
+  //  - hash-join GPU placement: build-probe join tasks are pinned to operator_id % num_gpus
+  //    (multi-GPU only), so joins may land on different GPUs.
   static bool USE_TREE_BASED_PIPELINE_BUILD;
 
   // Whether to fall back to duckdb execution after an error is detected

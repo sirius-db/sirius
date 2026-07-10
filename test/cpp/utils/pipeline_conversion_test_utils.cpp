@@ -42,10 +42,8 @@ namespace sirius::test {
 
 namespace {
 
-//! RAII shim that mirrors `SiriusTableFunctionData::PrepareConnection` /
-//! `CleanupConnection` (src/sirius_extension.cpp:142-162). Disables the
-//! optimizers Sirius normally disables when running `gpu_execution`, then
-//! restores the prior settings on destruction (and on exceptions).
+//! RAII: applies the optimizer disables of `SiriusTableFunctionData::PrepareConnection`,
+//! restoring the prior settings on destruction (including on exceptions).
 class optimizer_disable_guard {
  public:
   explicit optimizer_disable_guard(duckdb::ClientContext& context)
@@ -81,15 +79,10 @@ class optimizer_disable_guard {
   std::set<duckdb::OptimizerType> original_disabled_optimizers_;
 };
 
-//! Parse + plan + optimize + resolve a SQL query into a `LogicalOperator`, mirroring
-//! `SiriusTableFunctionData::ExtractPlan` (src/sirius_extension.cpp:164-197) including the
-//! sirius-specific order (`ResolveOperatorTypes` BEFORE `ColumnBindingResolver`).
-//!
-//! `Connection::ExtractPlan` is similar but uses the DuckDB-canonical order (resolver
-//! first, then ResolveOperatorTypes), which leaves the plan in a state that sirius's
-//! `sirius_physical_plan_generator::create_plan` re-resolves and trips on for some queries
-//! ("inequal types" binder error). Reproducing the sirius order here keeps the path
-//! byte-for-byte identical to production's GPUExecutionBind flow.
+//! Parse + plan + optimize + resolve a SQL query, mirroring the sirius-specific order of
+//! `SiriusTableFunctionData::ExtractPlan`: `ResolveOperatorTypes` BEFORE `ColumnBindingResolver`.
+//! DuckDB's `Connection::ExtractPlan` uses the reverse order, which trips sirius plan
+//! generation with an "inequal types" binder error on some queries.
 duckdb::unique_ptr<duckdb::LogicalOperator> extract_logical_plan_sirius_order(
   duckdb::ClientContext& context, const std::string& query)
 {
@@ -121,12 +114,10 @@ void with_conversion_result(
 {
   auto& context = *con.context;
 
-  // DuckDB's Optimizer reads catalog state, and the GPU-native seq_scan ingestible construction
-  // (make_ingestible -> prepare_duckdb_native_walk -> PartitionStatistics) touches
-  // ClientContext/LocalStorage — both require an active transaction. The production path inherits
-  // one from the TableFunction bind callsite; tests must open one explicitly and hold it across
-  // plan generation AND conversion, because both the tree-based plan generator and the legacy
-  // converter now build the ingestible eagerly. Rollback at the end since the path is read-only.
+  // The optimizer's catalog reads and the GPU-native seq_scan ingestible construction require
+  // an active transaction (production inherits one from the bind callsite). Hold it across
+  // plan generation AND conversion — both flag paths build the ingestible eagerly — then roll
+  // back, since the path is read-only.
   con.BeginTransaction();
   try {
     duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
@@ -145,8 +136,7 @@ void with_conversion_result(
     }
     const auto& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 
-    // Null telemetry context: pipelines built without an engine (per the
-    // pipeline_build_context ctor contract for tests / optimizer-bind paths).
+    // Null telemetry context: no engine, per the pipeline_build_context ctor contract.
     pipeline::pipeline_build_context build_ctx(
       /*telemetry_context=*/nullptr,
       duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
@@ -158,25 +148,19 @@ void with_conversion_result(
     root_pipeline->build(*sirius_plan);
     root_pipeline->ready();
 
-    // Iceberg metadata cache: under flag ON the plan generator owns its own cache and the
-    // converter's pointer is ignored on the tree-based path. Under flag OFF the converter
-    // would read this cache to construct iceberg scans — TPC-H has no iceberg, so passing
-    // an empty (but non-null) map keeps the legacy lookup site happy.
+    // The legacy (flag-OFF) converter requires a non-null iceberg cache; the tree path
+    // ignores it. TPC-H has no iceberg, so an empty map suffices.
     static const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
       kEmptyIcebergCache;
-    // Pass the connection's ClientContext so the legacy (flag-OFF) converter can build the
-    // GPU-native seq_scan operator, which requires it (mirrors sirius_engine's production
-    // construction). Without it, insert_duckdb_native_scan_operator throws for any seq_scan query.
+    // The ClientContext lets the legacy converter build the GPU-native seq_scan operator;
+    // without it, any seq_scan query throws.
     pipeline::sirius_pipeline_converter converter(
       build_ctx, op_params, &kEmptyIcebergCache, &context);
     auto result = converter.convert(*root_pipeline);
 
-    // Consume *here* while `sirius_plan`, `root_pipeline`, `result` are all in scope. The
-    // result's pipelines reference operators in the plan tree; if the result escaped to the
-    // caller, the plan tree would already be destroyed and reads would hit dangling pointers.
-    // Legacy (flag OFF) partially survives that hazard because its converter-inserted
-    // operators (PARTITION, CONCAT, MERGE_*) are owned by result.inserted_operators_, but the
-    // tree path (flag ON) has no inserted_operators_ at all — everything dangles.
+    // Consume *here*, while the plan tree and pipelines are in scope: the result's pipelines
+    // reference operators owned by the plan tree, so a result that escaped to the caller
+    // would read dangling pointers.
     consume(result);
     con.Rollback();
   } catch (...) {

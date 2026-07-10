@@ -382,17 +382,13 @@ class sirius_physical_operator {
   //! operator has no pipeline set.
   [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
-  //! Pointer to this operator's parent in the physical plan tree, or nullptr at the root.
-  //! Populated by `sirius_physical_plan_generator`'s post-pass walk over `children[]` after
-  //! plan generation completes; used by the pipeline converter and tree-based wiring lookup.
+  //! This operator's parent in the physical plan tree, or nullptr at the root. Stamped by
+  //! `sirius_physical_plan_generator::set_parent_ops` after plan generation completes.
   [[nodiscard]] sirius_physical_operator* get_parent_op() const noexcept { return _parent_op; }
 
-  //! Non-owning pointer to the DELIM_JOIN that owns this operator's execution, or nullptr if
-  //! the operator is not part of a DELIM_JOIN subtree. Set on the distinct chain top
-  //! (MERGE_GROUP_BY) by `wrap_delim_distinct` under USE_TREE_BASED_PIPELINE_BUILD. Used by
-  //! `compute_repository_wiring_tree_based` to redirect the merge-top -> DELIM_JOIN edge that
-  //! the uniform tree-parent walk would otherwise emit, routing instead to each
-  //! `delim_scan`'s consumer pipeline. Mirrors legacy `split_delim_join_sink`'s retarget loop.
+  //! Non-owning pointer to the DELIM_JOIN that owns this operator's execution (nullptr if
+  //! none). Set on the distinct chain top by `wrap_delim_distinct`; the tree-based wiring
+  //! uses it to route the merge-top into each delim_scan's consumer pipeline.
   [[nodiscard]] sirius_physical_delim_join* owning_delim_join() const noexcept
   {
     return _owning_delim_join;
@@ -454,17 +450,11 @@ class sirius_physical_operator {
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
-  //! Under flag ON: an operator is a pipeline sink iff its tree parent is a PARTITION or
-  //! a RIGHT_DELIM_JOIN (the operator that produces data flowing into either terminates
-  //! the upstream pipeline at itself; for RIGHT_DELIM_JOIN, the LHS source is its single
-  //! standalone-pipeline producer, matching legacy split_delim_join_sink). Computed
-  //! dynamically from `_parent_op` so it always reflects the final tree shape — no state
-  //! to maintain. Derived classes that are unconditionally sinks (HGB, ORDER_BY, all MERGE
-  //! operators, DUCKDB_SCAN, etc.) override this to return `true` regardless of parent.
-  //! HJ/NLJ that are the `delim.join` of a DELIM_JOIN override this to return `false`
-  //! (they're never standalone sinks) — see `_is_delim_join_inner`.
-  //! Under flag OFF: returns false; the legacy converter owns sink semantics via its
-  //! own derived-class overrides.
+  //! Flag ON: an operator is a pipeline sink iff its tree parent is a PARTITION or
+  //! RIGHT_DELIM_JOIN — computed from `_parent_op` so it always reflects the final tree.
+  //! Unconditional sinks (HGB, ORDER_BY, MERGE ops, scans) override to `true`; the
+  //! `delim.join` of a RIGHT_DELIM_JOIN overrides to `false`. Flag OFF: false — the
+  //! legacy converter owns sink semantics.
   virtual bool is_sink() const
   {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
@@ -614,19 +604,14 @@ class sirius_physical_operator {
   std::list<std::unique_ptr<port>> _ports_list;
   //! The next operators to be executed after this operator when it is used as a sink
   std::vector<sirius_physical_operator::next_port_info> next_port_after_sink;
-  //! The parent of this operator in the plan tree. Set by `sirius_physical_plan_generator`
-  //! via the private `set_parent_op()` setter (friend access) after the tree is final, or by
-  //! derived constructors during the legacy converter-driven construction path. nullptr at the
-  //! root and on operators that have not yet been linked into a tree.
+  //! The parent of this operator in the plan tree; nullptr at the root or before linking.
+  //! Set only by the plan generator via the private `set_parent_op()` (friend access).
   sirius_physical_operator* _parent_op = nullptr;
-  //! The DELIM_JOIN that this operator is logically owned by, or nullptr if none. Currently
-  //! set only on the distinct chain top (MERGE_GROUP_BY) of a DELIM_JOIN by
-  //! `wrap_delim_distinct` under USE_TREE_BASED_PIPELINE_BUILD. See `owning_delim_join()`.
+  //! The DELIM_JOIN that logically owns this operator, or nullptr. See `owning_delim_join()`.
   sirius_physical_delim_join* _owning_delim_join = nullptr;
 
  private:
-  //! Mutate the parent pointer. Restricted to `sirius_physical_plan_generator` so parent
-  //! pointers stay immutable once plan generation finishes.
+  //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
 
   friend class ::sirius::planner::sirius_physical_plan_generator;

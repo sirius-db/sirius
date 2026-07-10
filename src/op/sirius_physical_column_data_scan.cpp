@@ -56,12 +56,8 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 void sirius_physical_column_data_scan::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // LEFT_DELIM_JOIN ownership short-circuit (#604): when this scan is the cached
-  // chunk scan (`column_data_scan` field) of a LEFT_DELIM_JOIN, the enclosing
-  // delim join executes it inline via its `sink` method. The scan contributes no
-  // pipeline of its own; wiring to its inner-join probe destination is emitted
-  // from the LEFT_DELIM_JOIN sink case in compute_repository_wiring_tree_based
-  // (with a parent_op fallback that lands on PARTITION_probe's pipeline).
+  // Cached chunk scan of a LEFT_DELIM_JOIN: the delim join's sink executes it inline, so
+  // it contributes no pipeline; compute_repository_wiring_tree_based emits its wiring.
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && _owned_by_delim_join) { return; }
 
   // check if there is any additional action we need to do depending on the type
@@ -80,21 +76,13 @@ void sirius_physical_column_data_scan::build_pipelines(
       auto& delim_join = delim_sink->Cast<sirius_physical_delim_join>();
       current.add_dependency(delim_dependency);
       if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-        // DELIM_SCAN is routing-only under flag ON (mirrors CTE_SCAN). The
-        // distinct chain top carries `_owning_delim_join`, which redirects the
-        // uniform tree-parent walk in compute_repository_wiring_tree_based to
-        // wire the merge-top into each delim_scan's consumer pipeline (inner-HJ
-        // probe partition) instead of the DELIM_JOIN itself — mirrors legacy
-        // split_delim_join_sink's retarget loop. `is_ready` overwrites this
-        // pipeline's source to operators[0] = PARTITION (the inner-HJ probe
-        // partition that `current` was created with), so we don't append
-        // anything to operators[] here.
+        // DELIM_SCAN is routing-only under flag ON: `_owning_delim_join` on the distinct
+        // chain top redirects wiring into each delim_scan's consumer pipeline, and
+        // `is_ready` re-derives source from operators[0], so append nothing here.
         D_ASSERT(delim_join.distinct_root);
         (void)delim_join;
       } else {
-        // Flag OFF: legacy converter externalizes the chain and retargets downstream
-        // sources from the bare DISTINCT to merge_distinct. Set the source to the
-        // bare DISTINCT here and let the converter retarget it.
+        // Flag OFF: set the bare DISTINCT as source; the legacy converter retargets it.
         state.set_pipeline_source(current, delim_join.distinct->Cast<sirius_physical_operator>());
       }
       return;
@@ -111,18 +99,10 @@ void sirius_physical_column_data_scan::build_pipelines(
       D_ASSERT(cte_sink);
       D_ASSERT(cte_sink->type == SiriusPhysicalOperatorType::CTE);
       current.add_dependency(cte_dependency);
-      // CTE_SCAN is a routing-only marker — never materialize into operators[].
-      // Legacy's `finalize_pipeline_structure` drops the source and starts
-      // operators[] at the next real operator (e.g. PROJECTION). The runtime
-      // executor relies on this contract (`update_pipeline_status` and
-      // PARTITION's sibling sequencing both assume `pipeline->source` is a
-      // real producer like DUCKDB_SCAN, never CTE_SCAN). Tree must match.
-      //
-      // `set_pipeline_source` is still called so `compute_repository_wiring`
-      // (legacy path) can use `source_to_pipelines` to find the consumer.
-      // Under flag ON, `dest_for_op` won't contain CTE_SCAN (it's never in
-      // any operators[0]), so the tree-based wiring uses
-      // `state.cte_scan_consumers` instead — populated here.
+      // CTE_SCAN is routing-only — never materialized into operators[]; the runtime
+      // executor assumes `pipeline->source` is a real producer. `set_pipeline_source` is
+      // still needed by the legacy wiring path; under flag ON the tree-based wiring uses
+      // `state.cte_scan_consumers`, populated below.
       state.set_pipeline_source(current, *this);
       if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
         state.cte_scan_consumers.insert(
@@ -142,13 +122,9 @@ void sirius_physical_column_data_scan::build_pipelines(
   }
   D_ASSERT(children.empty());
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    // A leaf scan whose tree parent is RIGHT_DELIM_JOIN (or PARTITION) is a
-    // pipeline sink — give it its own single-op pipeline rather than absorbing
-    // it into `current`'s operators[]. Mirrors the leaf-sink branch in
-    // sirius_physical_operator::build_pipelines; we need to replicate the check
-    // here because this override exists to handle the DELIM_SCAN/CTE_SCAN
-    // special cases above and would otherwise unconditionally add to the
-    // current pipeline.
+    // A leaf sink (parent is PARTITION/RIGHT_DELIM_JOIN) gets its own single-op pipeline,
+    // mirroring the base leaf-sink branch — replicated here because this override would
+    // otherwise unconditionally append to `current`.
     if (is_sink()) {
       meta_pipeline.create_child_meta_pipeline(current, *this);
     } else {

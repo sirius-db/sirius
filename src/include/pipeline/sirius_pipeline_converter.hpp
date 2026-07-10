@@ -69,23 +69,15 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
   const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
     iceberg_cache);
 
-//! Returns a deterministic, comparable serialization of a pipeline_conversion_result.
-//! Used for differential testing between flag-OFF (legacy) and flag-ON (tree-based)
-//! pipeline-conversion paths during Phase 3 (#604). Output is line-oriented and includes
-//! pipeline indices, source/sink/operators types, and repository wiring descriptors
-//! keyed by pipeline index (so byte-comparable across paths that produce equivalent
-//! shapes on the same plan tree).
+//! Deterministic, line-oriented serialization of a pipeline_conversion_result, used for
+//! differential testing between the flag-OFF (legacy) and flag-ON (tree-based) conversion
+//! paths: equivalent graphs produce byte-identical output regardless of emission order.
 std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result);
 
-//! Reorders `pipelines` in place into a deterministic, strictly-topological schedule:
-//! every pipeline appears after all of its `dependencies` (producers). Emission is a
-//! post-order walk from the sink-side root (the pipeline nothing consumes, i.e. the
-//! result collector), descending `dependencies` in vector order. Renumbers
-//! `pipeline_id` to the new vector positions and re-sorts each pipeline's
-//! `dependencies` ascending by the new ids (the order the plan printer renders).
-//! Used by the tree-based conversion path, whose meta-sweep emission is not strictly
-//! topological (delim-join distribution pipelines precede the delim pipeline that
-//! feeds them). The legacy path already emits topologically and never runs this.
+//! Reorders `pipelines` in place into a deterministic, strictly-topological schedule
+//! (every pipeline after all of its `dependencies`), renumbers `pipeline_id` to the new
+//! positions, and re-sorts each pipeline's `dependencies` ascending by the new ids.
+//! Only the tree-based path needs this; the legacy path already emits topologically.
 void reorder_pipelines_topologically(
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
 
@@ -133,10 +125,8 @@ class sirius_pipeline_converter {
   // Compute plan-time wiring descriptors. Runtime materialization is done by
   // `materialize_repository_wiring()` from `pipeline/repository_wiring.hpp`.
   void compute_repository_wiring(sirius_pipeline_build_state& state);
-  // Tree-parent based wiring computation. Used under USE_TREE_BASED_PIPELINE_BUILD;
-  // assumes pipelines are in single-state form (post-`is_ready`) and that every
-  // operator has its `_parent_op` field populated by the plan generator's
-  // `set_parent_ops` post-pass.
+  // Tree-parent based wiring (USE_TREE_BASED_PIPELINE_BUILD). Assumes post-`is_ready`
+  // pipelines and `_parent_op` populated by the plan generator's `set_parent_ops` pass.
   void compute_repository_wiring_tree_based(sirius_pipeline_build_state& state);
   static std::string_view resolve_port_id(const op::sirius_physical_operator& sink,
                                           const op::sirius_physical_operator& parent);

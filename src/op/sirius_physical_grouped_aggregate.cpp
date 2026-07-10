@@ -29,18 +29,10 @@ namespace op {
 void sirius_physical_grouped_aggregate::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // When this HASH_GROUP_BY is the bare DISTINCT of a RIGHT_DELIM_JOIN
-  // (`delim_join.distinct`), it carries no pipeline contribution of its own —
-  // RIGHT_DELIM_JOIN::sink invokes `distinct->execute(input_data, ...)` and
-  // `distinct->sink(...)` inline, and the wiring `HASH_GROUP_BY (src=DELIM_JOIN)
-  // → PARTITION_distinct` (emitted in compute_repository_wiring_tree_based's
-  // RIGHT_DELIM_JOIN sink case with a parent_op fallback) handles data flow.
-  // Suppressing build_pipelines here mirrors legacy split_delim_join_sink, which
-  // never adds the bare DISTINCT to any pipeline's operators[].
-  //
-  // is_sink() stays `true` (PARTITION_distinct's build_pipelines asserts
-  // `children[0]->is_sink()` on its child, which is this bare DISTINCT). The
-  // assertion is about the operator's role, not its pipeline membership.
+  // The bare DISTINCT of a RIGHT_DELIM_JOIN contributes no pipeline of its own: the
+  // delim join's sink executes it inline and the tree-based wiring handles data flow.
+  // is_sink() stays true — PARTITION_distinct asserts `children[0]->is_sink()`, which
+  // is about the operator's role, not pipeline membership.
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && _owned_by_delim_join) { return; }
   sirius_physical_operator::build_pipelines(current, meta_pipeline);
 }

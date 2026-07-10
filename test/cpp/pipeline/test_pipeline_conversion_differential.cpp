@@ -28,8 +28,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-//! Path to the integration DuckDB with the TPC-H schema pre-loaded (also used by
-//! `GPUExecutionDuckDBFixture` in test_gpu_execution_tpch.cpp).
+//! Path to the integration DuckDB with the SF1 TPC-H schema pre-loaded.
 fs::path integration_db_path()
 {
 #ifdef SIRIUS_PROJECT_ROOT
@@ -42,16 +41,9 @@ fs::path integration_db_path()
 
 }  // namespace
 
-//! Primary differential gate for the tree-based pipeline build: assert that the legacy
-//! converter (flag OFF) and the tree-based converter (flag ON) produce byte-identical
-//! `pipeline_conversion_result` for every TPC-H query at SF1.
-//!
-//! Sources queries from `test/tpch_performance/tpch_queries/orig/q*.sql`.
-//! Uses the SF1 TPC-H schema in `test/cpp/integration/data/duckdb/integration.duckdb`
-//! (same fixture as `test_gpu_execution_tpch.cpp::GPUExecutionDuckDBFixture`).
-//!
-//! Toggles `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD` between flag states; restores
-//! the original value via RAII so other test cases see the default.
+//! Primary differential gate for the tree-based pipeline build: the legacy converter
+//! (flag OFF) and the tree-based converter (flag ON) must produce byte-identical
+//! `pipeline_conversion_result` dumps for every TPC-H query at SF1.
 TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipeline state",
           "[integration][pipeline][differential]")
 {
@@ -59,7 +51,6 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
   if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
   auto con = sirius::test::g_integration_env->make_connection();
 
-  // Attach the TPC-H schema used by the integration suite (read-only).
   auto db_path = integration_db_path();
   REQUIRE(fs::exists(db_path));
   auto r = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
@@ -71,9 +62,8 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
 
   sirius::test::tree_pipeline_flag_guard flag_guard;
 
-  // Differential gate for the tree-based pipeline build. Empty set means all 22 TPC-H
-  // queries produce byte-identical dumps under both flag states. Re-populate with the
-  // query numbers that diverge if a regression lands, then file a follow-up to clear it.
+  // Queries excluded to keep the gate green until fixes land; flipping the flag on by
+  // default requires this list to be empty.
   static const std::set<int> kKnownFailing = {};
 
   for (int q = 1; q <= 22; ++q) {
@@ -86,9 +76,7 @@ TEST_CASE("TPC-H SF1: legacy and tree-based converters produce identical pipelin
       auto tree_dump   = sirius::test::dump_under_flag(con, query, /*flag=*/true);
 
       if (legacy_dump != tree_dump) {
-        // Write both dumps to /tmp for clean external diffing — Catch2's INFO
-        // output wraps the strings in its own quoting, which makes the actual
-        // byte difference hard to spot in the failure message.
+        // Dump to /tmp for external diffing; Catch2's INFO quoting obscures byte diffs.
         auto path = std::string{"/tmp/diff_q"} + std::to_string(q);
         std::ofstream(path + "_legacy.txt") << legacy_dump;
         std::ofstream(path + "_tree.txt") << tree_dump;

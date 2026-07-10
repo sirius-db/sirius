@@ -61,13 +61,9 @@ class sirius_pipeline_build_state {
   sirius::reference_map_t<const op::sirius_physical_operator,
                           std::reference_wrapper<sirius_pipeline>>
     cte_dependencies;
-  //! Phase 3 (#604): CTE_SCAN → consumer pipeline. Populated by
-  //! `sirius_physical_column_data_scan::build_pipelines` under
-  //! `USE_TREE_BASED_PIPELINE_BUILD`. CTE_SCAN is never materialized in any
-  //! consumer pipeline's `operators[]` (matches legacy's contract that
-  //! `finalize_pipeline_structure` drops CTE_SCAN), so the tree-based wiring
-  //! can't use `dest_for_op` to locate the consumer. This map gives the
-  //! converter a direct lookup keyed by the scan-op pointer.
+  //! CTE_SCAN → consumer pipeline, populated under `USE_TREE_BASED_PIPELINE_BUILD` by
+  //! `sirius_physical_column_data_scan::build_pipelines`. CTE_SCAN never lands in any pipeline's
+  //! `operators[]`, so tree-based wiring resolves consumers through this map, not `dest_for_op`.
   sirius::reference_map_t<const op::sirius_physical_operator,
                           std::reference_wrapper<sirius_pipeline>>
     cte_scan_consumers;

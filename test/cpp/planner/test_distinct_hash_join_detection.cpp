@@ -40,9 +40,8 @@ using namespace duckdb;
 
 namespace {
 
-/// On-disk single-file DuckDB path (RAII). The GPU-native seq_scan ingestible requires a
-/// single-file block manager, so these plan-construction tests need an on-disk database rather
-/// than :memory:. Mirrors scoped_temp_db_path in test/cpp/scan.
+/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
+/// block managers, so these tests need an on-disk database rather than :memory:.
 class scoped_temp_db_path {
  public:
   scoped_temp_db_path()

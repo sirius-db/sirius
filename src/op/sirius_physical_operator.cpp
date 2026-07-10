@@ -156,20 +156,16 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
 {
   auto& state = meta_pipeline.get_state();
   if (is_sink()) {
-    // Operator is a sink, build a pipeline. Under flag ON we allow leaf-sinks
-    // (DUCKDB_SCAN / ICEBERG_SCAN / CPU_SOURCE) which terminate their own one-operator
-    // pipeline with no upstream recursion. Under flag OFF scans return is_sink=false so
-    // this branch only sees the legacy "sink with 1 child" shape.
+    // Sink: build a pipeline. Flag ON also admits leaf-sinks (scans) that terminate
+    // their own one-operator pipeline; flag OFF only sees the "sink with 1 child" shape.
     D_ASSERT(children.size() <= 1);
 
     if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
       // Legacy protocol: source field tracks pre-finalize source.
       state.set_pipeline_source(current, *this);
     }
-    // Under the new protocol, create_child_meta_pipeline pre-populates the new
-    // child_meta's operators[] with [*this], so *this lands at operators.back()
-    // post-reverse — source/sink derive from operators[] in `is_ready`, so no
-    // separate set_pipeline_source is needed.
+    // New protocol: create_child_meta_pipeline pre-populates [*this] in the child_meta;
+    // source/sink derive from operators[] in `is_ready`, so no set_pipeline_source here.
 
     // we create a new pipeline starting from the child (or just [*this] for leaf-sinks)
     auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -179,8 +175,7 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
     if (children.empty()) {
       // source-leaf
       if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-        // Source-leaves land at operators[0] post-reverse, so append to
-        // operators[] rather than only setting the source field.
+        // Append: source-leaves land at operators[0] post-reverse.
         state.add_pipeline_operator(current, *this);
       } else {
         state.set_pipeline_source(current, *this);

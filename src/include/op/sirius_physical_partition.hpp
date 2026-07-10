@@ -47,12 +47,9 @@ class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
 
-  //! `key_source` names the downstream consumer whose keys/types determine how this
-  //! PARTITION shards rows: a HASH_JOIN provides equi-join conditions, an HGB or
-  //! MERGE_GROUP_BY provides GROUP BY columns, etc. It is captured at construction by
-  //! `get_partition_keys_and_type` and never stored — it is *not* the tree parent of
-  //! this operator. The actual tree parent lives in the inherited `_parent_op` field and
-  //! is stamped post-construction by `sirius_physical_plan_generator::set_parent_ops`.
+  //! `key_source` is the downstream consumer whose keys determine partitioning (HJ join
+  //! conditions, HGB/MERGE_GROUP_BY grouping columns). Captured at construction, never
+  //! stored — the tree parent is `_parent_op`, stamped later by `set_parent_ops`.
   explicit sirius_physical_partition(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,

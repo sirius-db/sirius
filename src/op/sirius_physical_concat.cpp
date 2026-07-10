@@ -36,10 +36,8 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
 {
   _is_build           = is_build;
   _concat_batch_bytes = concat_batch_bytes;
-  // `downstream_join` is the HJ/NLJ this CONCAT feeds. We use it here to pick `_concat_all`
-  // based on join type, and stash it in `_downstream_join` for the legacy converter's
-  // post-construction destination lookup. The inherited `_parent_op` field (tree parent) is
-  // stamped later by `sirius_physical_plan_generator::set_parent_ops` under flag ON.
+  // `downstream_join` (the HJ/NLJ this CONCAT feeds — not the tree parent) picks
+  // `_concat_all` and is stashed for the legacy converter's destination lookup.
   _downstream_join = downstream_join;
   if (downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(downstream_join);

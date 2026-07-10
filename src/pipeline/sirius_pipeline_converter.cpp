@@ -139,14 +139,11 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
 
   auto copied_scheduled = schedule_and_copy_pipelines(root_pipeline);
   if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    // Under the tree-based path, the plan generator + build_pipelines virtuals already
-    // place every operator. There is nothing to split or insert at convert time.
+    // Legacy only: tree-based build_pipelines already places every operator.
     split_pipelines(copied_scheduled);
   } else {
-    // Under flag ON, split_pipelines never runs to populate scheduled_, so the post-build
-    // pipelines need to be transferred directly. compute_repository_wiring_tree_based and
-    // the dump helper both read scheduled_ — without this transfer the conversion result
-    // is empty even though build_pipelines produced a full pipeline tree.
+    // split_pipelines is what populates scheduled_ on the legacy path; transfer the
+    // built pipelines directly so wiring computation and the dump helper see them.
     scheduled_ = std::move(copied_scheduled);
   }
   compute_repository_wiring(root_pipeline.get_state());
@@ -155,9 +152,8 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   link_join_partition_siblings();
   configure_partition_min_partitions();
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    // Must run after finalize_pipeline_structure (which populates `dependencies`)
-    // and after link_join_partition_siblings (which reads dependencies[0]/[1]
-    // positionally in the pre-reorder order).
+    // Must run after finalize_pipeline_structure (populates `dependencies`) and after
+    // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
     reorder_pipelines_topologically(scheduled_);
   }
 
@@ -175,9 +171,8 @@ void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pi
   std::unordered_set<const sirius_pipeline*> in_progress;
 
   auto emit = [&](auto&& self, const duckdb::shared_ptr<sirius_pipeline>& pipeline) -> void {
-    // `in_progress` breaks dependency cycles (delim-join distribution edges) by
-    // skipping back-references; the pipeline is still emitted when its own frame
-    // completes.
+    // `in_progress` breaks dependency cycles (delim-join distribution edges); the
+    // pipeline is still emitted when its own frame completes.
     if (emitted.contains(pipeline.get()) || in_progress.contains(pipeline.get())) { return; }
     in_progress.insert(pipeline.get());
     for (const auto& producer : pipeline->dependencies) {
@@ -256,15 +251,10 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
       duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipeline_inside;
       to_schedule[to_schedule.size() - 1 - meta]->get_pipelines(pipeline_inside, false);
       for (auto& pipeline : pipeline_inside) {
-        // Legacy-only filter: under flag OFF, `set_pipeline_source` is overwritten as
-        // the recursion descends, so any HJ/NLJ-source pipeline at this point is a stale
-        // build-meta whose true source is its sink. The post-split `[HJ, ..., sink]`
-        // shape only emerges later in `split_pipelines`. DuckDB adds a build-side scan
-        // pipeline (join as source) for right/outer joins; sirius joins emit unmatched
-        // build rows inline, so keeping it would wire the join's downstream ports twice.
-        // Under flag ON, join-source pipelines that reach this point are legitimate
-        // (inner-join outputs feeding PARTITION); dropping them would corrupt the
-        // schedule.
+        // Legacy-only filter: DuckDB adds a build-side scan pipeline (join as source) for
+        // right/outer joins; sirius joins emit unmatched build rows inline, so keeping it
+        // would wire the join's downstream ports twice. Under flag ON join-source pipelines
+        // are legitimate (inner-join outputs feeding PARTITION) and must be kept.
         if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD &&
             (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
              pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN)) {
@@ -277,13 +267,9 @@ sirius_pipeline_converter::schedule_and_copy_pipelines(sirius_meta_pipeline& roo
     meta = (meta + 1) % to_schedule.size();
   }
 
-  // perform deep copy on scheduled pipelines. The copies isolate legacy's
-  // `split_pipelines` mutations from the meta-pipeline state. Under
-  // `USE_TREE_BASED_PIPELINE_BUILD` no split runs, and `build_pipelines`
-  // already produced final-shape pipelines — so return the originals
-  // directly so downstream code (wiring lookups via `state.cte_scan_consumers`
-  // populated in `build_pipelines`) can resolve consumer pipelines by
-  // pointer identity.
+  // Deep-copy so legacy `split_pipelines` mutations don't leak into meta-pipeline state.
+  // Under `USE_TREE_BASED_PIPELINE_BUILD` the pipelines are already final-shape; return the
+  // originals so pointer-identity lookups (`state.cte_scan_consumers`) still resolve.
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) { return sirius_scheduled; }
 
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> copied_scheduled;
@@ -1223,10 +1209,8 @@ std::string_view sirius_pipeline_converter::resolve_port_id(
   if (sink.type == T::CONCAT) {
     return sink.Cast<op::sirius_physical_concat>().is_build_concat() ? "build" : "default";
   }
-  // Leaf scans push splits onto the "scan" port of the next operator.
-  // GPU_SCAN is intentionally excluded — legacy treats it as a regular
-  // intermediate operator with the "default" port (see compute_repository_wiring's
-  // catch-all branch). Adding it here would diverge from the legacy wiring shape.
+  // Leaf scans push splits onto the "scan" port of the next operator. GPU_SCAN is
+  // intentionally excluded — legacy wires it as a regular "default"-port operator.
   if (sink.type == T::DUCKDB_SCAN || sink.type == T::ICEBERG_SCAN || sink.type == T::CPU_SOURCE) {
     return "scan";
   }
@@ -1237,11 +1221,9 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
   const op::sirius_physical_operator& sink, const sirius_pipeline& dest)
 {
   using T = op::SiriusPhysicalOperatorType;
-  // Sort/scan sinks process batches as they arrive — no barrier required.
-  // GPU_SCAN is intentionally excluded — legacy emits FULL/PARTIAL for it via
-  // the catch-all branch in compute_repository_wiring, not PIPELINE.
-  // SORT_SAMPLE is no longer a pipeline sink (it runs as an intermediate operator in the
-  // SORT_PARTITION pipeline post-#866), so it's not listed here.
+  // Sort/scan sinks process batches as they arrive — no barrier required. GPU_SCAN is
+  // intentionally excluded (legacy gives it FULL/PARTIAL, not PIPELINE); SORT_SAMPLE is
+  // never a pipeline sink (it runs as an intermediate in the SORT_PARTITION pipeline).
   if (sink.type == T::ORDER_BY || sink.type == T::DUCKDB_SCAN || sink.type == T::ICEBERG_SCAN ||
       sink.type == T::CPU_SOURCE) {
     return op::MemoryBarrierType::PIPELINE;
@@ -1255,23 +1237,14 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
                                       (dest.get_sink() && dest.get_sink()->type == T::CONCAT);
     return downstream_is_concat ? op::MemoryBarrierType::PARTIAL : op::MemoryBarrierType::FULL;
   }
-  // Intermediate sink feeding a probe-side PARTITION: the probe pipeline can
-  // stream batches, so the upstream→PARTITION_probe edge uses PARTIAL. Build-
-  // side PARTITION stays FULL — build must accumulate all partitions before
-  // the probe can join them. Aggregate-fanout PARTITIONs (between an HGB and
-  // its MERGE_GROUP_BY, or between a DISTINCT and its MERGE_DISTINCT) also
-  // stay FULL: the merge operator needs every per-thread bucket before it can
-  // emit output. We distinguish join-feeders from aggregate-fanouts by tree-
-  // parent type — join-feeder PARTITIONs always sit under a CONCAT (the
-  // CONCAT/PARTITION wrap chain emitted by wrap_join_child); aggregate-fanout
-  // PARTITIONs sit under MERGE_GROUP_BY / GROUPED_AGGREGATE_MERGE. Exception
-  // (#1088): a RIGHT-family join must size from the complete probe input
-  // because CONCAT retains the whole probe partition, so its probe PARTITION
-  // also keeps FULL; RIGHT_DELIM_JOIN's internal join is exempt — it
-  // bootstraps its probe subtree from build-side distinct data. Under the
-  // legacy path these same distinctions are enforced via
-  // `link_join_partition_siblings`, which only patches barriers on joins'
-  // probe partitions.
+  // Probe-side PARTITION under a join streams batches → PARTIAL; build-side PARTITION is
+  // FULL (build must accumulate every partition before the probe can join). Aggregate-
+  // fanout PARTITIONs are also FULL — the merge operator needs every per-thread bucket.
+  // Join-feeders sit under a CONCAT (wrap_join_child's wrap chain); aggregate-fanouts sit
+  // under MERGE_GROUP_BY / GROUPED_AGGREGATE_MERGE. Exception: a RIGHT-family join sizes
+  // from the complete probe input (CONCAT retains the whole probe partition), so its probe
+  // PARTITION stays FULL — unless it is a RIGHT_DELIM_JOIN's internal join, which
+  // bootstraps its probe subtree from build-side distinct data.
   if (dest.get_sink() && dest.get_sink()->type == T::PARTITION) {
     auto& partition        = dest.get_sink()->Cast<op::sirius_physical_partition>();
     auto* partition_parent = partition.get_parent_op();
@@ -1292,9 +1265,8 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
 void sirius_pipeline_converter::compute_repository_wiring_tree_based(
   sirius_pipeline_build_state& state)
 {
-  // Build a fast lookup: operator pointer -> the pipeline that "starts at" it.
-  // A pipeline P starts at op X iff X is operators[0] (entry-point post-reverse)
-  // OR P.sink == X (sink-only pipelines where source == sink).
+  // Lookup: operator -> the pipeline that starts at it, i.e. its operators[0]
+  // (entry-point post-reverse) or its sink for sink-only pipelines.
   std::unordered_map<const op::sirius_physical_operator*, duckdb::shared_ptr<sirius_pipeline>>
     dest_for_op;
   for (const auto& pipeline : scheduled_) {
@@ -1326,22 +1298,17 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
     // RESULT_COLLECTOR is a terminal sink — nothing to emit.
     if (sink_op->type == T::RESULT_COLLECTOR) { continue; }
 
-    // CTE iterates its sibling `cte_scans` (parent_op alone doesn't encode them).
-    // Lookup goes through `state.cte_scan_consumers` rather than `dest_for_op`
-    // because CTE_SCAN is a routing-only marker and never lands in any
-    // pipeline's operators[] under flag ON (matches legacy's contract). The map
-    // is populated by `sirius_physical_column_data_scan::build_pipelines`.
+    // CTE fans out to its sibling `cte_scans` (parent_op alone doesn't encode them).
+    // CTE_SCAN never lands in any pipeline's operators[], so consumers resolve via
+    // `state.cte_scan_consumers` instead of `dest_for_op`.
     if (sink_op->type == T::CTE) {
       auto& cte_op = sink_op->Cast<op::sirius_physical_cte>();
       for (auto cte_scan : cte_op.cte_scans) {
         auto it = state.cte_scan_consumers.find(cte_scan);
         if (it == state.cte_scan_consumers.end()) { continue; }
         auto dest_pipeline = it->second.get().shared_from_this();
-        // Per-consumer barrier: probe-side CTE_SCAN consumers (e.g. q15's first
-        // CTE_SCAN feeding the main HJ's probe PARTITION) resolve to PARTIAL via
-        // the join-feeder rule; build-side consumers (e.g. q15's second CTE_SCAN
-        // feeding the scalar-subquery aggregate chain) resolve to FULL. Hardcoding
-        // FULL matches legacy on the build side but disagrees on the probe side.
+        // Per-consumer barrier: probe-side CTE_SCAN consumers resolve to PARTIAL via the
+        // join-feeder rule; build-side consumers resolve to FULL.
         emit(
           "default", resolve_barrier(*sink_op, *dest_pipeline), sink_op, pipeline, dest_pipeline);
       }
@@ -1355,12 +1322,9 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       auto* distinct_op    = right_delim.distinct;
       if (partition_join) {
         auto it = dest_for_op.find(partition_join);
-        // partition_join is owned by the DELIM_JOIN and executed inline
-        // (RIGHT_DELIM_JOIN::sink). Under flag ON it has no pipeline of its own —
-        // build_join_pipelines skips the recursion that would have created one — so the
-        // direct lookup misses. Fall back to its tree parent (CONCAT_build), which is
-        // the build_meta sink and resolves to the externalized [CONCAT_build] single-op
-        // pipeline. Matches legacy `PARTITION → CONCAT` build wiring.
+        // partition_join executes inline in RIGHT_DELIM_JOIN::sink with no pipeline of
+        // its own, so the direct lookup misses; fall back to its tree parent
+        // (CONCAT_build), mirroring legacy's PARTITION → CONCAT build wiring.
         if (it == dest_for_op.end()) {
           if (auto* parent = partition_join->get_parent_op()) { it = dest_for_op.find(parent); }
         }
@@ -1370,13 +1334,9 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       }
       if (distinct_op) {
         auto it = dest_for_op.find(distinct_op);
-        // The bare DISTINCT is owned by DELIM_JOIN and executed inline
-        // (RIGHT_DELIM_JOIN::sink). Under flag ON it has no pipeline of its own —
-        // its build_pipelines override short-circuits when `_owned_by_delim_join`
-        // is set — so the direct lookup misses. Fall back to its tree parent
-        // (PARTITION_distinct), which is the partition pipeline that consumes the
-        // bare DISTINCT's per-thread output. Matches legacy
-        // `HASH_GROUP_BY (src=DELIM_JOIN) → PARTITION (dst=PARTITION_distinct)`.
+        // The bare DISTINCT also executes inline (`_owned_by_delim_join` short-circuits
+        // its build_pipelines), so the direct lookup misses; fall back to its tree
+        // parent (PARTITION_distinct), which consumes its per-thread output.
         if (it == dest_for_op.end()) {
           if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
         }
@@ -1394,14 +1354,9 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       auto* column_data_scan = left_delim.column_data_scan;
       if (column_data_scan) {
         auto it = dest_for_op.find(column_data_scan);
-        // column_data_scan is owned by the delim join and executed inline
-        // (LEFT_DELIM_JOIN::sink). Under flag ON its build_pipelines is a no-op,
-        // so the direct lookup misses. Fall back to its tree parent
-        // (PARTITION_probe), which carries the externalized [PARTITION] pipeline
-        // that consumes the cached chunk scan's output. Matches legacy's
-        // `COLUMN_DATA_SCAN (src=DELIM_JOIN) → PARTITION (dst=PARTITION_probe)`.
-        // Use resolve_barrier so the dest type (PARTITION_probe) dictates the
-        // barrier (PARTIAL for probe-side partition, per join-feeder rule).
+        // column_data_scan executes inline in LEFT_DELIM_JOIN::sink (build_pipelines is a
+        // no-op), so the direct lookup misses; fall back to its tree parent (PARTITION_probe).
+        // resolve_barrier lets the dest dictate PARTIAL for the probe-side partition.
         if (it == dest_for_op.end()) {
           if (auto* parent = column_data_scan->get_parent_op()) { it = dest_for_op.find(parent); }
         }
@@ -1415,9 +1370,8 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       }
       if (distinct_op) {
         auto it = dest_for_op.find(distinct_op);
-        // Same fallback as the RIGHT_DELIM_JOIN's bare DISTINCT above: it has
-        // no pipeline of its own under flag ON, so resolve to its tree parent
-        // (PARTITION_distinct).
+        // Same fallback as RIGHT_DELIM_JOIN's bare DISTINCT: no pipeline of its own,
+        // so resolve to its tree parent (PARTITION_distinct).
         if (it == dest_for_op.end()) {
           if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
         }
@@ -1428,13 +1382,10 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
       continue;
     }
 
-    // The distinct chain top of a DELIM_JOIN (MERGE_GROUP_BY) sits under
-    // DELIM_JOIN in the tree, so the uniform tree-parent walk below would emit
-    // `merge_top -> DELIM_JOIN`. Legacy split_delim_join_sink instead retargets
-    // the merged output to each delim_scan's downstream consumer (the inner-HJ
-    // probe partition). Mirror that here. Detection uses the explicit
-    // `_owning_delim_join` back-pointer set in wrap_delim_distinct — only the
-    // distinct_root carries it.
+    // A DELIM_JOIN's distinct chain top (MERGE_GROUP_BY) sits under DELIM_JOIN in the
+    // tree, but its merged output retargets to each delim_scan's downstream consumer
+    // (the inner-HJ probe partition), mirroring legacy's split_delim_join_sink. Only
+    // the distinct_root carries the `_owning_delim_join` back-pointer.
     if (auto* owning_delim = sink_op->owning_delim_join()) {
       for (auto& delim_scan_ref : owning_delim->delim_scans) {
         auto& delim_scan  = delim_scan_ref.get();
@@ -1455,14 +1406,10 @@ void sirius_pipeline_converter::compute_repository_wiring_tree_based(
     auto* parent_op = sink_op->get_parent_op();
     if (!parent_op) { continue; }
 
-    // When sink_op is the `delim.join` of a RIGHT_DELIM_JOIN, the legacy
-    // split_delim_join_sink wires the inner join out to the next HJ above the
-    // RDJ (via the legacy-constructed external partition_join), not to the RDJ
-    // itself. Mirror that: redirect to the RDJ's tree parent so the inner HJ
-    // skips over the RDJ. Without this, both `RDJ.children[0]`'s root HJ AND
-    // `RDJ.delim.join` resolve to the same RDJ pipeline, and the RDJ-sink
-    // emission's CONCAT fallback closes a cycle back through the inner HJ's own
-    // build CONCAT.
+    // A RIGHT_DELIM_JOIN's `delim.join` wires out to the RDJ's tree parent, skipping the
+    // RDJ itself (mirrors legacy split_delim_join_sink). Otherwise it and the root HJ of
+    // `RDJ.children[0]` would both resolve to the RDJ pipeline, and the RDJ-sink
+    // emission's CONCAT fallback would close a cycle through the inner HJ's build CONCAT.
     if ((parent_op->type == T::RIGHT_DELIM_JOIN) &&
         parent_op->Cast<op::sirius_physical_delim_join>().join.get() == sink_op) {
       auto* grand = parent_op->get_parent_op();
@@ -1514,10 +1461,8 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
   // source = &operators[0], sink = operators.back().
   for (const auto& pipeline : scheduled_) {
     if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      // Under USE_TREE_BASED_PIPELINE_BUILD, `is_ready` already pushed sink into
-      // operators[] and set source = &operators[0]. Skip the redoing here; the
-      // parent->dependency reverse map still needs to be populated (next loop),
-      // so the function as a whole is still called under both flag states.
+      // Under USE_TREE_BASED_PIPELINE_BUILD `is_ready` already did this; the function
+      // still runs in both flag states for the parent->dependency loop below.
       pipeline->operators.push_back(*pipeline->sink);
       pipeline->source = &pipeline->operators[0].get();
     }
@@ -1531,10 +1476,8 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
 void sirius_pipeline_converter::link_join_partition_siblings()
 {
   for (const auto& pipeline : scheduled_) {
-    // for each hash/nested-loop join as a source, get the dependencies (concat) and get the
-    // dependencies of concat (partition). Both join types receive the same CONCAT/PARTITION
-    // build+probe wrap from `wrap_join` at plan-gen, and the probe pipeline can stream batches
-    // for both, so the upstream→probe-partition edge should use PARTIAL in both cases.
+    // Both join types get the same CONCAT/PARTITION build+probe wrap from `wrap_join`, and
+    // both can stream the probe, so the upstream→probe-partition edge is PARTIAL for both.
     if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
         pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
       auto build_concat_pipeline    = pipeline->dependencies[0];
@@ -1552,14 +1495,9 @@ void sirius_pipeline_converter::link_join_partition_siblings()
 
       // Probe partitions normally stream through a partial barrier. A RIGHT-family join must
       // size from the complete probe input because CONCAT retains the whole probe partition.
-      // The corresponding port doesn't exist yet (materialisation happens after `convert()`
-      // returns); mutate the descriptor so the materialiser creates the port with the correct
-      // barrier type.
-      //
-      // Under USE_TREE_BASED_PIPELINE_BUILD, resolve_barrier already emits the
-      // upstream→PARTITION_probe edge with the right FULL/PARTIAL barrier directly. Skip
-      // the mutation under flag ON to keep barrier decisions consolidated in one
-      // place; the sibling-pointer setup below still runs in both flag states.
+      // Ports don't exist yet (materialised after `convert()` returns), so mutate the
+      // descriptor. Under USE_TREE_BASED_PIPELINE_BUILD resolve_barrier already emitted the
+      // right barrier — skip the mutation; sibling-pointer setup below runs in both states.
       if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
         auto wiring_it = std::find_if(
           repository_wirings_.begin(), repository_wirings_.end(), [&](const repository_wiring& w) {
@@ -1777,8 +1715,7 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
     return "?";
   };
 
-  // Per-pipeline local signature: sink|source|operators... Used as the base layer of the
-  // recursive signature below.
+  // Per-pipeline local signature: sink|source|operators...
   auto local_sig = [&](const sirius_pipeline* p) -> std::string {
     std::string s = op_name(p->get_sink().get());
     s += "|" + op_name(p->get_source().get());
@@ -1788,16 +1725,11 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
     return s;
   };
 
-  // Downstream-aware signature: a pipeline's signature includes its sorted list of
-  // (port_id, downstream_signature). Two pipelines with the same local shape AND the
-  // same set of consumers reach the same signature. Memoized; assumes acyclic graph
-  // (TPC-H plans are DAGs).
+  // Downstream-aware signature: local shape plus the sorted (port_id, downstream_signature)
+  // list, so pipelines only match when both shape and consumer set match. Memoized.
   std::unordered_map<const sirius_pipeline*, std::string> sig_cache;
-  // Defensive cycle guard: if the wiring graph ever contains a cycle, compute_sig
-  // would otherwise infinite-recurse. Returning "CYCLE" on re-entry keeps the dump
-  // function safe; the underlying bug surfaces as a dump mismatch which is easier
-  // to triage than a hang. TPC-H plans are DAGs in correct converter output, so
-  // this guard should never fire in green CI.
+  // Cycle guard: return "CYCLE" on re-entry instead of recursing forever, so a buggy
+  // cyclic wiring graph surfaces as a dump mismatch rather than a hang.
   std::unordered_set<const sirius_pipeline*> sig_visiting;
   std::function<std::string(const sirius_pipeline*)> compute_sig =
     [&](const sirius_pipeline* p) -> std::string {
@@ -1821,10 +1753,8 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
     return s;
   };
 
-  // Canonical pipeline order: sort by signature. Order in `scheduled_pipelines` reflects
-  // the scheduling pass that produced it (legacy iterative split vs tree-based DFS);
-  // sorting here makes the dump comparison independent of that order so both flag states
-  // produce byte-identical output when the resulting graph is the same.
+  // Canonical order: sort by signature so the dump is independent of each path's emission
+  // order — both flag states print byte-identical output for the same graph.
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> ordered = result.scheduled_pipelines;
   std::sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) -> bool {
     return compute_sig(a.get()) < compute_sig(b.get());
@@ -1858,8 +1788,7 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
     }
   }
 
-  // Sort wirings by the canonical pipeline indices so wiring order is also
-  // path-independent.
+  // Sort wirings by canonical pipeline indices so wiring order is also path-independent.
   std::vector<repository_wiring> sorted_wirings(result.repository_wirings.begin(),
                                                 result.repository_wirings.end());
   std::sort(sorted_wirings.begin(),

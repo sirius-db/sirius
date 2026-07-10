@@ -49,10 +49,8 @@ void sirius_physical_cpu_source::build_pipelines(pipeline::sirius_pipeline& curr
     sirius_physical_operator::build_pipelines(current, meta_pipeline);
     return;
   }
-  // CPU_SOURCE is the sink of its own child_meta. Under the new protocol,
-  // create_child_meta_pipeline pre-populates [*this] in the new child_meta's
-  // operators[] (via `is_ready`), so post-reverse operators=[*this] with
-  // source=sink=*this. CPU_SOURCE has no children, so no recursion.
+  // Leaf sink: create_child_meta_pipeline pre-populates [*this], yielding a one-operator
+  // pipeline with source=sink=*this. No children, so no recursion.
   D_ASSERT(children.empty());
   meta_pipeline.create_child_meta_pipeline(current, *this);
 }

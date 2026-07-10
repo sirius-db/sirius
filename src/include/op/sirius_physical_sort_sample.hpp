@@ -53,11 +53,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
  public:
   bool is_source() const override { return true; }
   // SORT_SAMPLE is not a pipeline sink — it runs as an intermediate operator in the
-  // SORT_PARTITION pipeline (post-#866). Returning false lets the tree-based
-  // build_pipelines (sirius_physical_operator.cpp:150) route this op through the
-  // intermediate branch (push self onto operators[], recurse into children[0]),
-  // producing the same 3-pipeline shape that split_order_by_sink produces on the
-  // legacy path.
+  // SORT_PARTITION pipeline, so the tree-based build matches the legacy 3-pipeline shape.
   bool is_sink() const override { return false; }
   bool sink_order_dependent() const override { return false; }
 

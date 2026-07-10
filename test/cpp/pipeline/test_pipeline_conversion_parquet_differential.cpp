@@ -39,10 +39,8 @@ fs::path project_root()
 #endif
 }
 
-//! Create `nation, region, customer, orders, part, partsupp, supplier, lineitem` as
-//! views over `test/cpp/integration/data/parquet/*.parquet` in `main`. Same SQL
-//! pattern as `GPUExecutionParquetFixture::setup_schema()` in
-//! `test_gpu_execution_tpch.cpp`. No `USE` statement — views live in the default schema.
+//! Create the eight TPC-H tables as views over `test/cpp/integration/data/parquet/*.parquet`.
+//! No `USE` — the views live in the default schema.
 void create_tpch_parquet_views(duckdb::Connection& con)
 {
   auto parquet_dir = (project_root() / "test/cpp/integration/data/parquet").string();
@@ -64,13 +62,9 @@ std::string hive_partition_root()
 
 }  // namespace
 
-//! Phase 3 (#604): differential gate for the tree-based pipeline build over
-//! parquet reads. Mirrors the DuckDB-attached gate in
-//! `test_pipeline_conversion_differential.cpp`, but creates the TPC-H schema as
-//! views over `read_parquet(...)`. This closes the blind spot that let commit
-//! `5dfe3df1` (op_params plumbing for hive_partition) ship without being caught
-//! — the original gate reads from an attached DuckDB and therefore never
-//! exercises the parquet scan path.
+//! Differential gate for the tree-based pipeline build over parquet reads: the same 22-query
+//! sweep as the DuckDB-attached gate, but with the TPC-H schema as views over
+//! `read_parquet(...)`. The attached-DuckDB gate never exercises the parquet scan path.
 TEST_CASE("TPC-H SF1 parquet: legacy and tree-based converters produce identical pipeline state",
           "[integration][pipeline][differential][parquet]")
 {
@@ -82,13 +76,8 @@ TEST_CASE("TPC-H SF1 parquet: legacy and tree-based converters produce identical
 
   sirius::test::tree_pipeline_flag_guard flag_guard;
 
-  // q21 previously diverged: under the parquet plan shape, the inner RDJ's
-  // build_pipelines was called with `current` pre-populated with the outer RDJ
-  // as its sink, causing build_join_pipelines to fuse the inner HJ with the
-  // outer RDJ (source:HJ,sink:RDJ). Fixed by checking `current`'s sink type in
-  // sirius_physical_right_delim_join::build_pipelines — when the sink is a
-  // RIGHT_DELIM_JOIN or PARTITION (barrier ops), the inner HJ is routed into
-  // its own standalone child meta pipeline instead, matching legacy's output.
+  // Queries excluded to keep the gate green until fixes land; flipping the flag on by
+  // default requires this list to be empty.
   static const std::set<int> kKnownFailing = {};
 
   for (int q = 1; q <= 22; ++q) {
@@ -101,9 +90,7 @@ TEST_CASE("TPC-H SF1 parquet: legacy and tree-based converters produce identical
       auto tree_dump   = sirius::test::dump_under_flag(con, query, /*flag=*/true);
 
       if (legacy_dump != tree_dump) {
-        // Write both dumps to /tmp for clean external diffing — Catch2's INFO
-        // output wraps the strings in its own quoting, which makes the actual
-        // byte difference hard to spot in the failure message.
+        // Dump to /tmp for external diffing; Catch2's INFO quoting obscures byte diffs.
         auto path = std::string{"/tmp/diff_parquet_q"} + std::to_string(q);
         std::ofstream(path + "_legacy.txt") << legacy_dump;
         std::ofstream(path + "_tree.txt") << tree_dump;
@@ -114,10 +101,8 @@ TEST_CASE("TPC-H SF1 parquet: legacy and tree-based converters produce identical
   }
 }
 
-//! Phase 3 (#604): differential gate for hive-partitioned parquet reads. The
-//! `hive_partitioning=true` path is the one that regressed in commit `5dfe3df1`
-//! (missing `op_params` plumbing into `wrap_table_scan_source`). Mirrors the
-//! six GPU-vs-CPU `[hive_partition]` queries in `test_gpu_execution_multi_format.cpp`.
+//! Differential gate for hive-partitioned parquet reads — `hive_partitioning=true` exercises
+//! op_params plumbing that the plain parquet gate does not reach.
 TEST_CASE("hive_partition: legacy and tree-based converters produce identical pipeline state",
           "[integration][pipeline][differential][hive_partition]")
 {
@@ -147,8 +132,7 @@ TEST_CASE("hive_partition: legacy and tree-based converters produce identical pi
      "SELECT SUM(amount) as total FROM read_parquet('" + hive + "', hive_partitioning=true)"},
   }};
 
-  // Empty set means all hive_partition variants produce byte-identical dumps
-  // under both flag states. Re-populate by query name if a regression lands.
+  // Variants excluded by name to keep the gate green; must be empty before the flag flips on.
   static const std::set<std::string> kKnownFailing = {};
 
   for (auto const& [name, sql] : queries) {

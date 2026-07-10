@@ -245,9 +245,8 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
   duckdb::optional_ptr<pipeline::sirius_meta_pipeline> last_child_ptr;
   if (build_rhs) {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      // Phase 3 (#604): see sirius_physical_hash_join::build_join_pipelines for the
-      // rationale — plan-time wrap_join inserted CONCAT_build as op.children[1]; use it
-      // as the build_meta sink and recurse past it into its PARTITION child.
+      // See sirius_physical_hash_join::build_join_pipelines: wrap_join inserted
+      // CONCAT_build as op.children[1]; sink the build_meta at it and recurse past it.
       auto& build_child = *op.children[1];
       D_ASSERT(build_child.is_sink());
       D_ASSERT(!build_child.children.empty());
@@ -281,10 +280,8 @@ void sirius_physical_nested_loop_join::build_join_pipelines(
   auto& join_op           = op.Cast<sirius_physical_nested_loop_join>();
   if (join_op.is_source()) { add_child_pipeline = true; }
 
-  // Phase 3 (#604): mirror the gate in sirius_physical_hash_join::build_join_pipelines —
-  // create_child_pipeline emits a phantom HJ/NLJ-source pipeline that legacy drops via
-  // schedule_and_copy_pipelines' filter, but under flag ON is_ready resets `source` to
-  // operators.front() so the filter no longer catches it. Skip the call under flag ON.
+  // Mirror sirius_physical_hash_join::build_join_pipelines: under flag ON the phantom
+  // join-source pipeline would evade the legacy scheduler filter — skip the call.
   if (add_child_pipeline && !duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
     meta_pipeline.create_child_pipeline(current, op, last_pipeline);
   }
@@ -298,7 +295,7 @@ void sirius_physical_nested_loop_join::build_pipelines(
     return;
   }
 
-  // Phase 3 (#604) flag-ON protocol — mirrors sirius_physical_hash_join::build_pipelines.
+  // Flag-ON protocol — mirrors sirius_physical_hash_join::build_pipelines.
   pipeline::sirius_meta_pipeline* host_meta;
   pipeline::sirius_pipeline* host_current;
   if (is_sink()) {

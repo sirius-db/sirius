@@ -113,9 +113,8 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
  public:
   // Source interface
-  //! Under flag OFF: NLJ is a source only for join types that propagate the build side
-  //! (LEFT/RIGHT/OUTER/SEMI). Inner NLJ historically doesn't claim source status under the
-  //! legacy converter. Under flag ON: NLJ is always a source — every join emits output.
+  //! Flag ON: always a source (every join emits output). Flag OFF: source only for join
+  //! types that propagate the build side, as the legacy converter expects.
   bool is_source() const override
   {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) { return true; }
@@ -123,17 +122,14 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   }
 
  public:
-  //! True when this NLJ is the internal `delim.join` of a RIGHT_DELIM_JOIN. See the
-  //! identical field on `sirius_physical_hash_join` for the full rationale; set in
-  //! `sirius_physical_right_delim_join`'s constructor.
+  //! True when this NLJ is the internal `delim.join` of a RIGHT_DELIM_JOIN; see the
+  //! identical field on `sirius_physical_hash_join`.
   [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
   void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
 
   // Sink Interface
-  //! Under flag OFF: unconditional sink (legacy converter rewrites the chain). Under flag
-  //! ON: never a sink when this NLJ is the inner join of a RIGHT_DELIM_JOIN
-  //! (`_is_delim_join_inner` short-circuits to `false`); otherwise delegates to the base
-  //! rule (sink iff parent is PARTITION or RIGHT_DELIM_JOIN). Mirrors HJ's behavior.
+  //! Flag OFF: unconditionally a sink. Flag ON: the inner join of a RIGHT_DELIM_JOIN is
+  //! never a sink; otherwise the base rule applies. Mirrors HJ.
   bool is_sink() const override
   {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {

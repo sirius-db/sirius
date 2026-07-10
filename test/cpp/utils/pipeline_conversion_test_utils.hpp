@@ -28,44 +28,24 @@ struct pipeline_conversion_result;
 
 namespace sirius::test {
 
-//! Drive the full sirius planner + meta_pipeline + converter flow on `query`
-//! and return `dump_pipeline_conversion_result(...)` for the resulting conversion.
-//! Mirrors the path `sirius_extension.cpp` and `sirius_engine::initialize_internal`
-//! follow at runtime, but stops after `converter.convert()` — no GPU execution,
-//! no materialize_repository_wiring side effects.
-//!
-//! Returns the dump *string* (not the raw `pipeline_conversion_result`) because the
-//! result's pipelines reference operators in the plan tree, and the tree is owned
-//! by a local in this function — extending its lifetime to the caller would require
-//! returning both, and is easier to get wrong than just dumping while everything is
-//! still alive.
-//!
-//! Optimizer disables match `SiriusTableFunctionData::PrepareConnection`
-//! (IN_CLAUSE, COMPRESSED_MATERIALIZATION, STATISTICS_PROPAGATION). The
-//! pre-existing settings are saved and restored even on error.
-//!
-//! Used by the differential dump tests to compare the conversion result between
-//! `USE_TREE_BASED_PIPELINE_BUILD=false` and `=true`. The flag's state at call time
-//! is what the converter and plan generator see; tests must toggle it before each
-//! call.
-//!
-//! Throws on parse / bind / optimize errors. Iceberg queries are not supported
-//! (no engine-side prefetch is performed) — TPC-H queries are unaffected.
+//! Drive the full sirius planner + meta_pipeline + converter flow on `query` (with the
+//! production optimizer disables) and return `dump_pipeline_conversion_result(...)`; stops
+//! after `converter.convert()` — no GPU execution. Returns a string rather than the raw
+//! result because the result references the function-local plan tree. Reads
+//! `USE_TREE_BASED_PIPELINE_BUILD` at call time; toggle it before each call. Throws on
+//! parse / bind / optimize errors; iceberg queries are unsupported.
 std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query);
 
-//! Like `convert_query_to_dump`, but hands the raw `pipeline_conversion_result` to
-//! `consume` while the plan tree and meta-pipelines are still alive (see the dump
-//! overload's lifetime note — the result must not escape `consume`). Lets tests
-//! inspect the real schedule order, which the canonical dump deliberately sorts away.
+//! Like `convert_query_to_dump`, but hands the raw `pipeline_conversion_result` to `consume`
+//! while the plan tree and meta-pipelines are still alive; the result must not escape
+//! `consume`. Lets tests inspect the real schedule order, which the dump sorts away.
 void with_conversion_result(
   duckdb::Connection& con,
   const std::string& query,
   const std::function<void(pipeline::pipeline_conversion_result&)>& consume);
 
-//! RAII guard that captures and restores the value of
-//! `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD`. The flag is a process-wide
-//! static; differential tests must restore it so other Catch2 test cases observe
-//! the default.
+//! RAII guard that restores `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD` (a process-wide
+//! static) so later test cases observe the default.
 class tree_pipeline_flag_guard {
  public:
   tree_pipeline_flag_guard();
@@ -82,12 +62,10 @@ class tree_pipeline_flag_guard {
 //! Wrap call sites with a `tree_pipeline_flag_guard` so the flag is restored on exit.
 std::string dump_under_flag(duckdb::Connection& con, const std::string& query, bool flag);
 
-//! Path to the 22 canonical TPC-H queries checked into the repo
-//! (`test/tpch_performance/tpch_queries/orig/`).
+//! Path to the canonical TPC-H queries (`test/tpch_performance/tpch_queries/orig/`).
 std::filesystem::path tpch_queries_dir();
 
-//! Read the canonical TPC-H query `q` (1..22) from `tpch_queries_dir()`.
-//! `REQUIRE`s that the file exists.
+//! Read canonical TPC-H query `q` (1..22); throws if the file cannot be opened.
 std::string read_tpch_query_file(int q);
 
 }  // namespace sirius::test

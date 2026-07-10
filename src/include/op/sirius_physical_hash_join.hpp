@@ -278,26 +278,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    std::size_t partition_idx) override;
 
  public:
-  //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN — i.e. its
-  //! execution is owned by the enclosing delim join and it shares a pipeline with its
-  //! lexical sibling sink (PROJECTION) rather than being a standalone pipeline boundary.
-  //! Set in `sirius_physical_right_delim_join`'s constructor; never mutated afterward.
-  //! Consumed by `is_sink()` (to suppress the standalone-sink behavior the base rule
-  //! would otherwise give for a join with `parent_op->type == RIGHT_DELIM_JOIN`) and by
-  //! `build_join_pipelines` (to gate build-side externalization for the synthetic
-  //! DUMMY_SCAN under the inner HJ's build subtree).
+  //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN (set in its
+  //! constructor). The delim join owns its execution: `is_sink()` returns false and
+  //! `build_join_pipelines` skips build-side externalization.
   [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
   void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
 
   // Sink Interface
-  //! Under flag OFF: HJ is unconditionally a sink (legacy converter expectation — the
-  //! legacy split_join_sink rewrites the HJ chain into source-partition-concat-sink shape).
-  //! Under flag ON: HJ is never a sink when it's the inner join of a RIGHT_DELIM_JOIN
-  //! (`_is_delim_join_inner` short-circuits to `false` — its sibling PROJECTION carries
-  //! the pipeline). Otherwise it delegates to the base rule, which makes HJ a sink iff
-  //! `parent_op->type` is PARTITION or RIGHT_DELIM_JOIN. For non-delim HJs the latter
-  //! case is unreachable (HJ is never positioned directly under RIGHT_DELIM_JOIN except
-  //! as `delim.join`, which is short-circuited above).
+  //! Flag OFF: unconditionally a sink (legacy converter expectation). Flag ON: the inner
+  //! join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule applies (sink
+  //! iff parent is PARTITION or RIGHT_DELIM_JOIN).
   bool is_sink() const override
   {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {

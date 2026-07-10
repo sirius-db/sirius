@@ -68,8 +68,7 @@ class sirius_physical_iceberg_scan : public sirius_physical_parquet_scan {
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
-  //! Mirrors DUCKDB_SCAN: under flag ON every Iceberg scan leaf terminates its own
-  //! pipeline. is_source is inherited from sirius_physical_parquet_scan (true).
+  //! Flag ON: every Iceberg scan leaf terminates its own pipeline (mirrors DUCKDB_SCAN).
   bool is_sink() const override { return duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD; }
 
   // -------------------------------------------------------------------------

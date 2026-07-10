@@ -64,10 +64,8 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<sirius::logi
 {
   s_partition_size = hash_partition_bytes;
   _is_build        = is_build;
-  // `key_source` is the downstream consumer that determines partition keys (HJ/NLJ
-  // conditions, HGB/MERGE_GROUP_BY grouping columns, or a CONCAT that chains to one).
-  // We capture its key/type info now and discard the pointer — the inherited
-  // `_parent_op` field is the *tree parent*, stamped later by `set_parent_ops`.
+  // Capture partition keys/types from `key_source` and discard the pointer — the tree
+  // parent is `_parent_op`, stamped later by `set_parent_ops`.
   get_partition_keys_and_type(key_source, is_build);
   _drives_partition_count = _is_build;
 }
@@ -85,13 +83,9 @@ void sirius_physical_partition::build_pipelines(pipeline::sirius_pipeline& curre
     sirius_physical_operator::build_pipelines(current, meta_pipeline);
     return;
   }
-  // Phase 3 (#604) flag-ON protocol. PARTITION is always its own single-operator
-  // pipeline. Its child is guaranteed to be a sink because the child's `_parent_op`
-  // points back at *this PARTITION (set by `set_parent_ops` after wraps), and the
-  // base `is_sink()` returns true whenever the parent is a PARTITION. So we just
-  // create our own meta and dispatch to the child — the child's protocol handles
-  // its own pipeline boundary creation, whether it's an HJ (nested join), a leaf
-  // scan, or an intermediate operator chain.
+  // PARTITION is always its own single-operator pipeline. The child is guaranteed to be
+  // a sink (its `_parent_op` is this PARTITION, so the base `is_sink()` returns true), so
+  // create our own meta and let the child's protocol build its own boundary.
   D_ASSERT(children.size() == 1);
   D_ASSERT(children[0]->is_sink());
   auto& partition_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -160,10 +154,8 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _partition_keys                  = grouped_aggregate_merge_op.get_output_grouping_indices();
 
   } else {
-    // PARTITION's `key_source` must be a key-bearing consumer (HJ/NLJ for join feeders,
-    // HGB/MERGE_GROUP_BY for aggregate feeders). Callers used to pass a CONCAT here, with
-    // PARTITION recursively unwrapping to find the underlying HJ — that legacy path is gone
-    // now that callers pass the join/group-by directly.
+    // `key_source` must be a key-bearing consumer (HJ/NLJ or HGB/MERGE_GROUP_BY);
+    // callers pass the join/group-by directly, never a CONCAT wrapper.
     throw std::runtime_error("Unsupported key_source for partition: " + op->get_name());
   }
 }

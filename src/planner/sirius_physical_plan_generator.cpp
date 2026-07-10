@@ -77,12 +77,8 @@ bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
 }
 
 //! Insert `factory(std::move(parent.children[i]))` between `parent` and its i-th child. The
-//! factory takes ownership of the original child and returns the wrapper subtree (which
-//! must already hold the original as one of its own descendants).
-//!
-//! Move-semantics on `parent.children[i]` guarantees no raw pointer is held across the
-//! mutation: the slot is null between the `std::move` and the assignment, so the compiler
-//! enforces tree integrity. See the master plan (`Tree-mutation pattern`) for the rationale.
+//! factory takes ownership of the original child and must return a wrapper subtree that
+//! already holds the original as a descendant.
 template <typename WrapperFactory>
 void wrap_child(sirius::op::sirius_physical_operator& parent,
                 std::size_t i,
@@ -93,10 +89,8 @@ void wrap_child(sirius::op::sirius_physical_operator& parent,
   parent.children[i] = std::move(wrapper);
 }
 
-//! Replace the operator at `slot` with `factory(std::move(slot))`. Used for sink-wrap rewrites
-//! (HASH_GROUP_BY, ORDER_BY, TOP_N, etc.) where the original operator becomes a child of a
-//! newly-inserted wrapper that sits in the slot it used to occupy. The factory receives
-//! ownership of the original and must return a wrapper subtree containing the original.
+//! Replace the operator at `slot` with `factory(std::move(slot))`: used for sink-wrap rewrites
+//! where the original operator becomes a descendant of the wrapper that now occupies its slot.
 template <typename WrapperFactory>
 void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                 WrapperFactory&& factory)
@@ -105,10 +99,8 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-//! Build a `parquet_ingestible_table_info` describing a parquet read by lifting fields out
-//! of a `sirius_physical_table_scan`. **Destructive**: `scan_op.table_filters` is moved into
-//! the info and `scan_op.table_filters` is left null. Mirrors the field plumbing in today's
-//! `sirius_pipeline_converter::insert_parquet_scan_operator` byte-for-byte.
+//! Build a `parquet_ingestible_table_info` from a TABLE_SCAN; mirrors the legacy converter's
+//! insert_parquet_scan_operator. Destructive: `table_filters` is moved out of the scan.
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
   sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
 {
@@ -131,22 +123,16 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
   info->names               = scan_op.names;
   info->table_filters       = std::move(scan_op.table_filters);
   info->partition_indices   = partition_indices;
-  // Mirror the two trailing fields the legacy `insert_parquet_scan_operator` sets:
-  //   - `scan_output_arity` drives `scan_info::make_provider`'s expected column count.
-  //     Without it, the runtime task emits only the data columns and skips the
-  //     hive-partition columns it should inject post-read, producing a 3-vs-5 column
-  //     mismatch and downstream vector::_M_range_check.
-  //   - `approximate_batch_size` provides the per-task scan batch sizing.
+  // `scan_output_arity` drives the provider's expected column count — without it the runtime
+  // task skips the hive-partition columns it should inject post-read, mis-sizing the output.
   info->scan_output_arity      = scan_op.types.size();
   info->approximate_batch_size = op_params.scan_task_batch_size;
   return info;
 }
 
-//! Build a `duckdb_native_ingestible_table_info` describing a `seq_scan` over a DuckDB base
-//! table by lifting fields out of a `sirius_physical_table_scan`. Mirrors the legacy converter's
-//! `insert_duckdb_native_scan_operator` field plumbing byte-for-byte. Requires a live
-//! `ClientContext` — the ingestible reads the table's storage during `prepare_for_query`.
-//! Throws if the scan is not a base-table `seq_scan` (the only shape the GPU-native path supports).
+//! Build a `duckdb_native_ingestible_table_info` from a `seq_scan` TABLE_SCAN; mirrors the
+//! legacy converter's insert_duckdb_native_scan_operator. Requires a live `ClientContext` (the
+//! ingestible reads table storage during `prepare_for_query`); throws on non-base-table scans.
 std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info>
 build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
                                const sirius::operator_params& op_params,
@@ -213,34 +199,16 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   return info;
 }
 
-//! Rewrite a TABLE_SCAN node so the tree-based converter's `build_pipelines` walk produces
-//! the same pipeline shape the legacy converter assembles at runtime.
-//!
-//! - For `parquet_scan` / `read_parquet`: the legacy
-//!   `sirius_pipeline_converter::insert_parquet_scan_operator` inserts the GPU scan at the
-//!   front of the *same* pipeline as the TABLE_SCAN's downstream operators (no extra
-//!   pipeline). We mirror that here by REPLACING the slot's TABLE_SCAN with the GPU leaf —
-//!   the leaf inherits TABLE_SCAN's position in the plan tree so the walk treats it as the
-//!   source-leaf of the existing pipeline, matching the legacy dump.
-//! - For `seq_scan`: the legacy `sirius_pipeline_converter::insert_duckdb_native_scan_operator`
-//!   lowers the scan to the unified GPU_SCAN operator (built from a
-//!   `duckdb_native_ingestible_table_info`). We mirror the parquet branch and REPLACE the slot's
-//!   TABLE_SCAN with that GPU leaf so the walk treats it as the source-leaf — matching dev, where
-//!   every scan source is a GPU_SCAN.
-//! - For `iceberg_scan`: the legacy
-//!   `sirius_pipeline_converter::split_table_scan_source` creates a *new* pipeline. We
-//!   reproduce that by attaching the GPU leaf as the TABLE_SCAN's only child so the walk
-//!   spins up a child meta-pipeline for it (the wrap pipeline). (Iceberg still emits an
-//!   ICEBERG_SCAN; migrating it to the unified GPU_SCAN is a separate follow-up.)
-//!
-//! For `iceberg_scan`, attaches the pre-fetched `IcebergDeleteData` from
-//! `iceberg_delete_data_cache_` so the GPU operator sees the delete-merge set on every read.
-//! Path resolution mirrors `resolve_iceberg_table_path` exactly; cache misses leave
-//! `delete_data` null, which matches today's converter behavior at
-//! `construct_sirius_specific_operator:65-76`.
-//!
-//! Throws on truly unsupported scan functions to match `construct_sirius_specific_operator`'s
-//! behavior at converter line 80.
+//! Rewrite a TABLE_SCAN so the tree walk produces the same pipeline shape the legacy converter
+//! assembles at runtime:
+//! - `seq_scan` / `parquet_scan` / `read_parquet`: REPLACE the slot with the GPU leaf so it
+//!   inherits the TABLE_SCAN's tree position and stays the source-leaf of the existing
+//!   pipeline (legacy inlines these scans into the current pipeline).
+//! - `iceberg_scan`: attach the leaf as the TABLE_SCAN's only child so the walk spins up a
+//!   child meta-pipeline for it (legacy creates a new pipeline). The pre-fetched
+//!   `IcebergDeleteData` is attached from the cache; a miss leaves `delete_data` null,
+//!   matching legacy.
+//! Throws on unsupported scan functions, matching the legacy converter.
 void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& table_scan_slot,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
@@ -248,9 +216,8 @@ void wrap_table_scan_source(
   const sirius::operator_params& op_params,
   duckdb::ClientContext& context)
 {
-  // Table-in-out functions wear a TABLE_SCAN with children — skip per the master plan's
-  // exclusion rule. Wrapping them would change their child layout in a way the converter
-  // and downstream operators don't expect.
+  // Table-in-out functions wear a TABLE_SCAN with children — skip them; wrapping would change
+  // a child layout the converter and downstream operators don't expect.
   if (!table_scan_slot->children.empty()) { return; }
 
   auto& scan     = table_scan_slot->Cast<sirius::op::sirius_physical_table_scan>();
@@ -263,18 +230,13 @@ void wrap_table_scan_source(
     auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
     leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(ingestible));
-    // seq_scan lowers to the unified GPU_SCAN (mirrors the parquet branch and the legacy
-    // insert_duckdb_native_scan_operator). Replace the TABLE_SCAN in place so the GPU leaf
-    // becomes the pipeline source-leaf — the TABLE_SCAN is dropped (its bind_data / metadata
-    // were lifted into the duckdb_native_ingestible_table_info).
+    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet") {
     auto info = build_parquet_table_info(scan, op_params);
-    // Dynamic filters: mirror the legacy converter's insert_parquet_scan_operator. The
-    // ingestible consumes them for read-time row-group pruning; the DYNAMIC_FILTER operator
-    // wrapped above the scan applies them post-decode. Elide both paths when no producer
-    // was wired during planning — the wrap runs after the whole plan tree is built, so
-    // has_producers() is as settled here as at legacy's convert-time check.
+    // Dynamic filters: the ingestible consumes them for read-time row-group pruning; the
+    // DYNAMIC_FILTER wrapped above applies them post-decode. Elide both when no producer was
+    // wired — the wrap runs after the whole tree is built, so has_producers() is settled here.
     auto dynamic_filters = scan.sirius_dynamic_filters;
     if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
     info->sirius_dynamic_filters = dynamic_filters;
@@ -283,9 +245,8 @@ void wrap_table_scan_source(
     leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(ingestible));
     if (dynamic_filters) {
-      // Wrap the scan leaf: under a PARTITION parent the base is_sink/build_pipelines
-      // protocol emits the legacy [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as sink);
-      // in inline contexts both join the current pipeline in legacy's insertion order.
+      // Under a PARTITION parent this emits the legacy [GPU_SCAN, DYNAMIC_FILTER] pipeline
+      // (filter as sink); in inline contexts both join the current pipeline.
       auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
         scan.types,
         scan.estimated_cardinality,
@@ -294,10 +255,7 @@ void wrap_table_scan_source(
       dynamic_filter_op->children.push_back(std::move(leaf));
       leaf = std::move(dynamic_filter_op);
     }
-    // Parquet: legacy inlines GPU_SCAN into the current pipeline, so replace the TABLE_SCAN
-    // in place rather than attaching as a child (which would make build_pipelines spin up a
-    // separate wrap pipeline). The TABLE_SCAN object is dropped — its bind_data and metadata
-    // have already been lifted into the parquet_ingestible_table_info.
+    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "iceberg_scan") {
     auto iceberg_scan = duckdb::make_uniq<sirius::op::sirius_physical_iceberg_scan>(&scan);
@@ -318,11 +276,9 @@ void wrap_table_scan_source(
   }
 }
 
-//! Attach a leaf CPU_SOURCE operator as the only child of a COLUMN_DATA_SCAN (with non-null
-//! collection), EMPTY_RESULT, or DUMMY_SCAN node. Mirrors the legacy converter's
-//! `split_cpu_source`. COLUMN_DATA_SCAN with a null collection is the LEFT_DELIM_JOIN cached
-//! chunk scan — populated at runtime by the delim-join sink, not by `cpu_source_task` — so
-//! we deliberately leave it as-is.
+//! Attach a leaf CPU_SOURCE as the only child of a COLUMN_DATA_SCAN, EMPTY_RESULT, or
+//! DUMMY_SCAN node; mirrors the legacy converter's split_cpu_source. A null-collection
+//! COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan (filled at runtime) — left as-is.
 void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
 {
   if (!source_op.children.empty()) { return; }
@@ -350,9 +306,7 @@ void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
 }
 
 //! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
-//! original_input`. Mirrors the converter's `split_group_aggregate_sink` HASH_GROUP_BY branch.
-//! The original HGB is kept as the per-thread state sink; PARTITION buckets its output for
-//! the cross-thread merge.
+//! original_input`: the original stays the per-thread sink, PARTITION buckets for the merge.
 void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                         const sirius::operator_params& op_params)
 {
@@ -375,8 +329,7 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 }
 
 //! Replace an UNGROUPED_AGGREGATE slot with `UNGROUPED_AGGREGATE_MERGE → UNGROUPED_AGGREGATE →
-//! original_input`. Mirrors the UNGROUPED branch of `split_group_aggregate_sink`. No PARTITION
-//! step is needed: the merge consumes the single per-thread accumulator directly.
+//! original_input`. No PARTITION: the merge consumes the single per-thread accumulator directly.
 void wrap_ungrouped_aggregate(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> ungrouped_op) {
@@ -399,21 +352,12 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
   });
 }
 
-//! Replace an ORDER_BY slot with the sort chain
-//! `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY → original_input`. Mirrors
-//! `split_order_by_sink` field-for-field including the destructive side-effects:
-//!   - ORDER_BY's `projections` is overwritten with the identity projection over the input's
-//!     types, and its `types` is replaced with the input's types — so the per-batch sort
-//!     keeps every column visible to SORT_SAMPLE / SORT_PARTITION.
-//!   - SORT_SAMPLE is constructed with the sample-sizing params from `op_params`
-//!     (`sort_sample_bytes`, `max_sort_partition_bytes`, `max_sort_partition_memory_fraction`).
-//!   - SORT_PARTITION's `set_sample_op` is wired to the SORT_SAMPLE just inserted.
-//!   - MERGE_SORT receives the original projection back via `set_final_projections` when the
-//!     original was non-identity (otherwise the chain already projects all columns).
-//!
-//! Post-#866/#876: SORT_SAMPLE has `is_sink()==false`, so under the tree-based build it lands
-//! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape) — matching what
-//! `split_order_by_sink` produces on the legacy path.
+//! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
+//! original_input`; mirrors the legacy split_order_by_sink. Destructive: ORDER_BY's
+//! `projections`/`types` are overwritten with the identity over the input's types so every
+//! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
+//! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
+//! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                    const sirius::operator_params& op_params)
 {
@@ -472,13 +416,9 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
   });
 }
 
-//! Wrap a single child of a HASH_JOIN or NESTED_LOOP_JOIN at `join_op.children[child_idx]`
-//! with `CONCAT → PARTITION → original_child`. `is_build` flips the build/probe semantics
-//! threaded through both wrappers. `join_op` is passed verbatim as PARTITION's `key_source`
-//! (HJ conditions or NLJ shape determine partition keys) and as CONCAT's `downstream_join`
-//! (the HJ/NLJ's join type determines CONCAT's batch-coalescing mode). Mirrors the per-side
-//! construction in `split_intermediate_joins` (probe) and `split_join_sink` (build) at
-//! converter:361-371 and 463-491.
+//! Wrap `join_op.children[child_idx]` with `CONCAT → PARTITION → original_child`. `is_build`
+//! flips build/probe semantics in both wrappers; `join_op` is PARTITION's `key_source`
+//! (determines partition keys) and CONCAT's `downstream_join` (picks the coalescing mode).
 void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                      std::size_t child_idx,
                      bool is_build,
@@ -489,9 +429,7 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
   auto* join_op_ptr = &join_op;
   wrap_child(
     join_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
-      // Capture types and cardinality from the original child BEFORE moving it: PARTITION
-      // and CONCAT need them to construct, and after the move into PARTITION the original's
-      // members are no longer addressable.
+      // Capture types/cardinality before the child is moved into PARTITION.
       auto child_types = child_orig->types;
       auto est_card    = child_orig->estimated_cardinality;
 
@@ -513,12 +451,8 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
     });
 }
 
-//! Wrap both children of a HASH_JOIN or NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
-//! chain. Probe side (`children[0]`, `is_build=false`) mirrors
-//! `split_intermediate_joins`; build side (`children[1]`, `is_build=true`) mirrors
-//! `split_join_sink`. If a side is unexpectedly missing (`children.size() < 2`), it is
-//! simply skipped — the join wouldn't be well-formed otherwise and the downstream
-//! operators would have already failed.
+//! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
+//! chain: probe = children[0], build = children[1]. A missing side is skipped.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
                const sirius::operator_params& op_params)
 {
@@ -530,9 +464,8 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
   }
 }
 
-// Forward declaration so `wrap_delim_join` can recurse into the internal `join`/`distinct`
-// subtrees of a DELIM JOIN; those operators are stored as `unique_ptr` fields on the
-// delim-join class, not in `children[]`, so the standard tree walk would otherwise skip them.
+// Forward declaration: wrap_delim_join recurses into a DELIM JOIN's internal `join`/`distinct`
+// subtrees, which live outside `children[]`.
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
@@ -540,18 +473,14 @@ void insert_gpu_pipeline_operators_recursive(
   const sirius::operator_params& op_params,
   duckdb::ClientContext& context);
 
-//! Replace a DELIM JOIN's `distinct_root` (initially the bare DISTINCT) with the chain
-//! `DISTINCT_MERGE -> PARTITION_DISTINCT -> original DISTINCT`. Mirrors `wrap_hash_group_by`
-//! structurally, applied to the `distinct_root` slot rather than a `children[]` entry. The
-//! original DISTINCT aggregate stays reachable via the non-owning `delim_base.distinct`
-//! borrow — the inline per-batch sink path on left/right_delim_join uses that borrow, and
-//! the underlying object never relocates (move-of-unique_ptr only transfers ownership).
+//! Replace a DELIM JOIN's `distinct_root` (the bare DISTINCT) with `DISTINCT_MERGE ->
+//! PARTITION_DISTINCT -> original DISTINCT`. The non-owning `delim_base.distinct` borrow stays
+//! valid — moving a unique_ptr never relocates the object — and the inline sink path uses it.
 void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
                          const sirius::operator_params& op_params)
 {
   if (!delim_base.distinct_root) { return; }
 
-  // distinct_root currently holds the bare original DISTINCT aggregate.
   auto original          = std::move(delim_base.distinct_root);
   auto* original_agg_ptr = &original->Cast<sirius::op::sirius_physical_grouped_aggregate>();
 
@@ -567,40 +496,21 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
     duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(original_agg_ptr);
   merge->children.push_back(std::move(partition));
 
-  // Tag the chain top with the owning DELIM_JOIN so
-  // compute_repository_wiring_tree_based can redirect its tree-parent wiring
-  // (which would otherwise emit merge_top -> DELIM_JOIN) to each delim_scan's
-  // consumer pipeline. Mirrors legacy split_delim_join_sink's retarget.
+  // Tag the chain top with the owning DELIM_JOIN so the tree-parent wiring redirects its
+  // output to each delim_scan's consumer pipeline instead of the DELIM_JOIN itself.
   merge->set_owning_delim_join(&delim_base);
 
   delim_base.distinct_root = std::move(merge);
-  // delim_base.distinct stays valid: the original DISTINCT object never relocates, only its
-  // owning slot moves from delim_base.distinct_root down through the chain.
 }
 
-//! Rewrite the internal subtrees of a DELIM JOIN (LEFT or RIGHT) and wire the sibling
-//! pointers that the operator needs at runtime. Mirrors `split_delim_join_sink`'s
-//! sibling-pointer assignments (converter:750-755) AND the DISTINCT_MERGE/PARTITION_DISTINCT
-//! chain that the legacy converter creates outside the tree (converter:769-841). Both halves
-//! live in the tree under USE_TREE_BASED_PIPELINE_BUILD.
-//!
-//! What this does:
-//!   - Recursively walks `delim->join` so source-side wraps (TABLE_SCAN/CPU_SOURCE family)
-//!     and sink-side wraps (HASH_GROUP_BY/ORDER_BY/TOP_N/UNGROUPED) inside the internal
-//!     join's subtree fire, and so the internal join (if HJ/NLJ) gets the same
-//!     CONCAT/PARTITION wraps on its probe + build that `wrap_join_child` applies to
-//!     top-level joins. This is what plants the `partition_join` candidate node.
-//!   - Recursively walks the children of the original DISTINCT (via `distinct_root->children`,
-//!     because at this point `distinct_root` still holds the bare DISTINCT) so source-side
-//!     wraps below it fire. Then calls `wrap_delim_distinct` to wrap DISTINCT_MERGE +
-//!     PARTITION_DISTINCT above it. Post-order: source-side wraps first, then the chain
-//!     wrap, so the chain wrap doesn't re-visit the freshly-inserted wrappers.
-//!   - For RIGHT_DELIM_JOIN: after the internal-join recursion has wrapped the build side
-//!     with `CONCAT_build -> PARTITION_build -> original_build`, captures the new
-//!     PARTITION_build via `internal_join->children[1]->children[0]` and assigns it to
-//!     `right_delim_join.partition_join`. Matches converter:750-751.
-//!   - For LEFT_DELIM_JOIN: assigns `left_delim_join.column_data_scan` to the COLUMN_DATA_SCAN
-//!     at `internal_join->children[0]`. Matches converter:753-754.
+//! Rewrite a DELIM JOIN's internal subtrees and wire the sibling pointers the operator needs
+//! at runtime (mirrors the legacy split_delim_join_sink, whose distinct chain lived outside
+//! the tree; here both halves live in the tree):
+//!   - recurse into `delim->join` so its source/sink/join wraps fire — this plants the
+//!     CONCAT/PARTITION chain on the internal join's build side;
+//!   - recurse into the bare DISTINCT's children first, then wrap_delim_distinct above it,
+//!     so the chain wrap never re-visits the freshly-inserted wrappers;
+//!   - RIGHT_DELIM_JOIN: point `partition_join` at the freshly-inserted build-side PARTITION.
 void wrap_delim_join(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
@@ -610,17 +520,11 @@ void wrap_delim_join(
 {
   auto& delim_base = slot->Cast<sirius::op::sirius_physical_delim_join>();
 
-  // Recurse into the internal join + distinct subtrees so their source/sink/join wraps fire.
-  // This is what produces the CONCAT_build/PARTITION_build chain on the internal join's
-  // build side (when the internal join is HJ/NLJ) that the RIGHT_DELIM sibling pointer
-  // references.
   if (delim_base.join) {
     insert_gpu_pipeline_operators_recursive(delim_base.join, iceberg_cache, op_params, context);
   }
   if (delim_base.distinct_root) {
-    // At this point `distinct_root` still holds the bare original DISTINCT (wrap_delim_distinct
-    // hasn't run yet). Recurse into its children for source-side wraps below DISTINCT, then
-    // wrap MERGE/PARTITION above.
+    // `distinct_root` still holds the bare DISTINCT: wrap below it first, then above.
     for (auto& child_slot : delim_base.distinct_root->children) {
       insert_gpu_pipeline_operators_recursive(child_slot, iceberg_cache, op_params, context);
     }
@@ -630,10 +534,8 @@ void wrap_delim_join(
   if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& right_delim = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
 
-    // Tag the bare DISTINCT so its `build_pipelines` becomes a no-op.
-    // RIGHT_DELIM_JOIN::sink runs `distinct->execute` and `distinct->sink` inline,
-    // so the bare DISTINCT contributes nothing to any pipeline (matches legacy's
-    // partition_distinct pipeline which has operators=[PARTITION] only).
+    // Tag the bare DISTINCT so its `build_pipelines` is a no-op: the delim-join sink runs
+    // `distinct->execute`/`sink` inline, so it contributes nothing to any pipeline.
     if (right_delim.distinct) { right_delim.distinct->set_owned_by_delim_join(true); }
 
     auto* internal_join = delim_base.join.get();
@@ -652,30 +554,17 @@ void wrap_delim_join(
   } else if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
     auto& left_delim = slot->Cast<sirius::op::sirius_physical_left_delim_join>();
 
-    // Same tagging as RIGHT_DELIM_JOIN above: tag the bare DISTINCT so its
-    // build_pipelines becomes a no-op. LEFT_DELIM_JOIN::sink runs
-    // `distinct->execute` and `distinct->sink` inline; the bare DISTINCT
-    // contributes nothing to any pipeline.
-    //
-    // The cached chunk scan (`left_delim.column_data_scan`) is already recorded
-    // and flagged in LEFT_DELIM_JOIN's constructor — we can't recover the same
-    // pointer here because wrap_join (which already ran above) replaced
-    // internal_join->children[0] with a CONCAT/PARTITION wrap chain.
+    // Same DISTINCT tagging as the RIGHT branch. The cached chunk scan
+    // (`left_delim.column_data_scan`) was already recorded in LEFT_DELIM_JOIN's constructor;
+    // it can't be recovered here — wrap_join already buried it under a CONCAT/PARTITION chain.
     if (left_delim.distinct) { left_delim.distinct->set_owned_by_delim_join(true); }
   }
 }
 
-//! Post-order recursive walk over the physical plan tree. Children are visited (and rewritten)
-//! before the dispatch on `slot->type`, so a later `wrap_above` cannot re-enter the freshly-
-//! inserted wrapper subtree and double-wrap the original node. Source-side wraps append a leaf
-//! to an existing TABLE_SCAN/COLUMN_DATA_SCAN/EMPTY_RESULT/DUMMY_SCAN node, growing it from a
-//! leaf into an intermediate; the new leaf has no children of its own, so post-order is
-//! equivalent to pre-order in those cases. Sink-side wraps replace the slot with a wrapper
-//! subtree whose root sits above the original sink; the new wrapper nodes are not visited
-//! because the walk has already moved past the slot. Join-side wraps replace each child of a
-//! HJ/NLJ with a CONCAT/PARTITION chain; the chain's original child (the already-walked
-//! probe/build subtree) is moved into PARTITION's child slot. DELIM JOIN handling recurses
-//! into the internal `join`/`distinct` fields (which live outside `children[]`).
+//! Post-order recursive walk over the plan tree: children are rewritten before the dispatch on
+//! `slot->type`, so freshly-inserted wrapper subtrees are never re-visited and no node can be
+//! double-wrapped. DELIM JOIN recurses into its internal `join`/`distinct` fields, which live
+//! outside `children[]`.
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>&
@@ -696,11 +585,8 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: wrap_cpu_source(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
-      // Skip the CPU_SOURCE wrap for the synthetic DUMMY_SCAN inserted as a
-      // RIGHT_DELIM_JOIN's build placeholder — it carries no runtime data flow
-      // (partition_join executes inline via DELIM_JOIN's sink) so the CPU_SOURCE
-      // leaf would only materialize a phantom pipeline. Real DUMMY_SCAN usages
-      // (constant-row subqueries) keep the wrap.
+      // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data flow, so a
+      // CPU_SOURCE leaf would only materialize a phantom pipeline; real DUMMY_SCANs keep it.
       auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
       if (!dummy.is_delim_join_placeholder()) { wrap_cpu_source(*slot); }
       break;
@@ -752,19 +638,11 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
 {
   op.set_parent_op(parent);
 
-  // CTE is transparent for data flow on its consumer side (children[1]): the
-  // CTE body (children[0]) materializes INTO CTE, while children[1] is the
-  // outer query that reads from the CTE via CTE_SCAN and whose result IS
-  // CTE's output (`sirius_physical_cte::execute` just forwards children[1]'s
-  // batches). Set children[1]'s parent_op to CTE's own parent so the
-  // tree-parent walk in `compute_repository_wiring_tree_based` doesn't emit
-  // `consumer_sink -> CTE_pipeline` edges. Such an edge, combined with the
-  // CTE sink's `CTE_pipeline -> CTE_SCAN_consumer` emissions
-  // (`sirius_pipeline_converter.cpp:1146-1158`), would close a cycle that
-  // `dump_pipeline_conversion_result::compute_sig` infinite-loops on (q15
-  // SIGSEGV — only TPC-H query that exercises CTE_SCAN). Mirrors legacy's
-  // wiring graph where the CTE consumer side never wires back to the CTE
-  // sink.
+  // CTE is transparent on its consumer side: children[0] materializes into the CTE while
+  // children[1]'s result IS the CTE's output (CTE::execute just forwards it). Stamp
+  // children[1] with CTE's own parent so the tree-parent wiring never emits
+  // consumer_sink -> CTE_pipeline edges, which would close a cycle with the CTE sink's own
+  // CTE_pipeline -> consumer emissions.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE) {
     D_ASSERT(op.children.size() == 2);
     set_parent_ops(*op.children[0], &op);
@@ -775,28 +653,20 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   for (auto& child : op.children) {
     if (child) { set_parent_ops(*child, &op); }
   }
-  // DELIM JOIN stores its internal `join` and `distinct_root` subtrees as unique_ptr fields
-  // outside `children[]`. Descend into them so the wrapped operators inside (the join's
-  // CONCAT/PARTITION wraps and the distinct chain's MERGE/PARTITION) get their `_parent_op`
-  // set to their tree parent. PARTITION's ctor takes a `key_source` argument that is
-  // captured for key/type derivation only and never stored (separated from the tree-parent
-  // role here), so without this descent PARTITION._parent_op stays nullptr and
-  // compute_repository_wiring_tree_based can't resolve its destination.
+  // DELIM JOIN keeps its internal `join`/`distinct_root` subtrees outside `children[]`;
+  // descend so the wrapped operators inside get tree parents. PARTITION's ctor `key_source`
+  // is captured for key/type derivation only and never stored, so without this descent its
+  // `_parent_op` stays null and the wiring can't resolve its destination.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
       op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
     if (delim.join) { set_parent_ops(*delim.join, &op); }
     if (delim.distinct_root) { set_parent_ops(*delim.distinct_root, &op); }
   }
-  // RESULT_COLLECTOR stores its tree child in `plan` (a reference, outside `children[]`) —
-  // it's the engine-injected root wrapper added by `sirius_pending_statement_internal`
-  // (`src/sirius_interface.cpp:166`), used by BOTH `CALL gpu_execution()` and transparent
-  // execution. Without descending here the wrapped sink (e.g. MERGE_TOP_N) gets
-  // `_parent_op = nullptr` and `compute_repository_wiring_tree_based` silently skips its
-  // emit at the uniform tree-parent lookup, leaving the RESULT_COLLECTOR pipeline with no
-  // input source — runtime hang. Not caught by the differential conversion test because
-  // `convert_query_to_dump` builds plans by calling `physical_planner.create_plan()`
-  // directly, bypassing the wrapping path.
+  // RESULT_COLLECTOR keeps its tree child in `plan` (a reference, outside `children[]`) —
+  // it's the engine-injected root wrapper. Without descending, the wrapped sink's `_parent_op`
+  // stays null and the wiring silently leaves the RESULT_COLLECTOR pipeline with no input
+  // source — runtime hang.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     auto& rc = op.Cast<sirius::op::sirius_physical_result_collector>();
     set_parent_ops(rc.plan, &op);
@@ -806,11 +676,8 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
 void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
 {
-  // op_params live on SiriusContext alongside the cache_level / quent config. Sink wraps
-  // (HASH_GROUP_BY, ORDER_BY) need `hash_partition_bytes` and `max_sort_partition_bytes` to
-  // match the legacy converter's `op_params_` reads at line 544 and line 624. Use empty
-  // defaults if SiriusContext is missing — the resulting wraps fall back to the operators'
-  // own constructor defaults, which match converter behavior when the context is absent.
+  // Sink wraps need the sizing params from SiriusContext. If it's missing, default-constructed
+  // op_params make the wraps fall back to the operators' own constructor defaults.
   sirius::operator_params op_params;
   if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     op_params = sirius_ctx->get_config().get_operator_params();
@@ -842,10 +709,6 @@ std::string sirius_physical_plan_generator::resolve_iceberg_table_path(
 void sirius_physical_plan_generator::prefetch_iceberg_delete_data(
   sirius::op::sirius_physical_operator& plan)
 {
-  // Walk the plan tree and fully materialize delete data for every iceberg scan, mirroring
-  // `sirius_engine::prefetch_iceberg_delete_data`. The engine's variant still runs for the
-  // flag-off (legacy converter) path; this variant feeds the tree-based wrap performed by
-  // `wrap_table_scan_source` later in `create_plan`.
   if (plan.type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     if (plan.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       auto& collector = plan.Cast<sirius::op::sirius_physical_result_collector>();
@@ -865,11 +728,9 @@ void sirius_physical_plan_generator::prefetch_iceberg_delete_data(
   if (table_path.empty()) { return; }
   if (iceberg_delete_data_cache_.count(table_path)) { return; }  // already fetched
 
-  // Iceberg delete-data reading is disabled in this build: the metadata reader
-  // (src/op/scan/iceberg_metadata_reader.cpp) is stale against the new io interface and is
-  // excluded from the build. Treat every iceberg table as having no delete files (V1
-  // semantics) so positional/equality deletes are simply not applied rather than producing an
-  // undefined-symbol link error. Mirrors sirius_engine::prefetch_iceberg_delete_data.
+  // Iceberg delete-data reading is disabled in this build (the metadata reader is excluded,
+  // stale against the new io interface), so treat every table as having no delete files
+  // (V1 semantics). Mirrors sirius_engine::prefetch_iceberg_delete_data.
   SIRIUS_LOG_WARN(
     "[sirius_physical_plan_generator] iceberg delete-data reading is disabled; treating '{}' as "
     "having no deletes.",
@@ -949,15 +810,10 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   plan = fold_adjacent_projections(std::move(plan));
   plan->verify();
 
-  // Phase 3 (#601) tree-based pipeline build. When the flag is on, rewrite the plan tree to
-  // contain GPU pipeline operators (PARTITION/CONCAT/MERGE_*/SORT_*/scan companions/etc.)
-  // so the converter becomes a pure topology pass driven by `build_pipelines` virtuals.
-  // Default off; the legacy `sirius_pipeline_converter` is authoritative when the flag is
-  // off. Iceberg delete data is pre-fetched before the tree rewrite so
-  // `wrap_table_scan_source` can attach `delete_data` to each `sirius_physical_iceberg_scan`
-  // it constructs. `set_parent_ops` then derives every operator's `_parent_op` from the
-  // final tree, enabling the tree-parent-lookup wiring in `build_pipelines` and the
-  // converter.
+  // Tree-based pipeline build: rewrite the plan tree to contain the GPU pipeline operators so
+  // the converter becomes a pure topology pass over `build_pipelines` virtuals. Delete data is
+  // pre-fetched first so the scan wrap can attach it; `set_parent_ops` then derives every
+  // `_parent_op` from the final tree for the tree-parent-lookup wiring.
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
     prefetch_iceberg_delete_data(*plan);
     insert_gpu_pipeline_operators(plan);

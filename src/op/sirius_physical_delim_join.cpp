@@ -73,12 +73,9 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
 {
   D_ASSERT(join->children.size() == 2);
 
-  // The inner join becomes the `delim.join` of this RIGHT_DELIM_JOIN — owned by us,
-  // executed inline by our `sink()`, and never a standalone pipeline sink. Tag it
-  // explicitly so the join's `is_sink()` and build-side externalization gate skip the
-  // rule that would otherwise treat it as one. Scoped to RIGHT_DELIM_JOIN only;
-  // LEFT_DELIM_JOIN's inner join feeds a real build subtree and must keep standard
-  // externalization.
+  // The inner join is executed inline by our sink() and is never a standalone pipeline
+  // sink — tag it so is_sink() and the build-side externalization gate skip it.
+  // RIGHT_DELIM_JOIN only: LEFT's inner join feeds a real build subtree.
   if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(join.get())) {
     hj->set_delim_join_inner(true);
   } else if (auto* nlj = dynamic_cast<sirius_physical_nested_loop_join*>(join.get())) {
@@ -87,11 +84,9 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
 
   children.push_back(std::move(join->children[1]));
 
-  // Mark the synthetic DUMMY_SCAN so plan-gen's wrap_cpu_source skips attaching a
-  // CPU_SOURCE leaf below it. The placeholder carries no runtime data flow
-  // (RIGHT_DELIM_JOIN::sink invokes partition_join inline), so the CPU_SOURCE wrap
-  // would be plan-time scaffolding that materializes a phantom [CPU_SOURCE] pipeline
-  // with no legacy counterpart.
+  // Mark the placeholder so wrap_cpu_source skips it: it carries no runtime data
+  // (sink() runs partition_join inline), so a CPU_SOURCE wrap would materialize a
+  // phantom pipeline.
   auto dummy_placeholder =
     duckdb::make_uniq<sirius_physical_dummy_scan>(children[0]->get_types(), estimated_cardinality);
   dummy_placeholder->set_delim_join_placeholder(true);
@@ -121,13 +116,9 @@ sirius_physical_left_delim_join::sirius_physical_left_delim_join(
     nullptr);
   if (delim_idx.IsValid()) { cached_chunk_scan->cte_index = delim_idx.GetIndex(); }
 
-  // LEFT_DELIM_JOIN ownership wiring (#604): record the cached chunk scan as a
-  // borrow ptr now — wrap_delim_join's LEFT branch can't recover this reference
-  // post-wrap_join because internal_join->children[0] becomes a CONCAT wrapper.
-  // Also tag the scan so its build_pipelines is a no-op: LEFT_DELIM_JOIN::sink
-  // invokes column_data_scan->execute and column_data_scan->sink inline
-  // (analogous to RIGHT_DELIM_JOIN's partition_join), so it never carries
-  // standalone pipeline data.
+  // Record the cached chunk scan now — after wrap_join, internal_join->children[0]
+  // becomes a CONCAT and the reference is unrecoverable. Tag it so build_pipelines is a
+  // no-op: our sink() executes the scan inline, so it never carries pipeline data.
   column_data_scan = cached_chunk_scan.get();
   cached_chunk_scan->set_owned_by_delim_join(true);
 
@@ -157,21 +148,12 @@ void sirius_physical_left_delim_join::build_pipelines(pipeline::sirius_pipeline&
   join->build_pipelines(current, meta_pipeline);
 
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && distinct_root) {
-    // Spawn a child meta_pipeline rooted at the distinct chain. After
-    // wrap_delim_distinct, distinct_root holds
-    // `DISTINCT_MERGE -> PARTITION_DISTINCT -> original DISTINCT`; building from it
-    // produces the chain's three pipelines via the standard recursive walk. Mirrors
-    // split_delim_join_sink's external chain construction but reachable via the plan
-    // tree. Sibling of child_meta_pipeline under meta_pipeline; data dependency on
-    // the original DISTINCT's per-thread output (populated by child_meta_pipeline's
-    // LHS) sequences this meta after child_meta_pipeline. Under flag OFF,
-    // distinct_root holds the bare DISTINCT and the legacy converter still owns
-    // chain construction — skip the spawn there.
-    //
-    // distinct_meta is created with distinct_root pre-populated as its sink, so walk
-    // into distinct_root's child rather than re-building distinct_root itself — calling
-    // build_pipelines on distinct_root would re-trigger its sink protocol and produce a
-    // duplicate child meta with the same sink, doubling the MERGE_GROUP_BY pipeline.
+    // Spawn a child meta rooted at the distinct chain
+    // (DISTINCT_MERGE -> PARTITION_DISTINCT -> DISTINCT); the standard walk produces its
+    // three pipelines, sequenced after child_meta_pipeline by the data dependency on the
+    // original DISTINCT's per-thread output. distinct_root is pre-populated as the meta's
+    // sink, so build from its child — re-building distinct_root would re-trigger its sink
+    // protocol and duplicate the MERGE_GROUP_BY pipeline.
     auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);
     if (!distinct_root->children.empty()) { distinct_meta.build(*distinct_root->children[0]); }
   }
@@ -195,23 +177,14 @@ void sirius_physical_right_delim_join::build_pipelines(
       duckdb::reference<pipeline::sirius_pipeline>(*child_meta_pipeline.get_base_pipeline())));
   }
 
-  // Under USE_TREE_BASED_PIPELINE_BUILD, wrap_delim_join recursed into delim->join
-  // and wrap_join inserted CONCAT_build → PARTITION_build → original_build as
-  // internal_join.children[1]. The modified build_join_pipelines (build_rhs=true)
-  // consumes that chain into build_meta + partition_meta + deeper_meta — handling
-  // the internal join's build side via the plan tree rather than via the legacy
-  // converter's runtime partition_join construction. Under flag OFF, build_rhs=false
-  // preserves today's behavior (legacy converter builds partition_join at runtime).
+  // Flag ON: wrap_join already inserted CONCAT_build → PARTITION_build → original_build
+  // as the inner join's children[1]; build_join_pipelines(build_rhs=true) consumes that
+  // chain via the plan tree. Flag OFF keeps the legacy runtime partition_join path.
   //
-  // In a nested RIGHT_DELIM_JOIN plan (e.g. q21 parquet), the inner RDJ's
-  // build_pipelines is called with `current` already containing the outer RDJ as
-  // its pre-populated sink. Routing *join (inner HJ) through the standard
-  // build_join_pipelines path would add it to that same pipeline, fusing
-  // source:HJ,sink:RDJ instead of producing two standalone pipelines. Mirror
-  // legacy's split_delim_join_sink: when `current`'s sink is a barrier op
-  // (RIGHT_DELIM_JOIN or PARTITION), route *join into its own standalone child
-  // meta pipeline instead. INNER_HJ fusing with other op types (PROJECTION, FILTER,
-  // etc.) is correct and does not trigger the split.
+  // Nested RIGHT_DELIM_JOIN: `current` may already carry a barrier op (RDJ/PARTITION) as
+  // its pre-populated sink; routing *join through it would fuse the inner join into that
+  // pipeline. Split it into its own child meta instead — fusing with non-barrier ops
+  // (PROJECTION, FILTER, ...) is correct.
   auto current_ops = current.get_operators();
   const bool needs_split =
     duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && !current_ops.empty() &&
@@ -221,9 +194,7 @@ void sirius_physical_right_delim_join::build_pipelines(
   if (needs_split) {
     auto& join_meta = meta_pipeline.create_child_meta_pipeline(current, *join);
     auto& join_base = *join_meta.get_base_pipeline();
-    // create_child_meta_pipeline pre-populates join_base.operators=[join] (USE_TREE path).
-    // Clear it so build_join_pipelines re-adds join via add_pipeline_operator in the
-    // correct join_meta context — probe/build recursion then stays inside join_meta.
+    // Clear the pre-populated [join] so build_join_pipelines re-adds it within join_meta.
     meta_pipeline.get_state().set_pipeline_operators(join_base, {});
     sirius_physical_hash_join::build_join_pipelines(
       join_base, join_meta, *join, duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD);
@@ -233,11 +204,8 @@ void sirius_physical_right_delim_join::build_pipelines(
   }
 
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && distinct_root) {
-    // Spawn a child meta_pipeline rooted at the distinct chain. See
-    // LEFT_DELIM_JOIN's identical comment block above for the full reasoning,
-    // including the rationale for walking distinct_root's child rather than
-    // distinct_root itself (avoids duplicate-sink meta under the new is_sink
-    // protocol).
+    // Spawn the distinct-chain child meta; see LEFT_DELIM_JOIN above for why we build
+    // from distinct_root's child rather than distinct_root itself.
     auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);
     if (!distinct_root->children.empty()) { distinct_meta.build(*distinct_root->children[0]); }
   }

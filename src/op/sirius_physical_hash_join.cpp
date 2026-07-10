@@ -392,25 +392,19 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
   duckdb::optional_ptr<pipeline::sirius_meta_pipeline> last_child_ptr;
   if (build_rhs) {
     if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      // Phase 3 (#604): plan-time wrap_join already inserted
-      // CONCAT_build → PARTITION_build → original_build as op.children[1]. Use CONCAT_build
-      // as the build_meta sink (not `op`) so we don't emit a redundant single-operator
-      // [op] build pipeline — legacy's split_join_sink eliminates that via sink promotion
-      // and we mirror the result. Recurse past CONCAT_build into its child so
-      // CONCAT_build.build_pipelines doesn't create a duplicate sink=CONCAT_build meta.
+      // Plan-time wrap_join inserted CONCAT_build → PARTITION_build → original_build as
+      // op.children[1]. Use CONCAT_build as the build_meta sink (not `op`) to avoid a
+      // redundant [op] build pipeline, and recurse past it so CONCAT_build's own
+      // build_pipelines doesn't create a duplicate sink meta.
       auto& build_child = *op.children[1];
       D_ASSERT(build_child.is_sink());
       D_ASSERT(!build_child.children.empty());
       auto& build_meta = meta_pipeline.create_child_meta_pipeline(current, build_child);
 
-      // When `op` is the inner join of a RIGHT_DELIM_JOIN, the build subtree below
-      // CONCAT_build is synthetic scaffolding — PARTITION_build/partition_join +
-      // DUMMY_SCAN placeholder. partition_join is owned by the DELIM_JOIN and
-      // executed inline (RIGHT_DELIM_JOIN::sink), and DUMMY_SCAN never produces
-      // runtime data. Skip the recursion so PARTITION_build, DUMMY_SCAN, and (the
-      // now-absent) CPU_SOURCE don't materialize their own pipelines. build_meta
-      // still finalizes to a [CONCAT_build] single-op pipeline via is_ready,
-      // matching legacy split_delim_join_sink's [CONCAT] pipeline.
+      // For the inner join of a RIGHT_DELIM_JOIN, the subtree below CONCAT_build is
+      // synthetic scaffolding: partition_join runs inline in the delim join's sink and
+      // the DUMMY_SCAN placeholder carries no runtime data. Skip the recursion; build_meta
+      // still finalizes to a [CONCAT_build] single-op pipeline (legacy's [CONCAT] shape).
       bool is_delim_inner = false;
       if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(&op)) {
         is_delim_inner = hj->is_delim_join_inner();
@@ -448,12 +442,9 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
   auto& join_op           = op.Cast<sirius_physical_hash_join>();
   if (join_op.is_source()) { add_child_pipeline = true; }
 
-  // Phase 3 (#604): legacy create_child_pipeline emits a pipeline whose state.source = op
-  // (the HJ). Under flag OFF, schedule_and_copy_pipelines' HJ-source filter drops it,
-  // making the call a no-op. Under flag ON, is_ready resets `source = operators.front()`
-  // (whatever sits below HJ in the chain — e.g. PROJECTION), so neither the gated filter
-  // nor any downstream stage detects/removes the pipeline; it leaks into scheduled_ as a
-  // phantom. Skip the call under flag ON to match the legacy net effect.
+  // create_child_pipeline emits an HJ-source pipeline that the legacy scheduler filter
+  // drops (net no-op). Under flag ON, is_ready resets source to operators.front(), the
+  // filter misses it, and the phantom would leak into the schedule — skip the call.
   if (add_child_pipeline && !duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
     meta_pipeline.create_child_pipeline(current, op, last_pipeline);
   }
@@ -467,9 +458,8 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
     return;
   }
 
-  // Phase 3 (#604) flag-ON protocol. The new is_sink() returns true iff our tree parent
-  // is a PARTITION (nested-join case); otherwise HJ feeds a downstream chain (HJ_top
-  // case) and contributes to that chain's pipeline as the source operator.
+  // Flag-ON protocol: is_sink() is true iff the tree parent is a PARTITION (nested-join
+  // case); otherwise HJ contributes to the downstream chain's pipeline as its source.
   pipeline::sirius_meta_pipeline* host_meta;
   pipeline::sirius_pipeline* host_current;
   if (is_sink()) {
@@ -482,10 +472,9 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
     host_current = &current;
   }
 
-  // Both sides feed HJ through a CONCAT wrap inserted at plan-gen time. Create explicit
-  // child metas for build (children[1]) and probe (children[0]) — both are CONCAT sinks
-  // whose own single-op pipelines we materialize here, then recurse past CONCAT into its
-  // PARTITION child so CONCAT doesn't redundantly create its own meta down the call.
+  // Both sides feed HJ through plan-gen CONCAT wraps. Create a child meta per side (each
+  // a CONCAT-sink single-op pipeline) and recurse past the CONCAT so it doesn't
+  // redundantly create its own meta.
   D_ASSERT(children.size() == 2);
   auto& build_child = *children[1];
   D_ASSERT(build_child.is_sink());

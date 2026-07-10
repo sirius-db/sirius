@@ -46,15 +46,12 @@ class sirius_physical_delim_join : public sirius_physical_operator {
     duckdb::optional_idx delim_idx);
 
   duckdb::unique_ptr<sirius_physical_operator> join;
-  //! Owns the top of the distinct subtree. Under USE_TREE_BASED_PIPELINE_BUILD=false
-  //! this holds the bare original DISTINCT aggregate; under flag ON, after
-  //! wrap_delim_distinct runs, it holds the
-  //! `DISTINCT_MERGE -> PARTITION_DISTINCT -> original DISTINCT` chain.
+  //! Owns the distinct subtree top: the bare DISTINCT under flag OFF, or the
+  //! `DISTINCT_MERGE -> PARTITION_DISTINCT -> DISTINCT` chain after wrap_delim_distinct
+  //! under flag ON.
   duckdb::unique_ptr<sirius_physical_operator> distinct_root;
-  //! Non-owning borrow of the original DISTINCT aggregate, used by the inline
-  //! per-batch sink path and by callers that need the grouped-aggregate-specific
-  //! interface. Always points at the bottom of the distinct subtree, regardless
-  //! of whether wrap_delim_distinct has wrapped MERGE/PARTITION above it.
+  //! Non-owning borrow of the original DISTINCT (always the subtree bottom), for the
+  //! inline per-batch sink path and grouped-aggregate-specific callers.
   sirius_physical_grouped_aggregate* distinct = nullptr;
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans;
 

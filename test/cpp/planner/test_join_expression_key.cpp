@@ -43,9 +43,8 @@ using namespace duckdb;
 
 namespace {
 
-/// On-disk single-file DuckDB path (RAII). The GPU-native seq_scan ingestible requires a
-/// single-file block manager, so these plan-construction tests need an on-disk database rather
-/// than :memory:. Mirrors scoped_temp_db_path in test_distinct_hash_join_detection.cpp.
+/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
+/// block managers, so these tests need an on-disk database rather than :memory:.
 class scoped_temp_db_path {
  public:
   scoped_temp_db_path()
@@ -200,8 +199,7 @@ struct join_expression_key_fixture {
 
   ~join_expression_key_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
-  // Declared before db/con so the backing file outlives the database (reverse
-  // destruction order: con, then db, then the temp file removal).
+  // Declared before db/con so the backing file outlives the database.
   scoped_temp_db_path _db_path;
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;

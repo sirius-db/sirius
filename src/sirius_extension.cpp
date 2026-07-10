@@ -1764,9 +1764,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
 
-  // Tree-based pipeline build toggle. See Config::USE_TREE_BASED_PIPELINE_BUILD in
-  // config.hpp for the design rationale. Default true: a differential dump test
-  // confirms byte-identical pipeline state vs the legacy converter on every TPC-H SF1 plan.
+  // Tree-based pipeline build toggle; see Config::USE_TREE_BASED_PIPELINE_BUILD in config.hpp.
   config.AddExtensionOption(
     "use_tree_based_pipeline_build",
     "Build pipelines from the operator tree (build_pipelines virtuals) instead of "

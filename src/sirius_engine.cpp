@@ -341,13 +341,10 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
     static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size())};
 
-  // The plan tree handed to the engine here is the RESULT_COLLECTOR wrap added by
-  // `sirius_pending_statement_internal` AFTER the plan generator's own `set_parent_ops` ran.
-  // Re-walk under the tree-based path so the wrapped child (RESULT_COLLECTOR's `plan`) has
-  // its `_parent_op` pointing at RESULT_COLLECTOR — required for the tree-parent-driven
-  // wiring in `compute_repository_wiring_tree_based` to route the final sink pipeline's
-  // output to the RESULT_COLLECTOR pipeline. Gated by the flag because the legacy converter
-  // path relies on per-op-ctor-set `_parent_op` values that this re-walk would overwrite.
+  // The RESULT_COLLECTOR wrap is added after the plan generator's own `set_parent_ops` ran;
+  // re-walk so the wrapped child's `_parent_op` points at RESULT_COLLECTOR (the tree-parent
+  // wiring needs it to route the final sink pipeline's output there). Flag-gated: the legacy
+  // path relies on ctor-set `_parent_op` values this re-walk would overwrite.
   if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
     sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                     /*parent=*/nullptr);
