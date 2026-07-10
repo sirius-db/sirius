@@ -86,6 +86,12 @@ struct vis_test_db {
   {
     db  = std::make_unique<duckdb::DuckDB>(path);
     con = std::make_unique<duckdb::Connection>(*db);
+    // The statically linked extension auto-loads into every instance; if an
+    // earlier test leaked SIRIUS_DISABLE unset, a SiriusContext auto-inits
+    // and transparent GPU execution would serve the SQL oracle below from the
+    // MVCC-blind native scan. Pin this connection to CPU; ignore the result
+    // so builds without the setting still run.
+    con->Query("SET gpu_execution = false;");
   }
 
   /// Close and reopen so persisted state (e.g. checkpointed tombstones) comes
