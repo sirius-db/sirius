@@ -32,9 +32,14 @@ void metadata_store::register_metadata(sirius_io_object const& obj,
 std::shared_ptr<sirius_io_object_metadata> metadata_store::get_metadata(
   sirius_io_object const& obj) const
 {
-  auto const& key = obj.raw_file_cache_id();
+  return get_metadata(obj.raw_file_cache_id());
+}
+
+std::shared_ptr<sirius_io_object_metadata> metadata_store::get_metadata(
+  std::string const& cache_key) const
+{
   std::shared_lock lk(_mtx);
-  auto it = _by_key.find(key);
+  auto it = _by_key.find(cache_key);
   if (it == _by_key.end()) return nullptr;
   return it->second;
 }

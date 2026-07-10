@@ -72,4 +72,16 @@ std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string pat
   return std::make_unique<sirius_datasource>(shared_from_this(), create_io_object(std::move(path)));
 }
 
+std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path, open_hint hint)
+{
+  return std::make_unique<sirius_datasource>(shared_from_this(),
+                                             create_io_object(std::move(path), hint));
+}
+
+std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
+                                                                 open_hint /*hint*/)
+{
+  return create_io_object(std::move(path));
+}
+
 }  // namespace sirius::io

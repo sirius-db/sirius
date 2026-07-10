@@ -58,6 +58,11 @@ class metadata_store {
   [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
     sirius_io_object const& obj) const;
 
+  /// As above but keyed directly by @c raw_file_cache_id() — for callers that
+  /// know the path but have not built an io_object yet.  Returns nullptr on miss.
+  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
+    std::string const& cache_key) const;
+
  private:
   mutable std::shared_mutex _mtx;
   std::unordered_map<std::string, std::shared_ptr<sirius_io_object_metadata>> _by_key;
