@@ -62,7 +62,6 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table
       table_scan,  // Pass pointer to the table scan for filter pushdown
       std::move(gpu_device_ids))
 {
-  dynamic_filters        = table_scan->dynamic_filters;
   sirius_dynamic_filters = table_scan->sirius_dynamic_filters;
 }
 

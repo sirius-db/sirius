@@ -16,9 +16,10 @@
 
 /**
  * @file test_preserve_dynamic_filter_metadata.cpp
- * @brief Tests for the transparent-optimizer post-Copy fixup helpers
- *        (sirius::transparent::detail::clone_filter_pushdown_info,
- *         sirius::transparent::detail::preserve_dynamic_filter_metadata).
+ * @brief Tests for the version-pinned adapter's post-Copy fixup helpers
+ *        (sirius::planner::duckdb_join_filter_candidate_adapter — preservation entry point and
+ *         its detail::clone_filter_pushdown_info helper), used by the transparent execution
+ *         path's copy_logical_plan.
  *
  * LogicalOperator::Copy round-trips through serialize/deserialize. LogicalComparisonJoin's
  * filter_pushdown and LogicalGet's dynamic_filters are not in the serialization schemas, so the
@@ -27,7 +28,7 @@
  * identity that downstream wiring (Phase 1.1 of dynamic filter pushdown) relies on.
  */
 
-#include "transparent/sirius_optimizer_extension.hpp"
+#include "planner/duckdb_join_filter_candidate_adapter.hpp"
 
 #include <catch.hpp>
 #include <duckdb/execution/operator/join/join_filter_pushdown.hpp>
@@ -36,9 +37,9 @@
 
 #include <utility>
 
-using sirius::transparent::detail::clone_filter_pushdown_info;
-using sirius::transparent::detail::preserve_dynamic_filter_metadata;
-using sirius::transparent::detail::preserved_counts;
+using sirius::planner::preserved_counts;
+using sirius::planner::duckdb_join_filter_candidate_adapter::preserve_dynamic_filter_metadata;
+using sirius::planner::duckdb_join_filter_candidate_adapter::detail::clone_filter_pushdown_info;
 
 namespace {
 
@@ -174,6 +175,11 @@ TEST_CASE("preserve_dynamic_filter_metadata recurses into children", "[transpare
 TEST_CASE("preserve_dynamic_filter_metadata bails on top-level structural mismatch",
           "[transparent][preserve]")
 {
+#ifdef D_ASSERT_IS_ENABLED
+  // Debug builds assert on the Copy-shape invariant this case deliberately violates (the bail is
+  // the release-build behavior under test) — same guard as the adapter test's mismatch case.
+  WARN("Skipped: this case intentionally violates the LogicalOperator::Copy shape invariant");
+#else
   auto dyn = duckdb::make_shared_ptr<duckdb::DynamicTableFilterSet>();
   duckdb::LogicalComparisonJoin original(duckdb::JoinType::INNER);
   original.filter_pushdown = make_pushdown_info(dyn);
@@ -188,4 +194,5 @@ TEST_CASE("preserve_dynamic_filter_metadata bails on top-level structural mismat
 
   REQUIRE(counts.joins == 0);
   REQUIRE_FALSE(copy.filter_pushdown);
+#endif
 }

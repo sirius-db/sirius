@@ -620,6 +620,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
+    test/cpp/operator/test_dynamic_filter_freeze.cpp
     test/cpp/operator/test_dynamic_filter_publish_plan_builder.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp

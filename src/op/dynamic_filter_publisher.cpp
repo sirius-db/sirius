@@ -72,7 +72,7 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
                                        rmm::cuda_stream_view stream) const
 {
   nvtx3::scoped_range nvtx_range{"dynfilter::push_build_side"};
-  assert(_plan.enabled());
+  assert(_plan->enabled());
 
   if (build_view.num_rows() == 0) {
     SIRIUS_LOG_DEBUG(
@@ -83,14 +83,14 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
   auto target_accepts_filters = [](dynamic_filter_publish_plan::probe_target const& tgt) {
     return tgt.filter_set && tgt.filter_set->accepting_filters();
   };
-  auto const& probe_targets = _plan.probe_targets();
+  auto const& probe_targets = _plan->probe_targets();
   if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
     SIRIUS_LOG_DEBUG(
       "[sirius_physical_hash_join] Skipping dynamic filter push: all target scans drained.");
     return;
   }
 
-  auto const& key_domains = _plan.build_key_domain_cardinalities();
+  auto const& key_domains = _plan->build_key_domain_cardinalities();
 
   int source_device = -1;
   if (cudaGetDevice(&source_device) != cudaSuccess) {
@@ -99,29 +99,29 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
       "GPU");
   }
   auto const source_space =
-    std::find_if(_plan.replica_spaces().begin(),
-                 _plan.replica_spaces().end(),
+    std::find_if(_plan->replica_spaces().begin(),
+                 _plan->replica_spaces().end(),
                  [source_device](auto const& target) {
                    return target.get_gpu_space().get_device_id() == source_device;
                  });
-  if (source_space == _plan.replica_spaces().end()) {
+  if (source_space == _plan->replica_spaces().end()) {
     throw std::logic_error(
       "[dynamic_filter_publisher::publish] Dynamic-filter source GPU is absent from the immutable "
       "publish plan");
   }
   auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
-  auto const l2_bytes      = device_l2_cache_bytes(_plan.replica_spaces());
+  auto const l2_bytes      = device_l2_cache_bytes(_plan->replica_spaces());
 
   // Build up to 2 complementary filters per join key:
   //  1) a zone-map (read-time ROW-GROUP pruning, the only path that cuts scan I/O)
   //  2) a membership filter (IN-list / Bloom, post-decode) chosen by L2-cache fit.
   // The two ride different consumer paths and compose; either may be absent for a key.
-  std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(
-    _filter_pushdown.join_condition.size());
-  std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(
-    _filter_pushdown.join_condition.size());
-  std::vector<cudf::data_type> per_key_build_type(_filter_pushdown.join_condition.size(),
+  // All per-key vectors are full arity — one slot per DuckDB-recorded candidate — whether or not
+  // that candidate was admitted, because the targets' column vectors use the same indexing.
+  std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(_plan->duckdb_key_count());
+  std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(_plan->duckdb_key_count());
+  std::vector<cudf::data_type> per_key_build_type(_plan->duckdb_key_count(),
                                                   cudf::data_type{cudf::type_id::EMPTY});
 
   // Read a numeric scalar to host as a double for the zone-map range-coverage gate. Returns nullopt
@@ -156,20 +156,24 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     }
   };
 
-  for (std::size_t k = 0; k < _filter_pushdown.join_condition.size(); ++k) {
-    auto const cond_idx = _filter_pushdown.join_condition[k];
-    // Skip cast keys to ensure type-equivalent build/probe base keys are used for the dynamic
-    // filter. We can repair this constraint later.
-    if (cond_idx < _key_casts.size() &&
-        (_key_casts[cond_idx].cast_right || _key_casts[cond_idx].cast_left)) {
+  for (std::size_t k = 0; k < _plan->ordinals().size(); ++k) {
+    auto const& ordinal = _plan->ordinals()[k];
+    // The per-candidate verdicts were decided once at plan time (see the decision rules in the
+    // hash-join constructor); here we only replay them, with the exact skip behavior — and skip
+    // logs — the old on-the-fly checks produced.
+    if (ordinal.decision == dynamic_filter_key_decision::cast) {
+      // Skip cast keys to ensure type-equivalent build/probe base keys are used for the dynamic
+      // filter. We can repair this constraint later.
       SIRIUS_LOG_DEBUG(
         "[sirius_physical_hash_join] dynamic filter key {}: skipped (cast on build key "
         "cond_idx={}).",
         k,
-        cond_idx);
+        ordinal.condition_index.value);
       continue;
     }
-    if (cond_idx >= _right_key_col_indices.size()) { continue; }
+    if (ordinal.decision != dynamic_filter_key_decision::admitted) {
+      continue;  // non-equality or unresolved: silent, exactly like the old bounds skip
+    }
 
     // Skip domain-covering keys before paying to build a membership structure; their filters keep
     // most probe rows, and the consumer-side gate remains the runtime backstop.
@@ -177,7 +181,7 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     if (key_domain > 0) {
       auto const covered =
         static_cast<double>(build_view.num_rows()) / static_cast<double>(key_domain);
-      if (covered >= _plan.domain_coverage_threshold()) {
+      if (covered >= _plan->domain_coverage_threshold()) {
         SIRIUS_LOG_DEBUG(
           "[sirius_physical_hash_join] publish gate: key {}: build {} rows cover {:.2f} of key "
           "domain (~{} rows) -> skip key.",
@@ -189,13 +193,24 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
       }
     }
 
-    auto const build_col_idx = _right_key_col_indices[cond_idx];
-    auto const& col          = build_view.column(build_col_idx);
-    per_key_build_type[k]    = col.type();
+    auto const build_col_idx =
+      static_cast<cudf::size_type>(ordinal.admitted_key->build_column_index);
+    auto const& col       = build_view.column(build_col_idx);
+    per_key_build_type[k] = col.type();
+    // The runtime column type is authoritative. The plan-time type is only a drift detector: a
+    // disagreement means planning misread the schema, which is worth a warning but must not
+    // change what gets published.
+    if (ordinal.build_type.has_value() && ordinal.build_type->id() != cudf::type_id::EMPTY &&
+        *ordinal.build_type != col.type()) {
+      SIRIUS_LOG_WARN(
+        "[sirius_physical_hash_join] dynamic filter key {}: plan-time build type differs from the "
+        "runtime column type; trusting the runtime type.",
+        k);
+    }
 
     // (1) Zone-map — read-time row-group pruning. This only helps when build keys are correlatively
     // clustered with the filter column(s), so it is off by default (TPC-H keys are scattered).
-    if (_plan.emit_zone_map_filters()) {
+    if (_plan->emit_zone_map_filters()) {
       nvtx3::scoped_range vr{"dynfilter::build_zone_map"};
       auto min_s = cudf::reduce(col,
                                 *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
@@ -216,7 +231,7 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
           auto const hi = scalar_to_double(*max_s);
           if (lo && hi) {
             auto const coverage = (*hi - *lo + 1.0) / static_cast<double>(key_domain);
-            if (coverage >= _plan.domain_coverage_threshold()) {
+            if (coverage >= _plan->domain_coverage_threshold()) {
               SIRIUS_LOG_DEBUG(
                 "[sirius_physical_hash_join] zone-map key {}: skipped (range [{},{}] covers {:.2f} "
                 "of key domain ~{}).",
@@ -290,7 +305,7 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
           "[dynamic_filter_publisher::publish] A published device-backed dynamic filter must "
           "implement sirius_device_replicable");
       }
-      replicable->replicate_to_devices(_plan.replica_spaces());
+      replicable->replicate_to_devices(_plan->replica_spaces());
     };
     for (auto const& filter : per_key_zone_map) {
       replicate(filter);
@@ -334,7 +349,7 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     active_targets,
     probe_targets.size(),
     build_view.num_rows(),
-    _filter_pushdown.join_condition.size());
+    _plan->duckdb_key_count());
 }
 
 }  // namespace sirius::op

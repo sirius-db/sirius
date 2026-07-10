@@ -74,9 +74,6 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
   duckdb::ExtraOperatorInfo extra_info;
   //! Parameters
   duckdb::vector<duckdb::Value> parameters;
-  //! Contains a reference to dynamically generated table filters (through e.g. a join up in the
-  //! tree)
-  duckdb::shared_ptr<duckdb::DynamicTableFilterSet> dynamic_filters;
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;
 

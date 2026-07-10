@@ -16,16 +16,15 @@
 
 #pragma once
 
-#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "op/dynamic_filter_publish_plan.hpp"
-#include "op/sirius_physical_hash_join.hpp"  // sirius_physical_hash_join::key_cast_info
 
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <vector>
+#include <memory>
+#include <utility>
 
 namespace sirius::op {
 
@@ -35,19 +34,19 @@ namespace sirius::op {
 /// @brief Builds, replicates, and fans out one immutable filter snapshot from a complete join
 /// build batch.
 ///
-/// It borrows the join's plan and key metadata by reference; its caller (@ref
-/// sirius_physical_hash_join::publish_dynamic_filters) owns source readiness and the exactly-once
-/// arbitration. A publisher instance is single-use and does not outlive the referenced metadata.
+/// This is step 4 of the story in dynamic_filter_publish_plan.hpp: by the time a publisher runs,
+/// planning has already decided everything — which keys are admitted, which build column each one
+/// reads, which scans receive the filters, and on which devices replicas live. The publisher's
+/// only inputs are the frozen plan and the build table itself; it reads no planner state and no
+/// DuckDB metadata.
+///
+/// Its caller (@ref sirius_physical_hash_join::publish_dynamic_filters) owns source readiness and
+/// the exactly-once arbitration. A publisher instance is single-use; sharing the plan's ownership
+/// keeps every referenced value alive for the duration of the publish call.
 class dynamic_filter_publisher final {
  public:
-  dynamic_filter_publisher(duckdb::JoinFilterPushdownInfo const& filter_pushdown,
-                           dynamic_filter_publish_plan const& plan,
-                           std::vector<sirius_physical_hash_join::key_cast_info> const& key_casts,
-                           std::vector<cudf::size_type> const& right_key_col_indices)
-    : _filter_pushdown(filter_pushdown),
-      _plan(plan),
-      _key_casts(key_casts),
-      _right_key_col_indices(right_key_col_indices)
+  explicit dynamic_filter_publisher(std::shared_ptr<dynamic_filter_publish_plan const> plan)
+    : _plan(std::move(plan))
   {
   }
 
@@ -55,10 +54,7 @@ class dynamic_filter_publisher final {
   void publish(cudf::table_view const& build_view, rmm::cuda_stream_view stream) const;
 
  private:
-  duckdb::JoinFilterPushdownInfo const& _filter_pushdown;
-  dynamic_filter_publish_plan const& _plan;
-  std::vector<sirius_physical_hash_join::key_cast_info> const& _key_casts;
-  std::vector<cudf::size_type> const& _right_key_col_indices;
+  std::shared_ptr<dynamic_filter_publish_plan const> _plan;
 };
 
 }  // namespace sirius::op

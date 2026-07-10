@@ -97,10 +97,10 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   duckdb::vector<duckdb::Value> parameters;
   //! Named parameters (e.g., snapshot_from_id for iceberg_scan)
   duckdb::named_parameter_map_t named_parameters;
-  /// The duckdb::DynamicTableFilterSet pointer planted by plan-gen for this scan, if any. Used as
-  /// the route key identity for Sirius-side dynamic filters @ref sirius_dynamic_filters. Read by
-  /// the scan consumer to merge into the parquet reader's AST filter.
-  duckdb::shared_ptr<duckdb::DynamicTableFilterSet> dynamic_filters;
+  /// The Sirius-side channel dynamic filters arrive through, if a producing join targets this
+  /// scan. Resolved at plan time from the preserved DuckDB channel identity (which is a
+  /// planning-only key and is deliberately NOT kept here — the channel object is the runtime
+  /// identity). Read by the scan consumer to merge into the parquet reader's AST filter.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;

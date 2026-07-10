@@ -61,6 +61,8 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <unordered_set>
+#include <vector>
 
 namespace sirius {
 
@@ -369,6 +371,42 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // Collect all pipelines for progress tracking
   root_pipeline->get_pipelines(sirius_pipelines, true);
   SIRIUS_LOG_DEBUG("total_pipelines = {}", sirius_pipelines.size());
+
+  // Freeze every hash join's dynamic-filter plan (step 3 of the story in
+  // dynamic_filter_publish_plan.hpp). This is deliberately the last thing that happens between
+  // "the physical plan is fully built" and "tasks can run": pipeline conversion is done, so C3's
+  // future target additions have physical endpoints to bind to, and no task exists yet, so
+  // nothing can observe a half-frozen topology. Re-executing a cached prepared plan takes the
+  // verify branch inside — the already-frozen plans are checked against the builders and reused,
+  // never assigned twice.
+  //
+  // Producers are enumerated from the pipelines, not by walking operator children: the pipeline
+  // set is the authoritative "everything that will run" list, and it sees through operators that
+  // hold sub-plans by member or reference instead of as children (the result collector's plan
+  // reference, the delim join's inner join, CTEs). A join can appear in two pipelines (as one
+  // pipeline's sink and another's source), so producers are de-duplicated while keeping
+  // first-seen order — the descriptor's enumeration order must be stable across re-executions
+  // of the same cached plan.
+  {
+    std::vector<op::sirius_physical_hash_join*> dynamic_filter_producers;
+    std::unordered_set<op::sirius_physical_hash_join*> seen_producers;
+    auto const consider = [&](op::sirius_physical_operator* node) {
+      if (node == nullptr || node->type != op::SiriusPhysicalOperatorType::HASH_JOIN) { return; }
+      auto* join = &node->Cast<op::sirius_physical_hash_join>();
+      if (seen_producers.insert(join).second) { dynamic_filter_producers.push_back(join); }
+    };
+    for (auto& pipeline : sirius_pipelines) {
+      // Source and sink are checked explicitly: get_operators() returns only the intermediate
+      // operator chain (despite its header comment), and completeness here must not hinge on
+      // every join variant also self-registering as an intermediate operator.
+      consider(pipeline->get_source().get());
+      for (auto& op_ref : pipeline->get_operators()) {
+        consider(&op_ref.get());
+      }
+      consider(pipeline->get_sink().get());
+    }
+    op::freeze_or_verify_dynamic_filter_plans(dynamic_filter_producers);
+  }
 
   // Auto-log the enriched query plan
   pipeline::sirius_plan_printer plan_printer(new_scheduled);

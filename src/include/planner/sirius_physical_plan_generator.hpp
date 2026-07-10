@@ -20,6 +20,7 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "op/dynamic_filter_identity.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "planner/dynamic_filter_candidate_cache.hpp"
 
@@ -89,6 +90,24 @@ class sirius_physical_plan_generator {
   /// create_plan(unique_ptr) before recursive planning drains the joins (C1a-2). Consumed by
   /// plan_comparison_join and, later, C3 route discovery via find().
   dynamic_filter_candidate_cache candidate_cache;
+
+  /// @brief The one minting authority for dynamic-filter identity in this plan: publication-plan
+  /// IDs (one per producing join), target IDs (one per scan target), and channel IDs (one per
+  /// shared scan channel). C3's route registry receives THIS allocator through the generator
+  /// handoff and never creates a second one — that rule is what makes the IDs unique per plan.
+  sirius::op::dynamic_filter_identity_allocator dynamic_filter_id_allocator;
+
+  /// @brief One publication-plan ID per producing logical join, no matter how many targets it
+  /// adds or how many times it is looked at. Keyed by logical node address, like the candidate
+  /// cache (stable through create_plan).
+  std::unordered_map<duckdb::LogicalOperator const*, sirius::op::dynamic_filter_publication_plan_id>
+    dynamic_filter_publication_ids;
+
+  /// @brief One channel ID per shared scan channel: producers that feed the same scan reuse the
+  /// same channel ID (but keep distinct target IDs). Keyed by the same preserved DuckDB pointer
+  /// that keys @ref dynamic_filter_channels.
+  std::unordered_map<duckdb::DynamicTableFilterSet const*, sirius::op::dynamic_filter_channel_id>
+    dynamic_filter_channel_ids;
 
  public:
   /// @brief Look up or create the dynamic filter channel keyed by @p key. Returns nullptr if @p key

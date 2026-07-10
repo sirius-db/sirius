@@ -104,12 +104,8 @@ unique_ptr<FunctionData> PlanCheckBind(ClientContext& context,
       plan = optimizer.Optimize(std::move(plan));
     }
 
-    // 4. Resolve types and column bindings
-    plan->ResolveOperatorTypes();
-
-    ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
-    resolver.VisitOperator(*plan);
+    // 4. Deliberately not resolved here: create_plan(unique_ptr) resolves types/bindings
+    // itself, after capturing the pre-resolver dynamic-filter snapshot (C1a-2).
 
     // 5. Translate to Sirius physical plan
     sirius::planner::sirius_physical_plan_generator gen(context);

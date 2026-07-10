@@ -338,9 +338,13 @@ adapter must not deep-copy or replace either endpoint independently.
 Extraction validates and fails closed on structural invariants it can prove locally:
 
 - out-of-range or duplicate `join_condition` indexes;
-- null target channel identities;
 - `probe_info[t].columns.size() != join_condition.size()`; and
 - a copied logical shape inconsistent with the pinned layout.
+
+Target arity is validated before null channels are handled. After arity is known to be correct, an
+individual target with a null channel is dropped if another live sibling remains. If every target
+has a null channel, the whole candidate is `malformed`. It is not reclassified as
+`statistics_only`, because DuckDB did record target metadata and that metadata is unusable.
 
 The lineage pass later validates that target column ordinal `j` actually corresponds to resolved
 condition `join_condition[j]` along the selected branch. A base-table binding cannot be proven
@@ -356,6 +360,10 @@ struct admitted_dynamic_filter_key {
   std::size_t sirius_key_ordinal;     // compact ordinal after Sirius narrowing
 };
 ```
+
+DuckDB filter ordinal `j` is the position in the two parallel metadata arrays. The stored
+`condition_index` is the value found at `join_condition[j]`. They often happen to be equal in
+simple joins, but they are different identities and must never be substituted for one another.
 
 `join_stats` is not correlated with these values; it uses a different/original condition order.
 Runtime publication never dereferences `JoinFilterPushdownInfo`.

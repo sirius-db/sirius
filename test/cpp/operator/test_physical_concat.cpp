@@ -102,7 +102,16 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (empty = all)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,                                                            // estimated_cardinality
-    nullptr);                                                        // pushdown_info
+    nullptr);  // dynamic_filter_builder (not a producer)
+
+  // The engine freezes every hash join's dynamic-filter plan after planning and before any task
+  // runs; a test that constructs the join directly must invoke the same freeze (this join has no
+  // builder, so it receives the canonical disabled plan). Without this, the join's runtime
+  // claim path would fail loudly — by design — when the first build batch arrives.
+  {
+    sirius::op::sirius_physical_hash_join* producers[] = {fixture.hash_join.get()};
+    sirius::op::freeze_or_verify_dynamic_filter_plans(producers);
+  }
 
   return fixture;
 }

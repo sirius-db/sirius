@@ -1,8 +1,13 @@
-# C1a-2 piece 3 — proposed code: builder, planning view, and the one-shot freeze seam
+# C1a-2 piece 3 — historical proposal: builder, planning view, and the one-shot freeze seam
 
-Companion to [C1ab-adapter-foundation.md](C1ab-adapter-foundation.md). This is a **proposal for
-you to insert** (per the working protocol: production code is shown, tests/validation are handled
-separately). Code below follows the verified project conventions: leading-underscore members,
+> **Historical document, not insertable code (2026-07-10).** The working tree now contains an
+> integrated builder and freeze seam. The code below records the proposal that informed that work;
+> it is not the current API and must not be pasted into the source tree. Use
+> [C1ab-adapter-foundation.md](C1ab-adapter-foundation.md) for the accepted target contract and the
+> [current-code audit](C1-current-code-audit-2026-07-10.md) for implementation status and gaps.
+
+Companion to [C1ab-adapter-foundation.md](C1ab-adapter-foundation.md). This was a proposal for the
+integration round. Code below follows the verified project conventions: leading-underscore members,
 `sirius::internal_exception` for internal-error guards, `.value` formatting on strong IDs.
 
 **What this piece does in one sentence:** the hash join stops being handed a finished
@@ -11,10 +16,8 @@ mutable Sirius-only *builder* that the engine freezes exactly once — after pip
 before task creation — into an immutable plan published through a `single_assignment` slot that
 runtime can only read after the freeze.
 
-Section A is fully insertable now (new types, no call-site changes; everything compiles unused).
-Section B is the integration round (constructor/planner/engine rewiring — piece 4's edits begin
-here) shown so you can see where every type lands; don't insert B until A is in and its tests are
-green.
+Sections A and B are retained only to explain the original reasoning. Neither section is now an
+instruction to edit the code.
 
 Deviations from the plan doc's letter, called out inline and worth recording as resolutions 22-23
 if you accept them:

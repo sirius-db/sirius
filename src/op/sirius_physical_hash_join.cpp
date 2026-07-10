@@ -30,7 +30,6 @@
 #include "cudf/utilities/memory_resource.hpp"
 #include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -211,26 +210,18 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   const duckdb::vector<std::size_t>& right_projection_map,
   duckdb::vector<sirius::logical_type> delim_types,
   std::size_t estimated_cardinality,
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p,
-  uint64_t max_build_hash_table_bytes,
-  dynamic_filter_publish_plan dynamic_filter_plan)
+  std::unique_ptr<dynamic_filter_publish_plan_builder> dynamic_filter_builder,
+  uint64_t max_build_hash_table_bytes)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
     conditions(std::move(cond)),
     join_type(join_type),
     delim_types(std::move(delim_types)),
-    _dynamic_filter_plan(std::move(dynamic_filter_plan))
+    _dynamic_filter_builder(std::move(dynamic_filter_builder))
 {
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   reorder_join_conditions(conditions);
-
-  filter_pushdown = std::move(pushdown_info_p);
-  if (_dynamic_filter_plan.enabled() && !filter_pushdown) {
-    throw std::invalid_argument(
-      "[sirius_physical_hash_join] An enabled dynamic-filter publication plan requires join "
-      "filter-pushdown metadata");
-  }
 
   children.push_back(std::move(left));
   children.push_back(std::move(right));
@@ -344,6 +335,62 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   if (!is_all_inequality_join && (num_equality_conditions < conditions.size())) {
     _join_mode = HASH_JOIN_MODE::MIXED_JOIN;
   }
+
+  // Dynamic-filter key resolution (step 2 of the story in dynamic_filter_publish_plan.hpp).
+  //
+  // The planner handed us candidates ("DuckDB thinks these join conditions could filter a probe
+  // scan"); the equality-key extraction above just worked out which conditions actually have a
+  // plain build column we can read. Marry the two: record one decision per candidate, and for
+  // every admitted candidate, exactly which build column and type it reads.
+  //
+  // The rules mirror what the runtime publisher used to check on the fly, so behavior under a
+  // frozen plan is identical to the old direct reads:
+  //   * a key used through a type cast is rejected (build and probe values must stay
+  //     type-identical for a filter to be correct);
+  //   * a range comparison is a valid candidate but publishes nothing yet;
+  //   * a recorded index with no matching resolved build column is unresolved;
+  //   * everything else is admitted.
+  if (_dynamic_filter_builder) {
+    auto const& build_input_types = children[1]->get_types();
+    std::vector<dynamic_filter_key_decision> decisions;
+    std::vector<dynamic_filter_key_plan> resolved_keys;
+    decisions.reserve(_dynamic_filter_builder->key_candidates().size());
+
+    for (auto const& candidate : _dynamic_filter_builder->key_candidates()) {
+      auto const cond_idx = static_cast<std::size_t>(candidate.condition_index.value);
+      // key_casts/right_key_col_indices hold one entry per EQUALITY condition, and both DuckDB
+      // and Sirius sort equality conditions first, so cond_idx addresses them directly whenever
+      // it is inside their range.
+      if (cond_idx < key_casts.size() &&
+          (key_casts[cond_idx].cast_right || key_casts[cond_idx].cast_left)) {
+        decisions.push_back(dynamic_filter_key_decision::cast);
+        continue;
+      }
+      if (cond_idx >= right_key_col_indices.size()) {
+        decisions.push_back(candidate.is_equality ? dynamic_filter_key_decision::unresolved
+                                                  : dynamic_filter_key_decision::non_equality);
+        continue;
+      }
+      auto const build_column_index = static_cast<std::size_t>(right_key_col_indices[cond_idx]);
+      // The plan-time type is only a drift detector; the runtime column type stays authoritative.
+      auto build_type = cudf::data_type{cudf::type_id::EMPTY};
+      if (build_column_index < build_input_types.size()) {
+        try {
+          build_type = sirius::get_cudf_type(build_input_types[build_column_index]);
+        } catch (std::exception const&) {
+          // No cudf mapping for this type: keep EMPTY (the drift check then stays quiet).
+        }
+      }
+      resolved_keys.push_back(dynamic_filter_key_plan{sirius_key_ordinal{resolved_keys.size()},
+                                                      candidate.duckdb_ordinal,
+                                                      candidate.condition_index,
+                                                      build_column_index,
+                                                      build_type});
+      decisions.push_back(dynamic_filter_key_decision::admitted);
+    }
+    _dynamic_filter_builder->resolve_keys(
+      std::move(decisions), std::move(resolved_keys), build_input_types.size());
+  }
 };
 
 sirius_physical_hash_join::sirius_physical_hash_join(
@@ -363,10 +410,19 @@ sirius_physical_hash_join::sirius_physical_hash_join(
                               {},
                               {},
                               estimated_cardinality,
-                              nullptr,
-                              max_build_hash_table_bytes,
-                              {})
+                              /*dynamic_filter_builder=*/nullptr,
+                              max_build_hash_table_bytes)
 {
+}
+
+dynamic_filter_planning_view sirius_physical_hash_join::planning_view() const
+{
+  if (!_dynamic_filter_builder) {
+    throw sirius::internal_exception(
+      "[sirius_physical_hash_join] planning_view() on a join that is not a dynamic-filter "
+      "producer");
+  }
+  return _dynamic_filter_builder->planning_view();
 }
 
 //===--------------------------------------------------------------------===//
@@ -1352,10 +1408,10 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
   }
 
   try {
-    if (filter_pushdown && _dynamic_filter_plan.enabled()) {
-      dynamic_filter_publisher{
-        *filter_pushdown, _dynamic_filter_plan, key_casts, right_key_col_indices}
-        .publish(build_view, stream);
+    // Everything the publisher needs was frozen into the plan before any task could run; the
+    // shared_ptr keeps it alive for the duration of the publish call.
+    if (auto const& plan = dynamic_filter_plan(); plan->enabled()) {
+      dynamic_filter_publisher{plan}.publish(build_view, stream);
     }
     _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FINISHED,
                                             std::memory_order_release);
@@ -1381,10 +1437,11 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     bool claim = false;
     {
       std::scoped_lock lg(op_state_mutex);
+      // dynamic_filter_plan() throws if the engine forgot to freeze before running tasks —
+      // by design: an unfrozen plan here is an engine bug, not a "disabled" plan.
       claim = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
                 dynamic_filter_publication_state::OPEN &&
-              _join_mode == HASH_JOIN_MODE::BUILD_PROBE && filter_pushdown &&
-              _dynamic_filter_plan.enabled();
+              _join_mode == HASH_JOIN_MODE::BUILD_PROBE && dynamic_filter_plan()->enabled();
     }
     if (claim) { build_ro.emplace(batch->to_read_only()); }
   }

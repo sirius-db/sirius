@@ -82,9 +82,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     const duckdb::vector<std::size_t>& right_projection_map,
     duckdb::vector<sirius::logical_type> delim_types,
     std::size_t estimated_cardinality,
-    duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
-    uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    dynamic_filter_publish_plan dynamic_filter_plan = {});
+    std::unique_ptr<dynamic_filter_publish_plan_builder> dynamic_filter_builder = nullptr,
+    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -96,8 +95,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
   duckdb::vector<sirius::join_condition> conditions;
-  //! Scans where we should push generated filters into (if any)
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
 
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
@@ -244,13 +241,69 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     CLOSED       ///< Finalization closed the window before the hook claimed it.
   };
 
-  /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
-  dynamic_filter_publish_plan const _dynamic_filter_plan;
+  /// The planner's mutable description of this join's publication (see
+  /// dynamic_filter_publish_plan.hpp for the full story). Null for joins that were never
+  /// dynamic-filter producers — tests and non-producer plan shapes — which receive the canonical
+  /// disabled plan at the freeze. The constructor records the per-candidate key decisions into it;
+  /// after that nothing mutates it, and the freeze turns it into the immutable runtime plan.
+  std::unique_ptr<dynamic_filter_publish_plan_builder> _dynamic_filter_builder;
+  /// The write-once slot the freeze publishes the immutable plan through. Runtime code reads it
+  /// via dynamic_filter_plan(), which fails loudly if the engine forgot to freeze — an unfrozen
+  /// plan must never be silently treated as "disabled".
+  sirius::single_assignment<std::shared_ptr<dynamic_filter_publish_plan const>>
+    _dynamic_filter_runtime_plan;
   /// Exactly-once arbitration between the publication hook and finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
   //===----------------------------------------------------------------------===//
 
+ public:
+  /// The write-once slot's token type; minted by prepare_dynamic_filter_plan_assignment and
+  /// consumed by commit_dynamic_filter_plan_assignment (the two phases of the freeze).
+  using dynamic_filter_plan_token =
+    sirius::single_assignment<std::shared_ptr<dynamic_filter_publish_plan const>>::assignment_token;
+
+  /// @brief The planner-side builder, or null when this join is not a dynamic-filter producer.
+  /// Read by the freeze (to finalize it) and by C3 route discovery (via planning_view only).
+  [[nodiscard]] dynamic_filter_publish_plan_builder const* dynamic_filter_builder() const noexcept
+  {
+    return _dynamic_filter_builder.get();
+  }
+
+  /// @brief The sanctioned pre-freeze read surface for C3 route discovery: plain values, no
+  /// access to the mutable builder. Throws if this join has no builder or keys are unresolved.
+  [[nodiscard]] dynamic_filter_planning_view planning_view() const;
+
+  /// @brief True once the freeze has published this join's immutable plan.
+  [[nodiscard]] bool has_frozen_dynamic_filter_plan() const noexcept
+  {
+    return _dynamic_filter_runtime_plan.is_assigned();
+  }
+
+  /// @brief The frozen immutable plan. Throws sirius::internal_exception if the engine has not
+  /// frozen this plan yet — reading too early is an engine bug, never a silent "disabled".
+  [[nodiscard]] std::shared_ptr<dynamic_filter_publish_plan const> const& dynamic_filter_plan()
+    const
+  {
+    return _dynamic_filter_runtime_plan.get();
+  }
+
+  /// @brief Freeze phase 1 (fallible): claim this join's slot and carry @p plan in the returned
+  /// token. Called only by prepare_dynamic_filter_plans.
+  [[nodiscard]] dynamic_filter_plan_token prepare_dynamic_filter_plan_assignment(
+    std::shared_ptr<dynamic_filter_publish_plan const> plan)
+  {
+    return _dynamic_filter_runtime_plan.prepare_assignment(std::move(plan));
+  }
+
+  /// @brief Freeze phase 2 (never throws): publish the prepared plan. Called only by
+  /// commit_dynamic_filter_plans.
+  void commit_dynamic_filter_plan_assignment(dynamic_filter_plan_token&& token) noexcept
+  {
+    _dynamic_filter_runtime_plan.commit_assignment(std::move(token));
+  }
+
+ protected:
  public:
   /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
   ///

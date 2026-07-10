@@ -12,6 +12,15 @@ This is a category, not a single feature. It spans:
 
 This document describes the implemented Phase 1 framework and the design-only directions that could generalize it. Phase 1 has a `BUILD_PROBE` hash-join-build producer, a parquet-scan consumer, and three filter kinds (zone map, IN-list, and Bloom). Membership pushdown is enabled by default; the workload-specific zone-map path remains opt-in. Phases 2–4 below are not implemented.
 
+> **Track C working-tree status (2026-07-10):** the current branch is replacing Phase 1's planner
+> metadata path with a version-pinned adapter, candidate cache, strong IDs, builder, and frozen
+> publication plan. That foundation exists, but its new reasoned lifecycle and clean reset for a
+> reused prepared topology do not. C1b, the join-probe consumer, and C3 routing are not implemented.
+> The Phase 2 text below is a historical design sketch; the
+> [Track C guide](issue-1010-track-c-guide.md), [implementation plan](issue-1010-implementation-plan.md),
+> and [dated audit](issue-1010-plans/C1-current-code-audit-2026-07-10.md) are authoritative for that
+> work.
+
 ## How the phases generalize
 
 The framework has four axes of generality. Each phase opens one axis:
@@ -23,7 +32,11 @@ The framework has four axes of generality. Each phase opens one axis:
 | Producer kind | `BUILD_PROBE` hash-join build only | (unchanged) | + agg, sort, filter | (unchanged) |
 | Coordination | single-shot build-port publication; direct probes ordered, transitive scan targets opportunistic | topology-aware coordination for join-probe consumers | (unchanged) | streaming / incremental refinement |
 
-Anything implemented in Phase 1 is reused unchanged by later phases. We do not replace DuckDB's static table-filter pushdown — static filters continue to flow through the existing translator path and are AND-merged with dynamic filters at the consumer.
+The filter implementations and safe pass-through behavior from Phase 1 are reused. Track C does
+change the planning metadata, channel-entry identity, publication lifecycle, and topology
+interfaces around them. DuckDB's static table-filter pushdown is not replaced: static filters
+continue through the existing translator path and are AND-merged with dynamic filters at the
+consumer.
 
 ## Generalized architecture
 
@@ -123,31 +136,51 @@ std::unordered_map<
 > dynamic_filter_channels;
 ```
 
-The route key in Phase 1.1 is `const duckdb::DynamicTableFilterSet*` — DuckDB's optimizer creates a `DynamicTableFilterSet` and references it from both the join's `JoinFilterPushdownInfo::probe_info` and the target `LogicalGet`'s `dynamic_filters`. The pointer is the identity that pairs them.
+The route key in Phase 1.1 is `const duckdb::DynamicTableFilterSet*`: DuckDB's optimizer
+creates a `DynamicTableFilterSet` and references it from both the join's
+`JoinFilterPushdownInfo::probe_info` and the target `LogicalGet`'s
+`dynamic_filters`. The pointer pairs those two planning endpoints. It is not an execution
+identity, is not written to telemetry, and must not survive as a runtime contract.
 
-For Phase 2 (SIP) and Phase 3 (other producers), there is no DuckDB-supplied pointer — Sirius creates the pairing itself, and the route key generalizes to a variant covering Sirius-owned producer/consumer ID pairs. The router's logic is unchanged: find or create a channel for a route key, attach to producer, attach to consumer. Only the key set grows.
+The old idea of extending this map with a route-key variant is superseded. Track C3 discovers
+Sirius-owned producer-to-consumer routes in a planning registry, gives them strong IDs and immutable
+descriptors, and binds them only after pipeline conversion proves the runtime endpoints. The raw
+DuckDB pointer remains only a short-lived Phase 1 planning key.
 
 ### Producer / consumer wiring
 
-*Introduced in Phase 1.1.* A **producer** receives an immutable publication plan. Its per-target entries hold the channel and the column-index translation from the build keys to the consumer:
+*Introduced in Phase 1.1 and being typed by C1a-2.* A **producer** receives an immutable publication
+plan. The current working-tree shape is approximately:
 
 ```cpp
 class dynamic_filter_publish_plan {
  public:
   struct probe_target {
     std::shared_ptr<sirius_dynamic_filter_set> filter_set;
-    std::vector<std::size_t> probe_col_idx;       // build-key idx -> consumer col idx
-    std::vector<cudf::data_type> probe_col_type;  // consumer storage type per key
+    std::vector<std::size_t> probe_col_idx;       // full DuckDB candidate arity in C1a-2
+    std::vector<cudf::data_type> probe_col_type;
+    dynamic_filter_target_id target_id;
+    dynamic_filter_channel_id channel_id;
   };
 
  private:
+  dynamic_filter_publication_plan_id _publication_plan_id;
+  std::vector<dynamic_filter_planning_ordinal_view> _ordinals;
   std::vector<probe_target> _probe_targets;
-  std::vector<std::size_t> _build_key_domain_cardinalities;  // per key; 0 = gates off
+  std::vector<std::size_t> _build_key_domain_cardinalities;  // all zero in C1a-2
   std::vector<dynamic_filter_replica_space> _replica_spaces;
 };
 ```
 
-The planner freezes routing, placement, and policy into the hash join's `const dynamic_filter_publish_plan`. Each `dynamic_filter_replica_space` pairs one target GPU space with its selected HOST staging space. The build-port hook claims publication as soon as the complete build batch arrives, holding the batch's read-only accessor from before it is routed so the GPU representation cannot be downgraded underneath publication. The producer builds and replicates each filter, then fans it into the accepting channels. Finalization only closes an unclaimed publication window.
+The planner first builds mutable Sirius-owned values, then the engine prepares every plan and
+commits the immutable plans through single-assignment slots after pipeline conversion. The
+publisher no longer reads raw DuckDB metadata. Each `dynamic_filter_replica_space` pairs one
+target GPU space with its selected HOST staging space.
+
+The build-port hook still uses the old five-state publication attempt. It claims publication when
+the complete build batch arrives, holds the batch's read-only accessor so the GPU representation
+cannot be downgraded underneath publication, builds and replicates each filter, and fans it into the
+accepting channels. The C1a-2 target lifecycle and repeated-execution reset are not yet present.
 
 A **consumer** holds the channel directly via `std::shared_ptr<sirius_dynamic_filter_set> sirius_dynamic_filters` and reads from it during execution.
 
@@ -315,7 +348,14 @@ run under normal locality-aware dispatch and may observe no filter, a partial fa
 complete publication at their checkpoints. See
 [Transitive scan targets and publication timing](#transitive-scan-targets-and-publication-timing).
 
-The publication attempt may intentionally emit no filter—for example, for an empty build, a cast or unsupported key, a domain-covering key, or a non-selective zone range. That successful no-op is still `FINISHED`. Allocation pressure may also leave an optional replica unavailable. Consumers need no readiness protocol: they test the channel and local device availability and pass the batch through when nothing useful can apply. Replica materialization for every filter kind treats a per-target failure (reservation denial, cloning, copy, or completion synchronize) as best-effort: it is logged and that target's replica is omitted.
+The publication attempt may intentionally emit no filter, for example for an empty build, a cast
+or unsupported key, a domain-covering key, or a non-selective zone range. In the current code that
+successful no-op is still `FINISHED`. The C1a-2 target replaces that ambiguous state with
+`PUBLISHED` or `NO_MATERIALIZATION(reason)`, plus per-target outcomes. Allocation pressure
+may also leave an optional replica unavailable. Consumers need no readiness protocol: they test the
+channel and local device availability and pass the batch through when nothing useful can apply.
+Replica materialization for every filter kind treats a per-target failure as best-effort: it is
+logged and that target's replica is omitted.
 
 A batch that arrives already non-GPU-resident (possible only when it was shared with an earlier consumer, e.g. CTE fan-out, and downgraded before delivery) skips publication — filters are optional. `on_finalize_operator` never publishes; it only changes an unclaimed `OPEN` state to `CLOSED`. GPU construction and replication run without holding `op_state_mutex`.
 
@@ -343,7 +383,17 @@ The zone-map captures only the build keys' `[min,max]` range, which is useless f
 
 **Producer policy** (`dynamic_filter_publisher::publish`). The master switch `enable_dynamic_filter_pushdown` emits a **membership filter** per key, chosen by **L2-cache fit**: build the structure whose device footprint fits the GPU's L2 cache, so its random per-row probe runs at L2 bandwidth instead of thrashing HBM. Prefer the exact **IN-list** (`cuco::static_set`, ≈ `16·N` bytes for INT64 and `8·N` for INT32) if it fits L2; else the smaller **Bloom** (≈ `2·N` bytes) whenever the key type supports it — built even if the bitset spills L2, since once the exact set overflows L2 the Bloom is the only viable membership structure; **none** only for key types other than INT32/INT64. Sizes come from `sirius_dynamic_in_list_filter::estimated_set_bytes` / `sirius_dynamic_bloom_filter::estimated_bytes` against the minimum `cudaDevAttrL2CacheSize` of the active probe GPUs, computed from the build row count (an upper bound on distinct keys; exact for the Bloom).
 
-A second switch, `enable_dynamic_zone_map_filter` (default **off**, requires the master), *additionally* emits a **zone map** (build-key min/max) per key for **read-time row-group pruning** — a complementary consumer path. It is off by default because on TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes range-derivable builds, while scattered keys span the domain and prune nothing. At publication, a numeric zone range covering at least `dynamic_filter_domain_coverage_threshold` (default 90%) of the key-domain estimate is skipped before it reaches the reader. The zone-map path has no post-decode `dynamic_filter_gate`.
+A second switch, `enable_dynamic_zone_map_filter` (default **off**, requires the master),
+*additionally* emits a **zone map** (build-key min/max) per key for **read-time row-group pruning**,
+a complementary consumer path. It is off by default because on TPC-H-shaped joins DuckDB's static
+transitive-predicate pushdown already prunes range-derivable builds, while scattered keys span the
+domain and prune nothing.
+
+The publisher still contains domain-coverage suppression branches. In the current C1a-2
+foundation, however, every stored domain cardinality is zero, so restored logical source evidence
+cannot trigger those branches. C1b must replace sentinel zero with optional evidence and calculate
+only a shadow decision. It must not make these suppression branches live. Enforcing the decision
+belongs to C1d.
 
 **Consumer**: membership rides the post-decode `apply_dynamic_filters_to_view` path (`membership_masks_only` mode); the zone-map rides the parquet reader's `set_filter` (cuDF prunes row groups by stats and evaluates it during decode). Because membership is applied *post-decode*, it never saves the scan I/O/decode — only the *downstream* work on dropped rows; so it wins on selective builds feeding expensive downstream and is neutral on scan-dominated single joins.
 
@@ -363,7 +413,10 @@ The cutover is **hardware-adaptive** — it replaced an earlier fixed `2M`-row-c
 
 - `enable_dynamic_filter_pushdown` (bool, default **true**) — master switch; when off, the router hands out no channels so neither side wires anything and there is zero overhead. Enabled by default to wire the membership (IN-list / Bloom) filters.
 - `enable_dynamic_zone_map_filter` (bool, default **false**, requires the master) — additionally emit a read-time zone map for row-group pruning. Off by default: static pushdown already handles range-derivable builds and scattered keys prune nothing, so it is reserved for clustered-keyset workloads whose narrow range is runtime-determined. The publication range-coverage gate skips obviously non-pruning numeric ranges.
-- `dynamic_filter_domain_coverage_threshold` (double, default **0.9**) — skip publishing a key's filters when the build covers at least this fraction of the key's domain (rows gate and zone-map range gate); ≥ 1.0 effectively disables the gate.
+- `dynamic_filter_domain_coverage_threshold` (double, default **0.9**) — retained by the
+  current publisher's legacy domain-coverage branches. C1a-2 supplies no nonzero source-domain
+  evidence, so the source-domain gate is inert. C1b observes the hypothetical result in shadow
+  mode; C1d is the phase that may enforce it.
 - `dynamic_filter_keep_threshold` (double, default **0.9**) — consumer-side scan gate: disable a scan's post-decode filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on.
 
 #### Ready replicas and per-split snapshots
@@ -396,12 +449,18 @@ A channel may carry both a zone map for the reader and a Bloom for the post-deco
 
 ## Phase 2 — Sideways information passing
 
+> **Historical sketch:** this section explains the original intent, not the accepted Track C
+> implementation. C2 builds the validated join-probe consumer. C3 separately discovers routes,
+> freezes planning descriptors, and binds runtime endpoints as one topology transaction. See the
+> Track C guide for the current contract.
+
 **Goal:** generalize the *consumer* axis. The hash-join probe becomes a consumer, allowing a build-side filter to prune the probe input of a *different* join before that join performs its hash-probe work, including inputs that cannot be filtered at a parquet scan.
 
 **Producer:** `BUILD_PROBE` hash-join build (same as Phase 1).
 **Consumer (new):** hash-join probe input.
-**Routing (new):** Sirius-owned `sirius_sip_route` route key.
-**Coordination:** implicit, where the producer's meta-pipeline is upstream of the consumer's; explicit readiness (Phase 4) otherwise.
+**Routing (new):** C3 planning registry and strong route identity.
+**Coordination:** opportunistic application at a validated probe checkpoint; no task waits for a
+filter.
 
 This differs from Phase 1 transitive scan pushdown. Today DuckDB may traverse an intervening join
 while locating a base-scan target, but that join does not consume the filter. Phase 2 would apply
@@ -410,7 +469,9 @@ parquet scan can consume the filter directly.
 
 What changes:
 
-- **Route key variant.** `dynamic_filter_channels` becomes keyed by a variant including a Sirius-owned `sirius_sip_route`. Plan-gen in `sirius_plan_comparison_join.cpp` extends: a join can register itself as a *consumer* of filters from upstream join builds in addition to its existing producer role. Producer/consumer pairing is Sirius's responsibility — no DuckDB pointer to lean on.
+- **Planning registry and runtime bind.** C3 records Sirius-owned route descriptors without live
+  channels or operator pointers, proves lineage and endpoint identity, and only then supplies
+  grouped targets to the generic producer freeze. No DuckDB pointer is used as a SIP route ID.
 - **New consumer code path in hash-join probe.** Before hashing, the probe would apply mask-capable filters through `sirius_mask_applicable::compute_mask` and the existing scan helpers. No new filter kinds are required; the parquet-specific AST path is not reused.
 
 The filter zoo, the channel type, and the producer side are unchanged.
@@ -451,4 +512,7 @@ An incrementally refined producer/consumer pair, or a consumer that requires a f
 - `src/planner/sirius_plan_comparison_join.cpp`, `src/planner/sirius_plan_get.cpp`, `test/cpp/planner/test_dynamic_filter_router.cpp` — producer/consumer plan-gen wiring and router
 - `src/op/sirius_physical_concat.cpp`, `src/op/sirius_physical_hash_join.cpp` — synchronous build-port publication and fan-out
 - `src/include/expression_evaluator/gpu_expression_translator_internal.hpp` — existing AST construction patterns (`cudf::ast::tree::emplace`, scalar lifetime)
-- `duckdb/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp` — `JoinFilterPushdownInfo`, `JoinFilterPushdownFilter` (consumed by Phase 1.1)
+- `duckdb/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp` —
+  `JoinFilterPushdownInfo` and `JoinFilterPushdownFilter`. Track C's version-pinned
+  adapter is intended to be the only reader; the 2026-07-10 audit records the candidate cache's
+  remaining direct-read exception.

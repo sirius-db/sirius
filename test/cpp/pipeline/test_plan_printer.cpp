@@ -377,10 +377,9 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(Connection& con,
   duckdb::Optimizer optimizer(*planner.binder, *con.context);
   logical_plan = optimizer.Optimize(std::move(logical_plan));
 
-  logical_plan->ResolveOperatorTypes();
-  duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*logical_plan);
-  resolver.VisitOperator(*logical_plan);
+  // Deliberately not resolved here: create_plan(unique_ptr) runs ResolveOperatorTypes and
+  // the sole ColumnBindingResolver pass itself, after capturing the pre-resolver
+  // dynamic-filter snapshot (C1a-2).
 
   sirius_physical_plan_generator physical_planner(*con.context);
   auto sirius_physical_plan = physical_planner.create_plan(std::move(logical_plan));

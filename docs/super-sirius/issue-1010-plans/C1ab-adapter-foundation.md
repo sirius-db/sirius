@@ -7,6 +7,12 @@ commit 1eecaf97; do not construct a synthetic "dev + #1134" base or start from #
 branch. Symbol names in this document are normative. Re-grep exact line numbers immediately before
 each patch.
 
+**Working-tree audit status (2026-07-10):** C1a-1 is mostly present. C1a-2 has the cache, builder,
+key-resolution, freeze, and publisher-decoupling foundation, but it does not yet have the required
+reasoned publication lifecycle or fresh-execution reset. Therefore this document remains the
+target contract, not a claim that C1a-2 is complete. See the
+[current-code audit](C1-current-code-audit-2026-07-10.md).
+
 PRs covered, in strict order:
 
 1. **C1a-1 — adapter and preservation boundary.** No runtime consumer or log-shape change.
@@ -118,9 +124,11 @@ entries. Structural target corruption still rejects the whole target.
 
 ---
 
-## Audited current surfaces
+## Historical baseline surfaces audited before implementation
 
-Re-run these greps on fac81e87 before editing.
+This inventory describes the `fac81e87` baseline that was inspected before implementation. It is
+not an inventory of the 2026-07-10 working tree. Re-run the searches against the actual delivery
+commit before using the line-level guidance.
 
 ### Producer metadata
 
@@ -261,7 +269,7 @@ filter-ID counter.
 Add a generator-local dynamic_filter_candidate_cache with three operations:
 
 1. capture_pre_resolver(root, context);
-2. extract_post_resolver(root, adapter); and
+2. extract_post_resolver(root); and
 3. find(join), returning a shared pointer to const candidate data.
 
 C1a-2 records node identity pre-resolver and stores extracted routing/comparison values
@@ -378,21 +386,22 @@ the target variant before C3 consumes it:
     void commit_dynamic_filter_plans(prepared_dynamic_filter_plans&&) noexcept;
 
 `prepared_dynamic_filter_plans` owns one prebuilt immutable plan and prepared assignment per
-builder plus a topology fingerprint. C1a-2 calls preparation with no additions; C1b generalizes the
-target variant; C3b supplies only its already validated, **grouped-by-producer** target additions.
-C1 knows nothing about C2 consumer tokens or a C3 route-registry bundle.
+builder. C1a-2 calls preparation with no additions; C1b generalizes the target variant; C3b
+supplies only its already validated, **grouped-by-producer** target additions. C1 knows nothing
+about C2 consumer tokens or a C3 route-registry bundle.
 
 The engine invokes this generic preparation/commit boundary unconditionally and enumerates every
 retained C1 builder.
 Disabled, scan-only, zero-admitted, no-registry, and all-C3-rejected joins receive a frozen plan
 with zero additions; registry presence is never the condition for assigning the runtime slot.
 
-On first preparation, all builder/slot/fingerprint checks finish before the no-throw commit.
-Cached-plan re-execution takes a separate
-`verify_frozen_dynamic_filter_topology(fingerprint)` path; it compares the descriptor and
-reuses the assigned value without invoking assignment again. The digest is only a fast reject;
-success requires full canonical value comparison. An incompatible descriptor or a direct second
-commit is an internal error.
+On first preparation, all builder, slot, identity, and value checks finish before the no-throw
+commit. On cached-plan re-execution, C1a-2 recomputes canonical values from the builders and the
+already frozen plans and requires full equality without invoking assignment again. It does not
+need a separately stored C1a-2 fingerprint. C3b may add a persistent routing descriptor beside
+these producer values. A digest may be used only as a fast rejection; success still requires full
+canonical value comparison. An incompatible descriptor or a direct second commit is an internal
+error.
 
 Runtime access requires a frozen slot. Planner tests either inspect the builder through a narrow
 test seam or invoke the same finalizer. Test runtime-before-freeze, direct double-assignment,
@@ -738,7 +747,7 @@ review should not be hidden inside telemetry changes.
 2. Zero admitted keys retain the existing terminal "Pushed 0" line.
 3. Runtime target mismatch remains WARN plus skip-target.
 4. Runtime build type remains authoritative; plan type is a WARN-only detector.
-5. The seven preservation tests remain and gain topology coverage.
+5. The seven preservation test cases remain and gain topology coverage.
 6. Planner tests require success and use the explicit freeze/test seam.
 7. Statistics-only metadata preserves the unfiltered-build INFO behavior.
 8. Timed INFO and non-timed DEBUG passes remain separate.
@@ -812,3 +821,62 @@ review should not be hidden inside telemetry changes.
     `key_candidates.size()` by construction (the adapter's whole-target arity fence already
     guarantees ordinal/column agreement), exposed as `duckdb_key_count()` and used verbatim for
     the terminal INFO line's key count once the `JoinFilterPushdownInfo` member is dropped.
+24. **`dynamic_filter_planning_ordinal_view` carries `condition_index`, and the frozen plan
+    stores the ordinal records.** The runtime cast-skip DEBUG line prints the condition index of
+    a REJECTED key, which has no `admitted_key` to read it from, so the view/record type carries
+    it top-level (same argument as `duckdb_ordinal`: rejected entries need self-carried
+    identity). The frozen `dynamic_filter_publish_plan` stores the builder's ordinal records
+    verbatim — view/plan parity holds by construction, and the publisher replays plan-time
+    decisions instead of re-deriving them.
+25. **The frozen plan's `probe_target` carries `target_id`/`channel_id`, and verification is
+    builder-vs-frozen.** With the IDs in the frozen targets, the cached-re-execution check needs
+    no separately stored fingerprint in C1a-2: `freeze_or_verify_dynamic_filter_plans` (the
+    engine's one entry point) recomputes the descriptor from the builders and from the frozen
+    plans and requires exact equality. C3b's cached routing descriptor slots into the same
+    `verify_frozen_dynamic_filter_topology(cached, current)` value comparison later. A
+    builder-less join (tests, non-producer shapes) freezes to the canonical disabled plan with
+    an invalid (zero) publication ID — the nonzero-ID rule applies to builder-produced plans.
+
+### 2026-07-10 implementation-audit clarifications
+
+26. **C1a-2 is not complete at the builder/freeze boundary.** The working tree's builder, key
+    decisions, prepare/commit seam, and publisher decoupling are foundation work. Completion still
+    requires the reasoned publication result, exactly-once attempt state, prepared-topology lease,
+    execution generation, channel reset, attempt reset, filter-ID reset, central begin/end, and a
+    repeated-execution proof.
+27. **The adapter remains the only allowed reader of pinned DuckDB metadata.** The candidate cache
+    must ask the adapter whether metadata is present; it must not read `join.filter_pushdown`
+    directly. In adapter terminology, `admitted` means that DuckDB metadata is structurally valid
+    and has at least one live target. It does not mean that Sirius has proved lineage or can execute
+    a route. The preserved `build_subtree_has_filter_hint` is the legacy Phase-1 wiring gate, not
+    candidate admission and not lineage proof.
+28. **Cache capture and extraction must cover the exact same node set.** Extraction must reject an
+    unseen join, reject a captured join that disappears, and fill each captured entry exactly once.
+    Before C1b coding starts, choose and document whether pre-resolver evidence is captured only for
+    adapter candidates or for all condition ordinals and then selected during extraction.
+29. **The planning view must be valid before C3 can read it.** It must guarantee strict vector
+    position equals DuckDB filter ordinal, `admitted_key` exists if and only if the decision is
+    admitted, and only equality candidates are admitted. Waiting until `finalize()` to discover
+    these errors is too late for a sanctioned pre-freeze view.
+30. **Freeze validates identities across the whole plan, not only within one builder.** Publication
+    IDs and target IDs must be globally unique. Channel ID and channel object must form a two-way
+    one-to-one mapping. This validation happens before any slot changes.
+31. **Cached verification compares every runtime-relevant value.** That includes all ordinals,
+    decisions, columns, types, channel-object associations, policy values, domain evidence, replica
+    placement, and the preserved wiring decision. Comparing only IDs and decision bytes is not
+    exact topology verification.
+32. **C1b changes evidence representation and behavior together.** Unknown domain evidence becomes
+    `std::optional<size_t>{}`; it is not sentinel zero. C1b computes and logs shadow decisions
+    only. It must not populate the current numeric vector while leaving the existing publisher
+    suppression branches active, because that would silently deliver C1d enforcement.
+33. **A stable channel ID is created with the channel.** It must be available even when a scan sees
+    zero filters and regardless of whether the producer or scan is planned first. One channel
+    object and one channel ID name each other for the lifetime of the prepared topology.
+34. **Filter-ID phase ownership is explicit.** C1a-2 owns the execution-scoped counter, reset, and
+    one ID per materialized immutable filter before fan-out. C1b owns ID-carrying channel entries,
+    telemetry fields, and reconciliation. C1b does not introduce a second counter.
+35. **The single-assignment token contract is checked, not assumed.** Committing a foreign token or
+    an already consumed token is an internal error. A failed check must not consume the token or
+    leave its original slot permanently pending. Tests cover both cases.
+36. **Delivery units remain independent.** A branch that combines C1a-1 with later C1 work does not
+    satisfy the planned review and rollback boundary even when the combined code passes tests.

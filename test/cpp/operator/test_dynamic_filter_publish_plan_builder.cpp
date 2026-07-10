@@ -22,15 +22,14 @@
  *        malformed builder cannot become a runtime plan.
  */
 
-#include <op/dynamic_filter_publish_plan.hpp>
-#include <op/sirius_dynamic_filter.hpp>
-#include <sirius/exception.hpp>
-
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <op/dynamic_filter_publish_plan.hpp>
+#include <op/sirius_dynamic_filter.hpp>
+#include <sirius/exception.hpp>
 
 #include <cstddef>
 #include <memory>
@@ -117,7 +116,7 @@ dynamic_filter_publish_plan_builder make_resolved_builder(std::size_t target_cou
                                  static_cast<std::uint32_t>(t + 1),
                                  /*arity=*/2));
   }
-  auto candidates = make_candidates(2);
+  auto candidates           = make_candidates(2);
   candidates[1].is_equality = false;
 
   auto builder = make_builder(std::move(targets), std::move(candidates));
@@ -199,9 +198,12 @@ TEST_CASE("planning_view exposes one entry per DuckDB ordinal with keys engaged 
   REQUIRE(again.by_duckdb_ordinal.data() == view.by_duckdb_ordinal.data());
 }
 
-TEST_CASE("planning_view reports a scan-only zero-admitted builder as disabled",
+TEST_CASE("planning_view reports a scan-only zero-admitted builder as enabled",
           "[dynamic_filter][publish_plan_builder]")
 {
+  // Zero admitted keys is a PUBLISH OUTCOME, not a disabled plan: the runtime publisher still
+  // runs and reports the terminal "Pushed 0 ..." line, exactly like the pre-C1a-2 code did.
+  // Only a plan with no live targets at all is disabled.
   auto candidates           = make_candidates(1);
   candidates[0].is_equality = false;
   auto builder              = make_builder({make_draft(1, 1, 1)}, std::move(candidates));
@@ -209,7 +211,7 @@ TEST_CASE("planning_view reports a scan-only zero-admitted builder as disabled",
 
   auto const view = builder.planning_view();
   REQUIRE(view.wired);
-  REQUIRE_FALSE(view.enabled);  // wired but nothing publishable: registration side effects only
+  REQUIRE(view.enabled);
 }
 
 //===-----------------------------------------------------------------------------------------===//
@@ -354,17 +356,16 @@ TEST_CASE("a disabled builder finalizes into a valid installable plan",
     REQUIRE_FALSE(plan->enabled());
     REQUIRE(plan->probe_targets().empty());
   }
-  SECTION("scan-only zero-admitted shape: targets but no publishable key")
+  SECTION("zero-admitted shape with targets stays ENABLED (the Pushed-0 contract)")
   {
+    // With live targets the plan is enabled even when no key was admitted, so it demands
+    // replica spaces like any enabled plan — proof that the publisher will actually run
+    // (and print "Pushed 0") rather than being silently disabled.
     auto candidates           = make_candidates(1);
     candidates[0].is_equality = false;
     auto builder              = make_builder({make_draft(1, 1, 1)}, std::move(candidates));
     builder.resolve_keys({dynamic_filter_key_decision::non_equality}, {}, 4);
-    auto plan = builder.finalize();
-    REQUIRE(plan != nullptr);
-    REQUIRE_FALSE(plan->enabled());  // no live target reaches the runtime plan
-    REQUIRE(plan->probe_targets().empty());
-    REQUIRE(plan->build_key_domain_cardinalities() == std::vector<std::size_t>{0});
+    REQUIRE_THROWS_AS(builder.finalize(), std::invalid_argument);
   }
 }
 

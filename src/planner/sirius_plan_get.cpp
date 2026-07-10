@@ -23,6 +23,7 @@
 #include "log/logging.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "planner/duckdb_join_filter_candidate_adapter.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 
@@ -261,11 +262,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.parameters),
     std::move(op.virtual_columns));
   node->named_parameters = std::move(op.named_parameters);
-  node->dynamic_filters  = op.dynamic_filters;
-  if (op.dynamic_filters) {
-    node->sirius_dynamic_filters = get_or_create_dynamic_filter_channel(op.dynamic_filters.get());
+  // The scan half of the producer↔consumer pairing: read the channel identity through the
+  // adapter (the one module allowed to read DuckDB's dynamic-filter metadata) and resolve the
+  // same Sirius channel the producing join resolves — both sides look it up by the same
+  // preserved DuckDB pointer, which is what pairs them. That pointer is a planning-only key;
+  // the runtime scan keeps only the Sirius channel.
+  if (auto const channel_identity =
+        duckdb_join_filter_candidate_adapter::scan_channel_identity(op)) {
+    node->sirius_dynamic_filters = get_or_create_dynamic_filter_channel(channel_identity.get());
     SIRIUS_LOG_INFO("[sirius_plan_get] LogicalGet has dynamic_filters attached (channel key={}).",
-                    static_cast<void const*>(op.dynamic_filters.get()));
+                    static_cast<void const*>(channel_identity.get()));
   }
   if (filter) {
     filter->children.push_back(std::move(node));

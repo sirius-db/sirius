@@ -280,6 +280,9 @@ Suggested issue structure: one umbrella issue per track (A, B, C) referencing th
 plus the standalone Phase 1 LIMIT/TOP-N bug issue (text in the B cluster doc). Each PR links its
 cluster doc section and states its gate outcome in the PR description.
 
-Current state (2026-07-09): **A is closed** on `dev` via merged #1134 (`1eecaf97`; measured on
+Current state (2026-07-10): **A is closed** on `dev` via merged #1134 (`1eecaf97`; measured on
 fork #1124, PASS; A1/A2/A3 never merged). **B is deferred** to the next DuckDB pin bump (#1123)
-and blocks nothing. **C is plan-reviewed and awaiting implementation from C1a-1.**
+and blocks nothing. **C1a-1 is mostly implemented in the Track C working tree. C1a-2 has its
+cache, builder, key-resolution, freeze, and publisher-decoupling foundation, but is not complete:**
+the reasoned publication lifecycle and clean execution reset remain missing. C1b, C2, and C3 are
+not implemented. See the [dated code audit](issue-1010-plans/C1-current-code-audit-2026-07-10.md).
