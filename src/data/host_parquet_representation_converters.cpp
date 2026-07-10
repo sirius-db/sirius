@@ -66,8 +66,8 @@ namespace detail {
  *   1. Sync caller's stream so any upstream work on it is flushed.
  *   2. Enter `rmm::cuda_set_device_raii` for the target device.
  *   3. Acquire a target-bound stream from `target_memory_space->acquire_stream()`.
- *   4. Use the TARGET-bound stream for read_parquet + apply_post_convert +
- *      apply_partition_inject + final sync (never the caller's stream).
+ *   4. Use the TARGET-bound stream for read_parquet + apply_partition_inject +
+ *      final sync (never the caller's stream).
  *   5. Consume sticky cuda errors before returning.
  */
 std::unique_ptr<cucascade::idata_representation>
@@ -157,7 +157,6 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     host_src.get_fallback_datasource(),
     host_src.get_filter_expression_by_device(),
     host_src.get_post_filter_projection_ids());
-  if (host_src.has_post_convert_fn()) { dst->set_post_convert_fn(host_src.get_post_convert_fn()); }
   if (host_src.has_partition_inject_fn()) {
     dst->set_partition_inject_fn(host_src.get_partition_inject_fn());
     dst->set_partition_values(host_src.get_partition_values());

@@ -26,7 +26,6 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -132,8 +131,9 @@ void sirius_pipeline::is_ready()
   if (ready) { return; }
   ready = true;
   std::reverse(operators.begin(), operators.end());
-  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && !operators.empty()) {
-    // Derive source/sink from operators[]; finalize_pipeline_structure skips this under flag ON.
+  if (!operators.empty()) {
+    // Derive source/sink from operators[] (meta-pipeline pre-populated the sink;
+    // build_pipelines appended intermediates/sources before the reverse above).
     source = &operators.front().get();
     sink   = &operators.back().get();
   }

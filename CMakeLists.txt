@@ -262,14 +262,9 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
-    src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
     src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
-    src/op/scan/iceberg_avro_reader.cpp
-    src/op/scan/iceberg_delete_pipeline.cpp
-    src/op/scan/positional_delete_filter.cpp
-    src/op/scan/puffin_reader.cpp
     src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
@@ -300,7 +295,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_operator.cpp
     src/op/sirius_physical_operator_type.cpp
     src/op/sirius_physical_order.cpp
-    src/op/sirius_physical_iceberg_scan.cpp
     src/op/sirius_physical_parquet_scan.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
@@ -369,7 +363,6 @@ set(CUDA_SOURCES
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
-    src/op/scan/equality_delete_mask.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -644,6 +637,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
+    test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
@@ -653,8 +647,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
-    test/cpp/pipeline/test_pipeline_conversion_differential.cpp
-    test/cpp/pipeline/test_pipeline_conversion_parquet_differential.cpp
+    test/cpp/pipeline/test_partition_build_pipelines.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp

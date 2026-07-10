@@ -81,16 +81,11 @@ void sirius_physical_result_collector::build_pipelines(
   // operator is a sink, build a pipeline
   D_ASSERT(children.empty());
 
-  // single operator: the operator becomes the data source of the current pipeline
+  // RESULT_COLLECTOR is both the root of `current` (appended here, operators[0]
+  // post-reverse) and the sink of its own child_meta (pre-populated by
+  // create_child_meta_pipeline).
   auto& state = meta_pipeline.get_state();
-  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    // RESULT_COLLECTOR is both the root of `current` (appended here, operators[0]
-    // post-reverse) and the sink of its own child_meta (pre-populated by
-    // create_child_meta_pipeline).
-    state.add_pipeline_operator(current, *this);
-  } else {
-    state.set_pipeline_source(current, *this);
-  }
+  state.add_pipeline_operator(current, *this);
 
   // we create a new pipeline starting from the child
   auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);

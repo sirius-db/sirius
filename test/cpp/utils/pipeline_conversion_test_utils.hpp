@@ -31,9 +31,8 @@ namespace sirius::test {
 //! Drive the full sirius planner + meta_pipeline + converter flow on `query` (with the
 //! production optimizer disables) and return `dump_pipeline_conversion_result(...)`; stops
 //! after `converter.convert()` — no GPU execution. Returns a string rather than the raw
-//! result because the result references the function-local plan tree. Reads
-//! `USE_TREE_BASED_PIPELINE_BUILD` at call time; toggle it before each call. Throws on
-//! parse / bind / optimize errors; iceberg queries are unsupported.
+//! result because the result references the function-local plan tree. Throws on
+//! parse / bind / optimize errors.
 std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query);
 
 //! Like `convert_query_to_dump`, but hands the raw `pipeline_conversion_result` to `consume`
@@ -43,24 +42,6 @@ void with_conversion_result(
   duckdb::Connection& con,
   const std::string& query,
   const std::function<void(pipeline::pipeline_conversion_result&)>& consume);
-
-//! RAII guard that restores `duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD` (a process-wide
-//! static) so later test cases observe the default.
-class tree_pipeline_flag_guard {
- public:
-  tree_pipeline_flag_guard();
-  ~tree_pipeline_flag_guard();
-
-  tree_pipeline_flag_guard(const tree_pipeline_flag_guard&)            = delete;
-  tree_pipeline_flag_guard& operator=(const tree_pipeline_flag_guard&) = delete;
-
- private:
-  bool original_;
-};
-
-//! Toggle `USE_TREE_BASED_PIPELINE_BUILD` to `flag`, then call `convert_query_to_dump`.
-//! Wrap call sites with a `tree_pipeline_flag_guard` so the flag is restored on exit.
-std::string dump_under_flag(duckdb::Connection& con, const std::string& query, bool flag);
 
 //! Path to the canonical TPC-H queries (`test/tpch_performance/tpch_queries/orig/`).
 std::filesystem::path tpch_queries_dir();

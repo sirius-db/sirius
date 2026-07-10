@@ -163,8 +163,8 @@ void require_all_equality_sides_are_references(sirius::op::sirius_physical_hash_
 bool has_projection_child(sirius::op::sirius_physical_hash_join& hj)
 {
   for (auto& child : hj.children) {
-    // Under USE_TREE_BASED_PIPELINE_BUILD, plan-gen wraps each join child in a
-    // CONCAT -> PARTITION chain; the materializing PROJECTION sits below the wraps.
+    // Plan-gen wraps each join child in a CONCAT -> PARTITION chain; the materializing
+    // PROJECTION sits below the wraps.
     auto* node = child.get();
     while (node != nullptr && (node->type == sirius::op::SiriusPhysicalOperatorType::CONCAT ||
                                node->type == sirius::op::SiriusPhysicalOperatorType::PARTITION)) {
