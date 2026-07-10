@@ -869,7 +869,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   sirius::scan_manager::sirius_scan_manager& scan_mgr,
   std::vector<std::string> const& file_paths,
   std::optional<std::vector<std::string>> const& cols,
-  std::size_t batch_size)
+  std::size_t batch_size,
+  vector<LogicalType>& pinned_column_types)
 {
   using sirius::op::scan::parquet_ingestible_table_info;
   auto desc = scan_mgr.describe_parquet(file_paths.front());
@@ -883,6 +884,11 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   info->names               = desc.names;                                  // full schema
   for (auto idx : keep) {
     info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(idx)));
+    // Pin-time DuckDB type of each pinned column, in column_ids (batch-column)
+    // order. Taken from the native DuckDB schema rather than round-tripped
+    // through sirius::logical_type: the zone-map capture keys its type
+    // allowlist on exact LogicalType identity (e.g. timestamp units).
+    pinned_column_types.push_back(desc.return_types[idx]);
   }
   if (is_subset) {
     // Non-empty projection_ids forces scan_plan::is_projected() so the cudf reader
@@ -925,7 +931,8 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   std::string const& table_ref,
   std::string const& schema_override,
   std::optional<std::vector<std::string>> const& cols,
-  std::size_t batch_size)
+  std::size_t batch_size,
+  vector<LogicalType>& pinned_column_types)
 {
   using sirius::op::scan::duckdb_native_ingestible_table_info;
 
@@ -968,6 +975,8 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   info->returned_types = sirius::from_duckdb_vec(schema_types);
   for (auto col : keep) {
     info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(col)));
+    // Exact pin-time DuckDB type per pinned column (see build_parquet_pin_info).
+    pinned_column_types.push_back(schema_types[col]);
     sirius::op::scan::projected_column pc;
     pc.is_rowid    = false;
     pc.storage_idx = duckdb::StorageIndex(static_cast<duckdb::idx_t>(col));
@@ -1142,13 +1151,16 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // duckdb-native has no standalone reader, so both formats go through their
   // gpu_ingestible — one read path.
   std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
+  // Pin-time DuckDB types of the pinned columns, in column_ids (batch-column)
+  // order — the zone-map capture keys its type allowlist on these exact types.
+  vector<LogicalType> pinned_column_types;
   // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
   // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
   transaction_t duckdb_pin_v_base = 0;
 
   if (data.args.format == "duckdb") {
-    auto info =
-      build_duckdb_pin_info(context, data.args.name, data.args.schema, data.args.cols, batch_size);
+    auto info = build_duckdb_pin_info(
+      context, data.args.name, data.args.schema, data.args.cols, batch_size, pinned_column_types);
     // After the catalog resolution (so a bad table name fails without side
     // effects) but before make_ingestible snapshots the on-disk row groups.
     suppress_auto_checkpoint_for_pin(context);
@@ -1170,7 +1182,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
-    auto info  = build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size);
+    auto info =
+      build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
   }
 
@@ -1186,7 +1199,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // whole table never needs to fit in GPU memory. On multi-GPU the chunks land round-robin
     // across NUMA nodes; the cached-serve path then reads each chunk back on a NUMA-local GPU.
     auto mat = sirius::materialize_pin_to_host(
-      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx());
+      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx(), pinned_column_types);
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
@@ -1194,7 +1207,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     scan_mgr.insert_pinned_entry_host(data.args.name,
                                       std::move(cache_info),
                                       std::move(mat.host_chunks),
-                                      *representative_host_space);
+                                      *representative_host_space,
+                                      std::move(pinned_column_types),
+                                      std::move(mat.chunk_stats));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1204,12 +1219,15 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   } else {
     // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
     // placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
+    auto mat = sirius::materialize_all_batches(
+      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pinned_column_types);
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),
                                  std::move(mat.tables),
-                                 std::move(mat.chunk_memory_spaces));
+                                 std::move(mat.chunk_memory_spaces),
+                                 std::move(pinned_column_types),
+                                 std::move(mat.chunk_stats));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;

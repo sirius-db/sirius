@@ -343,6 +343,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
+    src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
@@ -611,6 +612,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_pin_table_duckdb_native_cache.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
+    test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
