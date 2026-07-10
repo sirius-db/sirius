@@ -104,25 +104,34 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
   sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
 {
-  auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
-  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
-    throw std::runtime_error(
-      "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
+  auto info            = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->returned_types = scan_op.returned_types;
+  info->column_ids     = scan_op.column_ids;
+  info->projection_ids = scan_op.projection_ids;
+  info->names          = scan_op.names;
+  info->table_filters  = std::move(scan_op.table_filters);
+  if (scan_op.function.name == "sirius_read_parquet") {
+    // Internal S3 rewrite target: its bind_data is SiriusReadParquetBindData, not
+    // MultiFileBindData — the resolved URI travels in parameters[0].
+    if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
+      throw std::runtime_error(
+        "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
+        "has no URI parameter");
+    }
+    info->resolved_file_paths = {scan_op.parameters.front().GetValue<std::string>()};
+  } else {
+    auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+      throw std::runtime_error(
+        "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
+    }
+    std::vector<std::string> file_paths;
+    for (auto const& file : bind_data.file_list->GetAllFiles()) {
+      file_paths.push_back(file.path);
+    }
+    info->resolved_file_paths = std::move(file_paths);
+    info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
   }
-  std::vector<std::string> file_paths;
-  for (auto const& file : bind_data.file_list->GetAllFiles()) {
-    file_paths.push_back(file.path);
-  }
-  auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
-
-  auto info                 = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
-  info->returned_types      = scan_op.returned_types;
-  info->resolved_file_paths = std::move(file_paths);
-  info->column_ids          = scan_op.column_ids;
-  info->projection_ids      = scan_op.projection_ids;
-  info->names               = scan_op.names;
-  info->table_filters       = std::move(scan_op.table_filters);
-  info->partition_indices   = partition_indices;
   // `scan_output_arity` drives the provider's expected column count — without it the runtime
   // task skips the hive-partition columns it should inject post-read, mis-sizing the output.
   info->scan_output_arity      = scan_op.types.size();
@@ -156,6 +165,13 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   info->storage = &table.GetStorage();
   info->context = &context;
   info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  // Qualified-name identity for the pin cache — derived from the resolved
+  // DuckTableEntry so it matches the pin-side derivation (build_duckdb_pin_info)
+  // exactly. Without these a pin_table(format='duckdb', ...) query silently misses
+  // the pinned cache and falls through to disk.
+  info->catalog_name           = table.ParentCatalog().GetName();
+  info->schema_name            = table.ParentSchema().name;
+  info->table_name             = table.name;
   info->approximate_batch_size = op_params.scan_task_batch_size;
 
   std::vector<std::size_t> source_ids_fallback;
@@ -201,9 +217,10 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
 
 //! Rewrite a TABLE_SCAN so the tree walk produces the same pipeline shape the legacy converter
 //! assembles at runtime:
-//! - `seq_scan` / `parquet_scan` / `read_parquet`: REPLACE the slot with the GPU leaf so it
-//!   inherits the TABLE_SCAN's tree position and stays the source-leaf of the existing
-//!   pipeline (legacy inlines these scans into the current pipeline).
+//! - `seq_scan` / `parquet_scan` / `read_parquet` / `sirius_read_parquet` (the internal S3
+//!   rewrite target): REPLACE the slot with the GPU leaf so it inherits the TABLE_SCAN's
+//!   tree position and stays the source-leaf of the existing pipeline (legacy inlines these
+//!   scans into the current pipeline).
 //! - `iceberg_scan`: attach the leaf as the TABLE_SCAN's only child so the walk spins up a
 //!   child meta-pipeline for it (legacy creates a new pipeline). The pre-fetched
 //!   `IcebergDeleteData` is attached from the cache; a miss leaves `delete_data` null,
@@ -232,7 +249,7 @@ void wrap_table_scan_source(
       scan.types, scan.estimated_cardinality, std::move(ingestible));
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
-  } else if (fn == "parquet_scan" || fn == "read_parquet") {
+  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
     auto info = build_parquet_table_info(scan, op_params);
     // Dynamic filters: the ingestible consumes them for read-time row-group pruning; the
     // DYNAMIC_FILTER wrapped above applies them post-decode. Elide both when no producer was

@@ -1826,6 +1826,26 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
     std::size_t op_idx = 0;
     for (const auto& op_ref : ops) {
       out << "    [" << op_idx++ << "] " << op_name(&op_ref.get()) << "\n";
+      // Scan identity: serialize what the ingestible will scan, so a converter that
+      // drops identity fields (e.g. the duckdb-native pin-cache qualified name, or a
+      // parquet file list) fails the legacy-vs-tree differential byte-diff instead of
+      // passing on an identical operator-type chain. Conversion-time only: table_info
+      // is still parked on the operator (scan_manager takes it at prepare_for_query).
+      if (op_ref.get().type == op::SiriusPhysicalOperatorType::GPU_SCAN) {
+        auto const& info =
+          op_ref.get().Cast<op::scan::sirius_gpu_scan_operator>().peek_table_info();
+        if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+          out << "      scan: parquet files=[";
+          for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {
+            out << (f == 0 ? "" : ",") << pq->resolved_file_paths[f];
+          }
+          out << "]\n";
+        } else if (auto const* nat =
+                     dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
+          out << "      scan: duckdb table=" << nat->catalog_name << "." << nat->schema_name << "."
+              << nat->table_name << "\n";
+        }
+      }
     }
   }
 
