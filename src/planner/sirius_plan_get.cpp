@@ -137,10 +137,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats) ||
             duckdb::StringStats::MaxStringLength(*stats) >= overflow_limit) {
           throw duckdb::NotImplementedException(
-            "duckdb-native scan: varchar column {} may contain strings at/over the "
-            "overflow-block limit ({} bytes); overflow strings are not GPU-decodable",
-            primary,
-            overflow_limit);
+            "duckdb-native scan: varchar column %llu may contain strings at/over the "
+            "overflow-block limit (%llu bytes); overflow strings are not GPU-decodable",
+            static_cast<unsigned long long>(primary),
+            static_cast<unsigned long long>(overflow_limit));
         }
       }
 
@@ -166,10 +166,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             duckdb::DuckTransaction::Get(context, table.ParentCatalog()).start_time;
           if (start_time < entry->mvcc->v_base) {
             throw duckdb::NotImplementedException(
-              "duckdb-native scan: transaction snapshot ({}) predates the pinned cache "
-              "snapshot ({}) for table '{}'",
-              start_time,
-              entry->mvcc->v_base,
+              "duckdb-native scan: transaction snapshot (%llu) predates the pinned cache "
+              "snapshot (%llu) for table '%s'",
+              static_cast<unsigned long long>(start_time),
+              static_cast<unsigned long long>(entry->mvcc->v_base),
               table.name);
           }
           // (b) insert-present: committed rows beyond the pinned prefix, or
@@ -178,14 +178,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           // reader lands.
           if (static_cast<std::size_t>(storage.GetTotalRows()) > n_cache) {
             throw duckdb::NotImplementedException(
-              "duckdb-native scan: table '{}' has rows beyond the {} pinned at pin time; "
+              "duckdb-native scan: table '%s' has rows beyond the %llu pinned at pin time; "
               "post-pin inserts are not served from the cache yet",
               table.name,
-              n_cache);
+              static_cast<unsigned long long>(n_cache));
           }
           if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
             throw duckdb::NotImplementedException(
-              "duckdb-native scan: table '{}' has uncommitted appends in this transaction; "
+              "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
               "transaction-local inserts are not served from the cache",
               table.name);
           }
@@ -219,7 +219,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                 storage, projected, static_cast<std::size_t>(storage.GetTotalRows()));
             if (!clean) {
               throw duckdb::NotImplementedException(
-                "duckdb-native scan: table '{}' is MVCC-pinned, the pin cannot serve the "
+                "duckdb-native scan: table '%s' is MVCC-pinned, the pin cannot serve the "
                 "requested columns, and the table has diverged from its last-checkpointed "
                 "image",
                 table.name);
@@ -229,7 +229,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             // chains version values in place, invisibly to the DELETE
             // keep-masks — the cached values would be stale.
             throw duckdb::NotImplementedException(
-              "duckdb-native scan: table '{}' has in-memory update chains on a scanned "
+              "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
               "column; updated values are not served from the cache",
               table.name);
           }
