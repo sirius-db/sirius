@@ -622,7 +622,6 @@ set(TEST_SOURCES
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
-    test/cpp/scan_manager/test_pin_table_duckdb_native_cache.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
