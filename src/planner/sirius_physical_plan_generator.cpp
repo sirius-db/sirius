@@ -748,14 +748,11 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   plan = fold_adjacent_projections(std::move(plan));
   plan->verify();
 
-  // Tree-based pipeline build: rewrite the plan tree to contain the GPU pipeline operators so
-  // the converter becomes a pure topology pass over `build_pipelines` virtuals;
-  // `set_parent_ops` then derives every `_parent_op` from the final tree for the
-  // tree-parent-lookup wiring.
-  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    insert_gpu_pipeline_operators(plan);
-    set_parent_ops(*plan, /*parent=*/nullptr);
-  }
+  // Rewrite the plan tree to contain the GPU pipeline operators so the converter becomes a
+  // pure topology pass over `build_pipelines` virtuals; `set_parent_ops` then derives every
+  // `_parent_op` from the final tree for the tree-parent-lookup wiring.
+  insert_gpu_pipeline_operators(plan);
+  set_parent_ops(*plan, /*parent=*/nullptr);
 
   return plan;
 }

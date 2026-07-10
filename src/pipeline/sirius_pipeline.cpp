@@ -131,8 +131,9 @@ void sirius_pipeline::is_ready()
   if (ready) { return; }
   ready = true;
   std::reverse(operators.begin(), operators.end());
-  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && !operators.empty()) {
-    // Derive source/sink from operators[]; finalize_pipeline_structure skips this under flag ON.
+  if (!operators.empty()) {
+    // Derive source/sink from operators[] (meta-pipeline pre-populated the sink;
+    // build_pipelines appended intermediates/sources before the reverse above).
     source = &operators.front().get();
     sink   = &operators.back().get();
   }

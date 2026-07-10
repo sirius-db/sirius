@@ -128,8 +128,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
-                                   sirius_physical_operator& op,
-                                   bool build_rhs = true);
+                                   sirius_physical_operator& op);
 
   /**
    * @brief Returns true if the given join conditions can be handled by this operator.
@@ -285,16 +284,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
 
   // Sink Interface
-  //! Flag OFF: unconditionally a sink (legacy converter expectation). Flag ON: the inner
-  //! join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule applies (sink
-  //! iff parent is PARTITION or RIGHT_DELIM_JOIN).
+  //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule
+  //! applies (sink iff parent is PARTITION or RIGHT_DELIM_JOIN).
   bool is_sink() const override
   {
-    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      if (_is_delim_join_inner) { return false; }
-      return sirius_physical_operator::is_sink();
-    }
-    return true;
+    if (_is_delim_join_inner) { return false; }
+    return sirius_physical_operator::is_sink();
   }
 
   void on_finalize_operator() override;

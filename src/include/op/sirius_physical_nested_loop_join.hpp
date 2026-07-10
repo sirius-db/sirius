@@ -104,22 +104,13 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
  protected:
   // CachingOperator Interface
 
-  static void build_join_pipelines(pipeline::sirius_pipeline& current,
-                                   pipeline::sirius_meta_pipeline& meta_pipeline,
-                                   sirius_physical_operator& op,
-                                   bool build_rhs = true);
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
  public:
   // Source interface
-  //! Flag ON: always a source (every join emits output). Flag OFF: source only for join
-  //! types that propagate the build side, as the legacy converter expects.
-  bool is_source() const override
-  {
-    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) { return true; }
-    return duckdb::PropagatesBuildSide(join_type);
-  }
+  //! Always a source: every join emits output.
+  bool is_source() const override { return true; }
 
  public:
   //! True when this NLJ is the internal `delim.join` of a RIGHT_DELIM_JOIN; see the
@@ -128,15 +119,12 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
 
   // Sink Interface
-  //! Flag OFF: unconditionally a sink. Flag ON: the inner join of a RIGHT_DELIM_JOIN is
-  //! never a sink; otherwise the base rule applies. Mirrors HJ.
+  //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule
+  //! applies. Mirrors HJ.
   bool is_sink() const override
   {
-    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-      if (_is_delim_join_inner) { return false; }
-      return sirius_physical_operator::is_sink();
-    }
-    return true;
+    if (_is_delim_join_inner) { return false; }
+    return sirius_physical_operator::is_sink();
   }
 
  protected:

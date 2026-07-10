@@ -197,12 +197,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   // The RESULT_COLLECTOR wrap is added after the plan generator's own `set_parent_ops` ran;
   // re-walk so the wrapped child's `_parent_op` points at RESULT_COLLECTOR (the tree-parent
-  // wiring needs it to route the final sink pipeline's output there). Flag-gated: the legacy
-  // path relies on ctor-set `_parent_op` values this re-walk would overwrite.
-  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
-    sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
-                                                                    /*parent=*/nullptr);
-  }
+  // wiring needs it to route the final sink pipeline's output there).
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
+                                                                  /*parent=*/nullptr);
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;
