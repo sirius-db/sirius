@@ -42,10 +42,20 @@ struct pipeline_conversion_result {
   std::size_t meta_pipeline_count;
 };
 
-//! Deterministic, line-oriented serialization of a pipeline_conversion_result, used by the
-//! schedule/determinism tests and as a debugging surface: equivalent graphs produce
-//! byte-identical output regardless of emission order.
+//! Canonical, line-oriented serialization of a pipeline_conversion_result, used as a
+//! debugging surface: pipelines are signature-sorted, so equivalent graphs produce
+//! byte-identical output regardless of emission order. Because of that sort it CANNOT
+//! detect schedule-order differences — use `dump_pipeline_schedule_raw` for those.
 std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result);
+
+//! Like `dump_pipeline_conversion_result`, but serializes the RAW scheduled order:
+//! pipelines in `scheduled_pipelines` order, each with its `dependencies` as scheduled
+//! indices, plus the wirings keyed by scheduled indices. Nothing is signature-sorted, so
+//! comparing two conversions of the same query catches schedule-order nondeterminism
+//! (A,B vs B,A) that the canonical dump deliberately hides. Raw order is load-bearing:
+//! scan registration preserves scheduled order and `task_scheduler::start_query` launches
+//! `scans.front()`.
+std::string dump_pipeline_schedule_raw(const pipeline_conversion_result& result);
 
 //! Reorders `pipelines` in place into a deterministic, strictly-topological schedule
 //! (every pipeline after all of its `dependencies`), renumbers `pipeline_id` to the new

@@ -35,6 +35,11 @@ namespace sirius::test {
 //! parse / bind / optimize errors.
 std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query);
 
+//! Like `convert_query_to_dump`, but returns `dump_pipeline_schedule_raw(...)`: pipelines in
+//! true scheduled order with dependency indices, nothing canonicalized. Comparing two calls
+//! on the same query is the schedule-order determinism check.
+std::string convert_query_to_raw_schedule(duckdb::Connection& con, const std::string& query);
+
 //! Like `convert_query_to_dump`, but hands the raw `pipeline_conversion_result` to `consume`
 //! while the plan tree and meta-pipelines are still alive; the result must not escape
 //! `consume`. Lets tests inspect the real schedule order, which the dump sorts away.

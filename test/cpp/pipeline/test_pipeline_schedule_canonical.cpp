@@ -81,7 +81,7 @@ void require_strictly_topological(
 //! be strictly topological (the raw meta-sweep emission is not), join dependencies must stay
 //! build-side-first (dynamic filters publish before the probe-side scans they prune are
 //! launched), reordering an already-canonical schedule must be a no-op, and converting the
-//! same query twice must serialize byte-identically.
+//! same query twice must reproduce the raw scheduled order byte-identically.
 TEST_CASE("pipeline schedule is strictly topological and deterministic",
           "[integration][pipeline][schedule_canonical]")
 {
@@ -149,12 +149,15 @@ TEST_CASE("pipeline schedule is strictly topological and deterministic",
         }
       });
 
-      // Converting the same query twice serializes byte-identically (the dump is
-      // ID-normalized and signature-sorted, so this catches emission-order and
-      // container-iteration nondeterminism).
-      auto first_dump  = sirius::test::convert_query_to_dump(con, query);
-      auto second_dump = sirius::test::convert_query_to_dump(con, query);
-      REQUIRE(first_dump == second_dump);
+      // Converting the same query twice must reproduce the RAW schedule byte-identically:
+      // operator chains, scheduled order, dependency indices, and wiring endpoints. The
+      // canonical dump (`dump_pipeline_conversion_result`) is signature-sorted and would
+      // accept a schedule-order flip (A,B vs B,A); the raw dump keeps order visible. Raw
+      // order is load-bearing: scan registration preserves scheduled order and
+      // `task_scheduler::start_query` launches `scans.front()`.
+      auto first_raw  = sirius::test::convert_query_to_raw_schedule(con, query);
+      auto second_raw = sirius::test::convert_query_to_raw_schedule(con, query);
+      REQUIRE(first_raw == second_raw);
     }
   }
 }
