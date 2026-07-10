@@ -62,6 +62,54 @@ class sirius_dynamic_filter_set;
 enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
 enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
 
+//===----------------------------------------------------------------------===//
+// BUILD_PROBE scheduling helpers (pure, unit-testable)
+//
+// BUILD_PROBE keeps one hash table per partition. The multi-partition scheduling decision and the
+// mode-eligibility gate are factored into free functions so they can be exercised in unit tests
+// without a live pipeline or GPU.
+//===----------------------------------------------------------------------===//
+
+/// The action the BUILD_PROBE state machine should take next.
+enum class build_probe_action {
+  schedule_build,  ///< Build the hash table for `partition` (and probe its first batch).
+  schedule_probe,  ///< Probe an already-built `partition` with its next probe batch.
+  wait_for_build,  ///< No schedulable work; a partition is still awaiting its build batch.
+  wait_for_probe,  ///< No schedulable work; awaiting probe batches (or the op is draining).
+  none             ///< No partitions exist / all are destroyed.
+};
+
+/// A single partition's observable state for the scheduling decision.
+struct build_probe_slot_view {
+  BUILD_HASH_TABLE_STATE state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
+  bool has_build_batch         = false;  ///< The build repo holds this partition's build batch.
+  bool has_probe_batch         = false;  ///< The probe repo holds >=1 batch for this partition.
+};
+
+struct build_probe_decision {
+  build_probe_action action = build_probe_action::none;
+  std::size_t partition     = 0;
+};
+
+/// Decide the next BUILD_PROBE action from a per-partition snapshot. Prefers scheduling a build for
+/// the first NOT_BUILT partition that has both its build and a probe batch, then probing the first
+/// BUILT partition with probe data; otherwise reports whether it is waiting on build or probe
+/// input.
+[[nodiscard]] build_probe_decision select_build_probe_action(
+  std::vector<build_probe_slot_view> const& slots);
+
+/// Whether a join is eligible to run in BUILD_PROBE mode. Mirrors the gate in
+/// update_join_exec_mode: at most one partition per GPU, each partition's average build side fits a
+/// single hash table, the build side folds to one batch per partition, and the join is neither a
+/// right-family nor a mixed join.
+[[nodiscard]] bool build_probe_mode_eligible(int num_partitions,
+                                             uint64_t build_side_bytes,
+                                             bool build_foldable_to_single_batch,
+                                             bool is_right_family,
+                                             bool is_mixed_join,
+                                             int num_gpus,
+                                             uint64_t max_build_hash_table_bytes);
+
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
@@ -166,11 +214,23 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                              uint64_t build_side_bytes,
                              bool build_foldable_to_single_batch);
 
+  /// @brief Inform the join how many GPUs the query runs on. Set at plan time.
+  ///
+  /// BUILD_PROBE keeps one cuco hash table per partition, and each cuco table must live on a single
+  /// GPU. Partitions are routed to `partition_idx % num_gpus`, so BUILD_PROBE is allowed with up to
+  /// one partition per GPU (`num_partitions <= num_gpus`). Defaults to 1, which reduces the
+  /// BUILD_PROBE eligibility test to the historical single-partition rule.
+  void set_num_gpus(int num_gpus) { _num_gpus = num_gpus; }
+
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  /// Snapshot each partition's build state and per-partition data availability for the BUILD_PROBE
+  /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
+  std::vector<build_probe_slot_view> snapshot_build_probe_slots();
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -192,21 +252,39 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   bool is_all_inequality_join = true;
 
-  HASH_JOIN_MODE _join_mode                      = HASH_JOIN_MODE::STANDARD;
-  BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
-  uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
-  std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
-  std::unique_ptr<cudf::distinct_hash_join>
-    _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
-  std::unique_ptr<cudf::filtered_join>
-    _filtered_table;  // reusable build-on-right semi-join object for MARK joins in BUILD_PROBE mode
-  bool _build_has_null = false;  // whether the build/right side has a NULL in any join key column;
-                                 // needed for MARK three-valued logic in BUILD_PROBE mode
-  std::optional<::cucascade::read_only_data_batch>
-    _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
-  std::vector<std::unique_ptr<cudf::column>>
-    _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the
-                                // build table
+  HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
+  uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  // Number of GPUs the query runs on (set at plan time via set_num_gpus). BUILD_PROBE keeps one
+  // hash table per partition, each pinned to a single GPU, so it is allowed only when
+  // num_partitions <= _num_gpus. Defaults to 1 so single-GPU / unconfigured paths keep the
+  // historical single-partition BUILD_PROBE behavior.
+  int _num_gpus = 1;
+
+  // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
+  // that lives entirely on one GPU (partition_idx % _num_gpus). A partition is built once — its
+  // single SCHEDULED build task release-stores BUILT — and then probed by many streamed probe tasks
+  // that only read the table. `build_state` is atomic so get_next_task_hint can observe a slot's
+  // progress without holding op_state_mutex while execute() flips it.
+  struct per_partition_build_state {
+    std::atomic<BUILD_HASH_TABLE_STATE> build_state{BUILD_HASH_TABLE_STATE::NOT_BUILT};
+    std::unique_ptr<cudf::hash_join> hash_table;  // general path (INNER/LEFT/OUTER)
+    std::unique_ptr<cudf::distinct_hash_join>
+      distinct_hash_table;  // used instead of hash_table when build keys are proven unique
+    std::unique_ptr<cudf::filtered_join>
+      filtered_table;             // reusable build-on-right object for MARK/SEMI/ANTI joins
+    bool build_has_null = false;  // whether the build/right side has a NULL in any join key column;
+                                  // needed for MARK three-valued logic at probe time
+    std::optional<::cucascade::read_only_data_batch>
+      build_table;  // owned build table, to materialize build-side results at probe time
+    std::vector<std::unique_ptr<cudf::column>>
+      built_table_cast_columns;  // scope holder for columns cast for the build table's lifetime
+    int device_id = -1;          // GPU this slot's table was built on; guards teardown frees
+  };
+  // Sized to num_partitions when BUILD_PROBE is entered (see update_join_exec_mode). Elements are
+  // non-movable (atomic member), so the vector is default-constructed at the target size and only
+  // ever whole-move-assigned — never resized or push_back'd — so element moves are never required.
+  std::vector<per_partition_build_state> _partition_build_states;
   //
   // Number of equality conditions after reordering; inequality conditions follow at higher indices.
   std::size_t num_equality_conditions = 0;

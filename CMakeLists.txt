@@ -627,6 +627,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
+    test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
