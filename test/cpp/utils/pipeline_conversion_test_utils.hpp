@@ -32,7 +32,7 @@ namespace sirius::test {
 //! production optimizer disables) and return `dump_pipeline_conversion_result(...)`; stops
 //! after `converter.convert()` — no GPU execution. Returns a string rather than the raw
 //! result because the result references the function-local plan tree. Throws on
-//! parse / bind / optimize errors; iceberg queries are unsupported.
+//! parse / bind / optimize errors.
 std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query);
 
 //! Like `convert_query_to_dump`, but hands the raw `pipeline_conversion_result` to `consume`

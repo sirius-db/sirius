@@ -26,10 +26,6 @@
 #include <string>
 #include <unordered_map>
 
-namespace sirius::op::scan {
-struct IcebergDeleteData;
-}  // namespace sirius::op::scan
-
 namespace sirius::op {
 class sirius_physical_table_scan;
 }  // namespace sirius::op
@@ -219,19 +215,5 @@ class sirius_physical_plan_generator {
   //! structure before the pipeline converter runs. Flag-gated at the call site.
   void insert_gpu_pipeline_operators(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
-
-  //! Materialize Iceberg delete data for every iceberg_scan TABLE_SCAN into
-  //! `iceberg_delete_data_cache_`. Mirrors `sirius_engine::prefetch_iceberg_delete_data`,
-  //! which still serves the flag-off (legacy converter) path.
-  void prefetch_iceberg_delete_data(sirius::op::sirius_physical_operator& plan);
-
-  //! Resolve an Iceberg table's on-disk path: `parameters[0]` when present, else derived from
-  //! `bind_data.file_list` (REST catalog). Returns empty string when neither is available.
-  static std::string resolve_iceberg_table_path(sirius::op::sirius_physical_table_scan& scan_op);
-
-  //! Iceberg delete-data cache keyed by table path; populated by
-  //! `prefetch_iceberg_delete_data`, consumed when constructing iceberg scan leaves.
-  std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>
-    iceberg_delete_data_cache_;
 };
 }  // namespace sirius::planner

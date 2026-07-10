@@ -59,9 +59,9 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// A reusable copy of the optimized logical plan.
   /// DuckDB can execute the same prepared physical operator multiple times, so
   /// we rebuild a fresh Sirius physical plan from this template for each run.
-  /// May be null when the plan contains a non-Copy()-able LogicalGet (e.g.
-  /// iceberg_scan) — in that case we fall back to re-planning from
-  /// `unbound_statement_`.
+  /// May be null when the plan contains a non-Copy()-able LogicalGet (a table
+  /// function whose bind_data has no serializer) — in that case we fall back to
+  /// re-planning from `unbound_statement_`.
   /// Mutable: GetDataInternal is `const` per the DuckDB interface, but on the
   /// first execute we may discover Copy() throws and need to clear this so
   /// future executes skip straight to the replan path.
