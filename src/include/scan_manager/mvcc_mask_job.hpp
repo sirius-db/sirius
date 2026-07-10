@@ -110,10 +110,15 @@ struct mvcc_mask_job_request {
  * dropped rows get their mask slot set; all-visible chunks stay null (served
  * unmasked) and the bundle frees once the last published mask releases.
  *
+ * A mask larger than one staging block (blocks are not virtually contiguous)
+ * falls back to plain pageable host memory for that chunk — correctness is
+ * identical; only the true-async-DMA benefit is lost, and a log line records
+ * it.
+ *
  * @throws std::runtime_error on capture/validation failures, reservation
- *         failure, a mask exceeding one staging block, or dropped tasks —
- *         loud by design: this runs after the plan-time CPU-fallback gate, so
- *         the alternatives are all silent-wrong-data.
+ *         failure, or dropped tasks — loud by design: this runs after the
+ *         plan-time CPU-fallback gate, so the alternatives are all
+ *         silent-wrong-data.
  */
 void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
                         exec::scoped_dispatcher& dispatcher,

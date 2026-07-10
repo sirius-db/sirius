@@ -205,6 +205,19 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
   };
   constexpr std::size_t kMaskAlign = 64;  // cache-line-aligned carve within blocks
   std::map<std::size_t, node_layout> nodes;
+  std::vector<std::unique_ptr<chunk_work>> works;
+
+  auto make_work = [&jobs](std::size_t j, std::size_t c, std::size_t rows) {
+    auto& job         = jobs[j];
+    auto work         = std::make_unique<chunk_work>();
+    work->masks       = job.request->masks.get();
+    work->chunk_index = c;
+    work->row_count   = rows;
+    work->slices      = std::span<op::scan::mvcc_row_group_slice const>(job.plan.chunks[c].data(),
+                                                                   job.plan.chunks[c].size());
+    work->transaction = job.plan.transaction;
+    return work;
+  };
 
   for (std::size_t j = 0; j < jobs.size(); ++j) {
     auto& job = jobs[j];
@@ -214,15 +227,28 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
       for (auto const& slice : job.plan.chunks[c]) {
         rows += slice.row_count;
       }
-      auto const bytes = ((rows + 31) / 32) * sizeof(std::uint32_t);
+      auto const n_words = (rows + 31) / 32;
+      auto const bytes   = n_words * sizeof(std::uint32_t);
       if (bytes > block_size) {
-        // Blocks are not virtually contiguous, so a mask cannot span two.
-        // Unreachable with realistic chunk budgets (bit-packed masks are ~a
-        // few MB at most); loud rather than mis-carved.
-        throw std::runtime_error(
-          "[run_mvcc_mask_jobs] pinned entry '" + job.request->entry_name + "': chunk " +
-          std::to_string(c) + " needs a " + std::to_string(bytes) +
-          "-byte mask, larger than one staging block (" + std::to_string(block_size) + " bytes)");
+        // Staging blocks are not virtually contiguous, so a mask cannot span
+        // two. A chunk this large (block_size x 8 rows and up — narrow
+        // columns under a big batch budget) keeps a plain pageable mask
+        // instead: cudaMemcpyAsync stages pageable memory out before
+        // returning, so only the true-async-DMA benefit is lost, and only
+        // for these oversized chunks.
+        SIRIUS_LOG_INFO(
+          "[run_mvcc_mask_jobs] pinned entry '{}': chunk {} mask ({} bytes) exceeds one "
+          "staging block ({} bytes); using pageable host memory for it",
+          job.request->entry_name,
+          c,
+          bytes,
+          block_size);
+        auto storage    = std::make_shared<std::vector<std::uint32_t>>(n_words);
+        auto work       = make_work(j, c, rows);
+        work->words     = std::span<std::uint32_t>(storage->data(), storage->size());
+        work->retention = std::move(storage);
+        works.push_back(std::move(work));
+        continue;
       }
       auto* space = job.request->chunk_spaces[c];
       if (space == nullptr) {
@@ -240,7 +266,6 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
     }
   }
 
-  std::vector<std::unique_ptr<chunk_work>> works;
   for (auto& [numa_node, layout] : nodes) {
     auto const total_bytes = layout.blocks_used * block_size;
     ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST, numa_node);
@@ -265,18 +290,11 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
     bundle->blocks      = fsmr->allocate_multiple_blocks(total_bytes, bundle->reservation.get());
 
     for (auto const& slot : layout.slots) {
-      auto* base        = reinterpret_cast<std::uint8_t*>(bundle->blocks->at(slot.block).data());
-      auto work         = std::make_unique<chunk_work>();
-      auto& job         = jobs[slot.job];
-      work->masks       = job.request->masks.get();
-      work->chunk_index = slot.chunk;
+      auto* base  = reinterpret_cast<std::uint8_t*>(bundle->blocks->at(slot.block).data());
+      auto work   = make_work(slot.job, slot.chunk, slot.rows);
       work->words = std::span<std::uint32_t>(reinterpret_cast<std::uint32_t*>(base + slot.offset),
                                              slot.bytes / sizeof(std::uint32_t));
-      work->row_count = slot.rows;
       work->retention = bundle;
-      work->slices    = std::span<op::scan::mvcc_row_group_slice const>(
-        job.plan.chunks[slot.chunk].data(), job.plan.chunks[slot.chunk].size());
-      work->transaction = job.plan.transaction;
       works.push_back(std::move(work));
     }
   }
