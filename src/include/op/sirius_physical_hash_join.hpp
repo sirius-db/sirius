@@ -278,10 +278,29 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    std::size_t partition_idx) override;
 
  public:
+  //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN (set in its
+  //! constructor). The delim join owns its execution: `is_sink()` returns false and
+  //! `build_join_pipelines` skips build-side externalization.
+  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
+  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
+
   // Sink Interface
-  bool is_sink() const override { return true; }
+  //! Flag OFF: unconditionally a sink (legacy converter expectation). Flag ON: the inner
+  //! join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule applies (sink
+  //! iff parent is PARTITION or RIGHT_DELIM_JOIN).
+  bool is_sink() const override
+  {
+    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+      if (_is_delim_join_inner) { return false; }
+      return sirius_physical_operator::is_sink();
+    }
+    return true;
+  }
 
   void on_finalize_operator() override;
+
+ protected:
+  bool _is_delim_join_inner = false;
 };
 
 }  // namespace op

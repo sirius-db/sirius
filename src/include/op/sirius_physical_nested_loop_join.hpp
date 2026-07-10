@@ -26,6 +26,7 @@
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "sirius_config.hpp"
 
 #include <cstdint>
 
@@ -112,12 +113,36 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
  public:
   // Source interface
-  bool is_source() const override { return duckdb::PropagatesBuildSide(join_type); }
+  //! Flag ON: always a source (every join emits output). Flag OFF: source only for join
+  //! types that propagate the build side, as the legacy converter expects.
+  bool is_source() const override
+  {
+    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) { return true; }
+    return duckdb::PropagatesBuildSide(join_type);
+  }
 
  public:
-  // Sink Interface
-  bool is_sink() const override { return true; }
+  //! True when this NLJ is the internal `delim.join` of a RIGHT_DELIM_JOIN; see the
+  //! identical field on `sirius_physical_hash_join`.
+  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
+  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
 
+  // Sink Interface
+  //! Flag OFF: unconditionally a sink. Flag ON: the inner join of a RIGHT_DELIM_JOIN is
+  //! never a sink; otherwise the base rule applies. Mirrors HJ.
+  bool is_sink() const override
+  {
+    if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+      if (_is_delim_join_inner) { return false; }
+      return sirius_physical_operator::is_sink();
+    }
+    return true;
+  }
+
+ protected:
+  bool _is_delim_join_inner = false;
+
+ public:
   static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,
                            duckdb::JoinType join_type);
 

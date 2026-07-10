@@ -139,7 +139,8 @@ TEST_CASE("RIGHT_DELIM_JOIN: concatenates partition_join then distinct ports",
   distinct->add_next_port_after_sink({&distinct_consumer, "distinct_port"});
 
   right_delim->partition_join = partition_join.get();
-  right_delim->distinct       = std::move(distinct);
+  right_delim->distinct       = distinct.get();
+  right_delim->distinct_root  = std::move(distinct);
 
   sirius_pipeline_build_state build_state;
   build_state.set_pipeline_sink(pipeline, right_delim.get(), 0);
@@ -187,7 +188,8 @@ TEST_CASE("LEFT_DELIM_JOIN: concatenates column_data_scan then distinct ports",
   distinct->add_next_port_after_sink({&distinct_consumer_q, "distinct_q"});
 
   left_delim->column_data_scan = column_data_scan.get();
-  left_delim->distinct         = std::move(distinct);
+  left_delim->distinct         = distinct.get();
+  left_delim->distinct_root    = std::move(distinct);
 
   sirius_pipeline_build_state build_state;
   build_state.set_pipeline_sink(pipeline, left_delim.get(), 0);

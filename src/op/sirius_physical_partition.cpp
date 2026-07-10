@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -25,6 +26,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -54,16 +56,17 @@ std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& exp
 
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
                                                      std::size_t estimated_cardinality,
-                                                     sirius_physical_operator* parent_op,
+                                                     sirius_physical_operator* key_source,
                                                      bool is_build,
                                                      uint64_t hash_partition_bytes)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
   s_partition_size = hash_partition_bytes;
-  _parent_op       = parent_op;
   _is_build        = is_build;
-  get_partition_keys_and_type(parent_op, is_build);
+  // Capture partition keys/types from `key_source` and discard the pointer — the tree
+  // parent is `_parent_op`, stamped later by `set_parent_ops`.
+  get_partition_keys_and_type(key_source, is_build);
   _drives_partition_count = _is_build;
 }
 
@@ -72,6 +75,22 @@ std::string sirius_physical_partition::get_name() const { return "PARTITION"; }
 bool sirius_physical_partition::is_source() const { return true; }
 
 bool sirius_physical_partition::is_sink() const { return true; }
+
+void sirius_physical_partition::build_pipelines(pipeline::sirius_pipeline& current,
+                                                pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    sirius_physical_operator::build_pipelines(current, meta_pipeline);
+    return;
+  }
+  // PARTITION is always its own single-operator pipeline. The child is guaranteed to be
+  // a sink (its `_parent_op` is this PARTITION, so the base `is_sink()` returns true), so
+  // create our own meta and let the child's protocol build its own boundary.
+  D_ASSERT(children.size() == 1);
+  D_ASSERT(children[0]->is_sink());
+  auto& partition_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
+  children[0]->build_pipelines(*partition_meta.get_base_pipeline(), partition_meta);
+}
 
 void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_operator* op,
                                                             bool is_build)
@@ -134,23 +153,14 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     auto& grouped_aggregate_merge_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
     _partition_keys                  = grouped_aggregate_merge_op.get_output_grouping_indices();
 
-  } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
-    auto& parent_concat_op = op->Cast<sirius_physical_concat>();
-    bool is_build          = parent_concat_op.is_build_concat();
-    _is_build              = is_build;
-    if (parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::HASH_JOIN ||
-        parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-      get_partition_keys_and_type(parent_concat_op.get_parent_op(), is_build);
-    } else {
-      throw std::runtime_error("Unsupported operator following partition->concat: " +
-                               parent_concat_op.get_parent_op()->get_name());
-    }
   } else {
-    throw std::runtime_error("Unsupported operator type for partition: " + op->get_name());
+    // `key_source` must be a key-bearing consumer (HJ/NLJ or HGB/MERGE_GROUP_BY);
+    // callers pass the join/group-by directly, never a CONCAT wrapper.
+    throw std::runtime_error("Unsupported key_source for partition: " + op->get_name());
   }
 }
 
-bool sirius_physical_partition::is_build_partition() { return _is_build; }
+bool sirius_physical_partition::is_build_partition() const { return _is_build; }
 
 std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)

@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_column_data_scan.hpp"
 
+#include "config.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -55,6 +56,10 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 void sirius_physical_column_data_scan::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
+  // Cached chunk scan of a LEFT_DELIM_JOIN: the delim join's sink executes it inline, so
+  // it contributes no pipeline; compute_repository_wiring_tree_based emits its wiring.
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD && _owned_by_delim_join) { return; }
+
   // check if there is any additional action we need to do depending on the type
   auto& state = meta_pipeline.get_state();
   switch (type) {
@@ -70,7 +75,16 @@ void sirius_physical_column_data_scan::build_pipelines(
                delim_sink->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
       auto& delim_join = delim_sink->Cast<sirius_physical_delim_join>();
       current.add_dependency(delim_dependency);
-      state.set_pipeline_source(current, delim_join.distinct->Cast<sirius_physical_operator>());
+      if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+        // DELIM_SCAN is routing-only under flag ON: `_owning_delim_join` on the distinct
+        // chain top redirects wiring into each delim_scan's consumer pipeline, and
+        // `is_ready` re-derives source from operators[0], so append nothing here.
+        D_ASSERT(delim_join.distinct_root);
+        (void)delim_join;
+      } else {
+        // Flag OFF: set the bare DISTINCT as source; the legacy converter retargets it.
+        state.set_pipeline_source(current, delim_join.distinct->Cast<sirius_physical_operator>());
+      }
       return;
     }
     case SiriusPhysicalOperatorType::CTE_SCAN: {
@@ -85,7 +99,16 @@ void sirius_physical_column_data_scan::build_pipelines(
       D_ASSERT(cte_sink);
       D_ASSERT(cte_sink->type == SiriusPhysicalOperatorType::CTE);
       current.add_dependency(cte_dependency);
+      // CTE_SCAN is routing-only — never materialized into operators[]; the runtime
+      // executor assumes `pipeline->source` is a real producer. `set_pipeline_source` is
+      // still needed by the legacy wiring path; under flag ON the tree-based wiring uses
+      // `state.cte_scan_consumers`, populated below.
       state.set_pipeline_source(current, *this);
+      if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+        state.cte_scan_consumers.insert(
+          duckdb::make_pair(duckdb::reference<const sirius_physical_operator>(*this),
+                            duckdb::reference<pipeline::sirius_pipeline>(current)));
+      }
       return;
     }
     case SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
@@ -98,7 +121,18 @@ void sirius_physical_column_data_scan::build_pipelines(
     default: break;
   }
   D_ASSERT(children.empty());
-  state.set_pipeline_source(current, *this);
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    // A leaf sink (parent is PARTITION/RIGHT_DELIM_JOIN) gets its own single-op pipeline,
+    // mirroring the base leaf-sink branch — replicated here because this override would
+    // otherwise unconditionally append to `current`.
+    if (is_sink()) {
+      meta_pipeline.create_child_meta_pipeline(current, *this);
+    } else {
+      state.add_pipeline_operator(current, *this);
+    }
+  } else {
+    state.set_pipeline_source(current, *this);
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_column_data_scan::execute(

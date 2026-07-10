@@ -200,9 +200,10 @@ void downgrade_executor::processing_loop()
     }
 
     // === TIER 1: Data repositories ===
-    // Collect all repositories first so we can iterate (and later sort by priority).
-    // We use get_all_convertible() to snapshot eligible batches once per repo,
-    // avoiding re-scanning the same batch before its state changes from idle.
+    // Visited in get_repositories() order — ascending {operator_id, port_id} — with early
+    // stop once the reservation is satisfied, so operator-ID numbering decides which batches
+    // spill first (see USE_TREE_BASED_PIPELINE_BUILD in config.hpp). get_all_convertible()
+    // snapshots eligible batches once per repo so a batch isn't re-scanned before leaving idle.
     bool pool_interrupted = false;
     auto repos            = _data_repo_mgr.get_repositories();
     for (auto* repo : repos) {
