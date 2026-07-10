@@ -346,8 +346,10 @@ class sirius_physical_operator {
   sirius_physical_operator() : operator_id(next_operator_id++) {}
   virtual ~sirius_physical_operator() {}
 
-  //! The physical operator type
-  SiriusPhysicalOperatorType type;
+  //! The physical operator type. Default-initialized to INVALID for the test-only default
+  //! ctor — type-dispatch sites (e.g. the wiring materializer's delim-join routing) read it
+  //! on default-constructed operators, so it must not be indeterminate.
+  SiriusPhysicalOperatorType type = SiriusPhysicalOperatorType::INVALID;
   //! The set of children of the operator (operators that feed data _into_ the current operator)
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
