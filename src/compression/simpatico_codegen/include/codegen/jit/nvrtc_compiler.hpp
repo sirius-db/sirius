@@ -1,12 +1,15 @@
 // Owned compiled-kernel handle for plain-CUDA nvrtc JIT (encode + decode renderers).
 #pragma once
 
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 typedef struct CUlib_st* CUlibrary;
 typedef struct CUfunc_st* CUfunction;
+typedef struct CUkern_st* CUkernel;
 
 namespace codegen::jit {
 
@@ -28,11 +31,17 @@ struct CompileOptions {
 
 struct CompiledKernel {
   CUlibrary library = nullptr;
-  CUfunction func   = nullptr;
+  // Device-independent kernel handle (valid on all devices sharing this library).
+  // Use func_for_current_device() to get a context-specific CUfunction for launch.
+  CUkernel kern = nullptr;
   std::vector<char> cubin;
   std::string rendered_source;
   unsigned block_dim_x      = 1;
   unsigned shared_mem_bytes = 0;
+
+  // Returns the CUfunction for the current CUDA device, deriving and caching it
+  // on first call per device. Returns nullptr if kern is null or derivation fails.
+  CUfunction func_for_current_device() const;
 
   CompiledKernel() = default;
   ~CompiledKernel();
@@ -40,6 +49,10 @@ struct CompiledKernel {
   CompiledKernel& operator=(CompiledKernel&&) noexcept;
   CompiledKernel(const CompiledKernel&)            = delete;
   CompiledKernel& operator=(const CompiledKernel&) = delete;
+
+ private:
+  mutable std::mutex func_mu_;
+  mutable std::unordered_map<int, CUfunction> func_per_dev_;
 };
 
 // Ensure a CUDA driver context is current on this thread. Idempotent; safe to

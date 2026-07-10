@@ -21,7 +21,7 @@ using ::codegen::jit::CompiledKernel;
 using ::codegen::jit::CompileError;
 using ::codegen::jit::CompileOptions;
 
-// Compile a raw CUDA-C++ source string into a launchable CUfunction.
+// Compile a raw CUDA-C++ source string into a launchable kernel.
 //
 // `source`        : full translation unit.  Must declare exactly one
 //                   `extern "C" __global__ void <entry_symbol>(...)`.
@@ -34,10 +34,9 @@ using ::codegen::jit::CompileOptions;
 // Throws `CompileError` on nvrtc rejection (with .log and .source)
 // and `std::runtime_error` on driver-API failures.
 //
-// The returned CompiledKernel uses the same struct as the decode path
-// (same RAII semantics, same `library`/`func`/`cubin`/`rendered_source`
-// members), so callers can store both flavours in a single map / cache
-// without parametrising the value type.
+// The returned CompiledKernel stores a device-independent CUkernel handle.
+// Call CompiledKernel::func_for_current_device() to obtain the CUfunction
+// for whichever GPU is active on the calling thread.
 CompiledKernel compile_plain_kernel(const std::string& source,
                                     const std::string& entry_symbol,
                                     const CompileOptions& opts = {});

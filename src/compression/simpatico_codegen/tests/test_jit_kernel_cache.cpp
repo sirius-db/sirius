@@ -82,7 +82,7 @@ int main()
   } catch (const std::exception& e) {
     return report_fail(e.what());
   }
-  if (!k1 || !k1->func) return report_fail("first compile returned null");
+  if (!k1 || !k1->kern) return report_fail("first compile returned null");
   if (cache.size() != 1) return report_fail("cache size != 1 after first insert");
 
   if (k1->rendered_source.find("simpatico_bp_at") == std::string::npos) {

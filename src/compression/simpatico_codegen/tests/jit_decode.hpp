@@ -81,7 +81,7 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
     throw std::runtime_error(std::string("decode compile: ") + e.what() + "\n--- log ---\n" +
                              e.log);
   }
-  if (kernel == nullptr || kernel->func == nullptr) {
+  if (kernel == nullptr || kernel->kern == nullptr) {
     throw std::runtime_error("decode compile returned null kernel");
   }
 
@@ -107,16 +107,17 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
   args.push_back(&d_out_arg);
   args.push_back(&total_n);
 
-  int static_smem = 0;
-  cu_check(cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel->func),
+  CUfunction fn_dec = kernel->func_for_current_device();
+  int static_smem   = 0;
+  cu_check(cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn_dec),
            "cuFuncGetAttribute");
   if (static_smem + spec.shared_bytes > 48 * 1024) {
     cu_check(cuFuncSetAttribute(
-               kernel->func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, spec.shared_bytes),
+               fn_dec, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, spec.shared_bytes),
              "cuFuncSetAttribute");
   }
 
-  cu_check(cuLaunchKernel(kernel->func,
+  cu_check(cuLaunchKernel(fn_dec,
                           static_cast<unsigned>(num_chunks),
                           1,
                           1,

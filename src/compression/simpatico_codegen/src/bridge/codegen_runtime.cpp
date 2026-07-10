@@ -285,23 +285,26 @@ const char* dtype_to_cxx(const char* dtype)
 // after the first decompress on a hot loop.
 int detect_arch_cc() noexcept
 {
-  thread_local int cached = -1;
-  if (cached > 0) return cached;
+  // cudaGetDevice uses the runtime API and does not require a driver context
+  // to be current — safe to call before any ensure_cuda_context().
+  int device_id = 0;
+  if (cudaGetDevice(&device_id) != cudaSuccess) return 80;
+
+  // Thread-local cache keyed by device ordinal for multi-GPU correctness.
+  thread_local std::unordered_map<int, int> cache;
+  auto it = cache.find(device_id);
+  if (it != cache.end()) return it->second;
+
   CUdevice dev = 0;
-  if (cuCtxGetDevice(&dev) != CUDA_SUCCESS) {
-    cached = 80;
-    return cached;
-  }
+  if (cuDeviceGet(&dev, device_id) != CUDA_SUCCESS) return cache[device_id] = 80;
   int major = 0, minor = 0;
   if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) !=
         CUDA_SUCCESS ||
       cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) !=
         CUDA_SUCCESS) {
-    cached = 80;
-    return cached;
+    return cache[device_id] = 80;
   }
-  cached = major * 10 + minor;
-  return cached;
+  return cache[device_id] = major * 10 + minor;
 }
 
 // Launch the plain-CUDA rendered decode kernel (symmetric to the
@@ -352,7 +355,7 @@ int run_rendered_decode(const jit::FusedTree& tree,
       e.log.c_str());
     return -1;
   }
-  if (kernel == nullptr || kernel->func == nullptr) {
+  if (kernel == nullptr || kernel->kern == nullptr) {
     std::fprintf(stderr, "simpatico::codegen: rendered decode: null kernel\n");
     return -1;
   }
@@ -379,9 +382,9 @@ int run_rendered_decode(const jit::FusedTree& tree,
     {
       const std::size_t len = it->second.length;
       const bool is_off     = (b.field == "rle_runs_offsets" || b.field == "bp_offsets");
-      const bool is_perchk  = (b.field == "chunk_min" || b.field == "chunk_bits" ||
-                              b.field == "chunk_count" || b.field == "references" ||
-                              b.field == "offsets" || is_off);
+      const bool is_perchk =
+        (b.field == "chunk_min" || b.field == "chunk_bits" || b.field == "chunk_count" ||
+         b.field == "references" || b.field == "offsets" || is_off);
       const std::size_t need = static_cast<std::size_t>(num_chunks) + (is_off ? 1u : 0u);
       if (is_perchk && len < need) {
         std::fprintf(stderr,
@@ -415,16 +418,17 @@ int run_rendered_decode(const jit::FusedTree& tree,
   // nvcomp_def with two RLE levels) the Delta CUB union (~8 KB) + RLE block-
   // scan storage (~1 KB) can push static over the residual budget.
   {
+    CUfunction fn   = kernel->func_for_current_device();
     int static_smem = 0;
-    cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel->func);
+    cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn);
     if (static_smem + spec.shared_bytes > 48 * 1024) {
-      cuFuncSetAttribute(
-        kernel->func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, spec.shared_bytes);
+      cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, spec.shared_bytes);
     }
   }
 
-  CUstream stream = reinterpret_cast<CUstream>(stream_ptr);
-  CUresult r      = cuLaunchKernel(kernel->func,
+  CUstream stream   = reinterpret_cast<CUstream>(stream_ptr);
+  CUfunction fn_dec = kernel->func_for_current_device();
+  CUresult r        = cuLaunchKernel(fn_dec,
                               static_cast<unsigned>(num_chunks),
                               1,
                               1,
@@ -487,8 +491,6 @@ int decode_fused_subtree(codegen::jit::FusedTree const& tree,
                          std::uintptr_t stream_ptr)
 {
   try {
-    jit::ensure_cuda_context();
-
     const bool _timing = std::getenv("SIMPATICO_DECODE_TIMING") != nullptr;
     auto _t            = std::chrono::steady_clock::now();
     auto _lap          = [&](const char* what) {
@@ -678,8 +680,6 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
   if (builder == nullptr || cxx_dtype == nullptr) { return -1; }
 
   try {
-    jit::ensure_cuda_context();
-
     const std::int32_t num_chunks = static_cast<std::int32_t>(
       std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
 
@@ -759,7 +759,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
     for (auto& p : dev_ptrs)
       args.push_back(&p);
 
-    CUresult lr = cuLaunchKernel(kernel->func,
+    CUresult lr = cuLaunchKernel(kernel->func_for_current_device(),
                                  static_cast<unsigned>(num_chunks),
                                  1,
                                  1,
@@ -851,12 +851,11 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           // the column's original_type.  For the values channel this matches
           // original_type, but for the runs channel (int32 counts) it must
           // be INT32 regardless of the column dtype.
-          const cudf::data_type bp_elem_type = (spec.buffers[i_min].elem_size == 8)
-                                                 ? cudf::data_type(cudf::type_id::INT64)
-                                               : (spec.buffers[i_min].elem_size == 1)
-                                                 ? cudf::data_type(cudf::type_id::UINT8)
-                                                 : cudf::data_type(cudf::type_id::INT32);
-          auto mins_col                      = std::make_unique<cudf::column>(bp_elem_type,
+          const cudf::data_type bp_elem_type =
+            (spec.buffers[i_min].elem_size == 8)   ? cudf::data_type(cudf::type_id::INT64)
+            : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
+                                                   : cudf::data_type(cudf::type_id::INT32);
+          auto mins_col = std::make_unique<cudf::column>(bp_elem_type,
                                                          static_cast<cudf::size_type>(num_chunks),
                                                          std::move(bufs[i_min]),
                                                          rmm::device_buffer(0, stream),
@@ -871,12 +870,12 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                                          std::move(bufs[i_bits]),
                                                          rmm::device_buffer(0, stream),
                                                          0);
-          auto pkd_col  = std::make_unique<cudf::column>(
-            cudf::data_type(cudf::type_id::UINT32),
-            static_cast<cudf::size_type>(spec.buffers[i_pkd].length),
-            std::move(bufs[i_pkd]),
-                                                        rmm::device_buffer(0, stream),
-                                                        0);
+          auto pkd_col =
+            std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
+                                           static_cast<cudf::size_type>(spec.buffers[i_pkd].length),
+                                           std::move(bufs[i_pkd]),
+                                           rmm::device_buffer(0, stream),
+                                           0);
 
           // Construct the OverAllocate (sparse) rep from the encode
           // kernel's output, then EAGERLY compact it so every fused

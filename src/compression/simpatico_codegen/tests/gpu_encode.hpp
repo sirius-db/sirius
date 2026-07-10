@@ -181,7 +181,7 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
   for (auto& p : buf_ptrs)
     args.push_back(&p);
 
-  cu_check(cuLaunchKernel(kernel->func,
+  cu_check(cuLaunchKernel(kernel->func_for_current_device(),
                           static_cast<unsigned>(out.num_chunks),
                           1,
                           1,

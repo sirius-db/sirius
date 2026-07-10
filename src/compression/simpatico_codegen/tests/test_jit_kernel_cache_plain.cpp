@@ -128,7 +128,7 @@ int main()
     return report_fail(e.what());
   }
   if (!k1) return report_fail("first get_or_compile_plain returned null");
-  if (!k1->func) return report_fail("CUfunction is null after cold compile");
+  if (!k1->kern) return report_fail("CUkernel is null after cold compile");
   if (cache.size() != 1) return report_fail("cache size != 1 after first insert");
 
   // --- 2. Warm lookup of spec_a — same pointer, fast. ----------------
@@ -230,7 +230,7 @@ int main()
   } catch (const std::exception& e) {
     return report_fail(e.what());
   }
-  if (!k_for_i32 || !k_for_i32->func) {
+  if (!k_for_i32 || !k_for_i32->kern) {
     return report_fail("For{Bitpack}<int32_t> compile returned null");
   }
 
@@ -243,7 +243,7 @@ int main()
   } catch (const std::exception& e) {
     return report_fail(e.what());
   }
-  if (!k_for_i64 || !k_for_i64->func) {
+  if (!k_for_i64 || !k_for_i64->kern) {
     return report_fail("For{Bitpack}<int64_t> compile returned null");
   }
   if (k_for_i64 == k_for_i32) { return report_fail("int64 For slot collided with int32 For slot"); }

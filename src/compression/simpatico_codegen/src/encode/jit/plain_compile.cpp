@@ -155,27 +155,22 @@ CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
 {
   if (cubin.empty()) { throw std::runtime_error("load_kernel_from_cubin: empty cubin"); }
 
-  ::codegen::jit::ensure_cuda_context();
+  // cuLibraryLoadData is multi-device and does not require a specific context.
+  // cuLibraryGetKernel returns a device-independent CUkernel handle; the
+  // per-device CUfunction is derived lazily via func_for_current_device().
   CUlibrary lib = nullptr;
   CU_OR_THROW(cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
 
-  // extern "C" entry — name is the plain symbol the caller passed.
   CUkernel kern = nullptr;
   CUresult r    = cuLibraryGetKernel(&kern, lib, entry_symbol.c_str());
   if (r != CUDA_SUCCESS) {
     cuLibraryUnload(lib);
     throw_cu("LibraryGetKernel", r);
   }
-  CUfunction fn = nullptr;
-  r             = cuKernelGetFunction(&fn, kern);
-  if (r != CUDA_SUCCESS) {
-    cuLibraryUnload(lib);
-    throw_cu("KernelGetFunction", r);
-  }
 
   CompiledKernel out;
   out.library         = lib;
-  out.func            = fn;
+  out.kern            = kern;
   out.cubin           = std::move(cubin);
   out.rendered_source = std::move(rendered_source);
   return out;
