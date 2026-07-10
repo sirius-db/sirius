@@ -2621,6 +2621,32 @@ TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
   CHECK(wildcard_bucket->GetError().find("bucket") != std::string::npos);
 }
 
+TEST_CASE("transparent S3 glob scans 1001 parquet objects across LIST pages",
+          "[.][s3][integration][sql][gpu_execution][transparent][glob][large][glob-scale]")
+{
+  if (!truthy_env("SIRIUS_TEST_S3_GLOB_SCALE")) {
+    SUCCEED("SIRIUS_TEST_S3_GLOB_SCALE is not enabled");
+    return;
+  }
+
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const query =
+    "SELECT count(n_nationkey), sum(n_nationkey), min(n_nationkey), max(n_nationkey) FROM " +
+    s3_parquet_glob_scan(*env, "glob-scale/part_*.parquet");
+  auto result = require_query_ok(fixture.con, query);
+
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25'025);
+  CHECK(result->GetValue(1, 0).GetValue<int64_t>() == 300'300);
+  CHECK(result->GetValue(2, 0).GetValue<int64_t>() == 0);
+  CHECK(result->GetValue(3, 0).GetValue<int64_t>() == 24);
+}
+
 TEST_CASE("transparent S3 glob reports no-files and GPU-only errors clearly",
           "[s3][integration][sql][gpu_execution][transparent][glob]")
 {
