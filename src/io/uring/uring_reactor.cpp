@@ -67,7 +67,8 @@ namespace {
 /// by a silent fallback.
 [[nodiscard]] constexpr bool is_fixed_buffer_error(int errc) noexcept
 {
-  return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS;
+  return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS ||
+         errc == ENOMEM;
 }
 
 struct io_slot {
@@ -899,7 +900,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   int inflight = 0;
 
   auto poll_copy_completions = [&]() {
-    using query_status = cucascade::cuda::cuda_event::query_status;
+    using query_status = cucascade::cuda::event::query_result;
     copying_slots.erase(std::remove_if(copying_slots.begin(),
                                        copying_slots.end(),
                                        [&](slot_token const& token) {
