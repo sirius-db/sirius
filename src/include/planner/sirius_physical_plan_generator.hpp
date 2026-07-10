@@ -23,7 +23,16 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
+#include <string>
 #include <unordered_map>
+
+namespace sirius::op::scan {
+struct IcebergDeleteData;
+}  // namespace sirius::op::scan
+
+namespace sirius::op {
+class sirius_physical_table_scan;
+}  // namespace sirius::op
 
 namespace duckdb {
 class ClientContext;
@@ -194,5 +203,35 @@ class sirius_physical_plan_generator {
  public:
   duckdb::ClientContext& context;
   // duckdb::GPUContext& gpu_context;
+
+ public:
+  //! Recursive post-pass that derives each operator's `_parent_op` from the final tree's
+  //! `children[]`, run after all tree rewrites have settled so the pointer cannot drift.
+  //! Public so the engine can re-run it after the RESULT_COLLECTOR wrap is added around the
+  //! plan post-generation — otherwise the wrapped child's `_parent_op` would stay null and
+  //! break tree-parent-driven wiring under `USE_TREE_BASED_PIPELINE_BUILD`.
+  static void set_parent_ops(sirius::op::sirius_physical_operator& op,
+                             sirius::op::sirius_physical_operator* parent);
+
+ private:
+  //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
+  //! merge operators, scan companions, CPU_SOURCE) so the tree carries the full execution
+  //! structure before the pipeline converter runs. Flag-gated at the call site.
+  void insert_gpu_pipeline_operators(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
+
+  //! Materialize Iceberg delete data for every iceberg_scan TABLE_SCAN into
+  //! `iceberg_delete_data_cache_`. Mirrors `sirius_engine::prefetch_iceberg_delete_data`,
+  //! which still serves the flag-off (legacy converter) path.
+  void prefetch_iceberg_delete_data(sirius::op::sirius_physical_operator& plan);
+
+  //! Resolve an Iceberg table's on-disk path: `parameters[0]` when present, else derived from
+  //! `bind_data.file_list` (REST catalog). Returns empty string when neither is available.
+  static std::string resolve_iceberg_table_path(sirius::op::sirius_physical_table_scan& scan_op);
+
+  //! Iceberg delete-data cache keyed by table path; populated by
+  //! `prefetch_iceberg_delete_data`, consumed when constructing iceberg scan leaves.
+  std::unordered_map<std::string, std::shared_ptr<const sirius::op::scan::IcebergDeleteData>>
+    iceberg_delete_data_cache_;
 };
 }  // namespace sirius::planner

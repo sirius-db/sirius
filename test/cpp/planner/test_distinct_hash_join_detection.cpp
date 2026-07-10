@@ -30,13 +30,46 @@
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
+#include <unistd.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 
 using namespace duckdb;
 
 namespace {
+
+/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
+/// block managers, so these tests need an on-disk database rather than :memory:.
+class scoped_temp_db_path {
+ public:
+  scoped_temp_db_path()
+  {
+    char tmpl[] = "/tmp/sirius_distinct_hj_XXXXXX";
+    int fd      = ::mkstemp(tmpl);
+    REQUIRE(fd >= 0);
+    ::close(fd);
+    ::unlink(tmpl);
+    _path = tmpl;
+  }
+
+  ~scoped_temp_db_path()
+  {
+    if (!_path.empty()) {
+      std::remove(_path.c_str());
+      std::remove((_path + ".wal").c_str());
+    }
+  }
+
+  scoped_temp_db_path(const scoped_temp_db_path&)            = delete;
+  scoped_temp_db_path& operator=(const scoped_temp_db_path&) = delete;
+
+  const std::string& path() const { return _path; }
+
+ private:
+  std::string _path;
+};
 
 /// Generate a Sirius physical plan from a SQL query string.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
@@ -115,7 +148,7 @@ struct distinct_hash_join_fixture {
                "minimal.yaml";
     setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
     unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(nullptr);
+    db = std::make_unique<DuckDB>(db_path.path());
     setenv("SIRIUS_DISABLE", "1", 1);
     con = std::make_unique<Connection>(*db);
 
@@ -155,6 +188,7 @@ struct distinct_hash_join_fixture {
 
   ~distinct_hash_join_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
+  scoped_temp_db_path db_path;
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;
 };

@@ -60,6 +60,22 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
+  // Tree-based pipeline build: sirius_physical_plan_generator inserts all GPU pipeline
+  // operators into the plan tree and the converter becomes a pure topology pass driven by
+  // per-operator build_pipelines overrides (validated byte-identical to the legacy converter
+  // on every TPC-H SF1 plan). Set false to fall back to the legacy sirius_pipeline_converter,
+  // which constructs those operators at runtime (kept for rollback).
+  //
+  // Operator IDs (a global construction counter) differ per path because the injected
+  // operators are constructed at different times. Query results are unaffected, but the ID
+  // feeds two placement heuristics:
+  //  - downgrade order: tier-1 spill visits data repositories in ascending operator_id order
+  //    and stops once enough bytes are freed, so which batches spill to host/disk under GPU
+  //    memory pressure differs;
+  //  - hash-join GPU placement: build-probe join tasks are pinned to operator_id % num_gpus
+  //    (multi-GPU only), so joins may land on different GPUs.
+  static bool USE_TREE_BASED_PIPELINE_BUILD;
+
   // Whether to fall back to duckdb execution after an error is detected
   static bool ENABLE_DUCKDB_FALLBACK;
 

@@ -24,6 +24,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -42,7 +43,7 @@ struct pipeline_conversion_result {
   //! The execution-ready pipelines in dependency order
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_pipelines;
   //! Ownership container for operators inserted during splitting (PARTITION, CONCAT, MERGE,
-  //! and source-side operators such as DUCKDB_SCAN, GPU_PARQUET_SCAN, CPU_SOURCE).
+  //! and source-side operators such as DUCKDB_SCAN, GPU_SCAN, CPU_SOURCE).
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators;
   //! Plan-time wiring descriptors. Materialized into runtime repositories and ports by
   //! `materialize_repository_wiring()` after the converter returns.
@@ -67,6 +68,25 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
   op::sirius_physical_operator& physical_op,
   const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
     iceberg_cache);
+
+//! Deterministic, line-oriented serialization of a pipeline_conversion_result, used for
+//! differential testing between the flag-OFF (legacy) and flag-ON (tree-based) conversion
+//! paths: equivalent graphs produce byte-identical output regardless of emission order.
+std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result);
+
+//! Reorders `pipelines` in place into a deterministic, strictly-topological schedule
+//! (every pipeline after all of its `dependencies`), renumbers `pipeline_id` to the new
+//! positions, and re-sorts each pipeline's `dependencies` ascending by the new ids.
+//! Only the tree-based path needs this; the legacy path already emits topologically.
+//!
+//! Producers are visited in `dependencies` slot order, so with join dependencies kept
+//! build-first (see `finalize_pipeline_structure`) every join's build subtree is
+//! scheduled before its probe subtree. Pipelines launch in id order, so this is what
+//! lets a join publish its dynamic filters before the probe-side scans they prune are
+//! launched — probe-first numbering silently degrades those scans to full, unfiltered
+//! reads.
+void reorder_pipelines_topologically(
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
 
 class sirius_pipeline_converter {
  public:
@@ -109,10 +129,16 @@ class sirius_pipeline_converter {
                              duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
                              size_t pipeline_idx);
 
-  // Phase 3: Compute plan-time wiring descriptors
-  // Runtime materialization is done by `materialize_repository_wiring()` from
-  // `pipeline/repository_wiring.hpp`.
-  void compute_repository_wiring();
+  // Compute plan-time wiring descriptors. Runtime materialization is done by
+  // `materialize_repository_wiring()` from `pipeline/repository_wiring.hpp`.
+  void compute_repository_wiring(sirius_pipeline_build_state& state);
+  // Tree-parent based wiring (USE_TREE_BASED_PIPELINE_BUILD). Assumes post-`is_ready`
+  // pipelines and `_parent_op` populated by the plan generator's `set_parent_ops` pass.
+  void compute_repository_wiring_tree_based(sirius_pipeline_build_state& state);
+  static std::string_view resolve_port_id(const op::sirius_physical_operator& sink,
+                                          const op::sirius_physical_operator& parent);
+  static op::MemoryBarrierType resolve_barrier(const op::sirius_physical_operator& sink,
+                                               const sirius_pipeline& dest);
 
   // Phase 4: Set up dependencies
   void setup_pipeline_parents();

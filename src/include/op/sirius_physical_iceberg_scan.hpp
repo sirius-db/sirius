@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/sirius_physical_parquet_scan.hpp"
+#include "sirius_config.hpp"
 
 #include <memory>
 #include <string>
@@ -63,6 +64,12 @@ class sirius_physical_iceberg_scan : public sirius_physical_parquet_scan {
                                duckdb::ExtraOperatorInfo extra_info,
                                duckdb::vector<duckdb::Value> parameters,
                                duckdb::virtual_column_map_t virtual_columns);
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
+  //! Flag ON: every Iceberg scan leaf terminates its own pipeline (mirrors DUCKDB_SCAN).
+  bool is_sink() const override { return duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD; }
 
   // -------------------------------------------------------------------------
   // Fully materialized delete data (populated by sirius_engine.cpp).

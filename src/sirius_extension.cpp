@@ -1530,6 +1530,13 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static void SetUseTreeBasedPipelineBuild(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::USE_TREE_BASED_PIPELINE_BUILD = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config USE_TREE_BASED_PIPELINE_BUILD to {}",
+                   Config::USE_TREE_BASED_PIPELINE_BUILD);
+}
+
 static sirius::operator_params* get_operator_params(ClientContext& context)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -1803,6 +1810,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+
+  // Tree-based pipeline build toggle; see Config::USE_TREE_BASED_PIPELINE_BUILD in config.hpp.
+  config.AddExtensionOption(
+    "use_tree_based_pipeline_build",
+    "Build pipelines from the operator tree (build_pipelines virtuals) instead of "
+    "constructing operators in sirius_pipeline_converter at runtime",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::USE_TREE_BASED_PIPELINE_BUILD),
+    SetUseTreeBasedPipelineBuild);
 
   // Add in config options for duckdb scan task
   // Default batch size

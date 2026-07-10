@@ -28,18 +28,19 @@ namespace op {
 
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_type> types,
                                                std::size_t estimated_cardinality,
-                                               sirius_physical_operator* parent_op,
+                                               sirius_physical_operator* downstream_join,
                                                bool is_build,
                                                uint64_t concat_batch_bytes)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
-  _parent_op          = parent_op;
   _is_build           = is_build;
   _concat_batch_bytes = concat_batch_bytes;
-  // check if parent_op is a hash join
-  if (parent_op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-    auto hash_join = dynamic_cast<sirius_physical_hash_join*>(parent_op);
+  // `downstream_join` (the HJ/NLJ this CONCAT feeds — not the tree parent) picks
+  // `_concat_all` and is stashed for the legacy converter's destination lookup.
+  _downstream_join = downstream_join;
+  if (downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+    auto hash_join = dynamic_cast<sirius_physical_hash_join*>(downstream_join);
     if (hash_join->join_type == duckdb::JoinType::LEFT ||
         hash_join->join_type == duckdb::JoinType::ANTI ||
         hash_join->join_type == duckdb::JoinType::SEMI) {
@@ -59,11 +60,11 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
       throw std::runtime_error("sirius_physical_concat: unsupported join type: " +
                                duckdb::JoinTypeToString(hash_join->join_type));
     }
-  } else if (parent_op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+  } else if (downstream_join->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _concat_all = false;
   } else {
-    throw std::runtime_error("sirius_physical_concat: parent_op is not a hash join: " +
-                             SiriusPhysicalOperatorToString(parent_op->type));
+    throw std::runtime_error("sirius_physical_concat: downstream_join is not a hash/nlj: " +
+                             SiriusPhysicalOperatorToString(downstream_join->type));
   }
 }
 
@@ -227,7 +228,7 @@ bool sirius_physical_concat::is_source() const { return true; }
 
 bool sirius_physical_concat::is_sink() const { return true; }
 
-bool sirius_physical_concat::is_build_concat() { return _is_build; }
+bool sirius_physical_concat::is_build_concat() const { return _is_build; }
 
 void sirius_physical_concat::set_concat_all(bool concat_all)
 {

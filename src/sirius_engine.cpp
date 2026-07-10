@@ -48,6 +48,7 @@
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
@@ -339,6 +340,15 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
     static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size())};
+
+  // The RESULT_COLLECTOR wrap is added after the plan generator's own `set_parent_ops` ran;
+  // re-walk so the wrapped child's `_parent_op` points at RESULT_COLLECTOR (the tree-parent
+  // wiring needs it to route the final sink pipeline's output there). Flag-gated: the legacy
+  // path relies on ctor-set `_parent_op` values this re-walk would overwrite.
+  if (duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
+                                                                    /*parent=*/nullptr);
+  }
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;

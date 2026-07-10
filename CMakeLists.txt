@@ -609,6 +609,7 @@ set(TEST_SOURCES
     test/cpp/io/rest/test_rest_reactor.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
+    test/cpp/scan_manager/test_pin_table_duckdb_native_cache.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
@@ -644,6 +645,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_projection_fold.cpp
+    test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
@@ -651,6 +653,10 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
+    test/cpp/pipeline/test_pipeline_conversion_differential.cpp
+    test/cpp/pipeline/test_pipeline_conversion_parquet_differential.cpp
+    test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
+    test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
@@ -672,6 +678,7 @@ set(TEST_SOURCES
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/unittest.cpp
+    test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on

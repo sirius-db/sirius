@@ -16,6 +16,9 @@
 
 #include "op/sirius_physical_iceberg_scan.hpp"
 
+#include "config.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+
 namespace sirius {
 namespace op {
 
@@ -65,6 +68,19 @@ sirius_physical_iceberg_scan::sirius_physical_iceberg_scan(
 {
   // Override the type set by the parquet scan base constructor
   type = SiriusPhysicalOperatorType::ICEBERG_SCAN;
+}
+
+void sirius_physical_iceberg_scan::build_pipelines(pipeline::sirius_pipeline& current,
+                                                   pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  if (!duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD) {
+    sirius_physical_operator::build_pipelines(current, meta_pipeline);
+    return;
+  }
+  // Leaf sink: create_child_meta_pipeline pre-populates [*this], yielding a one-operator
+  // pipeline with source=sink=*this. No children, so no recursion.
+  D_ASSERT(children.empty());
+  meta_pipeline.create_child_meta_pipeline(current, *this);
 }
 
 }  // namespace op

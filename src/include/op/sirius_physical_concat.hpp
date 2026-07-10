@@ -32,10 +32,13 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
+  //! `downstream_join` is the HJ/NLJ this CONCAT feeds — not the tree parent (that is
+  //! `_parent_op`, stamped by `set_parent_ops`). Its join type picks `_concat_all`; the
+  //! pointer is retained for the legacy converter's destination lookup.
   explicit sirius_physical_concat(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
-    sirius_physical_operator* parent_op,
+    sirius_physical_operator* downstream_join,
     bool is_build,
     uint64_t concat_batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
 
@@ -45,7 +48,13 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   bool is_sink() const override;
 
-  bool is_build_concat();
+  bool is_build_concat() const;
+
+  //! The downstream HJ/NLJ this CONCAT feeds; distinct from `get_parent_op()` (tree parent).
+  [[nodiscard]] sirius_physical_operator* get_downstream_join() const noexcept
+  {
+    return _downstream_join;
+  }
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -56,9 +65,6 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
 
-  //! Get the parent operator (e.g., HASH_JOIN for build concat)
-  sirius_physical_operator* get_parent_op() const { return _parent_op; }
-
   //! Used when PARTITION + `update_join_exec_mode` selects BUILD_PROBE: merge all build batches
   //! before the join so the hash join sees a single build batch.
   void set_concat_all(bool concat_all);
@@ -67,10 +73,11 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     const op::input_stats& stats) const override;
 
  private:
-  sirius_physical_operator* _parent_op;
   bool _is_build;
   bool _concat_all;
   uint64_t _concat_batch_bytes;
+  //! Non-owning. Captured at construction from the `downstream_join` ctor argument.
+  sirius_physical_operator* _downstream_join = nullptr;
 };
 
 }  // namespace op

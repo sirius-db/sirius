@@ -47,10 +47,13 @@ class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
 
+  //! `key_source` is the downstream consumer whose keys determine partitioning (HJ join
+  //! conditions, HGB/MERGE_GROUP_BY grouping columns). Captured at construction, never
+  //! stored — the tree parent is `_parent_op`, stamped later by `set_parent_ops`.
   explicit sirius_physical_partition(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
-    sirius_physical_operator* parent_op,
+    sirius_physical_operator* key_source,
     bool is_build                 = false,
     uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES);
 
@@ -60,7 +63,10 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   bool is_sink() const override;
 
-  bool is_build_partition();
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
+  bool is_build_partition() const;
 
   void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }
 
@@ -110,7 +116,6 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// Looks at the amount of data waiting on the input port and determines the number of partitions
   /// to create. Returns a pair of (num_partitions, total_bytes).
   std::pair<int, uint64_t> determine_num_partitions();
-  sirius_physical_operator* _parent_op            = nullptr;
   sirius_physical_operator* _sibling_partition_op = nullptr;
   sirius_physical_operator* _hash_join_op =
     nullptr;  // hash join operator that this partition operator feeds into (optional: for
