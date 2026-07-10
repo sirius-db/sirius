@@ -3527,9 +3527,13 @@ TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and mat
     large_lineitem_orders_join_query(local_parquet_file_scan(large->local_path),
                                      local_parquet_scan(*env, "orders")));
 
-  auto const explain_sql = large_lineitem_orders_join_query(s3_sirius_large_lineitem_scan(*env),
-                                                            s3_sirius_parquet_scan(*env, "orders"));
-  auto const plan        = explain_text(fixture.con, explain_sql);
+  // The filtered query above guards correctness. With #1065 filter pushdown, its EXPLAIN reports
+  // DuckDB's post-filter orders estimate, so exact base cardinality requires this unfiltered plan;
+  // reusing large_lineitem_orders_join_query here would silently break this assertion again.
+  auto const explain_sql = "SELECT count(*) FROM " + s3_sirius_large_lineitem_scan(*env) +
+                           " l JOIN " + s3_sirius_parquet_scan(*env, "orders") +
+                           " o ON l.l_orderkey = o.o_orderkey";
+  auto const plan = explain_text(fixture.con, explain_sql);
   INFO(plan);
   CHECK(plan_mentions_cardinality(plan, expected_lineitem_rows));
   CHECK(plan_mentions_cardinality(plan, expected_orders_rows));
