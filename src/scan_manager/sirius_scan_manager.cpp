@@ -361,7 +361,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   }
 
   if (_scan_op_order.empty()) {
-    spdlog::warn("[sirius_scan_manager::prepare_for_query] no GPU scan operators found in query");
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::prepare_for_query] no GPU scan operators found in query");
     return;
   }
 
@@ -828,19 +829,19 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
       validate_pinned_entry_for_serving(entry, cols);
       auto provider = make_provider_for_pinned_entry(entry, cols, op->batch_telemetry());
       _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
-      spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
-                   pinned_name,
-                   op->get_operator_id());
+      SIRIUS_LOG_INFO("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
+                      pinned_name,
+                      op->get_operator_id());
       return true;
     }
   } catch (std::exception const& e) {
-    spdlog::error(
+    SIRIUS_LOG_ERROR(
       "[sirius_scan_manager] error while trying to assign cached entries to "
       "operator '{}': {}",
       op->get_operator_id(),
       e.what());
   } catch (...) {
-    spdlog::error(
+    SIRIUS_LOG_ERROR(
       "[sirius_scan_manager] error while trying to assign cached entries to "
       "operator '{}'",
       op->get_operator_id());
