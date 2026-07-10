@@ -127,8 +127,13 @@ struct compressed_representation {
       // fast-mode "keys" channel is a raw STRING column) — account for
       // offsets + chars directly instead of calling it on a STRING view.
       if (o.view.type().id() == cudf::type_id::STRING) {
+        if (o.view.num_children() == 0) {
+          if (o.view.size() == 0) continue;
+          throw std::logic_error("non-empty STRING channel has no offsets child.");
+        }
         cudf::strings_column_view scv(o.view);
-        total += static_cast<size_t>(o.view.size() + 1) * sizeof(int32_t) +
+        auto const offsets_width = static_cast<size_t>(cudf::size_of(scv.offsets().type()));
+        total += static_cast<size_t>(o.view.size() + 1) * offsets_width +
                  static_cast<size_t>(scv.chars_size(stream));
       } else {
         total +=

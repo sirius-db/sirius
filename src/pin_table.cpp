@@ -271,6 +271,7 @@ host_pin_result materialize_pin_to_host_with_compression(
 {
   auto& registry = converter_registry::get();
   host_pin_result out;
+  bool compression_failed = false;
 
   materialize_pin_batches(
     ingestible,
@@ -282,7 +283,8 @@ host_pin_result materialize_pin_to_host_with_compression(
       auto* target_host_space    = host_space_by_gpu.at(src_space->get_device_id());
       bool compressed_this_chunk = false;
 
-      if (compression.enabled && tbl && tbl->num_columns() > 0 && !compression.plan_dsl.empty()) {
+      if (compression.enabled && !compression_failed && tbl && tbl->num_columns() > 0 &&
+          !compression.plan_dsl.empty()) {
         try {
           // Total device footprint of the batch (includes string chars/offsets
           // and null masks), so string columns count toward the threshold.
@@ -357,6 +359,7 @@ host_pin_result materialize_pin_to_host_with_compression(
             }
           }
         } catch (const std::exception& e) {
+          compression_failed = true;
           SIRIUS_LOG_WARN(
             "[materialize_pin_to_host_with_compression] compression failed: {}; "
             "falling back to uncompressed for this chunk",
@@ -383,6 +386,7 @@ device_pin_result materialize_pin_to_device_with_compression(
   compression_pin_config const& compression)
 {
   device_pin_result out;
+  bool compression_failed = false;
 
   materialize_pin_batches(
     ingestible,
@@ -393,7 +397,8 @@ device_pin_result materialize_pin_to_device_with_compression(
         rmm::cuda_stream_view stream) {
       bool compressed_this_chunk = false;
 
-      if (compression.enabled && tbl && tbl->num_columns() > 0 && !compression.plan_dsl.empty()) {
+      if (compression.enabled && !compression_failed && tbl && tbl->num_columns() > 0 &&
+          !compression.plan_dsl.empty()) {
         try {
           // Total device footprint of the batch (includes string chars/offsets
           // and null masks), so string columns count toward the threshold.
@@ -437,11 +442,12 @@ device_pin_result materialize_pin_to_device_with_compression(
                                          src_space->get_default_allocator());
               for (auto const& b : buffers) {
                 if (b.size_bytes > 0 && b.device_ptr != nullptr) {
-                  cudaMemcpyAsync(static_cast<std::byte*>(payload.data()) + b.offset,
-                                  b.device_ptr,
-                                  static_cast<std::size_t>(b.size_bytes),
-                                  cudaMemcpyDeviceToDevice,
-                                  stream.value());
+                  CUCASCADE_CUDA_TRY(
+                    cudaMemcpyAsync(static_cast<std::byte*>(payload.data()) + b.offset,
+                                    b.device_ptr,
+                                    static_cast<std::size_t>(b.size_bytes),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream.value()));
                 }
               }
               stream.synchronize();
@@ -463,6 +469,7 @@ device_pin_result materialize_pin_to_device_with_compression(
             }
           }
         } catch (const std::exception& e) {
+          compression_failed = true;
           SIRIUS_LOG_WARN(
             "[materialize_pin_to_device_with_compression] compression failed: {}; "
             "falling back to uncompressed for this chunk",

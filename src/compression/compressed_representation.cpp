@@ -18,6 +18,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cucascade/error.hpp>
+
 #include <algorithm>
 #include <cstddef>
 #include <stdexcept>
@@ -42,8 +44,8 @@ void copy_device_to_pinned_blocks(
   std::size_t copied   = 0;
   while (copied < size) {
     const std::size_t chunk = std::min(size - copied, bs - d_off);
-    cudaMemcpyAsync(
-      dst.at(d_idx).data() + d_off, src + copied, chunk, cudaMemcpyDeviceToHost, stream.value());
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+      dst.at(d_idx).data() + d_off, src + copied, chunk, cudaMemcpyDeviceToHost, stream.value()));
     copied += chunk;
     d_off += chunk;
     if (d_off == bs) {
@@ -68,8 +70,8 @@ void copy_pinned_blocks_to_device(
   std::size_t copied   = 0;
   while (copied < size) {
     const std::size_t chunk = std::min(size - copied, bs - s_off);
-    cudaMemcpyAsync(
-      dst + copied, src.at(s_idx).data() + s_off, chunk, cudaMemcpyHostToDevice, stream.value());
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+      dst + copied, src.at(s_idx).data() + s_off, chunk, cudaMemcpyHostToDevice, stream.value()));
     copied += chunk;
     s_off += chunk;
     if (s_off == bs) {

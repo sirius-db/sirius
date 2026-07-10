@@ -718,6 +718,31 @@ std::string build_compressed_table_header(compressed_table const& table,
 {
   auto const all_descs = table.describe(stream);
 
+  // A STRING column is physically split across offsets and chars (plus an
+  // optional null mask), so no single parent head() pointer describes its
+  // bytes. Reject identity STRING and any unexpected raw STRING channel before
+  // exposing a fabricated contiguous payload range.
+  for (auto const& descs : all_descs) {
+    for (auto const& desc : descs) {
+      if (desc.kind == PlanLeafKind::Identity &&
+          tag_to_dtype(desc.type_tag).id() == cudf::type_id::STRING) {
+        out_header.clear();
+        out_buffers.clear();
+        out_payload_bytes = 0;
+        return "identity STRING leaves are not serializable; use str_split";
+      }
+      for (auto const& buffer : desc.buffers) {
+        if (tag_to_dtype(buffer.type_tag).id() == cudf::type_id::STRING) {
+          out_header.clear();
+          out_buffers.clear();
+          out_payload_bytes = 0;
+          return "raw STRING payload channels are not serializable; decompose into offsets and "
+                 "chars";
+        }
+      }
+    }
+  }
+
   out_header.clear();
   out_buffers.clear();
 

@@ -36,9 +36,17 @@ leaf_desc make_leaf_desc(std::uint32_t node_index,
     // fast-mode "keys" channel is a raw STRING column) — account for
     // offsets + chars directly instead of calling it on a STRING view.
     if (ch.view.type().id() == cudf::type_id::STRING) {
-      cudf::strings_column_view scv(ch.view);
-      bd.size_bytes = static_cast<std::uint64_t>(ch.view.size() + 1) * sizeof(int32_t) +
-                      static_cast<std::uint64_t>(scv.chars_size(stream));
+      if (ch.view.num_children() == 0) {
+        if (ch.view.size() != 0) {
+          throw std::logic_error("non-empty STRING channel has no offsets child.");
+        }
+        bd.size_bytes = 0;
+      } else {
+        cudf::strings_column_view scv(ch.view);
+        auto const offsets_width = static_cast<size_t>(cudf::size_of(scv.offsets().type()));
+        bd.size_bytes            = static_cast<std::uint64_t>(ch.view.size() + 1) * offsets_width +
+                        static_cast<std::uint64_t>(scv.chars_size(stream));
+      }
     } else {
       bd.size_bytes = static_cast<std::uint64_t>(ch.view.size()) *
                       static_cast<std::uint64_t>(cudf::size_of(ch.view.type()));

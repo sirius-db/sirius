@@ -14,7 +14,7 @@ bitpack.chunk_count.runs -> rle -> runs, values
 ---
 # column: ps_suppkey  dtype: i32  ratio: 1.321x  depth: 10
 # comp: 56.64 GB/s  decomp: 166.09 GB/s
-identity
+input -> identity
 
 ---
 # column: ps_availqty  dtype: i32  ratio: 2.272x  depth: 10
