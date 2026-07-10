@@ -360,8 +360,8 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
 
     // A DELIM_JOIN's distinct chain top (MERGE_GROUP_BY) sits under DELIM_JOIN in the
     // tree, but its merged output retargets to each delim_scan's downstream consumer
-    // (the inner-HJ probe partition), mirroring legacy's split_delim_join_sink. Only
-    // the distinct_root carries the `_owning_delim_join` back-pointer.
+    // (the inner-HJ probe partition). Only the distinct_root carries the
+    // `_owning_delim_join` back-pointer.
     if (auto* owning_delim = sink_op->owning_delim_join()) {
       for (auto& delim_scan_ref : owning_delim->delim_scans) {
         auto& delim_scan  = delim_scan_ref.get();
@@ -383,7 +383,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
     if (!parent_op) { continue; }
 
     // A RIGHT_DELIM_JOIN's `delim.join` wires out to the RDJ's tree parent, skipping the
-    // RDJ itself (mirrors legacy split_delim_join_sink). Otherwise it and the root HJ of
+    // RDJ itself. Otherwise it and the root HJ of
     // `RDJ.children[0]` would both resolve to the RDJ pipeline, and the RDJ-sink
     // emission's CONCAT fallback would close a cycle through the inner HJ's build CONCAT.
     if ((parent_op->type == T::RIGHT_DELIM_JOIN) &&

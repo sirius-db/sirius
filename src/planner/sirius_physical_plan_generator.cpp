@@ -97,8 +97,8 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-//! Build a `parquet_ingestible_table_info` from a TABLE_SCAN; mirrors the legacy converter's
-//! insert_parquet_scan_operator. Destructive: `table_filters` is moved out of the scan.
+//! Build a `parquet_ingestible_table_info` from a TABLE_SCAN. Destructive: `table_filters`
+//! is moved out of the scan.
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
   sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
 {
@@ -137,9 +137,9 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
   return info;
 }
 
-//! Build a `duckdb_native_ingestible_table_info` from a `seq_scan` TABLE_SCAN; mirrors the
-//! legacy converter's insert_duckdb_native_scan_operator. Requires a live `ClientContext` (the
-//! ingestible reads table storage during `prepare_for_query`); throws on non-base-table scans.
+//! Build a `duckdb_native_ingestible_table_info` from a `seq_scan` TABLE_SCAN. Requires a
+//! live `ClientContext` (the ingestible reads table storage during `prepare_for_query`);
+//! throws on non-base-table scans.
 std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info>
 build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
                                const sirius::operator_params& op_params,
@@ -276,8 +276,8 @@ void wrap_table_scan_source(
 }
 
 //! Attach a leaf CPU_SOURCE as the only child of a COLUMN_DATA_SCAN, EMPTY_RESULT, or
-//! DUMMY_SCAN node; mirrors the legacy converter's split_cpu_source. A null-collection
-//! COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan (filled at runtime) — left as-is.
+//! DUMMY_SCAN node. A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk
+//! scan (filled at runtime) — left as-is.
 void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
 {
   if (!source_op.children.empty()) { return; }
@@ -340,7 +340,7 @@ void wrap_ungrouped_aggregate(duckdb::unique_ptr<sirius::op::sirius_physical_ope
   });
 }
 
-//! Replace a TOP_N slot with `TOP_N_MERGE → TOP_N → original_input`. Mirrors `split_top_n_sink`.
+//! Replace a TOP_N slot with `TOP_N_MERGE → TOP_N → original_input`.
 void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> topn_op) {
@@ -352,7 +352,7 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 }
 
 //! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
-//! original_input`; mirrors the legacy split_order_by_sink. Destructive: ORDER_BY's
+//! original_input`. Destructive: ORDER_BY's
 //! `projections`/`types` are overwritten with the identity over the input's types so every
 //! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
@@ -501,8 +501,7 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
 }
 
 //! Rewrite a DELIM JOIN's internal subtrees and wire the sibling pointers the operator needs
-//! at runtime (mirrors the legacy split_delim_join_sink, whose distinct chain lived outside
-//! the tree; here both halves live in the tree):
+//! at runtime (both the internal `join` and the distinct chain live in the tree):
 //!   - recurse into `delim->join` so its source/sink/join wraps fire — this plants the
 //!     CONCAT/PARTITION chain on the internal join's build side;
 //!   - recurse into the bare DISTINCT's children first, then wrap_delim_distinct above it,
