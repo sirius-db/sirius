@@ -344,6 +344,27 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
   }
 }
 
+TEST_CASE("masked resident splits report the filter-copy working-set peak",
+          "[cached_serving][scan_manager]")
+{
+  auto& e    = env();
+  auto batch = make_test_batch(e, 64);
+
+  // Unmasked resident chunks serve a zero-copy view: working set == data.
+  sirius::op::scan::scan_operator_input unmasked(batch);
+  REQUIRE(unmasked.get_estimated_working_set_size_in_bytes() ==
+          unmasked.get_estimated_size_in_bytes());
+
+  // Masked chunks are filtered by copy: input + output coexist at peak, plus
+  // the BOOL8 expansion (1 B/row) and the uploaded bitmask words.
+  sirius::op::scan::scan_operator_input masked(batch);
+  masked.mvcc_keep_mask  = make_test_mask(64);
+  auto const batch_bytes = masked.get_estimated_size_in_bytes();
+  REQUIRE(batch_bytes > 0);
+  REQUIRE(masked.get_estimated_working_set_size_in_bytes() ==
+          2 * batch_bytes + 64 + masked.mvcc_keep_mask->words.size() * sizeof(std::uint32_t));
+}
+
 TEST_CASE("drain_cached_provider honors a pre-stopped token", "[cached_serving][scan_manager]")
 {
   auto& e = env();

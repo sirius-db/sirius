@@ -72,7 +72,17 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     return std::get<std::unique_ptr<scan_info>>(materialization_info)
       ->estimated_working_set_bytes();
   }
-  return get_estimated_size_in_bytes();
+  auto const batch_bytes = get_estimated_size_in_bytes();
+  if (mvcc_keep_mask) {
+    // A masked resident chunk is filtered by copy at materialize: the input
+    // batch and the compacted output (up to input-sized) coexist at peak,
+    // alongside the BOOL8 expansion column (1 B/row) and the uploaded bitmask
+    // words. An unmasked chunk serves a zero-copy view, so plain batch_bytes
+    // stays accurate for it.
+    return 2 * batch_bytes + mvcc_keep_mask->row_count +
+           mvcc_keep_mask->words.size() * sizeof(std::uint32_t);
+  }
+  return batch_bytes;
 }
 
 }  // namespace sirius::op::scan
