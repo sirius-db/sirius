@@ -272,6 +272,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_native_decoder.cpp
     src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
+    src/op/scan/host_keep_mask.cpp
     src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
@@ -684,6 +685,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
     test/cpp/scan/test_gpu_decode_strings.cpp
+    test/cpp/scan/test_host_keep_mask.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp

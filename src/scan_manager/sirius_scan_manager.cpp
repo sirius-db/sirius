@@ -67,10 +67,14 @@ namespace {
 
 struct cached_databatch_provider : public databatch_provider {
   cached_databatch_provider(pinned_entry const& entry,
-                            std::span<size_t> selected_columns,
+                            std::span<std::size_t const> selected_columns,
                             cached_scan_plan plan,
-                            const telemetry::batch_telemetry_info& telemetry_info)
-    : _plan(std::move(plan)), _entry(entry), _telemetry_info(telemetry_info)
+                            const telemetry::batch_telemetry_info& telemetry_info,
+                            std::shared_ptr<mvcc_chunk_mask_set const> mvcc_masks)
+    : _plan(std::move(plan)),
+      _entry(entry),
+      _telemetry_info(telemetry_info),
+      _mvcc_masks(std::move(mvcc_masks))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -79,18 +83,21 @@ struct cached_databatch_provider : public databatch_provider {
     });
   }
 
-  std::shared_ptr<cucascade::data_batch> get_next_batch() override
+  databatch_provider::batch get_next_batch() override
   {
     // The atomic cursor walks survivor positions, each mapping to a chunk index.
     auto const cursor = _index.fetch_add(1);
-    if (cursor >= _plan.survivor_chunk_indices.size()) { return nullptr; }
+    if (cursor >= _plan.survivor_chunk_indices.size()) { return {}; }
     auto const index = _plan.survivor_chunk_indices[cursor];
+    std::shared_ptr<cucascade::data_batch> data;
     if (_entry.tier == cucascade::memory::Tier::GPU) {
-      return get_device_databatch(index);
+      data = get_device_databatch(index);
     } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      return get_host_databatch(index);
+      data = get_host_databatch(index);
     }
-    return nullptr;
+    if (!data) { return {}; }
+    auto mask = (_mvcc_masks && index < _mvcc_masks->size()) ? (*_mvcc_masks)[index] : nullptr;
+    return {std::move(data), std::move(mask)};
   }
 
  private:
@@ -137,6 +144,7 @@ struct cached_databatch_provider : public databatch_provider {
   std::vector<size_t> _column_indices;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
+  std::shared_ptr<mvcc_chunk_mask_set const> _mvcc_masks;
   std::atomic<std::size_t> _index{0};
 };
 
@@ -160,12 +168,13 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
-  std::span<size_t> selected_columns,
+  std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  std::shared_ptr<mvcc_chunk_mask_set const> mvcc_masks)
 {
   return std::make_unique<cached_databatch_provider>(
-    entry, selected_columns, std::move(plan), telemetry_info);
+    entry, selected_columns, std::move(plan), telemetry_info, std::move(mvcc_masks));
 }
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
@@ -951,6 +960,7 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   throw std::runtime_error("pinned entry has an unsupported tier");
 }
 
+<<<<<<< HEAD
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
                                         duckdb::TableFilterSet const* table_filters,
                                         duckdb::vector<duckdb::ColumnIndex> const* column_ids)

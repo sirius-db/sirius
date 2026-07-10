@@ -170,9 +170,11 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
 {
   try {
     while (!stop.stop_requested()) {
-      auto databatch = provider.get_next_batch();
-      if (!databatch) { break; }
-      connector.push_split(std::make_unique<op::scan::scan_operator_input>(std::move(databatch)));
+      auto next = provider.get_next_batch();
+      if (!next.data) { break; }
+      auto split            = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
+      split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
+      connector.push_split(std::move(split));
     }
     connector.close();
   } catch (...) {

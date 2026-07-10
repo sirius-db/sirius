@@ -85,6 +85,10 @@ namespace sirius::planner {
 class query;
 }  // namespace sirius::planner
 
+namespace sirius::telemetry {
+struct batch_telemetry_info;
+}  // namespace sirius::telemetry
+
 namespace sirius::scan_manager {
 
 /// Lightweight descriptor of a pinned table's cache identity + column layout,
@@ -182,6 +186,19 @@ struct pinned_entry {
 /// attaching the provider and converts a throw into a disk-read fallback.
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
+
+/// Build the cached-serving databatch_provider for @p entry over
+/// @p selected_columns (positions into @c entry.cache_info.column_ids, in the
+/// scan's materialized order). @p mvcc_masks, when non-null, is the per-chunk
+/// MVCC keep-mask set the provider pairs with each chunk it yields (#819:
+/// slot i masks chunk i; a null slot serves that chunk unmasked). Declared
+/// here so the chunk↔mask pairing is unit-testable; the provider type itself
+/// stays internal to the scan manager.
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  std::shared_ptr<mvcc_chunk_mask_set const> mvcc_masks = nullptr);
 
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.

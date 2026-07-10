@@ -23,6 +23,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
+#include "scan_manager/mvcc_chunk_mask.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -36,8 +37,15 @@
 namespace sirius::scan_manager {
 
 struct databatch_provider {
-  virtual ~databatch_provider()                                   = default;
-  virtual std::shared_ptr<cucascade::data_batch> get_next_batch() = 0;
+  /// One cached chunk plus its (optional) per-query MVCC keep-mask (#819).
+  /// A default-constructed batch (null @ref data) means end-of-stream.
+  struct batch {
+    std::shared_ptr<cucascade::data_batch> data;
+    std::shared_ptr<mvcc_chunk_mask const> mvcc_keep_mask;  ///< null = all rows visible
+  };
+
+  virtual ~databatch_provider()  = default;
+  virtual batch get_next_batch() = 0;
 };
 
 /**
