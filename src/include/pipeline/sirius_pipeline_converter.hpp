@@ -78,6 +78,13 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
 //! (every pipeline after all of its `dependencies`), renumbers `pipeline_id` to the new
 //! positions, and re-sorts each pipeline's `dependencies` ascending by the new ids.
 //! Only the tree-based path needs this; the legacy path already emits topologically.
+//!
+//! Producers are visited in `dependencies` slot order, so with join dependencies kept
+//! build-first (see `finalize_pipeline_structure`) every join's build subtree is
+//! scheduled before its probe subtree. Pipelines launch in id order, so this is what
+//! lets a join publish its dynamic filters before the probe-side scans they prune are
+//! launched — probe-first numbering silently degrades those scans to full, unfiltered
+//! reads.
 void reorder_pipelines_topologically(
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
 

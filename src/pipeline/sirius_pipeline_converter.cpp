@@ -204,6 +204,22 @@ void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pi
                 return a->get_pipeline_id() < b->get_pipeline_id();
               });
   }
+#ifdef DEBUG
+  // Join dependencies are build-first (finalize_pipeline_structure) and the walk above
+  // visits slot 0 first, so every build concat is emitted — and numbered — before its
+  // probe sibling and the ascending re-sort keeps it in slot 0. Delim-join cycle
+  // breaking is the one path that could reorder them; catch that here instead of
+  // silently regressing dynamic-filter publish-before-probe scheduling.
+  for (const auto& pipeline : pipelines) {
+    if (pipeline->get_source()->type != op::SiriusPhysicalOperatorType::HASH_JOIN &&
+        pipeline->get_source()->type != op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+      continue;
+    }
+    auto build_sink = pipeline->dependencies[0]->get_sink();
+    D_ASSERT(build_sink->type == op::SiriusPhysicalOperatorType::CONCAT &&
+             build_sink->Cast<op::sirius_physical_concat>().is_build_concat());
+  }
+#endif
 }
 
 duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>
@@ -1466,9 +1482,28 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
       pipeline->operators.push_back(*pipeline->sink);
       pipeline->source = &pipeline->operators[0].get();
     }
-    // for each parent pipeline, add the current pipeline to the dependencies
+    // For each parent pipeline, add the current pipeline to its dependencies. Join
+    // dependencies must end up build-side-first: link_join_partition_siblings() reads
+    // dependencies[0]/[1] positionally, and reorder_pipelines_topologically() visits
+    // producers in slot order — build-first is what schedules a join's dynamic-filter
+    // publication before the probe-side scans it prunes. Legacy emission already visits
+    // build concats first (and only assigns the parent's `source` later in this loop,
+    // so the role check below cannot run there); the tree meta-sweep emits probe-first,
+    // so its build concats are inserted at the front instead.
     for (auto& parent : pipeline->parents) {
-      if (auto locked_parent = parent.lock()) { locked_parent->dependencies.push_back(pipeline); }
+      auto locked_parent = parent.lock();
+      if (!locked_parent) { continue; }
+      bool const build_side_of_join =
+        duckdb::Config::USE_TREE_BASED_PIPELINE_BUILD &&
+        (locked_parent->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+         locked_parent->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) &&
+        pipeline->sink->type == op::SiriusPhysicalOperatorType::CONCAT &&
+        pipeline->sink->Cast<op::sirius_physical_concat>().is_build_concat();
+      if (build_side_of_join) {
+        locked_parent->dependencies.insert(locked_parent->dependencies.begin(), pipeline);
+      } else {
+        locked_parent->dependencies.push_back(pipeline);
+      }
     }
   }
 }
@@ -1484,7 +1519,13 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
       auto probe_concat_pipeline    = pipeline->dependencies[1];
       auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
-      bool const is_right_delim     = build_partition_pipeline->get_sink()->type ==
+      // Positional roles are guaranteed by finalize_pipeline_structure() (tree path) /
+      // emission order (legacy). A swap here mislinks sibling partitions and, for
+      // right-family joins, drives_partition_count.
+      D_ASSERT(
+        build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
+        build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
+      bool const is_right_delim = build_partition_pipeline->get_sink()->type ==
                                   op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
       // RIGHT_DELIM_JOIN must bootstrap its probe subtree from build-side distinct data.
       // Right-family sizing applies to hash joins only — NLJ probe partitions always stream.
