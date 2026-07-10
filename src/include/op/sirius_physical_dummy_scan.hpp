@@ -38,9 +38,9 @@ class sirius_physical_dummy_scan : public sirius_physical_operator {
   bool is_source() const override { return true; }
 
   //! True when this DUMMY_SCAN is the synthetic build placeholder under a
-  //! RIGHT_DELIM_JOIN's internal join. Makes plan-gen skip `wrap_cpu_source`: the
+  //! RIGHT_DELIM_JOIN's internal join. Makes plan-gen's CPU-source rejection skip it: the
   //! placeholder carries no runtime data (sink() runs partition_join inline). Real
-  //! DUMMY_SCAN usages (constant-row subqueries) keep the wrap.
+  //! DUMMY_SCAN usages (constant-row subqueries) are rejected toward CPU fallback.
   [[nodiscard]] bool is_delim_join_placeholder() const noexcept
   {
     return _is_delim_join_placeholder;

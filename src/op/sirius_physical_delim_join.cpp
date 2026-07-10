@@ -84,9 +84,9 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
 
   children.push_back(std::move(join->children[1]));
 
-  // Mark the placeholder so wrap_cpu_source skips it: it carries no runtime data
-  // (sink() runs partition_join inline), so a CPU_SOURCE wrap would materialize a
-  // phantom pipeline.
+  // Mark the placeholder so plan generation's CPU-source rejection skips it: it carries
+  // no runtime data (sink() runs partition_join inline), so it needs no CPU-materialized
+  // source and must not force a CPU fallback.
   auto dummy_placeholder =
     duckdb::make_uniq<sirius_physical_dummy_scan>(children[0]->get_types(), estimated_cardinality);
   dummy_placeholder->set_delim_join_placeholder(true);
