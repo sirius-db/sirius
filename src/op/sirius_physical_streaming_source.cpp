@@ -36,28 +36,40 @@ sirius_physical_streaming_source::sirius_physical_streaming_source(
     _input_channel(std::move(input_channel)),
     _input_repository(std::move(input_repository))
 {
+  if (!_input_channel) {
+    throw sirius::invalid_input_exception(
+      "sirius_physical_streaming_source: input_channel must not be null");
+  }
+  if (!_input_repository) {
+    throw sirius::invalid_input_exception(
+      "sirius_physical_streaming_source: input_repository must not be null");
+  }
+}
+
+void sirius_physical_streaming_source::set_pipeline(
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
+{
+  sirius_physical_operator::set_pipeline(pipeline);
+
   // Close is the only event that can make this pipeline finish without a task in flight to
   // call mark_task_completed() -> update_pipeline_status() for it (empty stream, or the last
   // task already completed while the channel was still open). Wire close directly to a
-  // re-evaluation instead of relying on task_creator to notice a dropped nullopt hint — see
-  // docs/super-sirius/streaming-source-p1-fix-plan-v2-no-task-creator.md, Finding 1.
+  // status re-evaluation. `original_pipeline=false` so notify_downstream_pipelines() also
+  // schedules this pipeline's output consumers — with the default (true) an empty or
+  // late-closed stream would finish this pipeline but never re-arm its downstream.
   //
-  // get_pipeline() is resolved lazily (at callback-fire time, not here at construction time):
-  // set_pipeline() runs once per operator during query::build_indices(), which happens after
-  // every operator is constructed but before any channel activity starts in production, so by
-  // the time close() is actually called the pipeline is always set. The null check makes this
-  // safe even if that ordering assumption is ever violated (e.g. in tests that never wire a
-  // pipeline at all).
-  _input_channel->set_on_close([this] {
-    if (auto pipeline = get_pipeline()) { pipeline->update_pipeline_status(); }
+  // The callback captures a weak pipeline reference, never `this`: exchange_channel::close()
+  // snapshots the callback under its mutex and invokes it after unlocking, so a callback
+  // holding `this` could fire after this operator was destroyed (the channel is shared with
+  // the producer side and may outlive the operator).
+  duckdb::weak_ptr<pipeline::sirius_pipeline> weak_pipeline = pipeline;
+  _input_channel->set_on_close([weak_pipeline] {
+    if (auto p = weak_pipeline.lock()) { p->update_pipeline_status(false); }
   });
-}
 
-sirius_physical_streaming_source::~sirius_physical_streaming_source()
-{
-  // The channel may outlive this operator (e.g. held by a producer on another thread); clear
-  // the callback before `this` becomes dangling, per exchange_channel's documented contract.
-  _input_channel->set_on_close(nullptr);
+  // If close() ran before the callback was wired, on_close will never fire; re-evaluate now
+  // so an already-closed empty stream still finishes.
+  if (_input_channel->closed()) { pipeline->update_pipeline_status(false); }
 }
 
 std::optional<task_creation_hint> sirius_physical_streaming_source::get_next_task_hint()

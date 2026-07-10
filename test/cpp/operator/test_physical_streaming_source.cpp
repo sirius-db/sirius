@@ -17,6 +17,7 @@
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
+#include <creator/task_creator.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -32,9 +33,12 @@
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_streaming_source.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <sirius/exception.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <thread>
 #include <vector>
@@ -721,9 +725,8 @@ TEST_CASE("streaming_source SRC-21: concurrent input-data pulls deliver each bat
 }
 
 // ============================================================================
-// BUG-1 (Finding 1a, reproduction): closing an empty stream must finish a
-// zero-task pipeline. See docs/super-sirius/streaming-source-p1-p3-fix-plan.md,
-// Finding 1, "Empty stream" failure mode.
+// BUG-1 (reproduction): closing an empty stream must finish a zero-task
+// pipeline.
 //
 // These BUG-* tests exercise the real sirius_pipeline completion predicate
 // (update_pipeline_status() / is_pipeline_finished()), not just the operator's
@@ -732,9 +735,8 @@ TEST_CASE("streaming_source SRC-21: concurrent input-data pulls deliver each bat
 // itself.
 // ============================================================================
 
-TEST_CASE(
-  "streaming_source BUG-1 (Finding 1a): closing an empty stream finishes a zero-task pipeline",
-  "[streaming_source][pipeline_completion]")
+TEST_CASE("streaming_source BUG-1: closing an empty stream finishes a zero-task pipeline",
+          "[streaming_source][pipeline_completion]")
 {
   auto [op, ch, repo] = make_source();
   auto pipeline       = make_single_op_pipeline(*op);
@@ -758,15 +760,12 @@ TEST_CASE(
 }
 
 // ============================================================================
-// BUG-2 (Finding 1b, reproduction): closing the stream after the last task has
-// already completed must finish the pipeline. See streaming-source-p1-p3-fix-
-// plan.md, Finding 1, "Late close" failure mode.
+// BUG-2 (reproduction): closing the stream after the last task has already
+// completed must finish the pipeline.
 // ============================================================================
 
-TEST_CASE(
-  "streaming_source BUG-2 (Finding 1b): late close after last task completed finishes "
-  "the pipeline",
-  "[streaming_source][pipeline_completion]")
+TEST_CASE("streaming_source BUG-2: late close after last task completed finishes the pipeline",
+          "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
@@ -802,4 +801,135 @@ TEST_CASE(
   // now finish. The pipeline is stuck even though its finish predicate is
   // satisfied.
   REQUIRE(pipeline->is_pipeline_finished());
+}
+
+// ============================================================================
+// SRC-22: constructor input validation
+// ============================================================================
+
+TEST_CASE("streaming_source SRC-22: null channel or repository is rejected", "[streaming_source]")
+{
+  auto types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  auto ch   = std::make_shared<exchange_channel>(exchange_channel::config{16});
+  auto repo = std::make_shared<cucascade::shared_data_repository>();
+
+  REQUIRE_THROWS_AS(sirius_physical_streaming_source(types, 0, nullptr, repo),
+                    sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(sirius_physical_streaming_source(types, 0, ch, nullptr),
+                    sirius::invalid_input_exception);
+}
+
+// ============================================================================
+// SRC-23: close after the consumer side is destroyed must not touch freed
+// memory. The on-close callback holds only a weak pipeline reference, so a
+// producer closing a channel that outlived its operator/pipeline is a no-op.
+// ============================================================================
+
+TEST_CASE("streaming_source SRC-23: close after operator and pipeline destruction is safe",
+          "[streaming_source][pipeline_completion]")
+{
+  auto [op, ch, repo] = make_source();
+  {
+    auto pipeline = make_single_op_pipeline(*op);
+  }
+  op.reset();  // channel (producer side) outlives the whole consumer side
+
+  ch->close();  // fires on_close; the weak pipeline reference is expired
+  REQUIRE(ch->drained());
+}
+
+// ============================================================================
+// BUG-3 / BUG-4: pipeline completion must also re-arm downstream pipelines.
+// update_pipeline_status(false) makes notify_downstream_pipelines() schedule
+// this pipeline's output consumers via the task_creator; with the default
+// (true) an empty or late-closed stream finishes this pipeline but its
+// downstream pipeline never gets a task scheduled.
+// ============================================================================
+
+namespace {
+
+/// task_creator that only records what would have been scheduled.
+class recording_task_creator : public sirius::creator::task_creator {
+ public:
+  explicit recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr)
+    : task_creator(sirius::exec::thread_pool_config{.num_threads        = 1,
+                                                    .thread_name_prefix = "test_task_creator"},
+                   mem_mgr)
+  {
+  }
+
+  void schedule(sirius_physical_operator* request) override
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _scheduled.push_back(request);
+  }
+
+  bool scheduled(const sirius_physical_operator* op)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return std::find(_scheduled.begin(), _scheduled.end(), op) != _scheduled.end();
+  }
+
+ private:
+  std::mutex _mutex;
+  std::vector<sirius_physical_operator*> _scheduled;
+};
+
+}  // namespace
+
+TEST_CASE("streaming_source BUG-3: closing an empty stream schedules downstream consumers",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr = sirius::test::operator_utils::initialize_memory_manager();
+  recording_task_creator creator(*mem_mgr);
+
+  auto [op, ch, repo] = make_source();
+  auto pipeline       = make_single_op_pipeline(*op);
+  pipeline->set_task_creator(&creator);
+
+  // Downstream pipeline consuming this one's output: its source operator is what
+  // notify_downstream_pipelines() must hand to the task_creator on finish.
+  auto [downstream_op, downstream_ch, downstream_repo] = make_source();
+  auto downstream                                      = make_single_op_pipeline(*downstream_op);
+  downstream->add_dependency(pipeline);
+
+  ch->close();
+
+  REQUIRE(pipeline->is_pipeline_finished());
+  REQUIRE(creator.scheduled(downstream_op.get()));
+}
+
+TEST_CASE("streaming_source BUG-4: late close after last task schedules downstream consumers",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+  recording_task_creator creator(*mem_mgr);
+
+  auto [op, ch, repo] = make_source();
+  auto pipeline       = make_single_op_pipeline(*op);
+  pipeline->set_task_creator(&creator);
+
+  auto [downstream_op, downstream_ch, downstream_repo] = make_source();
+  auto downstream                                      = make_single_op_pipeline(*downstream_op);
+  downstream->add_dependency(pipeline);
+
+  // Run the stream's one real task to completion while the channel is still open.
+  auto batch = make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32);
+  push_batch(repo, *ch, batch);
+  pipeline->mark_task_created();
+  auto pod = op->get_next_task_input_data();
+  REQUIRE(pod != nullptr);
+  pipeline->mark_task_completed();
+  REQUIRE_FALSE(pipeline->is_pipeline_finished());
+  REQUIRE_FALSE(creator.scheduled(downstream_op.get()));
+
+  // Late close with no task in flight: the pipeline must finish AND its
+  // downstream consumer must still get scheduled.
+  ch->close();
+
+  REQUIRE(pipeline->is_pipeline_finished());
+  REQUIRE(creator.scheduled(downstream_op.get()));
 }

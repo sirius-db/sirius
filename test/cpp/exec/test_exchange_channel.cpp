@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <set>
 #include <thread>
 #include <vector>
@@ -150,7 +151,8 @@ TEST_CASE("exchange_channel: blocking push unblocks on pop", "[exchange_channel]
   std::atomic<bool> unblocked{false};
   std::thread producer([&] {
     bool ok = ch.push(make_handle(1));  // blocks until consumer pops
-    REQUIRE(ok);
+    // CHECK (not REQUIRE): a throwing assertion in a std::thread terminates the process.
+    CHECK(ok);
     unblocked.store(true, std::memory_order_release);
   });
 
@@ -214,7 +216,8 @@ TEST_CASE("exchange_channel: blocked pop wakes on close", "[exchange_channel]")
   std::atomic<bool> returned_nullopt{false};
   std::thread consumer([&] {
     auto h = ch.pop();  // blocks on empty open channel
-    REQUIRE_FALSE(h.has_value());
+    // CHECK (not REQUIRE): a throwing assertion in a std::thread terminates the process.
+    CHECK_FALSE(h.has_value());
     returned_nullopt.store(true, std::memory_order_release);
   });
 
@@ -337,11 +340,11 @@ TEST_CASE("exchange_channel: hooks fire outside the lock", "[exchange_channel]")
 }
 
 // ============================================================================
-// CH-16 (Finding 1): on_close fires exactly once, outside the lock, only on the
+// CH-16: on_close fires exactly once, outside the lock, only on the
 // first successful close().
 // ============================================================================
 
-TEST_CASE("exchange_channel: on_close fires exactly once outside the lock (Finding 1)",
+TEST_CASE("exchange_channel: on_close fires exactly once outside the lock",
           "[exchange_channel][pipeline_completion]")
 {
   exchange_channel ch(exchange_channel::config{.capacity_items = 4});
@@ -367,12 +370,12 @@ TEST_CASE("exchange_channel: on_close fires exactly once outside the lock (Findi
 }
 
 // ============================================================================
-// CH-17 (Finding 1): on_close fires even for a channel that closes with items
+// CH-17: on_close fires even for a channel that closes with items
 // still queued (close-then-drain — the callback signals "no more pushes will
 // ever happen", not "the queue is empty").
 // ============================================================================
 
-TEST_CASE("exchange_channel: on_close fires even when items remain queued (Finding 1)",
+TEST_CASE("exchange_channel: on_close fires even when items remain queued",
           "[exchange_channel][pipeline_completion]")
 {
   exchange_channel ch(exchange_channel::config{.capacity_items = 4});
@@ -388,14 +391,13 @@ TEST_CASE("exchange_channel: on_close fires even when items remain queued (Findi
 }
 
 // ============================================================================
-// CH-12 (Finding 3a, reproduction): a push that would push the cumulative total
+// CH-12 (reproduction): a push that would push the cumulative total
 // past capacity_bytes must be rejected. full_unlocked() only inspects bytes
 // already queued, not the incoming candidate, so a 40-byte handle is wrongly
 // admitted on top of 40 already-queued bytes in a 50-byte-bound channel.
-// See docs/super-sirius/streaming-source-p1-p3-fix-plan.md, Finding 3.
 // ============================================================================
 
-TEST_CASE("exchange_channel: cumulative push crossing byte bound is rejected (Finding 3a)",
+TEST_CASE("exchange_channel: cumulative push crossing byte bound is rejected",
           "[exchange_channel][byte_admission]")
 {
   exchange_channel ch(exchange_channel::config{.capacity_items = 10, .capacity_bytes = 50});
@@ -411,12 +413,12 @@ TEST_CASE("exchange_channel: cumulative push crossing byte bound is rejected (Fi
 }
 
 // ============================================================================
-// CH-13 (Finding 3b, reproduction): the oversized-batch rule is documented to
+// CH-13 (reproduction): the oversized-batch rule is documented to
 // admit an oversized handle only into an *empty* channel. A non-empty channel
 // must reject an oversized handle instead of wedging past its byte bound.
 // ============================================================================
 
-TEST_CASE("exchange_channel: oversized handle rejected while queue is non-empty (Finding 3b)",
+TEST_CASE("exchange_channel: oversized handle rejected while queue is non-empty",
           "[exchange_channel][byte_admission]")
 {
   exchange_channel ch(exchange_channel::config{.capacity_items = 10, .capacity_bytes = 50});
@@ -430,12 +432,12 @@ TEST_CASE("exchange_channel: oversized handle rejected while queue is non-empty 
 }
 
 // ============================================================================
-// CH-14 (Finding 3c, must-not-regress): the same oversized handle IS accepted
+// CH-14 (must-not-regress): the same oversized handle IS accepted
 // once the queue drains back to empty — the oversized-batch rule must keep
 // working for a channel that becomes empty again, not just a freshly-built one.
 // ============================================================================
 
-TEST_CASE("exchange_channel: oversized handle accepted once queue becomes empty (Finding 3c)",
+TEST_CASE("exchange_channel: oversized handle accepted once queue becomes empty",
           "[exchange_channel][byte_admission]")
 {
   exchange_channel ch(exchange_channel::config{.capacity_items = 10, .capacity_bytes = 50});
@@ -450,12 +452,12 @@ TEST_CASE("exchange_channel: oversized handle accepted once queue becomes empty 
 }
 
 // ============================================================================
-// CH-15 (Finding 3, blocking push): a blocking push() whose candidate would
+// CH-15 (blocking push): a blocking push() whose candidate would
 // cross the byte bound must wait rather than being admitted immediately, and
 // must succeed once popping frees enough byte capacity.
 // ============================================================================
 
-TEST_CASE("exchange_channel: blocking push waits for byte headroom (Finding 3, blocking path)",
+TEST_CASE("exchange_channel: blocking push waits for byte headroom (blocking path)",
           "[exchange_channel][byte_admission]")
 {
   exchange_channel ch(exchange_channel::config{.capacity_items = 10, .capacity_bytes = 50});
@@ -493,4 +495,34 @@ TEST_CASE("exchange_channel: blocking push waits for byte headroom (Finding 3, b
   producer.join();
   REQUIRE(unblocked.load());
   REQUIRE(push_ok.load());
+}
+
+// ============================================================================
+// CH-18: byte accounting never overflows
+// ============================================================================
+
+TEST_CASE("exchange_channel: rejects a push that would overflow byte accounting",
+          "[exchange_channel]")
+{
+  constexpr auto max_bytes = std::numeric_limits<std::size_t>::max();
+
+  // Byte-unbounded channel: this is the only configuration where the cumulative
+  // total is not already capped by capacity_bytes at admission time.
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4});
+
+  REQUIRE(ch.try_push(make_handle(1, max_bytes)));
+  REQUIRE(ch.size_bytes() == max_bytes);
+
+  // Admitting even one more byte would wrap _total_bytes.
+  REQUIRE_FALSE(ch.try_push(make_handle(2, 1)));
+  // A zero-sized handle still fits exactly.
+  REQUIRE(ch.try_push(make_handle(3, 0)));
+  REQUIRE(ch.size_bytes() == max_bytes);
+
+  // Popping the oversized handle restores headroom.
+  auto h = ch.try_pop();
+  REQUIRE(h.has_value());
+  REQUIRE(h->batch_id == 1);
+  REQUIRE(ch.size_bytes() == 0);
+  REQUIRE(ch.try_push(make_handle(4, 1)));
 }

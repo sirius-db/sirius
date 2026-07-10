@@ -28,33 +28,22 @@ namespace sirius::op {
 
 /// Source operator that pulls data_batch handles from an exchange_channel, resolves each
 /// handle via the input repository, and publishes the batch into the pipeline.
-///
-/// Lifecycle / engine contracts (discoveries §1/§2, plan §4):
-///   - get_next_task_hint(): READY{this} when channel non-empty; WAITING{nullptr} when
-///     open+empty (re-armable by the session pushing to the channel); nullopt when drained.
-///   - all_ports_empty(): delegates to _input_channel->drained(), drives both the task
-///     creation loop and the pipeline-finish predicate (port-less source variant).
-///   - get_next_task_input_data(): non-blocking try_pop + repo resolve; one batch per task.
-///   - execute(): pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
-///   - no_history_peak_memory_estimate(): returns stats.bytes (pass-through allocates nothing).
-///   - Completion: wires the channel's on-close callback (constructor) to
-///     pipeline->update_pipeline_status(), so an empty or already-drained-by-the-last-task
-///     stream still finishes its pipeline even though no task is left in flight to trigger
-///     re-evaluation via mark_task_completed(). See streaming-source-p1-fix-plan-v2-no-task-
-///     creator.md, Finding 1.
 class sirius_physical_streaming_source : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SOURCE;
 
+  /// Throws invalid_input_exception when input_channel or input_repository is null.
   sirius_physical_streaming_source(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     std::shared_ptr<exec::exchange_channel> input_channel,
     std::shared_ptr<cucascade::shared_data_repository> input_repository);
 
-  /// Clears the channel's on-close callback before this operator is destroyed, since the
-  /// channel (owned jointly with the producer side) may outlive it.
-  ~sirius_physical_streaming_source() override;
+  /// Wires the channel's on-close callback to the pipeline so an empty or late-closed
+  /// stream still finishes even when no task is in flight to re-evaluate completion.
+  /// The callback captures a weak reference to the pipeline (never `this`), so a close()
+  /// racing with operator destruction cannot dereference a destroyed operator.
+  void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
 
   // -----------------------------------------------------------------------
   // Source interface

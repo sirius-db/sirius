@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -28,30 +29,20 @@
 namespace sirius::exec {
 
 /// Lightweight handle pushed through the channel. The shared_data_repository is the owner of
-/// record; queued batches therefore sit idle where the downgrade sweep can see and spill them
-/// (design §3/§7). A channel that owned batches would make them spill-invisible.
+/// record; queued batches therefore sit idle where the downgrade sweep can see and spill them.
 struct exchange_batch_handle {
   uint64_t batch_id;       // repository batch id — repo is the owner of record
   std::size_t size_bytes;  // size estimate captured at registration (byte accounting)
 };
 
-/// Bounded MPMC queue of batch handles with close-then-drain end-of-stream.
+/// Bounded MPMC queue of batch handles with close-then-drain end-of-stream:
+/// close() forbids further pushes, already-queued items remain poppable, and
+/// drained() (= closed() && empty()) is the terminal EOS predicate.
 ///
-/// Semantics (design §3/§7):
-///   - full()    ≡  items == capacity_items  OR  (byte_bound set AND bytes ≥ bound AND non-empty)
-///     — a state-only query with no candidate handle. Push admission is decided separately (see
-///     can_push_unlocked()) because a specific incoming handle can cross the byte bound even
-///     while full() would still report false (e.g. 40 queued + a 40-byte handle against a
-///     50-byte bound).
-///   - Oversized-batch rule: a handle whose size_bytes > capacity_bytes is admitted into an
-///     *empty* channel so the stream never wedges. A non-empty channel never admits a handle
-///     that would push the cumulative total past capacity_bytes.
-///   - close()   forbids further pushes; already-queued items remain poppable.
-///   - drained() ≡  closed() && empty()  — terminal EOS predicate.
-///   - Engine workers use try_push / try_pop only (non-blocking). Blocking push / pop are
-///     provided for the wrapper / test side.
-///   - Callbacks (on_push / on_pop / on_close) fire outside the lock; each is single-slot —
-///     last setter wins. on_close fires exactly once, on the first successful close().
+/// Capacity is bounded by item count and optionally by cumulative bytes. Engine workers use
+/// the non-blocking try_push / try_pop; blocking push / pop serve the wrapper / test side.
+/// Callbacks (on_push / on_pop / on_close) fire outside the lock and must not capture raw
+/// pointers to objects the channel can outlive.
 class exchange_channel {
  public:
   struct config {
@@ -78,9 +69,7 @@ class exchange_channel {
     {
       std::unique_lock<std::mutex> lock(_mutex);
       if (_closed || !can_push_unlocked(h)) return false;
-      _queue.push_back(h);
-      _total_bytes += h.size_bytes;
-      cb = _on_push;
+      cb = enqueue_unlocked(h);
     }
     _cv.notify_all();
     if (cb) cb();
@@ -96,9 +85,7 @@ class exchange_channel {
       std::unique_lock<std::mutex> lock(_mutex);
       _cv.wait(lock, [&] { return can_push_unlocked(h) || _closed; });
       if (_closed) return false;
-      _queue.push_back(h);
-      _total_bytes += h.size_bytes;
-      cb = _on_push;
+      cb = enqueue_unlocked(h);
     }
     _cv.notify_all();
     if (cb) cb();
@@ -132,10 +119,7 @@ class exchange_channel {
     {
       std::unique_lock<std::mutex> lock(_mutex);
       if (_queue.empty()) return std::nullopt;
-      result = _queue.front();
-      _queue.pop_front();
-      _total_bytes -= result->size_bytes;
-      cb = _on_pop;
+      result = dequeue_unlocked(cb);
     }
     _cv.notify_all();
     if (cb) cb();
@@ -152,10 +136,7 @@ class exchange_channel {
       std::unique_lock<std::mutex> lock(_mutex);
       _cv.wait(lock, [&] { return !_queue.empty() || _closed; });
       if (_queue.empty()) return std::nullopt;  // closed && drained
-      result = _queue.front();
-      _queue.pop_front();
-      _total_bytes -= result->size_bytes;
-      cb = _on_pop;
+      result = dequeue_unlocked(cb);
     }
     _cv.notify_all();
     if (cb) cb();
@@ -204,9 +185,12 @@ class exchange_channel {
   }
 
   // -----------------------------------------------------------------------
-  // Re-arm hooks (single-slot; fired outside the lock).
+  // Re-arm hooks (single-slot — last setter wins; fired outside the lock).
   // Wired by the stream session in #839; tests poll instead.
-  // The owner must clear callbacks before the callee dies.
+  // A firing operation snapshots the callback under the lock and invokes the copy after
+  // unlocking, so replacing a callback does not synchronize with an in-flight invocation:
+  // callbacks must not capture raw pointers to objects the channel can outlive (capture a
+  // weak reference instead).
   // -----------------------------------------------------------------------
 
   void set_on_push(std::function<void()> cb)
@@ -232,6 +216,26 @@ class exchange_channel {
   }
 
  private:
+  /// Shared tail of try_push/push: admit `h` and snapshot the push callback for the caller to
+  /// fire outside the lock. Caller must hold _mutex and have checked can_push_unlocked().
+  std::function<void()> enqueue_unlocked(const exchange_batch_handle& h)
+  {
+    _queue.push_back(h);
+    _total_bytes += h.size_bytes;
+    return _on_push;
+  }
+
+  /// Shared tail of try_pop/pop: dequeue the front handle and snapshot the pop callback into
+  /// `cb` for the caller to fire outside the lock. Caller must hold _mutex; queue non-empty.
+  exchange_batch_handle dequeue_unlocked(std::function<void()>& cb)
+  {
+    exchange_batch_handle result = _queue.front();
+    _queue.pop_front();
+    _total_bytes -= result.size_bytes;
+    cb = _on_pop;
+    return result;
+  }
+
   /// full() without taking the lock. Caller must hold _mutex.
   [[nodiscard]] bool full_unlocked() const
   {
@@ -248,6 +252,11 @@ class exchange_channel {
   [[nodiscard]] bool can_push_unlocked(const exchange_batch_handle& h) const
   {
     if (_queue.size() >= _cfg.capacity_items) return false;
+    // Reject a handle whose size would overflow the byte accounting; without this a wrapped
+    // _total_bytes makes size_bytes()/full() wrong. Only reachable on a byte-unbounded
+    // channel — a bounded non-empty channel already rejects below, and an empty channel has
+    // _total_bytes == 0.
+    if (h.size_bytes > std::numeric_limits<std::size_t>::max() - _total_bytes) return false;
     if (_cfg.capacity_bytes == 0) return true;
     // Oversized-batch rule: always admit into an empty channel so the stream never wedges.
     if (_queue.empty()) return true;
