@@ -88,7 +88,10 @@ struct build_probe_slot_view {
 
 struct build_probe_decision {
   build_probe_action action = build_probe_action::none;
-  std::size_t partition     = 0;
+  // Set only for schedule_build / schedule_probe — the partition to act on. nullopt for
+  // wait_for_build / wait_for_probe / none, which name no partition (the caller waits on the port's
+  // single upstream producer, shared by every partition).
+  std::optional<std::size_t> partition;
 };
 
 /// Decide the next BUILD_PROBE action from a per-partition snapshot. Prefers scheduling a build for

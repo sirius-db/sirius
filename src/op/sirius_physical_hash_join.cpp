@@ -441,7 +441,7 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
 
 build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view> const& slots)
 {
-  if (slots.empty()) { return {build_probe_action::none, 0}; }
+  if (slots.empty()) { return {build_probe_action::none, std::nullopt}; }
 
   // 1. Prefer starting a build: the first NOT_BUILT partition that has both its (concat-folded)
   //    build batch and a probe batch. The scheduling task builds that partition's hash table and
@@ -459,18 +459,21 @@ build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view
       return {build_probe_action::schedule_probe, p};
     }
   }
-  // 3. No schedulable work. If a partition still lacks its build batch, wait on the build producer
+  // 3. No schedulable work. If any partition still lacks its build batch, wait on the build
+  // producer
   //    so builds can start; otherwise every partition is building or draining probe input. Only
-  //    when all partitions are torn down is the operator truly finished.
+  //    when all partitions are torn down is the operator truly finished. These actions name no
+  //    partition (the caller waits on the port's single upstream producer, shared by all
+  //    partitions).
   bool all_destroyed = true;
   for (auto const& s : slots) {
     if (s.state != BUILD_HASH_TABLE_STATE::DESTROYED) { all_destroyed = false; }
     if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && !s.has_build_batch) {
-      return {build_probe_action::wait_for_build, 0};
+      return {build_probe_action::wait_for_build, std::nullopt};
     }
   }
-  if (all_destroyed) { return {build_probe_action::none, 0}; }
-  return {build_probe_action::wait_for_probe, 0};
+  if (all_destroyed) { return {build_probe_action::none, std::nullopt}; }
+  return {build_probe_action::wait_for_probe, std::nullopt};
 }
 
 bool build_probe_mode_eligible(int num_partitions,
@@ -481,7 +484,14 @@ bool build_probe_mode_eligible(int num_partitions,
                                int num_gpus,
                                uint64_t max_build_hash_table_bytes)
 {
-  if (num_partitions < 1 || num_gpus < 1) { return false; }
+  // Invariants: determine_num_partitions() never returns < 1, and _num_gpus defaults to 1 and is
+  // only ever set to a hardware GPU count >= 1. A value < 1 is a programming error (and would make
+  // the per-partition division below ill-defined), not a legitimate "not eligible" outcome.
+  if (num_partitions < 1 || num_gpus < 1) {
+    throw std::invalid_argument("build_probe_mode_eligible: num_partitions (" +
+                                std::to_string(num_partitions) + ") and num_gpus (" +
+                                std::to_string(num_gpus) + ") must both be >= 1");
+  }
   // One hash table per partition, one partition per GPU: at most num_gpus partitions. With
   // num_gpus == 1 this reduces to the historical single-partition rule.
   if (num_partitions > num_gpus) { return false; }
@@ -575,7 +585,7 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       case build_probe_action::schedule_build:
         // Claim this partition's slot so exactly one build task is issued for it. The paired
         // get_next_task_input_data_for_build_probe scans for the SCHEDULING slot and advances it.
-        _partition_build_states[decision.partition].build_state.store(
+        _partition_build_states[decision.partition.value()].build_state.store(
           BUILD_HASH_TABLE_STATE::SCHEDULING, std::memory_order_release);
         return task_creation_hint{TaskCreationHint::READY, this};
       case build_probe_action::schedule_probe:

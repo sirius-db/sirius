@@ -29,6 +29,8 @@
 
 #include <catch.hpp>
 
+#include <stdexcept>
+
 using sirius::op::BUILD_HASH_TABLE_STATE;
 using sirius::op::build_probe_action;
 using sirius::op::build_probe_mode_eligible;
@@ -116,9 +118,18 @@ TEST_CASE("build_probe_mode_eligible - excluded join shapes and unfoldable build
   // Build side that cannot fold to a single batch per partition.
   REQUIRE_FALSE(build_probe_mode_eligible(
     1, k100MB, /*build_foldable=*/false, false, false, 1, kMaxBuildBytes));
-  // Degenerate counts are rejected rather than dividing by zero.
-  REQUIRE_FALSE(build_probe_mode_eligible(0, k100MB, true, false, false, 1, kMaxBuildBytes));
-  REQUIRE_FALSE(build_probe_mode_eligible(1, k100MB, true, false, false, 0, kMaxBuildBytes));
+}
+
+TEST_CASE("build_probe_mode_eligible - degenerate counts are precondition violations that throw",
+          "[hash_join][build_probe][unit]")
+{
+  // num_partitions and num_gpus are >= 1 by construction (determine_num_partitions clamps to 1;
+  // _num_gpus defaults to 1). A value < 1 is a programming error, not a "not eligible" case, so the
+  // gate throws rather than silently returning false (and would otherwise divide by zero).
+  REQUIRE_THROWS_AS(build_probe_mode_eligible(0, k100MB, true, false, false, 1, kMaxBuildBytes),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(build_probe_mode_eligible(1, k100MB, true, false, false, 0, kMaxBuildBytes),
+                    std::invalid_argument);
 }
 
 //===----------------------------------------------------------------------===//
