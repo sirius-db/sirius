@@ -391,12 +391,12 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     return;
   }
 
-  // #819: compute this query's duckdb MVCC keep-masks BEFORE serving starts —
-  // block-in-prepare, so masks are finished plain buffers when the sequencer
-  // runs (it walks all ops' slots serially; a wait there would be head-of-line
-  // blocking across every scan op). The dispatcher is fresh and otherwise idle
-  // here. Errors are loud: past the plan-time gate there is no CPU fallback,
-  // and the alternative to failing is serving rows a concurrent DELETE removed.
+  // Compute this query's duckdb MVCC keep-masks BEFORE serving starts, so
+  // masks are finished plain buffers when the sequencer runs (it walks all
+  // ops' slots serially; a wait there would be head-of-line blocking across
+  // every scan op). The dispatcher is fresh and otherwise idle here. Errors
+  // are loud: past the plan-time gate there is no CPU fallback, and the
+  // alternative to failing is serving rows a concurrent DELETE removed.
   if (!_pending_mvcc_mask_jobs.empty()) {
     run_mvcc_mask_jobs(
       _pending_mvcc_mask_jobs, *_dispatcher, _reservation_manager, *_topology_index);
@@ -1090,8 +1090,8 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
     // Identity + serviceability gate: empty when this cache cannot serve the scan
     // (wrong format / file-set / table, or missing a requested column).
     if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
-    // #819 cache-or-CPU: for duckdb pins with MVCC metadata, the plan-time
-    // guards promised this scan serves from the pin — the disk-native path is
+    // Cache-or-CPU: for duckdb pins with MVCC metadata, the plan-time guards
+    // promised this scan serves from the pin — the disk-native path is
     // MVCC-blind and increasingly stale under the pin's checkpoint
     // suppression, so any failure past the identity gate is a loud error,
     // never a silent disk fallback.
@@ -1147,8 +1147,9 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
                                           : entry.data_batches_by_column.begin()->second.size())
                                      : entry.host_chunks.size();
         if (stored_chunks != n_chunks) {
-          // PR1 keeps mvcc counts and entry chunks in lock-step (merge-path
-          // guard); a mismatch here means masks would bind to the wrong rows.
+          // Pin-time metadata and entry chunks are kept in lock-step (the
+          // insert merge-path guard); a mismatch means masks would bind to
+          // the wrong rows.
           throw std::runtime_error("mvcc metadata covers " + std::to_string(n_chunks) +
                                    " chunk(s) but the entry stores " +
                                    std::to_string(stored_chunks));

@@ -135,10 +135,9 @@ class scan_operator_input : public op::operator_data {
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
   std::variant<std::monostate, std::unique_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
-  /// Per-query MVCC keep-mask for a resident cached chunk (#819); null = every
-  /// row visible (the fast path — no upload, no kernel). Attached by
-  /// drain_cached_provider, applied in gpu_ingestible::materialize_table's
-  /// resident branch.
+  /// Per-query MVCC keep-mask for a resident cached chunk; null = every row
+  /// visible (no upload, no kernel). Attached by drain_cached_provider,
+  /// applied in gpu_ingestible::materialize_table's resident branch.
   std::shared_ptr<scan_manager::mvcc_chunk_mask const> mvcc_keep_mask;
 };
 

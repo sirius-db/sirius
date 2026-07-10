@@ -48,7 +48,7 @@ std::unique_ptr<cudf::table> apply_host_keep_mask(cudf::table_view const& view,
                                                   rmm::device_async_resource_ref mr);
 
 /**
- * @brief Filter @p view by a host-computed bit-packed keep-mask (#819).
+ * @brief Filter @p view by a host-computed bit-packed keep-mask.
  *
  * @p keep_words is a cuDF-convention bitmask (bit `row % 32` of uint32 word
  * `row / 32`, 1 = keep; padding bits past @p row_count ignored). Uploads the

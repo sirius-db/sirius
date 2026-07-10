@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Gates for the duckdb MVCC visibility walk (#819): capture must validate the
+// Gates for the duckdb MVCC visibility walk: capture must validate the
 // pinned prefix against the live row-group tree and flag version state; the
 // bit-packed fill must reproduce DuckDB's own row visibility exactly — the
 // oracle is `SELECT rowid` on the same connection/transaction — across

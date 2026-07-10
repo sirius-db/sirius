@@ -48,19 +48,15 @@ class topology_index;
 namespace sirius::scan_manager {
 
 /**
- * @brief Run @p tasks on @p dispatcher and block until every one has run —
- *        the drop-safe fan-out/join the prepare-time MVCC jobs use (#819;
- *        generic so the PR4 insert-delta job reuses it with a different
- *        payload).
+ * @brief Run @p tasks on @p dispatcher and block until every one has run.
+ *        Generic drop-safe fan-out/join for prepare-time work units.
  *
  * Each task's completion_controller slot is acquired BEFORE its enqueue and
- * moved into the task lambda: `scoped_dispatcher::enqueue` after
- * `request_stop` is a silent no-op that destroys the lambda, which releases
- * the slot — so the join still fires and the completed-count check below
- * turns the drop into a loud error instead of a deadlock (the same applies to
- * lambdas the dispatcher skips after a stop). Task exceptions are captured
- * (the dispatcher itself swallows them) and the FIRST one is rethrown here
- * after the join.
+ * moved into the task lambda: a stopping dispatcher silently drops enqueues
+ * (and skips already-queued lambdas), destroying the lambda and releasing the
+ * slot — the join still fires and the completed-count check turns the drop
+ * into a loud error instead of a deadlock. Task exceptions are captured (the
+ * dispatcher swallows them) and the FIRST one is rethrown after the join.
  *
  * @throws whatever the first failing task threw; std::runtime_error when
  *         fewer than tasks.size() tasks ran (dispatcher stopped mid-fan-out).
@@ -93,31 +89,24 @@ struct mvcc_mask_job_request {
 };
 
 /**
- * @brief Compute every pending request's keep-masks; block-in-prepare (#819).
+ * @brief Compute every pending request's keep-masks; blocks in prepare so
+ *        serving starts with finished plain buffers.
  *
- * (1) SERIAL capture per request (prepare thread — ClientContext
- * discipline); requests with zero version state anywhere return immediately
- * (the clean-table common case costs one non-loading row-group scan, no
- * reservation, no tasks). (2) Pinned mask acquisition, reservation-first
- * exactly like the decoder's staging path: dirty chunks group by host NUMA
- * node (chunk device id + topology), ONE consolidated
- * request_reservation(any_memory_space_in_tier_with_preference{HOST, node})
- * + allocate_multiple_blocks per node, per-chunk word spans carved 64-byte
- * aligned within block boundaries; the {reservation, blocks} bundle becomes
- * the masks' shared retention. (3) fan_out_and_join over one task per
- * ≤ metadata_parse_chunk() row groups (a task never spans chunks — the
- * bit-packed masks' lock-free write invariant). (4) Publish: chunks that
- * dropped rows get their mask slot set; all-visible chunks stay null (served
- * unmasked) and the bundle frees once the last published mask releases.
- *
- * A mask larger than one staging block (blocks are not virtually contiguous)
- * falls back to plain pageable host memory for that chunk — correctness is
- * identical; only the true-async-DMA benefit is lost, and a log line records
- * it.
+ * Serial capture per request (prepare thread — ClientContext discipline);
+ * zero version state anywhere returns immediately with every slot null.
+ * Pinned mask storage is acquired reservation-first like the decoder's
+ * staging path: dirty chunks group by host NUMA node, one consolidated
+ * reservation + multi-block allocation per node, per-chunk word spans carved
+ * within block boundaries, the {reservation, blocks} bundle retained by the
+ * published masks (a mask larger than one block falls back to pageable
+ * memory — blocks are not virtually contiguous — losing only the async-DMA
+ * benefit). Fill fans out one task per <= metadata_parse_chunk() row groups
+ * (a task never spans chunks — the lock-free bit-write invariant); chunks
+ * that dropped rows publish their mask, all-visible chunks stay null.
  *
  * @throws std::runtime_error on capture/validation failures, reservation
  *         failure, or dropped tasks — loud by design: this runs after the
- *         plan-time CPU-fallback gate, so the alternatives are all
+ *         plan-time CPU-fallback gate, where the alternatives are all
  *         silent-wrong-data.
  */
 void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,

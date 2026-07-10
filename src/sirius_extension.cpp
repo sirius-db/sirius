@@ -940,7 +940,7 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   auto keep            = resolve_pin_kept_indices(schema_names, cols);
   auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
 
-  // #819: update chains version values in place, invisibly to the DELETE
+  // Update chains version values in place, invisibly to the DELETE
   // keep-masks — a pin would serve stale values to every query until the
   // chains are folded away. Refuse loudly (the transient-rows case already
   // fails the same way); CHECKPOINT folds the chains into the base data.

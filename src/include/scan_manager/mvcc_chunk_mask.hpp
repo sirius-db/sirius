@@ -25,19 +25,14 @@
 namespace sirius::scan_manager {
 
 /**
- * @brief Bit-packed MVCC keep-mask for one cached chunk (#819).
+ * @brief Bit-packed MVCC keep-mask for one cached chunk.
  *
- * One bit per row in cuDF's bitmask convention — bit `row % 32` of uint32
- * word `row / 32`, LSB-first, 1 = keep — so the packed words upload straight
- * to the device and expand with @c cudf::mask_to_bools, no translation
- * (checked against @c cudf::bitmask_type where cudf is visible; this header
- * stays std-only). Padding bits past @ref row_count in the final word are
- * don't-care.
- *
- * @ref words points into storage owned via the type-erased @ref retention —
- * in production the mask job's per-NUMA-node {memory reservation, pinned
- * block allocation} bundle; unit tests may retain a plain vector. Immutable
- * once published to a scan.
+ * One bit per row in cuDF's bitmask convention (bit `row % 32` of uint32 word
+ * `row / 32`, 1 = keep), so the packed words upload and expand with
+ * @c cudf::mask_to_bools without translation; padding bits past @ref
+ * row_count are don't-care. @ref words points into storage owned via the
+ * type-erased @ref retention (the mask job's pinned {reservation, blocks}
+ * bundle; tests may retain a plain vector). Immutable once published.
  */
 struct mvcc_chunk_mask {
   std::span<std::uint32_t> words;   ///< ceil(row_count / 32) packed keep bits

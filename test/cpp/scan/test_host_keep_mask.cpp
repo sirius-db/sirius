@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Gates for the shared host-keep-mask GPU apply helpers (#819):
+// Gates for the shared host-keep-mask GPU apply helpers:
 // apply_host_keep_mask (byte mask — the positional-delete path) and
 // apply_host_keep_bitmask (bit-packed, cuDF bitmask convention — the MVCC
 // path) must drop exactly the flagged rows, agree with each other on every

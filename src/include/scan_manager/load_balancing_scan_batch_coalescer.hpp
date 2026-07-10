@@ -37,7 +37,7 @@
 namespace sirius::scan_manager {
 
 struct databatch_provider {
-  /// One cached chunk plus its (optional) per-query MVCC keep-mask (#819).
+  /// One cached chunk plus its (optional) per-query MVCC keep-mask.
   /// A default-constructed batch (null @ref data) means end-of-stream.
   struct batch {
     std::shared_ptr<cucascade::data_batch> data;

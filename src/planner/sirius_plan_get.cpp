@@ -144,7 +144,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
       }
 
-      // #819 cache-or-CPU guards: while this table is MVCC-pinned, a GPU plan
+      // Cache-or-CPU guards: while this table is MVCC-pinned, a GPU plan
       // either serves exactly from the pinned cache (DELETE keep-masks) or is
       // refused HERE, where the throw still becomes a clean CPU fallback. The
       // disk-native path is MVCC-blind, and the pin's checkpoint suppression

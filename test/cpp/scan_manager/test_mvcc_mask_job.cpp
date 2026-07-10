@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Gates for the prepare-time MVCC mask job (#819): fan_out_and_join must
+// Gates for the prepare-time MVCC mask job: fan_out_and_join must
 // assemble concurrent disjoint writes exactly once, rethrow the first task
 // error, and turn silently-dropped tasks (a stopping dispatcher) into a loud
 // error instead of a deadlock or a partial result; run_mvcc_mask_jobs must

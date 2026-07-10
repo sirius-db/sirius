@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-// #819 PR3 end-to-end: a duckdb-pinned table keeps serving GPU queries while
-// DELETEs land — every query's results must equal DuckDB CPU at its own
+// MVCC delete end-to-end: a duckdb-pinned table keeps serving GPU queries
+// while DELETEs land — every query's results must equal DuckDB CPU at its own
 // snapshot (per-query keep-masks over the cached base). States the masks
 // cannot represent — post-pin INSERTs, in-place UPDATEs, snapshots older than
 // the pin, columns the pin does not cover — must decline at plan time into a
@@ -172,7 +172,7 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
 {
   // integration.yaml caps scan_task_batch_size at 100 MB; 13M BIGINTs decode
   // past it, so the pin materializes as more than one chunk (the same sizing
-  // the PR1 foundation test uses).
+  // the mvcc foundation test uses).
   run_ok("CREATE TABLE t AS SELECT range AS k FROM range(13000000);");
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
@@ -191,7 +191,7 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   run_ok("DELETE FROM t;");
   // A bare count(*) compiles to a rowid-only scan the cache cannot serve
-  // (rowid is not cached; pre-#819 those scans silently read the STALE disk
+  // (rowid is not cached; unguarded, such scans silently read the STALE disk
   // image and would count 50000 here) — once diverged, cache-or-CPU sends
   // them to the CPU fallback with the correct (empty) answer.
   expect_fallback_matches_cpu(*this, "SELECT count(*) FROM t;");

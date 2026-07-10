@@ -121,8 +121,8 @@ class cache_entry_info {
     const op::scan::ingestible_table_info& other) const;
 
   /// Duckdb-identity check shared by can_serve_with_columns and the plan-time
-  /// MVCC guards (#819) — one matcher, so the probe and prepare can never
-  /// drift. False for parquet entries (empty table_name).
+  /// MVCC guards — one matcher, so the probe and prepare can never drift.
+  /// False for parquet entries (empty table_name).
   [[nodiscard]] bool matches_duckdb_table(std::string_view catalog,
                                           std::string_view schema,
                                           std::string_view table) const;
@@ -206,8 +206,8 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
 /// Build the cached-serving databatch_provider for @p entry over
 /// @p selected_columns (positions into @c entry.cache_info.column_ids, in the
 /// scan's materialized order). @p mvcc_masks, when non-null, is the per-chunk
-/// MVCC keep-mask set the provider pairs with each chunk it yields (#819:
-/// slot i masks chunk i; a null slot serves that chunk unmasked). Declared
+/// MVCC keep-mask set the provider pairs with each chunk it yields (slot i
+/// masks chunk i; a null slot serves that chunk unmasked). Declared
 /// here so the chunk↔mask pairing is unit-testable; the provider type itself
 /// stays internal to the scan manager.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
@@ -409,7 +409,7 @@ class sirius_scan_manager {
   /// nullptr. Non-owning; valid only until the next pin/unpin — the same
   /// single-threaded query-lifecycle discipline as visit_pinned_entries.
   /// First match wins if one table was pinned under two names. Read by the
-  /// plan-time MVCC guards (#819).
+  /// plan-time MVCC guards.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
     std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
 
@@ -482,8 +482,8 @@ class sirius_scan_manager {
   bool _pruning_enabled{true};
 
   /// Mask computations recorded by try_assign_cached_entries for this query's
-  /// duckdb+mvcc cache hits (#819); executed block-in-prepare by
-  /// run_mvcc_mask_jobs before start_metadata_processing, cleared in reset().
+  /// duckdb+mvcc cache hits; executed block-in-prepare by run_mvcc_mask_jobs
+  /// before start_metadata_processing, cleared in reset().
   std::vector<mvcc_mask_job_request> _pending_mvcc_mask_jobs;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
