@@ -51,14 +51,15 @@ struct mvcc_row_group_slice {
 /**
  * @brief Per-query visibility work plan over a pinned entry's cached prefix.
  *
- * Slot i of @ref chunks parallels base_row_count_per_chunk[i]. Holds copies
+ * Slot i of @ref mvcc_row_groups holds the slices for cached chunk i,
+ * paralleling base_row_count_per_chunk[i]. Holds copies
  * and tree-owned pointers only — no pinned_entry references escape into it.
  */
 struct mvcc_visibility_plan {
   explicit mvcc_visibility_plan(duckdb::TransactionData transaction) : transaction(transaction) {}
 
   duckdb::TransactionData transaction;  ///< query txn on the pinned table's own database
-  std::vector<std::vector<mvcc_row_group_slice>> chunks;
+  std::vector<std::vector<mvcc_row_group_slice>> mvcc_row_groups;
   std::vector<bool> chunk_has_version_state;  ///< OR of each chunk's slice probes
 
   /// True when any chunk has version state — the mask job's do-anything-at-all

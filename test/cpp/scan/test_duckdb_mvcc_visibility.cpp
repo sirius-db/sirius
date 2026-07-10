@@ -168,16 +168,17 @@ std::vector<bool> capture_fill_and_check(duckdb::Connection& con,
 {
   auto const n_cache = metadata.n_cache();
   auto plan          = capture_mvcc_visibility_plan(storage, *con.context, metadata);
-  REQUIRE(plan.chunks.size() == metadata.base_row_count_per_chunk.size());
+  REQUIRE(plan.mvcc_row_groups.size() == metadata.base_row_count_per_chunk.size());
 
   auto const oracle = visible_rowids(con, table, n_cache);
 
   std::vector<bool> dropped_per_chunk;
   std::size_t chunk_start = 0;
-  for (std::size_t c = 0; c < plan.chunks.size(); ++c) {
+  for (std::size_t c = 0; c < plan.mvcc_row_groups.size(); ++c) {
     auto const rows = metadata.base_row_count_per_chunk[c];
     std::vector<std::uint32_t> words((rows + 31) / 32, 0xDEADBEEFu);  // poison: fill must cover all
-    auto const dropped = fill_keep_mask_for_row_groups(plan.chunks[c], plan.transaction, words);
+    auto const dropped =
+      fill_keep_mask_for_row_groups(plan.mvcc_row_groups[c], plan.transaction, words);
     dropped_per_chunk.push_back(dropped);
     for (std::size_t r = 0; r < rows; ++r) {
       if (bit_at(words, r) != static_cast<bool>(oracle[chunk_start + r])) {
@@ -325,7 +326,7 @@ TEST_CASE("mvcc visibility: pin-coverage clamp under post-metadata appends",
   auto& storage2      = resolve_storage(*env.con, "t");
   auto plan           = capture_mvcc_visibility_plan(storage2, *env.con->context, metadata);
   std::size_t covered = 0;
-  for (auto const& chunk : plan.chunks) {
+  for (auto const& chunk : plan.mvcc_row_groups) {
     for (auto const& slice : chunk) {
       covered += slice.row_count;
     }

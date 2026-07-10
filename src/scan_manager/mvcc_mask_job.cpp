@@ -161,11 +161,11 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
                                  "': " + e.what());
       }
     }();
-    if (plan.chunks.size() != request.masks->size() ||
-        plan.chunks.size() != request.chunk_spaces.size()) {
+    if (plan.mvcc_row_groups.size() != request.masks->size() ||
+        plan.mvcc_row_groups.size() != request.chunk_spaces.size()) {
       throw std::runtime_error("[run_mvcc_mask_jobs] pinned entry '" + request.entry_name +
                                "': chunk count mismatch between the visibility plan (" +
-                               std::to_string(plan.chunks.size()) + "), the mask set (" +
+                               std::to_string(plan.mvcc_row_groups.size()) + "), the mask set (" +
                                std::to_string(request.masks->size()) + ") and chunk_spaces (" +
                                std::to_string(request.chunk_spaces.size()) + ")");
     }
@@ -213,18 +213,18 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
     work->masks       = job.request->masks.get();
     work->chunk_index = c;
     work->row_count   = rows;
-    work->slices      = std::span<op::scan::mvcc_row_group_slice const>(job.plan.chunks[c].data(),
-                                                                   job.plan.chunks[c].size());
+    work->slices      = std::span<op::scan::mvcc_row_group_slice const>(
+      job.plan.mvcc_row_groups[c].data(), job.plan.mvcc_row_groups[c].size());
     work->transaction = job.plan.transaction;
     return work;
   };
 
   for (std::size_t j = 0; j < jobs.size(); ++j) {
     auto& job = jobs[j];
-    for (std::size_t c = 0; c < job.plan.chunks.size(); ++c) {
-      if (!job.plan.chunk_has_version_state[c] || job.plan.chunks[c].empty()) { continue; }
+    for (std::size_t c = 0; c < job.plan.mvcc_row_groups.size(); ++c) {
+      if (!job.plan.chunk_has_version_state[c] || job.plan.mvcc_row_groups[c].empty()) { continue; }
       std::size_t rows = 0;
-      for (auto const& slice : job.plan.chunks[c]) {
+      for (auto const& slice : job.plan.mvcc_row_groups[c]) {
         rows += slice.row_count;
       }
       auto const n_words = (rows + 31) / 32;

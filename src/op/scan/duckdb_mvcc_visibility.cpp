@@ -107,7 +107,7 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
 
   auto const& counts = metadata.base_row_count_per_chunk;
   auto const n_cache = metadata.n_cache();
-  plan.chunks.resize(counts.size());
+  plan.mvcc_row_groups.resize(counts.size());
   plan.chunk_has_version_state.assign(counts.size(), false);
   if (n_cache == 0) { return plan; }
 
@@ -171,7 +171,8 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
     }
 
     bool const dirty = row_group_has_version_state(*node);
-    plan.chunks[chunk_idx].push_back({&rg, node->GetRowStart(), chunk_offset, covered, dirty});
+    plan.mvcc_row_groups[chunk_idx].push_back(
+      {&rg, node->GetRowStart(), chunk_offset, covered, dirty});
     if (dirty) { plan.chunk_has_version_state[chunk_idx] = true; }
 
     expected_start += covered;
