@@ -524,9 +524,14 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
   const uint64_t small_table_bytes = static_cast<uint64_t>(num_gpus) * uint64_t{16} * 1024 * 1024;
 
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
-    if (op && op->type == op::SiriusPhysicalOperatorType::PARTITION) {
+    if (!op) return;
+    if (op->type == op::SiriusPhysicalOperatorType::PARTITION) {
       static_cast<op::sirius_physical_partition*>(op)->set_min_num_partitions(num_gpus,
                                                                               small_table_bytes);
+    } else if (op->type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
+      // Let the join keep one hash table per partition (one per GPU) so BUILD_PROBE is admitted for
+      // up to num_gpus partitions rather than only one. Matches the partition floor set above.
+      static_cast<op::sirius_physical_hash_join*>(op)->set_num_gpus(num_gpus);
     }
   };
   for (auto& pipe : scheduled_) {

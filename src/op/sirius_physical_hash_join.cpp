@@ -450,6 +450,58 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
   probe_meta.build(*probe_child.children[0]);
 }
 
+build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view> const& slots)
+{
+  if (slots.empty()) { return {build_probe_action::none, 0}; }
+
+  // 1. Prefer starting a build: the first NOT_BUILT partition that has both its (concat-folded)
+  //    build batch and a probe batch. The scheduling task builds that partition's hash table and
+  //    probes its first batch together.
+  for (std::size_t p = 0; p < slots.size(); ++p) {
+    auto const& s = slots[p];
+    if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && s.has_build_batch && s.has_probe_batch) {
+      return {build_probe_action::schedule_build, p};
+    }
+  }
+  // 2. Otherwise probe an already-built partition that has probe data waiting.
+  for (std::size_t p = 0; p < slots.size(); ++p) {
+    auto const& s = slots[p];
+    if (s.state == BUILD_HASH_TABLE_STATE::BUILT && s.has_probe_batch) {
+      return {build_probe_action::schedule_probe, p};
+    }
+  }
+  // 3. No schedulable work. If a partition still lacks its build batch, wait on the build producer
+  //    so builds can start; otherwise every partition is building or draining probe input. Only
+  //    when all partitions are torn down is the operator truly finished.
+  bool all_destroyed = true;
+  for (auto const& s : slots) {
+    if (s.state != BUILD_HASH_TABLE_STATE::DESTROYED) { all_destroyed = false; }
+    if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && !s.has_build_batch) {
+      return {build_probe_action::wait_for_build, 0};
+    }
+  }
+  if (all_destroyed) { return {build_probe_action::none, 0}; }
+  return {build_probe_action::wait_for_probe, 0};
+}
+
+bool build_probe_mode_eligible(int num_partitions,
+                               uint64_t build_side_bytes,
+                               bool build_foldable_to_single_batch,
+                               bool is_right_family,
+                               bool is_mixed_join,
+                               int num_gpus,
+                               uint64_t max_build_hash_table_bytes)
+{
+  if (num_partitions < 1 || num_gpus < 1) { return false; }
+  // One hash table per partition, one partition per GPU: at most num_gpus partitions. With
+  // num_gpus == 1 this reduces to the historical single-partition rule.
+  if (num_partitions > num_gpus) { return false; }
+  // Each partition holds its own hash table, so gate on the per-partition average build side.
+  uint64_t const per_partition_bytes = build_side_bytes / static_cast<uint64_t>(num_partitions);
+  return per_partition_bytes < max_build_hash_table_bytes && build_foldable_to_single_batch &&
+         !is_right_family && !is_mixed_join;
+}
+
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
                                                       uint64_t build_side_bytes,
                                                       bool build_foldable_to_single_batch)
@@ -461,20 +513,30 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
   // RIGHT_SEMI/RIGHT_ANTI/RIGHT remain excluded: they emit build-side (right) output, which would
   // require the persistent table on the left plus cross-batch accumulation, incompatible with the
   // build-on-right / stream-left model.
-  if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      build_foldable_to_single_batch && !is_right_family() &&
-      _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
-    // Switch to a more efficient join strategy for small datasets. The
-    // build_foldable_to_single_batch gate matches the runtime invariant in
-    // get_next_task_input_data_for_build_probe — BUILD_PROBE requires the
-    // build port to deliver exactly one batch, so we refuse to enter the
-    // mode when the upstream pipeline cannot guarantee that.
+  //
+  // On multi-GPU we keep one hash table per partition (one partition per GPU), so BUILD_PROBE is
+  // admitted for up to num_gpus partitions rather than only one. The build_foldable_to_single_batch
+  // gate matches the runtime invariant in get_next_task_input_data_for_build_probe — each partition
+  // must deliver exactly one build batch — so we refuse the mode when the upstream pipeline cannot
+  // guarantee that.
+  if (build_probe_mode_eligible(num_partitions,
+                                build_side_bytes,
+                                build_foldable_to_single_batch,
+                                is_right_family(),
+                                _join_mode == HASH_JOIN_MODE::MIXED_JOIN,
+                                _num_gpus,
+                                _max_build_hash_table_bytes)) {
     _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
+    // One hash-table slot per partition. Elements are non-movable (atomic build_state), so build a
+    // fresh right-sized vector and move-assign it (steals the buffer, no element moves).
+    _partition_build_states =
+      std::vector<per_partition_build_state>(static_cast<std::size_t>(num_partitions));
     SIRIUS_LOG_DEBUG(
-      "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and build "
-      "side size {} bytes",
+      "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions ({} GPUs) "
+      "and build side size {} bytes",
       this->get_operator_id(),
       num_partitions,
+      _num_gpus,
       build_side_bytes);
   }
 }
@@ -485,13 +547,33 @@ bool sirius_physical_hash_join::is_build_probe_mode()
   return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
 }
 
+std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_probe_slots()
+{
+  auto* build_port = get_port("build");
+  auto* probe_port = get_port("default");
+  if (!build_port || !probe_port) {
+    throw std::runtime_error(
+      "In sirius_physical_hash_join:snapshot_build_probe_slots: missing expected ports in "
+      "operator " +
+      std::to_string(this->get_operator_id()));
+  }
+  std::vector<build_probe_slot_view> slots(_partition_build_states.size());
+  for (std::size_t p = 0; p < _partition_build_states.size(); ++p) {
+    slots[p].state = _partition_build_states[p].build_state.load(std::memory_order_acquire);
+    // repo->size(p) safely returns 0 for partitions whose data has not been produced yet.
+    slots[p].has_build_batch = build_port->repo->size(p) > 0;
+    slots[p].has_probe_batch = probe_port->repo->size(p) > 0;
+  }
+  return slots;
+}
+
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    // In build-probe mode, we want the first task to be with one batch from either side.
-    // In the first batch we will build the hash table, then we only need batches from the probe
-    // side.
+    // Each partition owns one hash table and runs its own build-then-probe sequence; those
+    // sequences interleave (a built partition probes on its GPU while another still builds on a
+    // different GPU). Pick the next action from a per-partition snapshot.
     auto* build_port = get_port("build");
     auto* probe_port = get_port("default");
     if (!build_port || !probe_port) {
@@ -499,38 +581,28 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         "In sirius_physical_hash_join:get_next_task_hint: missing expected ports in operator " +
         std::to_string(this->get_operator_id()));
     }
-    auto build_size = build_port->repo->total_size();
-    auto probe_size = probe_port->repo->total_size();
-    if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::NOT_BUILT) {
-      if (build_size > 0 && probe_size > 0) {
-        _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULING;
+    auto const decision = select_build_probe_action(snapshot_build_probe_slots());
+    switch (decision.action) {
+      case build_probe_action::schedule_build:
+        // Claim this partition's slot so exactly one build task is issued for it. The paired
+        // get_next_task_input_data_for_build_probe scans for the SCHEDULING slot and advances it.
+        _partition_build_states[decision.partition].build_state.store(
+          BUILD_HASH_TABLE_STATE::SCHEDULING, std::memory_order_release);
         return task_creation_hint{TaskCreationHint::READY, this};
-      } else if (build_size == 0) {
-        // No build batch available yet, hint to wait for build input data.
+      case build_probe_action::schedule_probe:
+        return task_creation_hint{TaskCreationHint::READY, this};
+      case build_probe_action::wait_for_build: {
         auto* producer = &build_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
-      } else {
-        // Build batch is available but no probe batch yet, hint to wait for probe input data.
+      }
+      case build_probe_action::wait_for_probe: {
         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
-    } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULING ||
-               _hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
-      // Hash table is currently being built, hint to wait for it to be ready.
-      auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
-    } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
-      // Hash table is built, we can process probe only batches.
-      if (ports["default"]->repo->total_size() > 0) {
-        return task_creation_hint{TaskCreationHint::READY, this};
-      } else {
-        // No probe batch available yet, hint to wait for probe input data.
-        auto* producer = &ports["default"]->src_pipeline->get_operators()[0].get();
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
-      }
-    } else {
-      // If we are here, then this operator is actually complete.
-      return std::nullopt;
+      case build_probe_action::none:
+      default:
+        // All partitions are torn down: the operator is complete.
+        return std::nullopt;
     }
   } else {
     return sirius_physical_operator::get_next_task_hint();
@@ -547,60 +619,67 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       "ports in operator " +
       std::to_string(this->get_operator_id()));
   }
-  if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULING) {
-    if (build_port->repo->num_partitions() != 1 || build_port->repo->size(0) != 1 ||
-        probe_port->repo->num_partitions() != 1) {
-      throw std::runtime_error(
-        "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: expected exactly 1 "
-        "partition and 1 batch in default (build) port in operator " +
-        std::to_string(this->get_operator_id()));
-    }
-    // When the hash table is not build yet, we will send both the build and probe side. To build
-    // the hash table and perform the first join.
-    std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    auto probe_batch = probe_port->repo->pop_next_data_batch();
-    auto build_batch = build_port->repo->pop_next_data_batch();
-    input_batch.push_back(std::move(probe_batch));
-    input_batch.push_back(std::move(build_batch));
-    _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
-    // BUILD_PROBE mode uses a single cuco hash table shared across every probe
-    // task for this join. All such tasks must land on the same GPU, so we tag
-    // them with operator_id as the partition index (hash joins get spread
-    // across GPUs at the query level, but each individual join stays pinned).
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
-                                                       this->get_operator_id());
 
-  } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
-    if (probe_port->repo->num_partitions() != 1) {
+  // How a partition's tasks are tagged for GPU routing (task_creator uses tag % num_gpus):
+  //  - Multiple partitions: tag with the real partition index p, so partitions spread one-per-GPU
+  //    and execute() can select the matching hash-table slot from the tag.
+  //  - Single partition: tag with operator_id, preserving the historical routing where several
+  //    small single-partition BUILD_PROBE joins in one query spread across GPUs instead of all
+  //    pinning to GPU 0. execute() maps the lone partition back to slot 0.
+  auto const partition_tag = [this](std::size_t p) -> std::size_t {
+    return _partition_build_states.size() == 1 ? this->get_operator_id() : p;
+  };
+
+  // Prefer a partition awaiting its build (SCHEDULING, claimed by get_next_task_hint): issue a task
+  // carrying that partition's single folded build batch plus its first probe batch. Concurrent
+  // input-data calls each claim a distinct SCHEDULING slot because we advance it to SCHEDULED here
+  // under op_state_mutex.
+  for (std::size_t p = 0; p < _partition_build_states.size(); ++p) {
+    if (_partition_build_states[p].build_state.load(std::memory_order_acquire) !=
+        BUILD_HASH_TABLE_STATE::SCHEDULING) {
+      continue;
+    }
+    if (build_port->repo->size(p) != 1) {
       throw std::runtime_error(
         "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: expected exactly 1 "
-        "partition in operator " +
-        std::to_string(this->get_operator_id()));
+        "(concat-folded) build batch for partition " +
+        std::to_string(p) + " in operator " + std::to_string(this->get_operator_id()));
     }
-    // If the hash table has already been build, we only send the probe side. The hash table should
-    // already be built and we can perform the join with the probe side batches.
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    auto batch = probe_port->repo->pop_next_data_batch();
+    input_batch.push_back(probe_port->repo->pop_next_data_batch(p));
+    input_batch.push_back(build_port->repo->pop_next_data_batch(p));
+    _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULED,
+                                                 std::memory_order_release);
+    // Every task of partition p (this build+first-probe and all later probe-only tasks) shares the
+    // same tag, so they land on the same GPU as p's hash table.
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_tag(p));
+  }
+
+  // Otherwise issue a probe-only task for a built partition that still has probe data.
+  for (std::size_t p = 0; p < _partition_build_states.size(); ++p) {
+    if (_partition_build_states[p].build_state.load(std::memory_order_acquire) !=
+          BUILD_HASH_TABLE_STATE::BUILT ||
+        probe_port->repo->size(p) == 0) {
+      continue;
+    }
+    std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+    auto batch = probe_port->repo->pop_next_data_batch(p);
     if (batch) {
       input_batch.push_back(std::move(batch));
     } else {
       SIRIUS_LOG_WARN(
         "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: expected to pop a "
-        "batch from the default port but got none in operator {}",
-        this->get_operator_id());
+        "probe batch for partition {} but got none in operator {}",
+        p, this->get_operator_id());
     }
-    // Subsequent probe-only tasks share the hash table built under the initial
-    // SCHEDULING task. They MUST run on the same GPU — tag with operator_id.
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch),
-                                                       this->get_operator_id());
-  } else {
-    SIRIUS_LOG_WARN(
-      "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
-      "build state {} in operator {}",
-      static_cast<int>(_hash_table_build_state),
-      this->get_operator_id());
-    return nullptr;
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_tag(p));
   }
+
+  // No SCHEDULING slot and no BUILT slot with probe data. This happens when a hint's READY raced
+  // ahead of another task draining the same probe data; there is simply nothing to issue now.
+  SIRIUS_LOG_WARN("In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable "
+    "partition (build/probe already drained) in operator {}", this->get_operator_id());
+  return nullptr;
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_data()
@@ -983,7 +1062,31 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
+    // Each partition owns one hash table. The incoming batch is tagged with its partition index
+    // (get_next_task_input_data_for_build_probe), which selects the per-partition slot; the
+    // scheduler has already pinned this task to that partition's GPU.
+    auto const* partitioned = dynamic_cast<const partitioned_operator_data*>(&input_data);
+    if (!partitioned) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join::execute: BUILD_PROBE expects partitioned_operator_data in "
+        "operator " +
+        std::to_string(this->get_operator_id()));
+    }
+    // With a single partition the task is tagged with operator_id (for cross-join GPU spread), so
+    // map any tag back to the lone slot 0; with multiple partitions the tag is the real partition
+    // index and selects its slot directly.
+    std::size_t const partition =
+      _partition_build_states.size() == 1 ? std::size_t{0} : partitioned->get_partition_idx();
+    if (partition >= _partition_build_states.size()) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join::execute: BUILD_PROBE partition index " +
+        std::to_string(partition) + " out of range (" +
+        std::to_string(_partition_build_states.size()) + ") in operator " +
+        std::to_string(this->get_operator_id()));
+    }
+    auto& slot = _partition_build_states[partition];
+
+    if (slot.build_state.load(std::memory_order_acquire) == BUILD_HASH_TABLE_STATE::SCHEDULED) {
       if (input_batches.size() != 2) {
         throw std::runtime_error(
           "In sirius_physical_hash_join::execute: BUILD_PROBE SCHEDULED expects probe + build "
@@ -1000,38 +1103,44 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  stream);
       cudf::table_view build_keys = build_keys_result.keys;
       {
-        std::lock_guard<std::mutex> lg(op_state_mutex);
-        _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
-        _build_table              = build_batch_ro;
+        // This partition's slot has a single writer — the one SCHEDULED build task — and no probe
+        // task for it runs until build_state becomes BUILT below, so the slot needs no lock. The
+        // release-store of build_state publishes these writes to acquiring probe tasks. Distinct
+        // partitions build concurrently on their own GPUs.
+        if (auto const* ms = build_batch_ro.get_memory_space(); ms) {
+          slot.device_id = ms->get_device_id();
+        }
+        slot.built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
+        slot.build_table              = build_batch_ro;
         if (join_type == duckdb::JoinType::MARK || join_type == duckdb::JoinType::SEMI ||
             join_type == duckdb::JoinType::ANTI) {
           // MARK/SEMI/ANTI: build a reusable filtered_join on the right (filter) keys; each probe
           // batch's semi_join/anti_join returns left-row match indices (scattered into a BOOL8 mark
           // for MARK, gathered as the output rows for SEMI/ANTI).
-          _filtered_table = make_right_filtered_join_ptr(build_keys, stream);
+          slot.filtered_table = make_right_filtered_join_ptr(build_keys, stream);
           // Record whether the build keys contain a NULL; MARK three-valued logic needs it at probe
           // time, but the build keys are not retained beyond this scope.
-          _build_has_null = table_has_any_null(build_keys);
+          slot.build_has_null = table_has_any_null(build_keys);
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
                            duckdb::JoinTypeToString(join_type));
         } else if (unique_build_keys &&
                    (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
-          _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
+          slot.distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
             build_keys, cudf::null_equality::UNEQUAL, 0.5, stream);
           SIRIUS_LOG_DEBUG(
             "sirius_physical_hash_join id {}: using distinct_hash_join (BUILD_PROBE)",
             this->get_operator_id());
         } else {
-          _hash_table =
+          slot.hash_table =
             std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
         }
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
                                // batches to proceed.
-        _hash_table_build_state = BUILD_HASH_TABLE_STATE::BUILT;
+        slot.build_state.store(BUILD_HASH_TABLE_STATE::BUILT, std::memory_order_release);
       }
     }
-    if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
+    if (slot.build_state.load(std::memory_order_acquire) == BUILD_HASH_TABLE_STATE::BUILT) {
       // Hash table is built, we can process probe batches. The probe-side keys will be processed in
       // the same way as the mixed join path, but with an equality-only predicate.
       auto probe_keys_result      = prepare_join_keys(input_batches[0],
@@ -1047,12 +1156,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       if (join_type == duckdb::JoinType::MARK) {
         // Reuse the persistent filtered_join (built on the right/filter side): probe with this left
         // batch to get its matched left-row indices, then materialize all left rows + BOOL8 mark.
-        auto semi_indices = _filtered_table->semi_join(probe_keys, stream);
+        auto semi_indices = slot.filtered_table->semi_join(probe_keys, stream);
         return resolve_mark_join_result(*semi_indices,
                                         left_full,
                                         lhs_output_columns.col_idxs,
                                         probe_keys,
-                                        _build_has_null,
+                                        slot.build_has_null,
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -1064,23 +1173,23 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         // gather_join_output, which collects the left side only (collect_right is false).
         // right_full stays default-constructed since it is never dereferenced for these join types.
         left_indices = (join_type == duckdb::JoinType::SEMI)
-                         ? _filtered_table->semi_join(probe_keys, stream)
-                         : _filtered_table->anti_join(probe_keys, stream);
+                         ? slot.filtered_table->semi_join(probe_keys, stream)
+                         : slot.filtered_table->anti_join(probe_keys, stream);
       } else {
-        right_full = _build_table.value()
+        right_full = slot.build_table.value()
                        .get_data()
                        ->cast<cucascade::gpu_table_representation>()
                        .get_table_view();
 
-        if (_distinct_hash_table) {
+        if (slot.distinct_hash_table) {
           // Distinct hash join path (unique build keys, INNER or LEFT only).
           if (join_type == duckdb::JoinType::INNER) {
-            auto result   = _distinct_hash_table->inner_join(probe_keys, stream);
+            auto result   = slot.distinct_hash_table->inner_join(probe_keys, stream);
             left_indices  = std::move(result.first);
             right_indices = std::move(result.second);
           } else {
             // LEFT: returns only build indices; probe indices are implicit [0..N-1].
-            auto build_indices = _distinct_hash_table->left_join(probe_keys, stream);
+            auto build_indices = slot.distinct_hash_table->left_join(probe_keys, stream);
             return gather_distinct_left_join_output(left_full,
                                                     right_full,
                                                     lhs_output_columns.col_idxs,
@@ -1092,15 +1201,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           }
         } else {
           if (join_type == duckdb::JoinType::INNER) {
-            auto result   = _hash_table->inner_join(probe_keys, {}, stream);
+            auto result   = slot.hash_table->inner_join(probe_keys, {}, stream);
             left_indices  = std::move(result.first);
             right_indices = std::move(result.second);
           } else if (join_type == duckdb::JoinType::LEFT) {
-            auto result   = _hash_table->left_join(probe_keys, {}, stream);
+            auto result   = slot.hash_table->left_join(probe_keys, {}, stream);
             left_indices  = std::move(result.first);
             right_indices = std::move(result.second);
           } else if (join_type == duckdb::JoinType::OUTER) {
-            auto result   = _hash_table->full_join(probe_keys, {}, stream);
+            auto result   = slot.hash_table->full_join(probe_keys, {}, stream);
             left_indices  = std::move(result.first);
             right_indices = std::move(result.second);
           } else {
@@ -1112,9 +1221,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
     } else {
       throw std::runtime_error(std::format(
-        "In sirius_physical_hash_join::execute: invalid hash table build state {} in BUILD_PROBE "
-        "mode for operator id {}",
-        static_cast<int>(_hash_table_build_state),
+        "In sirius_physical_hash_join::execute: invalid hash table build state {} for partition {} "
+        "in BUILD_PROBE mode for operator id {}",
+        static_cast<int>(slot.build_state.load(std::memory_order_acquire)),
+        partition,
         this->get_operator_id()));
     }
 
@@ -1441,8 +1551,11 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 {
   //===----------Dynamic Table Filters----------===//
   // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
-  // compute and publish the filter from the build keys. Only meaningful for the build port of a
-  // BUILD_PROBE join currently.
+  // compute and publish the filter from the build keys. Only single-partition BUILD_PROBE
+  // publishes: the one-shot publisher and its single-GPU reduction cover the whole build side only
+  // when there is exactly one build partition. With multiple partitions the build side is split
+  // across GPUs, so publishing from one partition's batch would emit an incomplete filter —
+  // pushdown is disabled for that case (cross-partition aggregation is a future extension).
   std::optional<::cucascade::read_only_data_batch> build_ro;
   if (port_id == "build" && batch) {
     bool claim = false;
@@ -1450,8 +1563,8 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       std::scoped_lock lg(op_state_mutex);
       claim = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
                 dynamic_filter_publication_state::OPEN &&
-              _join_mode == HASH_JOIN_MODE::BUILD_PROBE && filter_pushdown &&
-              _dynamic_filter_plan.enabled();
+              _join_mode == HASH_JOIN_MODE::BUILD_PROBE && _partition_build_states.size() == 1 &&
+              filter_pushdown && _dynamic_filter_plan.enabled();
     }
     if (claim) { build_ro.emplace(batch->to_read_only()); }
   }
@@ -1507,12 +1620,18 @@ void sirius_physical_hash_join::on_finalize_operator()
     std::memory_order_acquire);
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    _hash_table.reset();
-    _distinct_hash_table.reset();
-    _filtered_table.reset();
-    _build_table = std::nullopt;
-    _built_table_cast_columns.clear();
-    _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
+    // Each partition's hash table lives on its own GPU (partition_idx % num_gpus). Free every slot
+    // on the device it was built on so cuco/rmm releases memory in the right device context.
+    for (auto& slot : _partition_build_states) {
+      std::optional<rmm::cuda_set_device_raii> device_guard;
+      if (slot.device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{slot.device_id}); }
+      slot.hash_table.reset();
+      slot.distinct_hash_table.reset();
+      slot.filtered_table.reset();
+      slot.build_table = std::nullopt;
+      slot.built_table_cast_columns.clear();
+      slot.build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED, std::memory_order_release);
+    }
   }
 }
 
