@@ -257,9 +257,8 @@ native_read_mvcc_state check_native_read_mvcc_state(
       }
     }
     if (!row_group_has_version_state(*node)) { continue; }
-    // Load the physical count BEFORE the visibility count: a concurrent
-    // append between the two reads makes the counts diverge in either
-    // order, which refuses — never falsely matches.
+    // Read the physical count first: a concurrent append makes the two
+    // counts diverge in either order, so a race can only refuse.
     auto const physical = static_cast<duckdb::idx_t>(rg.count.load());
     if (rg.GetVisibleRowCount(transaction) != physical) {
       return native_read_mvcc_state::has_invisible_rows;

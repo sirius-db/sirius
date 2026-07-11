@@ -434,12 +434,9 @@ class scoped_temp_db_path {
 };
 
 /// Clears SIRIUS_DISABLE while a test's engine state is alive, then restores
-/// the previous value. The shared-env listener keeps SIRIUS_DISABLE=1 between
-/// tagged tests so that untagged tests' bare DuckDB instances do not
-/// auto-initialize a SiriusContext; these tests must drop the guard to build
-/// their own context, but leaking the unset poisons every untagged test that
-/// creates a DuckDB instance later in the suite (its queries get transparently
-/// GPU-executed).
+/// it. The harness keeps SIRIUS_DISABLE=1 so untagged tests' DuckDB instances
+/// don't auto-initialize a SiriusContext; leaking the unset would let later
+/// tests' queries run transparently on the GPU.
 struct scoped_sirius_disable_clear {
   scoped_sirius_disable_clear()
   {

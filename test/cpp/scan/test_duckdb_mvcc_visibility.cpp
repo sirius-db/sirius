@@ -86,11 +86,10 @@ struct vis_test_db {
   {
     db  = std::make_unique<duckdb::DuckDB>(path);
     con = std::make_unique<duckdb::Connection>(*db);
-    // The statically linked extension auto-loads into every instance; if an
-    // earlier test leaked SIRIUS_DISABLE unset, a SiriusContext auto-inits
-    // and transparent GPU execution would serve the SQL oracle below from the
-    // MVCC-blind native scan. Pin this connection to CPU; ignore the result
-    // so builds without the setting still run.
+    // Keep the SQL oracle on the CPU: if an earlier test leaked
+    // SIRIUS_DISABLE unset, the auto-loaded extension would serve it from
+    // the MVCC-blind native scan. Result ignored so builds without the
+    // setting still run.
     con->Query("SET gpu_execution = false;");
   }
 
@@ -491,10 +490,8 @@ TEST_CASE("mvcc visibility: fused native-read check is precise where the probe i
   exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
   std::vector<duckdb::storage_t> const col_k{0};
 
-  // Same-session writes leave the RowVersionManager attached (probe-dirty
-  // forever), but every row is committed and visible — the fused walk's
-  // visibility tier is what keeps such tables eligible for the disk-native
-  // read.
+  // Session writes leave the RowVersionManager attached (probe-dirty
+  // forever); the visibility tier must still report exact.
   exec_ok(*env.con, "BEGIN TRANSACTION");
   auto& storage = resolve_storage(*env.con, "t");
   auto& txn     = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached());

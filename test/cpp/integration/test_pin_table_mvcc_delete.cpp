@@ -24,11 +24,10 @@
 // Cache-served queries keep the {1, 0, 1} signature compare_gpu_vs_cpu
 // asserts.
 //
-// Unpinned tables have no masks at all: any state the MVCC-blind disk-native
-// read would misread (uncheckpointed deletes, in-flight or txn-local inserts,
-// update chains on scanned columns) must decline the same way, while tables
-// that are merely probe-dirty from this session's own committed writes keep
-// the GPU path.
+// Unpinned tables have no masks: deletes, in-flight or txn-local inserts, and
+// update chains on scanned columns must decline the same way, while tables
+// that are merely probe-dirty from this session's committed writes keep the
+// GPU path.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -336,9 +335,9 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
 
-  // The pin cannot serve column b. A session-written table keeps its version
-  // managers attached (conservatively dirty), but every row is visible — the
-  // fused exactness check keeps the scan on the native GPU path ({1,0,1}).
+  // The pin cannot serve column b, but every row is visible — the scan takes
+  // the native GPU path ({1,0,1}) even though session writes left the table
+  // probe-dirty.
   compare_gpu_vs_cpu("SELECT sum(b) FROM t;");
 
   // After a committed DELETE the disk image is stale: the same scan must now
@@ -397,13 +396,12 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
                  "[integration][gpu_execution][duckdb_native_mvcc_guard]")
 {
   run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(300000);");
-  // Session-written table, every row committed and visible: probe-dirty but
-  // exact — must stay on the GPU-native path.
+  // Session-written table: probe-dirty but every row visible — stays on GPU.
   compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
 
   run_ok("DELETE FROM t WHERE k IN (0, 2048, 122880) OR k % 50000 = 17;");
   expect_fallback_matches_cpu(*this, "SELECT count(*), sum(k) FROM t;");
-  // The oracle shape that exposed the blindness: rowids of deleted rows.
+  // rowid queries must not see deleted rows.
   expect_fallback_matches_cpu(*this, "SELECT min(rowid), count(*) FROM t;");
 }
 

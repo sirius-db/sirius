@@ -210,13 +210,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
         if (!pin_serves) {
           // (d) column-mismatch: the scan falls through to the disk-native
-          // read, so it must pass the same fused exactness check as an
-          // unpinned scan — no update chains on the scanned columns, every
-          // physically present row visible at this snapshot (probe-dirty
-          // row groups resolved by GetVisibleRowCount, so a session-written
-          // but fully-visible table keeps the native GPU path instead of
-          // declining to CPU). Guards (a)/(b) already excluded post-pin
-          // inserts and transaction-local appends.
+          // read, so it must pass the same exactness check as an unpinned
+          // scan. Guards (a)/(b) already excluded post-pin inserts and
+          // transaction-local appends.
           auto& txn = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
           if (sirius::op::scan::check_native_read_mvcc_state(
                 storage, projected, duckdb::TransactionData(txn)) !=
@@ -238,16 +234,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
       } else {
         // No MVCC-pinned cache for this table: the plan is the disk-native
-        // read (or a cached image byte-identical to it), which applies no
-        // visibility filtering — refuse any state it would misread, HERE,
-        // where the throw still becomes a clean CPU fallback (#1143).
-        // One fused row-group walk checks update chains and row visibility
-        // together; only probe-dirty row groups pay the visibility count, so
-        // tables written earlier in this session (their version managers
-        // stay attached after cleanup) keep the GPU path once every row is
-        // visible at this snapshot. Residual race: a row committing between
-        // this check and the scan's metadata capture is read unmasked; the
-        // keep-mask machinery planned for #1143 closes it.
+        // read, which applies no visibility filtering — refuse any state it
+        // would misread HERE, where the throw still becomes a clean CPU
+        // fallback (#1143). Residual race: a row committing between this
+        // check and the scan's metadata capture is read unmasked; the
+        // keep-masks planned in #819 PR6(d) close it.
         if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "

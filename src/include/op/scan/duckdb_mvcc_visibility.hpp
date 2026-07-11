@@ -128,32 +128,27 @@ bool any_update_chains(duckdb::DataTable& storage,
                        std::span<duckdb::storage_t const> storage_column_indices,
                        std::size_t row_prefix);
 
-/// Verdict of check_native_read_mvcc_state: whether the MVCC-blind disk-native
-/// read of a table is exact for a given snapshot, and if not, why.
+/// Whether the MVCC-blind disk-native read of a table is exact for a given
+/// snapshot, and if not, why.
 enum class native_read_mvcc_state : std::uint8_t {
-  exact,               ///< raw bytes are visibility-exact for this snapshot
-  has_update_chains,   ///< a scanned column carries in-memory UpdateSegment values
+  exact,               ///< raw bytes match this snapshot's visibility
+  has_update_chains,   ///< a scanned column has in-memory UpdateSegment values
   has_invisible_rows,  ///< tombstones or in-flight inserts at this snapshot
 };
 
 /**
- * @brief One row-group walk deciding whether the disk-native read is exact
- *        for @p transaction, checking update chains and row visibility
- *        together. Early-out on the first finding.
+ * @brief Single row-group walk checking update chains and row visibility
+ *        together, early-out on the first finding.
  *
- * Per row group, tiered cheap→expensive: (1) UpdateSegment chains on the
- * scanned columns — update chains version VALUES in place, invisibly to any
- * row mask; (2) the non-loading version-state probe — clean row groups are
- * provably exact and skip ahead; (3) probe-dirty row groups only pay DuckDB's
- * own RowGroup::GetVisibleRowCount(transaction) == physical count. Tier 3's
- * precision matters because the probe is conservative the wrong way for
- * unpinned tables — a RowVersionManager created by this session's own writes
- * stays attached after every row became globally visible, and refusing on the
- * probe alone would push every same-session-written table off the GPU
- * permanently. SERIAL — prepare/query thread only.
+ * Per row group, cheapest first: update-chain checks on the scanned columns,
+ * the non-loading version-state probe, and only probe-dirty row groups pay
+ * RowGroup::GetVisibleRowCount(transaction) == count. The last tier keeps
+ * session-written tables on the GPU: their RowVersionManager stays attached
+ * forever, so the probe alone would report them dirty long after every row
+ * became visible. SERIAL — prepare/query thread only.
  *
- * Does NOT see transaction-local appends (they live in LocalStorage, outside
- * the table's segment tree) — callers guard those separately.
+ * Transaction-local appends live in LocalStorage, outside the segment tree —
+ * callers check those separately.
  */
 native_read_mvcc_state check_native_read_mvcc_state(
   duckdb::DataTable& storage,
