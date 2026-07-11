@@ -233,10 +233,30 @@ void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   bool replace_slot = false;
   if (fn == "seq_scan") {
-    auto info       = build_duckdb_native_table_info(scan, op_params, context);
+    auto info = build_duckdb_native_table_info(scan, op_params, context);
+    // Dynamic filters: the native scan has no read-time dynamic path, so the DYNAMIC_FILTER
+    // wrapped above is the only consumer; it applies AST row masks in addition to membership.
+    // Elide when no producer was wired — the wrap runs after the whole tree is built, so
+    // has_producers() is settled here.
+    auto dynamic_filters = scan.sirius_dynamic_filters;
+    if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
+    info->sirius_dynamic_filters = dynamic_filters;
+
     auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
     leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(ingestible));
+    if (dynamic_filters) {
+      // Under a PARTITION parent this emits the legacy [GPU_SCAN, DYNAMIC_FILTER] pipeline
+      // (filter as sink); in inline contexts both join the current pipeline.
+      auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+        scan.types,
+        scan.estimated_cardinality,
+        std::move(dynamic_filters),
+        op_params.dynamic_filter_keep_threshold,
+        sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks);
+      dynamic_filter_op->children.push_back(std::move(leaf));
+      leaf = std::move(dynamic_filter_op);
+    }
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
