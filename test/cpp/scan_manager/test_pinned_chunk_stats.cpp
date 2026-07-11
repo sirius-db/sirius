@@ -564,6 +564,32 @@ TEST_CASE("pinned_zone_maps - append_column_from degrades one-way on incompatibl
   }
 }
 
+TEST_CASE("pinned_zone_maps - remap rebuilds a sidecar positionally", "[pinned_chunk_stats]")
+{
+  SECTION("reordering adoption")
+  {
+    auto incoming = pinned_zone_maps::from_capture(int_types(3), make_capture(2, 3), 3, 2);
+    auto out      = pinned_zone_maps::remap(std::move(incoming), {2, 0});
+    REQUIRE(out.has_stats());
+    REQUIRE(out.column_count() == 2);
+    require_cell_bounds(out.cell(0, 0), 200);
+    require_cell_bounds(out.cell(0, 1), 1200);
+    require_cell_bounds(out.cell(1, 0), 0);
+    require_cell_bounds(out.cell(1, 1), 1000);
+  }
+
+  SECTION("absent incoming, empty mapping, out-of-range, and duplicates yield absent")
+  {
+    REQUIRE_FALSE(pinned_zone_maps::remap(pinned_zone_maps{}, {0}).has_stats());
+    auto a = pinned_zone_maps::from_capture(int_types(2), make_capture(2, 2), 2, 2);
+    REQUIRE_FALSE(pinned_zone_maps::remap(std::move(a), {}).has_stats());
+    auto b = pinned_zone_maps::from_capture(int_types(2), make_capture(2, 2), 2, 2);
+    REQUIRE_FALSE(pinned_zone_maps::remap(std::move(b), {0, 5}).has_stats());
+    auto c = pinned_zone_maps::from_capture(int_types(2), make_capture(2, 2), 2, 2);
+    REQUIRE_FALSE(pinned_zone_maps::remap(std::move(c), {1, 1}).has_stats());
+  }
+}
+
 // ============================================================================
 // compute_pinned_chunk_stats — GPU capture (exact bounds, null flags, and the
 // null-entry degradations of the v1 type allowlist)

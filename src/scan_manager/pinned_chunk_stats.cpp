@@ -207,6 +207,21 @@ void pinned_zone_maps::append_column_from(pinned_zone_maps& incoming, std::size_
   _column_stats.push_back(std::move(incoming._column_stats[incoming_pos]));
 }
 
+pinned_zone_maps pinned_zone_maps::remap(pinned_zone_maps incoming,
+                                         std::vector<std::size_t> const& incoming_pos_by_pos)
+{
+  if (!incoming.has_stats() || incoming_pos_by_pos.empty()) { return {}; }
+  pinned_zone_maps out;
+  out._column_types.reserve(incoming_pos_by_pos.size());
+  out._column_stats.reserve(incoming_pos_by_pos.size());
+  for (auto pos : incoming_pos_by_pos) {
+    if (pos >= incoming.column_count() || incoming._column_stats[pos].empty()) { return {}; }
+    out._column_types.push_back(incoming._column_types[pos]);
+    out._column_stats.push_back(std::move(incoming._column_stats[pos]));
+  }
+  return out;
+}
+
 bool filter_safe_for_stats(duckdb::TableFilter const& filter, duckdb::LogicalType const& stats_type)
 {
   switch (filter.filter_type) {

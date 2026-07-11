@@ -272,7 +272,7 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
     {
       require_ok(con.Query("SET enable_pinned_zone_map_pruning = false;"), "disable before pin");
       auto pin =
-        con.Query("CALL pin_table('" + parquet_path.string() + "', tier='host', name='t');");
+        con.Query("CALL pin_table('" + parquet_path.string() + "', tier='gpu', name='t');");
       require_ok(pin, "pin with capture disabled");
       auto const* entry_ptr = find_entry(*sirius_ctx, "t");
       REQUIRE(entry_ptr != nullptr);
@@ -280,7 +280,7 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
       REQUIRE_FALSE(entry_ptr->zone_maps.has_stats());
 
       // Re-enabling the flag does not resurrect stats for an already-pinned
-      // entry: queries stay correct but nothing prunes until a re-pin.
+      // entry: queries stay correct but nothing prunes...
       require_ok(con.Query("SET enable_pinned_zone_map_pruning = true;"), "re-enable after pin");
       auto sel = con.Query(
         "SELECT count(*), sum(v) FROM t WHERE k >= " + std::to_string(kSelectiveLo) + ";");
@@ -289,7 +289,14 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
       REQUIRE(sel->GetValue(1, 0).ToString() == std::to_string(kExpectSum));
       REQUIRE(probe_pruned_count(*entry_ptr) == 0);
 
-      require_ok(con.Query("CALL unpin_table('t');"), "unpin statless");
+      // ...until a re-pin: the same-name GPU re-pin takes the equal-row-count
+      // merge and the statless entry adopts the fresh capture.
+      auto repin =
+        con.Query("CALL pin_table('" + parquet_path.string() + "', tier='gpu', name='t');");
+      require_ok(repin, "re-pin with capture enabled");
+      run_pruning_assertions(con, *sirius_ctx, "t", "t");
+
+      require_ok(con.Query("CALL unpin_table('t');"), "unpin");
     }
   }
 

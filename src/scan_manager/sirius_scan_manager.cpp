@@ -607,7 +607,7 @@ void sirius_scan_manager::insert_pinned_entry(
   }
 
   // Normalize the optional zone-map capture.
-  bool const stats_supplied = !chunk_stats.empty();
+  bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
   auto pin_zone_maps        = pinned_zone_maps::from_capture(std::move(column_types),
                                                       std::move(chunk_stats),
                                                       cache_info.column_ids.size(),
@@ -728,6 +728,27 @@ void sirius_scan_manager::insert_pinned_entry(
           "statistics; dropping zone-map statistics for entry '{}'",
           name);
       }
+      // A statless entry adopts the incoming capture when it covers every entry column (by
+      // primary index) — the re-pin recovery path for entries pinned while capture was off.
+      // Safe because the merge guards above proved identical chunk boundaries.
+      if (!entry.zone_maps.has_stats() && pin_zone_maps.has_stats()) {
+        std::unordered_map<duckdb::idx_t, std::size_t> incoming_pos_by_primary;
+        incoming_pos_by_primary.reserve(cache_info.column_ids.size());
+        for (std::size_t i = 0; i < cache_info.column_ids.size(); ++i) {
+          incoming_pos_by_primary.emplace(cache_info.column_ids[i].GetPrimaryIndex(), i);
+        }
+        std::vector<std::size_t> incoming_pos_by_entry_pos;
+        incoming_pos_by_entry_pos.reserve(entry.cache_info.column_ids.size());
+        for (auto const& col : entry.cache_info.column_ids) {
+          auto it = incoming_pos_by_primary.find(col.GetPrimaryIndex());
+          if (it == incoming_pos_by_primary.end()) { break; }
+          incoming_pos_by_entry_pos.push_back(it->second);
+        }
+        if (incoming_pos_by_entry_pos.size() == entry.cache_info.column_ids.size()) {
+          entry.zone_maps =
+            pinned_zone_maps::remap(std::move(pin_zone_maps), incoming_pos_by_entry_pos);
+        }
+      }
       return;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.
@@ -778,7 +799,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   }
 
   // Normalize the optional zone-map capture
-  bool const stats_supplied = !chunk_stats.empty();
+  bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
   auto pin_zone_maps        = pinned_zone_maps::from_capture(std::move(column_types),
                                                       std::move(chunk_stats),
                                                       cache_info.column_ids.size(),

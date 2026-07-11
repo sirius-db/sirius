@@ -93,6 +93,18 @@ class pinned_zone_maps {
    */
   void append_column_from(pinned_zone_maps& incoming, std::size_t incoming_pos);
 
+  /**
+   * @brief Rebuild a sidecar positionally from @p incoming: result position p takes incoming's
+   * column @p incoming_pos_by_pos[p] (pin-time type + per-chunk stats row, moved out).
+   *
+   * Returns an absent sidecar when @p incoming is absent, the mapping is empty, a position is out
+   * of range, or a position repeats (its row was already moved out). Used by the GPU re-pin merge
+   * to adopt a fresh capture onto a statless entry whose column order may differ from the
+   * incoming pin's.
+   */
+  [[nodiscard]] static pinned_zone_maps remap(pinned_zone_maps incoming,
+                                              std::vector<std::size_t> const& incoming_pos_by_pos);
+
  private:
   // Invariants: _column_types.size() == _column_stats.size();
   //             every inner vector shares one chunk count;

@@ -270,7 +270,7 @@ materialized_pin materialize_all_batches(
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       out.tables.emplace_back(std::move(tbl));
       out.chunk_memory_spaces.push_back(target);
-      out.chunk_stats.emplace_back(std::move(chunk_stats));
+      if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
     });
   return out;
 }
@@ -304,7 +304,7 @@ materialized_host_pin materialize_pin_to_host(
       // belt-and-suspenders before gpu_repr (which owns the GPU table's buffers) leaves scope.
       auto* target_host_space = host_space_by_gpu.at(src_space->get_device_id());
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
-      out.chunk_stats.emplace_back(std::move(chunk_stats));
+      if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
       cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
       auto host_repr =
         registry.convert<cucascade::host_data_representation>(gpu_repr, target_host_space, stream);

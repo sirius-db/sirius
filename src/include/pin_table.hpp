@@ -94,9 +94,10 @@ struct materialized_pin {
   /// pins these become @c duckdb_mvcc_metadata::base_row_count_per_chunk — the
   /// positional chunk→rowid-range map query-time MVCC merge relies on.
   std::vector<std::size_t> base_row_count_per_chunk;
-  /// Per-chunk zone-map capture, parallel to @c tables: chunk_stats[c][i] = stats
-  /// of batch column i of chunk c (null = none). Fed together with the pin-time
-  /// column types into @c sirius_scan_manager::insert_pinned_entry.
+  /// Per-chunk zone-map capture: chunk_stats[c][i] = stats of batch column i of
+  /// chunk c (null = none). Parallel to @c tables when capture ran; empty when
+  /// capture was skipped (no pinned column types). Fed together with the
+  /// pin-time column types into @c sirius_scan_manager::insert_pinned_entry.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
 };
 
@@ -106,9 +107,9 @@ struct materialized_pin {
 struct materialized_host_pin {
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   std::vector<std::size_t> base_row_count_per_chunk;
-  /// Per-chunk zone-map capture, parallel to @c host_chunks (captured on the GPU
-  /// before the host conversion); chunk_stats[c][i] = stats of batch column i of
-  /// chunk c (null = none).
+  /// Per-chunk zone-map capture (taken on the GPU before the host conversion);
+  /// chunk_stats[c][i] = stats of batch column i of chunk c (null = none).
+  /// Parallel to @c host_chunks when capture ran; empty when capture was skipped.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
 };
 
