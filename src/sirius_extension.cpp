@@ -1187,6 +1187,10 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
   }
 
+  if (!sirius_ctx->get_config().get_operator_params().enable_pinned_zone_map_pruning) {
+    pinned_column_types.clear();
+  }
+
   // Build the cache descriptor (table identity + column layout) from the
   // ingestible; it is stored on the pinned entry in place of the heavyweight
   // ingestible_table_info and drives later cache-hit matching + the gather.
@@ -1972,7 +1976,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption(
     "enable_pinned_zone_map_pruning",
     "Skip pinned-table chunks whose pin-time min/max statistics prove the scan's pushed-down "
-    "filter matches no rows; capture always runs at pin time",
+    "filter matches no rows; also gates the statistics capture during CALL pin_table, so a table "
+    "pinned while off carries no zone maps until re-pinned with the flag on",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
     SetEnablePinnedZoneMapPruning);

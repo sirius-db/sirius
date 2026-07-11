@@ -42,9 +42,6 @@
 #include <catch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/column_index.hpp>
-#include <scan_manager/pinned_chunk_stats.hpp>
-#include <scan_manager/sirius_scan_manager.hpp>
-
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/helper.hpp>
 #include <duckdb/common/types.hpp>
@@ -64,6 +61,8 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>
+#include <scan_manager/pinned_chunk_stats.hpp>
+#include <scan_manager/sirius_scan_manager.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -151,8 +150,7 @@ duckdb::BaseStatistics make_stats(LogicalType const& type,
 // filter_safe_for_stats — allowed shapes
 // ============================================================================
 
-TEST_CASE("pinned_chunk_stats - classifier accepts allowed static shapes",
-          "[pinned_chunk_stats]")
+TEST_CASE("pinned_chunk_stats - classifier accepts allowed static shapes", "[pinned_chunk_stats]")
 {
   auto const type = LogicalType::INTEGER;
 
@@ -173,10 +171,10 @@ TEST_CASE("pinned_chunk_stats - classifier accepts allowed static shapes",
                              cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(10)));
   REQUIRE(filter_safe_for_stats(*conjunctions, type));
 
-  auto nested = optional_of(or_of(
-    make_filter<duckdb::IsNullFilter>(),
-    and_of(cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(5)),
-           cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(0)))));
+  auto nested = optional_of(
+    or_of(make_filter<duckdb::IsNullFilter>(),
+          and_of(cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(5)),
+                 cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(0)))));
   REQUIRE(filter_safe_for_stats(*nested, type));
 }
 
@@ -217,8 +215,7 @@ TEST_CASE("pinned_chunk_stats - classifier rejects unsupported shapes and malfor
     filter_safe_for_stats(*cmp(ExpressionType::COMPARE_DISTINCT_FROM, Value::INTEGER(1)), type));
 
   REQUIRE_FALSE(filter_safe_for_stats(
-    duckdb::StructFilter{0, "child", cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1))},
-    type));
+    duckdb::StructFilter{0, "child", cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1))}, type));
 
   duckdb::ExpressionFilter expression_filter{
     duckdb::make_uniq<duckdb::BoundConstantExpression>(Value::BOOLEAN(true))};
@@ -261,17 +258,16 @@ TEST_CASE("pinned_chunk_stats - classifier requires exact logical type equality"
 
   // Exactly-typed controls for the same physical widths.
   auto const jan_2020 = Value::DATE(duckdb::Date::FromDate(2020, 1, 1));
-  REQUIRE(filter_safe_for_stats(*cmp(ExpressionType::COMPARE_EQUAL, jan_2020),
-                                LogicalType::DATE));
+  REQUIRE(filter_safe_for_stats(*cmp(ExpressionType::COMPARE_EQUAL, jan_2020), LogicalType::DATE));
   REQUIRE(filter_safe_for_stats(
     *cmp(ExpressionType::COMPARE_EQUAL, Value::TIMESTAMP(duckdb::timestamp_t{1'000'000})),
     LogicalType::TIMESTAMP));
 
   // One mismatched leaf poisons a conjunction.
-  REQUIRE_FALSE(filter_safe_for_stats(
-    *and_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(1)),
-            cmp(ExpressionType::COMPARE_LESSTHAN, Value::BIGINT(10))),
-    LogicalType::INTEGER));
+  REQUIRE_FALSE(
+    filter_safe_for_stats(*and_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(1)),
+                                  cmp(ExpressionType::COMPARE_LESSTHAN, Value::BIGINT(10))),
+                          LogicalType::INTEGER));
 }
 
 // ============================================================================
@@ -283,26 +279,26 @@ TEST_CASE("pinned_chunk_stats - prune only on provable emptiness", "[pinned_chun
   auto const stats = make_stats(LogicalType::INTEGER, Value::INTEGER(10), Value::INTEGER(20));
 
   // Provably disjoint ranges prune.
-  REQUIRE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100)),
-                               stats));
+  REQUIRE(
+    chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100)), stats));
   REQUIRE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(5)), stats));
   REQUIRE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(25)), stats));
-  REQUIRE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(20)),
-                               stats));
+  REQUIRE(
+    chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(20)), stats));
 
   // Overlapping or boundary-touching ranges keep.
-  REQUIRE_FALSE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(15)),
-                                     stats));
+  REQUIRE_FALSE(
+    chunk_provably_empty(*cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(15)), stats));
   REQUIRE_FALSE(chunk_provably_empty(
     *cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(20)), stats));
 
   // FILTER_ALWAYS_TRUE must not prune: only ALWAYS_FALSE does.
-  REQUIRE_FALSE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(0)),
-                                     stats));
+  REQUIRE_FALSE(
+    chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(0)), stats));
 
   // != prunes only a constant column matching the constant.
-  REQUIRE_FALSE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_NOTEQUAL, Value::INTEGER(15)),
-                                     stats));
+  REQUIRE_FALSE(
+    chunk_provably_empty(*cmp(ExpressionType::COMPARE_NOTEQUAL, Value::INTEGER(15)), stats));
   auto const constant_column =
     make_stats(LogicalType::INTEGER, Value::INTEGER(15), Value::INTEGER(15));
   REQUIRE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_NOTEQUAL, Value::INTEGER(15)),
@@ -313,17 +309,17 @@ TEST_CASE("pinned_chunk_stats - prune only on provable emptiness", "[pinned_chun
   REQUIRE_FALSE(chunk_provably_empty(*in_list({Value::INTEGER(15), Value::INTEGER(100)}), stats));
 
   // Conjunctions fold; OPTIONAL delegates to its child.
-  REQUIRE(chunk_provably_empty(
-    *and_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100)),
-            cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(200))),
-    stats));
+  REQUIRE(
+    chunk_provably_empty(*and_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100)),
+                                 cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(200))),
+                         stats));
   REQUIRE(chunk_provably_empty(*or_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100)),
                                       cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(5))),
                                stats));
-  REQUIRE_FALSE(chunk_provably_empty(
-    *or_of(cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(15)),
-           cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100))),
-    stats));
+  REQUIRE_FALSE(
+    chunk_provably_empty(*or_of(cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(15)),
+                                cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100))),
+                         stats));
   REQUIRE(chunk_provably_empty(
     *optional_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100))), stats));
 }
@@ -367,8 +363,8 @@ TEST_CASE("pinned_chunk_stats - prune is conservative on unsafe input", "[pinned
   // Type-mismatched probe: must return "keep" WITHOUT reaching CheckStatistics
   // — in a debug build reaching it would D_ASSERT-abort this very test, so
   // passing under test_debug is itself evidence the gate holds.
-  REQUIRE_FALSE(chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(1)),
-                                     date_stats));
+  REQUIRE_FALSE(
+    chunk_provably_empty(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(1)), date_stats));
   REQUIRE_FALSE(chunk_provably_empty(*dynamic_placeholder(), date_stats));
   REQUIRE_FALSE(chunk_provably_empty(duckdb::OptionalFilter{}, date_stats));
 }
@@ -495,8 +491,7 @@ TEST_CASE("pinned_zone_maps - from_capture normalizes malformed captures to abse
   expect_absent(pinned_zone_maps::from_capture(int_types(2), {}, 2, 0));
 }
 
-TEST_CASE("pinned_zone_maps - accessors are total on well-formed sidecars",
-          "[pinned_chunk_stats]")
+TEST_CASE("pinned_zone_maps - accessors are total on well-formed sidecars", "[pinned_chunk_stats]")
 {
   auto const zm = pinned_zone_maps::from_capture(int_types(1), make_capture(2, 1), 1, 2);
   REQUIRE(zm.has_stats());
@@ -667,7 +662,8 @@ TEST_CASE("compute_pinned_chunk_stats - exact bounds and null flags for allowed 
 
   SECTION("INT32, nulls excluded from bounds and flagged")
   {
-    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {7, 2, 11, 4}, {true, false, true, true});
+    auto col =
+      make_gpu_col<int32_t>(cudf::type_id::INT32, {7, 2, 11, 4}, {true, false, true, true});
     auto stats = capture_one(col->view(), LogicalType::INTEGER);
     REQUIRE(stats);
     REQUIRE(duckdb::NumericStats::Min(*stats) == Value::INTEGER(4));
@@ -697,15 +693,12 @@ TEST_CASE("compute_pinned_chunk_stats - exact bounds and null flags for allowed 
 
   SECTION("TIMESTAMP from TIMESTAMP_MICROSECONDS")
   {
-    auto col =
-      make_gpu_col<int64_t>(cudf::type_id::TIMESTAMP_MICROSECONDS, {5'000'000, 1'000'000});
+    auto col = make_gpu_col<int64_t>(cudf::type_id::TIMESTAMP_MICROSECONDS, {5'000'000, 1'000'000});
     auto stats = capture_one(col->view(), LogicalType::TIMESTAMP);
     REQUIRE(stats);
     REQUIRE(stats->GetType() == LogicalType::TIMESTAMP);
-    REQUIRE(duckdb::NumericStats::Min(*stats) ==
-            Value::TIMESTAMP(duckdb::timestamp_t{1'000'000}));
-    REQUIRE(duckdb::NumericStats::Max(*stats) ==
-            Value::TIMESTAMP(duckdb::timestamp_t{5'000'000}));
+    REQUIRE(duckdb::NumericStats::Min(*stats) == Value::TIMESTAMP(duckdb::timestamp_t{1'000'000}));
+    REQUIRE(duckdb::NumericStats::Max(*stats) == Value::TIMESTAMP(duckdb::timestamp_t{5'000'000}));
   }
 }
 
@@ -800,9 +793,10 @@ pinned_entry make_plan_entry(std::size_t n_chunks, std::vector<duckdb::idx_t> co
   }
   entry.tier = cucascade::memory::Tier::HOST;
   entry.host_chunks.resize(n_chunks);
-  entry.zone_maps = pinned_zone_maps::from_capture(
-    int_types(primaries.size()), make_capture(n_chunks, primaries.size()), primaries.size(),
-    n_chunks);
+  entry.zone_maps = pinned_zone_maps::from_capture(int_types(primaries.size()),
+                                                   make_capture(n_chunks, primaries.size()),
+                                                   primaries.size(),
+                                                   n_chunks);
   return entry;
 }
 
@@ -822,8 +816,8 @@ TEST_CASE("build_cached_scan_plan - prunes exactly the provably empty chunks",
   auto const entry = make_plan_entry(4, {3});
   duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
 
-  auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-                                     Value::INTEGER(2000)));
+  auto fs =
+    make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(2000)));
   auto plan = build_cached_scan_plan(entry, &fs, &qcols);
   REQUIRE(plan.survivor_chunk_indices == survivors_t{2, 3});
   REQUIRE(plan.pruned == 2);
@@ -843,8 +837,8 @@ TEST_CASE("build_cached_scan_plan - filter keys remap through query column_ids t
   auto const entry = make_plan_entry(3, {7, 3});
   duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
 
-  auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-                                   Value::INTEGER(1100)));
+  auto fs =
+    make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(1100)));
   auto plan = build_cached_scan_plan(entry, &fs, &qcols);
   REQUIRE(plan.survivor_chunk_indices == survivors_t{1, 2});
   REQUIRE(plan.pruned == 1);
@@ -883,7 +877,7 @@ TEST_CASE("build_cached_scan_plan - identity plan whenever pruning is not provab
 
   SECTION("statless entry")
   {
-    auto statless = make_plan_entry(3, {3});
+    auto statless      = make_plan_entry(3, {3});
     statless.zone_maps = pinned_zone_maps{};
     auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100000)));
     auto plan = build_cached_scan_plan(statless, &fs, &qcols);
@@ -945,8 +939,8 @@ TEST_CASE("build_cached_scan_plan - absent cells keep their chunks", "[pinned_ch
   entry.cache_info.names.push_back("c0");
   entry.tier = cucascade::memory::Tier::HOST;
   entry.host_chunks.resize(3);
-  auto capture  = make_capture(3, 1);
-  capture[1][0] = nullptr;
+  auto capture    = make_capture(3, 1);
+  capture[1][0]   = nullptr;
   entry.zone_maps = pinned_zone_maps::from_capture(int_types(1), std::move(capture), 1, 3);
 
   duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
@@ -963,7 +957,7 @@ TEST_CASE("build_cached_scan_plan - duplicate column names never alias (position
   // Two columns share the name "x" but have distinct primaries and ranges;
   // pruning on primary 2 (entry pos 1, ranges 1000c+100..) must use ITS
   // ranges, not pos 0's.
-  auto entry = make_plan_entry(3, {1, 2});
+  auto entry             = make_plan_entry(3, {1, 2});
   entry.cache_info.names = {"x", "x"};
 
   duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(2)};

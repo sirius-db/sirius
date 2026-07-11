@@ -264,7 +264,7 @@ bool chunk_provably_empty(duckdb::TableFilter const& filter,
                           duckdb::BaseStatistics const& stats) noexcept
 {
   try {
-    auto local_stats = stats.Copy();  // Protect agains concurrent mutation (DYNAMIC stats)
+    auto local_stats = stats.Copy();  // Protect against concurrent mutation (DYNAMIC stats)
     if (!filter_safe_for_stats(filter, local_stats.GetType())) { return false; }
     return filter.CheckStatistics(local_stats) ==
            duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE;

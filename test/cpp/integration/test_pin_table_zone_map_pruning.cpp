@@ -69,9 +69,9 @@ void generate_parquet(fs::path const& path)
   {
     duckdb::DuckDB gen_db(nullptr);
     duckdb::Connection gen(gen_db);
-    auto r = gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" +
-                       std::to_string(kRows) + ") ORDER BY k) TO '" + path.string() +
-                       "' (FORMAT PARQUET);");
+    auto r =
+      gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(kRows) +
+                ") ORDER BY k) TO '" + path.string() + "' (FORMAT PARQUET);");
     REQUIRE(r);
     REQUIRE_FALSE(r->HasError());
   }
@@ -191,8 +191,8 @@ void run_pruning_assertions(duckdb::Connection& con,
   UNSCOPED_INFO("plan probe pruned " << pruned << "/" << n_chunks << " chunks");
   REQUIRE(pruned > 0);
 
-  auto const selective = "SELECT count(*), sum(v) FROM " + relation + " WHERE k >= " +
-                         std::to_string(kSelectiveLo) + ";";
+  auto const selective = "SELECT count(*), sum(v) FROM " + relation +
+                         " WHERE k >= " + std::to_string(kSelectiveLo) + ";";
   auto sel = con.Query(selective);
   require_ok(sel, "selective query");
   REQUIRE(sel->GetValue(0, 0).ToString() == std::to_string(kExpectCount));
@@ -204,9 +204,8 @@ void run_pruning_assertions(duckdb::Connection& con,
 
   // Selects-nothing: every chunk is provably empty, so the scan serves only
   // the sentinel chunk; the query must return 0 rows and must not hang.
-  auto none_agg =
-    con.Query("SELECT count(*) FROM " + relation + " WHERE k >= " + std::to_string(kRows * 10) +
-              ";");
+  auto none_agg = con.Query("SELECT count(*) FROM " + relation +
+                            " WHERE k >= " + std::to_string(kRows * 10) + ";");
   require_ok(none_agg, "selects-nothing aggregate");
   REQUIRE(none_agg->GetValue(0, 0).ToString() == "0");
 
@@ -267,6 +266,30 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
 
         require_ok(con.Query("CALL unpin_table('t');"), "unpin");
       }
+    }
+
+    SECTION("capture disabled at pin time yields a statless entry")
+    {
+      require_ok(con.Query("SET enable_pinned_zone_map_pruning = false;"), "disable before pin");
+      auto pin =
+        con.Query("CALL pin_table('" + parquet_path.string() + "', tier='host', name='t');");
+      require_ok(pin, "pin with capture disabled");
+      auto const* entry_ptr = find_entry(*sirius_ctx, "t");
+      REQUIRE(entry_ptr != nullptr);
+      REQUIRE(entry_chunk_count(*entry_ptr) >= 3);
+      REQUIRE_FALSE(entry_ptr->zone_maps.has_stats());
+
+      // Re-enabling the flag does not resurrect stats for an already-pinned
+      // entry: queries stay correct but nothing prunes until a re-pin.
+      require_ok(con.Query("SET enable_pinned_zone_map_pruning = true;"), "re-enable after pin");
+      auto sel = con.Query(
+        "SELECT count(*), sum(v) FROM t WHERE k >= " + std::to_string(kSelectiveLo) + ";");
+      require_ok(sel, "selective query on statless entry");
+      REQUIRE(sel->GetValue(0, 0).ToString() == std::to_string(kExpectCount));
+      REQUIRE(sel->GetValue(1, 0).ToString() == std::to_string(kExpectSum));
+      REQUIRE(probe_pruned_count(*entry_ptr) == 0);
+
+      require_ok(con.Query("CALL unpin_table('t');"), "unpin statless");
     }
   }
 
