@@ -11,7 +11,7 @@ This document catalogs Super Sirius performance optimizations by category. Each 
 **Mechanism:** `determine_num_partitions()` computes partition count from actual input data size:
 ```
 total_bytes = sum of all batch sizes from input repository
-num_partitions = max(1, total_bytes / hash_partition_bytes)
+num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 ```
 
 **Code path:** `src/op/sirius_physical_partition.cpp` — `determine_num_partitions()`
@@ -36,7 +36,7 @@ num_partitions = max(1, total_bytes / hash_partition_bytes)
 3. **MERGE_SORT**: Multi-way merge of pre-sorted partitions via `cudf::merge_order_by()`
 
 **Code path:**
-- `src/pipeline/sirius_pipeline_converter.cpp` — `split_order_by_sink()` (pipeline splitting)
+- `src/planner/sirius_physical_plan_generator.cpp` — `wrap_order_by()` (plan-time sort chain insertion)
 - `src/op/sirius_physical_sort_sample.cpp` — boundary computation
 - `src/op/sirius_physical_sort_partition.cpp` — range partitioning
 - `src/op/sirius_physical_merge_sort.cpp` — multi-way merge
@@ -49,7 +49,7 @@ num_partitions = max(1, total_bytes / hash_partition_bytes)
 
 **Mechanism:** `sirius_physical_sort_sample` overrides `get_next_task_input_data()` so the boundary task receives the full multi-batch sample the hint waited for. Sampling is byte-based: it pulls batches until `sort_sample_bytes` is reached (or upstream finishes), then merges the already-sorted sample batches with `gpu_merge_impl::merge_order_by` and computes boundaries from the merged run — no concatenate-and-full-sort. Boundary scheduling uses an explicit `NOT_DONE -> SCHEDULED -> DONE` state machine: `get_next_task_input_data()` claims the sample and moves to `SCHEDULED`, `get_next_task_hint()` returns `nullopt` while `SCHEDULED` so no duplicate boundary task is created, `execute()` moves to `DONE`, and OOM resets to `NOT_DONE` for retry. After boundaries are computed the operator falls back to single-batch passthrough.
 
-**Code path:** `src/op/sirius_physical_sort_sample.cpp` — `get_next_task_input_data()`, `get_next_task_hint()`, `execute()`; `src/pipeline/sirius_pipeline_converter.cpp` — wiring `sort_sample_bytes` into SORT_SAMPLE
+**Code path:** `src/op/sirius_physical_sort_sample.cpp` — `get_next_task_input_data()`, `get_next_task_hint()`, `execute()`; `src/planner/sirius_physical_plan_generator.cpp` — wiring `sort_sample_bytes` into SORT_SAMPLE
 
 **Config:** `sort_sample_bytes` (default: 512 MB), settable via YAML and the `sort_sample_bytes` SET option
 

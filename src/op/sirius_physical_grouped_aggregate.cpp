@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
+#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
@@ -24,6 +25,17 @@
 
 namespace sirius {
 namespace op {
+
+void sirius_physical_grouped_aggregate::build_pipelines(
+  pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  // The bare DISTINCT of a RIGHT_DELIM_JOIN contributes no pipeline of its own: the
+  // delim join's sink executes it inline and the tree-based wiring handles data flow.
+  // is_sink() stays true — PARTITION_distinct asserts `children[0]->is_sink()`, which
+  // is about the operator's role, not pipeline membership.
+  if (_owned_by_delim_join) { return; }
+  sirius_physical_operator::build_pipelines(current, meta_pipeline);
+}
 
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
@@ -87,7 +99,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregate_idx,
                                                               cudf_aggregate_struct_col_indices,
                                                               stream,
-                                                              *space);
+                                                              *space,
+                                                              batch_telemetry());
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

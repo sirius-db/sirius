@@ -16,11 +16,13 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include "config.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -118,6 +120,13 @@ void pipelineable_operator_data::prepare_for_processing(
   }
 
   _read_only_data_batches = std::move(ro_batches);
+  // lock_or_prepare_batch may have returned an accessor to a clone (cross-GPU inputs), so
+  // accessor i can reference a different batch than _data_batches[i]. Reset the idle vector so
+  // get_data_batches() lazily rebuilds it from the accessors, restoring the invariant that
+  // _data_batches[i] is the batch underlying accessor i. Downstream forwarding (dynamic_filter,
+  // sink) and OOM reschedule (remove_read_only_lock materializes from the accessors) then all
+  // see the prepared batch, not a stale original.
+  _data_batches = std::nullopt;
 }
 
 std::string sirius_physical_operator::get_name() const
@@ -147,20 +156,20 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
 {
   auto& state = meta_pipeline.get_state();
   if (is_sink()) {
-    // operator is a sink, build a pipeline
-    D_ASSERT(children.size() == 1);
+    // Sink: build a pipeline. Leaf-sinks (scans) terminate their own one-operator pipeline.
+    D_ASSERT(children.size() <= 1);
 
-    // single operator: the operator becomes the data source of the current pipeline
-    state.set_pipeline_source(current, *this);
+    // create_child_meta_pipeline pre-populates [*this] in the child_meta; source/sink
+    // derive from operators[] in `is_ready`, so no set_pipeline_source here.
 
-    // we create a new pipeline starting from the child
+    // we create a new pipeline starting from the child (or just [*this] for leaf-sinks)
     auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
-    child_meta_pipeline.build(*children[0]);
+    if (!children.empty()) { child_meta_pipeline.build(*children[0]); }
   } else {
     // operator is not a sink! recurse in children
     if (children.empty()) {
-      // source
-      state.set_pipeline_source(current, *this);
+      // source-leaf. Append: source-leaves land at operators[0] post-reverse.
+      state.add_pipeline_operator(current, *this);
     } else {
       if (children.size() != 1) {
         throw internal_exception("Operator not supported in build_pipelines");
@@ -368,6 +377,12 @@ void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_
 {
   assert(pipeline != nullptr);
   _pipeline = std::move(pipeline);
+}
+
+telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
+{
+  if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
+  return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
 }
 
 // implement get_all_ports
