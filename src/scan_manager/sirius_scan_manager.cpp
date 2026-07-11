@@ -321,8 +321,10 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   return result;
 }
 
-void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
+void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
+                                            bool enable_pinned_zone_map_pruning)
 {
+  _pruning_enabled = enable_pinned_zone_map_pruning;
   reset();
 
   if (_io_ctx && _io_ctx->cache()) {
@@ -964,7 +966,8 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
       // back to the disk read instead.
       validate_pinned_entry_for_serving(entry, cols);
       // Zone-map survivor plan
-      auto const filter_view = extract_scan_filters(table_info);
+      auto const filter_view =
+        _pruning_enabled ? extract_scan_filters(table_info) : scan_filter_view{};
       auto plan = build_cached_scan_plan(entry, filter_view.table_filters, filter_view.column_ids);
       auto const total_chunks = plan.survivor_chunk_indices.size() + plan.pruned;
       if (plan.pruned > 0) {

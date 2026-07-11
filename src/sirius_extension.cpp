@@ -1727,6 +1727,15 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
                    params->dynamic_filter_keep_threshold);
 }
 
+static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_pinned_zone_map_pruning = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_PINNED_ZONE_MAP_PRUNING to {}",
+                   params->enable_pinned_zone_map_pruning);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1959,6 +1968,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::DOUBLE,
     Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
+
+  config.AddExtensionOption(
+    "enable_pinned_zone_map_pruning",
+    "Skip pinned-table chunks whose pin-time min/max statistics prove the scan's pushed-down "
+    "filter matches no rows; capture always runs at pin time",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
+    SetEnablePinnedZoneMapPruning);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

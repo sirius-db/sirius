@@ -41,7 +41,9 @@
 
 #include <catch.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/column_index.hpp>
 #include <scan_manager/pinned_chunk_stats.hpp>
+#include <scan_manager/sirius_scan_manager.hpp>
 
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/helper.hpp>
@@ -771,4 +773,207 @@ TEST_CASE("compute_pinned_chunk_stats - per-column alignment and shape degradati
     REQUIRE_FALSE(stats[1]);
     REQUIRE_FALSE(stats[2]);
   }
+}
+
+// ============================================================================
+// build_cached_scan_plan — serve-time survivor plans (host-only: plan building
+// never dereferences chunk data, so entries carry null chunk placeholders)
+// ============================================================================
+
+namespace {
+
+using sirius::scan_manager::build_cached_scan_plan;
+using sirius::scan_manager::pinned_entry;
+
+using survivors_t = std::vector<std::size_t>;
+
+/// HOST-tier entry with @p primaries.size() INTEGER columns over @p n_chunks
+/// chunks, zone maps from make_capture — column i of chunk c covers
+/// [1000*c + 100*i, 1000*c + 100*i + 9]. Host chunks stay null: the plan
+/// builder only reads their count.
+pinned_entry make_plan_entry(std::size_t n_chunks, std::vector<duckdb::idx_t> const& primaries)
+{
+  pinned_entry entry;
+  for (std::size_t i = 0; i < primaries.size(); ++i) {
+    entry.cache_info.column_ids.emplace_back(duckdb::ColumnIndex(primaries[i]));
+    entry.cache_info.names.push_back("c" + std::to_string(i));
+  }
+  entry.tier = cucascade::memory::Tier::HOST;
+  entry.host_chunks.resize(n_chunks);
+  entry.zone_maps = pinned_zone_maps::from_capture(
+    int_types(primaries.size()), make_capture(n_chunks, primaries.size()), primaries.size(),
+    n_chunks);
+  return entry;
+}
+
+duckdb::TableFilterSet make_filter_set(duckdb::idx_t key, filter_ptr f)
+{
+  duckdb::TableFilterSet fs;
+  fs.filters[key] = std::move(f);
+  return fs;
+}
+
+}  // namespace
+
+TEST_CASE("build_cached_scan_plan - prunes exactly the provably empty chunks",
+          "[pinned_chunk_stats]")
+{
+  // Column 0 (primary 3) ranges: [0,9], [1000,1009], [2000,2009], [3000,3009].
+  auto const entry = make_plan_entry(4, {3});
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+
+  auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                     Value::INTEGER(2000)));
+  auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+  REQUIRE(plan.survivor_chunk_indices == survivors_t{2, 3});
+  REQUIRE(plan.pruned == 2);
+
+  auto in_fs   = make_filter_set(0, in_list({Value::INTEGER(5), Value::INTEGER(3005)}));
+  auto in_plan = build_cached_scan_plan(entry, &in_fs, &qcols);
+  REQUIRE(in_plan.survivor_chunk_indices == survivors_t{0, 3});
+  REQUIRE(in_plan.pruned == 2);
+}
+
+TEST_CASE("build_cached_scan_plan - filter keys remap through query column_ids to entry positions",
+          "[pinned_chunk_stats]")
+{
+  // Entry columns: pos 0 = primary 7 (ranges 1000c..), pos 1 = primary 3
+  // (ranges 1000c+100..). The query selects only primary 3, so filter key 0
+  // must land on entry position 1.
+  auto const entry = make_plan_entry(3, {7, 3});
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+
+  auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+                                   Value::INTEGER(1100)));
+  auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+  REQUIRE(plan.survivor_chunk_indices == survivors_t{1, 2});
+  REQUIRE(plan.pruned == 1);
+}
+
+TEST_CASE("build_cached_scan_plan - all-pruned keeps the sentinel chunk", "[pinned_chunk_stats]")
+{
+  auto const entry = make_plan_entry(4, {3});
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+  auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100000)));
+
+  auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+  REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
+  REQUIRE(plan.pruned == 3);
+}
+
+TEST_CASE("build_cached_scan_plan - identity plan whenever pruning is not provably safe",
+          "[pinned_chunk_stats]")
+{
+  auto const entry = make_plan_entry(3, {3});
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+  auto const identity = survivors_t{0, 1, 2};
+
+  SECTION("no filters")
+  {
+    duckdb::TableFilterSet empty_fs;
+    REQUIRE(build_cached_scan_plan(entry, nullptr, &qcols).survivor_chunk_indices == identity);
+    REQUIRE(build_cached_scan_plan(entry, &empty_fs, &qcols).survivor_chunk_indices == identity);
+  }
+
+  SECTION("no query column_ids")
+  {
+    auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100000)));
+    REQUIRE(build_cached_scan_plan(entry, &fs, nullptr).survivor_chunk_indices == identity);
+  }
+
+  SECTION("statless entry")
+  {
+    auto statless = make_plan_entry(3, {3});
+    statless.zone_maps = pinned_zone_maps{};
+    auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100000)));
+    auto plan = build_cached_scan_plan(statless, &fs, &qcols);
+    REQUIRE(plan.survivor_chunk_indices == identity);
+    REQUIRE(plan.pruned == 0);
+  }
+
+  SECTION("filter key out of range")
+  {
+    auto fs = make_filter_set(9, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100000)));
+    REQUIRE(build_cached_scan_plan(entry, &fs, &qcols).survivor_chunk_indices == identity);
+  }
+
+  SECTION("rowid sentinel column is gated before GetPrimaryIndex")
+  {
+    duckdb::vector<duckdb::ColumnIndex> rowid_cols{duckdb::ColumnIndex()};
+    auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100000)));
+    REQUIRE(build_cached_scan_plan(entry, &fs, &rowid_cols).survivor_chunk_indices == identity);
+  }
+
+  SECTION("filtered column absent from the entry")
+  {
+    duckdb::vector<duckdb::ColumnIndex> other_cols{duckdb::ColumnIndex(8)};
+    auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100000)));
+    REQUIRE(build_cached_scan_plan(entry, &fs, &other_cols).survivor_chunk_indices == identity);
+  }
+
+  SECTION("exact-type mismatch rejects the filter")
+  {
+    auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::BIGINT(100000)));
+    REQUIRE(build_cached_scan_plan(entry, &fs, &qcols).survivor_chunk_indices == identity);
+  }
+
+  SECTION("dynamic filter rejects; a usable sibling filter still prunes")
+  {
+    duckdb::TableFilterSet fs;
+    fs.filters[0] = dynamic_placeholder();
+    duckdb::vector<duckdb::ColumnIndex> two_cols{duckdb::ColumnIndex(3), duckdb::ColumnIndex(3)};
+    fs.filters[1] = cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(1000));
+    auto plan     = build_cached_scan_plan(entry, &fs, &two_cols);
+    REQUIRE(plan.survivor_chunk_indices == survivors_t{1, 2});
+    REQUIRE(plan.pruned == 1);
+  }
+
+  SECTION("zero-chunk entry yields an empty plan, no sentinel")
+  {
+    auto empty_entry = make_plan_entry(0, {3});
+    auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100000)));
+    auto plan = build_cached_scan_plan(empty_entry, &fs, &qcols);
+    REQUIRE(plan.survivor_chunk_indices.empty());
+    REQUIRE(plan.pruned == 0);
+  }
+}
+
+TEST_CASE("build_cached_scan_plan - absent cells keep their chunks", "[pinned_chunk_stats]")
+{
+  pinned_entry entry;
+  entry.cache_info.column_ids.emplace_back(duckdb::ColumnIndex(3));
+  entry.cache_info.names.push_back("c0");
+  entry.tier = cucascade::memory::Tier::HOST;
+  entry.host_chunks.resize(3);
+  auto capture  = make_capture(3, 1);
+  capture[1][0] = nullptr;
+  entry.zone_maps = pinned_zone_maps::from_capture(int_types(1), std::move(capture), 1, 3);
+
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+  auto fs = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(0)));
+
+  auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+  REQUIRE(plan.survivor_chunk_indices == survivors_t{1});
+  REQUIRE(plan.pruned == 2);
+}
+
+TEST_CASE("build_cached_scan_plan - duplicate column names never alias (positional stats)",
+          "[pinned_chunk_stats]")
+{
+  // Two columns share the name "x" but have distinct primaries and ranges;
+  // pruning on primary 2 (entry pos 1, ranges 1000c+100..) must use ITS
+  // ranges, not pos 0's.
+  auto entry = make_plan_entry(3, {1, 2});
+  entry.cache_info.names = {"x", "x"};
+
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(2)};
+
+  // Pos 1 ranges: [100,109], [1100,1109], [2100,2109]; pos 0 ranges:
+  // [0,9], [1000,1009], [2000,2009]. "< 1050" is the discriminating probe —
+  // it keeps {0} against pos-1 bounds but would keep {0, 1} against pos-0
+  // bounds, so an aliased lookup fails the assertion.
+  auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(1050)));
+  auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+  REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
+  REQUIRE(plan.pruned == 2);
 }

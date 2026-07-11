@@ -188,14 +188,14 @@ struct cached_scan_plan {
 };
 
 /**
- * @brief Build the survivor plan for serving @p entry to a scan into @p column_ids with @p
- * table_filters applied. A chunk is pruned when any usable filter proves it empty against the
+ * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
+ * @p table_filters applied. A chunk is pruned when any usable filter proves it empty against the
  * pinned entry's zone-map statistics.
  */
 [[nodiscard]] cached_scan_plan build_cached_scan_plan(
   pinned_entry const& entry,
   duckdb::TableFilterSet const* table_filters,
-  duckdb::vector<duckdb::ColumnIndex> const* column_ids);
+  duckdb::vector<duckdb::ColumnIndex> const* requested_column_ids);
 
 /**
  * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
@@ -256,8 +256,13 @@ class sirius_scan_manager {
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
   ///
-  /// @param query        The query whose scan operators must be prepared.
-  void prepare_for_query(const sirius::planner::query& query);
+  /// @param query                           The query whose scan operators must be prepared.
+  /// @param enable_pinned_zone_map_pruning  Per-query snapshot of the serve-side pruning flag (the
+  ///                                        manager's _config is a construction-time copy, so SET
+  ///                                        changes must be forwarded per query by the caller).
+  ///                                        Consulted by try_assign_cached_entries when building
+  ///                                        the survivor plan.
+  void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -411,6 +416,7 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+  bool _pruning_enabled{true};
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
