@@ -23,6 +23,12 @@
 // executions}) with correct results, never the MVCC-blind disk-native read.
 // Cache-served queries keep the {1, 0, 1} signature compare_gpu_vs_cpu
 // asserts.
+//
+// Unpinned tables have no masks at all: any state the MVCC-blind disk-native
+// read would misread (uncheckpointed deletes, in-flight or txn-local inserts,
+// update chains on scanned columns) must decline the same way, while tables
+// that are merely probe-dirty from this session's own committed writes keep
+// the GPU path.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -387,4 +393,57 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
 
   compare_gpu_vs_cpu("SELECT u.g, count(*) FROM t JOIN u ON t.k = u.k GROUP BY u.g ORDER BY u.g;");
   run_ok("CALL unpin_table('t');");
+}
+
+//===----------------------------------------------------------------------===//
+// Unpinned tables: the disk-native read must decline any divergence (#1143)
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(PinMvccDeleteFixture,
+                 "native mvcc guard: uncheckpointed deletes on an unpinned table fall back",
+                 "[integration][gpu_execution][duckdb_native_mvcc_guard]")
+{
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(300000);");
+  // Session-written table, every row committed and visible: probe-dirty but
+  // exact — must stay on the GPU-native path.
+  compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
+
+  run_ok("DELETE FROM t WHERE k IN (0, 2048, 122880) OR k % 50000 = 17;");
+  expect_fallback_matches_cpu(*this, "SELECT count(*), sum(k) FROM t;");
+  // The oracle shape that exposed the blindness: rowids of deleted rows.
+  expect_fallback_matches_cpu(*this, "SELECT min(rowid), count(*) FROM t;");
+}
+
+TEST_CASE_METHOD(PinMvccDeleteFixture,
+                 "native mvcc guard: update chains gate only the scanned columns",
+                 "[integration][gpu_execution][duckdb_native_mvcc_guard]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, (range * 2)::INTEGER AS v "
+    "FROM range(200000);");
+  compare_gpu_vs_cpu("SELECT sum(v) FROM t;");
+
+  run_ok("UPDATE t SET v = v + 1 WHERE k % 1000 = 3;");
+  expect_fallback_matches_cpu(*this, "SELECT sum(v) FROM t;");
+  // The untouched column carries no chains — still GPU-served.
+  compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
+
+  run_ok("CHECKPOINT;");  // folds the chains into the base data
+  compare_gpu_vs_cpu("SELECT sum(v) FROM t;");
+}
+
+TEST_CASE_METHOD(PinMvccDeleteFixture,
+                 "native mvcc guard: transaction-local inserts fall back until resolved",
+                 "[integration][gpu_execution][duckdb_native_mvcc_guard]")
+{
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(200000);");
+  compare_gpu_vs_cpu("SELECT count(*), max(k) FROM t;");
+
+  run_ok("BEGIN TRANSACTION;");
+  run_ok("INSERT INTO t VALUES (1000000);");
+  // The txn must see its own row; the disk-native read cannot.
+  expect_fallback_matches_cpu(*this, "SELECT count(*), max(k) FROM t;");
+  run_ok("ROLLBACK;");
+
+  compare_gpu_vs_cpu("SELECT count(*), max(k) FROM t;");
 }

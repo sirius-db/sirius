@@ -256,4 +256,20 @@ bool has_any_version_state(duckdb::DataTable& storage, std::size_t row_prefix)
   return false;
 }
 
+bool all_rows_visible(duckdb::DataTable& storage, duckdb::TransactionData transaction)
+{
+  auto tree = storage.GetRowGroupCollection()->GetRowGroups();
+  for (duckdb::idx_t rg_index = 0;; ++rg_index) {
+    auto node = tree->GetSegmentByIndex(static_cast<int64_t>(rg_index));
+    if (!node) { return true; }
+    if (!row_group_has_version_state(*node)) { continue; }
+    auto& rg = node->GetNode();
+    // Load the physical count BEFORE the visibility count: a concurrent
+    // append between the two reads makes the counts diverge in either
+    // order, which refuses — never falsely matches.
+    auto const physical = static_cast<duckdb::idx_t>(rg.count.load());
+    if (rg.GetVisibleRowCount(transaction) != physical) { return false; }
+  }
+}
+
 }  // namespace sirius::op::scan

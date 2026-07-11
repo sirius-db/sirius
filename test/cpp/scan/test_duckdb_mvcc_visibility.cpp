@@ -472,3 +472,61 @@ TEST_CASE("mvcc visibility: any_update_chains flags updated columns only",
   REQUIRE_FALSE(any_update_chains(s2, both, total));
   exec_ok(*env.con, "ROLLBACK");
 }
+
+TEST_CASE("mvcc visibility: all_rows_visible is precise where the probe is conservative",
+          "[duckdb_mvcc_visibility][scan]")
+{
+  vis_test_db env;
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+
+  // Same-session writes leave the RowVersionManager attached (probe-dirty
+  // forever), but every row is committed and visible — the precise walk is
+  // what keeps such tables eligible for the disk-native read.
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  REQUIRE(has_any_version_state(storage, 10000));  // conservative probe: dirty
+  auto& txn = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached());
+  REQUIRE(all_rows_visible(storage, duckdb::TransactionData(txn)));  // precise: exact
+  exec_ok(*env.con, "ROLLBACK");
+
+  // A committed delete is dropped at every later snapshot — walk refuses.
+  exec_ok(*env.con, "DELETE FROM t WHERE k = 42");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& s2   = resolve_storage(*env.con, "t");
+  auto& txn2 = duckdb::DuckTransaction::Get(*env.con->context, s2.GetAttached());
+  REQUIRE_FALSE(all_rows_visible(s2, duckdb::TransactionData(txn2)));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // The query's own uncommitted delete must also refuse (invisible to self).
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  exec_ok(*env.con, "DELETE FROM t WHERE k = 7");
+  auto& s3   = resolve_storage(*env.con, "t");
+  auto& txn3 = duckdb::DuckTransaction::Get(*env.con->context, s3.GetAttached());
+  REQUIRE_FALSE(all_rows_visible(s3, duckdb::TransactionData(txn3)));
+  exec_ok(*env.con, "ROLLBACK");
+}
+
+TEST_CASE("mvcc visibility: all_rows_visible tracks foreign commits relative to the snapshot",
+          "[duckdb_mvcc_visibility][scan]")
+{
+  vis_test_db env;
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  duckdb::Connection con2(*env.db);
+
+  // Snapshot opened BEFORE a foreign insert commits: the appended rows are
+  // physically present in the row groups but must be invisible — refuse.
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  auto& txn     = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached());
+  REQUIRE(all_rows_visible(storage, duckdb::TransactionData(txn)));
+  exec_ok(con2, "INSERT INTO t SELECT range + 10000 FROM range(5000)");
+  REQUIRE_FALSE(all_rows_visible(storage, duckdb::TransactionData(txn)));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // A snapshot opened AFTER the commit sees every row — exact again.
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& s2   = resolve_storage(*env.con, "t");
+  auto& txn2 = duckdb::DuckTransaction::Get(*env.con->context, s2.GetAttached());
+  REQUIRE(all_rows_visible(s2, duckdb::TransactionData(txn2)));
+  exec_ok(*env.con, "ROLLBACK");
+}

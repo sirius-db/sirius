@@ -141,4 +141,24 @@ bool any_update_chains(duckdb::DataTable& storage,
  */
 bool has_any_version_state(duckdb::DataTable& storage, std::size_t row_prefix);
 
+/**
+ * @brief True when every physically present row of @p storage is visible to
+ *        @p transaction (insert- AND delete-side) — the exactness condition
+ *        for the MVCC-blind disk-native read at this snapshot.
+ *
+ * Precise complement to has_any_version_state: row groups whose non-loading
+ * probe is clean are skipped outright; dirty ones are answered by DuckDB's
+ * own RowGroup::GetVisibleRowCount(transaction) == physical count. The
+ * precision matters because the probe is conservative the wrong way for
+ * unpinned tables — a RowVersionManager created by this session's own writes
+ * stays attached after every row became globally visible, and guarding on
+ * the probe alone would push every same-session-written table off the GPU
+ * permanently. SERIAL — prepare/query thread only; probe-dirty row groups
+ * pay one visibility count each.
+ *
+ * Does NOT see transaction-local appends (they live in LocalStorage, outside
+ * the table's segment tree) — callers guard those separately.
+ */
+bool all_rows_visible(duckdb::DataTable& storage, duckdb::TransactionData transaction);
+
 }  // namespace sirius::op::scan
