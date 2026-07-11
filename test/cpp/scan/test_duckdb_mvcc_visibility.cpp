@@ -394,7 +394,12 @@ TEST_CASE("mvcc visibility: persisted tombstones load through a reopened databas
 
   exec_ok(*env.con, "BEGIN TRANSACTION");
   auto& storage = resolve_storage(*env.con, "t");
-  REQUIRE(has_any_version_state(storage, static_cast<std::size_t>(storage.GetTotalRows())));
+  // The unloaded tombstones make the native read inexact: the fused check's
+  // visibility tier loads and applies them.
+  std::vector<duckdb::storage_t> const col_k{0};
+  auto& probe_txn = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached());
+  REQUIRE(check_native_read_mvcc_state(storage, col_k, duckdb::TransactionData(probe_txn)) ==
+          native_read_mvcc_state::has_invisible_rows);
 
   auto metadata = make_metadata(*env.con, storage, 1);
   auto plan     = capture_mvcc_visibility_plan(storage, *env.con->context, metadata);
@@ -406,26 +411,30 @@ TEST_CASE("mvcc visibility: persisted tombstones load through a reopened databas
   exec_ok(*env.con, "ROLLBACK");
 }
 
-TEST_CASE("mvcc visibility: has_any_version_state flags deletes, clean tables pass",
+TEST_CASE("mvcc visibility: fused check on a reopened table takes the probe-clean fast path",
           "[duckdb_mvcc_visibility][scan]")
 {
   vis_test_db env;
   exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
   exec_ok(*env.con, "CHECKPOINT");
   env.reopen();  // freshly-loaded table: the provably-clean baseline
+  std::vector<duckdb::storage_t> const col_k{0};
 
   exec_ok(*env.con, "BEGIN TRANSACTION");
-  auto& storage    = resolve_storage(*env.con, "t");
-  auto const total = static_cast<std::size_t>(storage.GetTotalRows());
-  REQUIRE_FALSE(has_any_version_state(storage, total));
+  auto& storage = resolve_storage(*env.con, "t");
+  auto& txn     = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached());
+  REQUIRE(check_native_read_mvcc_state(storage, col_k, duckdb::TransactionData(txn)) ==
+          native_read_mvcc_state::exact);
   exec_ok(*env.con, "COMMIT");
 
   SECTION("uncommitted delete")
   {
     exec_ok(*env.con, "BEGIN TRANSACTION");
     exec_ok(*env.con, "DELETE FROM t WHERE rowid = 5");
-    auto& s = resolve_storage(*env.con, "t");
-    REQUIRE(has_any_version_state(s, total));
+    auto& s   = resolve_storage(*env.con, "t");
+    auto& tx2 = duckdb::DuckTransaction::Get(*env.con->context, s.GetAttached());
+    REQUIRE(check_native_read_mvcc_state(s, col_k, duckdb::TransactionData(tx2)) ==
+            native_read_mvcc_state::has_invisible_rows);
     exec_ok(*env.con, "ROLLBACK");
   }
 
@@ -433,8 +442,10 @@ TEST_CASE("mvcc visibility: has_any_version_state flags deletes, clean tables pa
   {
     exec_ok(*env.con, "DELETE FROM t WHERE rowid = 5");
     exec_ok(*env.con, "BEGIN TRANSACTION");
-    auto& s = resolve_storage(*env.con, "t");
-    REQUIRE(has_any_version_state(s, total));
+    auto& s   = resolve_storage(*env.con, "t");
+    auto& tx2 = duckdb::DuckTransaction::Get(*env.con->context, s.GetAttached());
+    REQUIRE(check_native_read_mvcc_state(s, col_k, duckdb::TransactionData(tx2)) ==
+            native_read_mvcc_state::has_invisible_rows);
     exec_ok(*env.con, "ROLLBACK");
   }
 }
@@ -473,28 +484,31 @@ TEST_CASE("mvcc visibility: any_update_chains flags updated columns only",
   exec_ok(*env.con, "ROLLBACK");
 }
 
-TEST_CASE("mvcc visibility: all_rows_visible is precise where the probe is conservative",
+TEST_CASE("mvcc visibility: fused native-read check is precise where the probe is conservative",
           "[duckdb_mvcc_visibility][scan]")
 {
   vis_test_db env;
   exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  std::vector<duckdb::storage_t> const col_k{0};
 
   // Same-session writes leave the RowVersionManager attached (probe-dirty
-  // forever), but every row is committed and visible — the precise walk is
-  // what keeps such tables eligible for the disk-native read.
+  // forever), but every row is committed and visible — the fused walk's
+  // visibility tier is what keeps such tables eligible for the disk-native
+  // read.
   exec_ok(*env.con, "BEGIN TRANSACTION");
   auto& storage = resolve_storage(*env.con, "t");
-  REQUIRE(has_any_version_state(storage, 10000));  // conservative probe: dirty
-  auto& txn = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached());
-  REQUIRE(all_rows_visible(storage, duckdb::TransactionData(txn)));  // precise: exact
+  auto& txn     = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached());
+  REQUIRE(check_native_read_mvcc_state(storage, col_k, duckdb::TransactionData(txn)) ==
+          native_read_mvcc_state::exact);
   exec_ok(*env.con, "ROLLBACK");
 
-  // A committed delete is dropped at every later snapshot — walk refuses.
+  // A committed delete is dropped at every later snapshot — refuse.
   exec_ok(*env.con, "DELETE FROM t WHERE k = 42");
   exec_ok(*env.con, "BEGIN TRANSACTION");
   auto& s2   = resolve_storage(*env.con, "t");
   auto& txn2 = duckdb::DuckTransaction::Get(*env.con->context, s2.GetAttached());
-  REQUIRE_FALSE(all_rows_visible(s2, duckdb::TransactionData(txn2)));
+  REQUIRE(check_native_read_mvcc_state(s2, col_k, duckdb::TransactionData(txn2)) ==
+          native_read_mvcc_state::has_invisible_rows);
   exec_ok(*env.con, "ROLLBACK");
 
   // The query's own uncommitted delete must also refuse (invisible to self).
@@ -502,31 +516,58 @@ TEST_CASE("mvcc visibility: all_rows_visible is precise where the probe is conse
   exec_ok(*env.con, "DELETE FROM t WHERE k = 7");
   auto& s3   = resolve_storage(*env.con, "t");
   auto& txn3 = duckdb::DuckTransaction::Get(*env.con->context, s3.GetAttached());
-  REQUIRE_FALSE(all_rows_visible(s3, duckdb::TransactionData(txn3)));
+  REQUIRE(check_native_read_mvcc_state(s3, col_k, duckdb::TransactionData(txn3)) ==
+          native_read_mvcc_state::has_invisible_rows);
   exec_ok(*env.con, "ROLLBACK");
 }
 
-TEST_CASE("mvcc visibility: all_rows_visible tracks foreign commits relative to the snapshot",
+TEST_CASE("mvcc visibility: fused native-read check tracks foreign commits and update chains",
           "[duckdb_mvcc_visibility][scan]")
 {
   vis_test_db env;
-  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*env.con,
+          "CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(10000)");
   duckdb::Connection con2(*env.db);
+  std::vector<duckdb::storage_t> const col_k{0};
+  std::vector<duckdb::storage_t> const col_v{1};
+  std::vector<duckdb::storage_t> const both{0, 1};
 
   // Snapshot opened BEFORE a foreign insert commits: the appended rows are
   // physically present in the row groups but must be invisible — refuse.
   exec_ok(*env.con, "BEGIN TRANSACTION");
   auto& storage = resolve_storage(*env.con, "t");
   auto& txn     = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached());
-  REQUIRE(all_rows_visible(storage, duckdb::TransactionData(txn)));
-  exec_ok(con2, "INSERT INTO t SELECT range + 10000 FROM range(5000)");
-  REQUIRE_FALSE(all_rows_visible(storage, duckdb::TransactionData(txn)));
+  REQUIRE(check_native_read_mvcc_state(storage, both, duckdb::TransactionData(txn)) ==
+          native_read_mvcc_state::exact);
+  exec_ok(con2, "INSERT INTO t SELECT range + 10000, 0 FROM range(5000)");
+  REQUIRE(check_native_read_mvcc_state(storage, both, duckdb::TransactionData(txn)) ==
+          native_read_mvcc_state::has_invisible_rows);
   exec_ok(*env.con, "ROLLBACK");
 
   // A snapshot opened AFTER the commit sees every row — exact again.
   exec_ok(*env.con, "BEGIN TRANSACTION");
   auto& s2   = resolve_storage(*env.con, "t");
   auto& txn2 = duckdb::DuckTransaction::Get(*env.con->context, s2.GetAttached());
-  REQUIRE(all_rows_visible(s2, duckdb::TransactionData(txn2)));
+  REQUIRE(check_native_read_mvcc_state(s2, both, duckdb::TransactionData(txn2)) ==
+          native_read_mvcc_state::exact);
+  exec_ok(*env.con, "ROLLBACK");
+
+  // Update chains gate only the scanned columns, and fold away at CHECKPOINT.
+  exec_ok(*env.con, "UPDATE t SET v = v + 1 WHERE k < 10");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& s3   = resolve_storage(*env.con, "t");
+  auto& txn3 = duckdb::DuckTransaction::Get(*env.con->context, s3.GetAttached());
+  REQUIRE(check_native_read_mvcc_state(s3, col_v, duckdb::TransactionData(txn3)) ==
+          native_read_mvcc_state::has_update_chains);
+  REQUIRE(check_native_read_mvcc_state(s3, col_k, duckdb::TransactionData(txn3)) ==
+          native_read_mvcc_state::exact);
+  exec_ok(*env.con, "ROLLBACK");
+
+  exec_ok(*env.con, "CHECKPOINT");  // folds the update chain into the base data
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& s4   = resolve_storage(*env.con, "t");
+  auto& txn4 = duckdb::DuckTransaction::Get(*env.con->context, s4.GetAttached());
+  REQUIRE(check_native_read_mvcc_state(s4, both, duckdb::TransactionData(txn4)) ==
+          native_read_mvcc_state::exact);
   exec_ok(*env.con, "ROLLBACK");
 }

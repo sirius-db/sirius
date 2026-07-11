@@ -209,17 +209,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
           pin_serves = !entry->cache_info.column_projection_for(column_ids).empty();
         }
         if (!pin_serves) {
-          // (d) column-mismatch, clean-table relaxation: with zero
-          // divergence from the disk image the native read is exact for
-          // every active snapshot — DuckDB cannot clean up version info an
-          // older active transaction still needs, and later commits are
-          // invisible to this query's start_time.
-          bool const clean =
-            !sirius::op::scan::has_any_version_state(
-              storage, static_cast<std::size_t>(storage.GetTotalRows())) &&
-            !sirius::op::scan::any_update_chains(
-              storage, projected, static_cast<std::size_t>(storage.GetTotalRows()));
-          if (!clean) {
+          // (d) column-mismatch: the scan falls through to the disk-native
+          // read, so it must pass the same fused exactness check as an
+          // unpinned scan — no update chains on the scanned columns, every
+          // physically present row visible at this snapshot (probe-dirty
+          // row groups resolved by GetVisibleRowCount, so a session-written
+          // but fully-visible table keeps the native GPU path instead of
+          // declining to CPU). Guards (a)/(b) already excluded post-pin
+          // inserts and transaction-local appends.
+          auto& txn = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
+          if (sirius::op::scan::check_native_read_mvcc_state(
+                storage, projected, duckdb::TransactionData(txn)) !=
+              sirius::op::scan::native_read_mvcc_state::exact) {
             throw duckdb::NotImplementedException(
               "duckdb-native scan: table '%s' is MVCC-pinned, the pin cannot serve the "
               "requested columns, and the table has diverged from its last-checkpointed "
@@ -240,9 +241,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         // read (or a cached image byte-identical to it), which applies no
         // visibility filtering — refuse any state it would misread, HERE,
         // where the throw still becomes a clean CPU fallback (#1143).
-        // all_rows_visible walks only probe-dirty row groups, so tables
-        // written earlier in this session (their version managers stay
-        // attached after cleanup) keep the GPU path once every row is
+        // One fused row-group walk checks update chains and row visibility
+        // together; only probe-dirty row groups pay the visibility count, so
+        // tables written earlier in this session (their version managers
+        // stay attached after cleanup) keep the GPU path once every row is
         // visible at this snapshot. Residual race: a row committing between
         // this check and the scan's metadata capture is read unmasked; the
         // keep-mask machinery planned for #1143 closes it.
@@ -252,20 +254,21 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             "the disk-native read cannot see transaction-local rows",
             table.name);
         }
-        if (sirius::op::scan::any_update_chains(
-              storage, projected, static_cast<std::size_t>(storage.GetTotalRows()))) {
-          throw duckdb::NotImplementedException(
-            "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
-            "column; the disk-native read would return stale values",
-            table.name);
-        }
         auto& txn = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
-        if (!sirius::op::scan::all_rows_visible(storage, duckdb::TransactionData(txn))) {
-          throw duckdb::NotImplementedException(
-            "duckdb-native scan: table '%s' has rows not visible to this transaction "
-            "(uncheckpointed deletes or in-flight inserts); the disk-native read is "
-            "MVCC-blind",
-            table.name);
+        switch (sirius::op::scan::check_native_read_mvcc_state(
+          storage, projected, duckdb::TransactionData(txn))) {
+          case sirius::op::scan::native_read_mvcc_state::has_update_chains:
+            throw duckdb::NotImplementedException(
+              "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
+              "column; the disk-native read would return stale values",
+              table.name);
+          case sirius::op::scan::native_read_mvcc_state::has_invisible_rows:
+            throw duckdb::NotImplementedException(
+              "duckdb-native scan: table '%s' has rows not visible to this transaction "
+              "(uncheckpointed deletes or in-flight inserts); the disk-native read is "
+              "MVCC-blind",
+              table.name);
+          case sirius::op::scan::native_read_mvcc_state::exact: break;
         }
       }
     }

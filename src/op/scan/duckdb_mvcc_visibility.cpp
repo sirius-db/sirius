@@ -241,34 +241,29 @@ bool any_update_chains(duckdb::DataTable& storage,
   return false;
 }
 
-bool has_any_version_state(duckdb::DataTable& storage, std::size_t row_prefix)
-{
-  if (row_prefix == 0) { return false; }
-  auto tree           = storage.GetRowGroupCollection()->GetRowGroups();
-  std::size_t covered = 0;
-  for (duckdb::idx_t rg_index = 0; covered < row_prefix; ++rg_index) {
-    auto node = tree->GetSegmentByIndex(static_cast<int64_t>(rg_index));
-    if (!node) { break; }
-    if (row_group_has_version_state(*node)) { return true; }
-    covered = static_cast<std::size_t>(node->GetRowStart()) +
-              static_cast<std::size_t>(node->GetNode().count.load());
-  }
-  return false;
-}
-
-bool all_rows_visible(duckdb::DataTable& storage, duckdb::TransactionData transaction)
+native_read_mvcc_state check_native_read_mvcc_state(
+  duckdb::DataTable& storage,
+  std::span<duckdb::storage_t const> scanned_columns,
+  duckdb::TransactionData transaction)
 {
   auto tree = storage.GetRowGroupCollection()->GetRowGroups();
   for (duckdb::idx_t rg_index = 0;; ++rg_index) {
     auto node = tree->GetSegmentByIndex(static_cast<int64_t>(rg_index));
-    if (!node) { return true; }
-    if (!row_group_has_version_state(*node)) { continue; }
+    if (!node) { return native_read_mvcc_state::exact; }
     auto& rg = node->GetNode();
+    for (auto col : scanned_columns) {
+      if (rg.GetRawColumnData(col).HasUpdates()) {
+        return native_read_mvcc_state::has_update_chains;
+      }
+    }
+    if (!row_group_has_version_state(*node)) { continue; }
     // Load the physical count BEFORE the visibility count: a concurrent
     // append between the two reads makes the counts diverge in either
     // order, which refuses — never falsely matches.
     auto const physical = static_cast<duckdb::idx_t>(rg.count.load());
-    if (rg.GetVisibleRowCount(transaction) != physical) { return false; }
+    if (rg.GetVisibleRowCount(transaction) != physical) {
+      return native_read_mvcc_state::has_invisible_rows;
+    }
   }
 }
 

@@ -327,25 +327,18 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
 }
 
 TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "mvcc guards: column-mismatch serves the disk path only while provably clean",
+                 "mvcc guards: column-mismatch serves the disk path only while exact",
                  "[integration][gpu_execution][pin_table_mvcc_delete]")
 {
   run_ok(
     "CREATE TABLE t AS SELECT range::INTEGER AS a, (range * 3)::INTEGER AS b "
     "FROM range(100000);");
   run_ok("CHECKPOINT;");
-  // A table written this session keeps its version managers attached for the
-  // process lifetime (conservatively "diverged"); re-attach the database so
-  // the row groups load fresh — the provably-clean ATTACH-then-pin shape.
-  run_ok("USE memory;");
-  run_ok("DETACH " + attach_alias + ";");
-  run_ok("ATTACH '" + temp_db_path + "' AS " + attach_alias + ";");
-  run_ok("USE " + attach_alias + ";");
-
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
 
-  // Clean table: the pin cannot serve column b, but nothing has diverged from
-  // the disk image — the scan may take the native GPU path ({1,0,1}).
+  // The pin cannot serve column b. A session-written table keeps its version
+  // managers attached (conservatively dirty), but every row is visible — the
+  // fused exactness check keeps the scan on the native GPU path ({1,0,1}).
   compare_gpu_vs_cpu("SELECT sum(b) FROM t;");
 
   // After a committed DELETE the disk image is stale: the same scan must now
