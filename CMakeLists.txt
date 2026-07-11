@@ -48,25 +48,26 @@ if(ENABLE_ROCM)
   # gfx950 — the Instinct MI series hipDF supports). 'native' is only meaningful on a
   # host with an AMD GPU, so default to the explicit set for portability.
   set(SIRIUS_GPU_LANG "HIP")
-  set(SIRIUS_GPU_STANDARD_VAR "CMAKE_HIP_STANDARD")
   if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES gfx90a;gfx942;gfx950)
     message(STATUS "CMAKE_HIP_ARCHITECTURES not defined. Setting to 'gfx90a;gfx942;gfx950'.")
   endif()
 else()
   set(SIRIUS_GPU_LANG "CUDA")
-  set(SIRIUS_GPU_STANDARD_VAR "CMAKE_CUDA_STANDARD")
 endif()
 
 project(sirius LANGUAGES CXX ${SIRIUS_GPU_LANG})
 
-# Set GPU architecture
+# Under ROCm the CUDA language is not enabled, so CMake's default source-file
+# extension map (which only treats .hip as HIP) would leave the .cu files in
+# CUDA_SOURCES without a language. Tell CMake that .cu is also a HIP source so
+# hip-clang compiles them. (hipDF's own .cu files rely on the same convention.)
 if(ENABLE_ROCM)
-  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-    set(CMAKE_HIP_ARCHITECTURES gfx90a;gfx942;gfx950)
-    message(STATUS "CMAKE_HIP_ARCHITECTURES not defined. Setting to 'gfx90a;gfx942;gfx950'.")
-  endif()
-else()
+  list(APPEND CMAKE_HIP_SOURCE_FILE_EXTENSIONS cu)
+endif()
+
+# Set GPU architecture (CUDA path only; HIP archs are set before project() above).
+if(NOT ENABLE_ROCM)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES native)
     message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
@@ -157,12 +158,16 @@ find_package(OpenSSL REQUIRED)
 # shipped in the roctracer / rocprofiler-developer-tools package. Resolved with
 # find_library (matching rocBLAS) so a non-default ROCm install path is honored.
 # The header is <roctracer/roctx.h>, consumed by cmake/rocm_compat/nvtx3/nvtx3.hpp.
+# ROCTX_PATH is an optional user override pointing at the ROCm install root.
 if(ENABLE_ROCM)
-  find_path(ROCTX_INCLUDE_DIR NAMES roctracer/roctx.h HINTS /opt/rocm/include)
-  find_library(ROCTX_LIBRARY NAMES roctx64 HINTS /opt/rocm/lib /opt/rocm)
-  if(NOT ROCTX_LIBRARY)
-    message(FATAL_ERROR "ENABLE_ROCM requires libroctx64 (roctracer/rocprofiler-developer-tools). "
-                        "Set ROCTX_PATH or install rocm-profiler-sdk.")
+  find_path(ROCTX_INCLUDE_DIR NAMES roctracer/roctx.h
+            HINTS ${ROCTX_PATH}/include ${ROCTX_PATH} /opt/rocm/include)
+  find_library(ROCTX_LIBRARY NAMES roctx64
+               HINTS ${ROCTX_PATH}/lib ${ROCTX_PATH} /opt/rocm/lib /opt/rocm)
+  if(NOT ROCTX_INCLUDE_DIR OR NOT ROCTX_LIBRARY)
+    message(FATAL_ERROR "ENABLE_ROCM requires the roctx profiling library (libroctx64 + "
+                        "roctracer/roctx.h), shipped in the roctracer / rocprofiler-developer-tools "
+                        "package. Set -DROCTX_PATH=/path/to/rocm or install the package.")
   endif()
 endif()
 
@@ -529,7 +534,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
                  CXX_STANDARD_REQUIRED ON
                  HIP_STANDARD 20
                  HIP_STANDARD_REQUIRED ON
-                 HIP_SEPARABLE_COMPILATION ON)
+                 HIP_SEPARABLE_COMPILATION ON
+                 HIP_RESOLVE_DEVICE_SYMBOLS ON)
   else()
     set_target_properties(
       ${_target}
@@ -567,7 +573,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
-      # ROCm compatibility shims (nvtx3→rotx, etc.) — on the include path only
+      # ROCm compatibility shims (nvtx3→roctx, etc.) — on the include path only
       # when ENABLE_ROCM is ON so they shadow the NVIDIA headers that don't
       # exist on an AMD host. See cmake/rocm_compat/.
       $<$<BOOL:${ENABLE_ROCM}>:${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat>
@@ -894,6 +900,15 @@ target_include_directories(
 target_link_libraries(sirius_unittest sirius_extension duckdb_static)
 link_extension_libraries(sirius_unittest "")
 
+# ROCm: the nvtx3 shim (on the include path above) #includes <roctracer/roctx.h>,
+# which requires ROCTX_INCLUDE_DIR. The extension targets get this inside the
+# foreach above; sirius_unittest pulls in nvtx3 transitively via sirius_pipeline.hpp
+# / helper.hpp, so it needs the same include dir + link.
+if(ENABLE_ROCM)
+  target_include_directories(sirius_unittest PRIVATE ${ROCTX_INCLUDE_DIR})
+  target_link_libraries(sirius_unittest PRIVATE ${ROCTX_LIBRARY})
+endif()
+
 # S3 container harness: the testcontainers-native bridge plus libcurl for
 # host-side fixture upload (SigV4 signing comes from sirius_extension). Gated so
 # offline/Go-less builds skip it; the harness calls in unittest.cpp are guarded
@@ -953,8 +968,22 @@ target_link_libraries(
 if(SIRIUS_ENABLE_CUCASCADE)
   target_link_libraries(parquet_benchmark
                         cuCascade::cucascade cuCascade::cucascade_cudf)
+else()
+  # parquet_benchmark.cpp unconditionally #includes <cucascade/...> headers and
+  # uses cucascade:: types (see PORTING.md). When cuCascade is gated off the
+  # source won't compile, so skip the target entirely rather than emit a
+  # confusing cascade of header-not-found errors.
+  set_target_properties(parquet_benchmark PROPERTIES EXCLUDE_FROM_ALL ON)
+  message(STATUS "parquet_benchmark excluded: SIRIUS_ENABLE_CUCASCADE is OFF "
+                 "(parquet_benchmark.cpp requires cuCascade headers)")
 endif()
 link_extension_libraries(parquet_benchmark "")
+
+# ROCm: same roctx include/link as sirius_unittest (nvtx3 shim → roctx.h).
+if(ENABLE_ROCM)
+  target_include_directories(parquet_benchmark PRIVATE ${ROCTX_INCLUDE_DIR})
+  target_link_libraries(parquet_benchmark PRIVATE ${ROCTX_LIBRARY})
+endif()
 
 target_link_options(parquet_benchmark PRIVATE
                     "LINKER:--allow-multiple-definition")
