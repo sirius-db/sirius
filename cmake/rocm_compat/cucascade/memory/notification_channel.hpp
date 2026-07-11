@@ -15,16 +15,23 @@ class notification_channel {
    public:
     void notify() {}
   };
-  template <typename Fn>
-  notify_on_exit(Fn&&) -> notify_on_exit<std::decay_t<Fn>>;
-  template <typename Fn>
-  class notify_on_exit {
-   public:
-    explicit notify_on_exit(Fn fn) : fn_(std::move(fn)) {}
-    ~notify_on_exit() { fn_(); }
-   private:
-    Fn fn_;
-  };
 };
+
+/// RAII guard that calls a function on destruction.
+template <typename Fn>
+class notify_on_exit {
+ public:
+  explicit notify_on_exit(Fn fn) : fn_(std::move(fn)) {}
+  ~notify_on_exit() { fn_(); }
+  notify_on_exit(notify_on_exit const&) = delete;
+  notify_on_exit& operator=(notify_on_exit const&) = delete;
+ private:
+  Fn fn_;
+};
+
+template <typename Fn>
+notify_on_exit<Fn> make_notify_on_exit(Fn fn) {
+  return notify_on_exit<Fn>(std::move(fn));
+}
 
 }  // namespace cucascade::memory

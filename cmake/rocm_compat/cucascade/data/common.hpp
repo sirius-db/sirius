@@ -50,6 +50,14 @@ class idata_representation {
     return *ptr;
   }
 
+  /// Const overload — Sirius calls cast() on const idata_representation*.
+  template <typename TargetType>
+  TargetType const& cast() const {
+    auto const* ptr = dynamic_cast<TargetType const*>(this);
+    if (!ptr) throw std::runtime_error("cuCascade stub: cast failed");
+    return *ptr;
+  }
+
  protected:
   memory::memory_space* space_;
 };

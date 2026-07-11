@@ -1,0 +1,4 @@
+// CCCL <cuda/std/algorithm> redirect for ROCm. See _redirect.hpp.
+#pragma once
+#include <algorithm>
+#include "cuda/std/_redirect.hpp"

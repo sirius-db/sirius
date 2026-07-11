@@ -1,0 +1,22 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ * Licensed under the Apache License, Version 2.0 (see LICENSE).
+ */
+
+//! @file
+//! CCCL @c <cuda/cmath> redirect for ROCm.
+//! Provides @c ::cuda::ceil_div — the only symbol Sirius uses from this header.
+
+#pragma once
+
+#include <cstdint>
+
+namespace cuda {
+
+/// Ceiling division: (a + b - 1) / b. Works in device and host code.
+template <typename A, typename B>
+__host__ __device__ constexpr auto ceil_div(A a, B b) -> decltype((a + b - 1) / b) {
+  return (a + b - 1) / b;
+}
+
+}  // namespace cuda

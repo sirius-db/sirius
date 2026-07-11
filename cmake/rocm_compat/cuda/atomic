@@ -1,0 +1,20 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ * Licensed under the Apache License, Version 2.0 (see LICENSE).
+ */
+
+//! @file
+//! CCCL @c <cuda/atomic> redirect for ROCm.
+//! No direct @c cuda::atomic usage found in live Sirius code; this header
+//! exists in case it's pulled transitively. Maps to @c <atomic>.
+
+#pragma once
+
+#include <atomic>
+
+namespace cuda {
+namespace std {
+using std::atomic;
+using std::atomic_ref;
+}  // namespace std
+}  // namespace cuda
