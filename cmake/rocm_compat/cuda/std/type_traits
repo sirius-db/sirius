@@ -1,0 +1,4 @@
+// CCCL <cuda/std/type_traits> redirect for ROCm. See _redirect.hpp.
+#pragma once
+#include <type_traits>
+#include "cuda/std/_redirect.hpp"

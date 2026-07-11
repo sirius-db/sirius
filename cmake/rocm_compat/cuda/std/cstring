@@ -1,0 +1,4 @@
+// CCCL <cuda/std/cstring> redirect for ROCm. See _redirect.hpp.
+#pragma once
+#include <cstring>
+#include "cuda/std/_redirect.hpp"

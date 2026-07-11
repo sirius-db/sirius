@@ -10,6 +10,7 @@
 #pragma once
 
 #include "cucascade/memory/common.hpp"
+#include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/stream_pool.hpp"
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
@@ -61,6 +62,21 @@ class memory_space {
   template <Tier TIER>
   typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of() {
     return nullptr;
+  }
+
+  // --- Memory reservation convenience methods (stub: return defaults) ---
+  std::size_t get_max_memory() const { return 0; }
+  std::size_t get_available_memory() const { return 0; }
+  std::size_t get_total_reserved_memory() const { return 0; }
+
+  std::unique_ptr<reservation> make_reservation(std::size_t /*bytes*/) {
+    throw std::runtime_error("cuCascade stub: memory_space::make_reservation");
+  }
+  std::unique_ptr<reservation> make_reservation_or_null(std::size_t /*bytes*/) {
+    return nullptr;
+  }
+  std::unique_ptr<reservation> make_reservation_upto(std::size_t /*bytes*/) {
+    throw std::runtime_error("cuCascade stub: memory_space::make_reservation_upto");
   }
 
  private:

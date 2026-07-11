@@ -49,8 +49,8 @@ class reservation {
   std::size_t size() const {
     return arena_ ? arena_->size() : 0;
   }
-  Tier tier() const;
-  int32_t device_id() const;
+  Tier tier() const { return space_ ? space_->get_tier() : Tier::GPU; }
+  int32_t device_id() const { return space_ ? space_->get_device_id() : 0; }
   memory_space const& get_memory_space() const { return *space_; }
 
   void grow_by(std::size_t n) { if (arena_) arena_->grow_by(n); }
