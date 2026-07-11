@@ -262,9 +262,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
     // STATISTICS_PROPAGATION folds metadata-only aggregates (count(*) / MIN / MAX) into
     // constant EXPRESSION_GET / DUMMY_SCAN sources, which need CPU-materialized data —
-    // plan generation rejects those while cpu_source_task dispatch stays reverted
-    // (#1114). Disable the fold (mirroring the transparent path) so such queries run as
-    // GPU aggregates instead of falling back to CPU.
+    // plan generation rejects those since CPU-source execution was removed (#980,
+    // reverted in #1114). Disable the fold (mirroring the transparent path) so such
+    // queries run as GPU aggregates instead of falling back to CPU.
     disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);

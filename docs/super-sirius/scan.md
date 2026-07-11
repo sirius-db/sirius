@@ -39,7 +39,7 @@ The operator handles two split shapes transparently, both delivered as `scan_ope
 
 `no_history_peak_memory_estimate()` returns the input size for resident (cached) inputs. For fresh reads it reserves 8x the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint.
 
-> The `DUCKDB_SCAN` and `PARQUET_SCAN` physical operator types and the `sirius_physical_table_scan` / `sirius_physical_duckdb_scan` / `sirius_physical_parquet_scan` wrappers still exist for the CPU / DuckDB-source path, but the GPU read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
+> `sirius_physical_table_scan` (`TABLE_SCAN`) remains only as the plan-time carrier that `wrap_table_scan_source` consumes; the read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
 
 ## gpu_ingestible
 
@@ -462,5 +462,4 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 | `src/include/scan_manager/config.hpp` | `scan_manager_config` |
 | `src/include/pin_table.hpp` / `src/pin_table.cpp` | `pin_table` / `unpin_table` + pin materialization |
 | `src/include/op/scan/cached_ranges.hpp` / `src/op/scan/cached_ranges.cpp` | Sorted byte-range coalescing/lookup |
-| `src/include/op/scan/cpu_source_task.hpp` / `src/op/scan/cpu_source_task.cpp` | CPU-source scan task (ColumnDataCollection / empty / dummy) |
 | `src/op/scan/scan_utils.cpp` | Row group pruning, filter expression conversion |

@@ -206,8 +206,6 @@ set(EXTENSION_SOURCES
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
-    src/data/host_parquet_representation.cpp
-    src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
     src/expression/ast/node.cpp
@@ -262,7 +260,6 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
-    src/op/scan/hive_partition.cpp
     src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/owning_table_view.cpp
@@ -278,11 +275,9 @@ set(EXTENSION_SOURCES
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
-    src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
-    src/op/sirius_physical_duckdb_scan.cpp
     src/op/sirius_physical_dummy_scan.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
@@ -295,7 +290,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_operator.cpp
     src/op/sirius_physical_operator_type.cpp
     src/op/sirius_physical_order.cpp
-    src/op/sirius_physical_parquet_scan.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
     src/op/sirius_physical_projection.cpp

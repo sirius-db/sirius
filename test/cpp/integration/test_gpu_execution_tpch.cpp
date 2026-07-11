@@ -5160,9 +5160,10 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 // constant EXPRESSION_GET / DUMMY_SCAN sources — the aggregate tests below pin
 // that (rebind + execute, zero fallback). Plans that DO need a CPU-materialized
 // source (bare VALUES, no-table SELECT, provably-empty scans) are rejected at
-// plan generation while cpu_source_task dispatch stays reverted (#1114) and
-// must complete correctly via the transparent CPU fallback — the fallback
-// tests at the end of this section pin that.
+// plan generation — the engine has no CPU-source execution (#980 was reverted
+// in #1114 and the machinery deleted) — and must complete correctly via the
+// transparent CPU fallback; the fallback tests at the end of this section pin
+// that.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
