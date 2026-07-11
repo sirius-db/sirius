@@ -65,19 +65,49 @@ No source edits needed.
 
 ### 2.4 The CUDA Runtime Compatibility Layer
 
-**This is the mechanism that eliminates per-file HIPIFY.**
+**⚠️ This section's original claim was empirically disproven on a real ROCm
+7.2.1 / gfx942 host. See §12 for the compile-test results.**
 
-hipDF's own source files (`cpp/src/utilities/cuda_memcpy.cu`, `cuda.cpp`) keep
-`cuda*` runtime calls verbatim — `cudaMemcpyAsync`, `cudaGetDevice`,
-`cudaDeviceGetAttribute`, etc. They compile as HIP because the ROCm SDK
-installs a compatibility layer: when hip-clang compiles a `.cu` file, `cuda*`
-symbols are macro-aliased to `hip*` equivalents, and a `cuda_runtime.h`
-wrapper is provided.
+The original assumption: hipDF keeps `cuda*` calls verbatim in its source, so
+the ROCm SDK must provide a compatibility layer that macro-aliases `cuda*` to
+`hip*`. Therefore Sirius's 69 files with `cuda*` calls would need zero edits.
 
-Sirius has ~67 distinct `cuda*` symbols across 69 live files. Because hipDF
-relies on this same layer, Sirius's `cuda*` calls need zero source edits —
-the layer covers them. The at-risk symbols (where the layer may be incomplete)
-are catalogued in §5.
+**What actually happens on a stock ROCm 7.2.1 install (no hipDF):**
+
+| Test | Result |
+|---|---|
+| `#include <cuda_runtime.h>` | ❌ `fatal error: 'cuda_runtime.h' file not found` — not installed |
+| `cudaError_t`, `cudaMalloc`, `cudaMemcpy` | ❌ `unknown type name`, `use of undeclared identifier` — NOT aliased |
+| `cudaDeviceProp`, `cudaGetDeviceProperties` | ❌ `unknown type name 'cudaDeviceProp'` — NOT aliased |
+| `#include <cub/cub.cuh>` | ❌ `file not found` — hipCUB provides `hipcub/`, not `cub/` |
+| `#include <thrust/...>` | ✅ rocThrust provides `thrust/` natively |
+| `__syncwarp()` | ✅ compiles (HIP provides it) |
+| `__shfl_xor_sync(mask, ...)` with 32-bit mask | ❌ `static_assert: mask must be 64-bit` — CUDA accepts 32-bit, HIP requires 64-bit |
+| `#include <hip/hip_cooperative_groups.h>` | ✅ compiles |
+| rotx shim (`<roctracer/roctx.h>`) | ✅ compiles, `roctx_range_id_t` correct |
+
+**The correction:** The compatibility layer that hipDF relies on is **hipDF's
+own build infrastructure**, not the stock ROCm SDK. hipDF bundles CCCL (which
+provides `cub/` headers and `cuda::std`) and likely has its own `cuda_runtime.h`
+wrapper. A Sirius build on AMD **must** have hipDF installed and its include
+paths visible — the stock ROCm SDK alone does not provide `cuda*` or `cub/`
+compatibility.
+
+This means:
+1. `#include <cuda_runtime.h>` in 38 live files will fail without hipDF's
+   compat wrapper on the include path.
+2. `#include <cub/cub.cuh>` and `cub::` usage will fail — hipCUB provides
+   `hipcub/hipcub.cuh`, not `cub/cub.cuh`. The include paths are different.
+3. `cuda*` runtime API calls (`cudaMalloc`, `cudaMemcpy`, etc.) will fail —
+   they must either be HIPIFY'd to `hip*` or the compat wrapper must be
+   provided by hipDF's build.
+4. `__shfl_xor_sync` with a 32-bit mask (`FULL_MASK = 0xFFFFFFFFu`) in
+   `fsst.cuh:132` will fail — HIP requires a 64-bit mask.
+
+The "zero source edits" claim applies only if hipDF's full build environment
+(CCCL, compat wrappers) is on the include path. Whether that suffices for all
+67 `cuda*` symbols is unverified — it requires hipDF to be installed and
+buildable, which is showstopper #2 (§7).
 
 ## 3. Gating Architecture
 
@@ -350,10 +380,71 @@ The `#ifdef`-guard approach is infeasible for cuCascade (§6.3: inheritance +
 public API signatures), so showstopper #1 requires either a cuCascade HIP port
 or a ROCm-native replacement subsystem.
 
-## 11. Verification State
+## 11. Compile-Test Results (Real ROCm 7.2.1 / gfx942)
+
+Compile-only tests (`hipcc -c`, no GPU execution) were run on a real AMD
+gfx942 host (ROCm 7.2.1, hipcc 7.2.53211). Tests were run in `/dev/shm`
+(RAM-backed tmpfs) to avoid interfering with a concurrent training job on the
+host. No hipDF/hipMM was installed (ML training box, not data-science box).
+
+### What compiles ✅
+
+| Test | Details |
+|---|---|
+| Basic `.cu` with `hip/hip_runtime.h` | `__global__`, `<<<>>>` launches — native HIP |
+| `__syncwarp()` | Provided by HIP |
+| `thrust/device_vector.h` | rocThrust provides `thrust/` namespace |
+| `hip/hip_cooperative_groups.h` | `cooperative_groups::this_thread_block()` compiles |
+| roctx shim | `<roctracer/roctx.h>` at `/opt/rocm-7.2.1/include/roctracer/roctx.h`; `roctx_range_id_t`, `roctxRangeStartA`, `roctxRangeStop` all resolve. The `nvtx3::scoped_range` shim compiles correctly. |
+
+### What does NOT compile ❌
+
+| Test | Error | Impact |
+|---|---|---|
+| `#include <cuda_runtime.h>` | `fatal error: 'cuda_runtime.h' file not found` | 38 live files include this — fails without hipDF's compat wrapper |
+| `cudaError_t`, `cudaMalloc`, `cudaMemcpy`, `cudaFree` | `unknown type name`, `use of undeclared identifier` | ~67 distinct `cuda*` symbols across 69 files — NOT aliased to `hip*` on stock ROCm |
+| `cudaDeviceProp`, `cudaGetDeviceProperties` | `unknown type name 'cudaDeviceProp'` | Used in `defragmenter_oom_policy.cpp` and test files |
+| `#include <cub/cub.cuh>` | `file not found` | hipCUB provides `hipcub/hipcub.cuh`, NOT `cub/cub.cuh`. All `cub::` usage needs include-path remapping or HIPIFY |
+| `__shfl_xor_sync(0xFFFFFFFFu, ...)` | `static_assert: The mask must be a 64-bit integer` | `fsst.cuh:132` passes `FULL_MASK = 0xFFFFFFFFu` (32-bit). CUDA accepts this; HIP requires `unsigned long long` (64-bit). |
+
+### What was NOT found on the host
+
+| Component | Searched | Found? |
+|---|---|---|
+| `cuda_runtime.h` | `find / -name cuda_runtime.h` | Only in Triton's NVIDIA backend package (not usable) |
+| `cooperative_groups.h` (CUDA-style) | `find / -name cooperative_groups.h` | Only in Triton (not usable); HIP has `hip/hip_cooperative_groups.h` |
+| `libroctx64.so` | `find /opt/rocm -name libroctx*` | Not found — roctx header exists but library not installed (developer-tools package missing) |
+| `cub/` headers | `find /opt/rocm/include -name cub.cuh` | Not found — hipCUB uses `hipcub/` namespace |
+
+### Key takeaways
+
+1. **The "zero source edits" claim (§2.4) is wrong** without hipDF's full build
+   environment. The stock ROCm SDK does NOT provide `cuda*` → `hip*` aliasing
+   or `cub/` headers. Either hipDF must be installed (providing CCCL + compat
+   wrappers) or the 69 files must be HIPIFY'd.
+
+2. **`cub/` → `hipcub/` is a real include-path problem.** hipCUB does not
+   provide `cub/cub.cuh`. Sirius's kernels include `<cub/cub.cuh>`,
+   `<cub/device/device_for.cuh>`, `<cub/warp/warp_scan.cuh>`, etc. These need
+   either HIPIFY (include rewrite) or a CMake-level include-path alias.
+
+3. **`__shfl_xor_sync` 32-bit mask is a confirmed compile error.** `fsst.cuh:132`
+   must be changed to use a 64-bit mask (or use `cub::ShuffleIndex` which is
+   already used elsewhere in the same file and IS portable).
+
+4. **roctx shim is verified correct** — compiles against the real header.
+
+5. **roctx library is NOT installed** on this host — the `find_library` in CMake
+   would correctly emit `FATAL_ERROR` (as designed).
+
+## 12. Verification State
 
 This port was developed on Apple Silicon (arm64) with no AMD GPU and no
 x86_64 ROCm toolchain. A Linux VM (Colima) was started but ROCm's gfx90a
-toolchain is not packaged for arm64. The work is static, verified by
-inspection and by two independent line-by-line review agents (each read every
-line of all relevant files). It has **not** been compiled or run.
+toolchain is not packaged for arm64.
+
+Compile-only tests were run on a real AMD gfx942 host (ROCm 7.2.1) via
+Tailscale SSH — see §11. These tests were compile-only (`hipcc -c`, no GPU
+execution) in RAM-backed `/dev/shm`, and did not interfere with a concurrent
+training job on the host. No full build was attempted (hipDF/hipMM not
+installed on the host).
