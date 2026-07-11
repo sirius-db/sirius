@@ -61,6 +61,31 @@ using cudaDeviceProp = hipDeviceProp_t;
 // CUDA and HIP have the same struct names for these (verified on ROCm 7.2.1).
 // They are already defined via hip/driver_types.h.
 
+// cudaPointerAttributes → hipPointerAttribute_t. Sirius accesses .type and
+// .device fields. HIP's hipPointerAttribute_t uses .memoryType (not .type),
+// so we provide a thin wrapper that maps .type → .memoryType.
+struct cudaPointerAttributes {
+  hipMemoryType type;
+  int device;
+  void* devicePointer;
+  void* hostPointer;
+  size_t size;
+};
+// Redefine cudaPointerGetAttributes to fill our wrapper.
+inline cudaError_t cudaPointerGetAttributes_impl(cudaPointerAttributes* attrs, void* ptr) {
+  hipPointerAttribute_t hip_attrs{};
+  hipError_t err = hipPointerGetAttributes(&hip_attrs, ptr);
+  if (err == hipSuccess) {
+    attrs->type = hip_attrs.memoryType;
+    attrs->device = hip_attrs.device;
+    attrs->devicePointer = hip_attrs.devicePointer;
+    attrs->hostPointer = hip_attrs.hostPointer;
+    attrs->size = 0;
+  }
+  return err;
+}
+#define cudaPointerGetAttributes(attrs, ptr) cudaPointerGetAttributes_impl((attrs), (ptr))
+
 // ---------------------------------------------------------------------------
 // Error codes
 // ---------------------------------------------------------------------------
@@ -171,7 +196,6 @@ using cudaDeviceProp = hipDeviceProp_t;
 #define cudaMemPoolTrimTo hipMemPoolTrimTo
 #define cudaHostAlloc hipHostAlloc
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
-#define cudaPointerGetAttributes hipPointerGetAttributes
 
 // ---------------------------------------------------------------------------
 // Profiler API — Sirius declares these extern "C" in sirius_extension.cpp.

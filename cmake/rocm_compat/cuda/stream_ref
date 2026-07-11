@@ -24,6 +24,8 @@ class stream_ref {
   /// Returns the underlying stream handle. Sirius calls .value() to get the
   /// raw stream for cudaMemcpyAsync etc.
   hipStream_t value() const { return stream_; }
+  /// Sirius's rmm_cuco_allocator calls stream.get() (CCCL API).
+  hipStream_t get() const { return stream_; }
   operator hipStream_t() const { return stream_; }
 
  private:

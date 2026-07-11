@@ -36,7 +36,7 @@ __device__ uint32_t warp_bitmask_set(uint32_t bitset)
   uint32_t lane_id = threadIdx.x % warpSize;
   uint32_t set     = (bitset << lane_id);
   for (int offset = 16; offset >= 1; offset /= 2) {
-    set |= __shfl_down_sync(0xFFFFFFFF, set, offset);
+    set |= __shfl_down_sync(0xFFFFFFFFull, set, offset);
   }
   return set;
 }

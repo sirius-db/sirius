@@ -23,9 +23,10 @@ namespace cucascade::memory {
 /// Stub: allocate/deallocate throw.
 class fixed_size_host_memory_resource {
  public:
-  static constexpr std::size_t default_pool_size_val = default_pool_size;
-  static constexpr std::size_t default_block_size_val = default_block_size;
-  static constexpr std::size_t default_initial_number_pools_val = default_initial_number_pools;
+  // Sirius accesses these as fixed_size_host_memory_resource::default_pool_size etc.
+  static constexpr std::size_t default_pool_size = ::cucascade::memory::default_pool_size;
+  static constexpr std::size_t default_block_size = ::cucascade::memory::default_block_size;
+  static constexpr std::size_t default_initial_number_pools = ::cucascade::memory::default_initial_number_pools;
 
   /// Multiple-block allocation from this resource. NESTED type — Sirius
   /// references it as fixed_size_host_memory_resource::multiple_blocks_allocation.

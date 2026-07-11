@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <cuda_runtime.h>  // cudaError_t, cudaSuccess, cudaGetLastError, cudaGetErrorString (shim)
 #include <stdexcept>
 #include <string>
 #include <string_view>
