@@ -20,9 +20,8 @@ namespace cucascade {
 
 class representation_converter_registry {
  public:
-  template <typename Src, typename Target>
-  void register_converter(std::function<std::unique_ptr<Target>(Src const&,
-    memory::memory_space const*, rmm::cuda_stream_view)> /*fn*/) {}
+  template <typename Src, typename Target, typename Callable>
+  void register_converter(Callable&& /*fn*/) {}
 
   template <typename Src, typename Target>
   bool has_converter() const { return false; }

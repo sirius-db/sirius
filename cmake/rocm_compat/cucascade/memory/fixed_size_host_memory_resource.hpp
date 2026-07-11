@@ -28,6 +28,24 @@ class fixed_size_host_memory_resource {
   static constexpr std::size_t default_block_size = ::cucascade::memory::default_block_size;
   static constexpr std::size_t default_initial_number_pools = ::cucascade::memory::default_initial_number_pools;
 
+  /// A memory block: a pointer + its size. Sirius calls .data() and uses
+  /// the pointer for arithmetic/memcpy. It also implicitly converts to void*
+  /// for code that treats blocks as raw pointers (memcpy etc.).
+  struct block {
+    void* ptr{nullptr};
+    std::size_t bytes{0};
+
+    block() = default;
+    block(void* p, std::size_t n) : ptr(p), bytes(n) {}
+
+    /// Sirius calls .data() on block elements.
+    void* data() const { return ptr; }
+    std::size_t size() const { return bytes; }
+
+    /// Implicit conversion to void* — Sirius uses blocks[i] in memcpy.
+    operator void*() const { return ptr; }
+  };
+
   /// Multiple-block allocation from this resource. NESTED type — Sirius
   /// references it as fixed_size_host_memory_resource::multiple_blocks_allocation.
   struct multiple_blocks_allocation {
@@ -49,20 +67,24 @@ class fixed_size_host_memory_resource {
     std::size_t size() const { return blocks_.size(); }
     void release_blocks() { blocks_.clear(); }
 
-    void* operator[](std::size_t i) const {
+    block& operator[](std::size_t i) {
       return i < blocks_.size() ? blocks_[i] : throw std::out_of_range("block index");
     }
-    void* at(std::size_t i) const { return operator[](i); }
+    block const& operator[](std::size_t i) const {
+      return i < blocks_.size() ? blocks_[i] : throw std::out_of_range("block index");
+    }
+    block const& at(std::size_t i) const { return operator[](i); }
 
-    /// Accessor for the blocks vector. Sirius calls .get_blocks().size().
-    std::vector<void*> const& get_blocks() const { return blocks_; }
-    std::vector<void*>& get_blocks() { return blocks_; }
+    /// Accessor for the blocks vector. Sirius calls .get_blocks().size()
+    /// and .get_blocks()[i] (as void* via block's implicit conversion).
+    std::vector<block> const& get_blocks() const { return blocks_; }
+    std::vector<block>& get_blocks() { return blocks_; }
 
     std::size_t block_size() const { return block_size_; }
     void grow_by(std::size_t n) { total_bytes_ += n; }
     void trim_to(std::size_t n) { total_bytes_ = n; }
 
-    std::vector<void*> blocks_;
+    std::vector<block> blocks_;
     std::size_t block_size_{default_block_size};
     std::size_t total_bytes_{0};
   };

@@ -10,6 +10,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
 #include "cucascade/memory/memory_reservation.hpp"
+#include "cucascade/memory/oom_handling_policy.hpp"
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -34,11 +35,13 @@ class reservation_aware_resource_adaptor {
 
   std::size_t get_peak_allocated_bytes(rmm::cuda_stream_view) const { return 0; }
   void reset_stream_reservation(rmm::cuda_stream_view) {}
-  // Sirius calls: allocator->attach_reservation_to_tracker(stream, std::move(reservation), std::make_unique<fail_reservation_limit_policy>())
-  // Returns bool (Sirius checks: if (!allocator->attach_reservation_to_tracker(...)))
+  // Sirius calls with 4 args: (stream, reservation, limit_policy, oom_policy)
+  // and with 3 args: (stream, reservation, limit_policy)
+  // Both return bool (Sirius checks: if (!allocator->attach_reservation_to_tracker(...)))
   bool attach_reservation_to_tracker(rmm::cuda_stream_view /*stream*/,
                                      std::unique_ptr<reservation> /*reservation*/,
-                                     std::unique_ptr<reservation_limit_policy> /*policy*/) {
+                                     std::unique_ptr<reservation_limit_policy> /*limit_policy*/,
+                                     std::unique_ptr<oom_handling_policy> /*oom_policy*/ = nullptr) {
     return false; // stub: no tracking
   }
 

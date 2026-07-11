@@ -40,6 +40,10 @@ class memory_space {
     if (!streams_) throw std::runtime_error("cuCascade stub: no stream pool");
     return streams_->acquire_stream(stream_acquire_policy::GROW);
   }
+  // Const overload — Sirius calls acquire_stream() on memory_space const&
+  rmm::cuda_stream_view acquire_stream() const {
+    return rmm::cuda_stream_per_thread;
+  }
 
   bool should_downgrade_memory() const { return false; }
 
@@ -57,10 +61,20 @@ class memory_space {
   T* get_memory_resource_as() {
     return nullptr;
   }
+  // Const overload — Sirius calls get_memory_resource_as<T>() on const memory_space&
+  template <typename T>
+  T const* get_memory_resource_as() const {
+    return nullptr;
+  }
 
   /// Template: get memory resource for a specific tier.
   template <Tier TIER>
   typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of() {
+    return nullptr;
+  }
+  // Const overload
+  template <Tier TIER>
+  typename tier_memory_resource_trait<TIER>::type const* get_memory_resource_of() const {
     return nullptr;
   }
 
