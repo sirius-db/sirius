@@ -13,6 +13,7 @@
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
+#include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -951,6 +952,14 @@ struct bench_record {
   std::vector<metric_delta> comparisons;
 };
 
+struct tpch_bench_record {
+  std::string scenario;
+  std::string arm;
+  std::size_t query_number{0};
+  double wall_clock_ms{0.0};
+  duckdb::idx_t row_count{0};
+};
+
 bench_record make_record(std::string scenario,
                          std::string transport,
                          std::string projection,
@@ -1305,6 +1314,38 @@ void write_perf_json(fs::path const& path,
     }
     out << "}";
     out << (i + 1 == records.size() ? "\n" : ",\n");
+  }
+  out << "  ]\n";
+  out << "}\n";
+}
+
+void write_perf_json(fs::path const& path,
+                     s3_test_env const& env,
+                     std::string_view backend,
+                     std::string_view object_key,
+                     std::uint64_t dataset_bytes,
+                     std::vector<tpch_bench_record> const& records)
+{
+  fs::create_directories(path.parent_path());
+  std::ofstream out(path);
+  REQUIRE(out);
+
+  out << "{\n";
+  out << "  \"git_sha\": \"" << json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\n";
+  out << "  \"host\": \"" << json_escape(env_or("HOSTNAME", "unknown")) << "\",\n";
+  out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
+  out << "  \"dataset_bytes\": " << dataset_bytes << ",\n";
+  out << "  \"config\": {\"bucket\": \"" << json_escape(env.bucket) << "\", \"key\": \""
+      << json_escape(object_key) << "\"},\n";
+  out << "  \"results\": [\n";
+  for (std::size_t index = 0; index < records.size(); ++index) {
+    auto const& record = records[index];
+    out << "    {\"scenario\": \"" << json_escape(record.scenario) << "\", "
+        << "\"arm\": \"" << json_escape(record.arm) << "\", "
+        << "\"query_number\": " << record.query_number << ", "
+        << "\"wall_clock_ms\": " << std::fixed << std::setprecision(3) << record.wall_clock_ms
+        << ", \"row_count\": " << record.row_count << "}";
+    out << (index + 1 == records.size() ? "\n" : ",\n");
   }
   out << "  ]\n";
   out << "}\n";
@@ -1732,6 +1773,56 @@ void compare_s3_gpu_to_local_cpu_with_watchdog(std::shared_ptr<s3_sql_fixture> c
   CHECK(s3_result.rows == local_rows);
 }
 
+constexpr std::array<std::string_view, 8> kBenchTpchTables = {
+  "nation", "region", "customer", "orders", "part", "partsupp", "supplier", "lineitem"};
+
+sirius_memory_limits tpch_sf1_bench_memory_limits()
+{
+  sirius_memory_limits limits;
+  limits.gpu_usage     = "2 GiB";
+  limits.host_capacity = "4 GiB";
+  limits.disk_capacity = "16 GiB";
+  return limits;
+}
+
+void create_tpch_bench_views(duckdb::Connection& connection, std::string const& root, bool s3)
+{
+  for (auto const table : kBenchTpchTables) {
+    auto const path = s3 ? root + "/" + std::string{table} + ".parquet"
+                         : (fs::path{root} / (std::string{table} + ".parquet")).string();
+    require_query_ok(connection,
+                     "CREATE OR REPLACE VIEW " + std::string{table} +
+                       " AS SELECT * FROM read_parquet(" + sql_quote(path) + ");");
+  }
+}
+
+tpch_bench_record run_tpch_bench_query(duckdb::Connection& connection,
+                                       sirius::test::tpch_query_spec const& query,
+                                       std::string arm)
+{
+  auto const start = bench_clock::now();
+  auto result      = connection.Query(std::string{query.sql});
+  auto const stop  = bench_clock::now();
+  if (!result)
+    throw std::runtime_error("TPC-H Q" + std::to_string(query.number) + " returned no result");
+  if (result->HasError()) throw std::runtime_error(result->GetError());
+
+  return tpch_bench_record{"tpch_q" + std::to_string(query.number) + "_" + arm,
+                           std::move(arm),
+                           query.number,
+                           elapsed_ms(start, stop),
+                           result->RowCount()};
+}
+
+std::uint64_t tpch_dataset_bytes(fs::path const& root)
+{
+  std::uint64_t bytes = 0;
+  for (auto const table : kBenchTpchTables) {
+    bytes += static_cast<std::uint64_t>(fs::file_size(root / (std::string{table} + ".parquet")));
+  }
+  return bytes;
+}
+
 }  // namespace
 
 TEST_CASE("internal sirius_read_parquet is registered as a one-argument table function",
@@ -2086,6 +2177,66 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
                             "rest_reactor_compat_http",
                             "rest_reactor_compat_https"});
   WARN("Wrote S3 REST perf JSON baseline to " << path.string());
+}
+
+TEST_CASE("S3 TPC-H benchmark records SF1 S3 and local wall-clock arms", "[.][s3][bench][tpch]")
+{
+  if (!truthy_env("SIRIUS_BENCH_S3_TPCH")) {
+    SUCCEED("SIRIUS_BENCH_S3_TPCH is not enabled");
+    return;
+  }
+
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+
+  auto const local_dir_text = env_or("SIRIUS_TEST_S3_TPCH_LOCAL_DIR");
+  REQUIRE_FALSE(local_dir_text.empty());
+  fs::path const local_dir{local_dir_text};
+  for (auto const table : kBenchTpchTables) {
+    REQUIRE(fs::exists(local_dir / (std::string{table} + ".parquet")));
+  }
+
+  s3_sql_fixture fixture(*env, tpch_sf1_bench_memory_limits());
+  set_gpu_execution(fixture.con, true);
+  create_tpch_bench_views(fixture.con, s3_uri(env->bucket, "tpch/sf1"), true);
+
+  duckdb::DuckDB local_db(nullptr);
+  duckdb::Connection local_connection(local_db);
+  create_tpch_bench_views(local_connection, local_dir.string(), false);
+
+  std::vector<tpch_bench_record> records;
+  records.reserve(sirius::test::kTpchQueries.size() * 2);
+  for (auto const& query : sirius::test::kTpchQueries) {
+    tpch_bench_record s3_record;
+    try {
+      s3_record = run_tpch_bench_query(fixture.con, query, "s3");
+    } catch (std::exception const& first_error) {
+      if (!query.retry_once) throw;
+      WARN("TPC-H Q" << query.number << " S3 benchmark first attempt failed; retrying once: "
+                     << first_error.what());
+      s3_record = run_tpch_bench_query(fixture.con, query, "s3");
+    }
+    auto local_record = run_tpch_bench_query(local_connection, query, "local");
+
+    CHECK(s3_record.row_count == local_record.row_count);
+    WARN("TPC-H Q" << query.number << " S3=" << s3_record.wall_clock_ms << "ms local="
+                   << local_record.wall_clock_ms << "ms rows=" << s3_record.row_count);
+    records.push_back(std::move(s3_record));
+    records.push_back(std::move(local_record));
+  }
+  REQUIRE(records.size() == 44);
+
+  auto const path = perf_json_path();
+  write_perf_json(
+    path, *env, "rest_minio_tpch", "tpch/sf1", tpch_dataset_bytes(local_dir), records);
+  auto const json = read_text_file(path);
+  for (auto const& query : sirius::test::kTpchQueries) {
+    CHECK(json.find("\"scenario\": \"tpch_q" + std::to_string(query.number) + "_s3\"") !=
+          std::string::npos);
+    CHECK(json.find("\"scenario\": \"tpch_q" + std::to_string(query.number) + "_local\"") !=
+          std::string::npos);
+  }
+  WARN("Wrote S3 TPC-H perf JSON to " << path.string());
 }
 
 TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
