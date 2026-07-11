@@ -302,7 +302,7 @@ inline std::vector<bool> host_validity_bits(cudf::column_view v)
              words.size() * sizeof(uint32_t),
              cudaMemcpyDeviceToHost);
   for (cudf::size_type r = 0; r < v.size(); ++r) {
-    std::size_t const bit = static_cast<std::size_t>(v.offset() + r);
+    std::size_t const bit              = static_cast<std::size_t>(v.offset() + r);
     valid[static_cast<std::size_t>(r)] = (words[bit / 32 - first_word] >> (bit % 32)) & 1u;
   }
   return valid;

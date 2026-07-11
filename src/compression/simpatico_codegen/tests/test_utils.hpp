@@ -228,7 +228,7 @@ inline std::vector<bool> host_validity_bits(cudf::column_view v)
              words.size() * sizeof(std::uint32_t),
              cudaMemcpyDeviceToHost);
   for (cudf::size_type r = 0; r < v.size(); ++r) {
-    std::size_t const bit = static_cast<std::size_t>(v.offset() + r);
+    std::size_t const bit              = static_cast<std::size_t>(v.offset() + r);
     valid[static_cast<std::size_t>(r)] = (words[bit / 32 - first_word] >> (bit % 32)) & 1u;
   }
   return valid;
@@ -350,15 +350,13 @@ inline bool strings_equal(cudf::column_view a, cudf::column_view b, rmm::cuda_st
     cudf::strings_column_view s(col);
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(o.back() - o.front()));
     if (!bytes.empty()) {
-      cudaMemcpy(bytes.data(),
-                 s.chars_begin(stream) + o.front(),
-                 bytes.size(),
-                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(
+        bytes.data(), s.chars_begin(stream) + o.front(), bytes.size(), cudaMemcpyDeviceToHost);
     }
     return bytes;
   };
-  auto const pa = read_span(a, oa);
-  auto const pb = read_span(b, ob);
+  auto const pa    = read_span(a, oa);
+  auto const pb    = read_span(b, ob);
   auto const valid = host_validity_bits(a);  // equals host_validity_bits(b) per validity_equal
 
   for (cudf::size_type r = 0; r < n; ++r) {

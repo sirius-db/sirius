@@ -804,8 +804,8 @@ int main()
       auto stream = cudf::get_default_stream();
       auto mr     = rmm::mr::get_current_device_resource_ref();
 
-      for (char const* plan : {"input -> dictionary\n", "input -> dictionary_fast\n",
-                               "input -> str_split\n"}) {
+      for (char const* plan :
+           {"input -> dictionary\n", "input -> dictionary_fast\n", "input -> str_split\n"}) {
         // describe() runs on a FRESH compress: str_split's single-shot
         // decompress consumes its channels, so describe-after-decompress
         // legitimately enumerates nothing.
@@ -821,8 +821,8 @@ int main()
         expect(strings_equal(tn->view().column(0), dn->view().column(0), stream),
                "string_all_null: data");
 
-        auto te = make_strings_table({"", "", ""}, {}, stream);
-        roundtrip_once(te->view(), plan, 1, "string_all_empty");
+        auto t_empty = make_strings_table({"", "", ""}, {}, stream);
+        roundtrip_once(t_empty->view(), plan, 1, "string_all_empty");
       }
 
       // The canonical childless empty column (cudf::make_empty_column).
@@ -838,12 +838,12 @@ int main()
       // Sliced STRING views: str_split must normalize a head slice (whose
       // offsets child still spans the parent) and a non-zero-offset slice.
       auto stream = cudf::get_default_stream();
-      auto full   = make_strings_column(
-        {"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh"},
-        {true, false, true, true, true, true, true, false},
-        stream);
-      auto head = cudf::slice(full->view(), {0, 5});
-      roundtrip_once(cudf::table_view({head[0]}), "input -> str_split\n", 1, "str_split_head_slice");
+      auto full   = make_strings_column({"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh"},
+                                        {true, false, true, true, true, true, true, false},
+                                      stream);
+      auto head   = cudf::slice(full->view(), {0, 5});
+      roundtrip_once(
+        cudf::table_view({head[0]}), "input -> str_split\n", 1, "str_split_head_slice");
       auto tail = cudf::slice(full->view(), {3, 8});
       roundtrip_once(
         cudf::table_view({tail[0]}), "input -> str_split\n", 1, "str_split_offset_slice");
@@ -880,15 +880,15 @@ int main()
       // validity must survive the from_outputs rebuild.
       auto stream             = cudf::get_default_stream();
       std::vector<bool> valid = {true, false, true, true};
-      auto tn = make_strings_table({"apple", "", "cherry", "apple"}, valid, stream);
-      auto ct = roundtrip_once(tn->view(),
+      auto tn                 = make_strings_table({"apple", "", "cherry", "apple"}, valid, stream);
+      auto ct                 = roundtrip_once(tn->view(),
                                "input -> dictionary -> keys_offsets, keys_chars, indices, "
-                               "null_mask\n"
-                               "dictionary.indices -> bitpack\n"
-                               "dictionary.null_mask -> identity\n",
+                                               "null_mask\n"
+                                               "dictionary.indices -> bitpack\n"
+                                               "dictionary.null_mask -> identity\n",
                                1,
                                "dictionary_decomposed_nulls");
-      auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
+      auto decoded            = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
       expect(decoded->view().column(0).null_count() == 1, "dictionary_decomposed_nulls: count");
     }
 
@@ -902,13 +902,13 @@ int main()
         v64.push_back("val" + std::to_string(i % 7));
         b64.push_back(i != 13 && i != 47);
       }
-      auto tn = make_strings_table(v64, b64, stream);
-      auto ct = roundtrip_once(tn->view(),
+      auto tn      = make_strings_table(v64, b64, stream);
+      auto ct      = roundtrip_once(tn->view(),
                                "input -> str_split -> offsets, chars, null_mask\n"
-                               "str_split.offsets -> delta -> differences\n"
-                               "str_split.offsets.differences -> bitpack\n"
-                               "str_split.chars -> lz4\n"
-                               "str_split.null_mask -> rle -> runs, values\n",
+                                    "str_split.offsets -> delta -> differences\n"
+                                    "str_split.offsets.differences -> bitpack\n"
+                                    "str_split.chars -> lz4\n"
+                                    "str_split.null_mask -> rle -> runs, values\n",
                                1,
                                "str_split_null_mask_rle_u8");
       auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());

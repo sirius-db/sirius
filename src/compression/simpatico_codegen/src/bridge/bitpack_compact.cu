@@ -150,8 +150,7 @@ void compact_bitpack_gather(void* dst_device,
     // tight input allocation whose byte size is not a 16-byte multiple. At
     // these sizes the launch latency dominates anyway; a serial kernel reads
     // exactly num_chunks elements.
-    exclusive_scan_serial_kernel<<<1, 1, 0, stream.value()>>>(
-      in_words, d_bp_offsets, num_chunks);
+    exclusive_scan_serial_kernel<<<1, 1, 0, stream.value()>>>(in_words, d_bp_offsets, num_chunks);
     check_cuda(cudaPeekAtLastError(), "bp_offsets serial scan");
   } else {
     // CUB's two-call protocol: probe the scratch size (no stream dependency),
