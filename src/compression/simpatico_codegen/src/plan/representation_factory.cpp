@@ -82,16 +82,17 @@ bool check_outputs(const char* op,
   return true;
 }
 
-// Validate a single "output" UINT8 channel and copy it into a device_buffer.
-// The shared payload-copy for the byte-stream codecs (ans/bitcomp/snappy/lz4/
-// deflate). Returns nullptr and sets *error_out on validation failure; on
-// success sets *out_size to the payload byte count.
+// Validate a single "output" UINT8 channel and adopt its device_buffer. The
+// reconstruction entry points own `outputs`, so releasing the column avoids a
+// redundant device-to-device copy for the byte-stream codecs
+// (ans/bitcomp/snappy/lz4/deflate). Returns nullptr and sets *error_out on
+// validation failure; on success sets *out_size to the payload byte count.
 std::unique_ptr<rmm::device_buffer> copy_output_payload(
   const char* codec,
   std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> const& outputs,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
+  std::vector<std::unique_ptr<cudf::column>>& outputs,
+  rmm::cuda_stream_view,
+  rmm::device_async_resource_ref,
   std::string* error_out,
   std::size_t* out_size)
 {
@@ -101,15 +102,9 @@ std::unique_ptr<rmm::device_buffer> copy_output_payload(
     if (error_out) *error_out = std::string(codec) + " 'output' must be UINT8";
     return nullptr;
   }
-  std::size_t const comp = static_cast<std::size_t>(payload_col->size());
-  auto payload           = std::make_unique<rmm::device_buffer>(comp, stream, mr);
-  if (comp > 0) {
-    cudaMemcpyAsync(payload->data(),
-                    payload_col->view().head<uint8_t>(),
-                    comp,
-                    cudaMemcpyDeviceToDevice,
-                    stream.value());
-  }
+  auto const comp = static_cast<std::size_t>(payload_col->size());
+  auto contents   = payload_col->release();
+  auto payload    = std::move(contents.data);
   if (out_size) *out_size = comp;
   return payload;
 }
@@ -249,8 +244,9 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
 
   rmm::device_buffer mask(0, stream, mr);
   cudf::size_type null_count = 0;
-  if (has_mask && !take_null_mask_channel(
-                    std::move(outputs[3]), indices->size(), &mask, &null_count, stream, error_out)) {
+  if (has_mask &&
+      !take_null_mask_channel(
+        std::move(outputs[3]), indices->size(), &mask, &null_count, stream, error_out)) {
     return nullptr;
   }
 
@@ -266,11 +262,11 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
                                                 0,
                                                 rmm::device_buffer(0, stream, mr));
 
-  auto dict_col = null_count > 0
-                    ? cudf::make_dictionary_column(
-                        std::move(keys_strings), std::move(indices), std::move(mask), null_count)
-                    : cudf::make_dictionary_column(
-                        std::move(keys_strings), std::move(indices), stream, mr);
+  auto dict_col =
+    null_count > 0
+      ? cudf::make_dictionary_column(
+          std::move(keys_strings), std::move(indices), std::move(mask), null_count)
+      : cudf::make_dictionary_column(std::move(keys_strings), std::move(indices), stream, mr);
   // Indices, keys, and chars are then obtained as views from this column via
   // get_dictionary_child_view(dict_col->view(), ...) / dictionary_column_view.
   return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
@@ -281,7 +277,8 @@ std::unique_ptr<compressed_representation> bitpack_compressed_representation::fr
   std::vector<std::unique_ptr<cudf::column>> outputs,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref /*mr*/,
-  std::string* error_out)
+  std::string* error_out,
+  std::uint64_t num_rows_hint)
 {
   // The ``packed`` channel may have been entropy-tail-routed at compress
   // time (e.g. ``…packed -> ans``); when that happens the writer drops it
@@ -323,10 +320,14 @@ std::unique_ptr<compressed_representation> bitpack_compressed_representation::fr
   cudf::data_type original_type = chunk_min->type();
   cudf::size_type num_chunks    = chunk_min->size();
 
-  // Calculate num_rows by summing chunk_count. Use stream-aware memcpy to
-  // respect stream ordering (fixes multistream crash).
+  // The serialized per-leaf num_rows (the same sum recorded at compress time)
+  // lets the from-wire path skip the D2H + sync; a zero hint (decode-driver
+  // path) falls back to summing chunk_count with a stream-aware memcpy that
+  // respects stream ordering (fixes multistream crash).
   cudf::size_type num_rows = 0;
-  if (chunk_count->size() > 0) {
+  if (num_rows_hint > 0) {
+    num_rows = static_cast<cudf::size_type>(num_rows_hint);
+  } else if (chunk_count->size() > 0) {
     std::vector<int32_t> h_counts(static_cast<size_t>(chunk_count->size()));
     cudaMemcpyAsync(h_counts.data(),
                     chunk_count->view().head<int32_t>(),
@@ -514,9 +515,9 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
     if (error_out) *error_out = "str_split outputs must be 'offsets, chars[, null_mask]'";
     return nullptr;
   }
-  auto offsets   = std::move(outputs[0]);
-  auto chars     = std::move(outputs[1]);
-  auto null_mask = has_mask ? std::move(outputs[2]) : nullptr;
+  auto offsets       = std::move(outputs[0]);
+  auto chars         = std::move(outputs[1]);
+  auto null_mask     = has_mask ? std::move(outputs[2]) : nullptr;
   auto const off_tid = offsets->type().id();
   if (off_tid != cudf::type_id::INT32 && off_tid != cudf::type_id::INT64) {
     if (error_out) *error_out = "str_split offsets must be INT32 or INT64";
@@ -525,8 +526,8 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
   // chars is UINT8 normally, or widened (UINT32/UINT64) to hold >2GB under the
   // 2^31-element column cap (see str_split_compressor).
   auto const chars_tid = chars->type().id();
-  bool const chars_ok  = chars_tid == cudf::type_id::UINT8 ||
-                        chars_tid == cudf::type_id::UINT32 || chars_tid == cudf::type_id::UINT64;
+  bool const chars_ok  = chars_tid == cudf::type_id::UINT8 || chars_tid == cudf::type_id::UINT32 ||
+                        chars_tid == cudf::type_id::UINT64;
   if (!chars_ok || (null_mask && null_mask->type().id() != cudf::type_id::UINT8)) {
     if (error_out) *error_out = "str_split chars must be UINT8/UINT32/UINT64, null_mask UINT8";
     return nullptr;
@@ -772,7 +773,8 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
-  leaf_meta_v const& meta)
+  leaf_meta_v const& meta,
+  std::uint64_t num_rows_hint)
 {
   auto const unsupported = [&]() -> std::unique_ptr<compressed_representation> {
     if (error_out) {
@@ -793,7 +795,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
         output_names, std::move(outputs), stream, mr, error_out);
     case OpId::Bitpack:
       return bitpack_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out);
+        output_names, std::move(outputs), stream, mr, error_out, num_rows_hint);
     case OpId::Alp:
       return alp_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out);

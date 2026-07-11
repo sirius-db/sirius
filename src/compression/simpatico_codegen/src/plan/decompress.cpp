@@ -93,16 +93,65 @@ std::vector<std::string> consumed_slots(std::string const& kind)
 
 // Decode memoises each reconstructed value by its structural identity — the
 // (node, port) it is produced on, packed into a key. A value is computed once
-// and shared by every consumer (and by the codegen tail binders). `kept` holds
-// the reconstructed reps alive for the walk's duration.
+// and shared by every consumer (and by the codegen tail binders). Consumer
+// counts let reconstruction move a value into its sole/last consumer while
+// preserving shared values. `kept` holds reconstructed reps alive for the
+// walk's duration.
 struct DecodeMemo {
   std::unordered_map<std::uint64_t, std::unique_ptr<cudf::column>> values;
+  std::unordered_map<std::uint64_t, std::size_t> remaining_consumers;
   std::vector<std::unique_ptr<compressed_representation>> kept;
 };
 
 std::uint64_t value_key(ValueId v)
 {
   return (static_cast<std::uint64_t>(v.node) << 16) | v.channel;
+}
+
+std::string value_label(ValueId v)
+{
+  return "(" + std::to_string(v.node) + "," + std::to_string(v.channel) + ")";
+}
+
+// Transfers a memoised value to the inverse of its producer. Shared values are copied until their
+// last consumer; a sole/last consumer takes ownership. A null entry is deliberately retained after
+// a move so any accidental re-request is a deterministic runtime error rather than a silent
+// re-decode.
+std::unique_ptr<cudf::column> consume_memo_value(ValueId value,
+                                                 DecodeMemo& memo,
+                                                 rmm::cuda_stream_view stream,
+                                                 rmm::device_async_resource_ref mr,
+                                                 std::string* error_out)
+{
+  auto const key = value_key(value);
+  auto value_it  = memo.values.find(key);
+  if (value_it == memo.values.end()) {
+    if (error_out) *error_out = "decode: unresolved memo value " + value_label(value);
+    return nullptr;
+  }
+  if (!value_it->second) {
+    if (error_out) {
+      *error_out = "decode: memo value " + value_label(value) + " was already consumed";
+    }
+    return nullptr;
+  }
+
+  auto count_it = memo.remaining_consumers.find(key);
+  if (count_it == memo.remaining_consumers.end() || count_it->second == 0) {
+    if (error_out) {
+      *error_out = "decode: memo value " + value_label(value) + " has no remaining consumer";
+    }
+    return nullptr;
+  }
+
+  if (count_it->second == 1) {
+    count_it->second = 0;
+    return std::move(value_it->second);
+  }
+
+  auto copy = std::make_unique<cudf::column>(value_it->second->view(), stream, mr);
+  --count_it->second;
+  return copy;
 }
 
 // Returns the rep for node nid, or nullptr if the node has none.
@@ -613,8 +662,15 @@ cudf::column const* materialize(NodeId nid,
   PlanNode const& node  = tree.nodes[nid];
   ValueId const primary = node.input_sources.empty() ? ValueId{nid, 0} : node.input_sources.front();
   std::uint64_t const pk = value_key(primary);
-  if (auto it = memo.values.find(pk); it != memo.values.end() && it->second)
+  if (auto it = memo.values.find(pk); it != memo.values.end()) {
+    if (!it->second) {
+      if (error_out) {
+        *error_out = "decode: memo value " + value_label(primary) + " was already consumed";
+      }
+      return nullptr;
+    }
     return it->second.get();
+  }
 
   // bitjoin recovers all its input values from one packed leaf.
   if (node.attrs.bitjoin.has_value()) {
@@ -643,15 +699,15 @@ cudf::column const* materialize(NodeId nid,
                                    node.children.end(),
                                    [&](PlanEdge const& e) { return e.channel == name; });
       if (child_it != node.children.end()) {
-        if (!materialize(child_it->child, tree, memo, stream, mr, error_out)) return nullptr;
-        auto it = memo.values.find(value_key(ValueId{nid, static_cast<ChannelId>(i)}));
-        if (it == memo.values.end() || !it->second) {
-          if (error_out && error_out->empty())
-            *error_out = "decode: output '" + name + "' unresolved at node " + std::to_string(nid);
-          return nullptr;
+        ValueId const output_value{nid, static_cast<ChannelId>(i)};
+        // Recurse only when the value isn't yet in the memo
+        if (!memo.values.count(value_key(output_value))) {
+          if (!materialize(child_it->child, tree, memo, stream, mr, error_out)) return nullptr;
         }
+        auto output = consume_memo_value(output_value, memo, stream, mr, error_out);
+        if (!output) return nullptr;
         names.push_back(name);
-        outputs.push_back(std::make_unique<cudf::column>(it->second->view(), stream, mr));
+        outputs.push_back(std::move(output));
         continue;
       }
       auto ch_it = node.channels.find(node.output_paths[i]);
@@ -697,6 +753,12 @@ std::unique_ptr<cudf::column> decompress_column(plan_compound const& compound,
   // consume it. Materialize those; fall back to a scan when the root carries no
   // structural edges (a rep-only tree).
   DecodeMemo memo;
+  for (auto const& node : tree.nodes) {
+    for (auto const& src : node.input_sources) {
+      auto const key = value_key(src);
+      ++memo.remaining_consumers[key];
+    }
+  }
   std::uint64_t const input_key = value_key(ValueId{0, 0});
   for (auto const& e : tree.nodes[0].children) {
     if (memo.values.count(input_key)) break;

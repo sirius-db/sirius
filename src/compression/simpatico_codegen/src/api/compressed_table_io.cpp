@@ -327,7 +327,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
     auto col           = cudf::make_numeric_column(
-      dt, static_cast<cudf::size_type>(bd.num_rows), cudf::mask_state::UNALLOCATED, stream);
+      dt, static_cast<cudf::size_type>(bd.num_rows), cudf::mask_state::UNALLOCATED, stream, mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -376,7 +376,8 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     names.push_back(bufs[i].name);
     cols.push_back(make_col(i));
   }
-  return reconstruct_representation(cname, names, std::move(cols), stream, mr, err, ld.meta);
+  return reconstruct_representation(
+    cname, names, std::move(cols), stream, mr, err, ld.meta, ld.num_rows);
 }
 
 // v10 combines the per-column fixed-point scale (decimal support) with the

@@ -12,6 +12,7 @@
 
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -244,6 +245,45 @@ int main()
         "-> bitjoin_f32 -> rejoined\n";
       roundtrip_once(t->view(), dsl, 1, "bitextract_bitjoin_f32");
       roundtrip_once(t->view(), dsl, 2, "bitextract_bitjoin_f32_mt");
+    }
+
+    {
+      // The sign plane is consumed twice by one ranged bitjoin. Decode must
+      // retain/copy this shared memo value rather than moving it prematurely.
+      auto t = make_f32_table(1, 4096, 6);
+      std::string dsl =
+        "input -> bitextract_f32 -> sign, exponent, mantissa\n"
+        "bitextract_f32.sign_0:0, bitextract_f32.sign_0:0 "
+        "-> bitjoin_u8 -> duplicated_sign\n";
+      roundtrip_once(t->view(), dsl, 1, "bitextract_shared_sign");
+    }
+
+    {
+      // Corrupt the structural metadata so the second bitextract output asks
+      // bitjoin to produce values after its primary memo value was moved. This
+      // must be a loud error, never an implicit second decode.
+      auto t = make_f32_table(1, 4096, 8);
+      std::string dsl =
+        "input -> bitextract_f32 -> sign, exponent, mantissa\n"
+        "bitextract_f32.sign, bitextract_f32.exponent, bitextract_f32.mantissa "
+        "-> bitjoin_f32 -> rejoined\n";
+      auto ct = compress_with_plan(
+        t->view(), dsl, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+      auto& tree   = ct.columns[0].compound->tree;
+      auto bitjoin = std::find_if(tree.nodes.begin(), tree.nodes.end(), [](auto const& node) {
+        return node.op == "bitjoin_f32";
+      });
+      expect(bitjoin != tree.nodes.end(), "consumed memo: bitjoin node missing");
+      bitjoin->input_sources.resize(1);
+
+      bool loud_error = false;
+      try {
+        (void)decompress(
+          ct, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+      } catch (std::runtime_error const& e) {
+        loud_error = std::string(e.what()).find("already consumed") != std::string::npos;
+      }
+      expect(loud_error, "consumed memo re-request must fail loudly");
     }
 
     {
