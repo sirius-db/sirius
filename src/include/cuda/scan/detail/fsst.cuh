@@ -129,7 +129,10 @@ warp_compute_decomp_len(uint8_t const* __restrict__ comp_ptr,
 
 #pragma unroll
     for (uint32_t s = cub::detail::warp_threads / 2; s > 0; s /= 2) {
-      my_len += __shfl_xor_sync(FULL_MASK, my_len, s);
+      // HIP's __shfl_xor_sync requires a 64-bit mask (static_assert on ROCm);
+      // CUDA accepts both 32-bit and 64-bit. Cast to unsigned long long for
+      // portability — FULL_MASK (unsigned int) widens cleanly on both backends.
+      my_len += __shfl_xor_sync(static_cast<unsigned long long>(FULL_MASK), my_len, s);
     }
     total += my_len;
 

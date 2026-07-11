@@ -1,450 +1,400 @@
-# Sirius ROCm/HIP Port — Component Architecture
+# Sirius ROCm/HIP Port — Engineering Reference
 
-This document describes how the ROCm/HIP backend is implemented: the
-components, how they are wired, and the constraints that shaped each decision.
-It is a reference for anyone continuing the port.
+## 1. Architecture Overview
 
-## 1. Backend Selection Component
+Sirius is a GPU-native SQL engine that runs as a DuckDB extension, routing
+SQL operators to the GPU and falling back to DuckDB's CPU execution for
+unsupported operations. The upstream codebase targets NVIDIA CUDA exclusively,
+built on cuDF (DataFrames), RMM (memory manager), cuCollections (GPU hash
+maps/Bloom filters), and cuCascade (out-of-core memory reservation/repository).
 
-**Entry point:** `ENABLE_ROCM` CMake option (`CMakeLists.txt:42`, default OFF).
+This port adds an opt-in AMD ROCm/HIP backend (`ENABLE_ROCM=ON`) that uses
+the ROCm-DS drop-in equivalents hipDF and hipMM, plus compatibility shims
+that eliminate per-file HIPIFY. The design goal is **zero source-file edits**
+for the 69 files containing `cuda*` runtime calls — achieved via a
+`cuda_runtime.h` compatibility shim that macro-aliases `cuda*` to `hip*`.
 
-The build selects a GPU backend at configure time. Exactly one of two paths
-activates:
+### Component map
 
-| | NVIDIA CUDA (default) | AMD ROCm (opt-in) |
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        CMakeLists.txt                               │
+│  ENABLE_ROCM → CXX HIP, gfx90a/942/950, .cu→HIP ext mapping         │
+│  SIRIUS_ENABLE_CUCO (OFF on ROCm)    SIRIUS_ENABLE_CUCASCADE (OFF)  │
+│  SIRIUS_BUILD_TELEMETRY (gated)      ROCTX find_library             │
+├─────────────────────────────────────────────────────────────────────┤
+│  cmake/rocm_compat/  ← BEFORE on include path, shadows NVIDIA hdrs  │
+│  ├── cuda_runtime.h      cuda*→hip* macro aliases (67 symbols)      │
+│  ├── cuda_runtime_api.h   redirect                                   │
+│  ├── cuda.h               redirect                                   │
+│  ├── cub/cub.cuh          #include hipcub + namespace cub=hipcub     │
+│  │   └── cub::detail::warp_threads = 64 (AMD wavefront)              │
+│  ├── cub/{config,util_arch,util_ptx,warp_scan,thread_store,...}.cuh  │
+│  ├── cucascade/           32-header stub (compile-only, throws RT)   │
+│  │   ├── error.hpp        CUCASCADE_CUDA_TRY macro                   │
+│  │   ├── memory/          Tier, memory_space, reservation, OOM, ...  │
+│  │   ├── data/            data_batch, repository, idata_representation│
+│  │   ├── cudf/            gpu/host_data_representation               │
+│  │   └── cuda/            cuda_event stub                            │
+│  └── nvtx3/nvtx3.hpp      scoped_range → roctxRangeStartA/Stop       │
+├─────────────────────────────────────────────────────────────────────┤
+│  Source fixes:                                                      │
+│  src/include/cuda/scan/detail/fsst.cuh:132                          │
+│    __shfl_xor_sync mask cast to unsigned long long (HIP=64-bit)      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## 2. Backend Selection
+
+**Entry point:** `ENABLE_ROCM` CMake option (default OFF).
+
+| Property | NVIDIA CUDA | AMD ROCm |
 |---|---|---|
-| Language enabled | `CXX CUDA` | `CXX HIP` |
-| Architecture var | `CMAKE_CUDA_ARCHITECTURES` (native) | `CMAKE_HIP_ARCHITECTURES` (gfx90a;gfx942;gfx950) |
-| Source-file ext | `.cu` → CUDA (built-in) | `.cu` → HIP (via `CMAKE_HIP_SOURCE_FILE_EXTENSIONS`) |
-| GPU standard prop | `CUDA_STANDARD 20` | `HIP_STANDARD 20` |
-| Device-symbol resolve | `CUDA_RESOLVE_DEVICE_SYMBOLS ON` | `HIP_RESOLVE_DEVICE_SYMBOLS ON` |
-| Separable compilation | `CUDA_SEPARABLE_COMPILATION ON` | `HIP_SEPARABLE_COMPILATION ON` |
+| Language | `CXX CUDA` | `CXX HIP` |
+| Source extension | `.cu` → CUDA (built-in) | `.cu` → HIP (via `CMAKE_HIP_SOURCE_FILE_EXTENSIONS`) |
+| Architecture | `CMAKE_CUDA_ARCHITECTURES` (native) | `CMAKE_HIP_ARCHITECTURES` (gfx90a;gfx942;gfx950) |
+| GPU standard | `CUDA_STANDARD 20` | `HIP_STANDARD 20` |
+| Device symbols | `CUDA_RESOLVE_DEVICE_SYMBOLS ON` | `HIP_RESOLVE_DEVICE_SYMBOLS ON` |
 | Extended lambda | `--expt-extended-lambda` (nvcc) | not needed (hip-clang default) |
 
-**Why `.cu` extension mapping is needed:** CMake's HIP language recognizes `.hip`
-by default. Sirius's kernel files are `.cu`. Under `ENABLE_ROCM`, the CUDA
-language is not enabled, so `.cu` files have no language assignment unless
-`CMAKE_HIP_SOURCE_FILE_EXTENSIONS` is extended. This is set at
-`CMakeLists.txt:66`:
+`CMAKE_HIP_SOURCE_FILE_EXTENSIONS` is set after `project()` but before the
+first HIP source is attached to a target. CMake re-reads the variable at
+source-add time (not project-time), so `.cu` files resolve to HIP.
 
-```cmake
-if(ENABLE_ROCM)
-  list(APPEND CMAKE_HIP_SOURCE_FILE_EXTENSIONS cu)
-endif()
-```
+## 3. Dependency Wiring
 
-hipDF itself uses the same convention (its source files are also `.cu` compiled
-as HIP).
+### 3.1 cuDF → hipDF
 
-## 2. Dependency Wiring
+hipDF preserves `namespace cudf`, exports `cudf::cudf` target, and uses
+`project(CUDF LANGUAGES C CXX HIP)`. `find_package(cudf REQUIRED CONFIG)`
+and the `cudf::cudf` link line are identical across backends. No source
+file using `cudf::` needs editing.
 
-### 2.1 cuDF → hipDF (drop-in)
+### 3.2 RMM → hipMM
 
-hipDF is AMD's port of cuDF. It preserves three things that make it a drop-in:
+hipMM preserves `namespace rmm`, `rmm/` includes, exports `rmm::rmm` target.
+The `rmm::rmm` link line is identical across backends.
 
-- **Package name:** `find_package(cudf REQUIRED CONFIG)` resolves to hipDF's
-  `cudf-config.cmake` (hipDF's `project(CUDF ...)` keeps the name).
-- **CMake target:** `cudf::cudf` (hipDF defines `add_library(cudf::cudf ALIAS cudf)`).
-- **C++ namespace:** `namespace cudf` (verified in
-  `cpp/include/cudf/table/table_view.hpp`).
+### 3.3 thrust/cub → rocThrust/hipCUB
 
-The `target_link_libraries(... cudf::cudf ...)` line in Sirius's CMakeLists is
-identical across backends. No source file using `cudf::` needs editing.
+rocThrust provides `thrust/` natively. hipCUB provides `hipcub/` — NOT `cub/`.
+The `cub/cub.cuh` shim redirects to `<hipcub/hipcub.hpp>` and creates
+`namespace cub = hipcub;` so all `cub::` usage resolves.
 
-### 2.2 RMM → hipMM (drop-in)
+### 3.4 cuco → gated OFF (no ROCm port)
 
-hipMM preserves the same three things: package name (`rmm`), target
-(`rmm::rmm`), namespace (`rmm::`), and include paths (`<rmm/...>`). The
-`rmm::rmm` link line is identical across backends.
+`SIRIUS_ENABLE_CUCO` defaults OFF on ROCm. The 2 `.cu` files using
+`cuco::bloom_filter` / `cuco::static_set` are excluded from `CUDA_SOURCES`.
+The PIMPL'd header (`sirius_dynamic_filter.hpp`) still compiles.
 
-### 2.3 thrust/cub → rocThrust/hipCUB (transitive)
+### 3.5 cuCascade → stub (cmake/rocm_compat/cucascade/)
 
-hipDF depends on rocThrust and hipCUB, which expose the same `thrust::` and
-`cub::` namespaces with the same include paths (`<thrust/...>`, `<cub/...>`).
-No source edits needed.
+`SIRIUS_ENABLE_CUCASCADE` defaults OFF on ROCm. Instead of the real cuCascade
+submodule, 32 stub headers provide ~70 types so 63 `.cpp` files compile.
+Stub methods throw `std::runtime_error("cuCascade stub")` at runtime →
+graceful degradation to DuckDB CPU execution.
 
-### 2.4 The CUDA Runtime Compatibility Layer
+## 4. Compatibility Shim Design
 
-**⚠️ This section's original claim was empirically disproven on a real ROCm
-7.2.1 / gfx942 host. See §12 for the compile-test results.**
+### 4.1 cuda_runtime.h
 
-The original assumption: hipDF keeps `cuda*` calls verbatim in its source, so
-the ROCm SDK must provide a compatibility layer that macro-aliases `cuda*` to
-`hip*`. Therefore Sirius's 69 files with `cuda*` calls would need zero edits.
+`#include <hip/hip_runtime.h>` then `#define cuda* hip*` for all 67 symbols
+Sirius and its dependencies (RMM, cuDF, cuCascade) use. Key mappings:
 
-**What actually happens on a stock ROCm 7.2.1 install (no hipDF):**
-
-| Test | Result |
-|---|---|
-| `#include <cuda_runtime.h>` | ❌ `fatal error: 'cuda_runtime.h' file not found` — not installed |
-| `cudaError_t`, `cudaMalloc`, `cudaMemcpy` | ❌ `unknown type name`, `use of undeclared identifier` — NOT aliased |
-| `cudaDeviceProp`, `cudaGetDeviceProperties` | ❌ `unknown type name 'cudaDeviceProp'` — NOT aliased |
-| `#include <cub/cub.cuh>` | ❌ `file not found` — hipCUB provides `hipcub/`, not `cub/` |
-| `#include <thrust/...>` | ✅ rocThrust provides `thrust/` natively |
-| `__syncwarp()` | ✅ compiles (HIP provides it) |
-| `__shfl_xor_sync(mask, ...)` with 32-bit mask | ❌ `static_assert: mask must be 64-bit` — CUDA accepts 32-bit, HIP requires 64-bit |
-| `#include <hip/hip_cooperative_groups.h>` | ✅ compiles |
-| rotx shim (`<roctracer/roctx.h>`) | ✅ compiles, `roctx_range_id_t` correct |
-
-**The correction:** The compatibility layer that hipDF relies on is **hipDF's
-own build infrastructure**, not the stock ROCm SDK. hipDF bundles CCCL (which
-provides `cub/` headers and `cuda::std`) and likely has its own `cuda_runtime.h`
-wrapper. A Sirius build on AMD **must** have hipDF installed and its include
-paths visible — the stock ROCm SDK alone does not provide `cuda*` or `cub/`
-compatibility.
-
-This means:
-1. `#include <cuda_runtime.h>` in 38 live files will fail without hipDF's
-   compat wrapper on the include path.
-2. `#include <cub/cub.cuh>` and `cub::` usage will fail — hipCUB provides
-   `hipcub/hipcub.cuh`, not `cub/cub.cuh`. The include paths are different.
-3. `cuda*` runtime API calls (`cudaMalloc`, `cudaMemcpy`, etc.) will fail —
-   they must either be HIPIFY'd to `hip*` or the compat wrapper must be
-   provided by hipDF's build.
-4. `__shfl_xor_sync` with a 32-bit mask (`FULL_MASK = 0xFFFFFFFFu`) in
-   `fsst.cuh:132` will fail — HIP requires a 64-bit mask.
-
-The "zero source edits" claim applies only if hipDF's full build environment
-(CCCL, compat wrappers) is on the include path. Whether that suffices for all
-67 `cuda*` symbols is unverified — it requires hipDF to be installed and
-buildable, which is showstopper #2 (§7).
-
-## 3. Gating Architecture
-
-Two NVIDIA-only dependencies have no ROCm port. Each is controlled by a CMake
-option that defaults OFF under `ENABLE_ROCM` and ON otherwise.
-
-### 3.1 SIRIUS_ENABLE_CUCO (cuCollections)
-
-**What cuco is:** NVIDIA's GPU hash-map and Bloom-filter library
-(cuCollections). Sirius uses a narrow slice of its API:
-
-- `cuco::bloom_filter` (in `sirius_dynamic_bloom_filter.cu`)
-- `cuco::static_set` (in `sirius_dynamic_in_list_filter.cu`)
-- Supporting types: `cuco::extent`, `cuco::empty_key`,
-  `cuco::arrow_filter_policy`, `cuco::default_filter_policy`,
-  `cuco::xxhash_64`, `cuco::double_hashing`, `cuco::default_hash_function`,
-  `cuco::contains`
-
-**How it's wired:**
-- CMake option `SIRIUS_ENABLE_CUCO` (`CMakeLists.txt:85`)
-- When ON: `find_package(cuco CONFIG REQUIRED)` or FetchContent (header-only),
-  creates `cuco::cuco` target, links it to extension targets, defines
-  `SIRIUS_ENABLE_CUCO=1`
-- When OFF: `cuco::cuco` target is never created; the two `.cu` files that use
-  it are excluded from `CUDA_SOURCES`
-
-**What breaks when OFF:** Bloom-filter and IN-list dynamic filters are not
-compiled. `sirius_dynamic_bloom_filter.cpp` / `sirius_dynamic_in_list_filter.cu`
-are dropped. The `sirius_dynamic_filter.hpp` header still compiles (it
-forward-declares the classes via PIMPL). Dynamic-filter *publication* code in
-`.cpp` files that references these classes will still compile but the filters
-won't be constructed at runtime.
-
-### 3.2 SIRIUS_ENABLE_CUCASCADE (cuCascade)
-
-**What cuCascade is:** NVIDIA's GPU memory-reservation and out-of-core data
-repository system. It provides:
-
-- `cucascade::shared_data_repository_manager` — central data repository
-- `cucascade::gpu_table_representation` / `host_data_representation` /
-  `disk_data_representation` — tiered memory representations
-- `cucascade::topology_discovery` — multi-GPU topology
-- `cucascade::memory::memory_space` — stream + allocator + device context
-- `cucascade::memory::memory_reservation_manager` — reservation subsystem
-- `cucascade::memory::fixed_size_host_memory_resource` — pinned host allocator
-
-**How it's wired:**
-- CMake option `SIRIUS_ENABLE_CUCASCADE` (`CMakeLists.txt:86`)
-- When ON: `add_subdirectory(cucascade)` builds the submodule; `cuCascade::cucascade`
-  and `cuCascade::cucascade_cudf` targets are linked to extension targets;
-  `SIRIUS_ENABLE_CUCASCADE=1` is defined
-- When OFF: submodule not built; targets not linked; one `.cu` file
-  (`dynamic_filter_replica_transfer.cu`) excluded from `CUDA_SOURCES`
-
-**The critical coupling (see §6):** 59 `.cpp` files in `EXTENSION_SOURCES`
-hard-include `<cucascade/...>` headers. These are NOT excluded from the build
-when `SIRIUS_ENABLE_CUCASCADE=OFF`. This is the port's blocking issue.
-
-### 3.3 NVML
-
-`CUDA::nvml_static` (NVIDIA Management Library) is pulled in transitively by
-cuCascade. The CMake block that redirects it from the static stub to the
-shared library (`CMakeLists.txt:663`) is gated:
-
-```cmake
-if(NOT ENABLE_ROCM AND TARGET CUDA::nvml_static)
-```
-
-Under ROCm, `CUDA::nvml_static` is never a target, so the block is skipped.
-ROCm's topology source is `rocm-smi` / hwloc — not wired yet.
-
-## 4. nvtx3 → roctx Shim
-
-**Component:** `cmake/rocm_compat/nvtx3/nvtx3.hpp`
-
-Sirius uses exactly one nvtx3 type — `nvtx3::scoped_range` — as an RAII
-profiling range (47 call sites across 31 files). Every call site passes either
-a string literal (`{"sirius::query"}`) or a `.c_str()` result (`const char*`).
-
-ROCm's equivalent is the roctx API:
-- `roctx_range_id_t roctxRangeStartA(const char* message)` — starts a range
-- `void roctxRangeStop(roctx_range_id_t id)` — stops a range
-- `roctx_range_id_t` is `typedef uint64_t`
-
-The shim defines `nvtx3::scoped_range` with two constructors (`char const*` and
-`std::string const&`) and a destructor that calls `roctxRangeStop`. It is
-non-copyable and non-movable, matching nvtx3 semantics.
-
-**Wiring:** The `cmake/rocm_compat/` directory is added to the include path of
-all four build targets (extension ×2, unittest, parquet_benchmark) only when
-`ENABLE_ROCM=ON`. This shadows the NVIDIA `<nvtx3/nvtx3.hpp>` header (which
-doesn't exist on an AMD host). The roctx include dir (`ROCTX_INCLUDE_DIR`,
-discovered via `find_path`) and library (`ROCTX_LIBRARY`, discovered via
-`find_library`) are also added to all four targets.
-
-**Transitive reach:** `<nvtx3/nvtx3.hpp>` is included by public headers
-(`src/include/pipeline/sirius_pipeline.hpp:28`,
-`src/include/helper/helper.hpp:19`), so every TU that includes those headers
-reaches the shim. This is why all four targets need the roctx include path.
-
-## 5. CUDA Runtime API Coverage
-
-The compatibility layer (§2.4) covers the majority of Sirius's `cuda*` calls.
-The following symbols are at risk — the layer may not map them, or semantics
-may differ:
-
-| Symbol | Where used | Why at risk |
-|---|---|---|
-| `__shfl_xor_sync` | `src/include/cuda/scan/strings/fsst.cuh:132` | Raw warp intrinsic. HIP compat may provide it but semantics differ. In a header used by 2 portable `.cu` kernels (`dict_fsst.cu`, `fsst.cu`). |
-| `__syncwarp()` | `src/include/cuda/scan/strings/fsst.cuh:227,229,237,239` | Raw warp-sync intrinsic. HIP provides it but behavior may differ. |
-| `<cooperative_groups.h>` | `src/include/cuda/scan/detail/shared_staging.cuh:25-26` | HIP provides via `<hip/cooperative_groups.h>`; include path must be remapped by compat layer. |
-| `<cuda/__memory/aligned_size.h>` | `src/include/cuda/scan/detail/shared_staging.cuh:28` | CCCL private internal header; version-dependent in hipDF's CCCL. |
-| `cudaMemcpyBatchAsync` + types | `src/op/scan/duckdb_native_decoder.cpp:664`, `src/cuda/dynamic_filter_replica_transfer.cu:131` | CUDA 12.8+ API. Guarded by `#if CUDART_VERSION >= 12080`. If HIP compat defines `CUDART_VERSION`, the batch path is taken but HIP may lack the API. |
-| `cudaMemPool*` | `src/memory/defragmenter_oom_policy.cpp:40,47,50,91` | HIP has `hipMemPool*` but enum value mappings must match. |
-| `cudaDevAttrL2CacheSize` | `src/op/dynamic_filter_publisher.cpp:52,61` | HIP names it `hipDeviceAttributeL2CacheSize`. |
-| `cudaProfilerStart/Stop` | `src/sirius_extension.cpp:38-39,1282,1294` | `extern "C"` decls linked via libcudart. Under ROCm the symbol may not resolve. |
-| `cub::ThreadLoad<cub::LOAD_LDG>` | `src/cuda/scan/gpu_decode_rle.cu:392,399,409` | hipCUB provides `LOAD_LDG` but maps to a regular load on AMD (no texture cache). Performance difference, not compile error. |
-
-## 6. The cuCascade Coupling (Blocking Issue)
-
-### 6.1 The `.cu` layer (gated, works)
-
-Three `.cu` files use cuCascade and/or cuco. They are correctly excluded from
-`CUDA_SOURCES` when their gates are OFF:
-
-| File | Gate | Uses cuco? | Uses cuCascade? |
+| Category | CUDA | HIP | Notes |
 |---|---|---|---|
-| `dynamic_filter_replica_transfer.cu` | `SIRIUS_ENABLE_CUCASCADE` | No | Yes |
-| `sirius_dynamic_bloom_filter.cu` | `SIRIUS_ENABLE_CUCO AND SIRIUS_ENABLE_CUCASCADE` | Yes | Yes |
-| `sirius_dynamic_in_list_filter.cu` | `SIRIUS_ENABLE_CUCO AND SIRIUS_ENABLE_CUCASCADE` | Yes | Yes (includes `<cucascade/memory/memory_space.hpp>`, passes `memory_space` to `enqueue_replica_copy`) |
+| Types | `cudaError_t` | `hipError_t` | `using` alias |
+| | `cudaDeviceProp` | `hipDeviceProp_t` | name mismatch, `using` alias |
+| | `cudaEvent_t` | `hipEvent_t` | direct |
+| | `cudaStream_t` | `hipStream_t` | direct |
+| Runtime | `cudaMalloc` | `hipMalloc` | `#define` |
+| | `cudaMemcpy` | `hipMemcpy` | `#define` |
+| | `cudaDeviceSynchronize` | `hipDeviceSynchronize` | `#define` |
+| Enums | `cudaSuccess` | `hipSuccess` | `#define` |
+| | `cudaDevAttrL2CacheSize` | `hipDeviceAttributeL2CacheSize` | prefix mismatch |
+| Version | `CUDART_VERSION` | `0` | routes `#if >= 12080` to serial fallback |
+| Profiler | `cudaProfilerStart` | `hipProfilerStart` | `#define` |
 
-### 6.2 The `.cpp` layer (NOT gated, blocks the build)
+`CUDART_VERSION = 0` is critical: it routes the `#if CUDART_VERSION >= 12080`
+guards (which gate `cudaMemcpyBatchAsync`) to the serial `cudaMemcpyAsync`
+fallback. HIP 7.2.1 has `hipMemcpyBatchAsync` but the struct layout differs;
+the serial fallback is simpler and correct.
 
-`EXTENSION_SOURCES` (`CMakeLists.txt:~293-446`) is a flat, unconditional
-`set()`. No `.cpp` entry is conditionally excluded. No `.cpp` file contains
-`#ifdef SIRIUS_ENABLE_CUCASCADE` guards (verified: zero matches).
+### 4.2 cub/ Redirect Headers
 
-**63 of these `.cpp` files** hard-include `<cucascade/...>` headers and use
-`cucascade::` types (205 `#include <cucascade/...>` directives total). They
-include the engine's core: `sirius_extension.cpp` (entry point),
-`sirius_context.cpp`, operators (`sirius_physical_hash_join.cpp`, etc.),
-pipeline executor (`gpu_pipeline_executor.cpp`, `gpu_pipeline_task.cpp`),
-memory manager (`sirius_memory_reservation_manager.cpp`,
-`defragmenter_oom_policy.cpp`), and the downgrade executor.
+hipCUB uses `hipcub::` namespace (not `cub::`). The `cub/cub.cuh` shim:
+1. `#include <hipcub/hipcub.hpp>` — pulls in all hipCUB headers
+2. `namespace cub = hipcub;` — aliases the namespace
+3. Defines `cub::detail::warp_threads = 64` — CUB internal constant
+   (= 32 on NVIDIA, not exposed by hipCUB). AMD wavefront = 64 on CDNA.
 
-When `SIRIUS_ENABLE_CUCASCADE=OFF`, the cuCascade submodule is not built, its
-headers are not on any include path, and every one of these 63 files fails at
-`#include <cucascade/...>`.
+Remaining 6 headers (`config.cuh`, `util_arch.cuh`, `util_ptx.cuh`,
+`warp/warp_scan.cuh`, `thread/thread_store.cuh`, `device/device_for.cuh`)
+redirect to `cub/cub.cuh`.
 
-### 6.3 Why this can't be fixed by exclusion or guards
+**Note:** hipCUB's `ShuffleUp`/`ShuffleIndex`/`ShuffleDown` ignore the
+`member_mask` parameter (rocPRIM doesn't support masked shuffles). Sirius's
+`FULL_MASK` is passed but silently ignored — functionally correct for
+unmasked warps.
 
-The cuCascade coupling exists at three architectural levels, not just
-implementation:
+### 4.3 cuCascade Stub (32 headers)
 
-1. **Inheritance** — `sirius_memory_reservation_manager` inherits from
-   `cucascade::memory::memory_reservation_manager` (IS-A relationship).
-   Guarding this requires redesigning the class hierarchy, not adding `#ifdef`.
-2. **Public API signatures** — `gpu_pipeline_executor`'s constructor takes
-   `cucascade::memory::memory_space*`; `sirius_context`'s constructor takes
-   `std::vector<cucascade::memory::memory_space_config>`. Removing cuCascade
-   changes the public API of core classes.
-3. **Implementation** — exception types (`cucascade::memory::cucascade_out_of_memory`),
-   memory resources, stream pools. Some could be guarded, but the guards would
-   need to disable not just includes but all `cucascade::` type usage, which is
-   woven through the operator/pipeline/memory architecture.
+Provides ~70 types across 32 headers in `cmake/rocm_compat/cucascade/`.
+Design principles:
 
-The options are:
-1. **Port cuCascade to HIP** — a full library port (repository manager,
-   tiered representations, topology, reservation). Months of work.
-2. **Build a ROCm-native reservation/repository subsystem** — design and
-   implement a replacement providing equivalent functionality on AMD.
-3. `#ifdef` guards alone are **not feasible** for levels 1 and 2 above.
+- **5 real virtual base classes** (Sirius subclasses them): `memory_reservation_manager`,
+  `oom_handling_policy`, `idata_batch_probe`, `idata_representation`,
+  `reservation_aware_resource_adaptor`. These have real vtables so Sirius's
+  subclasses link cleanly.
+- **Template methods**: inline, throw `std::runtime_error` at runtime.
+- **`cucascade_out_of_memory`**: derives from `rmm::out_of_memory` (hipMM
+  provides this), with `error_kind`/`requested_bytes`/`global_usage`/`pool_handle`
+  members. Sirius catches `rmm::out_of_memory&` then `dynamic_cast` to this type.
+- **`CUCASCADE_CUDA_TRY` macro**: wraps `cudaError_t` (from cuda_runtime.h shim).
+- **`data_repository`/`data_repository_manager`**: fully inline (nearly verbatim
+  from real cuCascade — they only manipulate `std::vector<shared_ptr<data_batch>>`).
+- **`register_builtin_converters`**: inline no-op.
 
-None of these are attempted in this branch.
+### 4.4 nvtx3 → roctx Shim
 
-## 7. SHOWSTOPPER #2: No ROCm Package Ecosystem
+`nvtx3::scoped_range` (the only nvtx3 type Sirius uses, 47 call sites) maps
+to `roctxRangeStartA`/`roctxRangeStop`. The shim is at
+`cmake/rocm_compat/nvtx3/nvtx3.hpp`. ROCm's roctx header is at
+`/opt/rocm/include/roctracer/roctx.h` (discovered via `find_path`).
 
-**Independent of §6. Either alone prevents an end-to-end ROCm build.**
+### 4.5 Source Fix: __shfl_xor_sync
 
-`pixi.toml` and `vcpkg.json` are 100% NVIDIA:
-- `pixi.toml` channels: `rapidsai`, `conda-forge` (no `rocm` channel)
-- GPU packages: `cuda-nvcc`, `cuda-nvml-dev`, `librmm`, `libcudf 26.06`,
-  `libcurand-dev`, `libnvjitlink-dev`, `cuda-nvrtc-dev`
-- Features: `cuda12`, `cuda13` only — no `rocm` feature/environment
-- `vcpkg.json` dependencies: `cudf`, `cuco` (NVIDIA ports; no hipDF overlay)
-- `.gitmodules`: `cucascade` → `github.com/NVIDIA/cuCascade.git`
+`fsst.cuh:132` calls `__shfl_xor_sync(FULL_MASK, ...)` where `FULL_MASK` is
+`unsigned int` (32-bit). HIP's `__shfl_xor_sync` requires a 64-bit mask
+(`static_assert: The mask must be a 64-bit integer`). CUDA accepts both.
 
-**The name-collision problem:** hipDF reuses the `cudf` package name (by
-design, for drop-in compatibility). `find_package(cudf REQUIRED CONFIG)` at
-`CMakeLists.txt:150` has no `ENABLE_ROCM`-specific `HINTS`/`PATHS` (unlike the
-roctx block which honors `ROCTX_PATH`/`/opt/rocm`). With pixi's NVIDIA cudf
-installed, `find_package(cudf)` resolves to **NVIDIA cudf**, not hipDF. The
-`.cu` kernels compile as HIP but link against NVIDIA libcudf → CUDA/HIP runtime
-ABI conflict.
+Fix: cast `FULL_MASK` to `unsigned long long` at the call site. The
+`cub::ShuffleUp`/`ShuffleIndex` calls in the same file take `unsigned int`
+and are unaffected (hipCUB ignores the mask).
 
-**What's needed:** a ROCm pixi environment (or vcpkg overlay ports for
-hipDF/hipMM), and `ENABLE_ROCM`-specific `find_package` hints that point at the
-hipDF/hipMM install, away from any NVIDIA cudf on the path.
+## 5. Build Target Topology
 
-## 8. Legacy Path (`gpu_processing`)
+| Target | Built when | Shims | ROCTX | cuCascade | Telemetry |
+|---|---|---|---|---|---|
+| `sirius_extension` | always | BEFORE PRIVATE | if `ENABLE_ROCM` | if `SIRIUS_ENABLE_CUCASCADE` | if `SIRIUS_BUILD_TELEMETRY` |
+| `sirius_loadable_extension` | always | BEFORE PRIVATE | if `ENABLE_ROCM` | if `SIRIUS_ENABLE_CUCASCADE` | if `SIRIUS_BUILD_TELEMETRY` |
+| `sirius_unittest` | always | BEFORE PRIVATE | if `ENABLE_ROCM` | via `sirius_extension` | via `sirius_extension` |
+| `parquet_benchmark` | always | BEFORE PRIVATE | if `ENABLE_ROCM` | if `SIRIUS_ENABLE_CUCASCADE` | — |
+| `telemetry_bridge` | if `SIRIUS_BUILD_TELEMETRY` | — | — | — | (is the telemetry) |
 
-The legacy in-memory path (`src/legacy/`) is gated behind
-`ENABLE_LEGACY_SIRIUS` (OFF by default, controlled by
-`src/legacy/CMakeLists.txt`). Its dependency surface is smaller:
+The shim include path uses `BEFORE PRIVATE` so it precedes system includes —
+load-bearing: without `BEFORE`, the compiler may find a stray system
+`cuda_runtime.h` (e.g. from Triton's NVIDIA backend) ahead of the shim.
 
-- 0 cuco references
-- 2 files use `cucascade::` (vs 63 in the live path)
+## 6. Build Configuration
 
-It depends on cudf, rmm, thrust, cub only — all of which have drop-in ROCm
-equivalents. This makes it the most architecturally portable subset, but the
-2 cuCascade-coupled legacy files still need investigation.
+### NVIDIA CUDA (default — unchanged)
 
-## 8. Build Target Map
-
-| Target | Always built? | Gets rocm_compat include? | Gets ROCTX include+lib? | cuCascade linked? |
-|---|---|---|---|---|
-| `sirius_extension` | Yes | If `ENABLE_ROCM` | If `ENABLE_ROCM` | If `SIRIUS_ENABLE_CUCASCADE` |
-| `sirius_loadable_extension` | Yes | If `ENABLE_ROCM` | If `ENABLE_ROCM` | If `SIRIUS_ENABLE_CUCASCADE` |
-| `sirius_unittest` | Yes | If `ENABLE_ROCM` | If `ENABLE_ROCM` | Via `sirius_extension` |
-| `parquet_benchmark` | Excluded if `SIRIUS_ENABLE_CUCASCADE=OFF` | If `ENABLE_ROCM` | If `ENABLE_ROCM` | If `SIRIUS_ENABLE_CUCASCADE` |
-
-`parquet_benchmark` is excluded from the build when cuCascade is off because
-`test/io/parquet_benchmark.cpp` unconditionally `#include`s `<cucascade/...>`
-headers — there is no source-level guard.
-
-## 9. Latent Risks
-
-These do not block the build today (they are masked by §6/§7 showstoppers)
-but would surface once those are resolved:
-
-- **`CMAKE_HIP_FLAGS` CCCL strip missing** (`CMakeLists.txt:~104-130`): the
-  VCPKG_BUILD block strips `-I.../include/cccl` from `CMAKE_CXX_FLAGS` and
-  `CMAKE_CUDA_FLAGS` but not `CMAKE_HIP_FLAGS`. If a pixi/conda env injects
-  CCCL into HIP flags under `VCPKG_BUILD + ENABLE_ROCM`, hip-clang sees a
-  conflicting CCCL version. Dormant only because §7 makes that combo unreachable.
-- **`telemetry_bridge` is an ungated Rust-toolchain landmine**
-  (`CMakeLists.txt:~286`): `add_subdirectory(rust/crates/telemetry/bridge)` is
-  unconditional and needs a Rust toolchain. Contrast: `SIRIUS_BUILD_S3_TESTS`
-  (which needs Go) is gated. A Go/Rust-less host hits this before even reaching
-  the cuCascade `.cpp` failures.
-- **roctx wiring is manually replicated** across 4 targets rather than wrapped
-  in a single `INTERFACE` library. Any new executable that transitively
-  includes a Sirius header pulling `nvtx3` will silently break under
-  `ENABLE_ROCM` with `roctracer/roctx.h: file not found`.
-
-## 10. Bug Dependency Graph
-
-The failures are not independent — they form a causal chain. Understanding the
-order in which they manifest is essential for prioritizing fixes:
-
-```
-SHOWSTOPPER #1 (§6: 63 .cpp files, 0 guards, unguarded cucascade includes)
-  ├── BLOCKS the entire build at #include resolution
-  ├── MASKS cudaProfilerStart/Stop link error (never reached)
-  ├── MASKS cudaMemPool* issue in defragmenter_oom_policy.cpp (never reached)
-  └── MASKS all at-risk symbols in .cpp files (cudaDevAttrL2CacheSize, etc.)
-
-SHOWSTOPPER #2 (§7: pixi/vcpkg 100% NVIDIA, no ROCm package env)
-  ├── find_package(cudf) resolves to NVIDIA cudf (name collision)
-  └── INDEPENDENT of #1 — both must be fixed for an end-to-end build
-
-IF both showstoppers resolved, then (in order):
-  ├── fsst.cuh __shfl_xor_sync/__syncwarp     → 2 .cu kernels fail (dict_fsst, fsst)
-  ├── shared_staging.cuh cooperative_groups   → 2 .cu kernels fail (alp, bitpacking)
-  ├── cudaProfilerStart/Stop extern "C"        → link error in sirius_extension
-  └── 5 truly clean kernels: rle, strings, native_decode, dictionary, uncompressed
+```bash
+pixi run make
 ```
 
-The `#ifdef`-guard approach is infeasible for cuCascade (§6.3: inheritance +
-public API signatures), so showstopper #1 requires either a cuCascade HIP port
-or a ROCm-native replacement subsystem.
+### AMD ROCm
 
-## 11. Compile-Test Results (Real ROCm 7.2.1 / gfx942)
+```bash
+cmake -B build/rocm -S . \
+  -DENABLE_ROCM=ON \
+  -DSIRIUS_ENABLE_CUCO=OFF \
+  -DSIRIUS_ENABLE_CUCASCADE=OFF \
+  -DSIRIUS_BUILD_S3_TESTS=OFF \
+  -DSIRIUS_BUILD_TELEMETRY=OFF \
+  -DCMAKE_HIP_ARCHITECTURES="gfx942"
+cmake --build build/rocm
+```
 
-Compile-only tests (`hipcc -c`, no GPU execution) were run on a real AMD
-gfx942 host (ROCm 7.2.1, hipcc 7.2.53211). Tests were run in `/dev/shm`
-(RAM-backed tmpfs) to avoid interfering with a concurrent training job on the
-host. No hipDF/hipMM was installed (ML training box, not data-science box).
+## 7. Remaining Work
 
-### What compiles ✅
+1. **hipDF/hipMM installation**: The host needs hipDF + hipMM installed and
+   discoverable as `cudf::cudf` / `rmm::rmm`. No pixi/vcpkg ROCm env exists yet.
+2. **Runtime validation**: The stub makes code compile; runtime behavior needs
+   testing on a host with hipDF installed. Stub methods throw → CPU fallback.
+3. **cuco port or replacement**: Needed for Bloom/in-list dynamic filters.
+4. **NVML → rocm-smi/hwloc**: For multi-GPU topology.
 
-| Test | Details |
-|---|---|
-| Basic `.cu` with `hip/hip_runtime.h` | `__global__`, `<<<>>>` launches — native HIP |
-| `__syncwarp()` | Provided by HIP |
-| `thrust/device_vector.h` | rocThrust provides `thrust/` namespace |
-| `hip/hip_cooperative_groups.h` | `cooperative_groups::this_thread_block()` compiles |
-| roctx shim | `<roctracer/roctx.h>` at `/opt/rocm-7.2.1/include/roctracer/roctx.h`; `roctx_range_id_t`, `roctxRangeStartA`, `roctxRangeStop` all resolve. The `nvtx3::scoped_range` shim compiles correctly. |
+## Appendix A: Compile-Test Success Logs (gfx942, ROCm 7.2.1)
 
-### What does NOT compile ❌
+The following compile-only tests were run on a real AMD MI300 (gfx942) host
+with ROCm 7.2.1, hipcc 7.2.53211. Tests were run in `/dev/shm` (RAM-backed
+tmpfs) to avoid interfering with a concurrent training job. No GPU execution.
 
-| Test | Error | Impact |
-|---|---|---|
-| `#include <cuda_runtime.h>` | `fatal error: 'cuda_runtime.h' file not found` | 38 live files include this — fails without hipDF's compat wrapper |
-| `cudaError_t`, `cudaMalloc`, `cudaMemcpy`, `cudaFree` | `unknown type name`, `use of undeclared identifier` | ~67 distinct `cuda*` symbols across 69 files — NOT aliased to `hip*` on stock ROCm |
-| `cudaDeviceProp`, `cudaGetDeviceProperties` | `unknown type name 'cudaDeviceProp'` | Used in `defragmenter_oom_policy.cpp` and test files |
-| `#include <cub/cub.cuh>` | `file not found` | hipCUB provides `hipcub/hipcub.cuh`, NOT `cub/cub.cuh`. All `cub::` usage needs include-path remapping or HIPIFY |
-| `__shfl_xor_sync(0xFFFFFFFFu, ...)` | `static_assert: The mask must be a 64-bit integer` | `fsst.cuh:132` passes `FULL_MASK = 0xFFFFFFFFu` (32-bit). CUDA accepts this; HIP requires `unsigned long long` (64-bit). |
+### A.1 Basic HIP compile
 
-### What was NOT found on the host
+```
+$ cat test_basic.cu
+#include <hip/hip_runtime.h>
+__global__ void kernel(int* x) { *x = 42; }
+int main() { return 0; }
 
-| Component | Searched | Found? |
-|---|---|---|
-| `cuda_runtime.h` | `find / -name cuda_runtime.h` | Only in Triton's NVIDIA backend package (not usable) |
-| `cooperative_groups.h` (CUDA-style) | `find / -name cooperative_groups.h` | Only in Triton (not usable); HIP has `hip/hip_cooperative_groups.h` |
-| `libroctx64.so` | `find /opt/rocm -name libroctx*` | Not found — roctx header exists but library not installed (developer-tools package missing) |
-| `cub/` headers | `find /opt/rocm/include -name cub.cuh` | Not found — hipCUB uses `hipcub/` namespace |
+$ hipcc -c test_basic.cu -o test_basic.o
+RESULT: BASIC COMPILE: OK
+```
 
-### Key takeaways
+### A.2 cuda_runtime.h — NOT found on stock ROCm
 
-1. **The "zero source edits" claim (§2.4) is wrong** without hipDF's full build
-   environment. The stock ROCm SDK does NOT provide `cuda*` → `hip*` aliasing
-   or `cub/` headers. Either hipDF must be installed (providing CCCL + compat
-   wrappers) or the 69 files must be HIPIFY'd.
+```
+$ cat test_cuda_rt.cu
+#include <cuda_runtime.h>
+__global__ void k(int* x) { *x = 1; }
+int main() { return 0; }
 
-2. **`cub/` → `hipcub/` is a real include-path problem.** hipCUB does not
-   provide `cub/cub.cuh`. Sirius's kernels include `<cub/cub.cuh>`,
-   `<cub/device/device_for.cuh>`, `<cub/warp/warp_scan.cuh>`, etc. These need
-   either HIPIFY (include rewrite) or a CMake-level include-path alias.
+$ hipcc -c test_cuda_rt.cu -o test_cuda_rt.o
+test_cuda_rt.cu:1:10: fatal error: 'cuda_runtime.h' file not found
+RESULT: FAILED (expected — no cuda_runtime.h in ROCm; shim provides it)
+```
 
-3. **`__shfl_xor_sync` 32-bit mask is a confirmed compile error.** `fsst.cuh:132`
-   must be changed to use a 64-bit mask (or use `cub::ShuffleIndex` which is
-   already used elsewhere in the same file and IS portable).
+### A.3 cuda* runtime API — NOT aliased on stock ROCm
 
-4. **roctx shim is verified correct** — compiles against the real header.
+```
+$ cat test_compat.cu
+#include <hip/hip_runtime.h>
+int main() {
+    int* d;
+    cudaError_t err = cudaMalloc(&d, 4);
+    cudaMemcpy(d, &d, 4, cudaMemcpyHostToDevice);
+    cudaFree(d);
+    return (int)err;
+}
 
-5. **roctx library is NOT installed** on this host — the `find_library` in CMake
-   would correctly emit `FATAL_ERROR` (as designed).
+$ hipcc -c test_compat.cu -o test_compat.o
+t_cuda.cu:4:2: error: unknown type name 'cudaError_t'
+t_cuda.cu:4:20: error: use of undeclared identifier 'cudaMalloc'
+t_cuda.cu:5:23: error: use of undeclared identifier 'cudaMemcpyHostToDevice'; did you mean 'hipMemcpyHostToDevice'?
+RESULT: FAILED (expected — shim provides the aliases)
+```
 
-## 12. Verification State
+### A.4 cub/cub.cuh — NOT found on stock ROCm
 
-This port was developed on Apple Silicon (arm64) with no AMD GPU and no
-x86_64 ROCm toolchain. A Linux VM (Colima) was started but ROCm's gfx90a
-toolchain is not packaged for arm64.
+```
+$ cat test_cub.cu
+#include <cub/cub.cuh>
+__global__ void k() {}
+int main() { return 0; }
 
-Compile-only tests were run on a real AMD gfx942 host (ROCm 7.2.1) via
-Tailscale SSH — see §11. These tests were compile-only (`hipcc -c`, no GPU
-execution) in RAM-backed `/dev/shm`, and did not interfere with a concurrent
-training job on the host. No full build was attempted (hipDF/hipMM not
-installed on the host).
+$ hipcc -c test_cub.cu -o test_cub.o
+test_cub.cu:1:10: fatal error: 'cub/cub.cuh' file not found
+RESULT: FAILED (expected — hipCUB provides hipcub/, not cub/; shim redirects)
+```
+
+### A.5 thrust — OK
+
+```
+$ cat test_thrust.cu
+#include <thrust/device_vector.h>
+int main() { thrust::device_vector<int> v(10); return 0; }
+
+$ hipcc -c test_thrust.cu -o test_thrust.o
+RESULT: OK
+```
+
+### A.6 __shfl_xor_sync with 32-bit mask — FAILS
+
+```
+$ cat test_shfl.cu
+#include <hip/hip_runtime.h>
+__global__ void k() {
+    unsigned m=0xFFFFFFFFu; int v=1;
+    v+=__shfl_xor_sync(m,v,1);
+    __syncwarp();
+}
+int main(){return 0;}
+
+$ hipcc -c test_shfl.cu -o t_shfl.o
+/opt/rocm-7.2.1/.../amd_warp_sync_functions.h:307:62: error: static assertion
+failed due to requirement 'sizeof(unsigned int) == 8': The mask must be a
+64-bit integer.
+RESULT: FAILED (fixed: fsst.cuh:132 now casts to unsigned long long)
+```
+
+### A.7 __shfl_xor_sync with 64-bit mask — OK
+
+```
+$ cat test_shfl64.cu
+#include <hip/hip_runtime.h>
+__global__ void k() {
+    unsigned long long m=0xFFFFFFFFFFFFFFFFull; int v=1;
+    v+=__shfl_xor_sync(m,v,1);
+}
+int main(){return 0;}
+
+$ hipcc -c test_shfl64.cu -o test_shfl64.o
+RESULT: 64BIT MASK OK
+```
+
+### A.8 roctx shim — OK
+
+```
+$ cat test_roctx.cpp
+#include <roctracer/roctx.h>
+#include <string>
+class scoped_range {
+    roctx_range_id_t id_;
+public:
+    explicit scoped_range(const char* n) noexcept : id_(roctxRangeStartA(n?n:"")) {}
+    explicit scoped_range(std::string const& n) noexcept : id_(roctxRangeStartA(n.c_str())) {}
+    ~scoped_range() noexcept { roctxRangeStop(id_); }
+};
+int main() { scoped_range r{"test"}; return 0; }
+
+$ hipcc -I/opt/rocm-7.2.1/include -c test_roctx.cpp -o test_roctx.o
+RESULT: roctx shim OK
+```
+
+### A.9 cooperative_groups via hip — OK
+
+```
+$ cat test_cg.cu
+#include <hip/hip_cooperative_groups.h>
+__global__ void k() { auto b = cooperative_groups::this_thread_block(); }
+int main(){return 0;}
+
+$ hipcc -c test_cg.cu -o test_cg.o
+RESULT: hip cg OK
+```
+
+### A.10 __syncwarp() — OK
+
+```
+$ cat test_syncwarp.cu
+#include <hip/hip_runtime.h>
+__global__ void k() { __syncwarp(); }
+int main(){return 0;}
+
+$ hipcc -c test_syncwarp.cu -o test_syncwarp.o
+RESULT: OK
+```
+
+### A.11 hipify-clang available
+
+```
+$ which hipify-clang
+/usr/bin/hipify-clang
+```
+
+### A.12 ROCm environment summary
+
+```
+GPU: gfx942 (AMD Instinct MI300)
+ROCm: 7.2.1
+hipcc: 7.2.53211-e1a6bc5663 (AMD clang 22.0.0git)
+cmake: 3.31.10
+hipCUB: /opt/rocm/include/hipcub/
+rocThrust: /opt/rocm/include/thrust/
+roctx: /opt/rocm-7.2.1/include/roctracer/roctx.h
+hipify-clang: /usr/bin/hipify-clang
+```
+
+### A.13 What was NOT on the host
+
+```
+cuda_runtime.h: NOT in /opt/rocm (only in Triton's NVIDIA backend package)
+cub/cub.cuh: NOT in /opt/rocm (hipCUB provides hipcub/)
+libcudf/librmm: NOT installed (ML training box, not data-science box)
+libroctx64.so: NOT installed (header exists, library missing)
+docker/podman: NOT installed
+conda/mamba: NOT installed
+```

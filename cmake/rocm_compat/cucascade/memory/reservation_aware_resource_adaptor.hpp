@@ -1,0 +1,43 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ * Licensed under the Apache License, Version 2.0 (see LICENSE).
+ */
+
+//! @file cuCascade reservation_aware_resource_adaptor — ROCm stub.
+
+#pragma once
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/resource_ref.hpp>
+#include <cstddef>
+#include <stdexcept>
+
+namespace cucascade::memory {
+
+class reservation;
+class memory_space;
+
+/// Wraps an RMM memory resource with reservation tracking.
+/// Stub: all methods throw or return defaults.
+class reservation_aware_resource_adaptor {
+ public:
+  reservation_aware_resource_adaptor(rmm::device_async_resource_ref /*upstream*/,
+                                     std::size_t /*reservation_limit*/ = 0) {}
+
+  void* allocate(rmm::cuda_stream_view, std::size_t /*bytes*/,
+                 std::size_t /*alignment*/ = 0) {
+    throw std::runtime_error("cuCascade stub: reservation_aware_resource_adaptor::allocate");
+  }
+  void deallocate(rmm::cuda_stream_view, void* /*ptr*/, std::size_t /*bytes*/,
+                  std::size_t /*alignment*/ = 0) {}
+
+  std::size_t get_peak_allocated_bytes(rmm::cuda_stream_view) const { return 0; }
+  void reset_stream_reservation(rmm::cuda_stream_view) {}
+  void attach_reservation_to_tracker(reservation& /*res*/, rmm::cuda_stream_view) {}
+
+  operator rmm::device_async_resource_ref() const {
+    throw std::runtime_error("cuCascade stub: no upstream resource");
+  }
+};
+
+}  // namespace cucascade::memory

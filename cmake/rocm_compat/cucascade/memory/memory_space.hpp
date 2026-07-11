@@ -1,0 +1,73 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ * Licensed under the Apache License, Version 2.0 (see LICENSE).
+ */
+
+//! @file
+//! cuCascade memory_space — ROCm stub.
+//! The central type: ties together a tier, device, stream pool, and allocator.
+
+#pragma once
+
+#include "cucascade/memory/common.hpp"
+#include "cucascade/memory/stream_pool.hpp"
+#include <rmm/cuda_stream.hpp>
+#include <rmm/resource_ref.hpp>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+namespace cucascade::memory {
+
+/// A memory space represents a tier (GPU/HOST/DISK) on a specific device,
+/// with an associated allocator and stream pool. This stub provides the
+/// interface Sirius calls; methods throw at runtime (graceful degradation
+/// to DuckDB CPU execution).
+class memory_space {
+ public:
+  memory_space(Tier tier, int32_t device_id,
+               rmm::device_async_resource_ref allocator,
+               std::shared_ptr<exclusive_stream_pool> streams)
+    : tier_(tier), device_id_(device_id), allocator_(allocator), streams_(std::move(streams)) {}
+
+  memory_space_id get_id() const { return {tier_, device_id_}; }
+  Tier get_tier() const { return tier_; }
+  int32_t get_device_id() const { return device_id_; }
+  rmm::device_async_resource_ref get_default_allocator() const { return allocator_; }
+
+  rmm::cuda_stream_view acquire_stream() {
+    if (!streams_) throw std::runtime_error("cuCascade stub: no stream pool");
+    return streams_->acquire_stream(stream_acquire_policy::GROW);
+  }
+
+  bool should_downgrade_memory() const { return false; }
+
+  std::string to_string() const {
+    return "cuCascade stub memory_space(tier=" + std::to_string(static_cast<int>(tier_)) +
+           ",device=" + std::to_string(device_id_) + ")";
+  }
+
+  bool operator==(memory_space const& other) const { return get_id() == other.get_id(); }
+  bool operator!=(memory_space const& other) const { return !(*this == other); }
+
+  /// Template: get memory resource as a specific type. Returns nullptr
+  /// (stub — no real reservation system).
+  template <typename T>
+  T* get_memory_resource_as() {
+    return nullptr;
+  }
+
+  /// Template: get memory resource for a specific tier.
+  template <Tier TIER>
+  typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of() {
+    return nullptr;
+  }
+
+ private:
+  Tier tier_;
+  int32_t device_id_;
+  rmm::device_async_resource_ref allocator_;
+  std::shared_ptr<exclusive_stream_pool> streams_;
+};
+
+}  // namespace cucascade::memory

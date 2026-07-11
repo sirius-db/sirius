@@ -107,6 +107,13 @@ if(VCPKG_BUILD)
                        "${CMAKE_CXX_FLAGS}")
   string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CUDA_FLAGS
                        "${CMAKE_CUDA_FLAGS}")
+  # Under ENABLE_ROCM the CUDA language is not enabled (CMAKE_CUDA_FLAGS is
+  # inert); strip the same conda-injected CCCL path from CMAKE_HIP_FLAGS so
+  # hip-clang doesn't see a conflicting CCCL version ahead of hipDF's bundled one.
+  if(ENABLE_ROCM)
+    string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_HIP_FLAGS
+                         "${CMAKE_HIP_FLAGS}")
+  endif()
 
   # The loadable extension must not depend on libcudart.so in the vcpkg build.
   # Set the CUDA language default to the static runtime before any CUDA targets
@@ -282,8 +289,18 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
   endforeach()
 endif()
 
-# Rust telemetry instrumentation (C++ FFI via Corrosion)
-add_subdirectory(rust/crates/telemetry/bridge)
+# Rust telemetry instrumentation (C++ FFI via Corrosion). Requires a Rust
+# toolchain. Gated like SIRIUS_BUILD_S3_TESTS (which needs Go) so offline /
+# Rust-less / ROCm builds skip it; the extension still builds without telemetry.
+option(SIRIUS_BUILD_TELEMETRY "Build the Rust telemetry bridge (requires Rust toolchain)" ON)
+if(SIRIUS_BUILD_TELEMETRY)
+  add_subdirectory(rust/crates/telemetry/bridge)
+else()
+  # Provide a stub target so the link targets below always resolve.
+  if(NOT TARGET telemetry_bridge)
+    add_library(telemetry_bridge INTERFACE)
+  endif()
+endif()
 
 # Upstream testcontainers-native, fetched + patched at configure time (see
 # cmake/testcontainers_native.cmake), used by the S3 integration test harness to
@@ -573,11 +590,17 @@ foreach(_target sirius_extension sirius_loadable_extension)
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
-      # ROCm compatibility shims (nvtx3→roctx, etc.) — on the include path only
-      # when ENABLE_ROCM is ON so they shadow the NVIDIA headers that don't
-      # exist on an AMD host. See cmake/rocm_compat/.
-      $<$<BOOL:${ENABLE_ROCM}>:${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat>
   )
+
+  # ROCm compatibility shims (cuda_runtime.h, cub/, cucascade/, nvtx3→roctx).
+  # BEFORE so the shim headers shadow any NVIDIA headers that might exist on
+  # the system include path. This is load-bearing: without BEFORE, the compiler
+  # may find a system cuda_runtime.h (e.g. from Triton's NVIDIA backend) ahead
+  # of the shim.
+  if(ENABLE_ROCM)
+    target_include_directories(${_target} BEFORE PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat)
+  endif()
 
   # Substrait->DuckDB reader headers (from_substrait.hpp) and its bundled
   # protobuf.
@@ -894,8 +917,12 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
-    $<$<BOOL:${ENABLE_ROCM}>:${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat>
 )
+
+if(ENABLE_ROCM)
+  target_include_directories(sirius_unittest BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat)
+endif()
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static)
 link_extension_libraries(sirius_unittest "")
@@ -953,8 +980,12 @@ endif()
 
 target_include_directories(
   parquet_benchmark
-  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-          $<$<BOOL:${ENABLE_ROCM}>:${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat>)
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+if(ENABLE_ROCM)
+  target_include_directories(parquet_benchmark BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat)
+endif()
 
 target_link_libraries(
   parquet_benchmark
@@ -968,15 +999,11 @@ target_link_libraries(
 if(SIRIUS_ENABLE_CUCASCADE)
   target_link_libraries(parquet_benchmark
                         cuCascade::cucascade cuCascade::cucascade_cudf)
-else()
-  # parquet_benchmark.cpp unconditionally #includes <cucascade/...> headers and
-  # uses cucascade:: types (see PORTING.md). When cuCascade is gated off the
-  # source won't compile, so skip the target entirely rather than emit a
-  # confusing cascade of header-not-found errors.
-  set_target_properties(parquet_benchmark PROPERTIES EXCLUDE_FROM_ALL ON)
-  message(STATUS "parquet_benchmark excluded: SIRIUS_ENABLE_CUCASCADE is OFF "
-                 "(parquet_benchmark.cpp requires cuCascade headers)")
 endif()
+# When SIRIUS_ENABLE_CUCASCADE is OFF, parquet_benchmark.cpp's <cucascade/...>
+# includes resolve to the cmake/rocm_compat/cucascade/ stub (on ROCm) or are
+# absent (on CUDA without cuCascade — an unusual config). The stub types make
+# it compile; runtime calls throw.
 link_extension_libraries(parquet_benchmark "")
 
 # ROCm: same roctx include/link as sirius_unittest (nvtx3 shim → roctx.h).
