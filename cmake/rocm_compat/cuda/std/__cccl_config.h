@@ -4,25 +4,39 @@
  */
 
 //! @file
-//! CCCL `<cuda/std/*>` redirect for ROCm/HIP.
+//! Minimal CCCL config for ROCm. Provides the _CCCL_* macros that Sirius's
+//! detail headers use for device/host/inline annotations.
 //!
-//! NVIDIA's CCCL (libcudacxx) provides `<cuda/std/limits>`, `<cuda/std/numeric>`,
-//! etc. — device-annotated versions of std types in `namespace cuda::std`.
-//! CCCL does NOT detect HIP (it only checks `__CUDACC__`/`__NVCC__`), so on
-//! stock ROCm these headers are unavailable or fall to the host path.
+//! The real CCCL __cccl_config.h defines version macros and platform detection.
+//! On stock ROCm (no hipDF/CCCL), this minimal shim provides the annotation
+//! macros so headers like bit_unpack.cuh, byte_copy.cuh, etc. that use
+//! _CCCL_DEVICE / _CCCL_FORCEINLINE compile.
 //!
-//! hipDF bundles its own CCCL patched for HIP. When hipDF is installed and on
-//! the include path, these redirects are NOT reached (hipDF's CCCL takes
-//! precedence). They exist as a fallback for stock-ROCm-only builds.
-//!
-//! The redirect maps `<cuda/std/X>` → standard `<X>` and aliases
-//! `cuda::std` → `std`. This works because hip-clang treats lambdas and
-//! functors in device code natively (no `__device__` annotation needed on
-//! std types for the operations Sirius uses: numeric_limits, accumulate,
-//! etc.).
+//! When hipDF is installed, its CCCL __cccl_config.h should take precedence.
+//! This file only resolves if the shim is found first (BEFORE on include path).
 
 #pragma once
 
-// Map cuda::std to std. hip-clang compiles std types in device code natively.
-#include_next <limits>
-namespace cuda { namespace std { using std::numeric_limits; } }
+// CCCL device/host annotations — map to HIP's __device__/__host__.
+#ifndef _CCCL_DEVICE
+#define _CCCL_DEVICE __device__
+#endif
+#ifndef _CCCL_HOST
+#define _CCCL_HOST __host__
+#endif
+#ifndef _CCCL_GLOBAL
+#define _CCCL_GLOBAL __global__
+#endif
+#ifndef _CCCL_FORCEINLINE
+#define _CCCL_FORCEINLINE __forceinline__
+#endif
+#ifndef _CCCL_EXECUTION_CHECK
+#define _CCCL_EXECUTION_CHECK
+#endif
+
+// CCCL version stub (not used by Sirius, but prevents undefined-macro issues).
+#ifndef _CCCL_VER_MAJOR
+#define _CCCL_VER_MAJOR 2
+#define _CCCL_VER_MINOR 0
+#define _CCCL_VER_PATCH 0
+#endif

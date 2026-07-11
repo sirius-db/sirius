@@ -58,7 +58,7 @@ __global__ void copy_mask(uint32_t* b, uint32_t* c, uint64_t offset, uint64_t N)
   uint32_t lane_id = threadIdx.x % 32;
   uint32_t set     = (mask << lane_id);
   for (int lane = 16; lane >= 1; lane /= 2) {
-    set |= __shfl_down_sync(0xFFFFFFFF, set, lane);
+    set |= __shfl_down_sync(0xFFFFFFFFull, set, lane);
   }
   __syncwarp();
   if (lane_id == 0) { c[idx / 32] = set; }

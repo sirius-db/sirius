@@ -18,10 +18,14 @@ namespace cucascade::memory {
 
 class host_table_allocation {
  public:
+  /// Typedef for the shared_ptr type — Sirius uses this as
+  /// `host_table_allocation::buffers_ptr` in host_table_chunk_reader.hpp.
+  using buffers_ptr = std::shared_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation>;
+
   virtual ~host_table_allocation() = default;
 
   /// The pinned host buffer allocation (may be null for empty tables).
-  std::shared_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation> allocation;
+  buffers_ptr allocation;
 
   /// Per-column layout metadata. Sirius reads .num_rows, .data_offset, etc.
   std::vector<column_metadata> columns;

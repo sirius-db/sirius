@@ -9,12 +9,13 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
+#include "cucascade/memory/memory_reservation.hpp"
 #include <cstddef>
+#include <memory>
 #include <stdexcept>
 
 namespace cucascade::memory {
 
-class reservation;
 class memory_space;
 
 /// Wraps an RMM memory resource with reservation tracking.
@@ -33,7 +34,13 @@ class reservation_aware_resource_adaptor {
 
   std::size_t get_peak_allocated_bytes(rmm::cuda_stream_view) const { return 0; }
   void reset_stream_reservation(rmm::cuda_stream_view) {}
-  void attach_reservation_to_tracker(reservation& /*res*/, rmm::cuda_stream_view) {}
+  // Sirius calls: allocator->attach_reservation_to_tracker(stream, std::move(reservation), std::make_unique<fail_reservation_limit_policy>())
+  // Returns bool (Sirius checks: if (!allocator->attach_reservation_to_tracker(...)))
+  bool attach_reservation_to_tracker(rmm::cuda_stream_view /*stream*/,
+                                     std::unique_ptr<reservation> /*reservation*/,
+                                     std::unique_ptr<reservation_limit_policy> /*policy*/) {
+    return false; // stub: no tracking
+  }
 
   operator rmm::device_async_resource_ref() const {
     throw std::runtime_error("cuCascade stub: no upstream resource");

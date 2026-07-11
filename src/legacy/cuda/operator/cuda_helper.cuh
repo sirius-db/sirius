@@ -217,11 +217,11 @@ __device__ __forceinline__ T BlockReduce(T item, T* shared, int op_mode)
   // Calculate sum across warp
   for (int offset = 16; offset > 0; offset /= 2) {
     if (op_mode == 0 || op_mode == 1) {  // sum or avg
-      val += __shfl_down_sync(0xffffffff, val, offset);
+      val += __shfl_down_sync(0xFFFFFFFFull, val, offset);
     } else if (op_mode == 2) {  // max
-      val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+      val = max(val, __shfl_down_sync(0xFFFFFFFFull, val, offset));
     } else if (op_mode == 3) {  // min
-      val = min(val, __shfl_down_sync(0xffffffff, val, offset));
+      val = min(val, __shfl_down_sync(0xFFFFFFFFull, val, offset));
     }
   }
 
@@ -243,11 +243,11 @@ __device__ __forceinline__ T BlockReduce(T item, T* shared, int op_mode)
   if (wid == 0) {
     for (int offset = 16; offset > 0; offset /= 2) {
       if (op_mode == 0 || op_mode == 1) {  // sum or avg
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val += __shfl_down_sync(0xFFFFFFFFull, val, offset);
       } else if (op_mode == 2) {  // max
-        val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+        val = max(val, __shfl_down_sync(0xFFFFFFFFull, val, offset));
       } else if (op_mode == 3) {  // min
-        val = min(val, __shfl_down_sync(0xffffffff, val, offset));
+        val = min(val, __shfl_down_sync(0xFFFFFFFFull, val, offset));
       }
     }
   }
