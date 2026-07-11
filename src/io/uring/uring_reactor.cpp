@@ -400,11 +400,11 @@ unique_ring_ptr make_ring(unsigned depth)
   p.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
   int rc = io_uring_queue_init_params(depth, r.get(), &p);
   if (rc == 0) {
-    spdlog::trace("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN, entries={}",
-                  depth);
+    SIRIUS_LOG_TRACE("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN, entries={}",
+                     depth);
     return unique_ring_ptr{r.release()};
   }
-  spdlog::trace(
+  SIRIUS_LOG_TRACE(
     "uring_device_reactor: SINGLE_ISSUER|DEFER_TASKRUN unsupported "
     "({}), falling back to plain flags",
     strerror(-rc));
@@ -412,7 +412,7 @@ unique_ring_ptr make_ring(unsigned depth)
   auto r2 = std::make_unique<io_uring>();
   int rc2 = io_uring_queue_init(depth, r2.get(), 0);
   if (rc2 < 0) throw std::runtime_error("uring_reactor: ring init: " + std::string(strerror(-rc2)));
-  spdlog::trace("uring_reactor: ring using plain flags, entries={}", depth);
+  SIRIUS_LOG_TRACE("uring_reactor: ring using plain flags, entries={}", depth);
   return unique_ring_ptr{r2.release()};
 }
 
@@ -428,8 +428,9 @@ struct unique_ring {
   [[nodiscard]] bool register_buffers(std::span<iovec> iovecs)
   {
     if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), iovecs.size()); rc < 0) {
-      spdlog::warn("uring_reactor: io_uring_register_buffers failed ({}); fixed buffers disabled",
-                   strerror(-rc));
+      SIRIUS_LOG_WARN(
+        "uring_reactor: io_uring_register_buffers failed ({}); fixed buffers disabled",
+        strerror(-rc));
       return false;
     }
     return true;
@@ -852,7 +853,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   static constexpr std::chrono::milliseconds SHUTDOWN_POLL_MS{100};
 
   std::stop_callback cb(stop_token, [this] {
-    spdlog::trace("uring_reactor worker_loop: stop requested");
+    SIRIUS_LOG_TRACE("uring_reactor worker_loop: stop requested");
     _requests.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queue
   });
 
@@ -980,7 +981,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         // resubmit — register_bound_buffer re-preps it as a plain read.  No
         // bytes landed, so the resubmit reads the whole range from scratch.
         if (s.used_fixed_buffer && is_fixed_buffer_error(errc)) {
-          spdlog::warn(
+          SIRIUS_LOG_WARN(
             "uring_reactor: fixed-buffer read failed on slot {} ({}); "
             "falling back to plain read",
             si,
@@ -1041,7 +1042,8 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     while (inflight > 0) {
       auto s = ring.wait_for(SHUTDOWN_POLL_MS);
       if (s) {
-        spdlog::error("uring_reactor: io_uring_wait_cqe failed during shutdown: {}", strerror(s));
+        SIRIUS_LOG_ERROR("uring_reactor: io_uring_wait_cqe failed during shutdown: {}",
+                         strerror(s));
         break;
       }
       reap_cqes();
@@ -1083,7 +1085,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         if (inflight > 0) {
           auto s = ring.wait_for(SHUTDOWN_POLL_MS);
           if (s) {
-            spdlog::error("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(s));
+            SIRIUS_LOG_ERROR("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(s));
             break;
           }
           reap_cqes();
@@ -1094,7 +1096,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         poll_copy_completions();
       }
     } catch (const std::exception& e) {
-      spdlog::error("uring_reactor: exception: {}", e.what());
+      SIRIUS_LOG_ERROR("uring_reactor: exception: {}", e.what());
     }
   }
 }

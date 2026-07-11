@@ -199,7 +199,7 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   // worker drops the old request and we don't leak both into the cache.
   if (_prefetch_handle) {
     if (_prefetch_handle.is_active()) {
-      spdlog::warn(
+      SIRIUS_LOG_WARN(
         "sirius_datasource::fadvise: a prefetching_handle was already stored on "
         "this datasource (path={}); cancelling the stale request.  Each scan "
         "should own a unique datasource.",

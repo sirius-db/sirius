@@ -88,6 +88,11 @@ inline void InitGlobalLogger(const std::string& log_level_str,
   spdlog::flush_every(std::chrono::seconds(flush_seconds));
 }
 
+inline void FlushGlobalLogger()
+{
+  if (auto* logger = spdlog::default_logger_raw()) { logger->flush(); }
+}
+
 inline void SetGlobalLogFlush(int flush_seconds)
 {
   spdlog::flush_every(std::chrono::seconds(flush_seconds));

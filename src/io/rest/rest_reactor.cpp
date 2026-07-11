@@ -24,7 +24,7 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <spdlog/spdlog.h>
+#include <spdlog/fmt/fmt.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
@@ -1640,7 +1640,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         pc.event->synchronize();
         pc.manager->chunk_complete(pc.bytes);
       } catch (const std::exception& e) {
-        spdlog::error("rest_reactor: copy-event synchronize on shutdown failed: {}", e.what());
+        SIRIUS_LOG_ERROR("rest_reactor: copy-event synchronize on shutdown failed: {}", e.what());
         pc.manager->report_error(std::make_exception_ptr(std::runtime_error(
           std::string("rest_reactor: device H2D copy failed on shutdown: ") + e.what())));
       }
@@ -1667,7 +1667,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     }
     ready.clear();
   } catch (const std::exception& e) {
-    spdlog::error("rest_reactor worker_loop: {}", e.what());
+    SIRIUS_LOG_ERROR("rest_reactor worker_loop: {}", e.what());
   }
 
   std::unique_ptr<rest_chunked_rx_request> dr;
