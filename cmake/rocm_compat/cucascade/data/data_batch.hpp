@@ -116,30 +116,54 @@ class data_batch {
   uint64_t get_batch_id() const { return batch_id_; }
 
   read_only_data_batch to_read_only() {
-    throw std::runtime_error("cuCascade stub: data_batch::to_read_only");
+    if (state_ != batch_state::mutable_locked && state_ != batch_state::idle) {
+      throw std::runtime_error("cuCascade: to_read_only from invalid state");
+    }
+    state_ = batch_state::read_only;
+    return read_only_data_batch(data_, space_, batch_id_);
   }
   mutable_data_batch to_mutable() {
-    throw std::runtime_error("cuCascade stub: data_batch::to_mutable");
+    if (state_ != batch_state::read_only && state_ != batch_state::idle) {
+      throw std::runtime_error("cuCascade: to_mutable from invalid state");
+    }
+    state_ = batch_state::mutable_locked;
+    return mutable_data_batch(data_, space_, batch_id_);
   }
-  bool try_to_read_only() { return false; }
-  bool try_to_mutable() { return false; }
+  bool try_to_read_only() {
+    if (state_ != batch_state::mutable_locked && state_ != batch_state::idle) return false;
+    state_ = batch_state::read_only;
+    return true;
+  }
+  bool try_to_mutable() {
+    if (state_ != batch_state::read_only && state_ != batch_state::idle) return false;
+    state_ = batch_state::mutable_locked;
+    return true;
+  }
 
-  static read_only_data_batch to_idle(read_only_data_batch&&) {
-    throw std::runtime_error("cuCascade stub: data_batch::to_idle");
+  static read_only_data_batch to_idle(read_only_data_batch&& ro) {
+    return std::move(ro);  // state transitions handled by caller
   }
-  static mutable_data_batch to_idle(mutable_data_batch&&) {
-    throw std::runtime_error("cuCascade stub: data_batch::to_idle");
+  static mutable_data_batch to_idle(mutable_data_batch&& mut) {
+    return std::move(mut);
   }
-  static mutable_data_batch readonly_to_mutable(read_only_data_batch&&) {
-    throw std::runtime_error("cuCascade stub: readonly_to_mutable");
+  static mutable_data_batch readonly_to_mutable(read_only_data_batch&& ro) {
+    auto data = ro.get_data();
+    auto space = ro.get_memory_space();
+    auto id = ro.get_batch_id();
+    return mutable_data_batch(std::shared_ptr<idata_representation>(
+      const_cast<idata_representation*>(data)), space, id);
   }
-  static read_only_data_batch mutable_to_readonly(mutable_data_batch&&) {
-    throw std::runtime_error("cuCascade stub: mutable_to_readonly");
+  static read_only_data_batch mutable_to_readonly(mutable_data_batch&& mut) {
+    auto data = mut.get_data();
+    auto space = mut.get_memory_space();
+    auto id = mut.get_batch_id();
+    return read_only_data_batch(std::shared_ptr<idata_representation>(
+      const_cast<idata_representation*>(data)), space, id);
   }
 
-  void subscribe() {}
-  void unsubscribe() {}
-  std::size_t get_subscriber_count() const { return 0; }
+  void subscribe() { ++subscriber_count_; }
+  void unsubscribe() { if (subscriber_count_ > 0) --subscriber_count_; }
+  std::size_t get_subscriber_count() const { return subscriber_count_; }
 
  private:
   data_batch(uint64_t batch_id, std::unique_ptr<idata_representation> data,
@@ -150,6 +174,7 @@ class data_batch {
   batch_state state_{batch_state::idle};
   std::shared_ptr<idata_representation> data_;
   memory::memory_space* space_{nullptr};
+  std::size_t subscriber_count_{0};
 };
 
 }  // namespace cucascade

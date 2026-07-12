@@ -15,8 +15,8 @@ struct disk_table_allocation {
   std::size_t size_bytes{0};
 };
 
-inline std::string generate_disk_file_path(std::string const& /*base*/, std::size_t /*idx*/) {
-  return {};
+inline std::string generate_disk_file_path(std::string const& base, std::size_t idx) {
+  return base + "/cucascade_disk_" + std::to_string(idx) + ".bin";
 }
 
 }  // namespace cucascade::memory
