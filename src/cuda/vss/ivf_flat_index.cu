@@ -45,6 +45,17 @@ cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metr
                               std::string(metric) + "'");
 }
 
+cuvs::distance::DistanceType enn_distance_type_from_metric(std::string_view metric)
+{
+  // Keep in sync with vss_pattern.cpp::metric_for_function: brute force runs on the
+  // raw (large-magnitude) vectors, so l2 uses the Unexpanded form to avoid
+  // catastrophic cancellation. Cosine matches the ANN form.
+  if (metric == "l2sq") { return cuvs::distance::DistanceType::L2SqrtUnexpanded; }
+  if (metric == "cosine") { return cuvs::distance::DistanceType::CosineExpanded; }
+  throw std::invalid_argument("enn_distance_type_from_metric: unsupported metric '" +
+                              std::string(metric) + "'");
+}
+
 namespace {
 
 /// RAII: route allocations on the current device through @p mr for the guard's

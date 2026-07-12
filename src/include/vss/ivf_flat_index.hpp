@@ -41,6 +41,12 @@ namespace sirius::vss {
 /// `std::invalid_argument` on an unknown metric.
 cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metric);
 
+/// Map a user metric string to the cuVS DistanceType for an exact BRUTE-FORCE
+/// search over raw vectors. Same as @ref ann_distance_type_from_metric except l2
+/// uses the Unexpanded form (`||a-b||^2` directly) to avoid catastrophic
+/// cancellation on large-magnitude vectors.
+cuvs::distance::DistanceType enn_distance_type_from_metric(std::string_view metric);
+
 /// Build an IVF-Flat index over @p vectors (a contiguous, unsliced, gap-free
 /// FLOAT32 LIST column of fixed width @p dim), allocating the index through
 /// @p index_mr, the GPU reservation's memory resource, so the whole index lives
@@ -72,7 +78,7 @@ struct ann_search_result {
 };
 
 /// Search a pinned IVF-Flat index (held type-erased in @p index) for the @p k
-/// nearest neighbours of a single query vector.
+/// nearest neighbors of a single query vector.
 ///
 /// @p query_device points to a @p dim-length FLOAT32 vector ALREADY ON THE
 /// DEVICE (caller uploads it). Outputs are allocated through @p mr. The call is
@@ -81,7 +87,7 @@ struct ann_search_result {
 /// \param index        Type-erased IVF-Flat index (throws if it is not one).
 /// \param query_device Device pointer to the [dim] FLOAT32 query vector.
 /// \param dim          Vector dimensionality (must equal the index's).
-/// \param k            Neighbours to return (1 <= k <= n_rows).
+/// \param k            Neighbors to return (1 <= k <= n_rows).
 /// \param n_probes     IVF lists to probe (accuracy/speed knob; <= n_lists).
 ann_search_result search_ivf_flat_index(any_cuvs_index const& index,
                                         const float* query_device,

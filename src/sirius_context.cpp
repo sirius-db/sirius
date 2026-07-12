@@ -36,6 +36,7 @@
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "vss/cuvs_index_cache.hpp"
+#include "vss/pinned_column_cache.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -314,6 +315,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // manager so an index build can reserve its GPU footprint through Sirius.
   cuvs_index_cache_ = std::make_unique<sirius::vss::cuvs_index_cache>(*memory_manager_);
 
+  // Session cache of coalesced contiguous pinned columns, reused across searches.
+  // Takes the memory manager so each coalesce reserves its GPU footprint.
+  pinned_column_cache_ = std::make_unique<sirius::vss::pinned_column_cache>(*memory_manager_);
+
   // Declare one telemetry device group per GPU so thread/queue telemetry can
   // nest under its device instead of piling up flat under the engine. The GPU
   // memory space configs already reflect the configured topology.num_gpus /
@@ -575,6 +580,9 @@ void SiriusContext::terminate()
   // no kernels are still reading the index buffers being freed here.
   cuvs_index_cache_.reset();
 
+  // Free coalesced pinned columns (GPU memory) while the memory manager is alive.
+  pinned_column_cache_.reset();
+
   // Drop any remaining repositories while the memory manager is still alive.
   data_repository_manager_.reset();
 
@@ -688,6 +696,11 @@ sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache()
 {
   throw_if_not_initialized();
   return *cuvs_index_cache_;
+}
+
+sirius::vss::pinned_column_cache& SiriusContext::get_pinned_column_cache()
+{
+  return *pinned_column_cache_;
 }
 
 const sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache() const

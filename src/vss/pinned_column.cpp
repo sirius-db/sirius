@@ -35,6 +35,15 @@ std::unique_ptr<cudf::column> concat_pinned_column(const scan_manager::pinned_en
                                                    cucascade::memory::memory_space& space,
                                                    rmm::cuda_stream_view stream)
 {
+  return concat_pinned_column(pin, column_name, space, stream, space.get_default_allocator());
+}
+
+std::unique_ptr<cudf::column> concat_pinned_column(const scan_manager::pinned_entry& pin,
+                                                   const std::string& column_name,
+                                                   cucascade::memory::memory_space& space,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr)
+{
   auto it = pin.data_batches_by_column.find(column_name);
   if (it == pin.data_batches_by_column.end() || it->second.empty()) {
     throw internal_exception("VSS: pinned table missing column '" + column_name + "'");
@@ -52,10 +61,22 @@ std::unique_ptr<cudf::column> concat_pinned_column(const scan_manager::pinned_en
     views.push_back(chunks[c]->view());
   }
 
-  if (views.size() == 1) {
-    return std::make_unique<cudf::column>(views.front(), stream, space.get_default_allocator());
+  if (views.size() == 1) { return std::make_unique<cudf::column>(views.front(), stream, mr); }
+  return cudf::concatenate(views, stream, mr);
+}
+
+std::size_t pinned_column_alloc_size(const scan_manager::pinned_entry& pin,
+                                     const std::string& column_name)
+{
+  auto it = pin.data_batches_by_column.find(column_name);
+  if (it == pin.data_batches_by_column.end() || it->second.empty()) {
+    throw internal_exception("VSS: pinned table missing column '" + column_name + "'");
   }
-  return cudf::concatenate(views, stream, space.get_default_allocator());
+  std::size_t bytes = 0;
+  for (auto const& chunk : it->second) {
+    bytes += chunk->alloc_size();
+  }
+  return bytes;
 }
 
 }  // namespace sirius::vss

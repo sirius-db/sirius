@@ -23,6 +23,7 @@
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/pinned_column_cache.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -170,7 +171,7 @@ std::unique_ptr<operator_data> sirius_physical_vss_ann_ivf_flat::execute(
 
   auto const k = std::min<int64_t>(num_rows, static_cast<int64_t>(offset + limit));
 
-  // Upload the (constant) query vector once: a [1, dim] device matrix.
+  // Upload the (constant) query vector once
   rmm::device_buffer query_buf(pattern.query.size() * sizeof(float), stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(query_buf.data(),
                                 pattern.query.data(),
@@ -193,15 +194,23 @@ std::unique_ptr<operator_data> sirius_physical_vss_ann_ivf_flat::execute(
                                                    mr);
 
   // Gather the requested output columns from the pinned table by the returned
-  // global row indices. Concatenate each output column's chunks (build order)
-  // into one contiguous column, then gather all at once.
-  std::vector<std::unique_ptr<cudf::column>> full_cols;
+  // global row indices. Each output column is coalesced (build order) into one
+  // contiguous column via the session cache then gathered all at once.
+  auto& col_cache = sirius_context_->get_pinned_column_cache();
+  std::vector<std::shared_ptr<cudf::column>> full_cols;
   for (std::size_t i = 0; i < pattern.output_columns.size(); ++i) {
     if (pattern.output_columns[i].which == sirius::vss::vss_output_column::kind::distance) {
       continue;
     }
-    full_cols.push_back(
-      sirius::vss::concat_pinned_column(*pin, output_column_names_[i], *space, stream));
+    auto const& name = output_column_names_[i];
+    full_cols.push_back(col_cache.get_or_build(table_name_,
+                                               name,
+                                               sirius::vss::pinned_column_alloc_size(*pin, name),
+                                               target_gpu,
+                                               [&](rmm::device_async_resource_ref build_mr) {
+                                                 return sirius::vss::concat_pinned_column(
+                                                   *pin, name, *space, stream, build_mr);
+                                               }));
   }
 
   std::vector<cudf::column_view> full_views;

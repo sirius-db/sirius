@@ -17,7 +17,9 @@
 #pragma once
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -50,5 +52,18 @@ std::unique_ptr<cudf::column> concat_pinned_column(const scan_manager::pinned_en
                                                    const std::string& column_name,
                                                    cucascade::memory::memory_space& space,
                                                    rmm::cuda_stream_view stream);
+
+/// As above, but allocate the result through @p mr (e.g. a reservation's memory
+/// resource) instead of @p space's default allocator. @p space is still used for
+/// the multi-GPU placement check.
+std::unique_ptr<cudf::column> concat_pinned_column(const scan_manager::pinned_entry& pin,
+                                                   const std::string& column_name,
+                                                   cucascade::memory::memory_space& space,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr);
+
+/// Sum of the pinned column's chunk allocation sizes.
+[[nodiscard]] std::size_t pinned_column_alloc_size(const scan_manager::pinned_entry& pin,
+                                                   const std::string& column_name);
 
 }  // namespace sirius::vss

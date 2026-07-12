@@ -364,7 +364,9 @@ set(EXTENSION_SOURCES
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp
     src/vss/cuvs_index_cache.cpp
-    src/vss/pinned_column.cpp)
+    src/vss/pinned_column.cpp
+    src/vss/pinned_column_cache.cpp
+    src/vss/vector_search.cpp)
 # cmake-format: on
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
@@ -612,6 +614,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_gpu_execution_vss_enn.cpp
     test/cpp/integration/test_gpu_execution_vss_ann.cpp
+    test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/io/s3/test_sigv4.cpp
