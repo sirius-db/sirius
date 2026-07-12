@@ -41,6 +41,26 @@ cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 #     builds end-to-end on AMD today.
 option(ENABLE_ROCM "Build Sirius against the AMD ROCm/HIP backend (hipDF + hipMM) instead of NVIDIA CUDA" OFF)
 
+# When ENABLE_ROCM, fetch the cuda2rocm compatibility shims from GitHub
+# instead of vendoring them. This makes cuda2rocm a proper dependency and
+# prevents the two copies from drifting. The shims provide cuda_runtime.h,
+# cub/→hipCUB, CCCL redirects, nvtx3→roctx, cooperative_groups, nvml, etc.
+if(ENABLE_ROCM)
+  include(FetchContent)
+  FetchContent_Declare(
+    cuda2rocm
+    URL https://github.com/hamstergamerszhang-ops/cuda2rocm/archive/706a736a871c46b580d35ed8afae64e4734645ac.tar.gz
+    URL_HASH SHA256=6cf72e8b4c52641f31e1ba2fcb7ba315cc11de52212ca03f478121c613d5c596
+  )
+  # We only need the headers, so populate without building
+  FetchContent_GetProperties(cuda2rocm)
+  if(NOT cuda2rocm_POPULATED)
+    FetchContent_Populate(cuda2rocm)
+  endif()
+  set(SIRIUS_ROCM_COMPAT_DIR "${cuda2rocm_SOURCE_DIR}/cuda-compat-shims/include")
+  message(STATUS "cuda2rocm shims: ${SIRIUS_ROCM_COMPAT_DIR}")
+endif()
+
 if(ENABLE_ROCM)
   # hipDF's own project() enables LANGUAGES C CXX HIP; mirror that here so the
   # .cu sources in CUDA_SOURCES are compiled by hip-clang as HIP. CMAKE_HIP_ARCHITECTURES
@@ -287,7 +307,7 @@ if(ENABLE_ROCM)
           cucascade_cudf_objects cucascade_cudf_static cucascade_cudf_shared)
     if(TARGET "${_cucascade_target}")
       target_include_directories("${_cucascade_target}" BEFORE PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat)
+        ${SIRIUS_ROCM_COMPAT_DIR})
     endif()
   endforeach()
 endif()
@@ -647,7 +667,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # of the shim.
   if(ENABLE_ROCM)
     target_include_directories(${_target} BEFORE PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat)
+      ${SIRIUS_ROCM_COMPAT_DIR})
   endif()
 
   # Substrait->DuckDB reader headers (from_substrait.hpp) and its bundled
@@ -969,7 +989,7 @@ target_include_directories(
 
 if(ENABLE_ROCM)
   target_include_directories(sirius_unittest BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat)
+    ${SIRIUS_ROCM_COMPAT_DIR})
 endif()
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static)
@@ -1032,7 +1052,7 @@ target_include_directories(
 
 if(ENABLE_ROCM)
   target_include_directories(parquet_benchmark BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat)
+    ${SIRIUS_ROCM_COMPAT_DIR})
 endif()
 
 target_link_libraries(
