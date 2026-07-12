@@ -5,42 +5,38 @@
 
 //! @file
 //! CCCL @c <cuda/atomic> redirect for ROCm.
-//! Real CCCL exposes @c cuda::atomic and @c cuda::atomic_ref in @c namespace cuda
-//! (NOT @c cuda::std). This shim provides both namespace locations.
+//! Tries hipDF's real CCCL first; falls back to std-based stubs.
 
 #pragma once
 
-#include <atomic>
+#if __has_include_next(<cuda/atomic>)
+  #include_next <cuda/atomic>
+#else
+  #include <atomic>
 
-namespace cuda {
+  namespace cuda {
+  template <typename T> using atomic = ::std::atomic<T>;
+  #if __cpp_lib_atomic_ref
+  template <typename T> using atomic_ref = ::std::atomic_ref<T>;
+  #endif
+  using ::std::memory_order;
+  using ::std::memory_order_relaxed;
+  using ::std::memory_order_acquire;
+  using ::std::memory_order_release;
+  using ::std::memory_order_acq_rel;
+  using ::std::memory_order_seq_cst;
+  }  // namespace cuda
 
-template <typename T>
-using atomic = ::std::atomic<T>;
-
-template <typename T>
-using atomic_ref = ::std::atomic_ref<T>;
-
-// Memory order constants (also in cuda::std via _redirect.hpp, but some
-// code uses cuda::memory_order_relaxed directly).
-using ::std::memory_order;
-using ::std::memory_order_relaxed;
-using ::std::memory_order_acquire;
-using ::std::memory_order_release;
-using ::std::memory_order_acq_rel;
-using ::std::memory_order_seq_cst;
-
-}  // namespace cuda
-
-// Also provide cuda::std::atomic for code that uses that path.
-namespace cuda {
-namespace std {
-template <typename T> using atomic = ::std::atomic<T>;
-template <typename T> using atomic_ref = ::std::atomic_ref<T>;
-using ::std::memory_order;
-using ::std::memory_order_relaxed;
-using ::std::memory_order_acquire;
-using ::std::memory_order_release;
-using ::std::memory_order_acq_rel;
-using ::std::memory_order_seq_cst;
-}  // namespace std
-}  // namespace cuda
+  namespace cuda { namespace std {
+  template <typename T> using atomic = ::std::atomic<T>;
+  #if __cpp_lib_atomic_ref
+  template <typename T> using atomic_ref = ::std::atomic_ref<T>;
+  #endif
+  using ::std::memory_order;
+  using ::std::memory_order_relaxed;
+  using ::std::memory_order_acquire;
+  using ::std::memory_order_release;
+  using ::std::memory_order_acq_rel;
+  using ::std::memory_order_seq_cst;
+  }}  // namespace cuda::std
+#endif

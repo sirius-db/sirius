@@ -1,0 +1,35 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ * Licensed under the Apache License, Version 2.0 (see LICENSE).
+ */
+
+//! @file
+//! CCCL @c <cuda/functional> redirect for ROCm.
+//! Tries hipDF's real CCCL first; falls back to minimal cuda::minimum/maximum.
+
+#pragma once
+
+#if __has_include_next(<cuda/functional>)
+  #include_next <cuda/functional>
+#else
+  #include <algorithm>
+  #include <functional>
+
+  namespace cuda {
+
+  template <typename T = void>
+  struct minimum {
+    __host__ __device__ constexpr T operator()(T const& a, T const& b) const {
+      return a < b ? a : b;
+    }
+  };
+
+  template <typename T = void>
+  struct maximum {
+    __host__ __device__ constexpr T operator()(T const& a, T const& b) const {
+      return a > b ? a : b;
+    }
+  };
+
+  }  // namespace cuda
+#endif

@@ -17,7 +17,12 @@
 
 #pragma once
 
-// CCCL device/host annotations — map to HIP's __device__/__host__.
+// Try hipDF's real CCCL config first (if installed via cudf::cudf includes).
+#if __has_include_next(<cuda/std/__cccl_config.h>)
+  #include_next <cuda/std/__cccl_config.h>
+#endif
+
+// Fallback: define _CCCL_* macros only if not already defined by real CCCL.
 #ifndef _CCCL_DEVICE
 #define _CCCL_DEVICE __device__
 #endif

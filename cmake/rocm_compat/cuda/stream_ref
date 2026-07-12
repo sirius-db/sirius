@@ -5,31 +5,25 @@
 
 //! @file
 //! CCCL @c <cuda/stream_ref> redirect for ROCm.
-//! Provides @c cuda::stream_ref — a lightweight non-owning reference to a
-//! CUDA/HIP stream. Sirius uses it as a parameter type for cuco allocator
-//! constructors and filter methods.
+//! Tries hipDF's real CCCL first; falls back to minimal stream_ref.
 
 #pragma once
 
-#include <hip/hip_runtime.h>  // hipStream_t (via cuda_runtime.h shim → cudaStream_t)
+#if __has_include_next(<cuda/stream_ref>)
+  #include_next <cuda/stream_ref>
+#else
+  #include <hip/hip_runtime.h>
 
-namespace cuda {
-
-/// Non-owning reference to a GPU stream. Wraps the raw stream handle.
-class stream_ref {
- public:
-  stream_ref() = default;
-  explicit stream_ref(hipStream_t s) : stream_(s) {}
-
-  /// Returns the underlying stream handle. Sirius calls .value() to get the
-  /// raw stream for cudaMemcpyAsync etc.
-  hipStream_t value() const { return stream_; }
-  /// Sirius's rmm_cuco_allocator calls stream.get() (CCCL API).
-  hipStream_t get() const { return stream_; }
-  operator hipStream_t() const { return stream_; }
-
- private:
-  hipStream_t stream_{};
-};
-
-}  // namespace cuda
+  namespace cuda {
+  class stream_ref {
+   public:
+    stream_ref() = default;
+    explicit stream_ref(hipStream_t s) : stream_(s) {}
+    hipStream_t value() const { return stream_; }
+    hipStream_t get() const { return stream_; }
+    operator hipStream_t() const { return stream_; }
+   private:
+    hipStream_t stream_{};
+  };
+  }  // namespace cuda
+#endif
