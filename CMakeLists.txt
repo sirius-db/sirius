@@ -49,8 +49,8 @@ if(ENABLE_ROCM)
   include(FetchContent)
   FetchContent_Declare(
     cuda2rocm
-    URL https://github.com/hamstergamerszhang-ops/cuda2rocm/archive/706a736a871c46b580d35ed8afae64e4734645ac.tar.gz
-    URL_HASH SHA256=6cf72e8b4c52641f31e1ba2fcb7ba315cc11de52212ca03f478121c613d5c596
+    URL https://github.com/hamstergamerszhang-ops/cuda2rocm/archive/2511e5265472f894a883a1bda0d677e4ecbcf059.tar.gz
+    URL_HASH SHA256=aad55f3897f2649f835a3f3587c8bc5bc18350256b277d3bbb66efd53a62d1ec
   )
   # We only need the headers, so populate without building
   FetchContent_GetProperties(cuda2rocm)
