@@ -7,7 +7,9 @@
 
 #pragma once
 #include "cucascade/memory/common.hpp"
+#include "cucascade/error.hpp"
 #include <rmm/cuda_stream.hpp>
+#include <cuda_runtime.h>  // shim → hip runtime (for hipEvent*)
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -38,9 +40,16 @@ class idata_representation {
   virtual std::size_t get_uncompressed_data_size_in_bytes() const = 0;
   virtual std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view) = 0;
 
-  virtual void record_writer_event(rmm::cuda_stream_view) {}
-  virtual cudaEvent_t get_writer_event() const { return nullptr; }
-  virtual void rebind_stream(rmm::cuda_stream_view) {}
+  virtual void record_writer_event(rmm::cuda_stream_view stream) {
+    if (!writer_event_) {
+      hipEventCreateWithFlags(&writer_event_, hipEventDisableTiming);
+    }
+    hipEventRecord(writer_event_, stream.value());
+  }
+  virtual cudaEvent_t get_writer_event() const { return writer_event_; }
+  virtual void rebind_stream(rmm::cuda_stream_view stream) {
+    if (writer_event_) hipEventRecord(writer_event_, stream.value());
+  }
 
   /// Template cast using dynamic_cast. Heavily used as ->cast<gpu_table_representation>().
   template <typename TargetType>
@@ -60,6 +69,7 @@ class idata_representation {
 
  protected:
   memory::memory_space* space_;
+  cudaEvent_t writer_event_{nullptr};
 };
 
 /// No-op batch probe. Sirius subclasses this (quent_data_batch_probe) and

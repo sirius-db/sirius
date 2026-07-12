@@ -100,7 +100,11 @@ inline constexpr std::size_t default_block_size = 1 << 20;        // 1 MiB
 inline constexpr std::size_t default_pool_size = 1 << 24;          // 16 MiB
 inline constexpr std::size_t default_initial_number_pools = 4;
 
-/// Check if peer DMA works between two devices (stub: always false).
-inline bool probe_peer_dma_works(int32_t /*src*/, int32_t /*dst*/) { return false; }
+/// Check if peer DMA works between two devices.
+inline bool probe_peer_dma_works(int32_t src, int32_t dst) {
+  int can_access = 0;
+  if (hipDeviceCanAccessPeer(&can_access, src, dst) != hipSuccess) return false;
+  return can_access != 0;
+}
 
 }  // namespace cucascade::memory

@@ -14,6 +14,7 @@
 #include "cucascade/memory/stream_pool.hpp"
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -80,26 +81,55 @@ class memory_space {
     throw std::runtime_error("cuCascade stub: get_memory_resource_of<TIER>() const — no reservation system");
   }
 
-  // --- Memory reservation convenience methods (stub: return defaults) ---
-  std::size_t get_max_memory() const { return 0; }
-  std::size_t get_available_memory() const { return 0; }
-  std::size_t get_total_reserved_memory() const { return 0; }
+  // --- Memory tracking (real: tracks allocated/reserved bytes) ---
+  std::size_t get_max_memory() const { return max_memory_; }
+  std::size_t get_available_memory() const { return max_memory_ - reserved_memory_; }
+  std::size_t get_total_reserved_memory() const { return reserved_memory_; }
 
-  std::unique_ptr<reservation> make_reservation(std::size_t /*bytes*/) {
-    throw std::runtime_error("cuCascade stub: memory_space::make_reservation");
+  std::unique_ptr<reservation> make_reservation(std::size_t bytes) {
+    if (bytes > get_available_memory()) {
+      throw std::runtime_error("cuCascade: insufficient memory for reservation");
+    }
+    reserved_memory_ += bytes;
+    auto arena = std::make_unique<simple_arena>(bytes);
+    return reservation::create(*this, std::move(arena));
   }
-  std::unique_ptr<reservation> make_reservation_or_null(std::size_t /*bytes*/) {
-    return nullptr;
+  std::unique_ptr<reservation> make_reservation_or_null(std::size_t bytes) {
+    if (bytes > get_available_memory()) return nullptr;
+    reserved_memory_ += bytes;
+    auto arena = std::make_unique<simple_arena>(bytes);
+    return reservation::create(*this, std::move(arena));
   }
-  std::unique_ptr<reservation> make_reservation_upto(std::size_t /*bytes*/) {
-    throw std::runtime_error("cuCascade stub: memory_space::make_reservation_upto");
+  std::unique_ptr<reservation> make_reservation_upto(std::size_t bytes) {
+    std::size_t actual = std::min(bytes, get_available_memory());
+    if (actual == 0) return nullptr;
+    reserved_memory_ += actual;
+    auto arena = std::make_unique<simple_arena>(actual);
+    return reservation::create(*this, std::move(arena));
   }
+
+  void release_reservation(std::size_t bytes) { if (reserved_memory_ >= bytes) reserved_memory_ -= bytes; }
 
  private:
   Tier tier_;
   int32_t device_id_;
   rmm::device_async_resource_ref allocator_;
   std::shared_ptr<exclusive_stream_pool> streams_;
+  std::size_t max_memory_{0};
+  std::size_t reserved_memory_{0};
+
+  /// Simple arena: tracks a byte count (no actual allocation — the
+  /// reservation is bookkeeping; actual device memory is allocated
+  /// separately via the allocator or hipMalloc).
+  class simple_arena : public reserved_arena {
+   public:
+    explicit simple_arena(std::size_t n) : bytes_(n) {}
+    std::size_t size() const override { return bytes_; }
+    void grow_by(std::size_t n) override { bytes_ += n; }
+    void shrink_to_fit() override {}
+   private:
+    std::size_t bytes_{0};
+  };
 };
 
 }  // namespace cucascade::memory

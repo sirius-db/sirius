@@ -7,9 +7,11 @@
 //! actually access (id, name, numa_node, pci_bus_id, num_gpus, num_numa_nodes, hostname).
 
 #pragma once
+#include <cuda_runtime.h>  // shim → hip runtime
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unistd.h>  // gethostname
 
 namespace cucascade::memory {
 
@@ -50,12 +52,51 @@ struct system_topology_info {
 class topology_discovery {
  public:
   bool discover(NetworkDeviceVerification /*verify*/ = NetworkDeviceVerification::EXISTS_ACTIVE_IP) {
-    return false; // stub: no topology discovery
+    int device_count = 0;
+    if (hipGetDeviceCount(&device_count) != hipSuccess || device_count <= 0) {
+      return false;
+    }
+    topology_.num_gpus = static_cast<std::size_t>(device_count);
+    topology_.gpus.clear();
+    topology_.gpus.reserve(device_count);
+    for (int i = 0; i < device_count; ++i) {
+      gpu_topology_info gpu;
+      gpu.id = i;
+      // Device name
+      hipDeviceProp_t prop;
+      if (hipGetDeviceProperties(&prop, i) == hipSuccess) {
+        gpu.name = prop.name;
+        gpu.total_memory = prop.totalGlobalMem;
+      }
+      // NUMA node — HIP doesn't expose this directly; use -1 as "unknown"
+      gpu.numa_node = -1;
+      // PCI bus ID
+      char pci_bus_id[32] = {0};
+      if (hipDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i) == hipSuccess) {
+        gpu.pci_bus_id = pci_bus_id;
+      }
+      // Peer access
+      for (int j = 0; j < device_count; ++j) {
+        if (j != i) {
+          int can_access = 0;
+          hipDeviceCanAccessPeer(&can_access, i, j);
+          if (can_access) gpu.peer_devices.push_back(j);
+        }
+      }
+      topology_.gpus.push_back(std::move(gpu));
+    }
+    topology_.num_numa_nodes = 1; // simplified
+    char hostname[256] = {0};
+    gethostname(hostname, sizeof(hostname) - 1);
+    topology_.hostname = hostname;
+    discovered_ = true;
+    return true;
   }
-  bool is_discovered() const { return false; }
+  bool is_discovered() const { return discovered_; }
   system_topology_info const& get_topology() const { return topology_; }
  private:
   system_topology_info topology_;
+  bool discovered_{false};
 };
 
 }  // namespace cucascade::memory
