@@ -1,4 +1,13 @@
-// CCCL <cuda/std/cstring> redirect for ROCm. See _redirect.hpp.
-#pragma once
-#include <cstring>
-#include "cuda/std/_redirect.hpp"
+// CCCL <cuda/std/cstring> redirect for ROCm.
+// Try hipDF's CCCL first via #include_next; fall back to std + namespace alias.
+#ifndef SIRIUS_ROCM_COMPAT_CUDASTD_CSTRING
+#define SIRIUS_ROCM_COMPAT_CUDASTD_CSTRING
+
+#if __has_include_next(<cuda/std/cstring>)
+  #include_next <cuda/std/cstring>
+  #define CUDA_STD_REDIRECT_ALREADY_DEFINED
+#else
+  #include <cstring>
+#endif
+#include "cuda/std/_fallback.hpp"
+#endif

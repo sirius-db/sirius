@@ -537,6 +537,17 @@ set_source_files_properties(${SIRIUS_SUBSTRAIT_SOURCES}
                             PROPERTIES COMPILE_OPTIONS "-w")
 list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
 
+# When telemetry is OFF, the Rust-generated headers (telemetry-bridge/gen/*.rs.h)
+# don't exist. Exclude the telemetry source files from the build — the stub
+# telemetry_bridge INTERFACE library satisfies the link dependency, and the
+# telemetry functionality is simply absent (no-op).
+if(NOT SIRIUS_BUILD_TELEMETRY)
+  list(REMOVE_ITEM EXTENSION_SOURCES
+       src/telemetry/telemetry_context.cpp
+       src/telemetry/memory_context.cpp)
+  message(STATUS "Telemetry sources excluded: SIRIUS_BUILD_TELEMETRY is OFF")
+endif()
+
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 

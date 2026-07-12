@@ -37,10 +37,11 @@ class reservation_aware_resource_adaptor {
   void reset_stream_reservation(rmm::cuda_stream_view) {}
   // Sirius calls with 4 args: (stream, reservation, limit_policy, oom_policy)
   // and with 3 args: (stream, reservation, limit_policy)
+  // and with 2 args: (stream, reservation) [test code]
   // Both return bool (Sirius checks: if (!allocator->attach_reservation_to_tracker(...)))
   bool attach_reservation_to_tracker(rmm::cuda_stream_view /*stream*/,
                                      std::unique_ptr<reservation> /*reservation*/,
-                                     std::unique_ptr<reservation_limit_policy> /*limit_policy*/,
+                                     std::unique_ptr<reservation_limit_policy> /*limit_policy*/ = nullptr,
                                      std::unique_ptr<oom_handling_policy> /*oom_policy*/ = nullptr) {
     return false; // stub: no tracking
   }

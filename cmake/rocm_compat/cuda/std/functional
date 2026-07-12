@@ -1,4 +1,13 @@
-// CCCL <cuda/std/functional> redirect for ROCm. See _redirect.hpp.
-#pragma once
-#include <functional>
-#include "cuda/std/_redirect.hpp"
+// CCCL <cuda/std/functional> redirect for ROCm.
+// Try hipDF's CCCL first via #include_next; fall back to std + namespace alias.
+#ifndef SIRIUS_ROCM_COMPAT_CUDASTD_FUNCTIONAL
+#define SIRIUS_ROCM_COMPAT_CUDASTD_FUNCTIONAL
+
+#if __has_include_next(<cuda/std/functional>)
+  #include_next <cuda/std/functional>
+  #define CUDA_STD_REDIRECT_ALREADY_DEFINED
+#else
+  #include <functional>
+#endif
+#include "cuda/std/_fallback.hpp"
+#endif

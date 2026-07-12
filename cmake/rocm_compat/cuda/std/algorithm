@@ -1,4 +1,13 @@
-// CCCL <cuda/std/algorithm> redirect for ROCm. See _redirect.hpp.
-#pragma once
-#include <algorithm>
-#include "cuda/std/_redirect.hpp"
+// CCCL <cuda/std/algorithm> redirect for ROCm.
+// Try hipDF's CCCL first via #include_next; fall back to std + namespace alias.
+#ifndef SIRIUS_ROCM_COMPAT_CUDASTD_ALGORITHM
+#define SIRIUS_ROCM_COMPAT_CUDASTD_ALGORITHM
+
+#if __has_include_next(<cuda/std/algorithm>)
+  #include_next <cuda/std/algorithm>
+  #define CUDA_STD_REDIRECT_ALREADY_DEFINED
+#else
+  #include <algorithm>
+#endif
+#include "cuda/std/_fallback.hpp"
+#endif

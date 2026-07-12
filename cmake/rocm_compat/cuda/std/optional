@@ -1,0 +1,25 @@
+// CCCL <cuda/std/optional> redirect for ROCm.
+// Try hipDF's CCCL first; fall back to std + namespace alias.
+#ifndef SIRIUS_ROCM_COMPAT_CUDASTD_OPTIONAL
+#define SIRIUS_ROCM_COMPAT_CUDASTD_OPTIONAL
+
+#if __has_include_next(<cuda/std/optional>)
+  #include_next <cuda/std/optional>
+  #define CUDA_STD_REDIRECT_ALREADY_DEFINED
+#else
+  #include <optional>
+#endif
+#include "cuda/std/_fallback.hpp"
+
+#ifndef CUDA_STD_REDIRECT_ALREADY_DEFINED
+namespace cuda {
+namespace std {
+using std::optional;
+using std::nullopt;
+using std::nullopt_t;
+using std::make_optional;
+}  // namespace std
+}  // namespace cuda
+#endif
+
+#endif

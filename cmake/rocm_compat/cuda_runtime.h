@@ -198,10 +198,19 @@ inline cudaError_t cudaPointerGetAttributes_impl(cudaPointerAttributes* attrs, v
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
 
 // ---------------------------------------------------------------------------
-// Profiler API — Sirius declares these extern "C" in sirius_extension.cpp.
-// HIP provides hipProfilerStart/Stop (deprecated but functional in 7.2.1).
+// Profiler API — Sirius declares these extern "C" in sirius_extension.cpp:
+//   extern "C" int cudaProfilerStart();
+//   extern "C" int cudaProfilerStop();
+// HIP provides hipProfilerStart/Stop (deprecated but functional in 7.2.1),
+// but they return hipError_t (enum), not int. A #define would create a
+// redeclaration mismatch (int vs hipError_t). Instead, provide inline
+// wrapper functions with C linkage and the correct int return type.
+// The `extern "C"` matches Sirius's own declarations, and `inline` makes
+// them COMDAT-safe across TUs.
 // ---------------------------------------------------------------------------
-#define cudaProfilerStart hipProfilerStart
-#define cudaProfilerStop hipProfilerStop
+extern "C" {
+inline int cudaProfilerStart() { return static_cast<int>(hipProfilerStart()); }
+inline int cudaProfilerStop() { return static_cast<int>(hipProfilerStop()); }
+}
 
 #endif  // SIRIUS_ROCM_COMPAT_CUDA_RUNTIME_H
