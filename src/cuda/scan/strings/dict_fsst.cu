@@ -358,6 +358,12 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
   // instantiation (launched over the same array) covers the rest.
   if ((desc.mode == DICT_FSST_MODE_FSST_ONLY) != FsstOnly) return;
 
+  // Guard: stub descriptors (from malformed segments) have dict_count == 0.
+  // Skip the row-copy — the rows were already zero-filled by the caller's
+  // stub handling. Without this guard, the kernel would OOB-read an empty
+  // dict_byte_offsets buffer and produce garbage strings.
+  if (desc.dict_count == 0) return;
+
   uint8_t const* base           = desc.d_bytes;
   uint32_t const* dict_byte_off = d_byte_offsets + desc.seg_dict_offset_base;
 
