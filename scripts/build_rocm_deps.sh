@@ -97,7 +97,7 @@ cd "$BUILD_DIR"
 echo "=== Step 2: Building hipDF ==="
 
 HIPDF_DIR="${BUILD_DIR}/hipDF"
-HIPDF_BRANCH="main"
+HIPDF_BRANCH="release/rocmds-26.03"
 
 if [ ! -d "$HIPDF_DIR" ]; then
   git clone --depth 1 --branch "$HIPDF_BRANCH" \

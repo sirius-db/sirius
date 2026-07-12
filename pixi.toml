@@ -144,6 +144,13 @@ liburing = "*"
 openssl = "*"
 curl = "*"
 git = "*"
+pkg-config = "*"
+ccache = "*"
+ninja = "*"
+sqlite = "*"
+mold = "*"
+catch-headers = "*"
+flatbuffers = "=24.3.25"
 
 [feature.rocm.activation.env]
 # hipDF/hipMM install to /opt/rocm by default (see scripts/build_rocm_deps.sh)
@@ -164,4 +171,4 @@ duckdb-python = ["duckdb-python"]
 vcpkg = ["vcpkg", "cuda13"]
 vcpkg-cuda12 = ["vcpkg", "cuda12"]
 nightly-runner = { features = ["nightly-runner"], no-default-feature = true }
-rocm = ["dev-libs", "rocm"]
+rocm = { features = ["rocm"], no-default-feature = true }
