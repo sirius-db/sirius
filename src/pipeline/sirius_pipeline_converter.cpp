@@ -473,7 +473,7 @@ void sirius_pipeline_converter::split_ann_source(
   if (current_pipeline->source == nullptr ||
       current_pipeline->source->type != op::SiriusPhysicalOperatorType::ANN_IVF_FLAT) {
     return;
-      }
+  }
   current_pipeline->operators.insert(current_pipeline->operators.begin(),
                                      *current_pipeline->source);
 }

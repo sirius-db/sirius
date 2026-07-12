@@ -52,6 +52,7 @@ class small_pinned_host_memory_resource;
 
 namespace sirius::vss {
 class cuvs_index_cache;
+class pinned_column_cache;
 }  // namespace sirius::vss
 
 namespace sirius::memory {
@@ -249,6 +250,9 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
   [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
 
+  /// \brief Get the session's cache of coalesced (contiguous) pinned columns.
+  [[nodiscard]] sirius::vss::pinned_column_cache& get_pinned_column_cache();
+
   [[nodiscard]] std::shared_ptr<const sirius::telemetry::telemetry_context> get_telemetry_context()
     const;
 
@@ -331,6 +335,10 @@ class SiriusContext : public ClientContextState {
   // reservation into the manager's GPU spaces, so the manager must outlive the
   // cache. Also reset explicitly in terminate() before the manager is torn down.
   std::unique_ptr<sirius::vss::cuvs_index_cache> cuvs_index_cache_;
+  // Session cache of coalesced contiguous pinned columns (see pinned_column_cache).
+  // Holds GPU memory derived from pinned chunks; reset in terminate() before the
+  // memory manager is torn down.
+  std::unique_ptr<sirius::vss::pinned_column_cache> pinned_column_cache_;
   // P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
   // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
   // call per pair. Consumed by is_peer_access_enabled() and any Sirius-side
