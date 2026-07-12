@@ -1232,7 +1232,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           std::fprintf(stderr,
                        "simpatico::codegen: cpp encode: BUG - unexpected op '%s' at node %d "
                        "(extract_fusable_subtree should have filtered)\n",
-                       jit::op_kind_name(node.op),
+                       jit::op_kind_name(node.op).c_str(),
                        node_id);
           return -1;
       }

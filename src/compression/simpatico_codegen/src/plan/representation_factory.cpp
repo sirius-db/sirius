@@ -318,7 +318,6 @@ std::unique_ptr<compressed_representation> bitpack_compressed_representation::fr
   // ``packed`` may legitimately be null here (tail-routed).
 
   cudf::data_type original_type = chunk_min->type();
-  cudf::size_type num_chunks    = chunk_min->size();
 
   // The serialized per-leaf num_rows (the same sum recorded at compress time)
   // lets the from-wire path skip the D2H + sync; a zero hint (decode-driver
