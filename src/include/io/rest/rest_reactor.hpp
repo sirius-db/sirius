@@ -157,14 +157,9 @@ struct rest_perf_snapshot {
 // rest_bounce_slice_snapshot
 // ---------------------------------------------------------------------------
 
-/// Test-observation view of one reactor's bounce staging slice, exposed so the
-/// slice invariants of the shared-span design are verifiable from outside:
-/// every entry of a pool shares one allocation (same @c allocation_id and
-/// @c span_bytes), reactor r's slice starts at r * conns * grain
-/// (@c offset_bytes) and covers conns * grain bytes (@c slice_bytes), with no
-/// overlap and full span coverage.  @c allocation_id is an opaque identity —
-/// never dereference it.  Populated only for the dedicated large-grain path
-/// after start(); the default block-carve path reports nothing.
+/// Test-observation view of one reactor's slice of the shared bounce span
+/// (large-grain staging only; the default block-carve path reports nothing).
+/// @c allocation_id is an opaque identity — never dereference it.
 struct rest_bounce_slice_snapshot {
   std::size_t reactor_index{0};
   std::uintptr_t allocation_id{0};
@@ -224,14 +219,12 @@ class rest_reactor {
       return _host_mr;
     }
 
-    /// One-shot: book (FSMR reserve, same host ledger with the stricter
-    /// reservation-limit admission) and allocate (one contiguous NUMA-bound
-    /// upstream region) the shared bounce span for @p n_reactors.  Called by
-    /// rest_ioctx::start() BEFORE any reactor worker starts.  No-op when
-    /// staging is absent, the grain equals the staging block size (default
-    /// block-carve path), or the span is already prepared.  Budget failures
-    /// throw with needed/limit/shortfall BEFORE any upstream allocation; an
-    /// upstream failure after a successful booking unwinds the booking.
+    /// One-shot: book (FSMR reserve) and allocate (one contiguous pinned
+    /// region from the selected HOST resource's upstream) the shared bounce
+    /// span for @p n_reactors.  No-op when staging is absent, the grain
+    /// equals the staging block size, or the span is already prepared.
+    /// Budget failures throw BEFORE any upstream allocation; an upstream
+    /// failure after a successful booking unwinds it.
     void prepare_bounce_span(std::size_t n_reactors);
 
     struct bounce_slice {
@@ -239,9 +232,8 @@ class rest_reactor {
       std::size_t index{0};
     };
 
-    /// Claim the next reactor slice of the prepared span (called from
-    /// rest_reactor::start(), sequential pool order under the base start
-    /// loop).  nullopt when no span exists (default path).  Throws if more
+    /// Claim the next reactor slice of the prepared span (start()-time, pool
+    /// order).  nullopt when no span exists (default path); throws if more
     /// reactors claim than the span was prepared for.
     [[nodiscard]] std::optional<bounce_slice> claim_bounce_slice();
 
@@ -256,9 +248,9 @@ class rest_reactor {
     std::shared_ptr<s3::s3_request_authorizer> _authorizer;
     cucascade::memory::fixed_size_host_memory_resource* _host_mr{nullptr};
 
-    // Shared bounce span (large-grain staging): the booking keeps the bytes
-    // visible in the host budget while the physical region lives outside the
-    // pool's block inventory (one contiguous slab-equivalent).
+    // Shared bounce span: the booking keeps the bytes visible in the host
+    // budget while the physical region lives outside the pool's block
+    // inventory.
     std::unique_ptr<cucascade::memory::reserved_arena> _bounce_booking;
     void* _bounce_span{nullptr};
     std::size_t _bounce_span_bytes{0};
@@ -345,10 +337,8 @@ class rest_reactor {
   /// loads); safe to call while the reactor is running.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
-  /// This reactor's bounce slice, when the dedicated large-grain pool backs
-  /// staging (nullopt on the default block-carve path or before start()).
-  /// @c reactor_index is left 0 — rest_ioctx assigns it by pool position.
-  /// Immutable once start() ran, so safe to call while the reactor is running.
+  /// This reactor's bounce slice (nullopt on the default block-carve path or
+  /// before start()); @c reactor_index is assigned by rest_ioctx.
   [[nodiscard]] std::optional<rest_bounce_slice_snapshot> bounce_slice_snapshot() const noexcept;
 
   // -- capabilities / factory ----------------------------------------------
@@ -393,10 +383,8 @@ class rest_reactor {
   // reactor is destroyed.  Null when no host_memory_resource is set.
   cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
 
-  // This reactor's slice of the context's shared bounce span (large-grain
-  // staging): base of max_connections * _bounce_slot_size contiguous bytes,
-  // claimed from the context in start().  Null on the default block-carve
-  // path.  Exactly one of _bounce_storage / _bounce_slice_base is set when
+  // This reactor's slice of the context's shared bounce span, claimed in
+  // start().  Exactly one of _bounce_storage / _bounce_slice_base is set when
   // staging is enabled.
   uint8_t* _bounce_slice_base{nullptr};
   std::size_t _reactor_index{0};

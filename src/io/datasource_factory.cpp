@@ -148,19 +148,13 @@ factory_type make_rest_ioctx_factory(
         return nullptr;
       }
       // Host staging is optional for REST — when absent, reactor-staged device
-      // reads are disabled (bounce_block_size 0), host reads still work.  A
-      // configured rest.bounce_block_size is authoritative when nonzero (it
-      // must be a whole multiple of the staging block size, since the default
-      // grain carves bounce slots from staging blocks); zero falls back to the
-      // staging resource's block size.
+      // reads are disabled (bounce_block_size 0), host reads still work.
       auto* host_mr = first_host_resource(reservation_manager);
       auto rest_cfg = config.rest;
       if (host_mr == nullptr) {
         if (rest_cfg.bounce_block_size != 0) {
-          // An explicitly configured grain must take effect or fail — never
-          // silently degrade to host-read-only staging.  (The YAML path is
-          // already rejected by the config preflight; this covers programmatic
-          // configs.)
+          // An explicit grain must take effect or fail — never silently
+          // degrade to host-read-only staging.
           throw std::invalid_argument(
             "make_rest_ioctx_factory: rest.bounce_block_size is configured but no host staging "
             "resource is available for reactor-staged device reads");
@@ -179,9 +173,8 @@ factory_type make_rest_ioctx_factory(
           std::to_string(rest::config::max_bounce_block_size) + " bytes");
       }
       if (host_mr != nullptr && rest_cfg.bounce_block_size != 0) {
-        // Pool-level ceiling on the RESOLVED grain — both axes (connections
-        // and grain) obey the same bound; the shared formula keeps this site,
-        // the YAML preflight, and the reactor context from drifting.
+        // Apply the same resolved pool formula and ceiling used by the config
+        // preflight and reactor-context preparation.
         auto const pool = rest::checked_bounce_pool_bytes(
           config.rest_n_reactors, rest_cfg.max_connections, rest_cfg.bounce_block_size);
         if (!pool || *pool > rest::config::max_bounce_pool_bytes) {

@@ -443,14 +443,12 @@ void rest_reactor::reactor_context::prepare_bounce_span(std::size_t n_reactors)
     fail("exceeds the bounce pool ceiling", needed, config::max_bounce_pool_bytes);
   }
 
-  // The uniform pool ceiling above binds BOTH grains — direct construction
-  // reaches no other checkpoint.  Only past it may the default carve path
-  // return to per-reactor block allocation, mechanism unchanged.
+  // The pool ceiling applies to both the default block-carve path and the
+  // explicit large-grain span path — direct construction reaches no other
+  // checkpoint before the default path returns.
   if (grain == block) { return; }
 
-  // Book first (same _allocated_bytes ledger as the block path, stricter
-  // reservation-limit admission); nothing physical exists yet, so a booking
-  // failure allocates nothing.
+  // Book first: a booking failure must allocate nothing.
   std::unique_ptr<cucascade::memory::reserved_arena> booking;
   try {
     booking = _host_mr->reserve(needed);
@@ -458,9 +456,9 @@ void rest_reactor::reactor_context::prepare_bounce_span(std::size_t n_reactors)
     booking.reset();
   }
   if (!booking) {
-    // Exact admissible headroom when sirius_config stamped the resolved
-    // reservation limit; otherwise get_available_memory() (capacity −
-    // allocated) is an upper bound on what the stricter limit could admit.
+    // Exact headroom when the resolved reservation limit was stamped;
+    // otherwise capacity − allocated is an upper bound on what the stricter
+    // limit could admit.
     std::size_t admissible = 0;
     if (_config.resolved_host_reservation_limit != 0) {
       auto const allocated = _host_mr->get_total_allocated_bytes();
@@ -473,9 +471,8 @@ void rest_reactor::reactor_context::prepare_bounce_span(std::size_t n_reactors)
     fail("does not fit the resolved host budget", needed, admissible);
   }
 
-  // Physical span: one contiguous, pinned, NUMA-bound region from the SAME
-  // upstream expand_pool() uses.  If this throws, `booking` unwinds and the
-  // ledger returns to baseline (rollback observed by the accounting tests).
+  // Physical span: one contiguous pinned region from the same upstream
+  // expand_pool() uses.  If this throws, `booking` unwinds.
   void* span = _host_mr->get_upstream_resource().allocate(
     rmm::cuda_stream_view{}, needed, alignof(std::max_align_t));
 
@@ -501,8 +498,6 @@ rest_reactor::reactor_context::claim_bounce_slice()
 rest_reactor::reactor_context::~reactor_context()
 {
   if (_bounce_span != nullptr && _host_mr != nullptr) {
-    // Physical region back to the upstream FIRST, then the booking — the
-    // budget must never under-report live pinned memory.
     _host_mr->get_upstream_resource().deallocate(
       rmm::cuda_stream_view{}, _bounce_span, _bounce_span_bytes, alignof(std::max_align_t));
   }
@@ -533,15 +528,12 @@ rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_vie
   (void)global_curl_context::instance();
 
   if (_ctx->host_memory_resource() != nullptr) {
-    // The bounce slot size doubles as the device-read window grain: the static
-    // prep_device_rx_request splits by cfg.bounce_block_size, and every window
-    // must fit the slot that stages it.  There is NO runtime capacity check
-    // anywhere downstream (sink bound, set_data, H2D all trust chunk.size), so
-    // this resolution + validation is the only enforcement point.  A nonzero
-    // configured value is authoritative; zero resolves to the staging
-    // resource's block size — written back into _config so get_config() (the
-    // ioctx's dispatch config) windows by the same value the slots are sized
-    // to, with or without the datasource factory in front.
+    // The bounce slot size doubles as the device-read window grain, and no
+    // downstream path re-checks capacity (sink, set_data, H2D all trust
+    // chunk.size) — this resolution + validation is the only enforcement
+    // point.  The zero fallback is written back into _config so get_config()
+    // (the ioctx's dispatch config) windows by the same value the slots are
+    // sized to.
     auto const staging_block = _ctx->host_memory_resource()->get_block_size();
     if (_config.bounce_block_size == 0) {
       _config.bounce_block_size = staging_block;
@@ -574,25 +566,20 @@ void rest_reactor::start()
 
   if (_ctx->host_memory_resource() != nullptr && _bounce_slice_base == nullptr &&
       !_bounce_storage) {
-    // One pinned bounce buffer per slot (1:1 with the easy-handle pool), since a
-    // slot stages at most one device read at a time.  The already-acquired
-    // guard keeps a retried start() (e.g. after a failed thread creation) from
-    // claiming a second slice or re-carving blocks.
+    // One pinned bounce buffer per slot (1:1 with the easy-handle pool), since
+    // a slot stages at most one device read at a time.  The already-acquired
+    // guard keeps a retried start() from claiming a second slice.
     if (auto slice = _ctx->claim_bounce_slice()) {
-      // Shared-span path (grain > staging block): this reactor's contiguous
-      // slice of the context's accounted span, claimed in pool order under the
-      // ioctx's sequential start loop.
+      // Shared-span path (grain > staging block).
       _bounce_slice_base = slice->base;
       _reactor_index     = slice->index;
     } else if (_bounce_slot_size == _ctx->host_memory_resource()->get_block_size()) {
-      // Default grain: carve one staging block per slot (accounted against the
-      // host staging budget, as always).
+      // Default grain: carve one staging block per slot.
       _bounce_storage = _ctx->host_memory_resource()->allocate_multiple_blocks(
         _config.max_connections * _bounce_slot_size);
     } else {
-      // A large grain with no prepared span means rest_ioctx::start() (which
-      // runs prepare_bounce_span first) was bypassed — carving this slot size
-      // from per-block staging would overflow slots, so refuse loudly.
+      // Large grain but no prepared span: rest_ioctx::start() was bypassed —
+      // per-block staging cannot back this slot size, refuse loudly.
       throw std::logic_error(
         "rest_reactor: bounce span not prepared for a large grain — start the reactor pool "
         "through rest_ioctx::start()");
@@ -768,8 +755,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
   if (offset >= end) { return rest_rx_request::create({}); }
   size_t const wanted = end - offset;
   size_t const bounce = cfg.bounce_block_size;
-  // Overflow-safe ceil(wanted / bounce): the additive form can wrap for a
-  // huge configured grain.
+  // Overflow-safe ceil: the additive form can wrap for a huge grain.
   size_t const n_win = wanted / bounce + (wanted % bounce != 0 ? 1 : 0);
 
   auto manager   = std::make_shared<request_manager>(wanted, n_win);
@@ -777,8 +763,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(n_win);
-  // Advance by the clamped window size (never past `end`), not by `bounce` —
-  // `w += bounce` could wrap for a huge configured grain.
+  // Advance by the clamped window size — `w += bounce` could wrap.
   for (size_t w = offset; w < end;) {
     size_t const rs = std::min(bounce, end - w);
     auto req        = std::make_unique<rest_chunked_rx_request>();
@@ -1368,8 +1353,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         bounce_bufs.push_back(reinterpret_cast<uint8_t*>(b));
       }
     } else if (_bounce_slice_base != nullptr) {
-      // Shared-span slice (configured grain > staging block): slot i owns the
-      // i-th _bounce_slot_size-sized stride of this reactor's slice.
+      // Shared-span slice: slot i owns the i-th _bounce_slot_size stride.
       bounce_bufs.reserve(_config.max_connections);
       for (std::size_t i = 0; i < _config.max_connections; ++i) {
         bounce_bufs.push_back(_bounce_slice_base + i * _bounce_slot_size);

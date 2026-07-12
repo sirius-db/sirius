@@ -47,10 +47,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @c templated_ioctx.
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
-  /// Prepares the context's shared bounce span (large-grain staging: one
-  /// accounted contiguous allocation for the whole pool) BEFORE the base class
-  /// starts any reactor worker — budget failures surface here, with no thread
-  /// or GET in flight.  Then delegates to the base start (idempotent).
+  /// Prepares the context's shared bounce span BEFORE the base class starts
+  /// any reactor worker — budget failures surface with no thread or GET in
+  /// flight.
   void start() override;
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
@@ -60,11 +59,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// non-zero reactor value.  Lock-free; drives the s3-bench JSON baseline.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
-  /// One entry per reactor whose staging is backed by the dedicated
-  /// large-grain bounce pool (empty on the default block-carve path), with
-  /// @c reactor_index assigned by pool position.  Exists so the shared-span
-  /// slice invariants (one allocation, r * conns * grain offsets, no overlap)
-  /// are externally verifiable — see rest_bounce_slice_snapshot.
+  /// One entry per reactor backed by the shared bounce span (empty on the
+  /// default block-carve path), @c reactor_index assigned by pool position —
+  /// see rest_bounce_slice_snapshot.
   [[nodiscard]] std::vector<rest_bounce_slice_snapshot> bounce_slice_snapshots() const;
 
  protected:
@@ -79,8 +76,7 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint) override;
 
  private:
-  /// The pool's shared context (also captured by every reactor); kept here so
-  /// start() can prepare the bounce span before the reactors run.
+  /// The pool's shared context, kept so start() can prepare the bounce span.
   std::shared_ptr<rest_reactor::reactor_context> _pool_ctx;
 
   /// Resolve @p path with a single suffix-range GET: it discovers the size and

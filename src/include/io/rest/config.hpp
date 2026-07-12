@@ -53,37 +53,28 @@ struct config {
   std::size_t max_read_split{16};
 
   /// Bounce-slot size (bytes) for the reactor-staged device path — also the
-  /// window grain @c prep_device_rx_request splits device reads by (the static
-  /// prep needs this size without access to the live staging resource, which
-  /// lives on the @c reactor_context).  Nonzero is authoritative and must be a
-  /// whole multiple of (and at least) the host staging block size — validated
-  /// at datasource construction and in the reactor constructor.  Zero means
-  /// auto: the factory substitutes the staging resource's block size, or
-  /// keeps 0 (device reads disabled) when no staging resource exists.  Values
-  /// above @c max_bounce_block_size are rejected outright.  A grain larger
-  /// than one staging block switches the bounce pool to one contiguous pinned
-  /// span BOOKED against the host staging budget (FSMR reservation, stricter
-  /// reservation-limit admission than the block path's capacity admission).
+  /// window grain @c prep_device_rx_request splits device reads by (the
+  /// static prep cannot reach the live staging resource).  Nonzero is
+  /// authoritative (whole multiple of the host block size,
+  /// <= @c max_bounce_block_size); a larger-than-block grain stages through
+  /// one budget-booked contiguous span instead of per-slot staging blocks.
+  /// 0 = auto: the host block size, or disabled when no staging resource
+  /// exists.
   std::size_t bounce_block_size{0};
 
-  /// RESOLVED host reservation limit (bytes), stamped by sirius_config after
+  /// RESOLVED host reservation limit, stamped by sirius_config after
   /// memory-space resolution so runtime budget failures can report exact
   /// needed/limit/shortfall (the staging pool exposes no limit getter).
-  /// Internal carrier — NOT a YAML key; 0 = unknown (direct construction),
-  /// in which case errors fall back to the capacity-headroom upper bound.
+  /// Internal carrier — NOT a YAML key; 0 = unknown, errors then fall back to
+  /// the capacity-headroom upper bound.
   std::size_t resolved_host_reservation_limit{0};
 
-  /// Hard ceiling for @c bounce_block_size (1 GiB).  This is a per-SLOT grain
-  /// bound for arithmetic hygiene (the reactor additionally guards
-  /// max_connections * grain against size_t overflow); the pool-level bound is
-  /// @c max_bounce_pool_bytes below.
+  /// Per-slot ceiling for @c bounce_block_size; the pool-level bound is
+  /// @c max_bounce_pool_bytes.
   static constexpr std::size_t max_bounce_block_size{1UL << 30};
 
-  /// Hard ceiling for the whole bounce pool (2 GiB):
-  /// reactors * max_connections * bounce_block_size must not exceed this,
-  /// whichever knob produced the product.  Calibrated so the largest
-  /// known-legal geometry (8 reactors * 256 connections * 1 MiB) sits exactly
-  /// at the cap.
+  /// Ceiling for the whole bounce pool: reactors * max_connections *
+  /// bounce_block_size, whichever knob produced the product.
   static constexpr std::size_t max_bounce_pool_bytes{2UL << 30};
 
   /// Idle-connection keepalive.  While the reactor is idle, every
@@ -132,10 +123,9 @@ struct config {
   std::size_t footer_probe_bytes{512UL << 10};  // 512 KiB
 };
 
-/// Overflow-safe reactors * connections * grain — THE bounce-pool sizing
-/// formula, shared verbatim by the YAML preflight, the datasource factory and
-/// the reactor context so the three admission sites cannot drift.  nullopt on
-/// size_t overflow (two-stage checked multiply).
+/// Overflow-safe reactors * connections * grain: the single bounce-pool
+/// sizing formula for every admission site (YAML preflight, factory, reactor
+/// context).  nullopt on size_t overflow.
 [[nodiscard]] inline std::optional<std::size_t> checked_bounce_pool_bytes(
   std::size_t n_reactors, std::size_t max_connections, std::size_t grain) noexcept
 {

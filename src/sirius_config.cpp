@@ -479,9 +479,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     }
 
     enforce_sirius_datasource_for_multi_gpu();
-    // Carry the resolved host reservation limit into the REST config so
-    // runtime budget failures can report exact needed/limit/shortfall (the
-    // FSMR exposes no limit getter).  Internal resolved field, not a YAML key.
+    // Stamp the resolved host reservation limit into the REST config — see
+    // rest::config::resolved_host_reservation_limit.
     for (auto const& space : _memory_space_configs) {
       if (auto const* h = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
         _scan_manager_config.rest.resolved_host_reservation_limit = static_cast<std::size_t>(
@@ -514,9 +513,8 @@ void sirius_config::preflight_rest_bounce_span() const
     fail("rest.max_connections must be > 0 when bounce_block_size is set", 0, 0);
   }
 
-  // The host space REST will actually select at runtime: the FIRST resolved
-  // HOST entry (explicit sirius.space.host configs bypass memory.host, so the
-  // check must run on the resolved list, not the high-level knobs).
+  // REST selects the FIRST resolved HOST entry at runtime — explicit
+  // sirius.space.host bypasses memory.host, so check the resolved list.
   const cucascade::memory::host_memory_space_config* host = nullptr;
   for (auto const& space : _memory_space_configs) {
     if (auto const* h = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
@@ -531,8 +529,7 @@ void sirius_config::preflight_rest_bounce_span() const
   }
 
   // Mirror the FSMR constructor's block-size alignment so the multiple-of
-  // check agrees with what the pool will actually report at runtime.  The
-  // from_yaml validators reject block_size == 0; guard anyway (division below).
+  // check matches the runtime pool; guard zero anyway (division below).
   if (host->block_size == 0) {
     fail("resolved host block_size is 0 — a HOST space must have a positive block size",
          rest.bounce_block_size,
@@ -568,9 +565,8 @@ void sirius_config::preflight_rest_bounce_span() const
       fail("bounce pool does not fit the resolved host reservation limit", *needed, resolved_limit);
     }
   } else {
-    // grain == block: runtime stays on the block-carve path, which admits
-    // against capacity — checking the stricter reservation limit here would
-    // reject configs that are legal today.
+    // grain == block stays on the block-carve path, which admits against
+    // capacity — the stricter reservation limit would reject legal configs.
     if (*needed > host->memory_capacity) {
       fail("bounce pool does not fit the resolved host capacity", *needed, host->memory_capacity);
     }
