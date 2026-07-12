@@ -230,11 +230,15 @@ pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
 # cuCascade - GPU Memory Reservation Library (submodule).
 #
-# cuCascade has no ROCm port (see PORTING.md). When SIRIUS_ENABLE_CUCASCADE is
-# OFF the submodule is not added and the cuCascade:: targets are undefined; the
-# sources that reference cucascade:: symbols are excluded from the build below
-# and the live gpu_execution operators that depend on them are not compiled.
-# Queries routed at operators absent on ROCm degrade to DuckDB's CPU engine.
+# On ROCm: instead of stubs, we build the REAL cuCascade submodule with the
+# ROCm compatibility shims applied. Per reviewer feedback (sirius-db/sirius#1158),
+# this uses the real implementation and tests as the specification. The staged
+# approach starts with CUCASCADE_TOPOLOGY_ONLY=ON (smallest scope), then
+# expands to CUCASCADE_BUILD_CUDF=ON once hipDF+hipMM are installed.
+#
+# When SIRIUS_ENABLE_CUCASCADE is OFF: the submodule is not built; the stub
+# types in cmake/rocm_compat/cucascade/ provide compile-only fallbacks
+# (throw at runtime → DuckDB CPU execution).
 if(SIRIUS_ENABLE_CUCASCADE)
 set(BUILD_TESTS
     OFF
@@ -262,7 +266,31 @@ set(CUCASCADE_WARNINGS_AS_ERRORS
 set(CUCASCADE_BUILD_IO
     OFF
     CACHE BOOL "" FORCE)
+# On ROCm: set topology-only (staged port), skip cudf/io/tests
+if(ENABLE_ROCM)
+  set(CUCASCADE_TOPOLOGY_ONLY ON CACHE BOOL "" FORCE)
+  set(CUCASCADE_BUILD_CUDF OFF CACHE BOOL "" FORCE)
+  set(CUCASCADE_BUILD_IO OFF CACHE BOOL "" FORCE)
+  set(CUCASCADE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(CUCASCADE_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+  message(STATUS "cuCascade: ROCm port — topology-only build (staged)")
+endif()
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
+
+# On ROCm: apply the shim include path to cuCascade targets so cuda_runtime.h,
+# nvml.h, nvtx3, etc. resolve to the compatibility shims.
+if(ENABLE_ROCM)
+  foreach(_cucascade_target
+          cucascade_topology_discovery_objects cucascade_topology_discovery_static
+          cucascade_topology_discovery_shared
+          cucascade_objects cucascade_static cucascade_shared
+          cucascade_cudf_objects cucascade_cudf_static cucascade_cudf_shared)
+    if(TARGET "${_cucascade_target}")
+      target_include_directories("${_cucascade_target}" BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocm_compat)
+    endif()
+  endforeach()
+endif()
 endif()
 
 if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
