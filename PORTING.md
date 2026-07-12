@@ -23,7 +23,7 @@ for the 69 files containing `cuda*` runtime calls — achieved via a
 │  SIRIUS_ENABLE_CUCO (OFF on ROCm)    SIRIUS_ENABLE_CUCASCADE (OFF)  │
 │  SIRIUS_BUILD_TELEMETRY (gated)      ROCTX find_library             │
 ├─────────────────────────────────────────────────────────────────────┤
-│  cmake/rocm_compat/  ← BEFORE on include path, shadows NVIDIA hdrs  │
+│  cuda2rocm shims (via FetchContent)  ← BEFORE on include path, shadows NVIDIA hdrs  │
 │  ├── cuda_runtime.h      cuda*→hip* macro aliases (67 symbols)      │
 │  ├── cuda_runtime_api.h   redirect                                   │
 │  ├── cuda.h               redirect                                   │
@@ -87,7 +87,7 @@ The `cub/cub.cuh` shim redirects to `<hipcub/hipcub.hpp>` and creates
 `cuco::bloom_filter` / `cuco::static_set` are excluded from `CUDA_SOURCES`.
 The PIMPL'd header (`sirius_dynamic_filter.hpp`) still compiles.
 
-### 3.5 cuCascade → stub (cmake/rocm_compat/cucascade/)
+### 3.5 cuCascade → stub (cuda2rocm shims (via FetchContent)cucascade/)
 
 `SIRIUS_ENABLE_CUCASCADE` defaults OFF on ROCm. Instead of the real cuCascade
 submodule, 32 stub headers provide ~70 types so 63 `.cpp` files compile.
@@ -139,7 +139,7 @@ unmasked warps.
 
 ### 4.3 cuCascade Stub (32 headers)
 
-Provides ~70 types across 32 headers in `cmake/rocm_compat/cucascade/`.
+Provides ~70 types across 32 headers in `cuda2rocm shims (via FetchContent)cucascade/`.
 Design principles:
 
 - **5 real virtual base classes** (Sirius subclasses them): `memory_reservation_manager`,
@@ -159,7 +159,7 @@ Design principles:
 
 `nvtx3::scoped_range` (the only nvtx3 type Sirius uses, 47 call sites) maps
 to `roctxRangeStartA`/`roctxRangeStop`. The shim is at
-`cmake/rocm_compat/nvtx3/nvtx3.hpp`. ROCm's roctx header is at
+`cuda2rocm shims (via FetchContent)nvtx3/nvtx3.hpp`. ROCm's roctx header is at
 `/opt/rocm/include/roctracer/roctx.h` (discovered via `find_path`).
 
 ### 4.5 Source Fix: __shfl_xor_sync
