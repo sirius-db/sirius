@@ -55,27 +55,29 @@ class memory_space {
   bool operator==(memory_space const& other) const { return get_id() == other.get_id(); }
   bool operator!=(memory_space const& other) const { return !(*this == other); }
 
-  /// Template: get memory resource as a specific type. Returns nullptr
-  /// (stub — no real reservation system).
+  /// Template: get memory resource as a specific type.
+  /// Throws — cuCascade stub has no real reservation system. The exception
+  /// propagates up; Sirius's error handling catches it and falls back to
+  /// DuckDB CPU execution.
   template <typename T>
   T* get_memory_resource_as() {
-    return nullptr;
+    throw std::runtime_error("cuCascade stub: get_memory_resource_as<T>() — no reservation system");
   }
   // Const overload — Sirius calls get_memory_resource_as<T>() on const memory_space&
   template <typename T>
   T const* get_memory_resource_as() const {
-    return nullptr;
+    throw std::runtime_error("cuCascade stub: get_memory_resource_as<T>() const — no reservation system");
   }
 
   /// Template: get memory resource for a specific tier.
   template <Tier TIER>
   typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of() {
-    return nullptr;
+    throw std::runtime_error("cuCascade stub: get_memory_resource_of<TIER>() — no reservation system");
   }
   // Const overload
   template <Tier TIER>
   typename tier_memory_resource_trait<TIER>::type const* get_memory_resource_of() const {
-    return nullptr;
+    throw std::runtime_error("cuCascade stub: get_memory_resource_of<TIER>() const — no reservation system");
   }
 
   // --- Memory reservation convenience methods (stub: return defaults) ---

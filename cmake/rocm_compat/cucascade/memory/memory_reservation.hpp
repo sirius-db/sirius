@@ -57,10 +57,14 @@ class reservation {
   void shrink_to_fit() { if (arena_) arena_->shrink_to_fit(); }
 
   template <typename T>
-  T* get_memory_resource_as() { return nullptr; }
+  T* get_memory_resource_as() {
+    throw std::runtime_error("cuCascade stub: reservation::get_memory_resource_as<T>()");
+  }
 
   template <Tier TIER>
-  typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of() { return nullptr; }
+  typename tier_memory_resource_trait<TIER>::type* get_memory_resource_of() {
+    throw std::runtime_error("cuCascade stub: reservation::get_memory_resource_of<TIER>()");
+  }
 
   static std::unique_ptr<reservation> create(memory_space& space,
                                              std::unique_ptr<reserved_arena> arena) {
