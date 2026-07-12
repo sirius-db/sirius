@@ -154,6 +154,15 @@ foreach(_sirius_link_flags CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
 endforeach()
 
 # Dependencies
+# Under ENABLE_ROCM, hipDF/hipMM are built and installed via
+# scripts/build_rocm_deps.sh. They export cudf::cudf / rmm::rmm — the same
+# target names as NVIDIA cuDF/RMM — so the find_package + link lines below
+# are identical across backends. The install prefix must be on
+# CMAKE_PREFIX_PATH (the build script defaults to /opt/rocm).
+if(ENABLE_ROCM)
+  # Ensure /opt/rocm is on the search path even if CMAKE_PREFIX_PATH is unset.
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
+endif()
 find_package(cudf REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
