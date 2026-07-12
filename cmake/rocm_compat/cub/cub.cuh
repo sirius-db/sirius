@@ -25,6 +25,8 @@
 #define SIRIUS_ROCM_COMPAT_CUB_CUB_CUH
 
 #include <hipcub/hipcub.hpp>
+// Provide _CCCL_DEVICE/_CCCL_FORCEINLINE macros (used by Sirius detail headers).
+#include "cuda/std/__cccl_config.h"
 
 // Define warp_threads INSIDE hipcub::detail (the real namespace), not via
 // the alias. You cannot add members through a namespace alias in C++.

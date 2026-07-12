@@ -15,32 +15,32 @@
 namespace cuda {
 
 template <typename T>
-using atomic = std::atomic<T>;
+using atomic = ::std::atomic<T>;
 
 template <typename T>
-using atomic_ref = std::atomic_ref<T>;
+using atomic_ref = ::std::atomic_ref<T>;
 
 // Memory order constants (also in cuda::std via _redirect.hpp, but some
 // code uses cuda::memory_order_relaxed directly).
-using std::memory_order;
-using std::memory_order_relaxed;
-using std::memory_order_acquire;
-using std::memory_order_release;
-using std::memory_order_acq_rel;
-using std::memory_order_seq_cst;
+using ::std::memory_order;
+using ::std::memory_order_relaxed;
+using ::std::memory_order_acquire;
+using ::std::memory_order_release;
+using ::std::memory_order_acq_rel;
+using ::std::memory_order_seq_cst;
 
 }  // namespace cuda
 
 // Also provide cuda::std::atomic for code that uses that path.
 namespace cuda {
 namespace std {
-using std::atomic;
-using std::atomic_ref;
-using std::memory_order;
-using std::memory_order_relaxed;
-using std::memory_order_acquire;
-using std::memory_order_release;
-using std::memory_order_acq_rel;
-using std::memory_order_seq_cst;
+template <typename T> using atomic = ::std::atomic<T>;
+template <typename T> using atomic_ref = ::std::atomic_ref<T>;
+using ::std::memory_order;
+using ::std::memory_order_relaxed;
+using ::std::memory_order_acquire;
+using ::std::memory_order_release;
+using ::std::memory_order_acq_rel;
+using ::std::memory_order_seq_cst;
 }  // namespace std
 }  // namespace cuda
