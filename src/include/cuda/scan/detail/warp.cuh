@@ -25,6 +25,9 @@
 namespace sirius::cuda::scan::detail {
 
 //! All-lanes mask for the warp shuffle / ballot collectives.
-constexpr uint32_t FULL_MASK = 0xFFFFFFFFu;
+//! On AMD (gfx90a/942/950) the wavefront is 64 wide; on NVIDIA the warp is 32.
+//! Using 64-bit covers both: the upper 32 bits are ignored on NVIDIA (only
+//! 32 lanes exist), and on AMD all 64 lanes are enabled.
+constexpr unsigned long long FULL_MASK = 0xFFFFFFFFFFFFFFFFull;
 
 }  // namespace sirius::cuda::scan::detail

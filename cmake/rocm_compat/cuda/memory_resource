@@ -5,42 +5,28 @@
 
 //! @file
 //! CCCL @c <cuda/memory_resource> redirect for ROCm.
-//! Provides @c cuda::mr::any_resource (variadic template), the property tags
-//! @c device_accessible / @c host_accessible, and the @c resource_with
-//! concept. Sirius uses all of these in sirius_memory_reservation_manager.hpp,
-//! resource_ref_utils.hpp, and numa_small_pinned_mr.hpp.
+//! Tries hipDF's real CCCL first; falls back to minimal stubs.
 
 #pragma once
 
-#include <rmm/resource_ref.hpp>
-#include <concepts>
+#if __has_include_next(<cuda/memory_resource>)
+  #include_next <cuda/memory_resource>
+#else
+  #include <rmm/resource_ref.hpp>
+  #include <concepts>
 
-namespace cuda {
-namespace mr {
+  namespace cuda {
+  namespace mr {
 
-/// Property tag: resource is accessible from the device.
-struct device_accessible {};
+  struct device_accessible {};
+  struct host_accessible {};
 
-/// Property tag: resource is accessible from the host.
-struct host_accessible {};
+  template <typename... Props>
+  using any_resource = rmm::device_async_resource_ref;
 
-/// Variadic template alias — Sirius uses any_resource<device_accessible>.
-/// The property tags are ignored in the stub; the underlying type is
-/// rmm::device_async_resource_ref.
-template <typename... Props>
-using any_resource = rmm::device_async_resource_ref;
+  template <typename Resource, typename... Props>
+  concept resource_with = (sizeof...(Props) >= 0);
 
-/// Concept: true if the resource type has the given properties.
-/// Sirius uses this in static_assert and requires clauses:
-///   static_assert(::cuda::mr::resource_with<numa_small_pinned_mr,
-///                ::cuda::mr::device_accessible, ::cuda::mr::host_accessible>);
-///   requires(::cuda::mr::resource_with<Resource,
-///            ::cuda::mr::host_accessible, ::cuda::mr::device_accessible>)
-/// The stub accepts any type (the friend get_property hooks are in Sirius's
-/// own headers, not checked here — a real implementation would verify ADL
-/// get_property overloads exist).
-template <typename Resource, typename... Props>
-concept resource_with = (sizeof...(Props) >= 0);
-
-}  // namespace mr
-}  // namespace cuda
+  }  // namespace mr
+  }  // namespace cuda
+#endif

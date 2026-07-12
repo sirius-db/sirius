@@ -5,18 +5,19 @@
 
 //! @file
 //! CCCL @c <cuda/cmath> redirect for ROCm.
-//! Provides @c ::cuda::ceil_div — the only symbol Sirius uses from this header.
+//! Tries hipDF's real CCCL first via #include_next; falls back to a minimal
+//! ::cuda::ceil_div if CCCL is not available.
 
 #pragma once
 
-#include <cstdint>
-
-namespace cuda {
-
-/// Ceiling division: (a + b - 1) / b. Works in device and host code.
-template <typename A, typename B>
-__host__ __device__ constexpr auto ceil_div(A a, B b) -> decltype((a + b - 1) / b) {
-  return (a + b - 1) / b;
-}
-
-}  // namespace cuda
+#if __has_include_next(<cuda/cmath>)
+  #include_next <cuda/cmath>
+#else
+  #include <cstdint>
+  namespace cuda {
+  template <typename A, typename B>
+  __host__ __device__ constexpr auto ceil_div(A a, B b) -> decltype((a + b - 1) / b) {
+    return (a + b - 1) / b;
+  }
+  }  // namespace cuda
+#endif

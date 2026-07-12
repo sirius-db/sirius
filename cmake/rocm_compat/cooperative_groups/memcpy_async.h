@@ -28,7 +28,7 @@ __device__ void memcpy_async(Group const& /*block*/, void* dst, void const* src,
                              ::cuda::aligned_size_t<0> n) {
   // Only thread 0 copies; others wait at the barrier.
   if (threadIdx.x == 0) {
-    std::memcpy(dst, src, static_cast<std::size_t>(n));
+    __builtin_memcpy(dst, src, static_cast<std::size_t>(n));
   }
   __syncthreads();
 }
@@ -38,7 +38,7 @@ template <std::size_t Alignment, typename Group>
 __device__ void memcpy_async(Group const& /*block*/, void* dst, void const* src,
                              ::cuda::aligned_size_t<Alignment> n) {
   if (threadIdx.x == 0) {
-    std::memcpy(dst, src, static_cast<std::size_t>(n));
+    __builtin_memcpy(dst, src, static_cast<std::size_t>(n));
   }
   __syncthreads();
 }
