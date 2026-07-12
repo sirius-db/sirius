@@ -94,6 +94,13 @@ cd "$BUILD_DIR"
 # =============================================================================
 # Step 2: Build hipDF (cuDF port for HIP)
 # =============================================================================
+# VERSION GAP: hipDF release/rocmds-26.03 is derived from cuDF 25.10.
+# Sirius uses libcudf 26.06 with APIs absent from this branch:
+#   - cudf::io::parquet::fetch_footer_to_host (absent)
+#   - hybrid_scan_reader::all_column_chunks_byte_ranges (absent — 26.03 has
+#     3 separate *_byte_ranges methods instead)
+# These APIs must be ported from upstream RAPIDS cuDF branch-26.06 into hipDF
+# before Sirius can compile end-to-end. See issue sirius-db/sirius#1158.
 echo "=== Step 2: Building hipDF ==="
 
 HIPDF_DIR="${BUILD_DIR}/hipDF"
@@ -102,6 +109,16 @@ HIPDF_BRANCH="release/rocmds-26.03"
 if [ ! -d "$HIPDF_DIR" ]; then
   git clone --depth 1 --branch "$HIPDF_BRANCH" \
     https://github.com/ROCm-DS/hipDF.git "$HIPDF_DIR"
+fi
+
+# Apply cuDF 26.06 API patches (fetch_footer_to_host, all_column_chunks_byte_ranges)
+# These APIs are absent from hipDF 25.10 but Sirius needs them.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/hipdf_26.06_api_patch.sh" ]; then
+  bash "$SCRIPT_DIR/hipdf_26.06_api_patch.sh" "$HIPDF_DIR"
+else
+  echo "WARNING: hipdf_26.06_api_patch.sh not found — Sirius will fail to compile"
+  echo "  without fetch_footer_to_host and all_column_chunks_byte_ranges."
 fi
 
 cd "$HIPDF_DIR"
