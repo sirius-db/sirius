@@ -27,9 +27,11 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda_runtime.h>
 
 #include <arpa/inet.h>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <netinet/in.h>
 #include <spdlog/sinks/base_sink.h>
@@ -52,8 +54,10 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -70,6 +74,8 @@ using sirius::io::rest::rest_ioctx;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
 using namespace std::chrono_literals;
+
+using fixed_host_mr = cucascade::memory::fixed_size_host_memory_resource;
 
 std::string env_or(std::string const& name, std::string fallback = {})
 {
@@ -599,6 +605,99 @@ class scoped_spdlog_capture {
   std::shared_ptr<capture_sink> _sink;
   spdlog::level::level_enum _old_level;
 };
+
+void require_invalid_bounce_grain_rejected(std::size_t bounce_block_size)
+{
+  scan_manager_fixture fixture;
+  auto cfg                   = make_fake_rest_config("http://127.0.0.1:9");
+  cfg.rest.bounce_block_size = bounce_block_size;
+
+  scoped_spdlog_capture capture;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto datasource = manager.create_datasource("s3://bounce-grain-bucket/object.bin");
+
+  REQUIRE(datasource == nullptr);
+  auto const records = capture.records();
+  CHECK(std::any_of(records.begin(), records.end(), [](capture_sink::record const& record) {
+    return record.payload.find("bounce_block_size") != std::string::npos;
+  }));
+}
+
+struct recording_upstream_state {
+  std::atomic<std::size_t> allocations{0};
+  std::atomic<std::size_t> deallocations{0};
+  std::atomic<bool> throw_on_allocate{false};
+  std::atomic<bool> workers_stopped{false};
+  std::atomic<bool> deallocated_after_workers_stopped{false};
+  std::atomic<bool> deallocated_while_reservation_active{false};
+  fixed_host_mr* host{nullptr};
+};
+
+/// Test-only upstream used through the public FSMR constructor.  It lets the
+/// test force the allocation after reserve() to fail, and records the only
+/// externally observable destruction order: workers are stopped, the upstream
+/// span is returned, then the FSMR reservation is released.
+class recording_upstream {
+ public:
+  explicit recording_upstream(std::shared_ptr<recording_upstream_state> state)
+    : state_(std::move(state))
+  {
+  }
+
+  void* allocate(cuda::stream_ref, std::size_t bytes, std::size_t = alignof(std::max_align_t))
+  {
+    state_->allocations.fetch_add(1, std::memory_order_relaxed);
+    if (state_->throw_on_allocate.load(std::memory_order_relaxed)) {
+      throw std::runtime_error("injected shared-bounce upstream allocation failure");
+    }
+    auto* ptr = std::malloc(bytes);
+    if (ptr == nullptr) { throw std::bad_alloc{}; }
+    return ptr;
+  }
+
+  void deallocate(cuda::stream_ref,
+                  void* ptr,
+                  std::size_t,
+                  std::size_t = alignof(std::max_align_t)) noexcept
+  {
+    state_->deallocated_after_workers_stopped.store(
+      state_->workers_stopped.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    auto* const host = state_->host;
+    state_->deallocated_while_reservation_active.store(
+      host != nullptr && host->get_active_reservation_count() != 0, std::memory_order_relaxed);
+    state_->deallocations.fetch_add(1, std::memory_order_relaxed);
+    std::free(ptr);
+  }
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    return allocate(cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+  }
+
+  bool operator==(recording_upstream const& other) const noexcept { return state_ == other.state_; }
+
+  friend void get_property(recording_upstream const&, cuda::mr::device_accessible) noexcept {}
+
+ private:
+  std::shared_ptr<recording_upstream_state> state_;
+};
+
+std::shared_ptr<rest_ioctx> make_host_backed_rest_ioctx(fixed_host_mr* host_mr,
+                                                        sirius::io::rest::config cfg,
+                                                        std::size_t n_reactors)
+{
+  auto authorizer = std::make_shared<fixed_url_authorizer>("http://127.0.0.1:9");
+  auto ctx        = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+    std::move(cfg), std::move(authorizer), host_mr);
+  return std::make_shared<rest_ioctx>(n_reactors, std::move(ctx));
+}
 
 }  // namespace
 
@@ -1364,6 +1463,378 @@ TEST_CASE("rest_ioctx stages device reads through FSMR for single and multi chun
     auto got = copy_device_to_host(dst, size, stream);
     require_bytes_equal(got, std::span<std::uint8_t const>(medium.data() + offset, size));
   }
+}
+
+TEST_CASE("REST rejects bounce grains incompatible with the host block size",
+          "[s3][rest][bounce_grain]")
+{
+  SECTION("smaller than one host block") { require_invalid_bounce_grain_rejected(512UL * 1024); }
+
+  SECTION("not a whole number of host blocks")
+  {
+    require_invalid_bounce_grain_rejected((3UL * 1024 * 1024) / 2);
+  }
+
+  SECTION("valid multiple above the hard grain ceiling")
+  {
+    require_invalid_bounce_grain_rejected(2UL * 1024 * 1024 * 1024);
+  }
+
+  SECTION("valid multiple near size_t max")
+  {
+    std::size_t constexpr host_block_size = 1UL * 1024 * 1024;
+    auto const size_max                   = std::numeric_limits<std::size_t>::max();
+    auto const near_size_max              = size_max - (size_max % host_block_size);
+    REQUIRE(near_size_max > sirius::io::rest::config::max_bounce_block_size);
+    require_invalid_bounce_grain_rejected(near_size_max);
+  }
+}
+
+TEST_CASE("REST direct context resolves a zero bounce grain to the host block size",
+          "[s3][rest][bounce_grain]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping REST direct-context bounce fallback test: no CUDA device");
+    return;
+  }
+
+  scan_manager_fixture fixture;
+  auto const host_spaces =
+    fixture.memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(host_spaces.empty());
+  auto* host_mr = host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host_mr != nullptr);
+  auto const host_block_size = host_mr->get_block_size();
+
+  auto const payload = deterministic_payload((2 * host_block_size) + 17);
+  range_http_server server(payload);
+  auto cfg                 = direct_rest_test_config();
+  cfg.max_connections      = 2;
+  cfg.bounce_block_size    = 0;
+  cfg.perf_instrumentation = true;
+  auto authorizer          = std::make_shared<fixed_url_authorizer>(server.endpoint());
+  auto reactor_ctx         = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+    cfg, std::move(authorizer), host_mr);
+  auto ioctx = std::make_shared<rest_ioctx>(1, std::move(reactor_ctx));
+  ioctx->start();
+  CHECK(ioctx->bounce_slice_snapshots().empty());
+  auto datasource = ioctx->open_datasource("s3://bounce-grain-bucket/zero-fallback.bin");
+  REQUIRE(datasource != nullptr);
+
+  rmm::cuda_stream stream;
+  rmm::device_buffer dst(payload.size(), stream);
+  auto const before = ioctx->perf_snapshot();
+  REQUIRE(datasource->device_read(
+            0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream) == payload.size());
+  auto const got   = copy_device_to_host(dst, payload.size(), stream);
+  auto const after = ioctx->perf_snapshot();
+
+  require_bytes_equal(got, payload);
+  auto const expected_windows =
+    payload.size() / host_block_size + (payload.size() % host_block_size != 0 ? 1 : 0);
+  CHECK(after.chunk_get_count - before.chunk_get_count == expected_windows);
+  CHECK(after.payload_bytes_read_total - before.payload_bytes_read_total == payload.size());
+  CHECK(server.get_count() == expected_windows);
+}
+
+TEST_CASE("REST device reads use the configured bounce grain for ranged GET windows",
+          "[s3][rest][bounce_grain]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping REST bounce-grain device-read test: no CUDA device");
+    return;
+  }
+
+  std::size_t constexpr bounce_block_size = 4UL * 1024 * 1024;
+  auto const payload                      = deterministic_payload((9UL * 1024 * 1024) + 17);
+  range_http_server server(payload);
+  scan_manager_fixture fixture;
+  auto cfg                      = make_fake_rest_config(server.endpoint());
+  cfg.rest.max_connections      = 4;
+  cfg.rest.bounce_block_size    = bounce_block_size;
+  cfg.rest.perf_instrumentation = true;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://bounce-grain-bucket/object.bin");
+  auto* ioctx     = require_rest_ioctx(datasource);
+
+  rmm::cuda_stream stream;
+  rmm::device_buffer dst(payload.size(), stream);
+  auto const before = ioctx->perf_snapshot();
+  REQUIRE(datasource->device_read(
+            0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream) == payload.size());
+  auto const got   = copy_device_to_host(dst, payload.size(), stream);
+  auto const after = ioctx->perf_snapshot();
+
+  require_bytes_equal(got, payload);
+  std::uint64_t const expected_windows =
+    (payload.size() + bounce_block_size - 1) / bounce_block_size;
+  CHECK(after.chunk_get_count - before.chunk_get_count == expected_windows);
+  CHECK(after.payload_bytes_read_total - before.payload_bytes_read_total == payload.size());
+  CHECK(server.get_count() == expected_windows);
+}
+
+TEST_CASE("REST large-grain staging is one accounted span with deterministic reactor slices",
+          "[s3][integration][rest][bounce_accounting]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping REST shared-bounce accounting test: no CUDA device");
+    return;
+  }
+
+  std::size_t constexpr kMiB        = 1UL << 20;
+  std::size_t constexpr reactors    = 2;
+  std::size_t constexpr connections = 2;
+  std::size_t constexpr grain       = 4 * kMiB;
+  std::size_t constexpr span_bytes  = reactors * connections * grain;
+
+  scan_manager_fixture fixture;
+  auto const host_spaces =
+    fixture.memory->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(host_spaces.empty());
+  auto* const host_mr =
+    host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host_mr != nullptr);
+  REQUIRE(host_mr->get_block_size() < grain);
+
+  auto const reserved_before     = host_mr->get_total_reserved_bytes();
+  auto const allocated_before    = host_mr->get_total_allocated_bytes();
+  auto const blocks_before       = host_mr->get_total_blocks();
+  auto const reservations_before = host_mr->get_active_reservation_count();
+
+  auto cfg              = direct_rest_test_config();
+  cfg.max_connections   = connections;
+  cfg.bounce_block_size = grain;
+  auto ioctx            = make_host_backed_rest_ioctx(host_mr, cfg, reactors);
+  REQUIRE_NOTHROW(ioctx->start());
+
+  CHECK(host_mr->get_total_reserved_bytes() == reserved_before + span_bytes);
+  CHECK(host_mr->get_total_allocated_bytes() == allocated_before + span_bytes);
+  CHECK(host_mr->get_total_blocks() == blocks_before);
+  CHECK(host_mr->get_active_reservation_count() == reservations_before + 1);
+
+  auto const slices = ioctx->bounce_slice_snapshots();
+  REQUIRE(slices.size() == reactors);
+  for (std::size_t r = 0; r < slices.size(); ++r) {
+    CHECK(slices[r].reactor_index == r);
+    CHECK(slices[r].allocation_id == slices.front().allocation_id);
+    CHECK(slices[r].span_bytes == span_bytes);
+    CHECK(slices[r].offset_bytes == r * connections * grain);
+    CHECK(slices[r].slice_bytes == connections * grain);
+  }
+
+  ioctx->shutdown();
+  ioctx.reset();
+
+  CHECK(host_mr->get_total_reserved_bytes() == reserved_before);
+  CHECK(host_mr->get_total_allocated_bytes() == allocated_before);
+  CHECK(host_mr->get_total_blocks() == blocks_before);
+  CHECK(host_mr->get_active_reservation_count() == reservations_before);
+}
+
+TEST_CASE("REST shared bounce span rolls back a successful FSMR reservation when upstream throws",
+          "[s3][integration][rest][bounce_accounting]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping REST shared-bounce rollback test: no CUDA device");
+    return;
+  }
+
+  std::size_t constexpr kMiB       = 1UL << 20;
+  std::size_t constexpr grain      = 4 * kMiB;
+  std::size_t constexpr span_bytes = 2 * grain;
+  auto state                       = std::make_shared<recording_upstream_state>();
+  recording_upstream upstream{state};
+  fixed_host_mr host{0,
+                     rmm::device_async_resource_ref{upstream},
+                     /*memory_limit=*/16 * kMiB,
+                     /*memory_capacity=*/16 * kMiB,
+                     /*block_size=*/kMiB,
+                     /*pool_size=*/1,
+                     /*initial_pools=*/0};
+  state->host = &host;
+  state->throw_on_allocate.store(true, std::memory_order_relaxed);
+
+  auto const reserved_before     = host.get_total_reserved_bytes();
+  auto const allocated_before    = host.get_total_allocated_bytes();
+  auto const reservations_before = host.get_active_reservation_count();
+
+  auto cfg              = direct_rest_test_config();
+  cfg.max_connections   = 2;
+  cfg.bounce_block_size = grain;
+  auto ioctx            = make_host_backed_rest_ioctx(&host, cfg, /*n_reactors=*/1);
+
+  CHECK_THROWS_WITH(ioctx->start(), Catch::Contains("injected shared-bounce upstream"));
+  CHECK(state->allocations.load(std::memory_order_relaxed) == 1);
+  CHECK(state->deallocations.load(std::memory_order_relaxed) == 0);
+  CHECK(host.get_total_reserved_bytes() == reserved_before);
+  CHECK(host.get_total_allocated_bytes() == allocated_before);
+  CHECK(host.get_active_reservation_count() == reservations_before);
+
+  ioctx->shutdown();
+}
+
+TEST_CASE("REST shared bounce span releases upstream before its FSMR booking",
+          "[s3][integration][rest][bounce_accounting]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping REST shared-bounce teardown-order test: no CUDA device");
+    return;
+  }
+
+  std::size_t constexpr kMiB       = 1UL << 20;
+  std::size_t constexpr grain      = 4 * kMiB;
+  std::size_t constexpr span_bytes = 2 * grain;
+  auto state                       = std::make_shared<recording_upstream_state>();
+  recording_upstream upstream{state};
+  fixed_host_mr host{0,
+                     rmm::device_async_resource_ref{upstream},
+                     /*memory_limit=*/16 * kMiB,
+                     /*memory_capacity=*/16 * kMiB,
+                     /*block_size=*/kMiB,
+                     /*pool_size=*/1,
+                     /*initial_pools=*/0};
+  state->host = &host;
+
+  auto cfg              = direct_rest_test_config();
+  cfg.max_connections   = 2;
+  cfg.bounce_block_size = grain;
+  auto ioctx            = make_host_backed_rest_ioctx(&host, cfg, /*n_reactors=*/1);
+  REQUIRE_NOTHROW(ioctx->start());
+  CHECK(state->allocations.load(std::memory_order_relaxed) == 1);
+  CHECK(host.get_total_reserved_bytes() == span_bytes);
+  CHECK(host.get_total_allocated_bytes() == span_bytes);
+  CHECK(host.get_active_reservation_count() == 1);
+
+  ioctx->shutdown();
+  state->workers_stopped.store(true, std::memory_order_relaxed);
+  ioctx.reset();
+
+  CHECK(state->deallocations.load(std::memory_order_relaxed) == 1);
+  CHECK(state->deallocated_after_workers_stopped.load(std::memory_order_relaxed));
+  CHECK(state->deallocated_while_reservation_active.load(std::memory_order_relaxed));
+  CHECK(host.get_total_reserved_bytes() == 0);
+  CHECK(host.get_total_allocated_bytes() == 0);
+  CHECK(host.get_active_reservation_count() == 0);
+}
+
+TEST_CASE("REST shared bounce span fails loudly when the resolved host budget is too small",
+          "[s3][integration][rest][bounce_accounting]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping REST shared-bounce host-budget test: no CUDA device");
+    return;
+  }
+
+  std::size_t constexpr kMiB  = 1UL << 20;
+  std::size_t constexpr grain = 4 * kMiB;
+  auto state                  = std::make_shared<recording_upstream_state>();
+  recording_upstream upstream{state};
+  fixed_host_mr host{0,
+                     rmm::device_async_resource_ref{upstream},
+                     /*memory_limit=*/4 * kMiB,
+                     /*memory_capacity=*/16 * kMiB,
+                     /*block_size=*/kMiB,
+                     /*pool_size=*/1,
+                     /*initial_pools=*/0};
+  state->host = &host;
+
+  auto cfg                            = direct_rest_test_config();
+  cfg.max_connections                 = 2;
+  cfg.bounce_block_size               = grain;
+  cfg.resolved_host_reservation_limit = 4 * kMiB;
+  auto ioctx                          = make_host_backed_rest_ioctx(&host, cfg, /*n_reactors=*/1);
+
+  std::string error;
+  try {
+    ioctx->start();
+  } catch (std::exception const& e) {
+    error = e.what();
+  }
+  REQUIRE_FALSE(error.empty());
+  CHECK(error.find("needed 8388608 bytes") != std::string::npos);
+  CHECK(error.find("admissible limit 4194304 bytes") != std::string::npos);
+  CHECK(error.find("shortfall 4194304 bytes") != std::string::npos);
+  CHECK(state->allocations.load(std::memory_order_relaxed) == 0);
+  CHECK(host.get_total_reserved_bytes() == 0);
+  CHECK(host.get_total_allocated_bytes() == 0);
+  CHECK(host.get_active_reservation_count() == 0);
+}
+
+TEST_CASE("REST shared bounce slices are disjoint under concurrent device reads",
+          "[s3][integration][rest][bounce_accounting]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping REST shared-bounce slice test: no CUDA device");
+    return;
+  }
+
+  std::size_t constexpr kMiB        = 1UL << 20;
+  std::size_t constexpr reactors    = 2;
+  std::size_t constexpr connections = 2;
+  std::size_t constexpr grain       = 4 * kMiB;
+  std::size_t constexpr span_bytes  = reactors * connections * grain;
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket  = require_env("SIRIUS_TEST_S3_BUCKET");
+  auto const payload = read_binary_file(local_fixture_path("small.bin"));
+  scan_manager_fixture fixture;
+  auto cfg                   = make_minio_rest_config();
+  cfg.rest_n_reactors        = reactors;
+  cfg.rest.max_connections   = connections;
+  cfg.rest.bounce_block_size = grain;
+  cfg.enable_prefetch_cache  = false;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto first        = manager.create_datasource("s3://" + bucket + "/small.bin");
+  auto* const ioctx = require_rest_ioctx(first);
+  auto second       = manager.create_datasource("s3://" + bucket + "/small.bin");
+  REQUIRE(first != nullptr);
+  REQUIRE(second != nullptr);
+  REQUIRE(second->io_ctx().get() == first->io_ctx().get());
+
+  auto const slices = ioctx->bounce_slice_snapshots();
+  REQUIRE(slices.size() == reactors);
+  for (std::size_t r = 0; r < slices.size(); ++r) {
+    CHECK(slices[r].reactor_index == r);
+    CHECK(slices[r].allocation_id == slices.front().allocation_id);
+    CHECK(slices[r].span_bytes == span_bytes);
+    CHECK(slices[r].offset_bytes == r * connections * grain);
+    CHECK(slices[r].slice_bytes == connections * grain);
+    if (r != 0) {
+      CHECK(slices[r - 1].offset_bytes + slices[r - 1].slice_bytes <= slices[r].offset_bytes);
+    }
+  }
+  CHECK(slices.back().offset_bytes + slices.back().slice_bytes == span_bytes);
+
+  auto read_all = [&](sirius::io::sirius_datasource& datasource) {
+    rmm::cuda_stream stream;
+    rmm::device_buffer dst(payload.size(), stream);
+    auto const read =
+      datasource.device_read(0, payload.size(), static_cast<std::uint8_t*>(dst.data()), stream);
+    if (read != payload.size()) {
+      throw std::runtime_error("concurrent REST device read returned a short result");
+    }
+    std::vector<std::uint8_t> out(payload.size());
+    auto const copy = cudaMemcpyAsync(
+      out.data(), dst.data(), payload.size(), cudaMemcpyDeviceToHost, stream.value());
+    if (copy != cudaSuccess) {
+      throw std::runtime_error(std::string("concurrent REST D2H copy failed: ") +
+                               cudaGetErrorString(copy));
+    }
+    stream.synchronize();
+    return out;
+  };
+  auto first_read  = std::async(std::launch::async, [&] { return read_all(*first); });
+  auto second_read = std::async(std::launch::async, [&] { return read_all(*second); });
+  require_bytes_equal(first_read.get(), payload);
+  require_bytes_equal(second_read.get(), payload);
 }
 
 TEST_CASE("rest_ioctx retries transient fake-server failures and reports terminal failures",

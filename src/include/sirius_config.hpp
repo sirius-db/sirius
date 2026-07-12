@@ -179,6 +179,14 @@ struct sirius_config {
   /// the override takes effect. Called from the end of @ref load_from_file.
   void enforce_sirius_datasource_for_multi_gpu();
 
+  /// When an explicit @c scan_manager.rest.bounce_block_size is configured,
+  /// validate the whole bounce-pool footprint against the RESOLVED host memory
+  /// space (the first HOST entry of @c _memory_space_configs — the one the
+  /// REST backend will select at runtime) and the pool ceiling.  Throws with a
+  /// needed/limit/shortfall message so misconfiguration fails at startup, not
+  /// at the first s3:// query.  Called from the end of @ref load_from_file.
+  void preflight_rest_bounce_span() const;
+
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   exec::thread_pool_config _task_creator_config{.num_threads        = 2,

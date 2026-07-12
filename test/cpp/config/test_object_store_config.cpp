@@ -19,8 +19,11 @@
 #include "io/rest/config.hpp"
 #include "sirius_config.hpp"
 
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
 using sirius::io::enum_to_string;
@@ -34,6 +37,21 @@ void write_yaml(std::filesystem::path const& path, std::string const& text)
   std::ofstream out(path);
   out << text;
   REQUIRE(out);
+}
+
+std::string load_config_error(std::filesystem::path const& path, std::string const& text)
+{
+  write_yaml(path, text);
+  std::string error;
+  try {
+    sirius::sirius_config cfg;
+    cfg.load_from_file(path);
+  } catch (std::exception const& e) {
+    error = e.what();
+  }
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  return error;
 }
 
 }  // namespace
@@ -273,6 +291,163 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config preserves an explicit REST bounce block size",
+          "[scan_manager][config][s3][rest][bounce_grain]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_bounce_block_size.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      rest:\n"
+             "        bounce_block_size: '8 MiB'\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK(cfg.get_scan_manager_config().rest.bounce_block_size == 8UL * 1024 * 1024);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config preflights the resolved REST bounce-span footprint",
+          "[scan_manager][config][s3][rest][bounce_accounting]")
+{
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_rest_bounce_span_preflight.yaml";
+
+  auto const expect_failure = [&](std::string const& yaml) {
+    auto const error = load_config_error(path, yaml);
+    INFO(error);
+    REQUIRE_FALSE(error.empty());
+    CHECK(error.find("needed") != std::string::npos);
+    CHECK(error.find("limit") != std::string::npos);
+    CHECK(error.find("shortfall") != std::string::npos);
+  };
+
+  SECTION("the exact 2 GiB pool boundary is legal")
+  {
+    auto const error = load_config_error(path,
+                                         "sirius:\n"
+                                         "  memory:\n"
+                                         "    host:\n"
+                                         "      capacity_bytes: 3GiB\n"
+                                         "      reservation_limit_fraction: 0.5\n"
+                                         "  executor:\n"
+                                         "    scan_manager:\n"
+                                         "      rest_n_reactors: 8\n"
+                                         "      rest:\n"
+                                         "        max_connections: 256\n"
+                                         "        bounce_block_size: 1MiB\n");
+    CHECK(error.empty());
+  }
+
+  SECTION("a pool larger than 2 GiB is rejected before runtime allocation")
+  {
+    expect_failure(
+      "sirius:\n"
+      "  memory:\n"
+      "    host:\n"
+      "      capacity_bytes: 16GiB\n"
+      "  executor:\n"
+      "    scan_manager:\n"
+      "      rest_n_reactors: 8\n"
+      "      rest:\n"
+      "        max_connections: 256\n"
+      "        bounce_block_size: 4MiB\n");
+  }
+
+  SECTION("reactor-count multiplication overflow is rejected")
+  {
+    auto const max_size = std::to_string(std::numeric_limits<std::int64_t>::max());
+    expect_failure(
+      "sirius:\n"
+      "  memory:\n"
+      "    host:\n"
+      "      capacity_bytes: 16GiB\n"
+      "  executor:\n"
+      "    scan_manager:\n"
+      "      rest_n_reactors: " +
+      max_size +
+      "\n"
+      "      rest:\n"
+      "        max_connections: 2\n"
+      "        bounce_block_size: 1MiB\n");
+  }
+
+  SECTION("zero REST connections are rejected by the YAML validator")
+  {
+    auto const error = load_config_error(path,
+                                         "sirius:\n"
+                                         "  memory:\n"
+                                         "    host:\n"
+                                         "      capacity_bytes: 16MiB\n"
+                                         "  executor:\n"
+                                         "    scan_manager:\n"
+                                         "      rest:\n"
+                                         "        max_connections: 0\n"
+                                         "        bounce_block_size: 1MiB\n");
+    INFO(error);
+    REQUIRE_FALSE(error.empty());
+    CHECK(error.find("max_connections") != std::string::npos);
+  }
+
+  SECTION("an explicit space configuration without a HOST space is rejected")
+  {
+    expect_failure(
+      "sirius:\n"
+      "  space:\n"
+      "    gpu:\n"
+      "      - device_id: 0\n"
+      "        memory_capacity: 4GiB\n"
+      "  executor:\n"
+      "    scan_manager:\n"
+      "      rest:\n"
+      "        max_connections: 2\n"
+      "        bounce_block_size: 4MiB\n");
+  }
+
+  SECTION("the first resolved explicit HOST space, not a later larger one, controls admission")
+  {
+    expect_failure(
+      "sirius:\n"
+      "  space:\n"
+      "    host:\n"
+      "      - numa_id: 0\n"
+      "        memory_capacity: 4MiB\n"
+      "        reservation_limit_fraction: 1.0\n"
+      "        initial_number_pools: 0\n"
+      "      - numa_id: 1\n"
+      "        memory_capacity: 64MiB\n"
+      "        reservation_limit_fraction: 1.0\n"
+      "        initial_number_pools: 0\n"
+      "  executor:\n"
+      "    scan_manager:\n"
+      "      rest_n_reactors: 2\n"
+      "      rest:\n"
+      "        max_connections: 2\n"
+      "        bounce_block_size: 4MiB\n");
+  }
+
+  SECTION("a resolved custom host block size still validates the configured grain")
+  {
+    expect_failure(
+      "sirius:\n"
+      "  space:\n"
+      "    host:\n"
+      "      - numa_id: 0\n"
+      "        memory_capacity: 64MiB\n"
+      "        reservation_limit_fraction: 1.0\n"
+      "        block_size: 2MiB\n"
+      "        initial_number_pools: 0\n"
+      "  executor:\n"
+      "    scan_manager:\n"
+      "      rest:\n"
+      "        max_connections: 1\n"
+      "        bounce_block_size: 3MiB\n");
+  }
 }
 
 TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][config][rest]")

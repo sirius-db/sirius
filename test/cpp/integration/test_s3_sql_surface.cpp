@@ -15,10 +15,17 @@
 #include "utils/s3_container.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/span.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
@@ -37,6 +44,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -45,11 +53,16 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 namespace {
 
@@ -300,6 +313,7 @@ struct sirius_memory_limits {
   std::optional<bool> enable_prefetch_cache;
   std::optional<std::size_t> rest_n_reactors;
   std::optional<std::size_t> rest_max_connections;
+  std::optional<std::string> rest_bounce_block_size;
   std::optional<bool> use_sirius_datasource;
   std::optional<std::string> rest_footer_probe_bytes;
   bool rest_perf_instrumentation{false};
@@ -416,6 +430,9 @@ class sirius_config_env_guard {
            "        request_timeout_s: 30\n";
     if (limits.rest_footer_probe_bytes.has_value()) {
       out << "        footer_probe_bytes: " << yaml_quote(*limits.rest_footer_probe_bytes) << "\n";
+    }
+    if (limits.rest_bounce_block_size.has_value()) {
+      out << "        bounce_block_size: " << yaml_quote(*limits.rest_bounce_block_size) << "\n";
     }
     if (limits.rest_perf_instrumentation) { out << "        perf_instrumentation: true\n"; }
     out.close();
@@ -907,6 +924,348 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
                                 static_cast<duckdb::idx_t>(table->num_rows()),
                                 bind_micro,
                                 micro};
+}
+
+std::string json_escape(std::string_view value);
+fs::path unittest_log_dir();
+
+struct read_consumer_partition {
+  std::size_t row_group_begin{0};
+  std::size_t row_group_end{0};
+  std::int64_t expected_rows{0};
+  std::vector<cudf::size_type> row_groups;
+};
+
+struct read_consumer_result {
+  std::string thread_name;
+  bench_clock::time_point thread_start;
+  bench_clock::time_point read_start;
+  bench_clock::time_point read_stop;
+  bench_clock::time_point reduce_stop;
+  bench_clock::time_point thread_stop;
+  std::int64_t rows{0};
+  std::int64_t orderkey_sum{0};
+};
+
+struct read_consumers_measurement {
+  bench_clock::time_point wall_start;
+  bench_clock::time_point open_start;
+  bench_clock::time_point open_stop;
+  bench_clock::time_point footer_start;
+  bench_clock::time_point footer_stop;
+  bench_clock::time_point metadata_start;
+  bench_clock::time_point metadata_stop;
+  bench_clock::time_point prepare_start;
+  bench_clock::time_point prepare_stop;
+  bench_clock::time_point scan_start;
+  bench_clock::time_point scan_stop;
+  bench_clock::time_point wall_stop;
+  std::vector<read_consumer_partition> partitions;
+  std::vector<read_consumer_result> consumers;
+  sirius::io::rest::rest_perf_snapshot aggregate;
+  std::int64_t rows{0};
+  std::int64_t orderkey_sum{0};
+};
+
+std::size_t positive_size_env(std::string_view name)
+{
+  auto const value = env_or(name);
+  if (value.empty()) { throw std::invalid_argument(std::string{name} + " is required"); }
+  auto const parsed = std::stoull(value);
+  if (parsed == 0) { throw std::invalid_argument(std::string{name} + " must be > 0"); }
+  return static_cast<std::size_t>(parsed);
+}
+
+std::string bounce_grain_yaml(std::size_t bytes)
+{
+  std::size_t constexpr kMiB = 1024UL * 1024UL;
+  if (bytes < kMiB || bytes % kMiB != 0) {
+    throw std::invalid_argument("SIRIUS_BENCH_READ_BOUNCE_BLOCK_SIZE must be a whole MiB");
+  }
+  return std::to_string(bytes / kMiB) + " MiB";
+}
+
+std::vector<read_consumer_partition> partition_whole_row_groups(
+  cudf::io::parquet::FileMetaData const& metadata, std::size_t read_consumers)
+{
+  if (read_consumers == 0 || metadata.row_groups.size() < read_consumers) {
+    throw std::invalid_argument("read_consumers exceeds the available row groups");
+  }
+
+  std::vector<read_consumer_partition> partitions;
+  partitions.reserve(read_consumers);
+  auto const base      = metadata.row_groups.size() / read_consumers;
+  auto const remainder = metadata.row_groups.size() % read_consumers;
+  std::size_t begin    = 0;
+  for (std::size_t consumer = 0; consumer < read_consumers; ++consumer) {
+    auto const count = base + (consumer < remainder ? 1 : 0);
+    read_consumer_partition partition;
+    partition.row_group_begin = begin;
+    partition.row_group_end   = begin + count;
+    partition.row_groups.reserve(count);
+    for (std::size_t rg = partition.row_group_begin; rg < partition.row_group_end; ++rg) {
+      partition.row_groups.push_back(static_cast<cudf::size_type>(rg));
+      partition.expected_rows += metadata.row_groups[rg].num_rows;
+    }
+    partitions.push_back(std::move(partition));
+    begin += count;
+  }
+  return partitions;
+}
+
+std::int64_t sum_orderkeys(cudf::column_view const& column, rmm::cuda_stream_view stream)
+{
+  if (column.type().id() != cudf::type_id::INT64) {
+    throw std::runtime_error("l_orderkey did not decode as INT64");
+  }
+  auto aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+  auto scalar =
+    cudf::reduce(column, *aggregation, cudf::data_type{cudf::type_id::INT64}, std::nullopt, stream);
+  return static_cast<cudf::numeric_scalar<std::int64_t> const&>(*scalar).value(stream);
+}
+
+read_consumers_measurement run_rest_parquet_read_consumers(s3_sql_fixture& fixture,
+                                                           std::string const& uri,
+                                                           std::vector<std::string> const& columns,
+                                                           std::size_t read_consumers)
+{
+  auto& manager = require_sirius_context(fixture).get_scan_manager();
+  auto& rest    = ensure_rest_ioctx_for_bench(manager, uri);
+
+  read_consumers_measurement measurement;
+  measurement.wall_start = bench_clock::now();
+  auto const before      = rest.perf_snapshot();
+
+  measurement.open_start = bench_clock::now();
+  auto datasource        = manager.create_datasource(uri);
+  measurement.open_stop  = bench_clock::now();
+  if (!datasource || !datasource->io_ctx() || datasource->io_ctx().get() != &rest) {
+    throw std::runtime_error(
+      "read-consumers benchmark did not route through the expected REST ioctx");
+  }
+
+  measurement.footer_start = bench_clock::now();
+  auto footer_buffer       = read_parquet_footer_for_bench(*datasource);
+  measurement.footer_stop  = bench_clock::now();
+
+  auto opts = cudf::io::parquet_reader_options::builder().column_names(columns).build();
+  measurement.metadata_start = bench_clock::now();
+  cudf::io::parquet::experimental::hybrid_scan_reader reader{
+    cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()), opts};
+  auto metadata             = reader.parquet_metadata();
+  measurement.metadata_stop = bench_clock::now();
+  measurement.partitions    = partition_whole_row_groups(metadata, read_consumers);
+
+  measurement.prepare_start = bench_clock::now();
+  std::vector<std::vector<std::unique_ptr<cudf::io::datasource>>> consumer_sources(read_consumers);
+  std::vector<std::vector<cudf::io::parquet::FileMetaData>> consumer_metadata(read_consumers);
+  std::vector<rmm::cuda_stream> streams;
+  streams.reserve(read_consumers);
+  for (std::size_t consumer = 0; consumer < read_consumers; ++consumer) {
+    streams.emplace_back();
+    consumer_metadata[consumer].push_back(metadata);
+    consumer_sources[consumer].push_back(datasource->duplicate());
+  }
+  measurement.prepare_stop = bench_clock::now();
+
+  int device_id                = 0;
+  auto const get_device_status = cudaGetDevice(&device_id);
+  if (get_device_status != cudaSuccess) {
+    throw std::runtime_error(std::string{"cudaGetDevice failed: "} +
+                             cudaGetErrorString(get_device_status));
+  }
+
+  measurement.consumers.resize(read_consumers);
+  std::vector<std::exception_ptr> errors(read_consumers);
+  std::mutex start_mutex;
+  std::condition_variable start_cv;
+  std::size_t ready = 0;
+  bool start        = false;
+  std::vector<std::thread> workers;
+  workers.reserve(read_consumers);
+  for (std::size_t consumer = 0; consumer < read_consumers; ++consumer) {
+    workers.emplace_back([&, consumer] {
+      auto& result       = measurement.consumers[consumer];
+      result.thread_name = "read_cons_" + std::to_string(consumer);
+#if defined(__linux__)
+      (void)pthread_setname_np(pthread_self(), result.thread_name.c_str());
+#endif
+      result.thread_start = bench_clock::now();
+      {
+        std::unique_lock lock(start_mutex);
+        ++ready;
+        start_cv.notify_all();
+        start_cv.wait(lock, [&] { return start; });
+      }
+
+      try {
+        auto const set_device_status = cudaSetDevice(device_id);
+        if (set_device_status != cudaSuccess) {
+          throw std::runtime_error(std::string{"cudaSetDevice failed: "} +
+                                   cudaGetErrorString(set_device_status));
+        }
+        auto consumer_opts =
+          cudf::io::parquet_reader_options::builder().column_names(columns).build();
+        consumer_opts.set_row_groups({measurement.partitions[consumer].row_groups});
+
+        result.read_start = bench_clock::now();
+        auto [table, table_metadata] =
+          cudf::io::read_parquet(std::move(consumer_sources[consumer]),
+                                 std::move(consumer_metadata[consumer]),
+                                 consumer_opts,
+                                 streams[consumer].view());
+        (void)table_metadata;
+        result.read_stop = bench_clock::now();
+        if (!table || table->num_columns() != static_cast<cudf::size_type>(columns.size())) {
+          throw std::runtime_error("read-consumers benchmark returned an unexpected table shape");
+        }
+        result.rows         = table->num_rows();
+        result.orderkey_sum = sum_orderkeys(table->view().column(0), streams[consumer].view());
+        result.reduce_stop  = bench_clock::now();
+      } catch (...) {
+        errors[consumer] = std::current_exception();
+      }
+      result.thread_stop = bench_clock::now();
+    });
+  }
+
+  {
+    std::unique_lock lock(start_mutex);
+    start_cv.wait(lock, [&] { return ready == read_consumers; });
+    measurement.scan_start = bench_clock::now();
+    start                  = true;
+  }
+  start_cv.notify_all();
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  measurement.scan_stop = bench_clock::now();
+
+  for (auto const& error : errors) {
+    if (error) { std::rethrow_exception(error); }
+  }
+  for (std::size_t consumer = 0; consumer < read_consumers; ++consumer) {
+    if (measurement.consumers[consumer].rows != measurement.partitions[consumer].expected_rows) {
+      throw std::runtime_error("whole-row-group partition returned an unexpected row count");
+    }
+    measurement.rows += measurement.consumers[consumer].rows;
+    measurement.orderkey_sum += measurement.consumers[consumer].orderkey_sum;
+  }
+
+  measurement.wall_stop = bench_clock::now();
+  measurement.aggregate = delta_snapshot(rest.perf_snapshot(), before);
+  return measurement;
+}
+
+fs::path read_consumers_json_path()
+{
+  auto const configured = env_or("SIRIUS_BENCH_READ_CONSUMERS_OUTPUT");
+  if (!configured.empty()) { return configured; }
+  auto const stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+  return unittest_log_dir() / ("s3_read_consumers_" + std::to_string(stamp) + ".json");
+}
+
+void write_read_consumers_json(fs::path const& path,
+                               s3_test_env const& env,
+                               std::string_view object_key,
+                               std::uint64_t dataset_bytes,
+                               std::string const& transport,
+                               std::size_t sample,
+                               std::size_t read_consumers,
+                               std::size_t rest_n_reactors,
+                               std::size_t max_connections,
+                               std::size_t bounce_block_size,
+                               read_consumers_measurement const& measurement)
+{
+  fs::create_directories(path.parent_path());
+  std::ofstream out(path);
+  if (!out) { throw std::runtime_error("could not create read-consumers JSON: " + path.string()); }
+
+  auto const offset_ms = [&](bench_clock::time_point point) {
+    return elapsed_ms(measurement.wall_start, point);
+  };
+  auto const wall_ms   = elapsed_ms(measurement.wall_start, measurement.wall_stop);
+  auto const scan_ms   = elapsed_ms(measurement.scan_start, measurement.scan_stop);
+  auto const payload   = measurement.aggregate.payload_bytes_read_total;
+  auto const wall_gbps = wall_ms > 0.0 ? static_cast<double>(payload) / wall_ms / 1'000'000.0 : 0.0;
+  auto const scan_gbps = scan_ms > 0.0 ? static_cast<double>(payload) / scan_ms / 1'000'000.0 : 0.0;
+  auto const pinned_bytes = rest_n_reactors * max_connections * bounce_block_size;
+  auto const signature    = "rest" + std::to_string(rest_n_reactors) + "_conn" +
+                         std::to_string(max_connections) + "_cons" +
+                         std::to_string(read_consumers) + "_grain" +
+                         std::to_string(bounce_block_size) + "_" + transport + "_compat7_cacheoff";
+
+  out << "{\n"
+      << "  \"git_sha\": \"" << json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\n"
+      << "  \"host\": \"" << json_escape(env_or("HOSTNAME", "unknown")) << "\",\n"
+      << "  \"scenario\": \"s3_read_consumers\",\n"
+      << "  \"arm\": \"" << json_escape(env_or("SIRIUS_BENCH_READ_ARM", "M1")) << "\",\n"
+      << "  \"backend_lifecycle\": \""
+      << json_escape(env_or("SIRIUS_BENCH_READ_BACKEND_LIFECYCLE", "unknown")) << "\",\n"
+      << "  \"config_signature\": \"" << signature << "\",\n"
+      << "  \"transport\": \"" << transport << "\",\n"
+      << "  \"sample\": " << sample << ",\n"
+      << "  \"dataset_bytes\": " << dataset_bytes << ",\n"
+      << "  \"object\": {\"bucket\": \"" << json_escape(env.bucket) << "\", \"key\": \""
+      << json_escape(object_key) << "\"},\n"
+      << "  \"projection\": \"columns_7\",\n"
+      << "  \"prefetch_cache_mode\": \"off\",\n"
+      << "  \"read_consumers\": " << read_consumers << ",\n"
+      << "  \"rest_n_reactors\": " << rest_n_reactors << ",\n"
+      << "  \"max_connections\": " << max_connections << ",\n"
+      << "  \"slot_budget\": " << rest_n_reactors * max_connections << ",\n"
+      << "  \"bounce_block_size\": " << bounce_block_size << ",\n"
+      << "  \"pinned_bytes\": " << pinned_bytes << ",\n"
+      << "  \"wall_clock_ms\": " << std::fixed << std::setprecision(3) << wall_ms << ",\n"
+      << "  \"scan_wall_ms\": " << scan_ms << ",\n"
+      << "  \"effective_wall_gb_per_sec\": " << wall_gbps << ",\n"
+      << "  \"effective_scan_gb_per_sec\": " << scan_gbps << ",\n"
+      << "  \"rows\": " << measurement.rows << ",\n"
+      << "  \"orderkey_sum\": " << measurement.orderkey_sum << ",\n"
+      << "  \"stage_boundaries_ms\": {"
+      << "\"open_start\":" << offset_ms(measurement.open_start)
+      << ",\"open_stop\":" << offset_ms(measurement.open_stop)
+      << ",\"footer_start\":" << offset_ms(measurement.footer_start)
+      << ",\"footer_stop\":" << offset_ms(measurement.footer_stop)
+      << ",\"metadata_start\":" << offset_ms(measurement.metadata_start)
+      << ",\"metadata_stop\":" << offset_ms(measurement.metadata_stop)
+      << ",\"prepare_start\":" << offset_ms(measurement.prepare_start)
+      << ",\"prepare_stop\":" << offset_ms(measurement.prepare_stop)
+      << ",\"scan_start\":" << offset_ms(measurement.scan_start)
+      << ",\"scan_stop\":" << offset_ms(measurement.scan_stop)
+      << ",\"wall_stop\":" << offset_ms(measurement.wall_stop) << "},\n"
+      << "  \"consumers\": [\n";
+  for (std::size_t consumer = 0; consumer < measurement.consumers.size(); ++consumer) {
+    auto const& result    = measurement.consumers[consumer];
+    auto const& partition = measurement.partitions[consumer];
+    out << "    {\"consumer\":" << consumer << ",\"thread_name\":\""
+        << json_escape(result.thread_name) << "\",\"row_group_begin\":" << partition.row_group_begin
+        << ",\"row_group_end\":" << partition.row_group_end
+        << ",\"expected_rows\":" << partition.expected_rows << ",\"rows\":" << result.rows
+        << ",\"orderkey_sum\":" << result.orderkey_sum
+        << ",\"read_ms\":" << elapsed_ms(result.read_start, result.read_stop)
+        << ",\"reduce_ms\":" << elapsed_ms(result.read_stop, result.reduce_stop)
+        << ",\"wall_ms\":" << elapsed_ms(result.thread_start, result.thread_stop) << "}"
+        << (consumer + 1 == measurement.consumers.size() ? "\n" : ",\n");
+  }
+  auto const& aggregate = measurement.aggregate;
+  out << "  ],\n"
+      << "  \"aggregate\": {"
+      << "\"chunk_get_count\":" << aggregate.chunk_get_count
+      << ",\"payload_bytes_read_total\":" << aggregate.payload_bytes_read_total
+      << ",\"queue_wait_ns_total\":" << aggregate.queue_wait_ns_total
+      << ",\"queue_wait_count\":" << aggregate.queue_wait_count
+      << ",\"chunk_get_ns_total\":" << aggregate.chunk_get_ns_total
+      << ",\"ttfb_ns\":" << aggregate.ttfb_ns
+      << ",\"h2d_observed_ns_total\":" << aggregate.h2d_observed_ns_total
+      << ",\"h2d_observed_count\":" << aggregate.h2d_observed_count
+      << ",\"h2d_observed_ns_max\":" << aggregate.h2d_observed_ns_max
+      << ",\"retries_total\":" << aggregate.retries_total
+      << ",\"terminal_failures_total\":" << aggregate.terminal_failures_total
+      << ",\"device_stream_sync_total\":" << aggregate.device_stream_sync_total << "}\n"
+      << "}\n";
 }
 
 struct metric_delta {
@@ -1904,6 +2263,102 @@ TEST_CASE("S3 REST bench perf instrumentation gate keeps micro counters zero", "
   CHECK(record.retries_total == 0);
   CHECK(record.terminal_failures_total == 0);
   CHECK(record.device_stream_sync_total == 0);
+}
+
+TEST_CASE("S3 REST read consumers benchmark partitions SF10 by whole row groups",
+          "[.][s3][read-consumers]")
+{
+  if (env_or("SIRIUS_BENCH_READ_CONSUMERS").empty()) {
+    SUCCEED("SIRIUS_BENCH_READ_CONSUMERS not set; skipping read-consumers measurement");
+    return;
+  }
+
+  auto const read_consumers  = positive_size_env("SIRIUS_BENCH_READ_CONSUMERS");
+  auto const rest_n_reactors = positive_size_env("SIRIUS_BENCH_READ_REACTORS");
+  auto const max_connections = positive_size_env("SIRIUS_BENCH_READ_MAX_CONNECTIONS");
+  auto const bounce_grain    = positive_size_env("SIRIUS_BENCH_READ_BOUNCE_BLOCK_SIZE");
+  auto const sample          = positive_size_env("SIRIUS_BENCH_READ_SAMPLE");
+  auto const transport       = env_or("SIRIUS_BENCH_READ_TRANSPORT", "http");
+
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  auto large = read_large_lineitem_bench_fixture(*env);
+  if (!large) { return; }
+
+  std::string endpoint;
+  std::optional<std::string> ca_bundle;
+  bool tls_verify = false;
+  if (transport == "http") {
+    endpoint = env->endpoint;
+  } else if (transport == "https") {
+    if (env->https_endpoint.empty() || env->ca_bundle_path.empty()) {
+      FAIL("HTTPS read-consumers measurement requires SIRIUS_TEST_S3_HTTPS_ENDPOINT and CA bundle");
+    }
+    endpoint   = env->https_endpoint;
+    ca_bundle  = env->ca_bundle_path;
+    tls_verify = true;
+  } else {
+    FAIL("SIRIUS_BENCH_READ_TRANSPORT must be http or https");
+  }
+
+  auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/false);
+  limits.gpu_usage                 = "8 GiB";
+  limits.gpu_reservation           = "3 GiB";
+  limits.host_capacity             = "12 GiB";
+  limits.rest_perf_instrumentation = true;
+  limits.rest_n_reactors           = rest_n_reactors;
+  limits.rest_max_connections      = max_connections;
+  limits.rest_bounce_block_size    = bounce_grain_yaml(bounce_grain);
+  s3_sql_fixture fixture(*env, limits, std::nullopt, endpoint, std::move(ca_bundle), tls_verify);
+
+  auto measurement =
+    run_rest_parquet_read_consumers(fixture, large->uri, bench_compat_projection(), read_consumers);
+
+  constexpr std::int64_t expected_rows         = 59'986'052;
+  constexpr std::int64_t expected_orderkey_sum = 1'799'465'265'420'123;
+  REQUIRE(static_cast<std::int64_t>(large->total_num_rows) == expected_rows);
+  CHECK(measurement.rows == expected_rows);
+  CHECK(measurement.orderkey_sum == expected_orderkey_sum);
+  CHECK(measurement.aggregate.chunk_get_count > 0);
+  CHECK(measurement.aggregate.payload_bytes_read_total > 0);
+  CHECK(measurement.aggregate.terminal_failures_total == 0);
+  CHECK(measurement.aggregate.device_stream_sync_total == 0);
+  CHECK(elapsed_ms(measurement.scan_start, measurement.scan_stop) > 0.0);
+  CHECK(elapsed_ms(measurement.wall_start, measurement.wall_stop) >=
+        elapsed_ms(measurement.scan_start, measurement.scan_stop));
+
+  auto const baseline_bytes = env_or("SIRIUS_BENCH_READ_BASELINE_BYTES");
+  if (!baseline_bytes.empty()) {
+    auto const ratio = static_cast<double>(measurement.aggregate.payload_bytes_read_total) /
+                       static_cast<double>(std::stoull(baseline_bytes));
+    CHECK(ratio >= 0.98);
+    CHECK(ratio <= 1.02);
+  }
+
+  auto const path = read_consumers_json_path();
+  write_read_consumers_json(path,
+                            *env,
+                            sf10_lineitem_key(),
+                            static_cast<std::uint64_t>(fs::file_size(large->local_path)),
+                            transport,
+                            sample,
+                            read_consumers,
+                            rest_n_reactors,
+                            max_connections,
+                            bounce_grain,
+                            measurement);
+  auto const json = read_text_file(path);
+  for (auto const key : {"\"config_signature\"",
+                         "\"stage_boundaries_ms\"",
+                         "\"consumers\"",
+                         "\"aggregate\"",
+                         "\"orderkey_sum\""}) {
+    CHECK(json.find(key) != std::string::npos);
+  }
+  WARN("S3 read-consumers sample wall="
+       << elapsed_ms(measurement.wall_start, measurement.wall_stop)
+       << "ms payload=" << measurement.aggregate.payload_bytes_read_total
+       << " bytes GETs=" << measurement.aggregate.chunk_get_count << " output=" << path.string());
 }
 
 TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][bench]")

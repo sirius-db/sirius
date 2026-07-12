@@ -29,10 +29,19 @@
 namespace sirius::io::rest {
 
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
-  : templated_ioctx<rest_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
-      return std::make_unique<rest_reactor>(ctx, fmt::format("rest-{}", i++));
-    })
+  : templated_ioctx<rest_reactor>(n_reactors,
+                                  [ctx, i = 0]() mutable {
+                                    return std::make_unique<rest_reactor>(
+                                      ctx, fmt::format("rest-{}", i++));
+                                  }),
+    _pool_ctx(std::move(ctx))
 {
+}
+
+void rest_ioctx::start()
+{
+  _pool_ctx->prepare_bounce_span(_reactors.size());
+  templated_ioctx<rest_reactor>::start();
 }
 
 rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
@@ -57,6 +66,19 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
     agg.payload_bytes_read_total += s.payload_bytes_read_total;
   }
   return agg;
+}
+
+std::vector<rest_bounce_slice_snapshot> rest_ioctx::bounce_slice_snapshots() const
+{
+  std::vector<rest_bounce_slice_snapshot> out;
+  out.reserve(_reactors.size());
+  for (std::size_t i = 0; i < _reactors.size(); ++i) {
+    if (auto s = _reactors[i]->bounce_slice_snapshot()) {
+      s->reactor_index = i;
+      out.push_back(*s);
+    }
+  }
+  return out;
 }
 
 std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path)

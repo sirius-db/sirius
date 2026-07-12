@@ -47,12 +47,25 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// @c templated_ioctx.
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
+  /// Prepares the context's shared bounce span (large-grain staging: one
+  /// accounted contiguous allocation for the whole pool) BEFORE the base class
+  /// starts any reactor worker — budget failures surface here, with no thread
+  /// or GET in flight.  Then delegates to the base start (idempotent).
+  void start() override;
+
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
   /// Pool-aggregated perf counters: every reactor's snapshot summed (ns totals,
   /// counts, retries, terminal, device-sync), maxes maxed, and ttfb the first
   /// non-zero reactor value.  Lock-free; drives the s3-bench JSON baseline.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
+
+  /// One entry per reactor whose staging is backed by the dedicated
+  /// large-grain bounce pool (empty on the default block-carve path), with
+  /// @c reactor_index assigned by pool position.  Exists so the shared-span
+  /// slice invariants (one allocation, r * conns * grain offsets, no overlap)
+  /// are externally verifiable — see rest_bounce_slice_snapshot.
+  [[nodiscard]] std::vector<rest_bounce_slice_snapshot> bounce_slice_snapshots() const;
 
  protected:
   /// Backend hook invoked by @c sirius_ioctx::open_datasource: parse @p path
@@ -66,6 +79,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint) override;
 
  private:
+  /// The pool's shared context (also captured by every reactor); kept here so
+  /// start() can prepare the bounce span before the reactors run.
+  std::shared_ptr<rest_reactor::reactor_context> _pool_ctx;
+
   /// Resolve @p path with a single suffix-range GET: it discovers the size and
   /// stashes the object's trailing bytes on the returned io_object so cuDF's
   /// footer reads are served locally by @c rest_reactor::host_read.  Falls back

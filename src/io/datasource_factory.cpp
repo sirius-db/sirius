@@ -34,10 +34,12 @@
 
 #include <cctype>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sirius::io {
@@ -146,10 +148,48 @@ factory_type make_rest_ioctx_factory(
         return nullptr;
       }
       // Host staging is optional for REST — when absent, reactor-staged device
-      // reads are disabled (bounce_block_size 0), host reads still work.
-      auto* host_mr              = first_host_resource(reservation_manager);
-      auto rest_cfg              = config.rest;
-      rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
+      // reads are disabled (bounce_block_size 0), host reads still work.  A
+      // configured rest.bounce_block_size is authoritative when nonzero (it
+      // must be a whole multiple of the staging block size, since the default
+      // grain carves bounce slots from staging blocks); zero falls back to the
+      // staging resource's block size.
+      auto* host_mr = first_host_resource(reservation_manager);
+      auto rest_cfg = config.rest;
+      if (host_mr == nullptr) {
+        if (rest_cfg.bounce_block_size != 0) {
+          SIRIUS_LOG_WARN(
+            "make_rest_ioctx_factory: rest.bounce_block_size is configured but no host staging "
+            "resource is available; reactor-staged device reads stay disabled");
+        }
+        rest_cfg.bounce_block_size = 0;
+      } else if (rest_cfg.bounce_block_size == 0) {
+        rest_cfg.bounce_block_size = host_mr->get_block_size();
+      } else if (rest_cfg.bounce_block_size < host_mr->get_block_size() ||
+                 rest_cfg.bounce_block_size % host_mr->get_block_size() != 0 ||
+                 rest_cfg.bounce_block_size > rest::config::max_bounce_block_size) {
+        throw std::invalid_argument(
+          "make_rest_ioctx_factory: rest.bounce_block_size (" +
+          std::to_string(rest_cfg.bounce_block_size) +
+          " bytes) must be a whole multiple of the host staging block size (" +
+          std::to_string(host_mr->get_block_size()) + " bytes) and at most " +
+          std::to_string(rest::config::max_bounce_block_size) + " bytes");
+      }
+      if (host_mr != nullptr && rest_cfg.bounce_block_size != 0) {
+        // Pool-level ceiling on the RESOLVED grain — both axes (connections
+        // and grain) obey the same bound; the shared formula keeps this site,
+        // the YAML preflight, and the reactor context from drifting.
+        auto const pool = rest::checked_bounce_pool_bytes(
+          config.rest_n_reactors, rest_cfg.max_connections, rest_cfg.bounce_block_size);
+        if (!pool || *pool > rest::config::max_bounce_pool_bytes) {
+          auto const needed = pool ? *pool : std::numeric_limits<std::size_t>::max();
+          auto const cap    = rest::config::max_bounce_pool_bytes;
+          throw std::invalid_argument(
+            "make_rest_ioctx_factory: rest bounce pool (rest_n_reactors x max_connections x "
+            "bounce_block_size) needed " +
+            std::to_string(needed) + " bytes, admissible limit " + std::to_string(cap) +
+            " bytes, shortfall " + std::to_string(needed - cap) + " bytes");
+        }
+      }
       // The object store owns the endpoint and its TLS trust; the reactor's
       // curl GETs must verify against the same CA bundle / policy the authorizer
       // presigns for, so source these from object_store rather than rest config.

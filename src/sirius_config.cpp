@@ -20,11 +20,14 @@
 #include "log/logging.hpp"
 #include "yaml_reader.hpp"
 
+#include <rmm/aligned.hpp>
+
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <exception>
+#include <limits>
 #include <variant>
 #include <vector>
 
@@ -61,6 +64,9 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
   r.optional("pool_size", opt.pool_size);
   r.optional("initial_number_pools", opt.initial_number_pools);
   r.reject_unknown();
+  if (opt.block_size == 0) {
+    throw std::runtime_error("host_memory_space: block_size must be > 0");
+  }
 }
 
 static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_space_config& opt)
@@ -102,7 +108,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);
-  r.optional("max_connections", opt.max_connections);
+  r.optional("max_connections", opt.max_connections, yaml::greater_than<std::size_t>{0});
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.optional("max_read_split", opt.max_read_split);
@@ -296,6 +302,7 @@ struct host_mem_config {
     r.optional("pool_size", opt.pool_size);
     r.optional("initial_number_pools", opt.initial_number_pools);
     r.reject_unknown();
+    if (opt.block_size == 0) { throw std::runtime_error("memory.host: block_size must be > 0"); }
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
@@ -472,10 +479,101 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     }
 
     enforce_sirius_datasource_for_multi_gpu();
+    // Carry the resolved host reservation limit into the REST config so
+    // runtime budget failures can report exact needed/limit/shortfall (the
+    // FSMR exposes no limit getter).  Internal resolved field, not a YAML key.
+    for (auto const& space : _memory_space_configs) {
+      if (auto const* h = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+        _scan_manager_config.rest.resolved_host_reservation_limit = static_cast<std::size_t>(
+          static_cast<double>(h->memory_capacity) * h->reservation_limit_fraction);
+        break;
+      }
+    }
+    preflight_rest_bounce_span();
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
                              e.what());
+  }
+}
+
+void sirius_config::preflight_rest_bounce_span() const
+{
+  auto const& rest = _scan_manager_config.rest;
+  if (rest.bounce_block_size == 0) { return; }  // auto: today's block path, nothing to preflight
+
+  auto const fail = [](std::string const& reason, std::size_t needed, std::size_t admissible) {
+    auto const shortfall = needed > admissible ? needed - admissible : std::size_t{0};
+    throw std::invalid_argument("scan_manager.rest bounce preflight: " + reason + " — needed " +
+                                std::to_string(needed) + " bytes, admissible limit " +
+                                std::to_string(admissible) + " bytes, shortfall " +
+                                std::to_string(shortfall) + " bytes");
+  };
+
+  if (rest.max_connections == 0) {
+    fail("rest.max_connections must be > 0 when bounce_block_size is set", 0, 0);
+  }
+
+  // The host space REST will actually select at runtime: the FIRST resolved
+  // HOST entry (explicit sirius.space.host configs bypass memory.host, so the
+  // check must run on the resolved list, not the high-level knobs).
+  const cucascade::memory::host_memory_space_config* host = nullptr;
+  for (auto const& space : _memory_space_configs) {
+    if (auto const* h = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+      host = h;
+      break;
+    }
+  }
+  if (host == nullptr) {
+    fail("bounce_block_size is set but no HOST memory space is configured for staging",
+         rest.bounce_block_size,
+         0);
+  }
+
+  // Mirror the FSMR constructor's block-size alignment so the multiple-of
+  // check agrees with what the pool will actually report at runtime.  The
+  // from_yaml validators reject block_size == 0; guard anyway (division below).
+  if (host->block_size == 0) {
+    fail("resolved host block_size is 0 — a HOST space must have a positive block size",
+         rest.bounce_block_size,
+         0);
+  }
+  auto const block = rmm::align_up(host->block_size, alignof(std::max_align_t));
+  if (rest.bounce_block_size < block || rest.bounce_block_size % block != 0 ||
+      rest.bounce_block_size > io::rest::config::max_bounce_block_size) {
+    fail("bounce_block_size must be a whole multiple of the host block size (" +
+           std::to_string(block) + " bytes) and at most " +
+           std::to_string(io::rest::config::max_bounce_block_size) + " bytes",
+         rest.bounce_block_size,
+         io::rest::config::max_bounce_block_size);
+  }
+
+  auto const needed = io::rest::checked_bounce_pool_bytes(
+    _scan_manager_config.rest_n_reactors, rest.max_connections, rest.bounce_block_size);
+  if (!needed) {
+    fail("rest_n_reactors x max_connections x bounce_block_size overflows size_t",
+         std::numeric_limits<std::size_t>::max(),
+         io::rest::config::max_bounce_pool_bytes);
+  }
+  if (*needed > io::rest::config::max_bounce_pool_bytes) {
+    fail("bounce pool exceeds the ceiling", *needed, io::rest::config::max_bounce_pool_bytes);
+  }
+
+  if (rest.bounce_block_size > block) {
+    // Span path (grain > block): admitted at runtime via the stricter
+    // reservation limit.
+    auto const resolved_limit = static_cast<std::size_t>(
+      static_cast<double>(host->memory_capacity) * host->reservation_limit_fraction);
+    if (*needed > resolved_limit) {
+      fail("bounce pool does not fit the resolved host reservation limit", *needed, resolved_limit);
+    }
+  } else {
+    // grain == block: runtime stays on the block-carve path, which admits
+    // against capacity — checking the stricter reservation limit here would
+    // reject configs that are legal today.
+    if (*needed > host->memory_capacity) {
+      fail("bounce pool does not fit the resolved host capacity", *needed, host->memory_capacity);
+    }
   }
 }
 
