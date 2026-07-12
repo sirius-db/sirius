@@ -1490,6 +1490,38 @@ TEST_CASE("REST rejects bounce grains incompatible with the host block size",
   }
 }
 
+TEST_CASE("REST rejects a programmatic bounce grain without HOST staging",
+          "[s3][rest][bounce_accounting]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping REST GPU-only staging test: no CUDA device");
+    return;
+  }
+
+  cucascade::memory::gpu_memory_space_config gpu_space{};
+  gpu_space.device_id       = 0;
+  gpu_space.memory_capacity = 256UL * 1024 * 1024;
+  std::vector<cucascade::memory::memory_space_config> spaces;
+  spaces.emplace_back(std::move(gpu_space));
+  sirius::memory::sirius_memory_reservation_manager memory{spaces};
+  REQUIRE(memory.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).empty());
+
+  auto cfg                   = make_fake_rest_config("http://127.0.0.1:9");
+  cfg.use_sirius_datasource  = false;
+  cfg.rest.bounce_block_size = 4UL * 1024 * 1024;
+
+  scoped_spdlog_capture capture;
+  sirius_scan_manager manager{cfg, memory, single_gpu_index()};
+  auto datasource = manager.create_datasource("s3://bounce-grain-bucket/object.bin");
+
+  REQUIRE(datasource == nullptr);
+  auto const records = capture.records();
+  CHECK(std::any_of(records.begin(), records.end(), [](capture_sink::record const& record) {
+    return record.payload.find("bounce_block_size") != std::string::npos;
+  }));
+}
+
 TEST_CASE("REST direct context resolves a zero bounce grain to the host block size",
           "[s3][rest][bounce_grain]")
 {
