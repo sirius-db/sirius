@@ -157,9 +157,13 @@ factory_type make_rest_ioctx_factory(
       auto rest_cfg = config.rest;
       if (host_mr == nullptr) {
         if (rest_cfg.bounce_block_size != 0) {
-          SIRIUS_LOG_WARN(
+          // An explicitly configured grain must take effect or fail — never
+          // silently degrade to host-read-only staging.  (The YAML path is
+          // already rejected by the config preflight; this covers programmatic
+          // configs.)
+          throw std::invalid_argument(
             "make_rest_ioctx_factory: rest.bounce_block_size is configured but no host staging "
-            "resource is available; reactor-staged device reads stay disabled");
+            "resource is available for reactor-staged device reads");
         }
         rest_cfg.bounce_block_size = 0;
       } else if (rest_cfg.bounce_block_size == 0) {
