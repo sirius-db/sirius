@@ -69,10 +69,39 @@ ORDER BY l_returnflag;
 SET gpu_execution = false;
 ```
 
-Two execution paths are available. See each page for build, configuration, and testing details:
+Execution is out-of-core with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling, and works with both **Parquet** and **DuckDB-native** storage. See [`gpu_execution`](gpu_execution.md) for build, configuration, and testing details.
 
-- **[`gpu_execution`](gpu_execution.md) (Recommended)** — Out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. Works with **Parquet** data format.
-- **[`gpu_processing`](gpu_processing.md)** — In-memory execution where the dataset must fit in GPU memory. Works with DuckDB's native storage format.
+## Pinning Tables for Hot Runs
+
+Sirius reads table data from storage on every query. For the best hot-run performance, pin
+frequently queried tables: `pin_table` materializes a table's columns into memory once, and
+subsequent queries over that source are served straight from the pinned copy, skipping file
+I/O and decode entirely. Queries don't change — pinned tables are matched automatically.
+
+```sql
+-- Pin a parquet file (or glob) into GPU memory; omit cols to pin all columns
+CALL pin_table('/path/to/lineitem.parquet', name = 'lineitem', tier = 'gpu',
+               cols = ['l_orderkey', 'l_quantity', 'l_extendedprice', 'l_shipdate']);
+
+-- Pin a DuckDB base table
+CALL pin_table(format = 'duckdb', name = 'my_table', tier = 'gpu');
+
+-- Served from the pinned copy — no file I/O
+SELECT sum(l_extendedprice * l_quantity)
+FROM read_parquet('/path/to/lineitem.parquet')
+WHERE l_shipdate >= DATE '1994-01-01';
+
+-- Release the pinned memory
+CALL unpin_table('lineitem');
+```
+
+`tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
+pinned host memory instead, for tables larger than GPU memory (a host pin streams through the
+GPU one batch at a time, so the whole table never has to fit). A pin serves any query that
+reads a subset of its pinned columns.
+
+For cache matching, memory placement, and re-pin semantics, see
+[Pinned Tables](super-sirius/scan.md#pinned-tables).
 
 ## Configuration
 
