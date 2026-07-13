@@ -1,10 +1,12 @@
 # Implementation plan — streaming sink operator (#837)
 
-> **Status: implementation plan, ready for review.** Owner: Alexander. Updated 2026-07-01.
+> **Status: implementation plan, ready for review.** Owner: Alexander. Updated 2026-07-13.
 > This is **PR 2 of 2**; it depends only on the `exchange_channel` primitive delivered by
-> the [source plan](streaming-source-plan.md) / PR 1 (§3 there) — otherwise independent
-> and reviewable in parallel. Follow-up work after both PRs land is in
+> the [source plan](streaming-source-plan.md) / PR 1 (#1094, §3 there) — otherwise
+> independent and reviewable in parallel. Follow-up work after both PRs land is in
 > [streaming-integration-follow-ups.md](streaming-integration-follow-ups.md).
+> **§11 folds in the review feedback from PR 1 (#1094)** — same reviewers, same operator
+> shape; treat it as blocking-level guidance, not polish.
 >
 > References: issue [#837](https://github.com/sirius-db/sirius/issues/837); design
 > authority is PR [#914](https://github.com/sirius-db/sirius/pull/914) (pinned copy:
@@ -49,6 +51,16 @@ Same five as the source plan §2, plus the two sink-specific ones:
    contrast with `sirius_physical_materialized_collector::sink()`, which `to_read_only()`s,
    clones GPU tiers to HOST, and appends — discoveries §5).
 
+**Channel API as landed in PR 1 (post-review shape — build against this, not the plan's
+original sketch):** admission and dequeue live in shared `*_unlocked` helpers, so
+`try_push`/`push` behave identically apart from the wait; `can_push_unlocked()` rejects a
+handle whose `size_bytes` would overflow `_total_bytes` (a `try_push` failure can therefore
+also mean *oversized/overflowing handle*, not only *full* — the `_pending` fallback covers
+both); the `on_close` callback captures a weak pipeline reference wired via a virtual
+`set_pipeline` override, never a raw operator pointer. The sink closes the channel and
+never registers `on_close`, but the same lifetime rule applies to any hook it does touch
+(§4, `on_pop`).
+
 ## 3. Operator shape: a CONCAT-style boundary operator, not a RESULT_COLLECTOR clone
 
 The load-bearing decision. Two candidate shapes exist among today's terminal operators
@@ -89,6 +101,8 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SINK;
   static constexpr std::string_view INPUT_PORT = "input";
 
+  // Throws InvalidInputException on a null channel or repository (PR 1 review
+  // requirement — validate at the boundary, tested explicitly in §7.3).
   sirius_physical_streaming_sink(
     duckdb::vector<sirius::logical_type> types, std::size_t estimated_cardinality,
     std::shared_ptr<exec::exchange_channel> output_channel,
@@ -159,6 +173,16 @@ admission is fine — races are absorbed by `_pending`; blocking is not fine.
 
 **`execute()`**: pass-through (COLUMN_DATA_SCAN shape). Coalescing/splitting is #838.
 
+**Hook lifetime rule (PR 1 blocking finding, generalized).** The channel invokes its
+hooks *after* unlocking, so a snapshotted callback can run against an already-destroyed
+capture — clearing it in a destructor does not synchronize. Any `on_pop` that reaches back
+into the sink (`try_flush_pending()` + re-arm, owned by the #839 session per §9.3) must
+therefore capture a **weak reference** (pipeline or `weak_ptr` to the sink if it becomes
+`enable_shared_from_this`), never raw `this`. PR 1 made `set_pipeline` virtual for exactly
+this wiring pattern — reuse it if the sink ever self-registers a hook. Add a
+destroy-the-operator-concurrently-with-hook-invocation test (§7.5) mirroring PR 1's
+close-after-destruction regression.
+
 **EOS — close at pipeline finish, never blocking.** Engine facts (discoveries §2): the
 engine auto-finalizes only *intermediate* operators; RESULT_COLLECTOR survives via an
 executor **type** special-case. Therefore: (a) close logic lives in
@@ -224,6 +248,11 @@ Same harness as the source plan (§7 there): Catch2, standalone (no env tag), ta
 `finalize_operator()` called directly (discoveries §2/§10). Common fixture: input port
 repo + output repo + channel + a `drain(channel, repo)` helper playing the consumer.
 
+The SNK-N codes below are **plan-local shorthand only** — committed test names must be
+plain descriptive strings, and no SNK-N / plan-doc reference may appear in committed
+source, comments, or `operators.md` (PR 1 review: internal codes mean nothing to a fresh
+reader).
+
 ### 7.1 Hint & admission (the backpressure contract)
 
 | ID | Scenario | Assert |
@@ -256,7 +285,8 @@ repo + output repo + channel + a `drain(channel, repo)` helper playing the consu
 | SNK-16 | finalize with pending | channel NOT closed yet; consumer pops → flushes → channel closes exactly after the last pending handle; consumer observes `drained()` |
 | SNK-17 | empty stream | finalize with zero batches ever sunk → channel closed; consumer drains 0 handles, sees EOS |
 | SNK-18 | conservation | across a long randomized run: handles popped == batches sunk, every `batch_id` unique, none lost or duplicated |
-| SNK-19 | spill while queued | downgrade an output-repo batch to HOST while its handle waits in the channel (source-plan SRC-14 technique) → consumer still resolves the id; content intact after re-upgrade |
+| SNK-19 | spill while queued | downgrade an output-repo batch to HOST while its handle waits in the channel (same technique as the source's spill-self-heal test) → consumer still resolves the id; content intact after re-upgrade |
+| SNK-26 | null constructor inputs | null `output_channel` or null `output_repository` → `InvalidInputException` at construction (mirrors PR 1's source-side test) |
 
 ### 7.4 Integration-with-neighbor-operators tests (the full boundary loop)
 
@@ -276,6 +306,12 @@ exercises, with the streaming sink as the destination:
 |---|---|---|
 | SNK-24 | concurrent `sink()` calls | 2+ threads emitting simultaneously (concurrent task completion, discoveries §3): conservation holds, `_pending` uncorrupted |
 | SNK-25 | producer/consumer/flush race | concurrent `sink()` + consumer pops + `try_flush_pending()` + a final `finalize_operator()`: terminates, conservation holds, channel ends `drained()` |
+| SNK-27 | hook fires after operator destruction | if a hook capturing the sink is ever wired (§4 lifetime rule): destroy the operator concurrently with hook invocation in a TSAN-friendly loop → no use-after-free (mirrors PR 1's close-after-destruction regression); skip if v1 wires no hook |
+
+**Assertion rule (PR 1 review, Copilot):** inside any `std::thread` lambda use
+`CHECK`/`CHECK_FALSE`, never `REQUIRE`/`REQUIRE_FALSE` — a throwing Catch2 assertion
+crossing a thread boundary calls `std::terminate`. Applies to SNK-24/25/27 and the §7.4
+stress variants.
 
 **Stretch (defer to #839 if heavy):** scheduler-driven test — real `task_scheduler`,
 sink re-armed via the channel `on_pop` hook, proving the edge-triggered
@@ -306,7 +342,9 @@ stall/resume/close cycle end-to-end.
 | `test/cpp/operator/test_physical_streaming_sink.cpp` | **new** |
 | `docs/super-sirius/operators.md` | `### sirius_physical_streaming_sink — STREAMING_SINK` entry |
 
-Untouched: planner, `build_pipelines`, FFI, `experimental/`, `rust/`, `src/legacy/`.
+Untouched: planner, `build_pipelines`, FFI, `experimental/`, `rust/`, `src/legacy/`,
+and — explicitly — the `duckdb`/`substrait` submodules and every test file not listed
+above. If the diff shows anything else, revert it before review (§11).
 Run `/module-context` before coding. PR: `feat(op): streaming sink operator (#837)` on
 `dev`, `starrocks` label; depends on PR 1 only for `exchange_channel`.
 
@@ -335,5 +373,103 @@ Run `/module-context` before coding. PR: `feat(op): streaming sink operator (#83
 - Demonstrated by test: per-`sink()`-call incremental emission with pointer-identity
   zero-copy and no host clone; hint-gated backpressure with a never-blocked worker
   (bounded-time `sink()` on a full channel); flush-then-close EOS in both immediate and
-  deferred (`_close_when_flushed`) paths; conservation under concurrency.
+  deferred (`_close_when_flushed`) paths; conservation under concurrency; constructor
+  input validation.
 - `docs/super-sirius/operators.md` updated; PR standalone per the onboarding agreement.
+- Every item in the §11 pre-review checklist passes before requesting review.
+
+## 11. PR discipline — lessons from PR 1 (#1094 review)
+
+The source PR drew CHANGES_REQUESTED plus heavy cleanup feedback from the same reviewers
+who will review this PR (@9prady9, @mbrobbel, Copilot). Everything below is already
+baked into §2/§4/§7 where it changes the design; this section is the pre-review gate.
+
+@9prady9's meta-feedback, verbatim intent: AI-assisted PRs put a lot of unclear text in
+descriptions (#1094's had to be tuned a couple of times to get down to the main relevant
+pieces), and agents leave a lot of notes in code docs — remove them, keep code docs
+simple and easy to understand. For this PR that means: the §11.4 description ships as-is
+on the first push (no rewrite cycle), and every committed comment describes the code, not
+the process that produced it.
+
+### 11.1 Diff hygiene (mbrobbel's entire review was this)
+
+- Diff contains **only** the §8 touch points. `git diff dev... --stat` before pushing;
+  revert anything else — unrelated test-file edits, alias renames, formatting-only churn.
+- **No submodule bumps**: `duckdb` and `substrait` SHAs must match `dev`
+  (`git checkout dev -- duckdb substrait` if they drifted).
+- Never touch `src/legacy/`, even for formatting.
+- Rebase on `dev` and get CI green **before** requesting review, not after.
+
+### 11.2 Correctness patterns reviewers will look for again
+
+- Constructor null-checks with tests (§4, SNK-26) — Copilot flagged the missing ones in
+  PR 1 and will scan for them here.
+- No raw-`this` capture in any hook that can outlive the operator (§4 lifetime rule,
+  SNK-27) — this was a **blocking** finding in PR 1.
+- Size arithmetic: the channel's overflow guard landed in PR 1; the sink must not
+  reintroduce unguarded accumulation on its side (e.g. if it ever sums `_pending` bytes).
+- Shared logic in one place: if two sink paths share admission/flush logic, factor a
+  single helper up front rather than waiting for the review to ask (PR 1's
+  `try_push`/`push` dedup).
+- `CHECK` not `REQUIRE` inside threaded test lambdas (§7.5).
+- Cross-pipeline completion: the sink is terminal so it does not re-arm downstream
+  Sirius pipelines, but if any status update crosses a pipeline boundary, remember
+  `update_pipeline_status(false)` — the default silently skips
+  `notify_downstream_pipelines()` (PR 1's other blocking finding).
+
+### 11.3 Docs and comments
+
+- Class docstring: behavior + the few critical invariants (never-blocking `sink()`,
+  flush-then-close EOS, `_pending` FIFO discipline). Subtleties go inline at the code.
+- No agent narration, no plan-doc references, no SNK-N / design §N / discoveries §N
+  citations in **committed** files — those live here only. Sweep every new file before
+  pushing.
+- `operators.md` entry: "Key design invariants" wording; only statements traceable from
+  the code.
+- This plan doc and any KT/scratch notes stay out of the PR.
+
+### 11.4 PR description (write it terse from the start)
+
+PR 1's description had to be rewritten mid-review. Use this shape verbatim:
+
+```markdown
+PR 2 of 2 for #836 (source: #1094). Adds the streaming sink operator. Deliberately
+unwired — nothing constructs it outside tests; wiring lands with the stream session
+(#839), partitioning/coalescing with #838.
+
+## What
+
+- `sirius::op::sirius_physical_streaming_sink` — boundary operator (source+sink)
+  heading its own pipeline: pops batches from its input port, registers them in the
+  output repository, pushes `{batch_id, size_bytes}` handles to the exchange channel;
+  closes the channel at pipeline finish.
+
+## Design notes
+
+- Zero-copy: the repository stays owner of record; no host clone, no
+  `ColumnDataCollection` — queued batches remain idle and spillable.
+- Backpressure is a task-creation condition: a full channel makes the hint report
+  not-ready; `sink()` on a full channel parks the handle in a pending queue and never
+  blocks a worker.
+- EOS: finalize flushes what fits and closes immediately, or defers the close until
+  consumer pops drain the pending queue.
+- Known gap, deferred to #839: sink re-arm on consumer pop is owned by the session
+  wiring, not the operator.
+
+## Testing
+
+- `[streaming_sink]` (GPU): hint/admission gating, zero-copy identity, full-channel
+  fallback, flush-then-close EOS (immediate/deferred/empty), spill-while-queued,
+  upstream-operator integration, mid-stream backpressure, concurrency conservation,
+  input validation.
+```
+
+### 11.5 Pre-review checklist (run mechanically)
+
+1. `git diff dev... --stat` — only §8 files, no submodules.
+2. `pixi run pre-commit run -a` — green.
+3. `pixi run make test` + `sirius_unittest "[streaming_sink]"` — green on a GPU box.
+4. Grep new/changed files for `SNK-`, `SRC-`, `BUG-`, `design §`, `discoveries §`,
+   plan-doc filenames, and `[this]` captures in hooks — resolve every hit.
+5. Read the PR description aloud: no fixup SHAs, no internal codes, gaps named with
+   their tracking issues.
