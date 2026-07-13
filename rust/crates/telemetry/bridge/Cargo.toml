@@ -14,6 +14,4 @@ instrumentation-model = { path = "../model" }
 [build-dependencies]
 cxx-build = "1"
 instrumentation-model = { path = "../model" }
-# TODO: flip back to rapidsai/quent once rapidsai/quent#323 merges — temporarily
-# tracks the PR branch on the felipeblazing fork (per-transition attributes).
-quent-codegen = { git = "https://github.com/felipeblazing/quent.git", rev = "f2ab99748eb3e6995b0882c525a78a43d10b5dab" }
+quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }

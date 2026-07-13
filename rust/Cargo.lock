@@ -1758,7 +1758,7 @@ dependencies = [
 [[package]]
 name = "quent-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-attributes",
  "quent-events",
@@ -1775,7 +1775,7 @@ dependencies = [
 [[package]]
 name = "quent-attributes"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "serde",
  "thiserror",
@@ -1785,7 +1785,7 @@ dependencies = [
 [[package]]
 name = "quent-build-info"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "serde",
  "serde_json",
@@ -1794,7 +1794,7 @@ dependencies = [
 [[package]]
 name = "quent-codegen"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "convert_case",
  "prettyplease",
@@ -1807,7 +1807,7 @@ dependencies = [
 [[package]]
 name = "quent-collector"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-collector-client",
  "quent-collector-proto",
@@ -1821,7 +1821,7 @@ dependencies = [
 [[package]]
 name = "quent-collector-client"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "bitcode",
  "http",
@@ -1840,7 +1840,7 @@ dependencies = [
 [[package]]
 name = "quent-collector-proto"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "prost",
  "tonic",
@@ -1851,7 +1851,7 @@ dependencies = [
 [[package]]
 name = "quent-events"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-time",
  "serde",
@@ -1861,7 +1861,7 @@ dependencies = [
 [[package]]
 name = "quent-instrumentation"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-attributes",
  "quent-build-info",
@@ -1877,7 +1877,7 @@ dependencies = [
 [[package]]
 name = "quent-io"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "async-trait",
  "http",
@@ -1894,7 +1894,7 @@ dependencies = [
 [[package]]
 name = "quent-io-collector"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "async-trait",
  "http",
@@ -1908,7 +1908,7 @@ dependencies = [
 [[package]]
 name = "quent-io-msgpack"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1923,7 +1923,7 @@ dependencies = [
 [[package]]
 name = "quent-io-ndjson"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1938,7 +1938,7 @@ dependencies = [
 [[package]]
 name = "quent-io-postcard"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "async-trait",
  "postcard",
@@ -1953,7 +1953,7 @@ dependencies = [
 [[package]]
 name = "quent-io-types"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "async-trait",
  "quent-events",
@@ -1965,7 +1965,7 @@ dependencies = [
 [[package]]
 name = "quent-model"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-attributes",
  "quent-build-info",
@@ -1983,7 +1983,7 @@ dependencies = [
 [[package]]
 name = "quent-model-macros"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -1994,7 +1994,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-analyzer",
  "quent-attributes",
@@ -2011,7 +2011,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-model"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-model",
  "serde",
@@ -2021,7 +2021,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-server"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "axum",
  "mime_guess",
@@ -2052,7 +2052,7 @@ dependencies = [
 [[package]]
 name = "quent-query-engine-ui"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-analyzer",
  "quent-attributes",
@@ -2067,7 +2067,7 @@ dependencies = [
 [[package]]
 name = "quent-simulator-ui"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-analyzer",
  "serde",
@@ -2078,7 +2078,7 @@ dependencies = [
 [[package]]
 name = "quent-stdlib"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-model",
  "uuid",
@@ -2087,7 +2087,7 @@ dependencies = [
 [[package]]
 name = "quent-time"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "serde",
  "thiserror",
@@ -2097,7 +2097,7 @@ dependencies = [
 [[package]]
 name = "quent-ui"
 version = "0.1.0"
-source = "git+https://github.com/felipeblazing/quent.git?rev=f2ab99748eb3e6995b0882c525a78a43d10b5dab#f2ab99748eb3e6995b0882c525a78a43d10b5dab"
+source = "git+https://github.com/rapidsai/quent.git?rev=5ec56ccb4163810ad42aa0a57559f4d20ddc3aee#5ec56ccb4163810ad42aa0a57559f4d20ddc3aee"
 dependencies = [
  "quent-analyzer",
  "quent-attributes",
