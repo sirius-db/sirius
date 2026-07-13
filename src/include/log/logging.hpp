@@ -43,6 +43,11 @@ namespace sirius {
 /// Log severity levels of the Sirius logging facade.
 enum class log_level { trace, debug, info, warn, error, critical, off };
 
+/// Selects the implementation behind the global logging facade (config option
+/// `sirius_log_backend`). String forms are parsed at the config boundaries via
+/// string_to_enum/enum_to_string in log/log_backend.hpp.
+enum class log_backend_type { spdlog, noop };
+
 static_assert(static_cast<int>(log_level::trace) == SIRIUS_LOG_LEVEL_TRACE &&
                 static_cast<int>(log_level::debug) == SIRIUS_LOG_LEVEL_DEBUG &&
                 static_cast<int>(log_level::info) == SIRIUS_LOG_LEVEL_INFO &&
