@@ -1609,21 +1609,21 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
-  SetGlobalLogLevel(Config::LOG_LEVEL);
+  sirius::SetGlobalLogLevel(Config::LOG_LEVEL);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
-  SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
+  sirius::SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
