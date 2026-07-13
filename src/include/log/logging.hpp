@@ -36,7 +36,6 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #endif
 
-#include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
 
 // Warn only if the level was actually raised above TRACE, which compiles out
@@ -45,8 +44,6 @@
 #if SPDLOG_ACTIVE_LEVEL > SPDLOG_LEVEL_TRACE
 #warning "SPDLOG_ACTIVE_LEVEL is above TRACE; lower-level log output is compiled out"
 #endif
-
-#include <string>
 
 #define SIRIUS_LOG_TRACE(...) SPDLOG_LOGGER_TRACE(spdlog::default_logger_raw(), __VA_ARGS__)
 #define SIRIUS_LOG_DEBUG(...) SPDLOG_LOGGER_DEBUG(spdlog::default_logger_raw(), __VA_ARGS__)
@@ -58,53 +55,30 @@
 #endif  // __CUDACC__
 #ifndef __CUDACC__
 
-namespace duckdb {
+#include <source_location>
+#include <string_view>
 
-inline spdlog::level::level_enum ParseLogLevel(const std::string& level_str)
-{
-  if (level_str == "trace") return spdlog::level::trace;
-  if (level_str == "debug") return spdlog::level::debug;
-  if (level_str == "info") return spdlog::level::info;
-  if (level_str == "warn") return spdlog::level::warn;
-  if (level_str == "error") return spdlog::level::err;
-  if (level_str == "critical") return spdlog::level::critical;
-  if (level_str == "off") return spdlog::level::off;
-  return spdlog::level::info;
-}
+namespace sirius {
 
-inline void InitGlobalLogger(const std::string& log_level_str,
-                             const std::string& log_dir,
-                             int flush_seconds)
-{
-  auto log_file  = log_dir + "/sirius.log";
-  auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
-  file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
+/// Log severity levels of the Sirius logging facade.
+enum class log_level { trace, debug, info, warn, error, critical, off };
 
-  auto log_level = ParseLogLevel(log_level_str);
-  auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
-  logger->set_level(log_level);
-  spdlog::set_default_logger(logger);
-  spdlog::set_level(log_level);
-  spdlog::flush_every(std::chrono::seconds(flush_seconds));
-}
+/// Initializes the global logger with a daily file sink at `<log_dir>/sirius.log`.
+void InitGlobalLogger(std::string_view log_level_str, std::string_view log_dir,
+                      int flush_seconds);
 
-inline void FlushGlobalLogger()
-{
-  if (auto* logger = spdlog::default_logger_raw()) { logger->flush(); }
-}
+/// Flushes buffered log lines of the global logger to its sink.
+void FlushGlobalLogger();
 
-inline void SetGlobalLogFlush(int flush_seconds)
-{
-  spdlog::flush_every(std::chrono::seconds(flush_seconds));
-}
+void SetGlobalLogFlush(int flush_seconds);
 
-inline void SetGlobalLogLevel(const std::string& log_level_str)
-{
-  auto log_level = ParseLogLevel(log_level_str);
-  spdlog::set_level(log_level);
-  if (auto logger = spdlog::default_logger()) { logger->set_level(log_level); }
-}
+void SetGlobalLogLevel(std::string_view log_level_str);
 
-}  // namespace duckdb
+/// Logs `message` attributed to a caller-supplied source location.
+///
+/// For log statements at the current location, use the SIRIUS_LOG_* macros.
+void LogAt(log_level level, const std::source_location& loc, std::string_view message);
+
+}  // namespace sirius
 
 #endif  // !__CUDACC__
