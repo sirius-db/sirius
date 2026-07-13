@@ -33,12 +33,16 @@
 #define SIRIUS_ACTIVE_LOG_LEVEL SIRIUS_LOG_LEVEL_TRACE
 #endif
 
+#include <cstdint>
 #include <format>
+#include <memory>
 #include <source_location>
 #include <string_view>
 #include <utility>
 
 namespace sirius {
+
+class log_backend;
 
 /// Log severity levels of the Sirius logging facade.
 enum class log_level { trace, debug, info, warn, error, critical, off };
@@ -57,14 +61,29 @@ static_assert(static_cast<int>(log_level::trace) == SIRIUS_LOG_LEVEL_TRACE &&
                 static_cast<int>(log_level::off) == SIRIUS_LOG_LEVEL_OFF,
               "log_level enum and SIRIUS_LOG_LEVEL_* macros must stay in sync");
 
-/// Initializes the global logger with a daily file sink at `<log_dir>/sirius.log`.
-void InitGlobalLogger(std::string_view log_level_str, std::string_view log_dir, int flush_seconds);
+/// Initializes (or re-initializes) the global logger with the given backend.
+///
+/// For the spdlog backend, `log_dir` is the directory of the daily log file
+/// and `flush_ms` the best-effort periodic flush interval (0 = no scheduled
+/// flushes); other backends interpret only the settings that apply to them.
+/// If the backend cannot be constructed, the previously installed backend
+/// (if any) stays active. Until the first successful call, log statements
+/// are dropped.
+void InitGlobalLogger(std::string_view log_level_str,
+                      std::string_view log_dir,
+                      uint32_t flush_ms,
+                      log_backend_type backend = log_backend_type::spdlog);
 
-/// Flushes buffered log lines of the global logger to its sink.
-void FlushGlobalLogger();
+/// Installs a caller-constructed backend (test seam / embedders). Passing
+/// nullptr resets the facade to its pre-init state (all statements dropped).
+void InitGlobalLogger(std::shared_ptr<log_backend> backend, std::string_view log_level_str);
 
-/// Sets the periodic flush interval of the global logger.
-void SetGlobalLogFlush(int flush_seconds);
+/// Requests a best-effort flush of the global logger.
+///
+/// Returns true iff all previously logged messages are durable in the
+/// backend's destination on return (false with no backend installed, or when
+/// the backend can only treat the flush as a hint).
+bool FlushGlobalLogger();
 
 /// Sets the level of the global logger from a level name.
 void SetGlobalLogLevel(std::string_view log_level_str);

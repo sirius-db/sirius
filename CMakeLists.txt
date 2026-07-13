@@ -256,6 +256,7 @@ set(EXTENSION_SOURCES
     src/io/uring/uring_reactor.cpp
     src/log/log_backend.cpp
     src/log/logging.cpp
+    src/log/spdlog_backend.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp

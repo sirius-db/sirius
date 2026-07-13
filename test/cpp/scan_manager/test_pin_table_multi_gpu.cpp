@@ -265,7 +265,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   }
 
   // Force-flush spdlog's file sink BEFORE tearing down the env. The default
-  // log flush is every 3s (Config::LOG_FLUSH_SECONDS) and the SF1 query
+  // log flush is every 3s (Config::LOG_FLUSH_MS) and the SF1 query
   // completes well under that, so without an explicit flush the [mgpu-audit]
   // emissions in src/pipeline/task_scheduler.cpp:275 stay in spdlog's
   // buffer and never reach disk before parse_audit_log() reads it.

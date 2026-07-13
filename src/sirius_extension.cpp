@@ -1616,15 +1616,16 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS);
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
-static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
+static void SetLogFlushMs(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
-  sirius::SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
-  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
+  Config::LOG_FLUSH_MS = UIntegerValue::Get(parameter);
+  // The flush interval is fixed at backend construction, so re-initialize.
+  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_MS to {}", Config::LOG_FLUSH_MS);
 }
 
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -1844,11 +1845,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::VARCHAR,
                             Value(Config::LOG_DIR),
                             SetLogDir);
-  config.AddExtensionOption("sirius_log_flush_seconds",
-                            "Interval in seconds between automatic log flushes",
-                            LogicalType::INTEGER,
-                            Value::INTEGER(Config::LOG_FLUSH_SECONDS),
-                            SetLogFlushSeconds);
+  config.AddExtensionOption("sirius_log_flush_ms",
+                            "Interval in milliseconds between scheduled best-effort log flushes "
+                            "(0 = no scheduled flushes)",
+                            LogicalType::UINTEGER,
+                            Value::UINTEGER(Config::LOG_FLUSH_MS),
+                            SetLogFlushMs);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

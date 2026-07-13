@@ -77,7 +77,7 @@ struct Config {
   // Logging configuration
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;
-  static int LOG_FLUSH_SECONDS;
+  static uint32_t LOG_FLUSH_MS;
 };
 
 }  // namespace duckdb

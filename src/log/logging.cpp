@@ -16,30 +16,31 @@
 
 #include "log/logging.hpp"
 
-#include <spdlog/sinks/daily_file_sink.h>
-#include <spdlog/spdlog.h>
+#include "log/log_backend.hpp"
 
+#include <atomic>
 #include <chrono>
-#include <format>
 #include <memory>
+#include <optional>
 
 namespace sirius {
 
 namespace {
 
-spdlog::level::level_enum to_spdlog_level(log_level level)
+// Global facade state. Level filtering is facade-owned (one relaxed atomic on
+// the hot path); the backend slot is swap-safe: loggers take a shared_ptr
+// snapshot, so a concurrent re-init cannot destroy a backend under an
+// in-flight log() call. Meyers singleton to avoid static-init-order issues.
+struct logger_state {
+  // Pre-init: everything below `off` is dropped and there is no backend.
+  std::atomic<int> level{SIRIUS_LOG_LEVEL_OFF};
+  std::atomic<std::shared_ptr<log_backend>> backend{};
+};
+
+logger_state& state()
 {
-  using enum log_level;
-  switch (level) {
-    case trace: return spdlog::level::trace;
-    case debug: return spdlog::level::debug;
-    case info: return spdlog::level::info;
-    case warn: return spdlog::level::warn;
-    case error: return spdlog::level::err;
-    case critical: return spdlog::level::critical;
-    case off: return spdlog::level::off;
-  }
-  return spdlog::level::info;
+  static logger_state instance;
+  return instance;
 }
 
 // Parses a level name ("trace" .. "critical", "off"), defaulting to `info`.
@@ -56,49 +57,74 @@ log_level ParseLogLevel(std::string_view level_str)
   return info;
 }
 
+// Installs `backend` (kept unchanged if null) and then opens the level gate.
+void install(std::shared_ptr<log_backend> backend, std::string_view log_level_str)
+{
+  if (backend) {
+    // Flush the displaced backend before its last reference may be released.
+    if (auto displaced = state().backend.exchange(std::move(backend), std::memory_order_acq_rel)) {
+      displaced->flush();
+    }
+  }
+  state().level.store(static_cast<int>(ParseLogLevel(log_level_str)), std::memory_order_relaxed);
+}
+
 }  // namespace
 
-void InitGlobalLogger(std::string_view log_level_str, std::string_view log_dir, int flush_seconds)
+void InitGlobalLogger(std::string_view log_level_str,
+                      std::string_view log_dir,
+                      uint32_t flush_ms,
+                      log_backend_type backend)
 {
-  auto log_file  = std::format("{}/sirius.log", log_dir);
-  auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
-  file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
-
-  auto log_level = to_spdlog_level(ParseLogLevel(log_level_str));
-  auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
-  logger->set_level(log_level);
-  spdlog::set_default_logger(logger);
-  spdlog::set_level(log_level);
-  spdlog::flush_every(std::chrono::seconds(flush_seconds));
+  std::shared_ptr<log_backend> new_backend;
+  switch (backend) {
+    case log_backend_type::spdlog: {
+      auto flush_interval =
+        flush_ms == 0 ? std::nullopt : std::optional{std::chrono::milliseconds{flush_ms}};
+      new_backend = make_spdlog_backend({std::string{log_dir}, flush_interval});
+      break;
+    }
+    case log_backend_type::noop: new_backend = make_noop_backend(); break;
+  }
+  // A failed factory (nullptr) keeps the current backend installed.
+  install(std::move(new_backend), log_level_str);
 }
 
-void FlushGlobalLogger()
+void InitGlobalLogger(std::shared_ptr<log_backend> backend, std::string_view log_level_str)
 {
-  if (auto* logger = spdlog::default_logger_raw()) { logger->flush(); }
+  if (backend == nullptr) {
+    // Reset to the pre-init state: drop everything, release the backend.
+    state().level.store(SIRIUS_LOG_LEVEL_OFF, std::memory_order_relaxed);
+    if (auto displaced = state().backend.exchange(nullptr, std::memory_order_acq_rel)) {
+      displaced->flush();
+    }
+    return;
+  }
+  install(std::move(backend), log_level_str);
 }
 
-void SetGlobalLogFlush(int flush_seconds)
+bool FlushGlobalLogger()
 {
-  spdlog::flush_every(std::chrono::seconds(flush_seconds));
+  if (auto backend = state().backend.load(std::memory_order_acquire)) { return backend->flush(); }
+  return false;
 }
 
 void SetGlobalLogLevel(std::string_view log_level_str)
 {
-  auto log_level = to_spdlog_level(ParseLogLevel(log_level_str));
-  spdlog::set_level(log_level);
-  if (auto logger = spdlog::default_logger()) { logger->set_level(log_level); }
+  state().level.store(static_cast<int>(ParseLogLevel(log_level_str)), std::memory_order_relaxed);
 }
 
 bool ShouldLog(log_level level)
 {
-  auto* logger = spdlog::default_logger_raw();
-  return logger != nullptr && logger->should_log(to_spdlog_level(level));
+  return static_cast<int>(level) >= state().level.load(std::memory_order_relaxed);
 }
 
 void LogAt(log_level level, const std::source_location& loc, std::string_view message)
 {
-  spdlog::source_loc spd_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
-  spdlog::default_logger_raw()->log(spd_loc, to_spdlog_level(level), "{}", message);
+  if (!ShouldLog(level)) { return; }
+  if (auto backend = state().backend.load(std::memory_order_acquire)) {
+    backend->log(level, loc, message);
+  }
 }
 
 }  // namespace sirius
