@@ -568,10 +568,6 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
   if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& right_delim = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
 
-    // Tag the bare DISTINCT so its `build_pipelines` is a no-op: the delim-join sink runs
-    // `distinct->execute`/`sink` inline, so it contributes nothing to any pipeline.
-    if (right_delim.distinct) { right_delim.distinct->set_owned_by_delim_join(true); }
-
     auto* internal_join = delim_base.join.get();
     if (internal_join && internal_join->children.size() >= 2) {
       auto* build_child = internal_join->children[1].get();
@@ -585,13 +581,6 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
         }
       }
     }
-  } else if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-    auto& left_delim = slot->Cast<sirius::op::sirius_physical_left_delim_join>();
-
-    // Same DISTINCT tagging as the RIGHT branch. The cached chunk scan
-    // (`left_delim.column_data_scan`) was already recorded in LEFT_DELIM_JOIN's constructor;
-    // it can't be recovered here — wrap_join already buried it under a CONCAT/PARTITION chain.
-    if (left_delim.distinct) { left_delim.distinct->set_owned_by_delim_join(true); }
   }
 }
 

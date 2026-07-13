@@ -286,69 +286,31 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
       continue;
     }
 
-    // RIGHT_DELIM_JOIN: emit partition_join + distinct sibling references.
-    if (sink_op->type == T::RIGHT_DELIM_JOIN) {
-      auto& right_delim    = sink_op->Cast<op::sirius_physical_right_delim_join>();
-      auto* partition_join = right_delim.partition_join;
-      auto* distinct_op    = right_delim.distinct;
-      if (partition_join) {
-        auto it = dest_for_op.find(partition_join);
-        // partition_join executes inline in RIGHT_DELIM_JOIN::sink with no pipeline of
-        // its own, so the direct lookup misses; fall back to its tree parent
-        // (CONCAT_build), mirroring legacy's PARTITION → CONCAT build wiring.
-        if (it == dest_for_op.end()) {
-          if (auto* parent = partition_join->get_parent_op()) { it = dest_for_op.find(parent); }
-        }
-        if (it != dest_for_op.end()) {
-          emit("default", op::MemoryBarrierType::FULL, partition_join, pipeline, it->second);
-        }
-      }
-      if (distinct_op) {
-        auto it = dest_for_op.find(distinct_op);
-        // The bare DISTINCT also executes inline (`_owned_by_delim_join` short-circuits
-        // its build_pipelines), so the direct lookup misses; fall back to its tree
-        // parent (PARTITION_distinct), which consumes its per-thread output.
-        if (it == dest_for_op.end()) {
-          if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
-        }
-        if (it != dest_for_op.end()) {
-          emit("default", op::MemoryBarrierType::FULL, distinct_op, pipeline, it->second);
-        }
-      }
-      continue;
-    }
-
-    // LEFT_DELIM_JOIN: emit column_data_scan + distinct sibling references.
-    if (sink_op->type == T::LEFT_DELIM_JOIN) {
-      auto& left_delim       = sink_op->Cast<op::sirius_physical_left_delim_join>();
-      auto* distinct_op      = left_delim.distinct;
-      auto* column_data_scan = left_delim.column_data_scan;
-      if (column_data_scan) {
-        auto it = dest_for_op.find(column_data_scan);
-        // column_data_scan executes inline in LEFT_DELIM_JOIN::sink (build_pipelines is a
-        // no-op), so the direct lookup misses; fall back to its tree parent (PARTITION_probe).
-        // resolve_barrier lets the dest dictate PARTIAL for the probe-side partition.
-        if (it == dest_for_op.end()) {
-          if (auto* parent = column_data_scan->get_parent_op()) { it = dest_for_op.find(parent); }
-        }
-        if (it != dest_for_op.end()) {
-          emit("default",
-               resolve_barrier(*column_data_scan, *it->second),
-               column_data_scan,
-               pipeline,
-               it->second);
-        }
-      }
-      if (distinct_op) {
-        auto it = dest_for_op.find(distinct_op);
-        // Same fallback as RIGHT_DELIM_JOIN's bare DISTINCT: no pipeline of its own,
-        // so resolve to its tree parent (PARTITION_distinct).
-        if (it == dest_for_op.end()) {
-          if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
-        }
-        if (it != dest_for_op.end()) {
-          emit("default", op::MemoryBarrierType::FULL, distinct_op, pipeline, it->second);
-        }
+    // A delim join is a fan-out sink: its base sink() pushes each input batch to both branch
+    // pipelines, which are first-class pipelines sourced from the delim join. Emit one edge per
+    // branch with the delim join as the producer; the sub-ops' outward edges (PARTITION_build →
+    // CONCAT_build, DISTINCT → PARTITION_distinct, column_data_scan → PARTITION_probe) come from
+    // the uniform tree-parent lookup below.
+    if (sink_op->type == T::RIGHT_DELIM_JOIN || sink_op->type == T::LEFT_DELIM_JOIN) {
+      auto& delim = sink_op->Cast<op::sirius_physical_delim_join>();
+      // Branch 1: the side that feeds the inner join (RHS build / LHS probe).
+      op::sirius_physical_operator* join_side =
+        (sink_op->type == T::RIGHT_DELIM_JOIN)
+          ? static_cast<op::sirius_physical_operator*>(
+              sink_op->Cast<op::sirius_physical_right_delim_join>().partition_join)
+          : static_cast<op::sirius_physical_operator*>(
+              sink_op->Cast<op::sirius_physical_left_delim_join>().column_data_scan);
+      // Branch 2: the duplicate-elimination (distinct) side.
+      op::sirius_physical_operator* distinct_op = delim.distinct;
+      for (auto* branch : {join_side, distinct_op}) {
+        if (!branch) { continue; }
+        auto it = dest_for_op.find(branch);
+        if (it == dest_for_op.end()) { continue; }
+        emit(resolve_port_id(*sink_op, *branch),
+             resolve_barrier(*sink_op, *it->second),
+             sink_op,
+             pipeline,
+             it->second);
       }
       continue;
     }
@@ -470,36 +432,29 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       D_ASSERT(
         build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
         build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
-      bool const is_right_delim = build_partition_pipeline->get_sink()->type ==
-                                  op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
-      // RIGHT_DELIM_JOIN must bootstrap its probe subtree from build-side distinct data.
+      // A RIGHT_DELIM_JOIN's inner join bootstraps its probe subtree from build-side (distinct)
+      // data, so the build side must drive the partition count. Detect it off the join's tree
+      // parent (the same predicate resolve_barrier uses) — the build partition is now a real
+      // PARTITION pipeline like any other, so the sink-type test no longer identifies it.
+      bool const inner_join_of_rdj =
+        pipeline->source->get_parent_op() != nullptr &&
+        pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
       // Right-family sizing applies to hash joins only — NLJ probe partitions always stream.
       bool const probe_drives_partition_count =
         pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN &&
         pipeline->source->Cast<op::sirius_physical_hash_join>().is_right_family() &&
-        !is_right_delim;
+        !inner_join_of_rdj;
 
-      if (is_right_delim) {
-        // partition pipeline only has one operator
-        auto& right_delim_join_op =
-          build_partition_pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
-        auto build_partition_op = right_delim_join_op.partition_join;
-        auto& probe_partition_op =
-          probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-        build_partition_op->set_sibling_partition_op(&probe_partition_op);
-        probe_partition_op.set_sibling_partition_op(build_partition_op);
-      } else {
-        // partition pipeline only has one operator, so sink and source are the same
-        auto& build_partition_op =
-          build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-        auto& probe_partition_op =
-          probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-        build_partition_op.set_sibling_partition_op(&probe_partition_op);
-        probe_partition_op.set_sibling_partition_op(&build_partition_op);
-        if (probe_drives_partition_count) {
-          build_partition_op.set_drives_partition_count(false);
-          probe_partition_op.set_drives_partition_count(true);
-        }
+      // partition pipeline only has one operator, so sink and source are the same
+      auto& build_partition_op =
+        build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
+      auto& probe_partition_op =
+        probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
+      build_partition_op.set_sibling_partition_op(&probe_partition_op);
+      probe_partition_op.set_sibling_partition_op(&build_partition_op);
+      if (probe_drives_partition_count) {
+        build_partition_op.set_drives_partition_count(false);
+        probe_partition_op.set_drives_partition_count(true);
       }
     }
   }
