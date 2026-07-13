@@ -775,6 +775,7 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
     if (req->is_cancelled() || st.stop_requested()) {
       std::ranges::for_each(allocated_chunks,
                             [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
+      std::ignore = req->state->mark_load_failed();
       continue;
     }
 

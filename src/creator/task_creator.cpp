@@ -32,8 +32,10 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 
 namespace sirius::creator {
 
@@ -41,10 +43,13 @@ namespace sirius::creator {
 // task_creator
 //------------------------------------------------------------------------------
 
-task_creator::task_creator(exec::thread_pool_config config,
+task_creator::task_creator(task_creator_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
                            const cucascade::memory::system_topology_info* sys_topology)
-  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _sys_topology(sys_topology)
+  : _running(false),
+    _config(std::move(config)),
+    _mem_res_mgr(mem_res_mgr),
+    _sys_topology(sys_topology)
 {
   // Normalize numa_node=-1 (Linux convention for non-NUMA / single-NUMA
   // hosts) to 0 so it matches the host memory space, which is built with
@@ -91,28 +96,42 @@ void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_sch
 
 void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
-  std::lock_guard<std::mutex> lock(_global_state_mutex);
+  {
+    std::lock_guard<std::mutex> lock(_global_state_mutex);
 
-  _gpu_operator_global_state_map.clear();
+    _gpu_operator_global_state_map.clear();
 
-  const auto& pipelines = query.get_pipelines();
+    const auto& pipelines = query.get_pipelines();
 
-  auto* sirius_ctx =
-    _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
-  std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
-    sirius_ctx->get_telemetry_context();
+    auto* sirius_ctx =
+      _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
+      sirius_ctx->get_telemetry_context();
 
-  for (const auto& pipeline : pipelines) {
-    pipeline->set_task_creator(this);
-    auto source_operator = pipeline->get_source();
-    if (source_operator == nullptr) {
-      SIRIUS_LOG_WARN("Pipeline has no source operator; skipping task creation for this pipeline.");
-      continue;
+    for (const auto& pipeline : pipelines) {
+      pipeline->set_task_creator(this);
+      auto source_operator = pipeline->get_source();
+      if (source_operator == nullptr) {
+        SIRIUS_LOG_WARN(
+          "Pipeline has no source operator; skipping task creation for this pipeline.");
+        continue;
+      }
+      size_t operator_id = source_operator->get_operator_id();
+      auto gs =
+        std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+      _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
     }
-    size_t operator_id = source_operator->get_operator_id();
-    auto gs =
-      std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
-    _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
+  }
+
+  std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);
+  _lookahead_queue.clear();
+  auto scan_operators      = query.get_scan_operators();
+  _index_of_next_lookahead = 0;
+  if (!scan_operators.empty()) {
+    auto begin = scan_operators.begin() + 1;
+    for (auto it = begin; it != scan_operators.end(); ++it) {
+      _lookahead_queue.push_back(*it);
+    }
   }
 }
 
@@ -131,15 +150,29 @@ void task_creator::drain_pending_tasks()
   // caller as "Operation not permitted" and breaking otherwise-successful
   // multi-file SF1000 scans.
   if (_bounded_pool) { _bounded_pool->wait_all(); }
+  // Clear lookahead state so any schedule_lookahead() call from the
+  // management_eventloop that races with QueryEnd (after query_.reset() destroys
+  // operators but before task_creator_->reset() clears the queue) finds an
+  // empty queue and exits cleanly instead of dereferencing dangling pointers.
+  {
+    std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);
+    _lookahead_queue.clear();
+    _index_of_next_lookahead = 0;
+  }
   _task_creation_queue.reactivate();
 }
 
-void task_creator::reset(bool /*keep_parquet_metadata*/)
+void task_creator::reset()
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _gpu_operator_global_state_map.clear();
   _thread_context.reset();
   _execution_context.reset();
+  {
+    std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);
+    _lookahead_queue.clear();
+    _index_of_next_lookahead = 0;
+  }
 }
 
 op::sirius_physical_operator* task_creator::get_operator_for_next_task(
@@ -148,16 +181,16 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
   if (node == nullptr) { return nullptr; }
 
   auto hint = node->get_next_task_hint();
+  if (!hint.has_value()) { return nullptr; }
 
-  if (hint.has_value() && hint.value().hint == op::TaskCreationHint::READY) {
+  if (hint.value().hint == op::TaskCreationHint::READY) {
     if (hint.value().producer == nullptr) {
       throw std::runtime_error(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
     // WSM TODO: how do we handle other ports that are not default?
     return hint.value().producer;
-  } else if (hint.has_value() &&
-             hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
+  } else if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
     return get_operator_for_next_task(hint.value().producer);
   }
   return nullptr;
@@ -180,8 +213,10 @@ void task_creator::start_thread_pool()
   // a paired reactivate() here, subsequent schedule() pushes silently no-op
   // and the next query's manager_loop sees an empty/inactive queue forever.
   _task_creation_queue.reactivate();
-  _bounded_pool = std::make_unique<exec::bounded_thread_pool>(
-    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
+  _bounded_pool =
+    std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
+                                                _config.thread_pool.thread_name_prefix,
+                                                _config.thread_pool.cpu_affinity_list);
   _manager_thread = std::thread(&task_creator::manager_loop, this);
 }
 
@@ -210,6 +245,29 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   _task_creation_queue.push(std::move(request));
 }
 
+void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
+{
+  if (_config.strategy != request_type::lookahead) { return; }
+  std::lock_guard lock(_lookahead_mutex);
+  for (; _index_of_next_lookahead < _lookahead_queue.size(); ++_index_of_next_lookahead) {
+    auto* node = _lookahead_queue[_index_of_next_lookahead];
+    if (node == nullptr) { continue; }
+    auto hint = node->get_next_task_hint();
+    if (!hint.has_value()) {
+      if (!node->get_pipeline()->is_pipeline_finished()) { return; }
+      continue;
+    }
+    if (hint.value().hint == op::TaskCreationHint::READY) {
+      SIRIUS_LOG_INFO("Task Creator: scheduling lookahead for operator {} (id {})",
+                      node->get_name(),
+                      node->get_operator_id());
+      schedule(node);
+      ++_index_of_next_lookahead;
+      return;
+    }
+  }
+}
+
 void task_creator::manager_loop()
 {
   while (_running.load()) {
@@ -227,7 +285,8 @@ void task_creator::manager_loop()
     auto node = request->node;
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    auto* source = node;
+    node         = get_operator_for_next_task(node);
 
     if (node == nullptr) { continue; }
 
@@ -243,12 +302,6 @@ void task_creator::manager_loop()
             port_info.next_operator->get_port(port_info.next_operator_port_name)->repo);
         }
 
-        // Create all possible tasks until all ports are empty
-        // TODO(amin) : do this based on the operator hint
-        // auto is_gpu_parquet_scan = node->type ==
-        // op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN; std::size_t count =
-        // is_gpu_parquet_scan ? 1 : std::numeric_limits<std::size_t>::max(); need to exhaust
-        // input batches until all ports are empty
         while (!node->all_ports_empty()) {
           auto task_lock  = pipeline->get_task_creation_lock();
           auto input_data = node->get_next_task_input_data();

@@ -316,6 +316,8 @@ void task_scheduler::management_eventloop()
       }
     }
 
+    if (_task_queue.is_empty()) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
+
     // Matcher: for each ready device, try to find a dispatchable task.
     // A task is dispatchable to device X if:
     //   (a) its preferred_device_id == X (exact match), OR
