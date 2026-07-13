@@ -91,8 +91,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
 
   auto original_disabled = DBConfig::GetConfig(context).options.disabled_optimizers;
   auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
-  // Mirror the transparent-interception disables (SiriusExtension PrepareConnection):
-  // without STATISTICS_PROPAGATION the deliminator keeps the DELIM_JOINs this file asserts.
+  // Keep STATISTICS_PROPAGATION disabled only for this shape-sensitive suite:
+  // disabling it lets the deliminator retain the DELIM_JOINs asserted below.
   disabled.insert(OptimizerType::IN_CLAUSE);
   disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
   disabled.insert(OptimizerType::STATISTICS_PROPAGATION);

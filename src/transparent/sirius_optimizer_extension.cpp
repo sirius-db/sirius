@@ -118,10 +118,9 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // plan shapes or source operators the rebind path cannot yet execute.
   disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
   disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-  // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
-  // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
-  // Transparent execution still falls back on those COLUMN_DATA_SCAN sources.
-  disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
+  // Keep STATISTICS_PROPAGATION enabled. Its constant-folded
+  // EXPRESSION_GET/COLUMN_DATA_SCAN and DUMMY_SCAN sources are handled by
+  // GPU_VALUES. If the user disabled it explicitly, it remains in `disabled`.
   // LATE_MATERIALIZATION rewrites `ORDER BY ... LIMIT N` over a scan into a
   // self-RIGHT_SEMI_JOIN keyed on the parquet virtual columns `file_index` /
   // `file_row_number` (TOP_N picks the N rows, the semi-join re-fetches them

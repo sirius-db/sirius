@@ -55,7 +55,6 @@ class optimizer_disable_guard {
     auto disabled  = dbconfig.options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-    disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
 #endif
