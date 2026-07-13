@@ -2,7 +2,8 @@
 #ifndef SIMPATICO_PLAN_BITJOIN_LAYOUT_HPP
 #define SIMPATICO_PLAN_BITJOIN_LAYOUT_HPP
 
-#include "codegen/plan/plan_dsl.hpp"  // bit_range
+#include "codegen/plan/plan_dsl.hpp"   // bit_range
+#include "codegen/plan/plan_tree.hpp"  // ValueId, ValueIdHash
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -33,20 +34,21 @@ struct bitjoin_layout {
 };
 
 bool resolve_bitjoin_layout(std::string const& compressor_name,
-                            std::vector<std::string> const& input_paths,
+                            std::size_t n_fields,
                             std::vector<std::optional<bit_range>> const& input_ranges,
                             bitjoin_layout* layout,
                             std::string* error_out);
 
-// For each unique input column referenced by a bitjoin step, OR the field masks
+// For each unique input value referenced by a bitjoin step, OR the field masks
 // that target it and check `(input & ~selected_mask) != 0` element-wise on the
 // GPU. Logs a stderr warning per input that had truncated bits. Synchronises
-// `stream`.
-void bitjoin_warn_on_truncation(std::unordered_map<std::string, cudf::column_view> const& columns,
-                                bitjoin_layout const& layout,
-                                std::vector<std::string> const& input_paths,
-                                std::string const& compressor_name,
-                                cudaStream_t stream);
+// `stream`. `columns` / `input_sources` are keyed structurally by ValueId.
+void bitjoin_warn_on_truncation(
+  std::unordered_map<ValueId, cudf::column_view, ValueIdHash> const& columns,
+  bitjoin_layout const& layout,
+  std::vector<ValueId> const& input_sources,
+  std::string const& compressor_name,
+  cudaStream_t stream);
 
 /// Deep-copy a column_view into an owning column (for identity leaves).
 /// Fixed-width types are copied via make_fixed_width_column + memcpy; STRING/LIST

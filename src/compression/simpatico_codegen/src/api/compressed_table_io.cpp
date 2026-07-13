@@ -332,8 +332,9 @@ static void push_node(std::vector<std::uint8_t>& hdr, PlanNode const& node)
 }
 
 // Inverse of push_node. output_paths mirror output_names as the node-local
-// channel key; bitjoin input arity/ranges are mirrored into input_paths/
-// input_ranges for layout resolution.
+// channel key; bitjoin input arity/ranges live on the bitjoin attrs, and each
+// node's structural input_sources are rebuilt by compute_input_sources after
+// the whole tree is read.
 static bool read_node(Reader& r, PlanNode& node)
 {
   if (!r.read_str16(node.op)) return false;
@@ -356,10 +357,6 @@ static bool read_node(Reader& r, PlanNode& node)
         if (!r.read_le(hi) || !r.read_le(lo)) return false;
         in.range = bit_range{hi, lo};
       }
-    }
-    for (auto const& in : bj.inputs) {
-      node.input_paths.push_back(in.channel);
-      node.input_ranges.push_back(in.range);
     }
     node.attrs.bitjoin = std::move(bj);
   }

@@ -31,6 +31,25 @@ struct ValueId {
   ChannelId channel = 0;
 };
 
+inline bool operator==(ValueId a, ValueId b) { return a.node == b.node && a.channel == b.channel; }
+inline bool operator!=(ValueId a, ValueId b) { return !(a == b); }
+
+// Pack a ValueId into a unique 64-bit key (channel is a uint8, so node<<8 leaves
+// no room for collision). Shared by the decode memo and the compress walk maps.
+inline std::uint64_t value_id_key(ValueId v)
+{
+  return (static_cast<std::uint64_t>(v.node) << 8) | v.channel;
+}
+
+// Hasher so ValueId can key an unordered_map/set (the compress walk's columns /
+// reprs / refcount tables).
+struct ValueIdHash {
+  std::size_t operator()(ValueId v) const noexcept
+  {
+    return static_cast<std::size_t>(value_id_key(v));
+  }
+};
+
 struct PlanEdge {
   std::string channel;
   NodeId child = 0;
@@ -62,21 +81,17 @@ struct PlanNode {
   std::vector<PlanEdge> children;
   op_attrs attrs;
 
-  // Producer metadata (populated by plan_tree_from_steps for decode).
-  std::string input_path;                 // DSL path this op consumes (empty for bitjoin)
+  // Producer metadata (populated by plan_tree_from_steps for decode). The
+  // output_paths string keys are the node.channels buffer contract shared by
+  // encode and decode.
   std::vector<std::string> output_names;  // port names in step order
   std::vector<std::string> output_paths;  // dotted paths this op produces
 
-  // Consumer metadata (populated by plan_tree_from_steps for the compress walk).
-  // The DSL paths this op consumes and their per-input source bit ranges. For a
-  // single-input op this is {input_path}; for a bitjoin it is the full field
-  // list. Lets the forward compress walk run an op straight from its node.
-  std::vector<std::string> input_paths;
-  std::vector<std::optional<bit_range>> input_ranges;
-
-  // Structural identity of each value this op consumes, in input_paths order:
-  // the (node, port) each input is produced on. This is what decode resolves
-  // against, so it never has to match DSL path strings across nodes.
+  // Structural identity of each value this op consumes, in field order: the
+  // (node, port) each input is produced on. Both compress and decode resolve
+  // cross-node values against this, so neither has to match DSL path strings.
+  // For a single-input op this holds one entry; for a bitjoin, one per field.
+  // Populated by compute_input_sources from the edge wiring + bitjoin attrs.
   std::vector<ValueId> input_sources;
 
   // Node-owned compressed representations. Two storage slots cover every shape:

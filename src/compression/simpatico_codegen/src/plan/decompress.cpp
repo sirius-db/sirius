@@ -546,7 +546,8 @@ bool decode_bitjoin(NodeId nid,
     input_ranges.push_back(ref.range);
 
   bitjoin_layout layout;
-  if (!resolve_bitjoin_layout(node.op, node.input_paths, input_ranges, &layout, error_out)) {
+  if (!resolve_bitjoin_layout(
+        node.op, node.input_sources.size(), input_ranges, &layout, error_out)) {
     return false;
   }
 

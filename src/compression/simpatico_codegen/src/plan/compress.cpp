@@ -41,43 +41,50 @@
 namespace simpatico {
 namespace {
 
-// Place one produced rep onto its owning node in `tree`, keyed by the DSL
-// `path`.
+using ValueColumnMap  = std::unordered_map<ValueId, cudf::column_view, ValueIdHash>;
+using ValueConsumeMap = std::unordered_map<ValueId, NodeId, ValueIdHash>;
+
+// The DSL output-path string a value is produced under (matching the producing
+// node's `output_paths`). Node 0 is the column input. Used only where the walk
+// still needs a path string: keys_chars byte-copy detection and the node
+// `channels` map, whose string keys are the shared encode/decode buffer
+// contract.
+std::string path_for_value(PlanTree const& tree, ValueId v)
+{
+  if (v.node == 0 || v.node >= tree.nodes.size()) return "input";
+  PlanNode const& np = tree.nodes[v.node];
+  if (v.channel < np.output_paths.size()) return np.output_paths[v.channel];
+  return {};
+}
+
+// Place one produced rep onto its owning node in `tree`, keyed structurally by
+// the value id `v` it is produced on.
 //
 // Placement rule (see plan_tree.hpp PlanNode docs):
-//   * If path P is consumed by a real op C, the rep is C's own representation
-//     (keyed by its input path) -> `consumer_by_input[P]`.rep.
-//   * Otherwise P is a terminal/identity OUTPUT of `producer` (the node the
-//     caller is currently emitting) -> `tree.nodes[producer]`.channels[P].
+//   * If value `v` is consumed by a real op C, the rep is C's own representation
+//     -> `consumer_by_input[v]`.rep.
+//   * Otherwise `v` is a terminal/identity OUTPUT of `producer` (the node the
+//     caller is currently emitting) -> `tree.nodes[producer]`.channels[out_path]
+//     (channels stay keyed by the output PATH string: the buffer contract decode
+//     reads against).
 void place_rep_on_node(PlanTree& tree,
-                       std::unordered_map<std::string, NodeId> const& consumer_by_input,
+                       ValueConsumeMap const& consumer_by_input,
                        NodeId producer,
-                       std::string const& path,
+                       ValueId v,
+                       std::string const& out_path,
                        std::unique_ptr<compressed_representation> rep)
 {
   if (!rep) return;
-  auto cit = consumer_by_input.find(path);
+  auto cit = consumer_by_input.find(v);
   if (cit != consumer_by_input.end()) {
     auto& node = tree.nodes[cit->second];
     node.rep   = std::move(rep);
     return;
   }
-  // Terminal output (nothing consumes `path`): park on the producing node's
+  // Terminal output (nothing consumes `v`): park on the producing node's
   // channels. `producer` is the node the caller is currently emitting, which
   // produces this output path.
-  tree.nodes[producer].channels.emplace(path, std::move(rep));
-}
-
-// Returns the DSL output path for `name` on `node` (output_paths[i] where
-// output_names[i] == name), or nullptr if `node` has no such output. Mirror of
-// decode's port_for_output_path (plan/decompress.cpp), which does the inverse
-// lookup.
-std::string const* output_path_for_name(PlanNode const& node, std::string const& name)
-{
-  for (std::size_t i = 0; i < node.output_names.size(); ++i) {
-    if (node.output_names[i] == name) return &node.output_paths[i];
-  }
-  return nullptr;
+  tree.nodes[producer].channels.emplace(out_path, std::move(rep));
 }
 
 // Move each NodeId-keyed leaf rep produced by a jit_encode_subtree() call onto
@@ -128,9 +135,10 @@ std::unique_ptr<cudf::column> copy_identity_leaf(cudf::column_view const& view,
 // caller's concern (see compress_column).
 struct CompressWalk {
   PlanTree& tree;
-  std::unordered_map<std::string, NodeId> const& consumer_by_input;
-  std::unordered_map<std::string, cudf::column_view>& columns;
-  std::unordered_map<std::string, std::unique_ptr<compressed_representation>>& reprs_by_input;
+  ValueConsumeMap const& consumer_by_input;
+  ValueColumnMap& columns;
+  std::unordered_map<ValueId, std::unique_ptr<compressed_representation>, ValueIdHash>&
+    reprs_by_input;
   std::vector<bool>& visited;
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
@@ -139,8 +147,11 @@ struct CompressWalk {
 
   // Eager-release bookkeeping: which reprs_by_input key owns each live column,
   // and how many of a key's consumed outputs are still referenced in `columns`.
-  std::unordered_map<std::string, std::string> col_to_repr_key;
-  std::unordered_map<std::string, size_t> repr_pending;
+  // A repr key is the producing value id of the rep's owning node (e.g. {n,0}
+  // for an op's own rep) — never one of its inputs, so it can never alias a
+  // downstream op's key.
+  std::unordered_map<ValueId, ValueId, ValueIdHash> col_to_repr_key;
+  std::unordered_map<ValueId, size_t, ValueIdHash> repr_pending;
 
   void set_error(std::string msg)
   {
@@ -150,21 +161,22 @@ struct CompressWalk {
   }
 
   void place(NodeId producer,
-             std::string const& path,
+             ValueId v,
+             std::string const& out_path,
              std::unique_ptr<compressed_representation> rep)
   {
-    place_rep_on_node(tree, consumer_by_input, producer, path, std::move(rep));
+    place_rep_on_node(tree, consumer_by_input, producer, v, out_path, std::move(rep));
   }
 
-  // Drop the live column view at `path`; if it was the last consumed output of
-  // its producing rep, free that rep (stream-ordered) so its device memory is
+  // Drop the live column view for value `v`; if it was the last consumed output
+  // of its producing rep, free that rep (stream-ordered) so its device memory is
   // reclaimed immediately rather than at the end of the walk.
-  void release_column(std::string const& path)
+  void release_column(ValueId v)
   {
-    columns.erase(path);
-    auto it = col_to_repr_key.find(path);
+    columns.erase(v);
+    auto it = col_to_repr_key.find(v);
     if (it == col_to_repr_key.end()) return;
-    std::string const key = it->second;
+    ValueId const key = it->second;
     col_to_repr_key.erase(it);
     auto cnt = repr_pending.find(key);
     if (cnt != repr_pending.end() && --(cnt->second) == 0) {
@@ -173,45 +185,45 @@ struct CompressWalk {
     }
   }
 
-  // Release every unique input column of `node` (a path may repeat across
+  // Release every unique input value of `node` (a value may repeat across
   // bitjoin fields). Inputs are consumed exactly once, so this is safe to call
   // as soon as the op's kernels are enqueued on `stream`.
   void release_node_inputs(PlanNode const& node)
   {
-    std::unordered_set<std::string> released;
-    for (auto const& ipath : node.input_paths) {
-      if (released.insert(ipath).second) release_column(ipath);
+    std::unordered_set<ValueId, ValueIdHash> released;
+    for (auto const& src : node.input_sources) {
+      if (released.insert(src).second) release_column(src);
     }
   }
 
-  void emit_path(std::string const& path);
+  void emit_path(ValueId v);
   void emit_bitjoin_node(NodeId n);
   bool emit_fused_node(NodeId n, cudf::column_view col);
   void emit_generic_node(NodeId n, cudf::column_view col);
 };
 
-void CompressWalk::emit_path(std::string const& path)
+void CompressWalk::emit_path(ValueId v)
 {
   if (failed) return;
-  auto it = consumer_by_input.find(path);
-  if (it == consumer_by_input.end()) return;  // terminal column, no consumer
+  auto it = consumer_by_input.find(v);
+  if (it == consumer_by_input.end()) return;  // terminal value, no consumer
   NodeId const n = it->second;
   if (visited[n]) return;
   PlanNode const& node = tree.nodes[n];
 
   // For a multi-input bitjoin, only fire once every field column is live; the
   // branch that produces the last input will re-enter here and proceed.
-  for (auto const& ipath : node.input_paths) {
-    if (columns.find(ipath) == columns.end()) return;
+  for (auto const& src : node.input_sources) {
+    if (columns.find(src) == columns.end()) return;
   }
   visited[n] = true;
 
-  if (node.input_paths.size() > 1) {
+  if (node.input_sources.size() > 1) {
     emit_bitjoin_node(n);
     return;
   }
 
-  auto col_it = columns.find(node.input_paths[0]);
+  auto col_it = columns.find(node.input_sources[0]);
   if (is_codegen_compressor(node.op)) {
     if (emit_fused_node(n, col_it->second)) return;
   }
@@ -222,13 +234,22 @@ void CompressWalk::emit_path(std::string const& path)
 void CompressWalk::emit_bitjoin_node(NodeId n)
 {
   PlanNode const& node = tree.nodes[n];
+  // Bit ranges come from the bitjoin attrs (per input, in field order) — the
+  // same source decode reads from.
+  std::vector<std::optional<bit_range>> input_ranges;
+  if (node.attrs.bitjoin.has_value()) {
+    input_ranges.reserve(node.attrs.bitjoin->inputs.size());
+    for (auto const& ref : node.attrs.bitjoin->inputs)
+      input_ranges.push_back(ref.range);
+  }
   bitjoin_layout layout;
-  if (!resolve_bitjoin_layout(node.op, node.input_paths, node.input_ranges, &layout, error_out)) {
+  if (!resolve_bitjoin_layout(
+        node.op, node.input_sources.size(), input_ranges, &layout, error_out)) {
     failed = true;
     return;
   }
 
-  int64_t const n_elements = static_cast<int64_t>(columns.at(node.input_paths[0]).size());
+  int64_t const n_elements = static_cast<int64_t>(columns.at(node.input_sources[0]).size());
   auto out_col             = cudf::make_fixed_width_column(layout.output_type,
                                                static_cast<cudf::size_type>(n_elements),
                                                cudf::mask_state::UNALLOCATED,
@@ -240,38 +261,40 @@ void CompressWalk::emit_bitjoin_node(NodeId n)
     static_cast<size_t>(n_elements) * static_cast<size_t>(cudf::size_of(layout.output_type)),
     stream.value());
 
-  for (size_t fi = 0; fi < node.input_paths.size(); ++fi) {
+  for (size_t fi = 0; fi < node.input_sources.size(); ++fi) {
     launch_bitjoin_field(out_col->mutable_view(),
-                         columns.at(node.input_paths[fi]),
+                         columns.at(node.input_sources[fi]),
                          static_cast<int>(layout.src_los[fi]),
                          static_cast<int>(layout.dst_los[fi]),
                          layout.widths[fi],
                          stream.value());
   }
-  bitjoin_warn_on_truncation(columns, layout, node.input_paths, node.op, stream.value());
+  bitjoin_warn_on_truncation(columns, layout, node.input_sources, node.op, stream.value());
 
   // Route the output: terminal outputs are placed straight onto the tree;
   // outputs consumed by a downstream op stay in reprs_by_input (keeping their
-  // buffers alive for the recursion).
-  std::string const out_key =
-    node.output_paths.empty() ? node.input_paths[0] : node.output_paths[0];
-  bool const output_is_terminal =
-    node.output_paths.empty() || !consumer_by_input.count(node.output_paths[0]);
-  columns.emplace(out_key, out_col->view());
+  // buffers alive for the recursion). A bitjoin with no declared output stores
+  // its packed leaf as the node's own rep (out value == its input source, which
+  // it consumes); a declared output is produced on port 0.
+  bool const has_output         = !node.output_paths.empty();
+  ValueId const out_val         = has_output ? ValueId{n, 0} : node.input_sources[0];
+  std::string const out_path    = has_output ? node.output_paths[0] : std::string{};
+  bool const output_is_terminal = !has_output || !consumer_by_input.count(ValueId{n, 0});
+  columns.emplace(out_val, out_col->view());
   if (output_is_terminal) {
-    place(n, out_key, std::make_unique<identity_compressed_representation>(std::move(out_col)));
+    place(n,
+          out_val,
+          out_path,
+          std::make_unique<identity_compressed_representation>(std::move(out_col)));
     release_node_inputs(node);
   } else {
-    std::string const repr_key = node.input_paths[0];
+    ValueId const repr_key = ValueId{n, 0};  // the bitjoin's own output value
     reprs_by_input.emplace(
       repr_key, std::make_unique<identity_compressed_representation>(std::move(out_col)));
-    col_to_repr_key[out_key] = repr_key;
+    col_to_repr_key[out_val] = repr_key;
     repr_pending[repr_key]   = 1;
-    // Release inputs AFTER registering the output owner: an input path may equal
-    // repr_key, but col_to_repr_key keys the upstream owner of that input, never
-    // the just-stored output, so the two never collide.
     release_node_inputs(node);
-    emit_path(out_key);
+    emit_path(out_val);
   }
 }
 
@@ -279,8 +302,8 @@ void CompressWalk::emit_bitjoin_node(NodeId n)
 // error) if the region is not fusable — the caller then runs the generic path.
 bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
 {
-  PlanNode const& root        = tree.nodes[n];
-  std::string const head_path = root.input_paths[0];
+  PlanNode const& root   = tree.nodes[n];
+  ValueId const head_val = root.input_sources[0];
   plan_compound_builder builder;
   std::string jit_err;
   CodegenHead head;
@@ -295,27 +318,38 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
 
   // Build covered set early so the raw-passthrough loop can use it.
   std::unordered_set<NodeId> const covered(head.covered_nodes.begin(), head.covered_nodes.end());
-  std::vector<std::string> to_recurse;
+  std::vector<ValueId> to_recurse;
 
   // Route each raw-passthrough leaf.
   //
-  // When a downstream non-fused op consumes the channel path (entropy-tail):
+  // When a downstream non-fused op consumes the channel value (entropy-tail):
   //   1. Strip the `data` column from the RawFused rep (keep only `offsets` for
   //      the decode binder, which resolves data via the downstream rep's bytes).
   //   2. Keep the data column alive via reprs_by_input until the downstream op
   //      fires and calls release_column.
-  //   3. Seed columns[channel_path] with a view of the raw data so emit_path can
+  //   3. Seed columns[channel_val] with a view of the raw data so emit_path can
   //      route it to the downstream op (e.g. ans, bitcomp).
-  //   4. Add channel_path to to_recurse.
+  //   4. Add channel_val to to_recurse.
   //
   // When no downstream consumer exists (terminal): park the whole RawFused.
   for (auto& leaf : builder.raw_passthrough_leaves) {
-    auto& parent_nd    = tree.nodes[leaf.parent_id];
-    auto const* path_p = output_path_for_name(parent_nd, leaf.channel_name);
-    if (!path_p) continue;  // shouldn't happen
-    std::string const channel_output_path = *path_p;
+    auto& parent_nd = tree.nodes[leaf.parent_id];
+    // Locate the parent's output port that carries this channel: its value id is
+    // {parent_id, port}, its channels-map key is output_paths[port].
+    ChannelId port  = 0;
+    bool found_port = false;
+    for (std::size_t i = 0; i < parent_nd.output_names.size(); ++i) {
+      if (parent_nd.output_names[i] == leaf.channel_name) {
+        port       = static_cast<ChannelId>(i);
+        found_port = true;
+        break;
+      }
+    }
+    if (!found_port) continue;  // shouldn't happen
+    ValueId const channel_val             = ValueId{leaf.parent_id, port};
+    std::string const channel_output_path = parent_nd.output_paths[port];
 
-    auto cit                  = consumer_by_input.find(channel_output_path);
+    auto cit                  = consumer_by_input.find(channel_val);
     bool const has_downstream = (cit != consumer_by_input.end() && !covered.count(cit->second));
 
     if (has_downstream) {
@@ -334,13 +368,16 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
                              raw_rep->buffers.end());
       if (data_col) {
         cudf::column_view data_view = data_col->view();
-        std::string repr_key        = channel_output_path + ":raw_passthrough";
+        // Key the stripped data rep by the channel's own value id. The
+        // downstream op keys its rep by ITS own output ({consumer,0}), never by
+        // channel_val, so the two never alias.
+        ValueId const repr_key = channel_val;
         reprs_by_input.emplace(
           repr_key, std::make_unique<identity_compressed_representation>(std::move(data_col)));
-        col_to_repr_key[channel_output_path] = repr_key;
-        repr_pending[repr_key]               = 1;
-        columns.emplace(channel_output_path, data_view);
-        to_recurse.push_back(channel_output_path);
+        col_to_repr_key[channel_val] = repr_key;
+        repr_pending[repr_key]       = 1;
+        columns.emplace(channel_val, data_view);
+        to_recurse.push_back(channel_val);
       }
     }
     // Park the (possibly data-stripped) RawFused rep in the parent's channels
@@ -349,8 +386,8 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
   }
 
   // The region's head input has now been fully consumed by the JIT kernel; free
-  // it (boundary outputs below are backed by node-owned reps, not by head_path).
-  release_column(head_path);
+  // it (boundary outputs below are backed by node-owned reps, not by head_val).
+  release_column(head_val);
 
   // The fused region covers several PlanTree nodes; mark them done and recurse
   // into each region output that feeds a real downstream op (e.g. a bitpack
@@ -364,13 +401,13 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
     PlanNode const& cnode          = tree.nodes[cn];
     compressed_representation* rep = cnode.rep.get();
     for (size_t k = 0; k < cnode.output_names.size(); ++k) {
-      std::string const& output_path = cnode.output_paths[k];
-      auto cit                       = consumer_by_input.find(output_path);
+      ValueId const output_val = ValueId{cn, static_cast<ChannelId>(k)};
+      auto cit                 = consumer_by_input.find(output_val);
       if (cit == consumer_by_input.end()) continue;  // terminal (owned by rep)
       if (covered.count(cit->second)) continue;      // interior region edge
       // Already routed by the raw-passthrough loop above (data_col was seeded
-      // into columns and path is in to_recurse).
-      if (columns.count(output_path)) continue;
+      // into columns and the value is in to_recurse).
+      if (columns.count(output_val)) continue;
 
       if (!rep) {
         set_error("fused boundary: missing rep at node " + std::to_string(cn));
@@ -389,8 +426,8 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
                   cnode.output_names[k] + "'");
         return true;
       }
-      columns.emplace(output_path, *view);
-      to_recurse.push_back(output_path);
+      columns.emplace(output_val, *view);
+      to_recurse.push_back(output_val);
     }
   }
   for (auto const& op : to_recurse) {
@@ -404,9 +441,10 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
 // output channels (terminal → identity leaf; consumed → recurse downstream).
 void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
 {
-  PlanNode const& node   = tree.nodes[n];
-  std::string const path = node.input_paths[0];
-  auto compressor        = make_compressor(node.op);
+  PlanNode const& node    = tree.nodes[n];
+  ValueId const input_val = node.input_sources[0];
+  std::string const path  = path_for_value(tree, input_val);
+  auto compressor         = make_compressor(node.op);
   if (!compressor) {
     set_error("unknown compressor '" + node.op + "'");
     return;
@@ -440,8 +478,10 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   tree.nodes[n].meta = repr->describe_meta();
 
   if (node.output_names.empty()) {
-    release_column(path);
-    place(n, path, std::move(repr));
+    release_column(input_val);
+    // No declared output: the whole rep becomes this node's own rep (place sees
+    // the node consuming input_val and stores it on tree.nodes[n].rep).
+    place(n, input_val, path, std::move(repr));
     return;
   }
 
@@ -471,8 +511,10 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   }
 
   size_t pending = 0;
-  std::vector<std::string> to_recurse;
-  std::string const repr_key = path;
+  std::vector<ValueId> to_recurse;
+  // The rep's owner key is this node's own representative output value {n,0} —
+  // never an input, so it can't alias a downstream op's key.
+  ValueId const repr_key = ValueId{n, 0};
   for (size_t idx = 0; idx < node.output_names.size(); ++idx) {
     auto const& out_name = node.output_names[idx];
     auto out_it          = output_by_name.find(out_name);
@@ -481,9 +523,10 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
       return;
     }
     std::string const& output_path = node.output_paths[idx];
-    columns.emplace(output_path, out_it->second);
+    ValueId const output_val       = ValueId{n, static_cast<ChannelId>(idx)};
+    columns.emplace(output_val, out_it->second);
 
-    if (!consumer_by_input.count(output_path)) {
+    if (!consumer_by_input.count(output_val)) {
       // Terminal leaf — copy the channel into an identity leaf (reps stay whole
       // on the PlanTree; no release_output destructuring).
       auto leaf_col = copy_identity_leaf(out_it->second, output_path, stream, mr);
@@ -491,12 +534,14 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
         set_error("failed to get column for identity leaf '" + output_path + "'");
         return;
       }
-      place(
-        n, output_path, std::make_unique<identity_compressed_representation>(std::move(leaf_col)));
+      place(n,
+            output_val,
+            output_path,
+            std::make_unique<identity_compressed_representation>(std::move(leaf_col)));
     } else {
       ++pending;
-      col_to_repr_key[output_path] = repr_key;
-      to_recurse.push_back(output_path);
+      col_to_repr_key[output_val] = repr_key;
+      to_recurse.push_back(output_val);
     }
   }
 
@@ -510,10 +555,10 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   // The input column is fully consumed (compress already ran + synced and all
   // output views derive from `repr`, not the input); release it now so an
   // upstream rep it backed can be freed before we descend.
-  release_column(path);
-  for (auto const& output_path : to_recurse) {
+  release_column(input_val);
+  for (auto const& output_val : to_recurse) {
     if (failed) return;
-    emit_path(output_path);
+    emit_path(output_val);
   }
 }
 
@@ -550,14 +595,16 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   }
   PlanTree& tree = *compound;
 
-  // consumer_by_input[P] = the node that consumes path P, derived straight from
-  // the tree's input metadata. First-consumer-wins, matching parse_plan_dsl. Only
-  // real ops are tree nodes, so synthetic-drain-only paths are absent — those
-  // fall to the producer's channels in place_rep_on_node.
-  std::unordered_map<std::string, NodeId> consumer_by_input;
+  // consumer_by_input[V] = the node that consumes the value produced at V,
+  // derived structurally from each node's input_sources (the (node, port) each
+  // input comes from). First-consumer-wins, matching parse_plan_dsl. Every value
+  // is consumed by at most one op, so this key uniquely identifies its consumer;
+  // terminal (unconsumed) values are absent and fall to the producer's channels
+  // in place_rep_on_node.
+  ValueConsumeMap consumer_by_input;
   for (NodeId i = 1; i < tree.nodes.size(); ++i) {
-    for (auto const& ip : tree.nodes[i].input_paths) {
-      consumer_by_input.emplace(ip, i);
+    for (auto const& src : tree.nodes[i].input_sources) {
+      consumer_by_input.emplace(src, i);
     }
   }
 
@@ -567,14 +614,15 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   // call itself and handles both the all-terminal case and the entropy-tail
   // case (a raw-passthrough or boundary channel with a downstream consumer)
   // uniformly — so there is no separate fast path to maintain here.
-  std::unordered_map<std::string, cudf::column_view> columns;
-  columns.emplace("input", input);
-  std::unordered_map<std::string, std::unique_ptr<compressed_representation>> reprs_by_input;
+  ValueColumnMap columns;
+  columns.emplace(ValueId{0, 0}, input);  // the column input is value (node 0, port 0)
+  std::unordered_map<ValueId, std::unique_ptr<compressed_representation>, ValueIdHash>
+    reprs_by_input;
   std::vector<bool> visited(tree.nodes.size(), false);
 
   CompressWalk walk{
     tree, consumer_by_input, columns, reprs_by_input, visited, stream, mr, error_out};
-  walk.emit_path("input");
+  walk.emit_path(ValueId{0, 0});
   if (walk.failed) return nullptr;
 
   // Every real op node must have been reached by the walk; a missed node would
@@ -584,9 +632,10 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   for (NodeId i = 1; i < tree.nodes.size(); ++i) {
     if (visited[i]) continue;
     if (error_out) {
-      PlanNode const& nd = tree.nodes[i];
-      *error_out         = "plan node[" + std::to_string(i) + "] '" +
-                   (nd.input_paths.empty() ? "?" : nd.input_paths[0]) + " -> " + nd.op +
+      PlanNode const& nd   = tree.nodes[i];
+      std::string in_label = dotted_label(tree, i);
+      if (in_label.empty()) in_label = "?";
+      *error_out = "plan node[" + std::to_string(i) + "] '" + in_label + " -> " + nd.op +
                    "' was not resolved (missing inputs or cycle)";
     }
     return nullptr;
@@ -708,10 +757,12 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
   if (!compound) return nullptr;
 
   // Locate the op node (index 1 for a single-step plan).
-  PlanNode* op_node = nullptr;
+  PlanNode* op_node  = nullptr;
+  NodeId op_node_idx = 0;
   for (std::size_t i = 1; i < compound->nodes.size(); ++i) {
     if (compound->nodes[i].op == op_name) {
-      op_node = &compound->nodes[i];
+      op_node     = &compound->nodes[i];
+      op_node_idx = static_cast<NodeId>(i);
       break;
     }
   }
@@ -742,13 +793,15 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
   for (std::size_t i = 0; i < op_node->output_names.size(); ++i) {
     std::string const& chan_name = op_node->output_names[i];
     std::string const& chan_path = op_node->output_paths[i];
+    // The value this channel produces, resolved structurally.
+    ValueId const chan_val = ValueId{op_node_idx, static_cast<ChannelId>(i)};
 
     bool found = false;
 
     for (std::size_t j = 1; j < compound->nodes.size() && !found; ++j) {
       auto& nj = compound->nodes[j];
-      if (nj.op != "identity" || nj.input_paths.empty()) continue;
-      if (nj.input_paths[0] != chan_path || !nj.rep) continue;
+      if (nj.op != "identity" || nj.input_sources.empty()) continue;
+      if (nj.input_sources[0] != chan_val || !nj.rep) continue;
       auto leaf_chans = nj.rep->named_channels(stream);
       if (!leaf_chans.empty()) {
         result->chans.push_back({chan_name, leaf_chans.front().view});

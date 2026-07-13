@@ -108,15 +108,8 @@ std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps
       return std::nullopt;
     }
 
-    if (is_bitjoin_compressor(step.compressor)) {
-      node.input_path.clear();
-    } else if (step.input_paths.size() == 1) {
-      node.input_path = step.input_paths[0];
-    }
     node.output_names = step.output_names;
     node.output_paths = step.output_paths;
-    node.input_paths  = step.input_paths;
-    node.input_ranges = step.input_ranges;
 
     tree.nodes.push_back(std::move(node));
 

@@ -20,7 +20,7 @@
 namespace simpatico {
 
 bool resolve_bitjoin_layout(std::string const& compressor_name,
-                            std::vector<std::string> const& input_paths,
+                            std::size_t n_fields,
                             std::vector<std::optional<bit_range>> const& input_ranges,
                             bitjoin_layout* layout,
                             std::string* error_out)
@@ -40,8 +40,7 @@ bool resolve_bitjoin_layout(std::string const& compressor_name,
     return false;
   }
 
-  size_t n_fields = input_paths.size();
-  bool any_range  = false;
+  bool any_range = false;
   for (auto const& r : input_ranges) {
     if (r.has_value()) {
       any_range = true;
@@ -103,22 +102,23 @@ bool resolve_bitjoin_layout(std::string const& compressor_name,
   return true;
 }
 
-void bitjoin_warn_on_truncation(std::unordered_map<std::string, cudf::column_view> const& columns,
-                                bitjoin_layout const& layout,
-                                std::vector<std::string> const& input_paths,
-                                std::string const& compressor_name,
-                                cudaStream_t stream)
+void bitjoin_warn_on_truncation(
+  std::unordered_map<ValueId, cudf::column_view, ValueIdHash> const& columns,
+  bitjoin_layout const& layout,
+  std::vector<ValueId> const& input_sources,
+  std::string const& compressor_name,
+  cudaStream_t stream)
 {
-  std::vector<std::pair<std::string, uint64_t>> per_input;
-  std::unordered_map<std::string, size_t> path_to_idx;
-  for (size_t fi = 0; fi < input_paths.size(); ++fi) {
+  std::vector<std::pair<ValueId, uint64_t>> per_input;
+  std::unordered_map<ValueId, size_t, ValueIdHash> src_to_idx;
+  for (size_t fi = 0; fi < input_sources.size(); ++fi) {
     uint64_t field_mask =
       (layout.widths[fi] >= 64) ? ~uint64_t{0} : ((uint64_t{1} << layout.widths[fi]) - 1);
     uint64_t mask = field_mask << layout.src_los[fi];
-    auto it       = path_to_idx.find(input_paths[fi]);
-    if (it == path_to_idx.end()) {
-      path_to_idx[input_paths[fi]] = per_input.size();
-      per_input.emplace_back(input_paths[fi], mask);
+    auto it       = src_to_idx.find(input_sources[fi]);
+    if (it == src_to_idx.end()) {
+      src_to_idx[input_sources[fi]] = per_input.size();
+      per_input.emplace_back(input_sources[fi], mask);
     } else {
       per_input[it->second].second |= mask;
     }
@@ -145,9 +145,10 @@ void bitjoin_warn_on_truncation(std::unordered_map<std::string, cudf::column_vie
     if (h_flag & (uint32_t{1} << b)) {
       std::fprintf(stderr,
                    "WARNING: bitjoin '%s' has non-zero bits outside the selected range "
-                   "in input '%s'; compression is lossy.\n",
+                   "in input value (node %u, port %u); compression is lossy.\n",
                    compressor_name.c_str(),
-                   per_input[b].first.c_str());
+                   per_input[b].first.node,
+                   static_cast<unsigned>(per_input[b].first.channel));
     }
   }
 }
