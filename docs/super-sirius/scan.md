@@ -39,7 +39,7 @@ The operator handles two split shapes transparently, both delivered as `scan_ope
 
 `no_history_peak_memory_estimate()` returns the input size for resident (cached) inputs. For fresh reads it reserves 8x the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint.
 
-> The `DUCKDB_SCAN` and `PARQUET_SCAN` physical operator types and the `sirius_physical_table_scan` / `sirius_physical_duckdb_scan` / `sirius_physical_parquet_scan` wrappers still exist for the CPU / DuckDB-source path, but the GPU read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
+> `sirius_physical_table_scan` (`TABLE_SCAN`) remains only as the plan-time carrier that `wrap_table_scan_source` consumes; the read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
 
 ## gpu_ingestible
 

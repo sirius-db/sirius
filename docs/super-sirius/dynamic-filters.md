@@ -296,7 +296,7 @@ Wires the scaffolding into operators end-to-end against a degenerate single-zone
 Plan-gen / type plumbing:
 
 - `sirius_physical_plan_generator::dynamic_filter_channels` map (the router), gated by `enable_dynamic_filter_pushdown`
-- `sirius_physical_table_scan` / transient `sirius_physical_parquet_scan` `sirius_dynamic_filters` field (consumer endpoint, propagated through `parquet_ingestible_table_info` to `parquet_gpu_ingestible` and through `duckdb_native_ingestible_table_info` to the native ingestible, which installs the channel's output-position remap)
+- `sirius_physical_table_scan`'s `sirius_dynamic_filters` field (consumer endpoint, propagated through `parquet_ingestible_table_info` to `parquet_gpu_ingestible` and through `duckdb_native_ingestible_table_info` to the native ingestible, which installs the channel's output-position remap)
 - `dynamic_filter_publish_plan::probe_target` entries plus non-owning paired GPU/HOST replica spaces (producer endpoint, held privately by the hash join)
 - Plan-gen wiring in `sirius_plan_get.cpp` and `sirius_plan_comparison_join.cpp`; the join attaches a channel per target
 

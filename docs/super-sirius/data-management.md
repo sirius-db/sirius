@@ -150,11 +150,10 @@ operator_data                       (empty generic base)
 **File:** `src/include/data/sirius_converter_registry.hpp`
 
 Global singleton for converting between data representations:
-- Registers builtin cuCascade converters + Sirius-specific converters (parquet)
+- Registers builtin cuCascade converters
 - Thread-safe initialization via mutex
 - Used by:
   - Downgrade tasks: GPU representation → HOST representation
-  - Scan tasks: Parquet representation → GPU table representation
   - GPU pipeline tasks: HOST representation → GPU representation (`lock_or_prepare_batch`)
 
 ### Conversion Examples
@@ -163,7 +162,6 @@ Global singleton for converting between data representations:
 |------|----|------|
 | `host_data_representation` | GPU `cudf::table` | GPU task input preparation |
 | GPU `cudf::table` | `host_data_representation` | Downgrade executor |
-| `host_parquet_representation` | GPU `cudf::table` | Parquet materialization |
 
 ## Key Files
 
@@ -171,6 +169,5 @@ Global singleton for converting between data representations:
 |------|---------|
 | `src/include/op/sirius_physical_operator.hpp` | Port struct, barrier types, push_data_batch |
 | `src/op/sirius_physical_operator.cpp` | Default sink/push implementation |
-| `src/include/data/cached_data_representation.hpp` | Cached data wrappers |
 | `src/include/data/sirius_converter_registry.hpp` | Format conversion registry |
 | `src/include/memory/multiple_blocks_allocation_accessor.hpp` | Multi-block allocation cursor |

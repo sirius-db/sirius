@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -72,7 +73,7 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
     telemetry::thread_local_executor_thread_telemtry_init(
       *telemetry_context,
-      fmt::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
+      std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
       telemetry_context->executor_thread_group_id(device_id));
 
     // Per-thread init runs on a worker thread just spawned by the
@@ -83,9 +84,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
     // check instead.
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
-      spdlog::error("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
-                    device_id,
-                    cudaGetErrorString(err));
+      SIRIUS_LOG_ERROR("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
+                       device_id,
+                       cudaGetErrorString(err));
     }
     sirius::util::enable_log_on_default_stream();
   };
@@ -95,7 +96,7 @@ void gpu_pipeline_executor::manager_loop()
 {
   telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
     *_telemetry_context,
-    fmt::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
+    std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
     _telemetry_context->manager_thread_group_id(_memory_space->get_device_id())};
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});

@@ -209,8 +209,6 @@ set(EXTENSION_SOURCES
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
-    src/data/host_parquet_representation.cpp
-    src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
     src/expression/ast/node.cpp
@@ -254,6 +252,7 @@ set(EXTENSION_SOURCES
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
+    src/log/logging.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -265,7 +264,6 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
-    src/op/scan/hive_partition.cpp
     src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/owning_table_view.cpp
@@ -282,10 +280,11 @@ set(EXTENSION_SOURCES
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_cpu_source.cpp
+    src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
+    src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
-    src/op/sirius_physical_duckdb_scan.cpp
     src/op/sirius_physical_dummy_scan.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
@@ -298,7 +297,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_operator.cpp
     src/op/sirius_physical_operator_type.cpp
     src/op/sirius_physical_order.cpp
-    src/op/sirius_physical_parquet_scan.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
     src/op/sirius_physical_projection.cpp
@@ -566,6 +564,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_semi_future.cpp
@@ -631,6 +630,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_physical_streaming_source.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp

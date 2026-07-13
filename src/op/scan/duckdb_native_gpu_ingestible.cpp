@@ -207,7 +207,8 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
                                      bind.table_filters.get(),
                                      &bind.column_ids);
   if (!_plan.viable) {
-    SPDLOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}", _plan.viability_failure_reason);
+    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
+                     _plan.viability_failure_reason);
     throw std::runtime_error("duckdb-native scan rejected query: " +
                              _plan.viability_failure_reason);
   }

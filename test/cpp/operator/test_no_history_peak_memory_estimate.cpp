@@ -20,7 +20,6 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -184,34 +183,6 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
     f.hash_join.get()};
   part.set_num_partitions(8);
   REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 8192);
-}
-
-// ---------------------------------------------------------------------------
-// sirius_physical_parquet_scan
-// ---------------------------------------------------------------------------
-
-TEST_CASE("parquet scan no_history_peak_memory_estimate returns 8x bytes",
-          "[no_history_peak_memory_estimate][parquet_scan]")
-{
-  // Constructed with all-empty/nullptr args; constructor body is a no-op when
-  // table_filters is nullptr (skips filter-translation path entirely).
-  sirius_physical_parquet_scan scan{/*types=*/{},
-                                    /*function=*/{},
-                                    /*bind_data=*/nullptr,
-                                    /*returned_types=*/{},
-                                    /*column_ids=*/{},
-                                    /*projection_ids=*/{},
-                                    /*names=*/{},
-                                    /*table_filters=*/nullptr,
-                                    /*estimated_cardinality=*/0,
-                                    /*extra_info=*/{},
-                                    /*parameters=*/{},
-                                    /*virtual_columns=*/{},
-                                    /*physical_table_scan=*/nullptr};
-
-  REQUIRE(scan.no_history_peak_memory_estimate({0, 0}) == 0);
-  REQUIRE(scan.no_history_peak_memory_estimate({1, 100}) == 800);
-  REQUIRE(scan.no_history_peak_memory_estimate({4, 512}) == 4096);
 }
 
 TEST_CASE("GPU scan adds filter-only decode bytes to its no-history estimate",
