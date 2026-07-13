@@ -41,17 +41,7 @@ These operators produce data for pipelines. See [Scan](scan.md) for in-depth cov
 ### `sirius_physical_table_scan` — `TABLE_SCAN`
 **File:** `src/include/op/sirius_physical_table_scan.hpp`
 
-Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. During pipeline construction it is converted into a format-specific wrapper (`DUCKDB_SCAN` or `PARQUET_SCAN`) for the CPU / DuckDB-source path; the GPU read path for parquet and DuckDB-native tables is instead rewritten into a `GPU_SCAN` source (see below).
-
-### `sirius_physical_duckdb_scan` — `DUCKDB_SCAN`
-**File:** `src/include/op/sirius_physical_duckdb_scan.hpp`
-
-Sequential scan using DuckDB's execution engine. Accumulates chunks into fixed-size batches via column builders. Tracks an atomic `exhausted` flag for pipeline completion.
-
-### `sirius_physical_parquet_scan` — `PARQUET_SCAN`
-**File:** `src/include/op/sirius_physical_parquet_scan.hpp`
-
-Wrapper for the DuckDB-source parquet path. Reads column-chunk byte ranges and optionally materializes (decompresses) to table format. Tracks `has_more_partitions` atomic flag. Row groups are partitioned by `approximate_batch_size`.
+Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. It exists only as the plan-time carrier: during plan generation it is rewritten into a `GPU_SCAN` source (see below).
 
 ### `sirius_gpu_scan_operator` — `GPU_SCAN`
 **File:** `src/include/op/scan/sirius_gpu_scan_operator.hpp`
@@ -353,8 +343,6 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
-| DUCKDB_SCAN | Scan | DuckDB table function (CPU / DuckDB-source path) |
-| PARQUET_SCAN | Scan | Parquet reading (CPU / DuckDB-source path) |
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
 | DUMMY_SCAN | Scan | Generates 1 row |

@@ -111,10 +111,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   auto& input                  = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& ro_input_batches = input.get_read_only_batches();
 
-  // For parquet scan pipelines, filter and projection are already applied in
-  // parquet_scan_task and the host_parquet_representation converters.
-  // Also, only parquet file tails are small due to the partitioning logic, so batch concatenation
-  // is not needed.
+  // Passthrough inputs arrive with filter and projection already applied upstream, in
+  // batches small enough that concatenation is not needed.
   if (passthrough) {
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }

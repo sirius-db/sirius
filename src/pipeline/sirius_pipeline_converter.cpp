@@ -191,7 +191,7 @@ std::string_view sirius_pipeline_converter::resolve_port_id(
   }
   // Leaf scans push splits onto the "scan" port of the next operator. GPU_SCAN is
   // intentionally excluded — legacy wires it as a regular "default"-port operator.
-  if (sink.type == T::DUCKDB_SCAN || sink.type == T::CPU_SOURCE) { return "scan"; }
+  if (sink.type == T::CPU_SOURCE) { return "scan"; }
   return "default";
 }
 
@@ -202,7 +202,7 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
   // Sort/scan sinks process batches as they arrive — no barrier required. GPU_SCAN is
   // intentionally excluded (legacy gives it FULL/PARTIAL, not PIPELINE); SORT_SAMPLE is
   // never a pipeline sink (it runs as an intermediate in the SORT_PARTITION pipeline).
-  if (sink.type == T::ORDER_BY || sink.type == T::DUCKDB_SCAN || sink.type == T::CPU_SOURCE) {
+  if (sink.type == T::ORDER_BY || sink.type == T::CPU_SOURCE) {
     return op::MemoryBarrierType::PIPELINE;
   }
   // Producers that feed CONCAT can drain incrementally (PARTIAL); otherwise wait
@@ -538,27 +538,107 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
   }
 }
 
+namespace {
+
+std::string dump_op_name(const op::sirius_physical_operator* op)
+{
+  return op == nullptr ? std::string{"(null)"} : op::SiriusPhysicalOperatorToString(op->type);
+}
+
+std::string dump_barrier_name(op::MemoryBarrierType b)
+{
+  switch (b) {
+    case op::MemoryBarrierType::PIPELINE: return "PIPELINE";
+    case op::MemoryBarrierType::PARTIAL: return "PARTIAL";
+    case op::MemoryBarrierType::FULL: return "FULL";
+  }
+  return "?";
+}
+
+//! Scan identity: serialize what the ingestible will scan, so a conversion that drops
+//! identity fields (e.g. the duckdb-native pin-cache qualified name, or a parquet file
+//! list) fails the dump byte-diff instead of passing on an identical operator-type chain.
+//! Conversion-time only: table_info is still parked on the operator (scan_manager takes it
+//! at prepare_for_query).
+void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
+{
+  if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
+  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().peek_table_info();
+  if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+    out << "      scan: parquet files=[";
+    for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {
+      out << (f == 0 ? "" : ",") << pq->resolved_file_paths[f];
+    }
+    out << "]\n";
+  } else if (auto const* nat =
+               dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
+    out << "      scan: duckdb table=" << nat->catalog_name << "." << nat->schema_name << "."
+        << nat->table_name << "\n";
+  }
+}
+
+//! One `[pipeline N]` block: source/sink/operators with per-scan identity, shared by the
+//! canonical and raw dumps so both describe a single pipeline identically.
+void dump_pipeline_block(std::ostringstream& out, std::size_t index, const sirius_pipeline& p)
+{
+  out << "[pipeline " << index << "]\n";
+  out << "  source: " << dump_op_name(p.get_source().get()) << "\n";
+  out << "  sink: " << dump_op_name(p.get_sink().get()) << "\n";
+  const auto ops = p.get_operators();
+  out << "  operators (" << ops.size() << "):\n";
+  std::size_t op_idx = 0;
+  for (const auto& op_ref : ops) {
+    out << "    [" << op_idx++ << "] " << dump_op_name(&op_ref.get()) << "\n";
+    dump_scan_identity(out, op_ref.get());
+  }
+}
+
+//! Wiring lines with endpoints resolved through `index_of`, sorted by those indices —
+//! insensitive to wiring emission order, sensitive to the caller's pipeline order.
+void dump_wirings(
+  std::ostringstream& out,
+  const std::vector<repository_wiring>& wirings,
+  const std::function<std::size_t(const duckdb::shared_ptr<sirius_pipeline>&)>& index_of)
+{
+  auto pipeline_index = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
+    auto idx = index_of(p);
+    return idx == std::numeric_limits<std::size_t>::max() ? std::string{"?"} : std::to_string(idx);
+  };
+  std::vector<repository_wiring> sorted_wirings(wirings.begin(), wirings.end());
+  std::sort(sorted_wirings.begin(),
+            sorted_wirings.end(),
+            [&](const repository_wiring& a, const repository_wiring& b) -> bool {
+              auto a_src = index_of(a.source_pipeline);
+              auto b_src = index_of(b.source_pipeline);
+              if (a_src != b_src) { return a_src < b_src; }
+              auto a_dst = index_of(a.dest_pipeline);
+              auto b_dst = index_of(b.dest_pipeline);
+              if (a_dst != b_dst) { return a_dst < b_dst; }
+              return a.port_id < b.port_id;
+            });
+
+  out << "\n=== repository_wirings (" << sorted_wirings.size() << ") ===\n";
+  for (std::size_t i = 0; i < sorted_wirings.size(); ++i) {
+    const auto& w = sorted_wirings[i];
+    out << "[wiring " << i << "]\n";
+    out << "  port_id: " << w.port_id << "\n";
+    out << "  barrier: " << dump_barrier_name(w.barrier_type) << "\n";
+    out << "  source_op: " << dump_op_name(w.source_op) << "\n";
+    out << "  src_pipeline: " << pipeline_index(w.source_pipeline) << "\n";
+    out << "  dest_pipeline: " << pipeline_index(w.dest_pipeline) << "\n";
+  }
+}
+
+}  // namespace
+
 std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result)
 {
-  auto op_name = [](const op::sirius_physical_operator* op) -> std::string {
-    return op == nullptr ? std::string{"(null)"} : op::SiriusPhysicalOperatorToString(op->type);
-  };
-
-  auto barrier_name = [](op::MemoryBarrierType b) -> std::string {
-    switch (b) {
-      case op::MemoryBarrierType::PIPELINE: return "PIPELINE";
-      case op::MemoryBarrierType::PARTIAL: return "PARTIAL";
-      case op::MemoryBarrierType::FULL: return "FULL";
-    }
-    return "?";
-  };
-
   // Per-pipeline local signature: sink|source|operators...
   auto local_sig = [&](const sirius_pipeline* p) -> std::string {
-    std::string s = op_name(p->get_sink().get());
-    s += "|" + op_name(p->get_source().get());
+    std::string s = dump_op_name(p->get_sink().get());
+    s += "|" + dump_op_name(p->get_source().get());
     for (const auto& op_ref : p->get_operators()) {
-      s += "|" + op_name(&op_ref.get());
+      s += "|" + dump_op_name(&op_ref.get());
     }
     return s;
   };
@@ -606,71 +686,45 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
     auto it = pipeline_to_index.find(p.get());
     return it == pipeline_to_index.end() ? std::numeric_limits<std::size_t>::max() : it->second;
   };
-  auto pipeline_index = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
-    auto it = pipeline_to_index.find(p.get());
-    return it == pipeline_to_index.end() ? std::string{"?"} : std::to_string(it->second);
-  };
 
   std::ostringstream out;
   out << "=== pipelines (" << ordered.size() << ") ===\n";
   for (std::size_t i = 0; i < ordered.size(); ++i) {
-    auto& p = *ordered[i];
-    out << "[pipeline " << i << "]\n";
-    out << "  source: " << op_name(p.get_source().get()) << "\n";
-    out << "  sink: " << op_name(p.get_sink().get()) << "\n";
-    const auto ops = p.get_operators();
-    out << "  operators (" << ops.size() << "):\n";
-    std::size_t op_idx = 0;
-    for (const auto& op_ref : ops) {
-      out << "    [" << op_idx++ << "] " << op_name(&op_ref.get()) << "\n";
-      // Scan identity: serialize what the ingestible will scan, so a conversion that
-      // drops identity fields (e.g. the duckdb-native pin-cache qualified name, or a
-      // parquet file list) fails the dump byte-diff instead of passing on an identical
-      // operator-type chain. Conversion-time only: table_info is still parked on the
-      // operator (scan_manager takes it at prepare_for_query).
-      if (op_ref.get().type == op::SiriusPhysicalOperatorType::GPU_SCAN) {
-        auto const& info =
-          op_ref.get().Cast<op::scan::sirius_gpu_scan_operator>().peek_table_info();
-        if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
-          out << "      scan: parquet files=[";
-          for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {
-            out << (f == 0 ? "" : ",") << pq->resolved_file_paths[f];
-          }
-          out << "]\n";
-        } else if (auto const* nat =
-                     dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
-          out << "      scan: duckdb table=" << nat->catalog_name << "." << nat->schema_name << "."
-              << nat->table_name << "\n";
-        }
-      }
+    dump_pipeline_block(out, i, *ordered[i]);
+  }
+
+  // Wirings keyed by canonical pipeline indices so wiring order is also path-independent.
+  dump_wirings(out, result.repository_wirings, idx_of);
+  return out.str();
+}
+
+std::string dump_pipeline_schedule_raw(const pipeline_conversion_result& result)
+{
+  const auto& scheduled = result.scheduled_pipelines;
+  std::unordered_map<const sirius_pipeline*, std::size_t> position;
+  for (std::size_t i = 0; i < scheduled.size(); ++i) {
+    position[scheduled[i].get()] = i;
+  }
+  auto idx_of = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::size_t {
+    auto it = position.find(p.get());
+    return it == position.end() ? std::numeric_limits<std::size_t>::max() : it->second;
+  };
+  auto idx_str = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
+    auto idx = idx_of(p);
+    return idx == std::numeric_limits<std::size_t>::max() ? std::string{"?"} : std::to_string(idx);
+  };
+
+  std::ostringstream out;
+  out << "=== scheduled pipelines (" << scheduled.size() << ") ===\n";
+  for (std::size_t i = 0; i < scheduled.size(); ++i) {
+    dump_pipeline_block(out, i, *scheduled[i]);
+    out << "  deps: [";
+    for (std::size_t d = 0; d < scheduled[i]->dependencies.size(); ++d) {
+      out << (d == 0 ? "" : ",") << idx_str(scheduled[i]->dependencies[d]);
     }
+    out << "]\n";
   }
-
-  // Sort wirings by canonical pipeline indices so wiring order is also path-independent.
-  std::vector<repository_wiring> sorted_wirings(result.repository_wirings.begin(),
-                                                result.repository_wirings.end());
-  std::sort(sorted_wirings.begin(),
-            sorted_wirings.end(),
-            [&](const repository_wiring& a, const repository_wiring& b) -> bool {
-              auto a_src = idx_of(a.source_pipeline);
-              auto b_src = idx_of(b.source_pipeline);
-              if (a_src != b_src) { return a_src < b_src; }
-              auto a_dst = idx_of(a.dest_pipeline);
-              auto b_dst = idx_of(b.dest_pipeline);
-              if (a_dst != b_dst) { return a_dst < b_dst; }
-              return a.port_id < b.port_id;
-            });
-
-  out << "\n=== repository_wirings (" << sorted_wirings.size() << ") ===\n";
-  for (std::size_t i = 0; i < sorted_wirings.size(); ++i) {
-    const auto& w = sorted_wirings[i];
-    out << "[wiring " << i << "]\n";
-    out << "  port_id: " << w.port_id << "\n";
-    out << "  barrier: " << barrier_name(w.barrier_type) << "\n";
-    out << "  source_op: " << op_name(w.source_op) << "\n";
-    out << "  src_pipeline: " << pipeline_index(w.source_pipeline) << "\n";
-    out << "  dest_pipeline: " << pipeline_index(w.dest_pipeline) << "\n";
-  }
+  dump_wirings(out, result.repository_wirings, idx_of);
   return out.str();
 }
 

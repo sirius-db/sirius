@@ -20,7 +20,6 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_operator_type.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
 #include <algorithm>
@@ -315,9 +314,6 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
   switch (op.type) {
     case op::SiriusPhysicalOperatorType::TABLE_SCAN:
       scan_name = op.Cast<op::sirius_physical_table_scan>().function.name;
-      break;
-    case op::SiriusPhysicalOperatorType::PARQUET_SCAN:
-      scan_name = op.Cast<op::sirius_physical_parquet_scan>().function.name;
       break;
     default: break;
   }

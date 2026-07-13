@@ -486,9 +486,8 @@ TEST_CASE("render_pipelines returns non-empty string for simple query", "[plan_p
   INFO("render_pipelines output:\n" << output);
   REQUIRE(!output.empty());
   REQUIRE(output.find("Pipeline #") != std::string::npos);
-  // Source is TABLE_SCAN / DUCKDB_SCAN on the legacy path, or GPU_SCAN under the tree pipeline.
+  // Source scan is the unified GPU_SCAN (TABLE_SCAN accepted for plan-time dumps).
   bool has_scan = (output.find("TABLE_SCAN") != std::string::npos ||
-                   output.find("DUCKDB_SCAN") != std::string::npos ||
                    output.find("GPU_SCAN") != std::string::npos);
   REQUIRE(has_scan);
   REQUIRE(output.find("RESULT_COLLECTOR") != std::string::npos);
@@ -511,7 +510,6 @@ TEST_CASE("render_pipelines shows operator chain for each pipeline", "[plan_prin
   REQUIRE(output.find("->") != std::string::npos);
   // Should contain recognizable operator names from source through sink
   bool has_scan = (output.find("TABLE_SCAN") != std::string::npos ||
-                   output.find("DUCKDB_SCAN") != std::string::npos ||
                    output.find("GPU_SCAN") != std::string::npos);
   REQUIRE(has_scan);
   REQUIRE(output.find("RESULT_COLLECTOR") != std::string::npos);
@@ -593,9 +591,8 @@ TEST_CASE("render_pipelines with projection query", "[plan_printer]")
   INFO("render_pipelines output:\n" << pipelines_output);
   // Should have at least one pipeline
   REQUIRE(pipelines_output.find("Pipeline #") != std::string::npos);
-  // Source scan: legacy TABLE_SCAN / DUCKDB_SCAN, or unified GPU_SCAN under the tree pipeline.
+  // Source scan is the unified GPU_SCAN (TABLE_SCAN accepted for plan-time dumps).
   bool has_scan = (pipelines_output.find("TABLE_SCAN") != std::string::npos ||
-                   pipelines_output.find("DUCKDB_SCAN") != std::string::npos ||
                    pipelines_output.find("GPU_SCAN") != std::string::npos);
   REQUIRE(has_scan);
 
@@ -604,7 +601,6 @@ TEST_CASE("render_pipelines with projection query", "[plan_printer]")
   REQUIRE(!dag_output.empty());
   // DAG should also contain the scan operator
   bool dag_has_scan = (dag_output.find("TABLE_SCAN") != std::string::npos ||
-                       dag_output.find("DUCKDB_SCAN") != std::string::npos ||
                        dag_output.find("GPU_SCAN") != std::string::npos);
   REQUIRE(dag_has_scan);
 }
@@ -649,10 +645,9 @@ TEST_CASE("barrier_type_to_string and build_operator_chain static methods", "[pl
 
   INFO("Operator chain:\n" << chain);
   REQUIRE(!chain.empty());
-  // Chain should contain at least one operator name (legacy scan ops or unified GPU_SCAN).
+  // Chain should contain at least one scan operator name.
   bool has_scan =
-    (chain.find("TABLE_SCAN") != std::string::npos ||
-     chain.find("DUCKDB_SCAN") != std::string::npos || chain.find("GPU_SCAN") != std::string::npos);
+    (chain.find("TABLE_SCAN") != std::string::npos || chain.find("GPU_SCAN") != std::string::npos);
   REQUIRE(has_scan);
 }
 
