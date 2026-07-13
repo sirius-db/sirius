@@ -213,6 +213,51 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   return info;
 }
 
+//! Build the GPU scan source leaf for a table scan, wrapping it in a `DYNAMIC_FILTER` operator
+//! when a producing join wired runtime dynamic filters into this scan.
+//!
+//! Shared by every scan format; `InfoT` is the concrete `ingestible_table_info` subtype. The
+//! template body relies on two per-format properties it resolves statically: `InfoT` exposes a
+//! `sirius_dynamic_filters` channel field, and a `make_ingestible` overload accepts
+//! `unique_ptr<InfoT>`.
+//!
+//! `mode` selects the wrapped operator's post-decode capability and is the scan format's only
+//! behavioral input here: a parquet scan already evaluated AST-capable filters (zone maps)
+//! through the reader's `set_filter`, so it wraps in `membership_masks_only`; a duckdb-native
+//! scan has no read-time dynamic path, so it wraps in `include_ast_row_masks` to also evaluate
+//! zone maps row-wise. Filters are elided when no producer ultimately registered — this runs
+//! after the whole tree is built, so `has_producers()` is settled.
+template <typename InfoT>
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
+  std::unique_ptr<InfoT> info,
+  const sirius::op::sirius_physical_table_scan& scan,
+  const sirius::operator_params& op_params,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto dynamic_filters = scan.sirius_dynamic_filters;
+  if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
+  info->sirius_dynamic_filters = dynamic_filters;
+
+  auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
+    duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
+      scan.types, scan.estimated_cardinality, std::move(ingestible));
+
+  if (dynamic_filters) {
+    // Under a PARTITION parent this emits the [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as
+    // sink); in inline contexts both join the current pipeline.
+    auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+      scan.types,
+      scan.estimated_cardinality,
+      std::move(dynamic_filters),
+      op_params.dynamic_filter_keep_threshold,
+      mode);
+    dynamic_filter_op->children.push_back(std::move(leaf));
+    leaf = std::move(dynamic_filter_op);
+  }
+  return leaf;
+}
+
 //! Rewrite a TABLE_SCAN for `seq_scan` / `parquet_scan` / `read_parquet` /
 //! `sirius_read_parquet` (the internal S3 rewrite target): REPLACE the slot with the GPU
 //! leaf so it inherits the TABLE_SCAN's tree position and stays the source-leaf of the
@@ -233,55 +278,21 @@ void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   bool replace_slot = false;
   if (fn == "seq_scan") {
-    auto info = build_duckdb_native_table_info(scan, op_params, context);
-    // Dynamic filters: the native scan has no read-time dynamic path, so the DYNAMIC_FILTER
-    // wrapped above is the only consumer; it applies AST row masks in addition to membership.
-    // Elide when no producer was wired — the wrap runs after the whole tree is built, so
-    // has_producers() is settled here.
-    auto dynamic_filters = scan.sirius_dynamic_filters;
-    if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
-    info->sirius_dynamic_filters = dynamic_filters;
-
-    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
-    leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types, scan.estimated_cardinality, std::move(ingestible));
-    if (dynamic_filters) {
-      // Under a PARTITION parent this emits the legacy [GPU_SCAN, DYNAMIC_FILTER] pipeline
-      // (filter as sink); in inline contexts both join the current pipeline.
-      auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-        scan.types,
-        scan.estimated_cardinality,
-        std::move(dynamic_filters),
-        op_params.dynamic_filter_keep_threshold,
-        sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks);
-      dynamic_filter_op->children.push_back(std::move(leaf));
-      leaf = std::move(dynamic_filter_op);
-    }
+    // The duckdb-native scan has no read-time dynamic-filter path, so its wrapped DYNAMIC_FILTER
+    // also evaluates AST-capable filters (zone maps) row-wise, not membership masks alone.
+    leaf = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
+                              scan,
+                              op_params,
+                              sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
-    auto info = build_parquet_table_info(scan, op_params);
-    // Dynamic filters: the ingestible consumes them for read-time row-group pruning; the
-    // DYNAMIC_FILTER wrapped above applies them post-decode. Elide both when no producer was
-    // wired — the wrap runs after the whole tree is built, so has_producers() is settled here.
-    auto dynamic_filters = scan.sirius_dynamic_filters;
-    if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
-    info->sirius_dynamic_filters = dynamic_filters;
-
-    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
-    leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types, scan.estimated_cardinality, std::move(ingestible));
-    if (dynamic_filters) {
-      // Under a PARTITION parent this emits the legacy [GPU_SCAN, DYNAMIC_FILTER] pipeline
-      // (filter as sink); in inline contexts both join the current pipeline.
-      auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-        scan.types,
-        scan.estimated_cardinality,
-        std::move(dynamic_filters),
-        op_params.dynamic_filter_keep_threshold);
-      dynamic_filter_op->children.push_back(std::move(leaf));
-      leaf = std::move(dynamic_filter_op);
-    }
+    // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped
+    // DYNAMIC_FILTER applies membership masks only.
+    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
+                              scan,
+                              op_params,
+                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else {
