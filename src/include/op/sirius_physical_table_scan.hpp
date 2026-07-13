@@ -95,7 +95,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   duckdb::ExtraOperatorInfo extra_info;
   //! Parameters
   duckdb::vector<duckdb::Value> parameters;
-  //! Named parameters (e.g., snapshot_from_id for iceberg_scan)
+  //! Named parameters of the table function
   duckdb::named_parameter_map_t named_parameters;
   /// The duckdb::DynamicTableFilterSet pointer planted by plan-gen for this scan, if any. Used as
   /// the route key identity for Sirius-side dynamic filters @ref sirius_dynamic_filters. Read by

@@ -82,16 +82,17 @@ bool check_outputs(const char* op,
   return true;
 }
 
-// Validate a single "output" UINT8 channel and copy it into a device_buffer.
-// The shared payload-copy for the byte-stream codecs (ans/bitcomp/snappy/lz4/
-// deflate). Returns nullptr and sets *error_out on validation failure; on
-// success sets *out_size to the payload byte count.
+// Validate a single "output" UINT8 channel and adopt its device_buffer. The
+// reconstruction entry points own `outputs`, so releasing the column avoids a
+// redundant device-to-device copy for the byte-stream codecs
+// (ans/bitcomp/snappy/lz4/deflate). Returns nullptr and sets *error_out on
+// validation failure; on success sets *out_size to the payload byte count.
 std::unique_ptr<rmm::device_buffer> copy_output_payload(
   const char* codec,
   std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> const& outputs,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
+  std::vector<std::unique_ptr<cudf::column>>& outputs,
+  rmm::cuda_stream_view,
+  rmm::device_async_resource_ref,
   std::string* error_out,
   std::size_t* out_size)
 {
@@ -101,15 +102,9 @@ std::unique_ptr<rmm::device_buffer> copy_output_payload(
     if (error_out) *error_out = std::string(codec) + " 'output' must be UINT8";
     return nullptr;
   }
-  std::size_t const comp = static_cast<std::size_t>(payload_col->size());
-  auto payload           = std::make_unique<rmm::device_buffer>(comp, stream, mr);
-  if (comp > 0) {
-    cudaMemcpyAsync(payload->data(),
-                    payload_col->view().head<uint8_t>(),
-                    comp,
-                    cudaMemcpyDeviceToDevice,
-                    stream.value());
-  }
+  auto const comp = static_cast<std::size_t>(payload_col->size());
+  auto contents   = payload_col->release();
+  auto payload    = std::move(contents.data);
   if (out_size) *out_size = comp;
   return payload;
 }
@@ -253,7 +248,8 @@ std::unique_ptr<compressed_representation> bitpack_compressed_representation::fr
   std::vector<std::unique_ptr<cudf::column>> outputs,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref /*mr*/,
-  std::string* error_out)
+  std::string* error_out,
+  std::uint64_t num_rows_hint)
 {
   // The ``packed`` channel may have been entropy-tail-routed at compress
   // time (e.g. ``…packed -> ans``); when that happens the writer drops it
@@ -293,12 +289,15 @@ std::unique_ptr<compressed_representation> bitpack_compressed_representation::fr
   // ``packed`` may legitimately be null here (tail-routed).
 
   cudf::data_type original_type = chunk_min->type();
-  cudf::size_type num_chunks    = chunk_min->size();
 
-  // Calculate num_rows by summing chunk_count. Use stream-aware memcpy to
-  // respect stream ordering (fixes multistream crash).
+  // The serialized per-leaf num_rows (the same sum recorded at compress time)
+  // lets the from-wire path skip the D2H + sync; a zero hint (decode-driver
+  // path) falls back to summing chunk_count with a stream-aware memcpy that
+  // respects stream ordering (fixes multistream crash).
   cudf::size_type num_rows = 0;
-  if (chunk_count->size() > 0) {
+  if (num_rows_hint > 0) {
+    num_rows = static_cast<cudf::size_type>(num_rows_hint);
+  } else if (chunk_count->size() > 0) {
     std::vector<int32_t> h_counts(static_cast<size_t>(chunk_count->size()));
     cudaMemcpyAsync(h_counts.data(),
                     chunk_count->view().head<int32_t>(),
@@ -703,7 +702,8 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
-  leaf_meta_v const& meta)
+  leaf_meta_v const& meta,
+  std::uint64_t num_rows_hint)
 {
   auto const unsupported = [&]() -> std::unique_ptr<compressed_representation> {
     if (error_out) {
@@ -724,7 +724,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
         output_names, std::move(outputs), stream, mr, error_out);
     case OpId::Bitpack:
       return bitpack_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out);
+        output_names, std::move(outputs), stream, mr, error_out, num_rows_hint);
     case OpId::Alp:
       return alp_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out);

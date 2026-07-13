@@ -222,14 +222,10 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     plan.partition_primary_indices.insert(hpi.index);
   }
 
-  // Reader projection is needed whenever the planner pruned / reordered columns
-  // (non-empty projection_ids) or hive-partition columns must be stripped from
-  // the physical read. It is ALSO needed when projection_ids is empty but
-  // column_ids is itself a pruned/reordered subset — DuckDB's no-projection-
-  // pushdown plan for sirius_read_parquet. Without it the reader returns the full
-  // file width in file order while output_layout assembles by compacted subset
-  // position, selecting the wrong columns. (Guarded on names: the reader is
-  // projected by name, and the ingestible's needs_names check enforces presence.)
+  // First mark every shape that may need a by-name reader projection:
+  // explicit projection, hive partitions, or a pruned/reordered column_ids
+  // subset. After the walk below, we clear this again for scans with no real
+  // parquet data columns.
   plan.needs_reader_projection =
     !projection_ids.empty() || !partition_indices.empty() ||
     (!names.empty() && column_ids_need_reader_projection(column_ids, names.size()));
@@ -307,6 +303,11 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     if (it == primary_to_batch.end()) { continue; }
     plan.batch_position_by_column_id[c] = it->second;
   }
+
+  // The gate: a column-less scan (count(*)/virtual-only or partition-only, only
+  // known after the walk) must keep the natural batch — projecting it hands cuDF
+  // set_column_names({}), a zero-column read over live row groups that hangs.
+  plan.needs_reader_projection = plan.needs_reader_projection && !plan.data_columns.empty();
 
   SIRIUS_LOG_DEBUG("[scan_plan] built plan: {} data col(s), {} partition col(s), {} output entries",
                    plan.data_columns.size(),

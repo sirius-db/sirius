@@ -1056,50 +1056,16 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             // The kernel wrote data[c*CHUNK + t] and offsets[c] = c*CHUNK.
             const auto i_offs = find_buffer_idx(spec.buffers, node_id, "offsets");
 
-            const std::size_t data_bytes = static_cast<std::size_t>(num_chunks) *
-                                           static_cast<std::size_t>(kChunkSize) *
-                                           static_cast<std::size_t>(elem_size);
-            const std::size_t offs_bytes =
-              static_cast<std::size_t>(num_chunks + 1) * sizeof(std::int32_t);
-
-            rmm::device_buffer data_buf(data_bytes, stream, mr);
-            if (cudaError_t e = cudaMemcpyAsync(data_buf.data(),
-                                                reinterpret_cast<const void*>(dev_ptrs[i_data]),
-                                                data_bytes,
-                                                cudaMemcpyDeviceToDevice,
-                                                stream.value());
-                e != cudaSuccess) {
-              std::fprintf(stderr,
-                           "simpatico::codegen: %s Raw: data DtoD failed: %s\n",
-                           origin.parent_op.c_str(),
-                           cudaGetErrorString(e));
-              return -1;
-            }
-            rmm::device_buffer offs_buf(offs_bytes, stream, mr);
-            if (cudaError_t e = cudaMemcpyAsync(offs_buf.data(),
-                                                reinterpret_cast<const void*>(dev_ptrs[i_offs]),
-                                                offs_bytes,
-                                                cudaMemcpyDeviceToDevice,
-                                                stream.value());
-                e != cudaSuccess) {
-              std::fprintf(stderr,
-                           "simpatico::codegen: %s Raw: offsets DtoD failed: %s\n",
-                           origin.parent_op.c_str(),
-                           cudaGetErrorString(e));
-              return -1;
-            }
-            cudaStreamSynchronize(stream.value());
-
             auto data_col =
               std::make_unique<cudf::column>(data_elem_type,
                                              static_cast<cudf::size_type>(num_chunks * kChunkSize),
-                                             std::move(data_buf),
+                                             std::move(bufs[i_data]),
                                              rmm::device_buffer(0, stream),
                                              0);
             auto offs_col =
               std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
                                              static_cast<cudf::size_type>(num_chunks + 1),
-                                             std::move(offs_buf),
+                                             std::move(bufs[i_offs]),
                                              rmm::device_buffer(0, stream),
                                              0);
 
@@ -1225,7 +1191,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
           std::fprintf(stderr,
                        "simpatico::codegen: cpp encode: BUG - unexpected op '%s' at node %d "
                        "(extract_fusable_subtree should have filtered)\n",
-                       jit::op_kind_name(node.op),
+                       jit::op_kind_name(node.op).c_str(),
                        node_id);
           return -1;
       }

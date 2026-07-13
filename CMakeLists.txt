@@ -152,6 +152,9 @@ set(CUCASCADE_BUILD_CUDF
 set(CUCASCADE_WARNINGS_AS_ERRORS
     OFF
     CACHE BOOL "" FORCE)
+set(CUCASCADE_BUILD_IO
+    OFF
+    CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
 # Simpatico GPU compression engine Tests disabled here — run them via the
@@ -257,6 +260,7 @@ set(EXTENSION_SOURCES
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
     src/io/s3/sigv4.cpp
+    src/io/s3/sirius_httpfs.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
@@ -271,14 +275,9 @@ set(EXTENSION_SOURCES
     src/op/scan/cached_ranges.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
-    src/op/scan/equality_delete_filter.cpp
     src/op/scan/hive_partition.cpp
     src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
-    src/op/scan/iceberg_avro_reader.cpp
-    src/op/scan/iceberg_delete_pipeline.cpp
-    src/op/scan/positional_delete_filter.cpp
-    src/op/scan/puffin_reader.cpp
     src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
@@ -309,7 +308,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_operator.cpp
     src/op/sirius_physical_operator_type.cpp
     src/op/sirius_physical_order.cpp
-    src/op/sirius_physical_iceberg_scan.cpp
     src/op/sirius_physical_parquet_scan.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
@@ -364,6 +362,7 @@ set(EXTENSION_SOURCES
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
+    src/telemetry/memory_context.cpp
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
@@ -377,7 +376,6 @@ set(CUDA_SOURCES
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
-    src/op/scan/equality_delete_mask.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -614,6 +612,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
+    test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
@@ -625,6 +624,8 @@ set(TEST_SOURCES
     test/cpp/io/rest/test_rest_reactor.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
+    test/cpp/scan_manager/test_pin_table_duckdb_native_cache.cpp
+    test/cpp/scan_manager/test_cached_serving_hardening.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -658,13 +659,19 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
+    test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
+    test/cpp/planner/test_sirius_read_parquet_scan.cpp
+    test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
+    test/cpp/pipeline/test_partition_build_pipelines.cpp
+    test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
+    test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
@@ -680,10 +687,13 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
+    test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
+    test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/unittest.cpp
+    test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
@@ -699,6 +709,7 @@ if(SIRIUS_BUILD_S3_TESTS)
     APPEND
     TEST_SOURCES
     test/cpp/utils/s3_container.cpp
+    test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp)

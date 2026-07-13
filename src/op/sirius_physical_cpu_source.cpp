@@ -16,6 +16,9 @@
 
 #include "op/sirius_physical_cpu_source.hpp"
 
+#include "config.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+
 namespace sirius::op {
 
 sirius_physical_cpu_source::sirius_physical_cpu_source(
@@ -37,6 +40,15 @@ sirius_physical_cpu_source::sirius_physical_cpu_source(duckdb::vector<sirius::lo
     collection(nullptr),
     produce_single_row(produce_single_row)
 {
+}
+
+void sirius_physical_cpu_source::build_pipelines(pipeline::sirius_pipeline& current,
+                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  // Leaf sink: create_child_meta_pipeline pre-populates [*this], yielding a one-operator
+  // pipeline with source=sink=*this. No children, so no recursion.
+  D_ASSERT(children.empty());
+  meta_pipeline.create_child_meta_pipeline(current, *this);
 }
 
 }  // namespace sirius::op

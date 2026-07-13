@@ -16,6 +16,7 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
+#include "config.hpp"
 #include "creator/task_creator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
@@ -25,7 +26,6 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -54,7 +54,7 @@ bool sirius_pipeline::is_order_dependent() const
     if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
     if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!build_ctx_.preserve_insertion_order) { return false; }
+  if (!build_ctx_.preserve_insertion_order()) { return false; }
   if (sink && sink->sink_order_dependent()) { return true; }
   return false;
 }
@@ -131,6 +131,12 @@ void sirius_pipeline::is_ready()
   if (ready) { return; }
   ready = true;
   std::reverse(operators.begin(), operators.end());
+  if (!operators.empty()) {
+    // Derive source/sink from operators[] (meta-pipeline pre-populated the sink;
+    // build_pipelines appended intermediates/sources before the reverse above).
+    source = &operators.front().get();
+    sink   = &operators.back().get();
+  }
 }
 
 void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline)

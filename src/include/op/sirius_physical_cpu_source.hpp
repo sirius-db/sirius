@@ -19,6 +19,7 @@
 #include "duckdb/common/optionally_owned_ptr.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius::op {
 
@@ -53,6 +54,11 @@ class sirius_physical_cpu_source : public sirius_physical_operator {
   }
 
   bool is_source() const override { return true; }
+  //! Mirrors DUCKDB_SCAN: every CPU_SOURCE leaf is its own one-operator pipeline.
+  bool is_sink() const override { return true; }
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   //! The ColumnDataCollection to scan (may be nullptr for EMPTY_RESULT)
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection;

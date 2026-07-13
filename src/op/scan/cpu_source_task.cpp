@@ -88,7 +88,8 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   duckdb::DataChunk& chunk,
   const duckdb::vector<sirius::logical_type>& types,
   cucascade::memory::memory_space& mem_space,
-  cucascade::memory::reservation* reservation)
+  cucascade::memory::reservation* reservation,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   using host_table_allocation    = cucascade::memory::host_table_allocation;
   using host_data_representation = cucascade::host_data_representation;
@@ -100,12 +101,14 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   // host allocation. allocate_multiple_blocks(0, ...) is not guaranteed to
   // return an allocation with a usable block, so skip it entirely.
   if (num_rows == 0 || num_cols == 0) {
+    const auto batch_id = get_next_batch_id();
     return cucascade::data_batch::make(
-      get_next_batch_id(),
+      batch_id,
       std::make_unique<host_data_representation>(
         host_table_allocation::create(
           nullptr, std::vector<cucascade::memory::column_metadata>{}, 0),
-        &mem_space));
+        &mem_space),
+      telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
   }
 
   // First pass: calculate total allocation size and flatten vectors. Dispatch
@@ -136,12 +139,14 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   }
 
   if (total_size == 0) {
+    const auto batch_id = get_next_batch_id();
     return cucascade::data_batch::make(
-      get_next_batch_id(),
+      batch_id,
       std::make_unique<host_data_representation>(
         host_table_allocation::create(
           nullptr, std::vector<cucascade::memory::column_metadata>{}, 0),
-        &mem_space));
+        &mem_space),
+      telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
   }
 
   // Allocate pinned host memory
@@ -266,10 +271,15 @@ static std::shared_ptr<cucascade::data_batch> chunk_to_data_batch(
   auto table_allocation =
     host_table_allocation::create(std::move(allocation), std::move(columns), offset);
   auto table = std::make_unique<host_data_representation>(std::move(table_allocation), &mem_space);
-  return cucascade::data_batch::make(get_next_batch_id(), std::move(table));
+  const auto batch_id = get_next_batch_id();
+  return cucascade::data_batch::make(
+    batch_id,
+    std::move(table),
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
 }
 
-pipeline::reservation_size_info cpu_source_task::get_estimated_reservation_size_info() const
+pipeline::reservation_size_info cpu_source_task::get_estimated_reservation_size_info(
+  const cucascade::memory::memory_space* /*target_space*/) const
 {
   constexpr std::size_t kMinBytes = 64ULL * 1024;
   auto& g_state                   = _global_state->cast<cpu_source_task_global_state>();
@@ -319,7 +329,8 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
 
     while (source.collection->Scan(scan_state, chunk)) {
       if (chunk.size() == 0) break;
-      batches.push_back(chunk_to_data_batch(chunk, source.types, mem_space, reservation_ptr));
+      batches.push_back(chunk_to_data_batch(
+        chunk, source.types, mem_space, reservation_ptr, source.batch_telemetry()));
       chunk.Reset();
     }
   } else if (source.produce_single_row) {
@@ -346,7 +357,8 @@ std::unique_ptr<op::operator_data> cpu_source_task::compute_task(rmm::cuda_strea
         if (type_size > 0) { std::memset(duckdb::FlatVector::GetData(vec), 0, type_size); }
       }
     }
-    batches.push_back(chunk_to_data_batch(chunk, source.types, mem_space, reservation_ptr));
+    batches.push_back(chunk_to_data_batch(
+      chunk, source.types, mem_space, reservation_ptr, source.batch_telemetry()));
   }
   // else: EMPTY_RESULT — produce no data batches
 

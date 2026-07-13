@@ -176,13 +176,13 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
                                 << ", scan=" << counts[1].scan_ids.size() << "}");
 
   // Both GPUs saw SOME pipeline work — under the PARQUET_METADATA_SCAN
-  // → GPU_PARQUET_SCAN pipeline architecture, parquet reads dispatch as
+  // → GPU_SCAN pipeline architecture, parquet reads dispatch as
   // gpu_pipeline_task entries (logged via [mgpu-audit] pipeline_task
   // dispatched) rather than scan_executor scan_batch entries (which are
   // reserved for the duckdb_scan_task / cpu_source_task / legacy
   // PARQUET_SCAN path through duckdb_scan_executor::select_target_gpu).
   // BUILD_PROBE pins post-partition probe tasks to one GPU via SCHED-00,
-  // but the metadata + GPU_PARQUET_SCAN pipelines upstream of the join
+  // but the metadata + GPU_SCAN pipelines upstream of the join
   // are not partition-pinned and distribute across both GPUs, so
   // pipeline_ids >= 1 on both GPUs is the correct cross-GPU signal —
   // the same metric MIXED_JOIN below uses.
@@ -654,7 +654,7 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
                                 << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
                                 << ", scan=" << counts[1].scan_ids.size() << "}");
   // Use pipeline_ids: scan reads dispatch as gpu_pipeline_task under the
-  // PARQUET_METADATA_SCAN → GPU_PARQUET_SCAN architecture, not as
+  // PARQUET_METADATA_SCAN → GPU_SCAN architecture, not as
   // scan_executor scan_batch entries. cache=table_gpu also collapses
   // scan_executor traffic on warm iterations. See BUILD_PROBE comment above.
   REQUIRE(counts[0].pipeline_ids.size() >= 1);

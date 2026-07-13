@@ -528,7 +528,7 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
 
     if (!consumer_by_input.count(output_val)) {
       // Terminal leaf — copy the channel into an identity leaf (reps stay whole
-      // on the PlanTree; no release_output destructuring).
+      // on the PlanTree; no destructuring).
       auto leaf_col = copy_identity_leaf(out_it->second, output_path, stream, mr);
       if (!leaf_col) {
         set_error("failed to get column for identity leaf '" + output_path + "'");

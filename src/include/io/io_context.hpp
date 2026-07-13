@@ -37,6 +37,14 @@ namespace sirius::io {
 
 enum class io_context_type { uring, restful, kvikio };
 
+/// Hint passed to @c open_datasource so a backend can tailor how it resolves an
+/// object's metadata.  @c generic resolves the size however is cheapest for the
+/// scheme (a HEAD for object stores).  @c parquet_footer_probe asks the backend
+/// to resolve the size *and* stash the object's trailing bytes in one
+/// round-trip (a suffix-range GET), so the parquet footer reads that follow are
+/// served locally instead of costing extra round-trips.
+enum class open_hint { generic, parquet_footer_probe };
+
 namespace cache {
 class prefetching_cache;
 }
@@ -96,6 +104,11 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// unreachable paths (callers that want a check-without-open should use
   /// @c supports()).
   [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path);
+
+  /// As above, forwarding @p hint to the backend's io_object resolution so it
+  /// can, e.g., prefetch a parquet footer in the same round-trip as the size.
+  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
+                                                                   open_hint hint);
 
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
@@ -228,6 +241,13 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// the public surface (callers receive a ready @c sirius_datasource).  Throws
   /// on unsupported / unreachable paths.
   virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path) = 0;
+
+  /// Hinted variant.  The base implementation ignores @p hint and delegates to
+  /// the required @c create_io_object(path); a backend that can act on the hint
+  /// (e.g. rest_ioctx's suffix-range footer probe) overrides this.  Kept a
+  /// distinct virtual — not a defaulted argument on the pure virtual above — so
+  /// the hint dispatches on the dynamic type instead of binding statically.
+  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint);
 
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,

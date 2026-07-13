@@ -117,7 +117,7 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << "\n"
        "    downgrade:\n"
        "      num_threads: 1\n"
-       "      monitor_period_ms: 10\n"
+       "      monitor_period: 10ms\n"
        "  operator_params:\n"
        "    scan_task_batch_size: "
     << params.scan_task_batch_size

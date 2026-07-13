@@ -34,12 +34,45 @@
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/planner.hpp>
+#include <unistd.h>
 
+#include <cstdio>
 #include <filesystem>
 
 using namespace duckdb;
 
 namespace {
+
+/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
+/// block managers, so these tests need an on-disk database rather than :memory:.
+class scoped_temp_db_path {
+ public:
+  scoped_temp_db_path()
+  {
+    char tmpl[] = "/tmp/sirius_join_expr_key_XXXXXX";
+    int fd      = ::mkstemp(tmpl);
+    REQUIRE(fd >= 0);
+    ::close(fd);
+    ::unlink(tmpl);
+    _path = tmpl;
+  }
+
+  ~scoped_temp_db_path()
+  {
+    if (!_path.empty()) {
+      std::remove(_path.c_str());
+      std::remove((_path + ".wal").c_str());
+    }
+  }
+
+  scoped_temp_db_path(const scoped_temp_db_path&)            = delete;
+  scoped_temp_db_path& operator=(const scoped_temp_db_path&) = delete;
+
+  const std::string& path() const { return _path; }
+
+ private:
+  std::string _path;
+};
 
 /// Generate a Sirius physical plan from a SQL query string.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
@@ -130,7 +163,16 @@ void require_all_equality_sides_are_references(sirius::op::sirius_physical_hash_
 bool has_projection_child(sirius::op::sirius_physical_hash_join& hj)
 {
   for (auto& child : hj.children) {
-    if (child->type == sirius::op::SiriusPhysicalOperatorType::PROJECTION) { return true; }
+    // Plan-gen wraps each join child in a CONCAT -> PARTITION chain; the materializing
+    // PROJECTION sits below the wraps.
+    auto* node = child.get();
+    while (node != nullptr && (node->type == sirius::op::SiriusPhysicalOperatorType::CONCAT ||
+                               node->type == sirius::op::SiriusPhysicalOperatorType::PARTITION)) {
+      node = node->children.empty() ? nullptr : node->children[0].get();
+    }
+    if (node != nullptr && node->type == sirius::op::SiriusPhysicalOperatorType::PROJECTION) {
+      return true;
+    }
   }
   return false;
 }
@@ -142,7 +184,7 @@ struct join_expression_key_fixture {
                "minimal.yaml";
     setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
     unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(nullptr);
+    db = std::make_unique<DuckDB>(_db_path.path());
     setenv("SIRIUS_DISABLE", "1", 1);
     con = std::make_unique<Connection>(*db);
 
@@ -157,6 +199,8 @@ struct join_expression_key_fixture {
 
   ~join_expression_key_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
+  // Declared before db/con so the backing file outlives the database.
+  scoped_temp_db_path _db_path;
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;
 };

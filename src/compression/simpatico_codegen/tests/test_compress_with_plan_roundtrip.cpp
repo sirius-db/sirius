@@ -12,6 +12,7 @@
 
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -245,6 +246,45 @@ int main()
         "-> bitjoin_f32 -> rejoined\n";
       roundtrip_once(t->view(), dsl, 1, "bitextract_bitjoin_f32");
       roundtrip_once(t->view(), dsl, 2, "bitextract_bitjoin_f32_mt");
+    }
+
+    {
+      // The sign plane is consumed twice by one ranged bitjoin. Decode must
+      // retain/copy this shared memo value rather than moving it prematurely.
+      auto t = make_f32_table(1, 4096, 6);
+      std::string dsl =
+        "input -> bitextract_f32 -> sign, exponent, mantissa\n"
+        "bitextract_f32.sign_0:0, bitextract_f32.sign_0:0 "
+        "-> bitjoin_u8 -> duplicated_sign\n";
+      roundtrip_once(t->view(), dsl, 1, "bitextract_shared_sign");
+    }
+
+    {
+      // Corrupt the structural metadata (drop two of the bitjoin's three inputs)
+      // so decode is asked to reconstruct from an inconsistent tree. This must
+      // be a loud error, never an implicit/partial decode of a wrong column.
+      auto t = make_f32_table(1, 4096, 8);
+      std::string dsl =
+        "input -> bitextract_f32 -> sign, exponent, mantissa\n"
+        "bitextract_f32.sign, bitextract_f32.exponent, bitextract_f32.mantissa "
+        "-> bitjoin_f32 -> rejoined\n";
+      auto ct = compress_with_plan(
+        t->view(), dsl, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+      auto& tree   = *ct.columns[0].compound;
+      auto bitjoin = std::find_if(tree.nodes.begin(), tree.nodes.end(), [](auto const& node) {
+        return node.op == "bitjoin_f32";
+      });
+      expect(bitjoin != tree.nodes.end(), "consumed memo: bitjoin node missing");
+      bitjoin->input_sources.resize(1);
+
+      bool loud_error = false;
+      try {
+        (void)decompress(
+          ct, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+      } catch (std::runtime_error const& e) {
+        loud_error = std::string(e.what()).find("input count") != std::string::npos;
+      }
+      expect(loud_error, "corrupt bitjoin metadata must fail loudly");
     }
 
     {
@@ -782,8 +822,8 @@ int main()
         expect(strings_equal(tn->view().column(0), dn->view().column(0), stream),
                "string_all_null: data");
 
-        auto empty_strings = make_strings_table({"", "", ""}, {}, stream);
-        roundtrip_once(empty_strings->view(), plan, 1, "string_all_empty");
+        auto t_empty = make_strings_table({"", "", ""}, {}, stream);
+        roundtrip_once(t_empty->view(), plan, 1, "string_all_empty");
       }
 
       // The canonical childless empty column (cudf::make_empty_column).

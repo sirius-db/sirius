@@ -30,11 +30,15 @@ namespace parallel {
 
 itask_executor::itask_executor(
   exec::thread_pool_config config,
-  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+  std::optional<int> device_id)
   : _config(std::move(config)),
     _telemetry_context(std::move(telemetry_context)),
     _task_queue_telemetry(std::make_unique<telemetry::TaskQueueHandleWrapper>(
-      *_telemetry_context, _config.thread_name_prefix + "-task-queue"))
+      *_telemetry_context,
+      _config.thread_name_prefix + "-task-queue",
+      device_id.has_value() ? _telemetry_context->gpu_device_group_id(*device_id)
+                            : _telemetry_context->engine_id()))
 {
 }
 

@@ -23,7 +23,12 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
+#include <string>
 #include <unordered_map>
+
+namespace sirius::op {
+class sirius_physical_table_scan;
+}  // namespace sirius::op
 
 namespace duckdb {
 class ClientContext;
@@ -194,5 +199,21 @@ class sirius_physical_plan_generator {
  public:
   duckdb::ClientContext& context;
   // duckdb::GPUContext& gpu_context;
+
+ public:
+  //! Recursive post-pass that derives each operator's `_parent_op` from the final tree's
+  //! `children[]`, run after all tree rewrites have settled so the pointer cannot drift.
+  //! Public so the engine can re-run it after the RESULT_COLLECTOR wrap is added around the
+  //! plan post-generation — otherwise the wrapped child's `_parent_op` would stay null and
+  //! break the tree-parent-driven wiring.
+  static void set_parent_ops(sirius::op::sirius_physical_operator& op,
+                             sirius::op::sirius_physical_operator* parent);
+
+ private:
+  //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
+  //! merge operators, scan companions, CPU_SOURCE) so the tree carries the full execution
+  //! structure before the pipeline converter runs.
+  void insert_gpu_pipeline_operators(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
 };
 }  // namespace sirius::planner

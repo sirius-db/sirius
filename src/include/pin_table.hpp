@@ -77,6 +77,7 @@ namespace sirius {
 
 namespace op::scan {
 class gpu_ingestible;
+class scan_info;
 }  // namespace op::scan
 namespace io {
 class sirius_ioctx;
@@ -90,7 +91,32 @@ class sirius_ioctx;
 struct materialized_pin {
   std::vector<std::unique_ptr<cudf::table>> tables;
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  /// Row count of each materialized chunk (parallel to @c tables). For duckdb-native
+  /// pins these become @c duckdb_mvcc_metadata::base_row_count_per_chunk — the
+  /// positional chunk→rowid-range map query-time MVCC merge relies on.
+  std::vector<std::size_t> base_row_count_per_chunk;
 };
+
+/// Host-pinned chunks produced by @ref materialize_pin_to_host — one
+/// host_data_representation per emitted batch, with the batch row counts captured
+/// alongside (parallel to @c host_chunks), mirroring @ref materialized_pin.
+struct materialized_host_pin {
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  std::vector<std::size_t> base_row_count_per_chunk;
+};
+
+/// Pin-time validation of the coalescer invariant the MVCC delta merge relies on
+/// (#819): every duckdb-native batch must be a contiguous run of WHOLE row groups
+/// starting at @p rows_before_chunk, and its row-group metadata must cover exactly
+/// @p chunk_rows (the decoded cudf row count) — so the pinned chunks partition the
+/// decoded rowid prefix [0, N_cache) at row-group boundaries and per-chunk
+/// visibility masks can be assembled at row-group granularity. Throws
+/// std::runtime_error on violation; batches that are not duckdb_native_scan_info
+/// (parquet) are skipped. Called by the pin materialization driver on every
+/// emitted batch; exposed here so its failure paths are unit-testable.
+void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
+                               std::size_t chunk_rows,
+                               std::size_t rows_before_chunk);
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
 /// materializing every emitted batch into a GPU-resident cudf::table and round-robining
@@ -113,6 +139,10 @@ materialized_pin materialize_all_batches(
 struct host_pin_result {
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks;
+  /// Row count of each materialized batch, in emission order (covers compressed
+  /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
+  /// base_row_count_per_chunk for duckdb-format pins.
+  std::vector<std::size_t> base_row_count_per_chunk;
 };
 
 /// Optional compression settings for @ref materialize_pin_to_host_with_compression
@@ -137,6 +167,10 @@ struct device_pin_result {
   std::vector<std::unique_ptr<cudf::table>> tables;
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks;
+  /// Row count of each materialized batch, in emission order (covers compressed
+  /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
+  /// base_row_count_per_chunk for duckdb-format pins.
+  std::vector<std::size_t> base_row_count_per_chunk;
 };
 
 /// Drive @p ingestible to completion like @ref materialize_pin_to_host, optionally
@@ -173,8 +207,9 @@ device_pin_result materialize_pin_to_device_with_compression(
 ///                          be pinned on (NUMA-local). Must contain an entry for every device id
 ///                          in @p gpu_spaces.
 /// \param io_ctx            IO context the metadata reads run on (owned by the scan manager).
-/// \return The pinned host chunks in materialization (round-robin) order — one per emitted batch.
-std::vector<std::shared_ptr<cucascade::host_data_representation>> materialize_pin_to_host(
+/// \return The pinned host chunks in materialization (round-robin) order — one per emitted
+///         batch — plus their per-chunk row counts.
+materialized_host_pin materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,

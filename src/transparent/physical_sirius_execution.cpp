@@ -111,9 +111,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // the same prepared physical operator across multiple EXECUTE calls.
     //
     // Prefer LogicalOperator::Copy when the plan supports it (cheap deep clone
-    // via serialization). When the plan contains a non-serializable LogicalGet
-    // (e.g. iceberg_scan), fall back to re-parsing + re-binding the unbound SQL
-    // statement, which exercises the same bind path the very first run did.
+    // via serialization). When the plan contains a non-serializable LogicalGet,
+    // fall back to re-parsing + re-binding the unbound SQL statement, which
+    // exercises the same bind path the very first run did.
     duckdb::unique_ptr<duckdb::LogicalOperator> fresh_plan;
     if (logical_plan_) {
       try {

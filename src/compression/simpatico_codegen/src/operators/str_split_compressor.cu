@@ -61,8 +61,7 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
     // cudf::make_empty_column(STRING), has no offsets child to copy from.
     auto offsets = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::INT32}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
-    cudaMemsetAsync(
-      offsets->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
+    cudaMemsetAsync(offsets->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
     auto chars = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::UINT8}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
     cudaStreamSynchronize(stream.value());
