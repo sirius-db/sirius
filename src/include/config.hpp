@@ -17,6 +17,7 @@
 #pragma once
 
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
+#include <log/logging.hpp>
 
 #include <cstdint>
 #include <string>
@@ -78,6 +79,7 @@ struct Config {
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;
   static uint32_t LOG_FLUSH_MS;
+  static sirius::log_backend_type LOG_BACKEND;
 };
 
 }  // namespace duckdb

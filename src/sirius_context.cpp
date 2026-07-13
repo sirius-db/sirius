@@ -25,6 +25,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "log/log_backend.hpp"
 #include "log/logging.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
@@ -998,7 +999,16 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
-  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS);
+  const char* bad_backend_env = nullptr;
+  if (auto* env = std::getenv("SIRIUS_LOG_BACKEND")) {
+    if (!sirius::string_to_enum(env, Config::LOG_BACKEND)) { bad_backend_env = env; }
+  }
+  sirius::InitGlobalLogger(
+    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
+  if (bad_backend_env != nullptr) {
+    SIRIUS_LOG_WARN("Unknown SIRIUS_LOG_BACKEND '{}' (expected: spdlog, noop); keeping default",
+                    bad_backend_env);
+  }
   read_config_file_if_exists();
 }
 

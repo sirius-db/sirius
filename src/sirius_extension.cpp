@@ -75,6 +75,7 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
+#include "log/log_backend.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
@@ -1616,7 +1617,8 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS);
+  sirius::InitGlobalLogger(
+    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
@@ -1624,8 +1626,23 @@ static void SetLogFlushMs(ClientContext& context, SetScope scope, Value& paramet
 {
   Config::LOG_FLUSH_MS = UIntegerValue::Get(parameter);
   // The flush interval is fixed at backend construction, so re-initialize.
-  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS);
+  sirius::InitGlobalLogger(
+    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_MS to {}", Config::LOG_FLUSH_MS);
+}
+
+static void SetLogBackend(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto backend_str = StringValue::Get(parameter);
+  sirius::log_backend_type backend;
+  if (!sirius::string_to_enum(backend_str, backend)) {
+    throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: spdlog, noop)",
+                                backend_str);
+  }
+  Config::LOG_BACKEND = backend;
+  sirius::InitGlobalLogger(
+    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
+  SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", backend_str);
 }
 
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -1851,6 +1868,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UINTEGER,
                             Value::UINTEGER(Config::LOG_FLUSH_MS),
                             SetLogFlushMs);
+  std::string log_backend_name;
+  sirius::enum_to_string(Config::LOG_BACKEND, log_backend_name);
+  config.AddExtensionOption("sirius_log_backend",
+                            "Logging backend for Sirius (spdlog, noop)",
+                            LogicalType::VARCHAR,
+                            Value(log_backend_name),
+                            SetLogBackend);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

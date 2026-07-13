@@ -46,8 +46,9 @@ uint64_t Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256ULL;
 
 uint64_t Config::MAX_SORT_PARTITION_BYTES = 0;  ///< 0 = auto (33% of available GPU memory)
 
-std::string Config::LOG_LEVEL = "info";
-std::string Config::LOG_DIR   = "log";
-uint32_t Config::LOG_FLUSH_MS = 3000;
+std::string Config::LOG_LEVEL                = "info";
+std::string Config::LOG_DIR                  = "log";
+uint32_t Config::LOG_FLUSH_MS                = 3000;
+sirius::log_backend_type Config::LOG_BACKEND = sirius::log_backend_type::spdlog;
 
 }  // namespace duckdb
