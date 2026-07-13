@@ -26,7 +26,7 @@ use tracing::debug;
 
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, Span,
-    fsm::{FsmTypeDeclaration, FsmUsages},
+    fsm::{FsmTypeDeclaration, FsmUsages, collection::FsmCollection},
     resource::{
         ResourceGroup, ResourceTypeDecl, Usage, Using, collection::ResourceCollection,
         tree::ResourceTreeNode,
@@ -87,6 +87,30 @@ struct PerStateBuilderSlot<'a> {
     resource_id_filter: Arc<HashSet<Uuid>>,
     op_filter: OperatorFilter,
     entity_type_name: String,
+}
+
+/// Adapts the model's task map to the [`FsmCollection`] contract that
+/// [`entities::list_entities`] ranks and pages over.
+struct TaskCollection<'a>(&'a HashMap<Uuid, Task>);
+
+impl FsmCollection for TaskCollection<'_> {
+    type Fsm = Task;
+
+    fn fsms(&self) -> impl Iterator<Item = &Task> {
+        self.0.values()
+    }
+}
+
+/// Adapts the model's data-batch map to the [`FsmCollection`] contract that
+/// [`entities::list_entities`] ranks and pages over.
+struct DataBatchCollection<'a>(&'a HashMap<Uuid, DataBatch>);
+
+impl FsmCollection for DataBatchCollection<'_> {
+    type Fsm = DataBatch;
+
+    fn fsms(&self) -> impl Iterator<Item = &DataBatch> {
+        self.0.values()
+    }
 }
 
 impl UiAnalyzer for SiriusUiAnalyzer {
@@ -281,10 +305,10 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .transpose()?;
         let operator_filter = entry.application;
 
-        // Restrict candidates to the requested query: a task belongs to a query
-        // iff its operator is one of that query's operators. Without this, tasks
-        // from a different query sharing a resource and overlapping the window
-        // would leak in.
+        // Restrict candidates to the requested query: an entity belongs to a
+        // query iff its (producer) pipeline is one of that query's operators.
+        // Without this, entities from a different query sharing a resource and
+        // overlapping the window would leak in.
         let query_operators: HashSet<Uuid> = self
             .model
             .query_view(query_id)?
@@ -292,22 +316,39 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .map(|op| op.id())
             .collect();
 
-        entities::list_entities(
-            &self.model,
-            |task| {
-                task.pipeline_uuid()
-                    .is_some_and(|op| query_operators.contains(&op))
-                    && task.matches_filter(&operator_filter)
-            },
-            entities::ListQuery {
-                scope: scope.as_ref(),
-                window,
-                filter: &entry.filter,
-                sort: entry.sort,
-                page: entry.page,
-                epoch,
-            },
-        )
+        let query = entities::ListQuery {
+            scope: scope.as_ref(),
+            window,
+            filter: &entry.filter,
+            sort: entry.sort,
+            page: entry.page,
+            epoch,
+        };
+
+        // The model holds two distinct FSM types (tasks and data batches), so
+        // dispatch on the requested entity type rather than a single collection.
+        // Absent an explicit type, default to tasks.
+        match entry.filter.entity_type_name.as_deref() {
+            Some(DATA_BATCH_TYPE_NAME) => entities::list_entities(
+                &DataBatchCollection(&self.model.data_batches),
+                |data_batch| {
+                    data_batch
+                        .producer_pipeline_uuid()
+                        .is_some_and(|op| query_operators.contains(&op))
+                        && data_batch.matches_filter(&operator_filter)
+                },
+                query,
+            ),
+            _ => entities::list_entities(
+                &TaskCollection(&self.model.tasks),
+                |task| {
+                    task.pipeline_uuid()
+                        .is_some_and(|op| query_operators.contains(&op))
+                        && task.matches_filter(&operator_filter)
+                },
+                query,
+            ),
+        }
     }
 
     // TODO(johanpel): consider reusing the bulk request API with a single entry for requests like this.
