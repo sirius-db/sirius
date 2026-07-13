@@ -80,7 +80,7 @@ class recording_log_backend final : public sirius::log_backend {
 
 /// Swaps the global logging backend for a recording one for the scope of a
 /// test and restores the configured logger (initialized in unittest.cpp's
-/// main from the Config statistics) on exit.
+/// main from the Config:: values) on exit.
 class scoped_recording_log_backend {
  public:
   explicit scoped_recording_log_backend(std::string_view level = "trace")

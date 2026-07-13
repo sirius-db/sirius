@@ -46,7 +46,7 @@ spdlog::level::level_enum to_spdlog_level(log_level level)
 
 /// Writes to a daily-rotated `<log_dir>/sirius.log` through a multi-threaded
 /// file sink. The logger is deliberately NOT put into spdlog's global
-/// registry: registry statistics can be destroyed before this backend at process
+/// registry: registry-owned static state can be destroyed before this backend at process
 /// exit, and the periodic flusher spdlog::flush_every drives outlives a
 /// backend swap. Periodic flushing is a backend-owned thread instead, whose
 /// lifetime exactly matches the backend's.
