@@ -17,6 +17,7 @@
 #include "log/logging.hpp"
 
 #include <spdlog/sinks/daily_file_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <format>
@@ -28,14 +29,15 @@ namespace {
 
 spdlog::level::level_enum to_spdlog_level(log_level level)
 {
+  using enum log_level;
   switch (level) {
-    case log_level::trace: return spdlog::level::trace;
-    case log_level::debug: return spdlog::level::debug;
-    case log_level::info: return spdlog::level::info;
-    case log_level::warn: return spdlog::level::warn;
-    case log_level::error: return spdlog::level::err;
-    case log_level::critical: return spdlog::level::critical;
-    case log_level::off: return spdlog::level::off;
+    case trace: return spdlog::level::trace;
+    case debug: return spdlog::level::debug;
+    case info: return spdlog::level::info;
+    case warn: return spdlog::level::warn;
+    case error: return spdlog::level::err;
+    case critical: return spdlog::level::critical;
+    case off: return spdlog::level::off;
   }
   return spdlog::level::info;
 }
@@ -43,14 +45,15 @@ spdlog::level::level_enum to_spdlog_level(log_level level)
 // Parses a level name ("trace" .. "critical", "off"), defaulting to `info`.
 log_level ParseLogLevel(std::string_view level_str)
 {
-  if (level_str == "trace") return log_level::trace;
-  if (level_str == "debug") return log_level::debug;
-  if (level_str == "info") return log_level::info;
-  if (level_str == "warn") return log_level::warn;
-  if (level_str == "error") return log_level::error;
-  if (level_str == "critical") return log_level::critical;
-  if (level_str == "off") return log_level::off;
-  return log_level::info;
+  using enum log_level;
+  if (level_str == "trace") return trace;
+  if (level_str == "debug") return debug;
+  if (level_str == "info") return info;
+  if (level_str == "warn") return warn;
+  if (level_str == "error") return error;
+  if (level_str == "critical") return critical;
+  if (level_str == "off") return off;
+  return info;
 }
 
 }  // namespace
@@ -84,6 +87,12 @@ void SetGlobalLogLevel(std::string_view log_level_str)
   auto log_level = to_spdlog_level(ParseLogLevel(log_level_str));
   spdlog::set_level(log_level);
   if (auto logger = spdlog::default_logger()) { logger->set_level(log_level); }
+}
+
+bool ShouldLog(log_level level)
+{
+  auto* logger = spdlog::default_logger_raw();
+  return logger != nullptr && logger->should_log(to_spdlog_level(level));
 }
 
 void LogAt(log_level level, const std::source_location& loc, std::string_view message)
