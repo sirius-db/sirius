@@ -134,6 +134,17 @@ class sirius_physical_gpu_values : public sirius_physical_operator {
    */
   static void throw_if_unsupported_types(const duckdb::vector<sirius::logical_type>& types);
 
+  /**
+   * @brief Reject a collection that is too large for the single GPU_VALUES task.
+   *
+   * GPU_VALUES intentionally materializes its source as one cuDF table. The
+   * caller must therefore cap the collection before moving it into this
+   * operator; oversized collections fall back to DuckDB's streaming CPU path
+   * instead of entering an unsplittable GPU OOM retry loop.
+   */
+  static void throw_if_collection_too_large(const duckdb::ColumnDataCollection& collection,
+                                            std::size_t max_source_bytes);
+
  private:
   [[nodiscard]] std::size_t estimated_source_bytes() const;
 

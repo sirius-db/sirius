@@ -5164,6 +5164,15 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 // those paths work and don't regress.
 //===----------------------------------------------------------------------===//
 
+struct scan_task_batch_size_guard {
+  duckdb::Connection& con;
+  explicit scan_task_batch_size_guard(duckdb::Connection& con, std::size_t size) : con(con)
+  {
+    con.Query("SET scan_task_batch_size = " + std::to_string(size));
+  }
+  ~scan_task_batch_size_guard() { con.Query("RESET scan_task_batch_size"); }
+};
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - empty result (WHERE false)",
                  "[integration][gpu_execution][gpu_values]")
@@ -5190,6 +5199,16 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select b from (values (1), (2), (3)) t(b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - count over projection-pruned values preserves cardinality",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // DuckDB may prune every VALUES column because count(*) only needs the row
+  // cardinality. GPU_VALUES must retain those rows even though cuDF cannot
+  // represent a positive-row table with zero columns.
+  compare_gpu_vs_cpu("select count(*) from (values (1), (2), (3)) t(i);");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -5234,6 +5253,34 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu(
     "select n.n_name from nation n join (values (0), (1), (2)) t(k) on n.n_nationkey = t.k order "
     "by n.n_name;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - oversized values source falls back before GPU materialization",
+                 "[integration][gpu_execution][gpu_values][fallback]")
+{
+  // GPU_VALUES is intentionally a single-table source. Force a tiny source
+  // cap and verify an oversized collection is refused during planning, where
+  // transparent execution can safely replay it on DuckDB's streaming path.
+  scan_task_batch_size_guard guard(*con, 64);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+
+  std::string const payload(128, 'x');
+  auto result = con->Query("select sum(length(s)) from (values ('" + payload + "'), ('" + payload +
+                           "')) t(s);");
+  REQUIRE(result);
+  if (result->HasError()) {
+    UNSCOPED_INFO("oversized VALUES fallback error: " << result->GetError());
+  }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 256);
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before,
+                                                    after,
+                                                    /*expected_rebind_delta=*/0,
+                                                    /*expected_fallback_delta=*/1,
+                                                    /*expected_execution_delta=*/0);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,

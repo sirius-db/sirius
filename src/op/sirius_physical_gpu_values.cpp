@@ -214,6 +214,19 @@ std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<sirius::logic
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
+/// cuDF derives table cardinality from its columns, so a positive-row,
+/// zero-column DuckDB source needs a private sentinel column. Downstream
+/// operators use only num_rows() and never expose the sentinel in their output.
+std::unique_ptr<cudf::table> make_row_count_sentinel_table(cudf::size_type num_rows,
+                                                           rmm::cuda_stream_view stream,
+                                                           rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(cudf::make_fixed_width_column(
+    cudf::data_type{cudf::type_id::INT8}, num_rows, cudf::mask_state::ALL_NULL, stream, mr));
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -292,45 +305,57 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
     }
     auto const total_rows = static_cast<cudf::size_type>(total_rows_idx);
 
-    std::vector<column_staging> staging(types.size());
-    for (size_t c = 0; c < types.size(); c++) {
-      init_staging(staging[c], types[c], total_rows);
-    }
-
-    duckdb::ColumnDataScanState scan_state;
-    _collection->InitializeScan(scan_state);
-    duckdb::DataChunk chunk;
-    chunk.Initialize(duckdb::Allocator::DefaultAllocator(), _collection->Types());
-    cudf::size_type row_base = 0;
-    while (_collection->Scan(scan_state, chunk)) {
-      if (chunk.ColumnCount() != types.size()) {
-        throw std::runtime_error(
-          "[sirius_physical_gpu_values] collection chunk column count does not match operator "
-          "output types");
-      }
+    if (types.empty()) {
+      // Projection pruning can leave a positive-row ColumnDataCollection with
+      // zero output columns (for example COUNT(*) over VALUES). Preserve its
+      // cardinality with the same private sentinel used by a zero-column
+      // DUMMY_SCAN.
+      output_table = make_row_count_sentinel_table(total_rows, stream, mr);
+    } else {
+      std::vector<column_staging> staging(types.size());
       for (size_t c = 0; c < types.size(); c++) {
-        stage_chunk_column(staging[c], chunk.data[c], chunk.size(), types[c], row_base);
+        init_staging(staging[c], types[c], total_rows);
       }
-      row_base += static_cast<cudf::size_type>(chunk.size());
-      chunk.Reset();
+
+      duckdb::ColumnDataScanState scan_state;
+      _collection->InitializeScan(scan_state);
+      duckdb::DataChunk chunk;
+      chunk.Initialize(duckdb::Allocator::DefaultAllocator(), _collection->Types());
+      cudf::size_type row_base = 0;
+      while (_collection->Scan(scan_state, chunk)) {
+        if (chunk.ColumnCount() != types.size()) {
+          throw std::runtime_error(
+            "[sirius_physical_gpu_values] collection chunk column count does not match operator "
+            "output types");
+        }
+        for (size_t c = 0; c < types.size(); c++) {
+          stage_chunk_column(staging[c], chunk.data[c], chunk.size(), types[c], row_base);
+        }
+        row_base += static_cast<cudf::size_type>(chunk.size());
+        chunk.Reset();
+      }
+      if (row_base != total_rows) {
+        throw std::runtime_error(
+          "[sirius_physical_gpu_values] collection scan row count does not match Count()");
+      }
+      output_table = staging_to_table(staging, types, total_rows, stream, mr);
     }
-    output_table = staging_to_table(staging, types, total_rows, stream, mr);
   } else if (_produce_single_row) {
     // DUMMY_SCAN: one all-null row. A 0-output-column DUMMY_SCAN (e.g.
     // SELECT 42) gets a TINYINT sentinel column because cudf derives table
     // row count from columns; downstream constant projections read
     // num_rows() and never the sentinel values, and projection output
     // contains only the evaluated expression columns.
-    duckdb::vector<sirius::logical_type> effective_types = types;
-    if (effective_types.empty()) {
-      effective_types.push_back(sirius::logical_type::make(sirius::type_id::TINYINT));
+    if (types.empty()) {
+      output_table = make_row_count_sentinel_table(1, stream, mr);
+    } else {
+      std::vector<column_staging> staging(types.size());
+      for (size_t c = 0; c < types.size(); c++) {
+        init_staging(staging[c], types[c], 1);
+        stage_null_row(staging[c], types[c]);
+      }
+      output_table = staging_to_table(staging, types, 1, stream, mr);
     }
-    std::vector<column_staging> staging(effective_types.size());
-    for (size_t c = 0; c < effective_types.size(); c++) {
-      init_staging(staging[c], effective_types[c], 1);
-      stage_null_row(staging[c], effective_types[c]);
-    }
-    output_table = staging_to_table(staging, effective_types, 1, stream, mr);
   } else {
     // EMPTY_RESULT (or an empty collection): 0-row table with the declared
     // schema, so downstream operators see a real (empty) input — the same
@@ -381,6 +406,30 @@ void sirius_physical_gpu_values::throw_if_unsupported_types(
       static_cast<void>(sirius::get_cudf_type(t));
       static_cast<void>(t.fixed_width_byte_size());
     }
+  }
+}
+
+void sirius_physical_gpu_values::throw_if_collection_too_large(
+  const duckdb::ColumnDataCollection& collection, std::size_t max_source_bytes)
+{
+  auto const rows = collection.Count();
+  if (rows > static_cast<duckdb::idx_t>(std::numeric_limits<cudf::size_type>::max())) {
+    throw std::runtime_error(
+      "[sirius_physical_gpu_values] collection row count exceeds cudf size_type; "
+      "falling back to DuckDB CPU");
+  }
+
+  // A zero-column collection can report no payload bytes even though its
+  // cardinality sentinel needs one INT8 value (plus validity) per row on the
+  // GPU. Include that private representation in the source-size gate.
+  auto const bytes = collection.Types().empty()
+                       ? std::max<std::size_t>(collection.SizeInBytes(), rows)
+                       : collection.SizeInBytes();
+  if (bytes > max_source_bytes) {
+    throw std::runtime_error(
+      "[sirius_physical_gpu_values] collection size (" + std::to_string(bytes) +
+      " bytes) exceeds the single-task GPU_VALUES limit (" + std::to_string(max_source_bytes) +
+      " bytes); falling back to DuckDB CPU");
   }
 }
 

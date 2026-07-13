@@ -280,9 +280,10 @@ void wrap_table_scan_source(
 //! GPU_VALUES is a first-class in-pipeline source driven by the normal task creation
 //! loop, exactly like GPU_SCAN (same shape as wrap_table_scan_source's replace path).
 //! A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan (filled
-//! at runtime) — left as-is. The type gate runs BEFORE the collection is moved out so an
-//! unsupported type falls back to DuckDB CPU with the source's data intact.
-void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
+//! at runtime) — left as-is. The viability gates run BEFORE the collection is moved out so an
+//! unsupported type or oversized single-task source falls back to DuckDB CPU with its data intact.
+void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
+                             std::size_t max_source_bytes)
 {
   if (!slot->children.empty()) { return; }
 
@@ -292,6 +293,8 @@ void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_oper
       auto& col_scan = slot->Cast<sirius::op::sirius_physical_column_data_scan>();
       if (!col_scan.collection) { return; }  // LEFT_DELIM_JOIN cached chunk scan — skip
       sirius::op::sirius_physical_gpu_values::throw_if_unsupported_types(slot->types);
+      sirius::op::sirius_physical_gpu_values::throw_if_collection_too_large(*col_scan.collection,
+                                                                            max_source_bytes);
       gpu_values = duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
         slot->types, slot->estimated_cardinality, std::move(col_scan.collection));
       break;
@@ -581,13 +584,23 @@ void insert_gpu_pipeline_operators_recursive(
       wrap_table_scan_source(slot, op_params, context);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
-    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: replace_with_gpu_values(slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
+      replace_with_gpu_values(slot,
+                              op_params.scan_task_batch_size == 0
+                                ? sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE
+                                : op_params.scan_task_batch_size);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
       // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data flow, so a
       // GPU_VALUES replacement would only materialize a phantom source; real DUMMY_SCANs
       // are replaced.
       auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
-      if (!dummy.is_delim_join_placeholder()) { replace_with_gpu_values(slot); }
+      if (!dummy.is_delim_join_placeholder()) {
+        replace_with_gpu_values(slot,
+                                op_params.scan_task_batch_size == 0
+                                  ? sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE
+                                  : op_params.scan_task_batch_size);
+      }
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
