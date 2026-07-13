@@ -462,5 +462,5 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 | `src/include/scan_manager/config.hpp` | `scan_manager_config` |
 | `src/include/pin_table.hpp` / `src/pin_table.cpp` | `pin_table` / `unpin_table` + pin materialization |
 | `src/include/op/scan/cached_ranges.hpp` / `src/op/scan/cached_ranges.cpp` | Sorted byte-range coalescing/lookup |
-| `src/include/op/scan/cpu_source_task.hpp` / `src/op/scan/cpu_source_task.cpp` | CPU-source scan task (ColumnDataCollection / empty / dummy) |
+| `src/include/op/sirius_physical_gpu_values.hpp` / `src/op/sirius_physical_gpu_values.cpp` | `GPU_VALUES` source for `ColumnDataCollection`, empty-result, and dummy-scan inputs |
 | `src/op/scan/scan_utils.cpp` | Row group pruning, filter expression conversion |

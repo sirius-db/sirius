@@ -22,6 +22,8 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/common/enums/optimizer_type.hpp>
+#include <duckdb/main/config.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -39,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -5173,6 +5176,25 @@ struct scan_task_batch_size_guard {
   ~scan_task_batch_size_guard() { con.Query("RESET scan_task_batch_size"); }
 };
 
+struct optimizer_disable_guard {
+  duckdb::ClientContext& context;
+  std::set<duckdb::OptimizerType> original_disabled;
+
+  optimizer_disable_guard(duckdb::ClientContext& context, duckdb::OptimizerType optimizer)
+    : context(context),
+      original_disabled(duckdb::DBConfig::GetConfig(context).options.disabled_optimizers)
+  {
+    auto disabled = original_disabled;
+    disabled.insert(optimizer);
+    duckdb::DBConfig::GetConfig(context).options.disabled_optimizers = std::move(disabled);
+  }
+
+  ~optimizer_disable_guard()
+  {
+    duckdb::DBConfig::GetConfig(context).options.disabled_optimizers = std::move(original_disabled);
+  }
+};
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - empty result (WHERE false)",
                  "[integration][gpu_execution][gpu_values]")
@@ -5205,10 +5227,43 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - count over projection-pruned values preserves cardinality",
                  "[integration][gpu_execution][gpu_values]")
 {
-  // DuckDB may prune every VALUES column because count(*) only needs the row
-  // cardinality. GPU_VALUES must retain those rows even though cuDF cannot
-  // represent a positive-row table with zero columns.
+  // Prevent DuckDB from folding the aggregate to a constant: UNUSED_COLUMNS
+  // can then prune the VALUES payload while preserving its three logical rows.
+  // GPU_VALUES must retain those rows even though cuDF cannot represent a
+  // positive-row table with zero columns.
+  optimizer_disable_guard guard(*con->context, duckdb::OptimizerType::STATISTICS_PROPAGATION);
   compare_gpu_vs_cpu("select count(*) from (values (1), (2), (3)) t(i);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - boolean values",
+                 "[integration][gpu_execution][gpu_values][types]")
+{
+  compare_gpu_vs_cpu("select b from (values (true), (false), (NULL::BOOLEAN)) t(b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - temporal values",
+                 "[integration][gpu_execution][gpu_values][types]")
+{
+  compare_gpu_vs_cpu(
+    "select d, ts from (values "
+    "(DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.123456'), "
+    "(DATE '1999-12-31', TIMESTAMP '1999-12-31 23:59:59.999999'), "
+    "(NULL::DATE, NULL::TIMESTAMP)) t(d, ts);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - DECIMAL32, DECIMAL64, and DECIMAL128 values",
+                 "[integration][gpu_execution][gpu_values][types][decimal]")
+{
+  compare_gpu_vs_cpu(
+    "select d32, d64, d128 from (values "
+    "(CAST('1234567.89' AS DECIMAL(9,2)), "
+    " CAST('12345678901234.5678' AS DECIMAL(18,4)), "
+    " CAST('12345678901234567890123456789012.345678' AS DECIMAL(38,6))), "
+    "(NULL::DECIMAL(9,2), NULL::DECIMAL(18,4), NULL::DECIMAL(38,6))) "
+    "t(d32, d64, d128);");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -5222,10 +5277,12 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - values spanning multiple chunks",
-                 "[integration][gpu_execution][gpu_values]")
+                 "[integration][gpu_execution][gpu_values][large_input]")
 {
   // > STANDARD_VECTOR_SIZE (2048) rows so the ColumnDataCollection scans
-  // multiple DataChunks through the GPU_VALUES staging path.
+  // multiple DataChunks through the GPU_VALUES staging path. Disable
+  // statistics propagation so the aggregate cannot be folded before staging.
+  optimizer_disable_guard guard(*con->context, duckdb::OptimizerType::STATISTICS_PROPAGATION);
   std::string query = "select count(*), min(i), max(i) from (values (0)";
   for (int i = 1; i < 5000; i++) {
     query += ", (" + std::to_string(i) + ")";
@@ -5257,7 +5314,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - oversized values source falls back before GPU materialization",
-                 "[integration][gpu_execution][gpu_values][fallback]")
+                 "[integration][gpu_execution][gpu_values][fallback][large_input]")
 {
   // GPU_VALUES is intentionally a single-table source. Force a tiny source
   // cap and verify an oversized collection is refused during planning, where
@@ -5274,6 +5331,33 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   }
   REQUIRE_FALSE(result->HasError());
   REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 256);
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before,
+                                                    after,
+                                                    /*expected_rebind_delta=*/0,
+                                                    /*expected_fallback_delta=*/1,
+                                                    /*expected_execution_delta=*/0);
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - unsupported HUGEINT values fall back",
+                 "[integration][gpu_execution][gpu_values][fallback][types]")
+{
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query(
+    "select x from (values "
+    "(CAST('9223372036854775808' AS HUGEINT)), "
+    "(CAST('-9223372036854775809' AS HUGEINT))) t(x) order by x;");
+
+  REQUIRE(result);
+  if (result->HasError()) {
+    UNSCOPED_INFO("unsupported HUGEINT VALUES fallback error: " << result->GetError());
+  }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->RowCount() == 2);
+  REQUIRE(result->GetValue(0, 0).ToString() == "-9223372036854775809");
+  REQUIRE(result->GetValue(0, 1).ToString() == "9223372036854775808");
 
   auto after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before,
