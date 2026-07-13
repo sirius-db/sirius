@@ -152,6 +152,9 @@ set(CUCASCADE_BUILD_CUDF
 set(CUCASCADE_WARNINGS_AS_ERRORS
     OFF
     CACHE BOOL "" FORCE)
+set(CUCASCADE_BUILD_IO
+    OFF
+    CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
 if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
@@ -249,6 +252,7 @@ set(EXTENSION_SOURCES
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
+    src/log/logging.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -275,6 +279,8 @@ set(EXTENSION_SOURCES
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_cpu_source.cpp
+    src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_cte.cpp
@@ -558,6 +564,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_semi_future.cpp
@@ -622,6 +629,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_physical_streaming_source.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp

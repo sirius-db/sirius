@@ -49,8 +49,6 @@
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
-#include <spdlog/sinks/basic_file_sink.h>
-#include <spdlog/spdlog.h>
 #include <sys/resource.h>
 
 #include <cctype>
@@ -143,12 +141,12 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
     auto* fs_mr =
       space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
     if (fs_mr) {
-      spdlog::info("[host_pool] HOST:{} {} allocated={} bytes peak={} bytes free_blocks={}",
-                   space->get_id().device_id,
-                   tag,
-                   fs_mr->get_total_allocated_bytes(),
-                   fs_mr->get_peak_total_allocated_bytes(),
-                   fs_mr->get_free_blocks());
+      SIRIUS_LOG_INFO("[host_pool] HOST:{} {} allocated={} bytes peak={} bytes free_blocks={}",
+                      space->get_id().device_id,
+                      tag,
+                      fs_mr->get_total_allocated_bytes(),
+                      fs_mr->get_peak_total_allocated_bytes(),
+                      fs_mr->get_free_blocks());
     }
   }
 
@@ -158,12 +156,12 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
     auto* ra_mr =
       space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
     if (!ra_mr) { continue; }
-    spdlog::info("[gpu_pool] GPU:{} {} allocated={} bytes peak={} bytes reserved={} bytes",
-                 space->get_device_id(),
-                 tag,
-                 ra_mr->get_total_allocated_bytes(),
-                 ra_mr->get_peak_total_allocated_bytes(),
-                 ra_mr->get_total_reserved_bytes());
+    SIRIUS_LOG_INFO("[gpu_pool] GPU:{} {} allocated={} bytes peak={} bytes reserved={} bytes",
+                    space->get_device_id(),
+                    tag,
+                    ra_mr->get_total_allocated_bytes(),
+                    ra_mr->get_peak_total_allocated_bytes(),
+                    ra_mr->get_total_reserved_bytes());
   }
 }
 
@@ -1000,7 +998,7 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
-  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
   read_config_file_if_exists();
 }
 
