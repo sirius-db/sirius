@@ -76,17 +76,12 @@ void require_strictly_topological(
   }
 }
 
-//! The full canonical-schedule battery for one query: the schedule must be strictly
-//! topological (the raw meta-sweep emission is not), pipeline ids must equal vector
-//! positions with `dependencies` sorted by them, join dependencies must stay
-//! build-side-first (dynamic filters publish before the probe-side scans they prune are
-//! launched), reordering an already-canonical schedule must be a no-op, and converting the
-//! same query twice must reproduce the RAW schedule byte-identically: operator chains,
-//! scheduled order, dependency indices, and wiring endpoints. The canonical dump
-//! (`dump_pipeline_conversion_result`) is signature-sorted and would accept a
-//! schedule-order flip (A,B vs B,A); the raw dump keeps order visible. Raw order is
-//! load-bearing: scan registration preserves scheduled order and
-//! `task_scheduler::start_query` launches `scans.front()`.
+//! The per-query battery: the schedule must be strictly topological (raw meta-sweep
+//! emission is not), pipeline ids must equal vector positions with `dependencies` sorted
+//! by them, join dependencies must stay build-side-first (dynamic filters publish before
+//! the probe-side scans they prune), reordering an already-canonical schedule must be a
+//! no-op, and converting twice must reproduce the raw schedule byte-identically — the
+//! canonical dump is signature-sorted and would miss a schedule-order flip.
 void require_canonical_schedule(duckdb::Connection& con, const std::string& query)
 {
   sirius::test::with_conversion_result(con, query, [&](pipeline_conversion_result& result) {
@@ -183,8 +178,7 @@ TEST_CASE("pipeline schedule is strictly topological and deterministic",
   }
 }
 
-//! The same gate through the parquet ingestible. Together with the hive sweep below it
-//! retargets the deleted legacy-vs-tree parquet differential coverage as single-path checks.
+//! The same gate through the parquet ingestible.
 TEST_CASE("parquet pipeline schedule is strictly topological and deterministic",
           "[integration][pipeline][schedule_canonical][parquet]")
 {
@@ -208,10 +202,9 @@ TEST_CASE("hive-partitioned parquet pipeline schedule is strictly topological an
   if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
   auto con = sirius::test::g_integration_env->make_connection();
 
-  // The six layouts of the deleted differential test, verbatim. `reversed_column_order` is
-  // plan-construction-safe here: its known binder failure only reproduces through DuckDB's
-  // default ExtractPlan order, which the hidden end-to-end hive tests use;
-  // `with_conversion_result` extracts in sirius order (ResolveOperatorTypes first).
+  // `reversed_column_order` is safe here: its known binder failure only reproduces
+  // through DuckDB's default ExtractPlan order (used by the hidden end-to-end hive
+  // tests), not the sirius-order extraction `with_conversion_result` uses.
   auto const hive = (integration_data_dir() / "hive_partitioned").string() + "/**/*.parquet";
   std::array<std::pair<const char*, std::string>, 6> const queries = {{
     {"basic_scan_with_partition_columns",

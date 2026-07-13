@@ -5155,13 +5155,11 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 //===----------------------------------------------------------------------===//
 // Metadata-only aggregates + CPU-source fallback
 //
-// Both interception paths disable STATISTICS_PROPAGATION, so ungrouped
-// count(*)/MIN/MAX stay GPU aggregates over the scan instead of folding into
-// constant EXPRESSION_GET / DUMMY_SCAN sources — the aggregate tests below pin
-// that (rebind + execute, zero fallback). Plans that DO need a CPU-materialized
-// source (bare VALUES, no-table SELECT, provably-empty scans) are rejected at
-// plan generation while cpu_source_task dispatch stays reverted (#1114) and
-// must complete correctly via the transparent CPU fallback — the fallback
+// STATISTICS_PROPAGATION is disabled on both interception paths, so ungrouped
+// count(*)/min/max stay GPU aggregates — the aggregate tests pin that (rebind +
+// execute, zero fallback). Plans that genuinely need a CPU-materialized source
+// (bare VALUES, no-table SELECT, provably-empty scans) are rejected at plan
+// generation and must complete via the transparent CPU fallback — the fallback
 // tests at the end of this section pin that.
 //===----------------------------------------------------------------------===//
 
@@ -5244,8 +5242,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   auto result = con->Query("VALUES (1), (2);");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
-  // Rejected at plan generation (COLUMN_DATA_SCAN needs CPU-materialized data) -> clean
-  // transparent fallback, not a debug assert, an empty-scan-list crash, or a hang.
+  // Rejected at plan generation -> clean CPU fallback, not an assert or a hang.
   auto after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
   REQUIRE(result->RowCount() == 2);
@@ -5262,8 +5259,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   auto result = con->Query("SELECT 40 + 2;");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
-  // DUMMY_SCAN source rejected at plan generation -> transparent fallback (issue #952's
-  // hang shape: a scheduled source no task dispatch ever serves).
+  // DUMMY_SCAN source rejected at plan generation -> transparent fallback.
   auto after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
   REQUIRE(result->RowCount() == 1);

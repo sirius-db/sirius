@@ -42,19 +42,16 @@ struct pipeline_conversion_result {
   std::size_t meta_pipeline_count;
 };
 
-//! Canonical, line-oriented serialization of a pipeline_conversion_result, used as a
-//! debugging surface: pipelines are signature-sorted, so equivalent graphs produce
-//! byte-identical output regardless of emission order. Because of that sort it CANNOT
-//! detect schedule-order differences — use `dump_pipeline_schedule_raw` for those.
+//! Canonical, line-oriented serialization for debugging: pipelines are signature-sorted,
+//! so equivalent graphs print byte-identically regardless of emission order — which also
+//! means it cannot show schedule-order differences; use `dump_pipeline_schedule_raw`
+//! for those.
 std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result);
 
-//! Like `dump_pipeline_conversion_result`, but serializes the RAW scheduled order:
-//! pipelines in `scheduled_pipelines` order, each with its `dependencies` as scheduled
-//! indices, plus the wirings keyed by scheduled indices. Nothing is signature-sorted, so
-//! comparing two conversions of the same query catches schedule-order nondeterminism
-//! (A,B vs B,A) that the canonical dump deliberately hides. Raw order is load-bearing:
-//! scan registration preserves scheduled order and `task_scheduler::start_query` launches
-//! `scans.front()`.
+//! The unsorted counterpart: pipelines in true scheduled order, each with `dependencies`
+//! as scheduled indices, wirings keyed by scheduled indices. Comparing two conversions of
+//! the same query catches schedule-order nondeterminism, which matters because scan
+//! registration and `task_scheduler::start_query` consume pipelines in scheduled order.
 std::string dump_pipeline_schedule_raw(const pipeline_conversion_result& result);
 
 //! Reorders `pipelines` in place into a deterministic, strictly-topological schedule

@@ -593,9 +593,8 @@ void dump_pipeline_block(std::ostringstream& out, std::size_t index, const siriu
   }
 }
 
-//! Wiring lines with pipeline endpoints resolved through `index_of` (canonical or scheduled
-//! indices). Sorted by the resolved indices, so the output is insensitive to wiring emission
-//! order while staying fully sensitive to the pipeline order the caller chose.
+//! Wiring lines with endpoints resolved through `index_of`, sorted by those indices —
+//! insensitive to wiring emission order, sensitive to the caller's pipeline order.
 void dump_wirings(
   std::ostringstream& out,
   const std::vector<repository_wiring>& wirings,

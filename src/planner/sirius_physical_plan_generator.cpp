@@ -274,17 +274,12 @@ void wrap_table_scan_source(
   }
 }
 
-//! Reject a source that would need CPU-materialized data: a VALUES / expression-list
-//! COLUMN_DATA_SCAN (non-null `collection`), a no-table-SELECT DUMMY_SCAN, or an
-//! EMPTY_RESULT. These used to get a leaf CPU_SOURCE child here, but cpu_source_task
-//! dispatch was reverted (#1114, originally added by #980 for #952), so such plans cannot
-//! run: COLUMN_DATA_SCAN's build_pipelines trips D_ASSERT(children.empty()) in debug
-//! builds and in release leaves the query with no schedulable scan
-//! (task_scheduler::start_query throws), while DUMMY_SCAN / EMPTY_RESULT pipelines hang
-//! waiting for a task nothing dispatches. Throwing here — at plan generation — lands in
-//! the interception fallback (SiriusContext::OnFinalizePrepare), so the query runs on the
-//! DuckDB CPU path instead. A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN
-//! cached chunk scan (filled at runtime by the delim sink) — supported, not rejected.
+//! Reject sources that need CPU-materialized data: a VALUES / expression-list
+//! COLUMN_DATA_SCAN (non-null `collection`), a real DUMMY_SCAN, or an EMPTY_RESULT.
+//! Nothing dispatches tasks for a CPU_SOURCE leaf, so such plans can never finish.
+//! Throwing during plan generation routes the query to the DuckDB CPU fallback.
+//! A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan
+//! (filled at runtime) — supported.
 void reject_cpu_source(const sirius::op::sirius_physical_operator& source_op)
 {
   if (!source_op.children.empty()) { return; }
@@ -569,9 +564,8 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: reject_cpu_source(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
-      // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data flow (the
-      // delim sink runs partition_join inline), so it is supported; real DUMMY_SCANs would
-      // need CPU-materialized data.
+      // The RIGHT_DELIM_JOIN build placeholder carries no runtime data (the delim sink
+      // runs partition_join inline) — keep it. Real DUMMY_SCANs need CPU data.
       auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
       if (!dummy.is_delim_join_placeholder()) { reject_cpu_source(*slot); }
       break;

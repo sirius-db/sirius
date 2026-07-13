@@ -83,10 +83,9 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
-/// Generate a Sirius physical plan from a SQL query string. Throws on any parse / plan /
-/// optimize / generation failure (after rolling back and restoring the optimizer settings):
-/// these fixtures are supported in CI, so a planner regression must fail the test rather
-/// than silently skip it.
+/// Generate a Sirius physical plan from a SQL query string. Throws on any failure (after
+/// rolling back and restoring the optimizer settings) so a planner regression fails the
+/// test instead of silently skipping it.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& con,
                                                                   const std::string& query)
 {
@@ -339,11 +338,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - CPU-source plans are rejected toward CPU fallback",
                  "[plan_tree_shape][isolated_context]")
 {
-  // All three need a CPU-materialized source (the CPU_SOURCE leaf whose task dispatch is
-  // not wired), so plan generation must throw NotImplementedException — the transparent
-  // interception catches it and keeps DuckDB's CPU plan. The supported delim-join
-  // internals (null-collection COLUMN_DATA_SCAN, placeholder DUMMY_SCAN) stay accepted;
-  // the delim-join test cases in this file cover them.
+  // Each needs a CPU-materialized source, which nothing executes, so plan generation
+  // must throw — transparent interception catches this and keeps DuckDB's CPU plan.
+  // The delim-join internals stay accepted (covered by the delim-join cases above).
 
   // VALUES -> COLUMN_DATA_SCAN holding a materialized collection.
   CHECK_THROWS_AS(generate_sirius_plan(*con, "VALUES (1), (2)"), duckdb::NotImplementedException);
