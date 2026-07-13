@@ -145,6 +145,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   MERGE_AGGREGATE,
   SORT_PARTITION,
   SORT_SAMPLE,
+  CPU_SOURCE,
   GPU_SCAN,
   DYNAMIC_FILTER
 };

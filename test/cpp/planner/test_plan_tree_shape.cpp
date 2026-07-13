@@ -339,11 +339,11 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - CPU-source plans are rejected toward CPU fallback",
                  "[plan_tree_shape][isolated_context]")
 {
-  // All three need a CPU-materialized source, which the engine cannot execute, so plan
-  // generation must throw NotImplementedException — the transparent interception catches
-  // it and keeps DuckDB's CPU plan. The supported delim-join internals (null-collection
-  // COLUMN_DATA_SCAN, placeholder DUMMY_SCAN) stay accepted; the delim-join test cases in
-  // this file cover them.
+  // All three need a CPU-materialized source (the CPU_SOURCE leaf whose task dispatch is
+  // not wired), so plan generation must throw NotImplementedException — the transparent
+  // interception catches it and keeps DuckDB's CPU plan. The supported delim-join
+  // internals (null-collection COLUMN_DATA_SCAN, placeholder DUMMY_SCAN) stay accepted;
+  // the delim-join test cases in this file cover them.
 
   // VALUES -> COLUMN_DATA_SCAN holding a materialized collection.
   CHECK_THROWS_AS(generate_sirius_plan(*con, "VALUES (1), (2)"), duckdb::NotImplementedException);

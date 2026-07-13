@@ -276,15 +276,15 @@ void wrap_table_scan_source(
 
 //! Reject a source that would need CPU-materialized data: a VALUES / expression-list
 //! COLUMN_DATA_SCAN (non-null `collection`), a no-table-SELECT DUMMY_SCAN, or an
-//! EMPTY_RESULT. The engine has no CPU-source execution — the CPU_SOURCE operator and
-//! cpu_source_task (#980, fixing #952) were reverted in #1114 and their remnants deleted —
-//! so a plan containing such a source either has no schedulable scan
-//! (task_scheduler::start_query throws) or hangs waiting for a task nothing dispatches.
-//! Throwing here — at plan generation — lands in the interception fallback
-//! (SiriusContext::OnFinalizePrepare), so the query runs on the DuckDB CPU path instead;
-//! GPU-side support means re-porting #980 from git history. A null-collection
-//! COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan (filled at runtime by the
-//! delim sink) — supported, not rejected.
+//! EMPTY_RESULT. These used to get a leaf CPU_SOURCE child here, but cpu_source_task
+//! dispatch was reverted (#1114, originally added by #980 for #952), so such plans cannot
+//! run: COLUMN_DATA_SCAN's build_pipelines trips D_ASSERT(children.empty()) in debug
+//! builds and in release leaves the query with no schedulable scan
+//! (task_scheduler::start_query throws), while DUMMY_SCAN / EMPTY_RESULT pipelines hang
+//! waiting for a task nothing dispatches. Throwing here — at plan generation — lands in
+//! the interception fallback (SiriusContext::OnFinalizePrepare), so the query runs on the
+//! DuckDB CPU path instead. A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN
+//! cached chunk scan (filled at runtime by the delim sink) — supported, not rejected.
 void reject_cpu_source(const sirius::op::sirius_physical_operator& source_op)
 {
   if (!source_op.children.empty()) { return; }

@@ -276,6 +276,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_concat.cpp
+    src/op/sirius_physical_cpu_source.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
     src/op/sirius_physical_dummy_scan.cpp
