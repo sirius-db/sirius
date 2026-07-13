@@ -12,9 +12,9 @@ axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 instrumentation-model = { path = "../model", features = ["collector"] }
 sirius-telemetry-analyzer = { path = "../analyzer" }
-quent-collector = { git = "https://github.com/felipeblazing/quent.git", rev = "246b92f86f946a404fb091b831c746c7a41e8a0b" }
-quent-exporter = { git = "https://github.com/felipeblazing/quent.git", rev = "246b92f86f946a404fb091b831c746c7a41e8a0b" }
-quent-query-engine-server = { git = "https://github.com/felipeblazing/quent.git", rev = "246b92f86f946a404fb091b831c746c7a41e8a0b" }
+quent-collector = { git = "https://github.com/felipeblazing/quent.git", rev = "f2ab99748eb3e6995b0882c525a78a43d10b5dab" }
+quent-io = { git = "https://github.com/felipeblazing/quent.git", rev = "f2ab99748eb3e6995b0882c525a78a43d10b5dab" }
+quent-query-engine-server = { git = "https://github.com/felipeblazing/quent.git", rev = "f2ab99748eb3e6995b0882c525a78a43d10b5dab" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 uuid = "1"
@@ -22,7 +22,7 @@ uuid = "1"
 [build-dependencies]
 # TODO: flip back to rapidsai/quent once rapidsai/quent#323 merges — temporarily
 # tracks the PR branch on the felipeblazing fork (per-transition attributes).
-quent-simulator-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "246b92f86f946a404fb091b831c746c7a41e8a0b" }
-quent-query-engine-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "246b92f86f946a404fb091b831c746c7a41e8a0b" }
-quent-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "246b92f86f946a404fb091b831c746c7a41e8a0b" }
+quent-simulator-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "f2ab99748eb3e6995b0882c525a78a43d10b5dab" }
+quent-query-engine-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "f2ab99748eb3e6995b0882c525a78a43d10b5dab" }
+quent-ui = { git = "https://github.com/felipeblazing/quent.git", rev = "f2ab99748eb3e6995b0882c525a78a43d10b5dab" }
 ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }

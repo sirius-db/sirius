@@ -16,9 +16,9 @@ use quent_analyzer::{
     },
 };
 use quent_attributes::Attribute;
+use quent_query_engine_ui::OperatorFilter;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
-use quent_query_engine_ui::OperatorFilter;
 use uuid::Uuid;
 
 /// The reconstructed Task FSM.
@@ -85,8 +85,7 @@ impl TaskExt for Task {
                 if let ModelTaskTransition::Computing(data) = &transition.data
                     && let Some(next) = raw.get(i + 1)
                 {
-                    let span_secs =
-                        (next.timestamp() - transition.timestamp()) as f64 / 1e9;
+                    let span_secs = (next.timestamp() - transition.timestamp()) as f64 / 1e9;
                     if span_secs > 0.0 {
                         derived_attributes.push(Attribute::f64(
                             "bytes_per_sec",

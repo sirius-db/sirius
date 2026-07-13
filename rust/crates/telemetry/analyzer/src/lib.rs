@@ -1,6 +1,7 @@
 use instrumentation_model::{Sirius, SiriusEvent};
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
+use quent_query_engine_analyzer::entities;
 use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
 use quent_query_engine_ui::{OperatorFilter, QueryBundle, QueryEntities, QueryFilter};
 use quent_ui::{
@@ -62,7 +63,7 @@ impl QuentViewer for Viewer {
 
     fn import_events(
         dir: &std::path::Path,
-    ) -> quent_model::exporter::ImporterResult<ViewerEventStream<Self::Analyzer>> {
+    ) -> quent_model::io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
         Sirius::import_events(dir)
     }
 }
@@ -262,6 +263,51 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
     fn query_engine_model(&self) -> &impl QueryEngineModel {
         &self.model
+    }
+
+    fn list_entities(
+        &self,
+        request: quent_ui::entities::request::EntityListRequest<QueryFilter, OperatorFilter>,
+    ) -> AnalyzerResult<quent_ui::entities::response::EntityListResponse> {
+        let query_id = request.app_params.query_id;
+        let epoch = self.query_engine_model().query_epoch(query_id)?;
+        let entry = request.entry;
+        let window = entry.window.try_into_span(epoch)?;
+        let scope = entry
+            .filter
+            .scope
+            .as_ref()
+            .map(|s| s.resolve(&self.model))
+            .transpose()?;
+        let operator_filter = entry.application;
+
+        // Restrict candidates to the requested query: a task belongs to a query
+        // iff its operator is one of that query's operators. Without this, tasks
+        // from a different query sharing a resource and overlapping the window
+        // would leak in.
+        let query_operators: HashSet<Uuid> = self
+            .model
+            .query_view(query_id)?
+            .operators()
+            .map(|op| op.id())
+            .collect();
+
+        entities::list_entities(
+            &self.model,
+            |task| {
+                task.pipeline_uuid()
+                    .is_some_and(|op| query_operators.contains(&op))
+                    && task.matches_filter(&operator_filter)
+            },
+            entities::ListQuery {
+                scope: scope.as_ref(),
+                window,
+                filter: &entry.filter,
+                sort: entry.sort,
+                page: entry.page,
+                epoch,
+            },
+        )
     }
 
     // TODO(johanpel): consider reusing the bulk request API with a single entry for requests like this.
