@@ -261,7 +261,10 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
       SIRIUS_LOG_INFO("Task Creator: scheduling lookahead for operator {} (id {})",
                       node->get_name(),
                       node->get_operator_id());
-      schedule(node);
+      auto request  = std::make_unique<task_creation_request>();
+      request->node = node;
+      request->type = request_type::lookahead;
+      _task_creation_queue.push(std::move(request));
       ++_index_of_next_lookahead;
       return;
     }
@@ -282,7 +285,8 @@ void task_creator::manager_loop()
       continue;
     }
 
-    auto node = request->node;
+    auto node         = request->node;
+    auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
     auto* source = node;
@@ -291,7 +295,7 @@ void task_creator::manager_loop()
     if (node == nullptr) { continue; }
 
     // Dispatch the task creation work to the pool
-    _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {
+    _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {
       try {
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();
@@ -460,6 +464,7 @@ void task_creator::manager_loop()
                                                                     gpu_pipeline_task_global_state);
           task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
+          if (request_kind == request_type::lookahead) { break; }
         }
         // Unconditional re-evaluation at every creation exit: with the
         // source-exhaustion finish guard, "last task completed at T1,
