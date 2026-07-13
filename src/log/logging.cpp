@@ -76,6 +76,8 @@ void InitGlobalLogger(std::string_view log_level_str,
                       uint32_t flush_ms,
                       log_backend_type backend)
 {
+  // A throwing factory (e.g. unwritable log_dir) propagates to the caller
+  // before install(), keeping the current backend and level untouched.
   std::shared_ptr<log_backend> new_backend;
   switch (backend) {
     case log_backend_type::spdlog: {
@@ -86,7 +88,6 @@ void InitGlobalLogger(std::string_view log_level_str,
     }
     case log_backend_type::noop: new_backend = make_noop_backend(); break;
   }
-  // A failed factory (nullptr) keeps the current backend installed.
   install(std::move(new_backend), log_level_str);
 }
 
@@ -105,6 +106,10 @@ void InitGlobalLogger(std::shared_ptr<log_backend> backend, std::string_view log
 
 bool FlushGlobalLogger()
 {
+  // Called from the fatal-signal handler (segfault_backtrace_handler.cpp).
+  // The atomic<shared_ptr> load is lock-based in libstdc++, so a thread that
+  // crashes inside a facade atomic operation could deadlock its own handler;
+  // like the sink mutex, this is accepted and bounded by the handler's alarm.
   if (auto backend = state().backend.load(std::memory_order_acquire)) { return backend->flush(); }
   return false;
 }

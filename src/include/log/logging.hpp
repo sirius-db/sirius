@@ -66,9 +66,9 @@ static_assert(static_cast<int>(log_level::trace) == SIRIUS_LOG_LEVEL_TRACE &&
 /// For the spdlog backend, `log_dir` is the directory of the daily log file
 /// and `flush_ms` the best-effort periodic flush interval (0 = no scheduled
 /// flushes); other backends interpret only the settings that apply to them.
-/// If the backend cannot be constructed, the previously installed backend
-/// (if any) stays active. Until the first successful call, log statements
-/// are dropped.
+/// Throws if the backend cannot be constructed (e.g. an unwritable log_dir);
+/// the previously installed backend (if any) then stays active. Until the
+/// first successful call, log statements are dropped.
 void InitGlobalLogger(std::string_view log_level_str,
                       std::string_view log_dir,
                       uint32_t flush_ms,

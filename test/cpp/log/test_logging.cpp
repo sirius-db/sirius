@@ -18,6 +18,7 @@
 #include "config.hpp"
 #include "log/log_backend.hpp"
 #include "log/logging.hpp"
+#include "utils/log_test_utils.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -32,73 +33,8 @@
 
 using namespace sirius;
 
-namespace {
-
-struct recorded_message {
-  log_level level;
-  std::string file;
-  uint32_t line;
-  std::string message;
-};
-
-class recording_backend final : public log_backend {
- public:
-  void log(log_level level, const std::source_location& loc, std::string_view message) override
-  {
-    std::lock_guard lock(_mutex);
-    _messages.push_back({level, loc.file_name(), loc.line(), std::string{message}});
-  }
-
-  bool flush() override
-  {
-    ++_flush_count;
-    return true;
-  }
-
-  std::vector<recorded_message> messages() const
-  {
-    std::lock_guard lock(_mutex);
-    return _messages;
-  }
-
-  size_t count() const
-  {
-    std::lock_guard lock(_mutex);
-    return _messages.size();
-  }
-
-  int flush_count() const { return _flush_count; }
-
- private:
-  mutable std::mutex _mutex;
-  std::vector<recorded_message> _messages;
-  std::atomic<int> _flush_count{0};
-};
-
-/// Installs a recording backend for the scope of a test and restores the
-/// process-wide logger (initialized in unittest.cpp's main) on exit.
-class scoped_recording_backend {
- public:
-  explicit scoped_recording_backend(std::string_view level = "trace")
-    : _backend(std::make_shared<recording_backend>())
-  {
-    InitGlobalLogger(_backend, level);
-  }
-
-  ~scoped_recording_backend()
-  {
-    using duckdb::Config;
-    InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
-  }
-
-  recording_backend& backend() { return *_backend; }
-  std::shared_ptr<recording_backend> backend_ptr() { return _backend; }
-
- private:
-  std::shared_ptr<recording_backend> _backend;
-};
-
-}  // namespace
+using recording_backend        = sirius::test::recording_log_backend;
+using scoped_recording_backend = sirius::test::scoped_recording_log_backend;
 
 TEST_CASE("ShouldLog gates by the global level", "[log]")
 {
@@ -137,7 +73,7 @@ TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
   SIRIUS_LOG_INFO("x={}", 42);
   const uint32_t expected_line = __LINE__ - 1;
 
-  auto messages = scoped.backend().messages();
+  auto messages = scoped.backend().records();
   REQUIRE(messages.size() == 1);
   CHECK(messages[0].level == log_level::info);
   CHECK(messages[0].message == "x=42");

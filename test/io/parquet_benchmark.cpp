@@ -133,7 +133,9 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  sirius::SetGlobalLogLevel("info");  // show per-read trace
+  // Per-read trace goes to log/sirius.log (no backend is installed until the
+  // logger is initialized; without this every log statement is dropped).
+  sirius::InitGlobalLogger("info", "log", 0);
 
   std::cout << "Source : " << argv[2] << "\n"
             << "Files  : " << paths.size() << "\n";

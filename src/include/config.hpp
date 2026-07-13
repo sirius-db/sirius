@@ -17,10 +17,15 @@
 #pragma once
 
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
-#include <log/logging.hpp>
 
 #include <cstdint>
 #include <string>
+
+namespace sirius {
+// Opaque declaration: the full definition lives in log/logging.hpp; TUs that
+// only pass Config::LOG_BACKEND around don't need the logging headers.
+enum class log_backend_type;
+}  // namespace sirius
 
 namespace duckdb {
 

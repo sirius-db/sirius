@@ -19,11 +19,11 @@
 #include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
 
-#include <atomic>
-#include <chrono>
-#include <cstdint>
+#include <condition_variable>
 #include <format>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 namespace sirius {
 
@@ -45,9 +45,11 @@ spdlog::level::level_enum to_spdlog_level(log_level level)
 }
 
 /// Writes to a daily-rotated `<log_dir>/sirius.log` through a multi-threaded
-/// file sink. The logger is registered in spdlog's registry only so that
-/// spdlog::flush_every's periodic worker can reach it; the registry's default
-/// logger and global level are never touched.
+/// file sink. The logger is deliberately NOT put into spdlog's global
+/// registry: registry statistics can be destroyed before this backend at process
+/// exit, and the periodic flusher spdlog::flush_every drives outlives a
+/// backend swap. Periodic flushing is a backend-owned thread instead, whose
+/// lifetime exactly matches the backend's.
 class spdlog_backend final : public log_backend {
  public:
   explicit spdlog_backend(const spdlog_backend_config& config)
@@ -56,33 +58,26 @@ class spdlog_backend final : public log_backend {
     auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
     file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
-    // Unique registry name per instance: during a backend swap the new
-    // instance is constructed while the previous one is still registered.
-    static std::atomic<uint64_t> instance_counter{0};
-    _registry_name = std::format("sirius-{}", instance_counter.fetch_add(1));
-
-    _logger = std::make_shared<spdlog::logger>(_registry_name, spdlog::sinks_init_list{file_sink});
+    _logger = std::make_shared<spdlog::logger>("sirius", spdlog::sinks_init_list{file_sink});
     // Pass-through: the facade's level filter is authoritative.
     _logger->set_level(spdlog::level::trace);
 
     if (config.flush_interval) {
-      spdlog::register_logger(_logger);
-      _registered = true;
-      // spdlog's periodic flusher has whole-second granularity; rounding up
-      // keeps sub-second requests scheduled (flushing is best-effort anyway).
-      spdlog::flush_every(std::chrono::ceil<std::chrono::seconds>(*config.flush_interval));
+      _flusher = std::jthread(
+        [logger = _logger, interval = *config.flush_interval](const std::stop_token& stop) {
+          std::mutex mutex;
+          std::condition_variable_any cv;
+          std::unique_lock lock(mutex);
+          // wait_for returns true when stop was requested (the predicate).
+          while (!cv.wait_for(lock, stop, interval, [&stop] { return stop.stop_requested(); })) {
+            logger->flush();
+          }
+        });
     }
   }
 
-  ~spdlog_backend() override
-  {
-    // Unregister so the periodic flush worker does not keep this backend's
-    // sink alive after a backend swap.
-    if (_registered) { spdlog::drop(_registry_name); }
-  }
-
-  spdlog_backend(const spdlog_backend&)            = delete;
-  spdlog_backend& operator=(const spdlog_backend&) = delete;
+  // The implicit destructor stops and joins the flusher (jthread), then
+  // releases the logger; the file sink flushes on destruction.
 
   void log(log_level level, const std::source_location& loc, std::string_view message) override
   {
@@ -98,23 +93,20 @@ class spdlog_backend final : public log_backend {
   }
 
  private:
-  std::string _registry_name;
   std::shared_ptr<spdlog::logger> _logger;
-  bool _registered = false;
+  // Declared last: joined (and thus done touching _logger) before members are
+  // destroyed.
+  std::jthread _flusher;
 };
 
 }  // namespace
 
 std::shared_ptr<log_backend> make_spdlog_backend(const spdlog_backend_config& config)
 {
-  try {
-    return std::make_shared<spdlog_backend>(config);
-  } catch (const std::exception& e) {
-    SIRIUS_LOG_ERROR("Failed to construct the spdlog logging backend for directory {}: {}",
-                     config.log_dir,
-                     e.what());
-    return nullptr;
-  }
+  // Sink-construction failures (e.g. an unwritable log_dir) propagate to the
+  // caller so a bad `SET sirius_log_dir` fails loudly instead of silently
+  // disabling logging.
+  return std::make_shared<spdlog_backend>(config);
 }
 
 }  // namespace sirius

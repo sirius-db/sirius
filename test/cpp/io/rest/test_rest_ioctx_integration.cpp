@@ -37,6 +37,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <utils/log_test_utils.hpp>
 
 #include <algorithm>
 #include <array>
@@ -544,56 +545,8 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
   return make_direct_rest_ioctx(std::move(endpoint), direct_rest_test_config());
 }
 
-class capture_backend final : public sirius::log_backend {
- public:
-  struct record {
-    sirius::log_level level;
-    std::string payload;
-  };
-
-  void log(sirius::log_level level, const std::source_location&, std::string_view message) override
-  {
-    std::lock_guard<std::mutex> lock(_records_mutex);
-    _records.push_back({level, std::string(message)});
-  }
-
-  bool flush() override { return true; }
-
-  [[nodiscard]] std::vector<record> records() const
-  {
-    std::lock_guard<std::mutex> lock(_records_mutex);
-    return _records;
-  }
-
- private:
-  mutable std::mutex _records_mutex;
-  std::vector<record> _records;
-};
-
-/// Swaps the global logging backend for a capturing one and restores the
-/// configured logger on scope exit.
-class scoped_log_capture {
- public:
-  scoped_log_capture() : _backend(std::make_shared<capture_backend>())
-  {
-    sirius::InitGlobalLogger(_backend, "trace");
-  }
-
-  ~scoped_log_capture()
-  {
-    using duckdb::Config;
-    sirius::InitGlobalLogger(
-      Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
-  }
-
-  scoped_log_capture(scoped_log_capture const&)            = delete;
-  scoped_log_capture& operator=(scoped_log_capture const&) = delete;
-
-  [[nodiscard]] std::vector<capture_backend::record> records() const { return _backend->records(); }
-
- private:
-  std::shared_ptr<capture_backend> _backend;
-};
+using capture_backend    = sirius::test::recording_log_backend;
+using scoped_log_capture = sirius::test::scoped_recording_log_backend;
 
 }  // namespace
 
@@ -1129,7 +1082,7 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
     auto const records = logs.records();
     auto const found   = std::any_of(records.begin(), records.end(), [](auto const& r) {
       return r.level == sirius::log_level::warn &&
-             r.payload.find("warn-retry.parquet") != std::string::npos;
+             r.message.find("warn-retry.parquet") != std::string::npos;
     });
     CHECK(found);
   }

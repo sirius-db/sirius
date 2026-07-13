@@ -87,8 +87,8 @@ struct spdlog_backend_config {
 
 /// Creates a backend writing to a daily-rotated `<log_dir>/sirius.log`.
 ///
-/// Returns nullptr (after logging an error) if the sink cannot be
-/// constructed, e.g. because the directory is not writable.
+/// Throws if the sink cannot be constructed, e.g. because the directory is
+/// not writable — misconfiguration must fail loudly, not silence logging.
 std::shared_ptr<log_backend> make_spdlog_backend(const spdlog_backend_config& config);
 
 /// Creates a backend that discards everything. Selectable via
