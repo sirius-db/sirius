@@ -143,9 +143,9 @@ Uses base class for both `get_next_task_hint()` and `get_next_task_input_data()`
 
 | Method | Behavior |
 |--------|----------|
-| `get_next_task_hint()` | If probe-side with no `_num_partitions` and has sibling: delegates to build sibling's hint. Otherwise: base class. |
-| `get_next_task_input_data()` | Mutex-locked with sibling to atomically determine partition count on first call via `determine_num_partitions()`. Notifies hash join of partition count. Then delegates to base class. |
-| Why custom | Sibling pair coordination: probe must wait for build to determine partition count |
+| `get_next_task_hint()` | If the non-driving side has no `_num_partitions`, delegates to the sizing sibling's hint. Otherwise: base class. |
+| `get_next_task_input_data()` | Mutex-locked with sibling to atomically determine partition count from the designated sizing side on first call. Notifies the hash join when build-side sizing can select an execution mode. Then delegates to base class. |
+| Why custom | Sibling pair coordination: build normally sizes both sides; RIGHT-family joins other than `RIGHT_DELIM_JOIN` size both from the retained probe side. |
 
 Deadlock prevention: both this and sibling partition locks are acquired in a fixed order using `std::scoped_lock`.
 
@@ -196,7 +196,7 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 | PARQUET_SCAN | READY if partitions remain | N/A (task creator handles) | Source, no ports |
 | HASH_JOIN (BUILD_PROBE) | Build state machine | Build+probe or probe only | Build/probe asymmetry |
 | HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
-| PARTITION | Delegates to build sibling | Mutex-locked count determination | Sibling coordination |
+| PARTITION | Delegates to sizing sibling | Mutex-locked count determination | Sibling coordination |
 | CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
 | SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
 | MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |

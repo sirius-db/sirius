@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_nested_loop_join.hpp"
 
+#include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -34,15 +35,19 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/join/conditional_join.hpp>
 #include <cudf/join/join.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/transform.hpp>
 
 #include <rmm/resource_ref.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
 #include <cstdio>
+#include <span>
 
 namespace sirius {
 namespace op {
@@ -50,6 +55,14 @@ namespace op {
 static bool nlj_is_equality(sirius::comparison_type c)
 {
   return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
+}
+
+// Null-safe comparisons treat NULL as an ordinary value: a NULL operand yields a definite
+// TRUE/FALSE, never UNKNOWN.
+static bool nlj_is_null_safe(sirius::comparison_type c)
+{
+  return c == sirius::comparison_type::distinct_from ||
+         c == sirius::comparison_type::not_distinct_from;
 }
 
 void reorder_conditions(duckdb::vector<sirius::join_condition>& conditions)
@@ -95,8 +108,8 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
-    join_type(join_type),
-    conditions(std::move(cond))
+    conditions(std::move(cond)),
+    join_type(join_type)
 {
   reorder_conditions(conditions);
 
@@ -125,8 +138,8 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
-    join_type(join_type),
-    conditions(std::move(cond))
+    conditions(std::move(cond)),
+    join_type(join_type)
 {
   reorder_conditions(conditions);
   children.push_back(std::move(left));
@@ -156,8 +169,8 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
-    join_type(join_type),
-    conditions(std::move(cond))
+    conditions(std::move(cond)),
+    join_type(join_type)
 {
   reorder_conditions(conditions);
   children.push_back(std::move(left));
@@ -215,64 +228,34 @@ duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
-void sirius_physical_nested_loop_join::build_join_pipelines(
-  pipeline::sirius_pipeline& current,
-  pipeline::sirius_meta_pipeline& meta_pipeline,
-  sirius_physical_operator& op,
-  bool build_rhs)
-{
-  auto& state = meta_pipeline.get_state();
-  state.add_pipeline_operator(current, op);
-
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines_so_far;
-  meta_pipeline.get_pipelines(pipelines_so_far, false);
-  auto& last_pipeline = *pipelines_so_far.back();
-
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> dependencies;
-  duckdb::optional_ptr<pipeline::sirius_meta_pipeline> last_child_ptr;
-  if (build_rhs) {
-    // on the RHS (build side), we construct a child MetaPipeline with this operator as its sink
-    auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, op);
-    child_meta_pipeline.build(*op.children[1]);
-    // if (op.children[1].get().CanSaturateThreads(current.GetClientContext())) {
-    // 	// if the build side can saturate all available threads,
-    // 	// we don't just make the LHS pipeline depend on the RHS, but recursively all LHS children
-    // too.
-    // 	// this prevents breadth-first plan evaluation
-    // 	child_meta_pipeline.GetPipelines(dependencies, false);
-    // 	last_child_ptr = meta_pipeline.GetLastChild();
-    // }
-  }
-
-  op.children[0]->build_pipelines(current, meta_pipeline);
-
-  // if (last_child_ptr) {
-  // 	// the pointer was set, set up the dependencies
-  // 	meta_pipeline.add_recursive_dependencies(dependencies, *last_child_ptr);
-  // }
-
-  switch (op.type) {
-    case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
-      throw not_implemented_exception("POSITIONAL_JOIN is not implemented yet");
-      meta_pipeline.create_child_pipeline(current, op, last_pipeline);
-      return;
-    case SiriusPhysicalOperatorType::CROSS_PRODUCT:
-      throw not_implemented_exception("CROSS_PRODUCT is not implemented yet");
-      return;
-    default: break;
-  }
-
-  bool add_child_pipeline = false;
-  auto& join_op           = op.Cast<sirius_physical_nested_loop_join>();
-  if (join_op.is_source()) { add_child_pipeline = true; }
-
-  if (add_child_pipeline) { meta_pipeline.create_child_pipeline(current, op, last_pipeline); }
-}
-
 void sirius_physical_nested_loop_join::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this);
+  // Mirrors sirius_physical_hash_join::build_pipelines.
+  pipeline::sirius_meta_pipeline* host_meta;
+  pipeline::sirius_pipeline* host_current;
+  if (is_sink()) {
+    auto& sink_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
+    host_meta       = &sink_meta;
+    host_current    = sink_meta.get_base_pipeline().get();
+  } else {
+    meta_pipeline.get_state().add_pipeline_operator(current, *this);
+    host_meta    = &meta_pipeline;
+    host_current = &current;
+  }
+
+  D_ASSERT(children.size() == 2);
+  auto& build_child = *children[1];
+  D_ASSERT(build_child.is_sink());
+  D_ASSERT(!build_child.children.empty());
+  auto& build_meta = host_meta->create_child_meta_pipeline(*host_current, build_child);
+  build_meta.build(*build_child.children[0]);
+
+  auto& probe_child = *children[0];
+  D_ASSERT(probe_child.is_sink());
+  D_ASSERT(!probe_child.children.empty());
+  auto& probe_meta = host_meta->create_child_meta_pipeline(*host_current, probe_child);
+  probe_meta.build(*probe_child.children[0]);
 }
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()
@@ -347,16 +330,31 @@ namespace {
 cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
 {
   switch (comparison) {
-    case sirius::comparison_type::equal: return cudf::ast::ast_operator::EQUAL;
-    case sirius::comparison_type::not_distinct_from: return cudf::ast::ast_operator::NULL_EQUAL;
-    case sirius::comparison_type::not_equal:
-    case sirius::comparison_type::distinct_from: return cudf::ast::ast_operator::NOT_EQUAL;
-    case sirius::comparison_type::lt: return cudf::ast::ast_operator::LESS;
-    case sirius::comparison_type::gt: return cudf::ast::ast_operator::GREATER;
-    case sirius::comparison_type::le: return cudf::ast::ast_operator::LESS_EQUAL;
-    case sirius::comparison_type::ge: return cudf::ast::ast_operator::GREATER_EQUAL;
+    using enum sirius::comparison_type;
+    using enum cudf::ast::ast_operator;
+    case equal: return EQUAL;
+    case not_distinct_from: return NULL_EQUAL;
+    case not_equal: return NOT_EQUAL;
+    case distinct_from: break;  // built as NOT(NULL_EQUAL) by the caller
+    case lt: return LESS;
+    case gt: return GREATER;
+    case le: return LESS_EQUAL;
+    case ge: return GREATER_EQUAL;
   }
   throw std::runtime_error("sirius_physical_nested_loop_join: unsupported comparison type");
+}
+
+/// @brief Left-associative LOGICAL_AND over @p terms; @p chain owns the AND nodes and must be
+/// pre-reserved to terms.size()-1.
+const cudf::ast::expression& fold_logical_and(
+  std::span<const std::reference_wrapper<const cudf::ast::expression>> terms,
+  std::vector<cudf::ast::operation>& chain)
+{
+  for (size_t i = 1; i < terms.size(); i++) {
+    const cudf::ast::expression& lhs = (i == 1) ? terms[0].get() : chain.back();
+    chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND, lhs, terms[i].get());
+  }
+  return chain.empty() ? terms[0].get() : chain.back();
 }
 
 // Resolve table column index: BOUND_REF, BOUND_CAST(BOUND_REF), or BOUND_SUBQUERY (scalar
@@ -383,6 +381,186 @@ bool get_column_index(const duckdb::Expression& expr, cudf::size_type& out_idx)
 }
 
 }  // namespace
+
+cudf::table_view sirius_physical_nested_loop_join::select_left_output(
+  const cudf::table_view& left) const
+{
+  std::vector<cudf::size_type> sel;
+  sel.reserve(left_output_col_idxs.size());
+  for (std::size_t idx : left_output_col_idxs) {
+    if (idx < static_cast<std::size_t>(left.num_columns())) {
+      sel.push_back(static_cast<cudf::size_type>(idx));
+    }
+  }
+  return left.select(sel);
+}
+
+static std::unique_ptr<cudf::column> scatter_bool(
+  std::unique_ptr<cudf::column> column,
+  const rmm::device_uvector<cudf::size_type>& indices,
+  bool value,
+  rmm::cuda_stream_view stream)
+{
+  if (indices.size() == 0) { return column; }
+  cudf::numeric_scalar<bool> scalar(value, true, stream);
+  cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
+                                static_cast<cudf::size_type>(indices.size()),
+                                indices.data(),
+                                nullptr,
+                                0,
+                                0,
+                                {});
+  auto scattered = cudf::scatter({std::ref(static_cast<const cudf::scalar&>(scalar))},
+                                 scatter_map,
+                                 cudf::table_view({column->view()}),
+                                 stream);
+  return std::move(scattered->release()[0]);
+}
+
+/// @brief MARK join output with SQL three-valued logic: every row of @p left_view passes through,
+/// plus a BOOL8 mark that is true at @p true_indices, NULL at rows in @p maybe_indices (the
+/// "predicate IS NOT FALSE" semi-join) but not in @p true_indices, and false elsewhere.
+///
+/// Callers pass the projection-selected left view; the index sets index original left rows, which
+/// stay valid because selection drops columns only. @p telemetry_info links the emitted batch into
+/// the query's telemetry lineage.
+static std::unique_ptr<operator_data> resolve_mark_join_result(
+  const rmm::device_uvector<cudf::size_type>& true_indices,
+  const rmm::device_uvector<cudf::size_type>& maybe_indices,
+  const cudf::table_view& left_view,
+  cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  std::vector<std::unique_ptr<cudf::column>> out_cols;
+  out_cols.reserve(left_view.num_columns() + 1);
+  for (cudf::size_type i = 0; i < left_view.num_columns(); i++) {
+    out_cols.push_back(std::make_unique<cudf::column>(left_view.column(i), stream));
+  }
+
+  auto num_rows = left_view.num_rows();
+
+  cudf::numeric_scalar<bool> false_scalar(false, true, stream);
+  auto mark_column = cudf::make_column_from_scalar(false_scalar, num_rows, stream);
+  mark_column      = scatter_bool(std::move(mark_column), true_indices, true, stream);
+
+  // validity == matched OR NOT maybe; false cells become NULL via bools_to_mask.
+  cudf::numeric_scalar<bool> true_scalar(true, true, stream);
+  auto validity_col = cudf::make_column_from_scalar(true_scalar, num_rows, stream);
+  validity_col      = scatter_bool(std::move(validity_col), maybe_indices, false, stream);
+  validity_col      = scatter_bool(std::move(validity_col), true_indices, true, stream);
+
+  auto [null_mask, null_count] = cudf::bools_to_mask(validity_col->view(), stream);
+  if (null_count > 0) { mark_column->set_null_mask(std::move(*null_mask), null_count); }
+
+  out_cols.push_back(std::move(mark_column));
+
+  auto output_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{
+      make_data_batch(std::move(output_table), space, stream, telemetry_info)});
+}
+
+std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_empty_result(
+  const cudf::table_view& left,
+  const cudf::table_view& right,
+  bool left_side_empty,
+  cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream)
+{
+  auto mr                       = space.get_default_allocator();
+  auto const num_surviving_rows = left_side_empty ? right.num_rows() : left.num_rows();
+
+  if (join_type == duckdb::JoinType::MARK) {
+    // Empty left emits 0 rows (schema kept); empty right marks every left row false — the OR over
+    // an empty set of right rows is FALSE, never NULL, so both index sets stay empty.
+    rmm::device_uvector<cudf::size_type> no_matches(0, stream);
+    rmm::device_uvector<cudf::size_type> no_maybe(0, stream);
+    return resolve_mark_join_result(
+      no_matches, no_maybe, select_left_output(left), space, stream, batch_telemetry());
+  }
+
+  // Gather maps per the §3 semantics table, filled on the task stream (cudf::sequence /
+  // make_column_from_scalar run the device fill; this TU is host-compiled, so raw thrust
+  // device algorithms are not available here). -1 entries gathered from the 0-row empty-side
+  // table become NULL rows under the NULLIFY policy.
+  auto iota = [&]() -> std::unique_ptr<cudf::column> {
+    cudf::numeric_scalar<cudf::size_type> init(0, true, stream);
+    return cudf::sequence(num_surviving_rows, init, stream, mr);
+  };
+  auto pad = [&]() -> std::unique_ptr<cudf::column> {
+    cudf::numeric_scalar<cudf::size_type> minus_one(-1, true, stream);
+    return cudf::make_column_from_scalar(minus_one, num_surviving_rows, stream, mr);
+  };
+  auto none = [&]() -> std::unique_ptr<cudf::column> {
+    return cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
+  };
+
+  std::unique_ptr<cudf::column> left_map, right_map;
+  switch (join_type) {
+    case duckdb::JoinType::LEFT:
+      left_map  = left_side_empty ? none() : iota();
+      right_map = left_side_empty ? none() : pad();
+      break;
+    case duckdb::JoinType::RIGHT:
+      left_map  = left_side_empty ? pad() : none();
+      right_map = left_side_empty ? iota() : none();
+      break;
+    case duckdb::JoinType::OUTER:
+      left_map  = left_side_empty ? pad() : iota();
+      right_map = left_side_empty ? iota() : pad();
+      break;
+    case duckdb::JoinType::INNER:
+      left_map  = none();
+      right_map = none();
+      break;
+    case duckdb::JoinType::SEMI:
+    case duckdb::JoinType::ANTI: {
+      // Mirror execute(): SEMI/ANTI output the projected left columns. An empty side
+      // means no matches — SEMI keeps nothing; ANTI keeps every left row when the right
+      // side is the empty one.
+      bool const keep_all = (join_type == duckdb::JoinType::ANTI) && !left_side_empty;
+      auto left_map_col   = keep_all ? iota() : none();
+      auto gathered       = cudf::gather(select_left_output(left),
+                                   left_map_col->view(),
+                                   cudf::out_of_bounds_policy::DONT_CHECK,
+                                   stream,
+                                   mr);
+      return std::make_unique<pipelineable_operator_data>(
+        std::vector<std::shared_ptr<cucascade::data_batch>>{
+          make_data_batch(std::move(gathered), space, stream, batch_telemetry())});
+    }
+    default:
+      throw std::runtime_error("sirius_physical_nested_loop_join: unsupported join type: " +
+                               duckdb::JoinTypeToString(join_type));
+  }
+
+  auto left_out_of_bounds =
+    (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER)
+      ? cudf::out_of_bounds_policy::NULLIFY
+      : cudf::out_of_bounds_policy::DONT_CHECK;
+  auto right_out_of_bounds =
+    (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER)
+      ? cudf::out_of_bounds_policy::NULLIFY
+      : cudf::out_of_bounds_policy::DONT_CHECK;
+
+  auto left_gathered  = cudf::gather(left, left_map->view(), left_out_of_bounds, stream, mr);
+  auto right_gathered = cudf::gather(right, right_map->view(), right_out_of_bounds, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> out_cols;
+  auto left_released  = left_gathered->release();
+  auto right_released = right_gathered->release();
+  out_cols.reserve(left_output_col_idxs.size() + right_output_col_idxs.size());
+  for (std::size_t idx : left_output_col_idxs) {
+    if (idx < left_released.size()) { out_cols.push_back(std::move(left_released[idx])); }
+  }
+  for (std::size_t idx : right_output_col_idxs) {
+    if (idx < right_released.size()) { out_cols.push_back(std::move(right_released[idx])); }
+  }
+  auto result_table = std::make_unique<cudf::table>(std::move(out_cols), stream, mr);
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{
+      make_data_batch(std::move(result_table), space, stream, batch_telemetry())});
+}
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
@@ -419,23 +597,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   auto mr = space->get_default_allocator();
 
   if (left.num_rows() == 0 || right.num_rows() == 0) {
-    std::vector<std::unique_ptr<cudf::column>> empty_cols;
-    empty_cols.reserve(left_output_col_idxs.size() + right_output_col_idxs.size());
-    for (std::size_t idx : left_output_col_idxs) {
-      if (idx < static_cast<std::size_t>(left.num_columns())) {
-        empty_cols.push_back(cudf::make_empty_column(left.column(idx).type()));
-      }
-    }
-    for (std::size_t idx : right_output_col_idxs) {
-      if (idx < static_cast<std::size_t>(right.num_columns())) {
-        empty_cols.push_back(cudf::make_empty_column(right.column(idx).type()));
-      }
-    }
-    auto empty_table = std::make_unique<cudf::table>(std::move(empty_cols), stream, mr);
-    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 empty output batches", pipeline_id);
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{
-        make_data_batch(std::move(empty_table), *space, stream)});
+    // A real 0-row batch on one side (e.g. an all-pruned scan under the empty-split fallback)
+    // must produce the same join-type-correct output as a dead side — LEFT/RIGHT/OUTER pad the
+    // preserved rows, ANTI keeps them, MARK marks them false — not an unconditionally empty
+    // table.
+    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, one input side empty", pipeline_id);
+    return emit_one_side_empty_result(left, right, left.num_rows() == 0, *space, stream);
   }
 
   std::unique_ptr<cudf::table> result_table;
@@ -470,10 +637,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     std::vector<cudf::ast::column_reference> left_refs;
     std::vector<cudf::ast::column_reference> right_refs;
     std::vector<cudf::ast::operation> cond_ops;
+    std::vector<cudf::ast::operation> distinct_inner_ops;  // NULL_EQUAL nodes under distinct_from
     std::vector<cudf::ast::operation> and_chain;
     left_refs.reserve(conditions.size());
     right_refs.reserve(conditions.size());
     cond_ops.reserve(conditions.size());
+    distinct_inner_ops.reserve(conditions.size());
     and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
     std::vector<cudf::column_view> left_col_views, right_col_views;
     std::vector<std::unique_ptr<cudf::column>> intermediates_scope_holder;
@@ -551,25 +720,24 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
 
       left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
       right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);
-      cond_ops.emplace_back(to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
+      if (cond.comparison == sirius::comparison_type::distinct_from) {
+        // IS DISTINCT FROM is null-safe (NULL vs 5 is TRUE, NULL vs NULL is FALSE) but cuDF's
+        // NOT_EQUAL is null-propagating, so build NOT(NULL_EQUAL(l, r)) instead.
+        distinct_inner_ops.emplace_back(
+          cudf::ast::ast_operator::NULL_EQUAL, left_refs.back(), right_refs.back());
+        cond_ops.emplace_back(cudf::ast::ast_operator::NOT, distinct_inner_ops.back());
+      } else {
+        cond_ops.emplace_back(
+          to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
+      }
     }
 
     cudf::table_view left_effective(left_col_views);
     cudf::table_view right_effective(right_col_views);
 
-    // Build a left-associative AND chain referencing cond_ops elements directly — never copying
-    // operations, matching the cuDF test pattern. and_chain holds exactly (N-1) LOGICAL_AND nodes
-    // for N conditions; cond_ops[0] is the left leaf of the first AND node, not copied into
-    // and_chain.
-    for (size_t i = 1; i < cond_ops.size(); i++) {
-      const cudf::ast::expression& lhs =
-        (i == 1) ? static_cast<const cudf::ast::expression&>(cond_ops[0]) : and_chain.back();
-      and_chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND,
-                             lhs,
-                             static_cast<const cudf::ast::expression&>(cond_ops[i]));
-    }
-    const cudf::ast::expression& predicate =
-      and_chain.empty() ? static_cast<const cudf::ast::expression&>(cond_ops[0]) : and_chain.back();
+    const std::vector<std::reference_wrapper<const cudf::ast::expression>> cond_terms(
+      cond_ops.begin(), cond_ops.end());
+    const cudf::ast::expression& predicate = fold_logical_and(cond_terms, and_chain);
 
     std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
               std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
@@ -599,12 +767,12 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
                                           0,
                                           0,
                                           {});
-        auto gathered =
-          cudf::gather(left, left_map, cudf::out_of_bounds_policy::NULLIFY, stream, mr);
+        auto gathered = cudf::gather(
+          select_left_output(left), left_map, cudf::out_of_bounds_policy::NULLIFY, stream, mr);
         SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
         return std::make_unique<pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{
-            make_data_batch(std::move(gathered), *space, stream)});
+            make_data_batch(std::move(gathered), *space, stream, batch_telemetry())});
       }
       case duckdb::JoinType::ANTI: {
         auto left_indices = cudf::conditional_left_anti_join(
@@ -616,12 +784,60 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
                                           0,
                                           0,
                                           {});
-        auto gathered =
-          cudf::gather(left, left_map, cudf::out_of_bounds_policy::NULLIFY, stream, mr);
+        auto gathered = cudf::gather(
+          select_left_output(left), left_map, cudf::out_of_bounds_policy::NULLIFY, stream, mr);
         SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
         return std::make_unique<pipelineable_operator_data>(
           std::vector<std::shared_ptr<cucascade::data_batch>>{
-            make_data_batch(std::move(gathered), *space, stream)});
+            make_data_batch(std::move(gathered), *space, stream, batch_telemetry())});
+      }
+      case duckdb::JoinType::MARK: {
+        auto true_indices = cudf::conditional_left_semi_join(
+          left_effective, right_effective, predicate, std::nullopt, stream, mr);
+
+        // Three-valued MARK: an unmatched row is NULL only when the predicate was UNKNOWN (never
+        // TRUE) for some right row; a second semi-join on "predicate IS NOT FALSE" finds those.
+        // (AND ci) IS NOT FALSE == AND_i (ci IS NOT FALSE), where a null-propagating ci becomes
+        // ci OR IS_NULL(left) OR IS_NULL(right) (Kleene NULL_LOGICAL_OR) and a null-safe ci is
+        // never UNKNOWN, so it stays ci itself.
+        std::vector<cudf::ast::operation> isnull_left_ops;
+        std::vector<cudf::ast::operation> isnull_right_ops;
+        std::vector<cudf::ast::operation> notfalse_inner_ops;
+        std::vector<cudf::ast::operation> notfalse_or_ops;
+        std::vector<cudf::ast::operation> notfalse_and_chain;
+        std::vector<std::reference_wrapper<const cudf::ast::expression>> notfalse_terms;
+        isnull_left_ops.reserve(cond_ops.size());
+        isnull_right_ops.reserve(cond_ops.size());
+        notfalse_inner_ops.reserve(cond_ops.size());
+        notfalse_or_ops.reserve(cond_ops.size());
+        notfalse_and_chain.reserve(cond_ops.size() > 1 ? cond_ops.size() - 1 : 0);
+        notfalse_terms.reserve(cond_ops.size());
+        for (size_t i = 0; i < cond_ops.size(); i++) {
+          if (nlj_is_null_safe(conditions[i].comparison)) {
+            notfalse_terms.emplace_back(cond_ops[i]);
+            continue;
+          }
+          isnull_left_ops.emplace_back(cudf::ast::ast_operator::IS_NULL, left_refs[i]);
+          isnull_right_ops.emplace_back(cudf::ast::ast_operator::IS_NULL, right_refs[i]);
+          notfalse_inner_ops.emplace_back(
+            cudf::ast::ast_operator::NULL_LOGICAL_OR, cond_ops[i], isnull_left_ops.back());
+          notfalse_or_ops.emplace_back(cudf::ast::ast_operator::NULL_LOGICAL_OR,
+                                       notfalse_inner_ops.back(),
+                                       isnull_right_ops.back());
+          notfalse_terms.emplace_back(notfalse_or_ops.back());
+        }
+        const cudf::ast::expression& not_false_predicate =
+          fold_logical_and(notfalse_terms, notfalse_and_chain);
+        auto maybe_indices = cudf::conditional_left_semi_join(
+          left_effective, right_effective, not_false_predicate, std::nullopt, stream, mr);
+
+        SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
+        return resolve_mark_join_result(*true_indices,
+                                        *maybe_indices,
+                                        select_left_output(left),
+                                        *space,
+                                        stream,
+                                        batch_telemetry());
       }
       case duckdb::JoinType::OUTER:
         join_result =
@@ -677,7 +893,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{
-      make_data_batch(std::move(result_table), *space, stream)});
+      make_data_batch(std::move(result_table), *space, stream, batch_telemetry())});
 }
 
 }  // namespace op

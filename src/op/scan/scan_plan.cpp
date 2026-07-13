@@ -222,14 +222,10 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     plan.partition_primary_indices.insert(hpi.index);
   }
 
-  // Reader projection is needed whenever the planner pruned / reordered columns
-  // (non-empty projection_ids) or hive-partition columns must be stripped from
-  // the physical read. It is ALSO needed when projection_ids is empty but
-  // column_ids is itself a pruned/reordered subset — DuckDB's no-projection-
-  // pushdown plan for sirius_read_parquet. Without it the reader returns the full
-  // file width in file order while output_layout assembles by compacted subset
-  // position, selecting the wrong columns. (Guarded on names: the reader is
-  // projected by name, and the ingestible's needs_names check enforces presence.)
+  // First mark every shape that may need a by-name reader projection:
+  // explicit projection, hive partitions, or a pruned/reordered column_ids
+  // subset. After the walk below, we clear this again for scans with no real
+  // parquet data columns.
   plan.needs_reader_projection =
     !projection_ids.empty() || !partition_indices.empty() ||
     (!names.empty() && column_ids_need_reader_projection(column_ids, names.size()));
@@ -246,6 +242,10 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   std::unordered_set<std::size_t> seen_primary_indices;
   std::unordered_map<std::size_t, std::size_t> primary_to_batch;  // P → D
 
+  // C → output-position map; filled as output entries are appended (see field doc). Sized to
+  // column_ids; positions that never produce output keep the sentinel.
+  plan.output_position_by_column_id.assign(column_ids.size(), scan_plan::no_output_position);
+
   auto handle_position = [&](std::size_t column_ids_pos, bool is_output) {
     auto const primary_idx = column_ids.at(column_ids_pos).GetPrimaryIndex();
     if (duckdb::IsVirtualColumn(primary_idx)) { return; }
@@ -261,6 +261,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       auto const partition_cols_idx = plan.partition_columns.size();
       plan.partition_columns.push_back(scan_plan::partition_column{
         primary_idx, names.at(primary_idx), returned_types.at(primary_idx)});
+      plan.output_position_by_column_id[column_ids_pos] = plan.output_layout.size();
       plan.output_layout.push_back(
         scan_plan::output_entry{scan_plan::output_entry::PARTITION, partition_cols_idx});
     } else {
@@ -274,6 +275,7 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
       primary_to_batch[primary_idx] = batch_idx;
       if (is_output) {
+        plan.output_position_by_column_id[column_ids_pos] = plan.output_layout.size();
         plan.output_layout.push_back(
           scan_plan::output_entry{scan_plan::output_entry::DATA, batch_idx});
       }
@@ -301,6 +303,11 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     if (it == primary_to_batch.end()) { continue; }
     plan.batch_position_by_column_id[c] = it->second;
   }
+
+  // The gate: a column-less scan (count(*)/virtual-only or partition-only, only
+  // known after the walk) must keep the natural batch — projecting it hands cuDF
+  // set_column_names({}), a zero-column read over live row groups that hangs.
+  plan.needs_reader_projection = plan.needs_reader_projection && !plan.data_columns.empty();
 
   SIRIUS_LOG_DEBUG("[scan_plan] built plan: {} data col(s), {} partition col(s), {} output entries",
                    plan.data_columns.size(),

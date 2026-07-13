@@ -95,7 +95,7 @@ void write_config(fs::path const& yaml_path)
        "      num_threads: 2\n"
        "    downgrade:\n"
        "      num_threads: 1\n"
-       "      monitor_period_ms: 10\n"
+       "      monitor_period: 10ms\n"
        "  operator_params:\n"
        "    scan_task_batch_size: 100000000\n"
        "    default_scan_task_varchar_size: 256\n"

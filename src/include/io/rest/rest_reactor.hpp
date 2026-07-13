@@ -43,6 +43,27 @@
 
 namespace sirius::io::rest {
 
+/// Parse the total object length out of a Content-Range value of the form
+/// "bytes <first>-<last>/<total>".  Returns nullopt when the unit is not
+/// "bytes", the range is unsatisfied ("bytes */..."), or the total is unknown
+/// ("*") — i.e. any response the footer probe cannot trust.
+[[nodiscard]] std::optional<std::size_t> content_range_total(std::string const& content_range);
+
+// ---------------------------------------------------------------------------
+// footer_probe
+// ---------------------------------------------------------------------------
+
+/// Result of a suffix-range footer probe: the object's total size plus the
+/// trailing window [window_lo, object_size) captured in @c bytes.  @c bytes is
+/// null when the probe could not be satisfied (the caller then falls back to a
+/// HEAD).  Held by shared_ptr so the trailing bytes are shared, not copied, with
+/// the io_object that carries them for this open.
+struct footer_probe {
+  std::size_t object_size{0};
+  std::size_t window_lo{0};
+  std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+};
+
 // ---------------------------------------------------------------------------
 // rest_io_object
 // ---------------------------------------------------------------------------
@@ -61,6 +82,24 @@ class rest_io_object : public sirius_io_object {
   {
   }
 
+  /// As above, but carrying a suffix-range footer stash: @p stash holds the
+  /// object's bytes over [window_lo, object_size), so @c rest_reactor::host_read
+  /// serves any read fully inside that window from memory instead of a GET.
+  rest_io_object(std::string path,
+                 std::string bucket,
+                 std::string key,
+                 size_t object_size,
+                 size_t window_lo,
+                 std::shared_ptr<const std::vector<std::uint8_t>> stash)
+    : _path(std::move(path)),
+      _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _file_size(object_size),
+      _window_lo(window_lo),
+      _stash(std::move(stash))
+  {
+  }
+
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
@@ -69,11 +108,22 @@ class rest_io_object : public sirius_io_object {
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
   [[nodiscard]] s3::s3_object_ref object_ref() const { return s3::s3_object_ref{_bucket, _key}; }
 
+  /// Trailing bytes prefetched at open (a suffix-range footer probe), or null
+  /// when the object was opened without one.  A read fully inside
+  /// [stash_window_lo, size) is served from here by @c host_read.
+  [[nodiscard]] const std::shared_ptr<const std::vector<std::uint8_t>>& stash() const noexcept
+  {
+    return _stash;
+  }
+  [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
+
  private:
   std::string _path;
   std::string _bucket;
   std::string _key;
   size_t _file_size{0};
+  size_t _window_lo{0};
+  std::shared_ptr<const std::vector<std::uint8_t>> _stash;
 };
 
 // ---------------------------------------------------------------------------
@@ -217,6 +267,14 @@ class rest_reactor {
   /// Blocking HEAD to discover an object's size.  Used by the ioctx to build
   /// an @c rest_io_object.  @p bucket / @p key identify the object.
   size_t head_object_size(std::string_view bucket, std::string_view key);
+
+  /// Blocking suffix-range GET of the last @p n bytes of an object, resolving
+  /// the size and stashing the parquet footer in a single round-trip.  On a
+  /// well-formed 206 the returned @c footer_probe carries the object size, the
+  /// window origin, and the trailing bytes; on any unusable response (200 full
+  /// body, missing / unsatisfied Content-Range) @c bytes is null so the caller
+  /// falls back to a HEAD.  @p bucket / @p key identify the object.
+  footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
 
   /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
   /// loads); safe to call while the reactor is running.

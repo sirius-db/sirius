@@ -50,7 +50,7 @@ void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
   while (has_more_splits()) {
     auto work = next_split_provider();
     if (!work) { continue; }
-    scheduler.enqueue([this, on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
+    scheduler.enqueue([on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
       try {
         auto split = work();
         on_split(std::move(split));

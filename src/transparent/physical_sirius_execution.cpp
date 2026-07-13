@@ -20,6 +20,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
+#include "transparent/sirius_optimizer_extension.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -110,13 +111,17 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // the same prepared physical operator across multiple EXECUTE calls.
     //
     // Prefer LogicalOperator::Copy when the plan supports it (cheap deep clone
-    // via serialization). When the plan contains a non-serializable LogicalGet
-    // (e.g. iceberg_scan), fall back to re-parsing + re-binding the unbound SQL
-    // statement, which exercises the same bind path the very first run did.
+    // via serialization). When the plan contains a non-serializable LogicalGet,
+    // fall back to re-parsing + re-binding the unbound SQL statement, which
+    // exercises the same bind path the very first run did.
     duckdb::unique_ptr<duckdb::LogicalOperator> fresh_plan;
     if (logical_plan_) {
       try {
-        fresh_plan = logical_plan_->Copy(context.client);
+        // Use the dynamic-filter-aware copy so LogicalComparisonJoin::filter_pushdown and
+        // LogicalGet::dynamic_filters survive the serialize/deserialize round-trip — they are
+        // not in DuckDB's serialization schema and would otherwise be null on the fresh plan,
+        // making downstream Sirius wiring silently miss runtime-computed dynamic filters.
+        fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
       } catch (duckdb::NotImplementedException&) {
         // Drop logical_plan_ — we know it can't be copied, so future executes
         // will skip straight to the replan path.

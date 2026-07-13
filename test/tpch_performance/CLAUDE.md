@@ -171,7 +171,7 @@ Key flags:
 | `duckdb` | `run_tpch_duckdb.sh` | `performance_test.duckdb` or `--duckdb-file` | `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN` (the engine default) |
 | `duckdb-native` | `run_tpch_duckdb.sh` | same `.duckdb` file as `duckdb` | alias of `duckdb` — kept for compatibility |
 
-The **GPU-native DuckDB scan is the only `seq_scan` path** in the engine, so the `duckdb` data source routes `seq_scan` to `GPU_DUCKDB_NATIVE_SCAN` via `insert_duckdb_native_scan_operator` (`src/pipeline/sirius_pipeline_converter.cpp`). `duckdb-native` and the `--gpu-native-scan` flag are redundant no-op aliases. The `duckdb` engine remains the unchanged DuckDB CPU baseline (it runs with `SIRIUS_DISABLE=1`), so `validation.csv` validates GPU-native-scan output against DuckDB CPU.
+The **GPU-native DuckDB scan is the only `seq_scan` path** in the engine, so the `duckdb` data source routes `seq_scan` to `GPU_DUCKDB_NATIVE_SCAN` via `build_duckdb_native_table_info` (`src/planner/sirius_physical_plan_generator.cpp`). `duckdb-native` and the `--gpu-native-scan` flag are redundant no-op aliases. The `duckdb` engine remains the unchanged DuckDB CPU baseline (it runs with `SIRIUS_DISABLE=1`), so `validation.csv` validates GPU-native-scan output against DuckDB CPU.
 
 ```bash
 # Generate the native .duckdb tables

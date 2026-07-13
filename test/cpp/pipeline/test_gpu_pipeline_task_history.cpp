@@ -87,6 +87,16 @@ class stub_operator : public sirius::op::sirius_physical_operator {
   bool acts_as_sink = false;
 };
 
+class scan_sizing_input : public sirius::op::operator_data {
+ public:
+  [[nodiscard]] sirius::op::operator_data_type get_type() const override
+  {
+    return sirius::op::operator_data_type::GPU_SCAN;
+  }
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override { return 100; }
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override { return 500; }
+};
+
 //------------------------------------------------------------------------------
 // Test fixture: memory manager setup and data creation helpers.
 //------------------------------------------------------------------------------
@@ -135,7 +145,8 @@ struct pipeline_task_history_fixture {
                                                  gpu_mr);
     stream.synchronize();
 
-    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
     auto& registry = sirius::converter_registry::get();
     {
@@ -165,7 +176,8 @@ struct pipeline_task_history_fixture {
                                                  gpu_mr);
     stream.synchronize();
 
-    auto batch = sirius::make_data_batch(std::move(gpu_table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
     return batch;
   }
 };
@@ -182,7 +194,7 @@ struct pipeline_context {
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_source = std::make_unique<stub_operator>();
@@ -277,7 +289,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
     std::move(global_state));
 
   if (reservation_size > 0) {
-    auto info        = task->get_estimated_reservation_size_info();
+    auto info        = task->get_estimated_reservation_size_info(f.gpu_space);
     auto reservation = f.manager->request_reservation(
       cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, reservation_size);
     REQUIRE(reservation != nullptr);
@@ -335,7 +347,7 @@ TEST_CASE("cached scan input materialization contributes to task reservations",
     REQUIRE(materialization_bytes > 0);
 
     auto task = create_cached_scan_task(global_state, batch, 1);
-    auto info = task->get_estimated_reservation_size_info();
+    auto info = task->get_estimated_reservation_size_info(nullptr);
     REQUIRE(info.input_basis == input_basis);
     REQUIRE(info.bytes_to_materialize_input == materialization_bytes);
     REQUIRE_FALSE(info.had_history);
@@ -344,7 +356,7 @@ TEST_CASE("cached scan input materialization contributes to task reservations",
 
     global_state->get_memory_history().record({input_basis, input_basis / 2, input_basis});
     auto task_with_history = create_cached_scan_task(global_state, batch, 2);
-    auto info_with_history = task_with_history->get_estimated_reservation_size_info();
+    auto info_with_history = task_with_history->get_estimated_reservation_size_info(nullptr);
     REQUIRE(info_with_history.had_history);
     REQUIRE(info_with_history.peak_memory_estimate == input_basis / 2);
     REQUIRE(info_with_history.reservation_size == input_basis / 2 + materialization_bytes);
@@ -362,13 +374,36 @@ TEST_CASE("cached scan input materialization contributes to task reservations",
     REQUIRE(input_basis > 0);
 
     auto task = create_cached_scan_task(global_state, std::move(batch), 1);
-    auto info = task->get_estimated_reservation_size_info();
+    auto info = task->get_estimated_reservation_size_info(nullptr);
     REQUIRE(info.input_basis == input_basis);
     REQUIRE(info.bytes_to_materialize_input == 0);
     REQUIRE_FALSE(info.had_history);
     REQUIRE(info.peak_memory_estimate == input_basis);
     REQUIRE(info.reservation_size == input_basis);
   }
+}
+
+TEST_CASE("scan working set is a lower bound for history-based reservations",
+          "[gpu_pipeline_task][history][scan]")
+{
+  auto ctx          = create_pipeline_context();
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  global_state->get_memory_history().record({100, 200, 100});
+
+  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    1,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+      std::make_unique<scan_sizing_input>()),
+    std::move(global_state));
+
+  // nullptr target space: scan inputs are not pipelineable, so no materialization is counted
+  // regardless; this test sizes from history + scan working set only.
+  auto const estimate = task->get_estimated_reservation_size_info(nullptr);
+  CHECK(estimate.had_history);
+  CHECK(estimate.peak_memory_estimate == 500);
+  CHECK(estimate.reservation_size == 500);
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +419,12 @@ TEST_CASE("cached scan input materialization contributes to task reservations",
 // When execute() tries to convert the host data to GPU via lock_or_prepare_batch,
 // the 300 MB allocation exceeds the remaining ~100 MB -> rmm::out_of_memory.
 //
-// In the OOM catch handler, peak_bytes ~= 300 MB (requested) should be recorded to memory history.
+// The OOM catch handler records to memory history with bytes_to_materialize_input subtracted
+// from the observed peak (consistent with the success and compute-OOM record paths, so
+// materialization overhead never inflates operator peaks). Prepare's allocations here are
+// entirely input materialization (~300 MB == bytes_to_materialize_input), so the recorded
+// operator peak is 0 — a record still exists, and the estimator re-adds materialization cost
+// separately on top of the history-based estimate.
 // ---------------------------------------------------------------------------
 
 TEST_CASE(
@@ -435,11 +475,13 @@ TEST_CASE(
 
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
 
-  // Verify: memory history should have one record with the OOM peak_bytes
+  // Verify: one record exists, and its peak excludes materialization bytes. Prepare's
+  // allocations were entirely input materialization, so the recorded operator peak is 0
+  // (the estimator adds bytes_to_materialize_input back on top of the history estimate).
   REQUIRE(global_state->get_memory_history().size() == 1);
   auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
   REQUIRE(estimate.has_value());
-  REQUIRE(*estimate == kInputDataSize);
+  REQUIRE(*estimate == 0);
 
   // Cleanup: release the pressure allocation
   pressure_allocator->deallocate(
@@ -555,7 +597,7 @@ TEST_CASE("gpu_pipeline_task execute successfully records to pipeline memory his
 
   auto task2 = create_pipeline_task(f, global_state, input_batch2, 0, /*task_id=*/2);
 
-  auto info2       = task2->get_estimated_reservation_size_info();
+  auto info2       = task2->get_estimated_reservation_size_info(f.gpu_space);
   auto estimation2 = info2.reservation_size;
   REQUIRE(estimation2 ==
           ((float)kInputDataSize2 / (float)kInputDataSize1) * (kExecuteConsumptionSize1));

@@ -66,4 +66,13 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
   return 0;
 }
 
+std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
+{
+  if (std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info)) {
+    return std::get<std::unique_ptr<scan_info>>(materialization_info)
+      ->estimated_working_set_bytes();
+  }
+  return get_estimated_size_in_bytes();
+}
+
 }  // namespace sirius::op::scan

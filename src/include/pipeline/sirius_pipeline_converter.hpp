@@ -17,19 +17,13 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
-#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
-#include <memory>
-#include <unordered_map>
+#include <string>
 #include <vector>
-
-namespace duckdb {
-class ClientContext;
-}  // namespace duckdb
 
 namespace sirius {
 
@@ -41,9 +35,6 @@ namespace pipeline {
 struct pipeline_conversion_result {
   //! The execution-ready pipelines in dependency order
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_pipelines;
-  //! Ownership container for operators inserted during splitting (PARTITION, CONCAT, MERGE,
-  //! and source-side operators such as DUCKDB_SCAN, GPU_PARQUET_SCAN, CPU_SOURCE).
-  duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators;
   //! Plan-time wiring descriptors. Materialized into runtime repositories and ports by
   //! `materialize_repository_wiring()` after the converter returns.
   std::vector<repository_wiring> repository_wirings;
@@ -51,31 +42,39 @@ struct pipeline_conversion_result {
   std::size_t meta_pipeline_count;
 };
 
-//! Converts DuckDB-style meta-pipelines into Sirius execution-ready pipelines.
+//! Deterministic, line-oriented serialization of a pipeline_conversion_result, used by the
+//! schedule/determinism tests and as a debugging surface: equivalent graphs produce
+//! byte-identical output regardless of emission order.
+std::string dump_pipeline_conversion_result(const pipeline_conversion_result& result);
+
+//! Reorders `pipelines` in place into a deterministic, strictly-topological schedule
+//! (every pipeline after all of its `dependencies`), renumbers `pipeline_id` to the new
+//! positions, and re-sorts each pipeline's `dependencies` ascending by the new ids.
+//! The raw meta-sweep emission is not topological, so this must run last in `convert()`.
 //!
-//! This class handles the full pipeline conversion process:
-//! 1. Schedule meta-pipelines in dependency order and deep-copy them
-//! 2. Split pipelines by operator type (insert PARTITION/CONCAT/MERGE/SORT operators)
-//! 3. Compute plan-time wiring descriptors
-//! 4. Set up parent-child pipeline dependencies
-//! 5. Finalize pipeline structure (merge sink into operators vector)
-//! 6. Link hash join sibling partition operators
+//! Producers are visited in `dependencies` slot order, so with join dependencies kept
+//! build-first (see `finalize_pipeline_structure`) every join's build subtree is
+//! scheduled before its probe subtree. Pipelines launch in id order, so this is what
+//! lets a join publish its dynamic filters before the probe-side scans they prune are
+//! launched — probe-first numbering silently degrades those scans to full, unfiltered
+//! reads.
+void reorder_pipelines_topologically(
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
 
-//! Construct a Sirius-specific operator (scan, merge) from a generic physical operator.
-//! This is a pure factory function with no engine/context dependency.
-duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
-  op::sirius_physical_operator& physical_op,
-  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-    iceberg_cache);
-
+//! Converts the meta-pipeline tree into Sirius execution-ready pipelines.
+//!
+//! The plan generator already placed every GPU operator in the physical plan tree and
+//! per-operator `build_pipelines` produced final-shape pipelines, so conversion is a pure
+//! topology pass:
+//! 1. Schedule meta-pipelines in dependency order
+//! 2. Compute plan-time wiring descriptors via tree-parent lookup
+//! 3. Set up parent/dependency pipeline edges
+//! 4. Link hash join sibling partition operators and multi-GPU partition floors
+//! 5. Reorder into the canonical strictly-topological schedule
 class sirius_pipeline_converter {
  public:
-  sirius_pipeline_converter(
-    const pipeline_build_context& ctx,
-    const sirius::operator_params& op_params,
-    const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-      iceberg_cache                       = nullptr,
-    duckdb::ClientContext* client_context = nullptr);
+  sirius_pipeline_converter(const pipeline_build_context& ctx,
+                            const sirius::operator_params& op_params);
 
   //! Convert meta-pipelines into execution-ready pipelines.
   //! No runtime state required: wiring is emitted as descriptors in the result;
@@ -83,44 +82,24 @@ class sirius_pipeline_converter {
   pipeline_conversion_result convert(sirius_meta_pipeline& root_pipeline);
 
  private:
-  // Phase 1: Schedule and deep-copy
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> schedule_and_copy_pipelines(
+  //! Schedule the meta-pipeline tree's pipelines in dependency order.
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> schedule_pipelines(
     sirius_meta_pipeline& root_pipeline);
 
-  // Phase 2: Split pipelines by operator type
-  void split_pipelines(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled);
-  void insert_parquet_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
-  void insert_duckdb_native_scan_operator(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
-  void split_table_scan_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
-  void split_cpu_source(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
-  void split_intermediate_joins(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
-  void split_join_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline);
-  void split_group_aggregate_sink(
-    duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
-    duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
-    size_t pipeline_idx);
-  void split_order_by_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
-                           duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
-                           size_t pipeline_idx);
-  void split_top_n_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
-                        duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
-                        size_t pipeline_idx);
-  void split_delim_join_sink(duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
-                             duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
-                             size_t pipeline_idx);
+  //! Compute plan-time wiring descriptors from the operator tree. Assumes post-`is_ready`
+  //! pipelines and `_parent_op` populated by the plan generator's `set_parent_ops` pass.
+  //! Runtime materialization is done by `materialize_repository_wiring()` from
+  //! `pipeline/repository_wiring.hpp`.
+  void compute_repository_wiring(sirius_pipeline_build_state& state);
+  static std::string_view resolve_port_id(const op::sirius_physical_operator& sink,
+                                          const op::sirius_physical_operator& parent);
+  static op::MemoryBarrierType resolve_barrier(const op::sirius_physical_operator& sink,
+                                               const sirius_pipeline& dest);
 
-  // Phase 3: Compute plan-time wiring descriptors
-  // Runtime materialization is done by `materialize_repository_wiring()` from
-  // `pipeline/repository_wiring.hpp`.
-  void compute_repository_wiring();
-
-  // Phase 4: Set up dependencies
+  //! Set up parent/dependency pipeline edges from the wiring descriptors.
   void setup_pipeline_parents();
   void finalize_pipeline_structure();
   void link_join_partition_siblings();
-
-  // Phase 5: Debug logging
-  void log_pipeline_debug_info() const;
 
   // Configure every sirius_physical_partition operator with the multi-GPU
   // partition floor so partition-consumer tasks (hash_join, merge_group_by)
@@ -131,13 +110,9 @@ class sirius_pipeline_converter {
 
   const pipeline_build_context build_ctx_;
   const sirius::operator_params& op_params_;
-  const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-    iceberg_cache_;
-  duckdb::ClientContext* client_context_ = nullptr;
 
   // Internal state built during convert(), moved into result
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_;
-  duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> inserted_operators_;
   std::vector<repository_wiring> repository_wirings_;
   std::size_t meta_pipeline_count_ = 0;
 };

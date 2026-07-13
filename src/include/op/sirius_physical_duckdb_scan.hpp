@@ -23,6 +23,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius {
 namespace op {
@@ -103,6 +104,11 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
+  //! Every DUCKDB_SCAN terminates its own one-operator pipeline.
+  bool is_sink() const override { return true; }
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 };
 
 }  // namespace op

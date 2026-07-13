@@ -18,6 +18,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cassert>
+
 namespace sirius {
 
 template <class T, class SRC>
@@ -25,7 +27,7 @@ void DynamicCastCheck(const SRC* source)
 {
 #ifndef __APPLE__
   // Actual check is on the fact that dynamic_cast and reinterpret_cast are equivalent
-  reinterpret_cast<const T*>(source) == dynamic_cast<const T*>(source);
+  assert(reinterpret_cast<const T*>(source) == dynamic_cast<const T*>(source));
 #endif
 }
 

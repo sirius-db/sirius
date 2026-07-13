@@ -53,7 +53,10 @@ std::shared_ptr<data_batch> create_batch_with_random_data(
   }
   auto table = create_cudf_table_with_random_data(
     num_rows, column_types, ranges, cudf::get_default_stream(), mem_space.get_default_allocator());
-  return sirius::make_data_batch(std::move(table), mem_space, cudf::get_default_stream());
+  return sirius::make_data_batch(std::move(table),
+                                 mem_space,
+                                 cudf::get_default_stream(),
+                                 sirius::telemetry::batch_telemetry_info{});
 }
 
 void copy_data_to_host_by_rows(cudf::table_view table, std::vector<std::vector<int64_t>>& h_rows)

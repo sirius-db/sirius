@@ -37,8 +37,18 @@ class sirius_physical_dummy_scan : public sirius_physical_operator {
  public:
   bool is_source() const override { return true; }
 
-  std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+  //! True when this DUMMY_SCAN is the synthetic build placeholder under a
+  //! RIGHT_DELIM_JOIN's internal join. Makes plan-gen skip `wrap_cpu_source`: the
+  //! placeholder carries no runtime data (sink() runs partition_join inline). Real
+  //! DUMMY_SCAN usages (constant-row subqueries) keep the wrap.
+  [[nodiscard]] bool is_delim_join_placeholder() const noexcept
+  {
+    return _is_delim_join_placeholder;
+  }
+  void set_delim_join_placeholder(bool value) noexcept { _is_delim_join_placeholder = value; }
+
+ protected:
+  bool _is_delim_join_placeholder = false;
 };
 
 }  // namespace op
