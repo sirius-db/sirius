@@ -46,7 +46,7 @@ class gpu_values_input : public operator_data {
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view /*stream*/) override
   {
-    gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
+    _gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   }
 
   /// Feeds the reservation system's input_basis (see
@@ -56,9 +56,15 @@ class gpu_values_input : public operator_data {
     return _estimated_bytes;
   }
 
-  ::cucascade::memory::memory_space* gpu_memory_space = nullptr;
+  /// Memory space captured by prepare_for_processing where execute()
+  /// materializes the output table.
+  [[nodiscard]] ::cucascade::memory::memory_space* get_gpu_memory_space() const
+  {
+    return _gpu_memory_space;
+  }
 
  private:
+  ::cucascade::memory::memory_space* _gpu_memory_space = nullptr;
   std::size_t _estimated_bytes;
 };
 

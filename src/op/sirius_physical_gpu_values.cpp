@@ -288,7 +288,7 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
       "[sirius_physical_gpu_values::execute] expected input of type gpu_values_input; got " +
       std::string(typeid(input_data).name()));
   }
-  auto* mem_space = values_input->gpu_memory_space;
+  auto* mem_space = values_input->get_gpu_memory_space();
   if (!mem_space) {
     throw std::runtime_error(
       "[sirius_physical_gpu_values::execute] no memory space set on task input; "
