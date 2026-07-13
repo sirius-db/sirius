@@ -98,7 +98,6 @@ std::unique_ptr<cudf::column> lz4_compressor::decompress(compressed_representati
 }
 
 namespace detail {
-void release_lz4_manager_scratch() {}  // no cached manager under the batched API
 }  // namespace detail
 
 }  // namespace simpatico

@@ -52,8 +52,7 @@ bool jit_encode_subtree(PlanTree const& tree,
                         CodegenHead* head_out = nullptr);
 
 /// Decode one codegen-fused subtree (C++-native). The caller passes a
-/// fully-built ``FusedTree`` (per-Bitpack-node ``fixed_stride`` set from the
-/// rep layout) and a ``LabeledBuffers`` of the real device buffers keyed by
+/// fully-built ``FusedTree`` and a ``LabeledBuffers`` of the real device buffers keyed by
 /// DFS-preorder ``buffer_key(node_id, field)``. This adds the decode-only
 /// transients (Compact ``bp_offsets`` scan, RLE scratch) into ``labeled``,
 /// compiles/launches the rendered kernel, and writes ``num_rows`` decoded

@@ -42,9 +42,9 @@ struct TmpFile {
 };
 
 // Flatten leaf kinds from describe() into a simple vector for comparison.
-std::vector<simpatico::PlanLeafKind> leaf_kinds(simpatico::compressed_table const& ct)
+std::vector<simpatico::OpId> leaf_kinds(simpatico::compressed_table const& ct)
 {
-  std::vector<simpatico::PlanLeafKind> out;
+  std::vector<simpatico::OpId> out;
   for (auto const& descs : ct.describe())
     for (auto const& ld : descs)
       out.push_back(ld.kind);
@@ -236,7 +236,7 @@ void test_for_only()
 }
 
 // 3b. ZigZag leaf: exercises the codegen_fused_representation("zigzag") channel
-//     write/read (PlanLeafKind::Zigzag -> make_fused_rep), terminal and with an
+//     write/read (OpId::Zigzag -> make_fused_rep), terminal and with an
 //     entropy tail on the stored channel.
 void test_zigzag()
 {
@@ -473,7 +473,6 @@ int main()
     std::fprintf(stderr, "test_compressed_table_io: cudaSetDevice failed\n");
     return 1;
   }
-  codegen::jit::ensure_cuda_context();
 
   struct Case {
     char const* name;

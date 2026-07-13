@@ -145,19 +145,6 @@ bool contains_rle(const jit::FusedTree& t)
   return false;
 }
 
-// The GPU encode kernel only emits the fixed-stride OverAllocate
-// bitpack layout, so every Bitpack node must carry fixed_stride=true
-// for *encode*.  The same tree object drives the JIT decode, but decode
-// is Compact-only (drop-overalloc): the decode renderer ignores
-// fixed_stride and the encode helper injects the real arithmetic
-// bp_offsets for the Compact gather.
-void set_fixed_stride(jit::FusedTree& t)
-{
-  if (t.op == OpKind::Bitpack) t.fixed_stride = true;
-  for (auto& [_, c] : t.children)
-    set_fixed_stride(*c);
-}
-
 // Pretty-print a tree like "Rle{runs=Bp, values=Delta(Bp)}" — used
 // only as the per-shape diagnostic tag; the JIT cache keys on a hash
 // of the rendered CUDA source, not this string.
@@ -294,16 +281,14 @@ int env_depth(int default_depth)
 
 int main()
 {
-  try {
-    jit::ensure_cuda_context();
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "FAIL: ensure_cuda_context: %s\n", e.what());
+  if (cudaSetDevice(0) != cudaSuccess) {
+    std::fprintf(stderr, "FAIL: cudaSetDevice(0) failed\n");
     return 1;
   }
   // Single process, so clear at startup before any compile (see the sweep's
   // orchestrator for the same option).
   if (std::getenv("SIMPATICO_JIT_CACHE_CLEAR")) codegen::jit::clear_jit_disk_cache();
-  const int arch      = detect_arch_cc();
+  const int arch      = jit::arch_cc_for_current_device();
   const int max_depth = env_depth(/*default=*/4);
   const int64_t n     = 4321;
   auto data_generic   = synth_data(n);
@@ -320,7 +305,6 @@ int main()
   int passed = 0;
   std::vector<std::string> failures;
   for (const auto& t : shapes) {
-    set_fixed_stride(*t);
     const std::string s_tag = tag(*t);
     const auto& fixture     = contains_rle(*t) ? data_rle : data_generic;
     if (run_one_shape(*t, s_tag, fixture, arch) == 0) {

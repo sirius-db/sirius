@@ -1,7 +1,5 @@
 #include "codegen/jit/kernel_cache.hpp"
 
-#include "codegen/encode/jit/plain_compile.hpp"
-
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -215,8 +213,7 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
     std::vector<char> bytes;
     if (read_cubin_file(path, bytes)) {
       try {
-        CompiledKernel loaded =
-          ::codegen::encode::jit::load_kernel_from_cubin(std::move(bytes), entry_symbol, source);
+        CompiledKernel loaded = load_kernel_from_cubin(std::move(bytes), entry_symbol, source);
         ++g_jit_disk_hits;
         std::lock_guard<std::mutex> lock(mu_);
         auto [it, inserted] = table_.emplace(std::move(key), std::move(loaded));
@@ -229,7 +226,7 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
   }
 
   auto _t0             = std::chrono::steady_clock::now();
-  CompiledKernel fresh = ::codegen::encode::jit::compile_plain_kernel(source, entry_symbol, opts);
+  CompiledKernel fresh = compile_plain_kernel(source, entry_symbol, opts);
   auto _us =
     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0)
       .count();

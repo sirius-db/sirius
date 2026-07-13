@@ -10,7 +10,6 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
-#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -20,27 +19,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-// Detect the compute capability of the current CUDA device.
-// Initialises the CUDA driver and picks device 0 if no context exists.
-// Falls back to sm_89 (Ada) if detection fails.
-inline int detect_arch_cc() noexcept
-{
-  if (cuInit(0) != CUDA_SUCCESS) return 89;
-  CUdevice dev = 0;
-  // If a context is active, use its device; otherwise use device 0.
-  if (cuCtxGetDevice(&dev) != CUDA_SUCCESS) {
-    if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS) return 89;
-  }
-  int major = 0, minor = 0;
-  if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) !=
-        CUDA_SUCCESS ||
-      cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) !=
-        CUDA_SUCCESS) {
-    return 89;
-  }
-  return major * 10 + minor;
-}
 
 // ---------------------------------------------------------------------------
 // Table factories
@@ -228,7 +206,7 @@ inline std::vector<bool> host_validity_bits(cudf::column_view v)
              words.size() * sizeof(std::uint32_t),
              cudaMemcpyDeviceToHost);
   for (cudf::size_type r = 0; r < v.size(); ++r) {
-    std::size_t const bit = static_cast<std::size_t>(v.offset() + r);
+    std::size_t const bit              = static_cast<std::size_t>(v.offset() + r);
     valid[static_cast<std::size_t>(r)] = (words[bit / 32 - first_word] >> (bit % 32)) & 1u;
   }
   return valid;
@@ -350,15 +328,13 @@ inline bool strings_equal(cudf::column_view a, cudf::column_view b, rmm::cuda_st
     cudf::strings_column_view s(col);
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(o.back() - o.front()));
     if (!bytes.empty()) {
-      cudaMemcpy(bytes.data(),
-                 s.chars_begin(stream) + o.front(),
-                 bytes.size(),
-                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(
+        bytes.data(), s.chars_begin(stream) + o.front(), bytes.size(), cudaMemcpyDeviceToHost);
     }
     return bytes;
   };
-  auto const pa = read_span(a, oa);
-  auto const pb = read_span(b, ob);
+  auto const pa    = read_span(a, oa);
+  auto const pb    = read_span(b, ob);
   auto const valid = host_validity_bits(a);  // equals host_validity_bits(b) per validity_equal
 
   for (cudf::size_type r = 0; r < n; ++r) {

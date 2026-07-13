@@ -37,34 +37,25 @@
 // tree shape the decode side accepts becomes encodable, including
 // arbitrary RLE/Delta nesting.
 //
-// Supported shapes
-// ----------------
-// Bitpack leaf; Raw leaf (verbatim passthrough, valid as an Rle child);
-// Delta(values=...); Rle{runs=..., values=...} composed arbitrarily
-// (the staged-materialisation walker handles nested Rle/Delta and Raw
-// children).  Unsupported shapes (e.g. FOR) throw a `RenderError` with
-// a clear diagnostic.
+// Supported ops
+// -------------
+// Bitpack (leaf); Raw (verbatim-passthrough leaf, synthesized for a
+// delta/rle/for channel that isn't further fused); Delta, Rle, For, and
+// Zigzag, composed arbitrarily — the staged-materialisation walker handles
+// nested Rle/Delta/For/Zigzag and Raw children.  An op the renderer can't
+// emit throws a `RenderError` with a clear diagnostic.
 //
 // Buffer layout contract
 // ----------------------
-// The encode kernel always emits OverAllocate (`fixed_stride=true`):
-//   * `bp_offsets` is NOT produced by the encoder — it doesn't need
-//     one to write, since every chunk's packed words land at the
-//     fixed arithmetic offset `chunk_id * kStrideWords`.
-//   * `packed` is sized `num_chunks * kStrideWords` for every Bitpack
-//     node — deterministic, no host cumsum needed at encode time.
-//   * `live_words[c]` reports the actual bit-packed word count for
-//     chunk c.  Consumed only by `compact_in_place()`
-//     (src/bridge/bitpack_compact.cu), which runs once before publish to
-//     densify OverAllocate into the Compact layout that actually gets
-//     persisted to disk.
+// The encode kernel always emits the OverAllocate layout: `packed` is sized
+// `num_chunks * kStrideWords` per Bitpack node, and each chunk's words land at
+// the fixed arithmetic offset `chunk_id * kStrideWords` — so no `bp_offsets`
+// and no host cumsum are needed to write. `live_words[c]` reports the actual
+// bit-packed word count for chunk c.
 //
-// Decode never sees OverAllocate: every persisted bitpack rep is
-// already Compact (dense), and the decode renderer reconstructs
-// `bp_offsets` itself at decode time via an on-device CUB exclusive
-// scan over the stored `chunk_bits`/`chunk_count` (see
-// `synthesize_decode_transients` in bridge/codegen_runtime.cpp) —
-// it never reads anything the encoder wrote for this purpose.
+// The OverAllocate→Compact story (compact_in_place before store, decode seeing
+// only Compact) is documented canonically on `bitpack_compressed_representation`
+// in codegen/plan/representation.hpp.
 
 #pragma once
 
@@ -150,8 +141,8 @@ struct RenderError : std::runtime_error {
 //                    (no second walk needed at launch time).
 //
 // Throws `RenderError` if `tree` contains an op the renderer can't emit.
-// Supported ops: `Bitpack` (leaf, `fixed_stride=true` / OverAllocate), `Raw`
-// (leaf passthrough), `Delta`, `Rle`, `For` — composed arbitrarily.
+// Supported ops: `Bitpack` (leaf, OverAllocate layout), `Raw` (leaf
+// passthrough), `Delta`, `Rle`, `For`, `Zigzag` — composed arbitrarily.
 //
 // Throws `std::invalid_argument` for malformed inputs (empty dtype,
 // num_chunks < 1).

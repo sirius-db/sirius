@@ -28,18 +28,15 @@ std::string bitjoin_spec_suffix(std::string const& compressor)
 
 }  // namespace
 
-std::optional<PlanTree> plan_tree_from_dsl(std::string_view dsl,
-                                           std::string* error_out,
-                                           PlanPathMap* path_map)
+std::optional<PlanTree> plan_tree_from_dsl(std::string_view dsl, std::string* error_out)
 {
   std::vector<plan_step> steps;
   if (!parse_plan_dsl(dsl, &steps, error_out)) return std::nullopt;
-  return plan_tree_from_steps(steps, error_out, path_map);
+  return plan_tree_from_steps(steps, error_out);
 }
 
 std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps,
-                                             std::string* error_out,
-                                             PlanPathMap* path_map)
+                                             std::string* error_out)
 {
   PlanTree tree;
   tree.nodes.push_back(PlanNode{.op = "input"});
@@ -50,7 +47,6 @@ std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps
 
   for (std::size_t step_idx = 0; step_idx < steps.size(); ++step_idx) {
     auto const& step = steps[step_idx];
-    if (step.synthetic) continue;
 
     NodeId const nid = static_cast<NodeId>(tree.nodes.size());
     PlanNode node;
@@ -131,12 +127,6 @@ std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps
   }
 
   compute_input_sources(tree);
-
-  if (path_map) {
-    path_map->node    = path_to_node;
-    path_map->channel = path_to_channel;
-    path_map->channel.emplace("input", "input");
-  }
 
   if (error_out) error_out->clear();
   return tree;

@@ -17,7 +17,6 @@
 #include "codegen/plan/representation.hpp"
 #include "nvcomp_batched_codec.hpp"
 #include "nvcomp_simple_compressor.hpp"
-#include "nvcomp_string_support.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -109,28 +108,6 @@ bool parse_bitcomp_suffix(std::string_view suffix, int* algorithm)
 std::unique_ptr<cudf::column> bitcomp_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
-  // STRING: split the payload into the offsets and chars codec streams,
-  // decompress each, and rebuild the strings column.
-  if (original_type.id() == cudf::type_id::STRING) {
-    auto ops = make_bitcomp_ops(compress_algorithm);
-    auto decompress_bytes =
-      [&](void const* comp, std::size_t comp_size, void* out, std::size_t out_bytes) {
-        detail::nvcomp_decompress_bytes(ops, comp, comp_size, out, out_bytes, stream, mr);
-      };
-    auto col = detail::rebuild_string_column(compressed_data ? compressed_data->data() : nullptr,
-                                             compressed_size,
-                                             offsets_compressed_size,
-                                             offsets_uncompressed_size,
-                                             uncompressed_size,
-                                             offsets_type,
-                                             num_rows,
-                                             decompress_bytes,
-                                             stream,
-                                             mr);
-    if (cudaStreamSynchronize(stream.value()) != cudaSuccess) return nullptr;
-    return col;
-  }
-
   return detail::nvcomp_decompress_impl(make_bitcomp_ops(compress_algorithm),
                                         compressed_data.get(),
                                         compressed_size,
@@ -157,29 +134,10 @@ std::unique_ptr<compressed_representation> bitcomp_compressor::compress(
       /*uncomp_size=*/0,
       algorithm_);
   }
-  // STRING: compress the offsets and chars streams independently with bitcomp
-  // and store them concatenated in the rep's payload.
-  if (dt.id() == cudf::type_id::STRING) {
-    auto ops            = make_bitcomp_ops(algorithm_);
-    auto compress_bytes = [&](void const* ptr, std::size_t bytes) {
-      return detail::nvcomp_compress_bytes(ops, ptr, bytes, stream, mr);
-    };
-
-    auto cs  = detail::compress_string_column(column_to_compress, compress_bytes, stream, mr);
-    auto rep = std::make_unique<bitcomp_compressed_representation>(dt,
-                                                                   cs.num_rows,
-                                                                   std::move(cs.payload),
-                                                                   cs.total_compressed_size,
-                                                                   cs.chars_uncompressed_size,
-                                                                   algorithm_);
-    rep->offsets_compressed_size   = cs.offsets_compressed_size;
-    rep->offsets_uncompressed_size = cs.offsets_uncompressed_size;
-    rep->offsets_type              = cs.offsets_type;
-    return rep;
-  }
 
   if (!cudf::is_fixed_width(dt)) {
-    throw std::runtime_error("bitcomp_compressor: only fixed-width columns supported");
+    throw std::runtime_error(
+      "bitcomp_compressor: only fixed-width columns supported; use str_split");
   }
 
   size_t const uncompressed_size = static_cast<size_t>(n) * cudf::size_of(dt);
@@ -202,7 +160,6 @@ std::unique_ptr<cudf::column> bitcomp_compressor::decompress(
 }
 
 namespace detail {
-void release_bitcomp_manager_scratch() {}  // no cached manager under the batched API
 }  // namespace detail
 
 }  // namespace simpatico

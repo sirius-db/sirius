@@ -67,7 +67,7 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Lz4, "lz4", {"output"}, {"lz4"}, true, false, false},
     {OpId::Bitextract, "bitextract", {}, {"bitextract_f32", "bitextract_f64"}, false, true, false},
     {OpId::Identity, "identity", {"data"}, {}, false, false, false},
-    {OpId::Cascaded, "nvcomp_cascaded", {"output"}, {}, false, false, false},
+    {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"}, {}, false, false, false},
     // Variable arity (2 or 3: offsets, chars[, null_mask]) -> empty channels, like Dictionary.
     // Cataloged so string exploration can discover the decomposed shape
     // (offsets -> delta -> bitpack, chars -> byte codec); STRING-only via the
@@ -102,7 +102,7 @@ std::optional<OpId> op_id_from_name(std::string const& name)
 
   // Parameterised suffix families sharing a bare-name entry above.
   if (after_prefix(name, "bitcomp")) return OpId::Bitcomp;
-  if (after_prefix(name, "nvcomp_cascaded")) return OpId::Cascaded;
+  if (after_prefix(name, "nvcomp_cascaded")) return OpId::NvcompCascaded;
   return std::nullopt;
 }
 
@@ -159,7 +159,7 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
       }
       return nullptr;
     }
-    case OpId::Cascaded: {
+    case OpId::NvcompCascaded: {
       // `nvcomp_cascaded` — nvcomp default opts; `nvcomp_cascaded_<N>D<M>R<K>B` — explicit opts.
       if (name == "nvcomp_cascaded") return std::make_unique<cascaded_compressor>();
       int deltas = 0, rles = 0, bp = 0;

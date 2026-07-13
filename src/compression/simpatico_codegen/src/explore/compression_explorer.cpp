@@ -12,7 +12,6 @@
 #include "codegen/plan/bitjoin_layout.hpp"  // copy_column_view
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
-#include "codegen/util/nvcomp_scratch.hpp"
 #include "explore/operator_catalog.hpp"
 
 #include <cudf/copying.hpp>
@@ -121,10 +120,10 @@ struct ranked_candidate {
 
 // Sum of every stored leaf's compressed bytes — the same accounting
 // `benchmark`'s `compound_compressed_bytes` uses, so the two never drift.
-size_t compound_compressed_bytes(plan_compound const& compound, rmm::cuda_stream_view stream)
+size_t compound_compressed_bytes(PlanTree const& tree, rmm::cuda_stream_view stream)
 {
   size_t total = 0;
-  for (auto const& node : compound.tree.nodes) {
+  for (auto const& node : tree.nodes) {
     if (node.rep) total += node.rep->compressed_size_bytes(stream);
     for (auto const& [path, rep] : node.channels) {
       if (rep) total += rep->compressed_size_bytes(stream);
@@ -175,7 +174,7 @@ bool round_trip_time_rr(cudf::column_view input,
                         size_t& compressed_bytes_out,
                         std::string* err_out)
 {
-  std::unique_ptr<plan_compound> compound;
+  std::unique_ptr<PlanTree> compound;
   std::string err;
   compress_ms_out = time_cuda_ms(
     stream.value(), [&] { compound = compress_column(input, plan_dsl, stream, mr, &err); });
@@ -749,7 +748,6 @@ exploration_result explore_column_compression(cudf::column_view input,
   // sized for the largest of those calls — memory nvcomp never shrinks
   // back down on its own. Release it now so it doesn't sit pinned while
   // exploring whatever column comes next.
-  release_nvcomp_manager_scratch();
 
   return result;
 }

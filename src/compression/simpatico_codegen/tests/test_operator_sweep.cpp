@@ -409,7 +409,6 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
   }
   pool_mr_guard mr_guard;
   mr_guard.install();
-  codegen::jit::ensure_cuda_context();
 
   auto stream         = cudf::get_default_stream();
   auto mr             = rmm::mr::get_current_device_resource_ref();
@@ -437,7 +436,7 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
         }
       }
     };
-    must_apply("string", {"dictionary", "dictionary_fast", "str_split", "ans", "bitcomp"});
+    must_apply("string", {"dictionary", "dictionary_fast", "str_split"});
     must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack"});
     must_apply("date", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
   }

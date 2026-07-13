@@ -114,35 +114,6 @@ std::unique_ptr<rmm::device_buffer> copy_output_payload(
   return payload;
 }
 
-// Rebuild a string-typed ANS/bitcomp rep from its single concatenated payload
-// column plus the string_extras carried in the leaf meta. `make_rep` constructs
-// the codec-specific rep from (orig_type, num_rows, payload, comp_size, uncomp).
-template <class RepT, class MakeRep>
-std::unique_ptr<compressed_representation> string_rep_from_outputs(
-  const char* codec,
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>>& outputs,
-  leaf_meta::string_extras const& s,
-  std::uint64_t chars_uncompressed,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out,
-  MakeRep&& make_rep)
-{
-  std::size_t comp = 0;
-  auto payload = copy_output_payload(codec, output_names, outputs, stream, mr, error_out, &comp);
-  if (!payload) return nullptr;
-  auto rep                       = make_rep(cudf::data_type{cudf::type_id::STRING},
-                      static_cast<cudf::size_type>(s.num_rows),
-                      std::move(payload),
-                      comp,
-                      static_cast<size_t>(chars_uncompressed));
-  rep->offsets_compressed_size   = s.offsets_compressed_size;
-  rep->offsets_uncompressed_size = s.offsets_uncompressed_size;
-  rep->offsets_type              = cudf::data_type{static_cast<cudf::type_id>(s.offsets_type_id)};
-  return rep;
-}
-
 }  // namespace
 
 std::unique_ptr<compressed_representation> identity_compressed_representation::from_outputs(
@@ -249,8 +220,9 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
 
   rmm::device_buffer mask(0, stream, mr);
   cudf::size_type null_count = 0;
-  if (has_mask && !take_null_mask_channel(
-                    std::move(outputs[3]), indices->size(), &mask, &null_count, stream, error_out)) {
+  if (has_mask &&
+      !take_null_mask_channel(
+        std::move(outputs[3]), indices->size(), &mask, &null_count, stream, error_out)) {
     return nullptr;
   }
 
@@ -266,11 +238,11 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
                                                 0,
                                                 rmm::device_buffer(0, stream, mr));
 
-  auto dict_col = null_count > 0
-                    ? cudf::make_dictionary_column(
-                        std::move(keys_strings), std::move(indices), std::move(mask), null_count)
-                    : cudf::make_dictionary_column(
-                        std::move(keys_strings), std::move(indices), stream, mr);
+  auto dict_col =
+    null_count > 0
+      ? cudf::make_dictionary_column(
+          std::move(keys_strings), std::move(indices), std::move(mask), null_count)
+      : cudf::make_dictionary_column(std::move(keys_strings), std::move(indices), stream, mr);
   // Indices, keys, and chars are then obtained as views from this column via
   // get_dictionary_child_view(dict_col->view(), ...) / dictionary_column_view.
   return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
@@ -514,9 +486,9 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
     if (error_out) *error_out = "str_split outputs must be 'offsets, chars[, null_mask]'";
     return nullptr;
   }
-  auto offsets   = std::move(outputs[0]);
-  auto chars     = std::move(outputs[1]);
-  auto null_mask = has_mask ? std::move(outputs[2]) : nullptr;
+  auto offsets       = std::move(outputs[0]);
+  auto chars         = std::move(outputs[1]);
+  auto null_mask     = has_mask ? std::move(outputs[2]) : nullptr;
   auto const off_tid = offsets->type().id();
   if (off_tid != cudf::type_id::INT32 && off_tid != cudf::type_id::INT64) {
     if (error_out) *error_out = "str_split offsets must be INT32 or INT64";
@@ -525,8 +497,8 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
   // chars is UINT8 normally, or widened (UINT32/UINT64) to hold >2GB under the
   // 2^31-element column cap (see str_split_compressor).
   auto const chars_tid = chars->type().id();
-  bool const chars_ok  = chars_tid == cudf::type_id::UINT8 ||
-                        chars_tid == cudf::type_id::UINT32 || chars_tid == cudf::type_id::UINT64;
+  bool const chars_ok  = chars_tid == cudf::type_id::UINT8 || chars_tid == cudf::type_id::UINT32 ||
+                        chars_tid == cudf::type_id::UINT64;
   if (!chars_ok || (null_mask && null_mask->type().id() != cudf::type_id::UINT8)) {
     if (error_out) *error_out = "str_split chars must be UINT8/UINT32/UINT64, null_mask UINT8";
     return nullptr;
@@ -570,28 +542,6 @@ std::unique_ptr<compressed_representation> bitcomp_compressed_representation::fr
   std::string* error_out,
   leaf_meta_v const& meta)
 {
-  if (auto const* m = std::get_if<leaf_meta::bitcomp>(&meta);
-      m && m->original_type_id == static_cast<std::int32_t>(cudf::type_id::STRING)) {
-    int const algorithm = m->algorithm;
-    return string_rep_from_outputs<bitcomp_compressed_representation>(
-      "bitcomp",
-      output_names,
-      outputs,
-      m->strings,
-      m->uncompressed_size,
-      stream,
-      mr,
-      error_out,
-      [algorithm](cudf::data_type t,
-                  cudf::size_type n,
-                  std::unique_ptr<rmm::device_buffer> p,
-                  size_t c,
-                  size_t u) {
-        return std::make_unique<bitcomp_compressed_representation>(
-          t, n, std::move(p), c, u, algorithm);
-      });
-  }
-
   std::size_t comp = 0;
   auto payload =
     copy_output_payload("bitcomp", output_names, outputs, stream, mr, error_out, &comp);
@@ -699,25 +649,6 @@ std::unique_ptr<compressed_representation> ans_compressed_representation::from_o
   std::string* error_out,
   leaf_meta_v const& meta)
 {
-  if (auto const* m = std::get_if<leaf_meta::ans>(&meta);
-      m && m->original_type_id == static_cast<std::int32_t>(cudf::type_id::STRING)) {
-    return string_rep_from_outputs<ans_compressed_representation>(
-      "ans",
-      output_names,
-      outputs,
-      m->strings,
-      m->uncompressed_size,
-      stream,
-      mr,
-      error_out,
-      [](cudf::data_type t,
-         cudf::size_type n,
-         std::unique_ptr<rmm::device_buffer> p,
-         size_t c,
-         size_t u) {
-        return std::make_unique<ans_compressed_representation>(t, n, std::move(p), c, u);
-      });
-  }
   return nvcomp_simple_from_outputs<ans_compressed_representation, leaf_meta::ans>(
     "ans", output_names, std::move(outputs), stream, mr, error_out, meta);
 }
@@ -825,7 +756,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
     case OpId::Deflate:
       return deflate_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::Cascaded:
+    case OpId::NvcompCascaded:
       return cascaded_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out, meta);
     case OpId::StrSplit:

@@ -356,7 +356,7 @@ bool bind_real_node_buffers(std::int32_t node_id,
 // builder's DFS-preorder (preorder index == rendered kernel node_id). The
 // structural shape (op kinds, children, node-id order) is the builder's
 // responsibility — shared with the encode bridge — so this binder only sources
-// the per-node reps/buffers. Decode uses ``fixed_stride=false`` (Compact).
+// the per-node reps/buffers. Decode is Compact-only.
 //
 // Returns the built tree, or nullptr + *error_out on failure.
 std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(NodeId root_nid,
@@ -368,7 +368,7 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(NodeId root_nid,
                                                             DecodeMemo& decompressed,
                                                             std::string* error_out)
 {
-  auto built = build_fused_tree(tree, root_nid, /*fixed_stride=*/false);
+  auto built = build_fused_tree(tree, root_nid);
   if (!built) {
     if (error_out)
       *error_out =
@@ -439,7 +439,7 @@ std::unique_ptr<cudf::column> dispatch_codegen_subtree(NodeId root_nid,
   if (root_repr == nullptr) {
     // Transformer-mode root (e.g. ZigZag with a codegen child) stores no rep;
     // find the first non-null rep in the fused preorder for metadata.
-    auto maybe_built = build_fused_tree(tree, root_nid, /*fixed_stride=*/false);
+    auto maybe_built = build_fused_tree(tree, root_nid);
     if (maybe_built) {
       for (auto const& origin : maybe_built->preorder) {
         if (!origin.is_raw_passthrough && origin.plan_node < tree.nodes.size()) {
@@ -680,16 +680,15 @@ cudf::column const* materialize(NodeId nid,
 
 }  // namespace
 
-std::unique_ptr<cudf::column> decompress_column(plan_compound const& compound,
+std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
                                                 std::string* error_out)
 {
   nvtx3::scoped_range r_decompress{"decompress_column"};
 
-  PlanTree const& tree = compound.tree;
   if (tree.nodes.empty() || tree.nodes[0].op != "input") {
-    if (error_out) *error_out = "decompress: compound.tree missing input root";
+    if (error_out) *error_out = "decompress: tree missing input root";
     return nullptr;
   }
 
@@ -723,5 +722,5 @@ std::unique_ptr<cudf::column> decompress_column(plan_compound const& compound,
 }
 
 // ---------------------------------------------------------------------------
-// plan_compound_from_leaves
+// tree_from_leaves
 }  // namespace simpatico

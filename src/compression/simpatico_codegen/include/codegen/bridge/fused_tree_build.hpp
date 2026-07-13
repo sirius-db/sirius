@@ -16,25 +16,26 @@ namespace simpatico {
 // Shared structural builder: PlanTree fusable region -> jit::FusedTree.
 //
 // Both the encode and decode bridges need the SAME runtime FusedTree shape for
-// a fused region; the only difference is FusedTree::fixed_stride on Bitpack
-// nodes (true for the OverAllocate encode layout, false for the Compact decode
-// layout) and what each side does per node afterwards (encode produces device
-// buffers + reps; decode binds device buffers). This builder owns the one piece
-// they share — the tree shape and the DFS-preorder node-id assignment — so the
-// two sides can never drift on structure or id order.
+// a fused region; the only difference is what each side does per node afterwards
+// (encode produces device buffers + reps; decode binds device buffers). This
+// builder owns the one piece they share — the tree shape and the DFS-preorder
+// node-id assignment — so the two sides can never drift on structure or id
+// order.
 //
-// The build mirrors the fusion accept rules (see plan/fusion.hpp):
-//   * bitpack -> Bitpack leaf (its outgoing edges are entropy tails, ignored).
-//   * delta   -> Delta with one child keyed "values" (DSL "differences").
-//   * rle     -> Rle with children "runs" (required, fusable) and "values"
-//                (fusable child, OR a synthesized Raw passthrough leaf when the
-//                tree has no "values" edge — the DSL drained it through a
-//                synthetic identity leaf that plan_tree_from_steps dropped).
+// The build mirrors the fusion accept rules (see plan/fusion.hpp). Fusable ops
+// are bitpack, zigzag, delta, rle, and for:
+//   * bitpack is a leaf (its outgoing edges are entropy tails, ignored).
+//   * delta/rle/for recurse into each declared channel when it feeds a codegen
+//     op, else synthesize a Raw passthrough leaf (channel drained through a
+//     synthetic identity leaf, left terminal, or feeding a non-fusable op); rle
+//     keeps both its "runs" and "values" children.
+//   * zigzag fuses its "zigzag" child only when present and codegen; otherwise
+//     it carries no child.
 //
-// Child keys use the renderer's convention (Delta's value port is keyed
-// "values"), and children are stored in a std::map so iteration is lex-sorted —
-// the same order jit::dfs_nodes() assigns node ids, so `preorder` index ==
-// rendered kernel node_id.
+// Children are keyed by their DSL channel name directly ("differences", "runs",
+// "values", "deltas", "zigzag") with no translation, and stored in a std::map so
+// iteration is lex-sorted — the same order jit::dfs_nodes() assigns node ids, so
+// `preorder` index == rendered kernel node_id.
 // ---------------------------------------------------------------------------
 
 // One built FusedTree node mapped back to its PlanTree origin, in DFS-preorder
@@ -57,12 +58,9 @@ struct BuiltFusedTree {
   std::vector<FusedNodeOrigin> preorder;  // index == jit node_id
 };
 
-// Build the FusedTree for the fusable region rooted at `root`. `fixed_stride`
-// sets FusedTree::fixed_stride on every Bitpack node. Returns std::nullopt if
-// `root` is not the root of a valid fusable region.
-std::optional<BuiltFusedTree> build_fused_tree(PlanTree const& tree,
-                                               NodeId root,
-                                               bool fixed_stride);
+// Build the FusedTree for the fusable region rooted at `root`. Returns
+// std::nullopt if `root` is not the root of a valid fusable region.
+std::optional<BuiltFusedTree> build_fused_tree(PlanTree const& tree, NodeId root);
 
 }  // namespace simpatico
 

@@ -23,16 +23,12 @@ PlanEdge const* find_edge(PlanNode const& node, std::string const& channel)
 // children; children visited in ascending child-key order so the index matches
 // jit::dfs_nodes()). Returns the built node, or nullptr if the region is
 // invalid.
-std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
-                                          NodeId nid,
-                                          bool fixed_stride,
-                                          BuiltFusedTree& out)
+std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, BuiltFusedTree& out)
 {
   PlanNode const& node = tree.nodes[nid];
 
   if (node.op == "bitpack") {
-    auto t          = jit::FusedTree::make(OpKind::Bitpack);
-    t->fixed_stride = fixed_stride;
+    auto t = jit::FusedTree::make(OpKind::Bitpack);
     out.preorder.push_back({t.get(), nid, false, 0});
     return t;
   }
@@ -42,7 +38,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
     auto t             = jit::FusedTree::make(OpKind::Zigzag);
     out.preorder.push_back({t.get(), nid, false, 0});
     if (zz != nullptr && is_codegen_compressor(tree.nodes[zz->child].op)) {
-      auto child = build_rec(tree, zz->child, fixed_stride, out);
+      auto child = build_rec(tree, zz->child, out);
       if (!child) return nullptr;
       // Child keyed "zigzag" everywhere — the DSL port, the fused rep channel,
       // and the renderer all agree, so there is no name translation.
@@ -57,7 +53,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
     out.preorder.push_back({t.get(), nid, false, 0});
     std::shared_ptr<jit::FusedTree> diff_child;
     if (diff != nullptr && is_codegen_compressor(tree.nodes[diff->child].op)) {
-      diff_child = build_rec(tree, diff->child, fixed_stride, out);
+      diff_child = build_rec(tree, diff->child, out);
       if (!diff_child) return nullptr;
     } else {
       diff_child = jit::FusedTree::make(OpKind::Raw);
@@ -78,7 +74,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
     // Like values, a missing edge (terminal run-count storage) is valid.
     std::shared_ptr<jit::FusedTree> runs_child;
     if (runs != nullptr && is_codegen_compressor(tree.nodes[runs->child].op)) {
-      runs_child = build_rec(tree, runs->child, fixed_stride, out);
+      runs_child = build_rec(tree, runs->child, out);
       if (!runs_child) return nullptr;
     } else {
       // Materialize run-counts (compact layout, int32 element size). The
@@ -91,7 +87,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
     // values — dual-mode: fuse a codegen child, or synthesize Raw passthrough.
     std::shared_ptr<jit::FusedTree> values_child;
     if (values != nullptr && is_codegen_compressor(tree.nodes[values->child].op)) {
-      values_child = build_rec(tree, values->child, fixed_stride, out);
+      values_child = build_rec(tree, values->child, out);
       if (!values_child) return nullptr;
     } else {
       // Raw passthrough: either no values edge (DSL drained it through a
@@ -110,7 +106,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
     out.preorder.push_back({t.get(), nid, false, 0});
     std::shared_ptr<jit::FusedTree> deltas_child;
     if (deltas != nullptr && is_codegen_compressor(tree.nodes[deltas->child].op)) {
-      deltas_child = build_rec(tree, deltas->child, fixed_stride, out);
+      deltas_child = build_rec(tree, deltas->child, out);
       if (!deltas_child) return nullptr;
     } else {
       // Materialize deltas (fixed-stride storage). Downstream non-fused op
@@ -127,11 +123,11 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree,
 
 }  // namespace
 
-std::optional<BuiltFusedTree> build_fused_tree(PlanTree const& tree, NodeId root, bool fixed_stride)
+std::optional<BuiltFusedTree> build_fused_tree(PlanTree const& tree, NodeId root)
 {
   if (root >= tree.nodes.size()) return std::nullopt;
   BuiltFusedTree out;
-  auto t = build_rec(tree, root, fixed_stride, out);
+  auto t = build_rec(tree, root, out);
   if (!t) return std::nullopt;
   out.tree = std::move(t);
   return out;

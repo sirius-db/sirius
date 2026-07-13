@@ -279,36 +279,6 @@ bool parse_plan_dsl(std::string_view dsl, std::vector<plan_step>* out, std::stri
     result.push_back(std::move(step));
   }
 
-  // Add synthetic leaf steps for output paths that are never used as input.
-  // Decompression only populates decompressed[path] when it finds a step with
-  // output_names.empty() and that input_path, so we need a step per "identity" output.
-  std::unordered_set<std::string> used_as_input;
-  for (auto const& s : result) {
-    for (auto const& ipath : s.input_paths) {
-      used_as_input.insert(ipath);
-    }
-  }
-  // Collect synthetic leaves first, then append — appending to `result` while
-  // iterating it would invalidate the references the range-for holds.
-  std::vector<plan_step> synthetic_leaves;
-  for (auto const& s : result) {
-    for (auto const& output_path : s.output_paths) {
-      // insert().second is true the first time we see an unconsumed output.
-      if (used_as_input.insert(output_path).second) {
-        plan_step leaf_step;
-        leaf_step.input_paths  = {output_path};
-        leaf_step.input_ranges = {std::nullopt};
-        leaf_step.compressor   = "identity";
-        leaf_step.output_names = {};
-        leaf_step.output_paths = {};
-        leaf_step.synthetic    = true;
-        synthetic_leaves.push_back(std::move(leaf_step));
-      }
-    }
-  }
-  for (auto& leaf : synthetic_leaves)
-    result.push_back(std::move(leaf));
-
   *out = std::move(result);
   if (error_out) { error_out->clear(); }
   return true;
@@ -335,13 +305,6 @@ std::string render_plan_steps(std::vector<plan_step> const& steps)
 {
   std::ostringstream out;
   for (auto const& step : steps) {
-    // Skip purely synthetic identity-leaf steps that `parse_plan_dsl` appends
-    // for unconsumed output paths — they get re-injected on the next parse,
-    // so rendering them would create duplicates. Real user-authored leaf
-    // steps (e.g. plain `input -> lc_sp_speed` with no further processing)
-    // MUST be rendered; otherwise the plan-file round-trip loses them and
-    // decompression has nothing to do.
-    if (step.synthetic) continue;
     render_token_list(out, step.input_paths, step.input_ranges);
     out << " -> " << step.compressor;
     if (!step.output_names.empty()) {

@@ -81,15 +81,14 @@ struct PlanNode {
 
   // Node-owned compressed representations. Two storage slots cover every shape:
   //
-  //   * `rep` — this op's own single representation, keyed by its INPUT path
-  //     (`rep_path`). Set for all JIT-fused ops (Delta/Rle/Bitpack/For).
+  //   * `rep` — this op's own single representation. Set for all JIT-fused ops
+  //     (Delta/Rle/Bitpack/For/Zigzag).
   //
   //   * `channels` — terminal OUTPUT representations (identity / RawFused),
   //     keyed by their DSL output PATH. Set for a producing node's non-consumed
   //     outputs — e.g. `for`'s `references` channel or the RawFused `values`
   //     passthrough of an Rle or the `deltas` passthrough of a For.
   std::unique_ptr<compressed_representation> rep;
-  std::string rep_path;
   std::unordered_map<std::string, std::unique_ptr<compressed_representation>> channels;
 
   // Per-node decode metadata populated by the compress walk from
@@ -103,27 +102,11 @@ struct PlanTree {
   std::vector<PlanNode> nodes;
 };
 
-// Maps each DSL dotted path to the node that produces it and the channel
-// (output-port) name under which it is produced. This is the inverse of the
-// tree's named-edge wiring, used when populating node reps during native
-// tree-based compression (each produced channel's rep attaches to
-// `node[path]` under `channel[path]`). The reserved root path "input" maps to
-// node 0 with channel "input".
-struct PlanPathMap {
-  std::unordered_map<std::string, NodeId> node;
-  std::unordered_map<std::string, std::string> channel;
-};
+std::optional<PlanTree> plan_tree_from_dsl(std::string_view dsl, std::string* error_out = nullptr);
 
-std::optional<PlanTree> plan_tree_from_dsl(std::string_view dsl,
-                                           std::string* error_out = nullptr,
-                                           PlanPathMap* path_map  = nullptr);
-
-// Build the canonical PlanTree from the parsed plan steps (synthetic identity
-// drains are skipped — they have no node). Populates `path_map` (producer node
-// + channel per output path) when non-null.
+// Build the canonical PlanTree from the parsed plan steps.
 std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps,
-                                             std::string* error_out = nullptr,
-                                             PlanPathMap* path_map  = nullptr);
+                                             std::string* error_out = nullptr);
 
 // Populate every node's input_sources from the tree's edge wiring (and bitjoin
 // attrs, which carry input order). Called after the tree is built from the DSL

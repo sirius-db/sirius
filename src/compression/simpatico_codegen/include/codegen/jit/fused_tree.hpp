@@ -39,28 +39,6 @@ struct FusedTree {
   // than one place).
   std::map<std::string, std::shared_ptr<FusedTree>> children;
 
-  // Per-node attribute: only meaningful for ``OpKind::Bitpack``, and
-  // only consulted by the ENCODE renderer, which requires it to be
-  // true (see the contract check in encode/jit/renderer.cpp).  Encode
-  // always emits OverAllocate: each chunk's packed words are written
-  // at the arithmetic offset ``chunk_id * STRIDE_WORDS``, so the
-  // kernel never needs a host cumsum before it can start writing.
-  //
-  // The DECODE renderer ignores this field entirely (see
-  // `test_jit_kernel_cache.cpp`'s "fixed_stride is ignored here" for
-  // decode): every persisted bitpack rep has already been densified
-  // into the Compact layout by `compact_in_place()`
-  // (src/bridge/bitpack_compact.cu) before it's written to disk, and
-  // decode always reconstructs `bp_offsets` itself on-device via a CUB
-  // exclusive scan over the stored `chunk_bits`/`chunk_count` (see
-  // `synthesize_decode_transients` in bridge/codegen_runtime.cpp).
-  //
-  // Flipping this changes the CUDA source the encode renderer emits
-  // for the node, so it naturally lands in a different kernel-cache
-  // entry (the cache keys on a hash of the fully rendered source —
-  // see `ShapeKey` in `kernel_cache.hpp`).
-  bool fixed_stride{false};
-
   bool is_leaf() const noexcept { return children.empty(); }
 
   static std::shared_ptr<FusedTree> make(OpKind op)

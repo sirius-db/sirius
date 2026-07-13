@@ -7,8 +7,7 @@
 // `gpu_encode_tree` returns device `LabeledBuffers` (OverAllocate layout)
 // plus the rmm `device_buffer`s that own the allocations.  Feed `buffers`
 // to `jit_decode.hpp::jit_decode_tree` (plain-CUDA decode renderer +
-// `KernelCache::get_or_compile_plain`).  The FusedTree must carry
-// fixed_stride=true on Bitpack nodes (the encoder requires it anyway).
+// `KernelCache::get_or_compile_plain`).
 //
 // Post-processing the helper performs so callers don't have to:
 //   * rle_runs_offsets — the kernel writes raw per-chunk nruns at index
@@ -29,11 +28,10 @@
 
 #pragma once
 
-#include "codegen/encode/jit/plain_compile.hpp"
 #include "codegen/encode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
-#include "codegen/jit/nvrtc_compiler.hpp"  // CompileOptions
+#include "codegen/jit/nvrtc_compiler.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -131,9 +129,9 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
   //    shared KernelCache (same path the real pipeline and the operator sweep
   //    use) so the on-disk cubin cache covers fused_operator_sweep's encode too.
   cje::EncodeKernelSpec spec = cje::render(tree, element_dtype, out.num_chunks);
-  cje::CompileOptions opts;
+  jit::CompileOptions opts;
   opts.arch_cc = arch_cc;
-  const cje::CompiledKernel* kernel =
+  const jit::CompiledKernel* kernel =
     jit::KernelCache::instance().get_or_compile_plain(spec.source, spec.entry_symbol, opts);
 
   // Reserve so the per-spec emplace_backs never reallocate `owned` (keeps

@@ -213,7 +213,6 @@ std::unique_ptr<cudf::column> cascaded_compressor::decompress(
 }
 
 namespace detail {
-void release_cascaded_manager_scratch() {}  // no cached manager under the batched API
 }  // namespace detail
 
 }  // namespace simpatico

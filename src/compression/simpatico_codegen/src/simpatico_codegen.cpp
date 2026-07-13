@@ -13,7 +13,7 @@ namespace {
 
 leaf_desc make_leaf_desc(std::uint32_t node_index,
                          std::int32_t slot,
-                         PlanLeafKind kind,
+                         OpId kind,
                          compressed_representation const* rep,
                          rmm::cuda_stream_view stream)
 {
@@ -62,12 +62,13 @@ leaf_desc make_leaf_desc(std::uint32_t node_index,
 // ---------------------------------------------------------------------------
 // compressed_table::describe()
 // ---------------------------------------------------------------------------
-// Walk each column's plan_compound::tree; for every stored rep emit one
+// Walk each column's PlanTree; for every stored rep emit one
 // leaf_desc. Two storage slots per PlanNode:
-//   * node.rep      (path = node.rep_path)
+//   * node.rep      (the op's own representation)
 //   * node.channels (path = the map key)
 // rep->kind() is used for all rep types including codegen_fused_representation,
-// which returns Delta/Rle/Identity for fused delta/rle/raw ops respectively.
+// which maps its fused op tag to a leaf kind (delta->Delta, rle->Rle,
+// bitpack->Bitpack, for->For, zigzag->Zigzag, RawFused->Identity).
 
 std::vector<std::vector<leaf_desc>> compressed_table::describe(rmm::cuda_stream_view stream) const
 {
@@ -79,7 +80,7 @@ std::vector<std::vector<leaf_desc>> compressed_table::describe(rmm::cuda_stream_
       result.push_back({});
       continue;
     }
-    auto const& nodes = col.compound->tree.nodes;
+    auto const& nodes = col.compound->nodes;
     for (std::uint32_t ni = 0; ni < nodes.size(); ++ni) {
       auto const& node = nodes[ni];
       if (node.rep) {
@@ -182,12 +183,12 @@ compressed_table compress_with_plan(cudf::table_view table,
 
 // ── decompress ────────────────────────────────────────────────────────────────
 
-std::unique_ptr<cudf::column> decompress(const simpatico::plan_compound& compound,
+std::unique_ptr<cudf::column> decompress(const PlanTree& tree,
                                          rmm::cuda_stream_view stream,
                                          rmm::device_async_resource_ref mr)
 {
   std::string err;
-  auto col = decompress_column(compound, stream, mr, &err);
+  auto col = decompress_column(tree, stream, mr, &err);
   if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
   return col;
 }

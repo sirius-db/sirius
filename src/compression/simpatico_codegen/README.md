@@ -41,7 +41,6 @@ Modes:
   explore     BFS cascade search for the best plan for a single column
   compress    Compress input to a .hpln file
   decompress  Decompress a .hpln file to Parquet
-  verify      Roundtrip equality check
 ```
 
 Run `simpatico <mode> --help` for per-mode options.
@@ -65,20 +64,16 @@ Output is a plan DSL block per column, separated by `---`.
 
 ```bash
 simpatico compress --input data.parquet --plan plans/example_plans.txt --out data.hpln
+# --verify decompresses in-memory and checks the round-trip matches the input
+simpatico compress --input data.parquet --plan plans/example_plans.txt --out data.hpln --verify
 ```
 
 ### Decompress
 
 ```bash
 simpatico decompress --input data.hpln --out data_out.parquet
-```
-
-### Verify roundtrip
-
-```bash
-simpatico verify --input data.parquet --plan plans/example_plans.txt
-# or check an existing .hpln
-simpatico verify --input data.parquet --hpln data.hpln
+# --verify checks the decompressed output byte-for-byte against a source file
+simpatico decompress --input data.hpln --verify data.parquet
 ```
 
 ### Benchmark
@@ -94,7 +89,7 @@ simpatico benchmark --input data.parquet --plan plans/intraday_balanced.txt \
 
 ## Plan DSL
 
-Plans live in `plans/`. Each file contains one DSL block per column, separated by `---`.
+Each file contains one DSL block per column, separated by `---`.
 Lines beginning with `#` are comments.
 
 ```
@@ -104,8 +99,6 @@ delta.differences -> rle -> values, runs
 delta.differences.values -> bitpack
 delta.differences.runs -> bitpack
 ```
-
-See `plans/example_plans.txt` for annotated multi-column examples.
 
 ## C++ library API
 
@@ -136,32 +129,4 @@ auto result = simpatico::explore_column_compression(col_view, cfg, stream, mr);
 ```bash
 pixi run test          # full ctest
 cd build && ctest -R roundtrip   # run a specific test by name regex
-```
-
-Key tests:
-- `compress_with_plan_roundtrip` — per-operator and multi-level cascade roundtrip
-- `operator_sweep` — exhaustive generated sweep of all operators × all dtypes (depth 2 by default, set `SIMPATICO_SWEEP_DEPTH=4` for thorough)
-- `shape_parity` — fused-operator tree shapes
-- `compressed_table_io` — .hpln read/write
-
-## Architecture
-
-```
-include/
-  api/           simpatico_codegen.hpp, compressed_table_io.hpp
-  codegen/plan/  plan_interpreter, plan_tree, representation, leaf_desc, plan_dsl
-  codegen/jit/   nvrtc_compiler, kernel_cache
-  explore/       compression_explorer, operator_catalog
-src/
-  plan/          compress, decompress, plan_dsl, plan_tree, fusion, ...
-  bridge/        codegen_runtime, fused_tree_build
-  operators/     per-codec CUDA kernels (.cu)
-  jit/           NVRTC JIT compiler for fused kernels
-  explore/       BFS explorer + operator_catalog
-  api/           compressed_table_io
-  c_api/         simpatico_c_api (C ABI for FFI bindings)
-bench/           compress_with_plan_benchmark (legacy harness)
-cli/             driver_common.hpp, benchmark.hpp, simpatico_main.cpp
-tests/           gtest-based unit + integration tests
-plans/           example plan DSL files
 ```

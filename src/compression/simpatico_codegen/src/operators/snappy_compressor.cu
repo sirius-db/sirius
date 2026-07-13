@@ -93,7 +93,6 @@ std::unique_ptr<cudf::column> snappy_compressor::decompress(compressed_represent
 }
 
 namespace detail {
-void release_snappy_manager_scratch() {}  // no cached manager under the batched API
 }  // namespace detail
 
 }  // namespace simpatico

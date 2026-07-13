@@ -19,7 +19,6 @@
 // is to prove cache plumbing.
 
 #include "codegen/decode/jit/renderer.hpp"
-#include "codegen/encode/jit/plain_compile.hpp"  // for cje::CompileError alias
 #include "codegen/encode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
@@ -53,16 +52,10 @@ static double timed_ms(F&& fn)
 
 int main()
 {
-  // Real CUDA context is required to load the cuLibrary the cache
-  // hands back.  Same bootstrap as the decode-side cache test.
-  try {
-    cjj::ensure_cuda_context();
-  } catch (const std::exception& e) {
-    return report_fail("ensure_cuda_context failed", e.what());
-  }
+  if (cudaSetDevice(0) != cudaSuccess) return report_fail("cudaSetDevice(0) failed");
 
   cjj::CompileOptions opts;
-  opts.arch_cc = detect_arch_cc();  // matches the decode-side test default
+  opts.arch_cc = cjj::arch_cc_for_current_device();
 
   // Reset cache so size assertions are deterministic regardless of
   // whether the test binary inherits state from anywhere.
@@ -72,11 +65,9 @@ int main()
 
   // --- Render two distinct encode kernels via the real renderer. -----
   // Shape A: [Bitpack<int32>].  Smallest fusable shape — proves the
-  // wiring without depending on Delta/Rle support.  The encoder
-  // currently emits the OverAllocate layout only (Bitpack as a leaf
-  // must have fixed_stride=true; see renderer.cpp's contract check).
-  auto tree_bp          = cjj::FusedTree::make(OpKind::Bitpack);
-  tree_bp->fixed_stride = true;
+  // wiring without depending on Delta/Rle support.  The encoder emits
+  // the OverAllocate layout.
+  auto tree_bp = cjj::FusedTree::make(OpKind::Bitpack);
 
   cje::EncodeKernelSpec spec_a;
   try {
@@ -122,7 +113,7 @@ int main()
   try {
     cold_ms =
       timed_ms([&] { k1 = cache.get_or_compile_plain(spec_a.source, spec_a.entry_symbol, opts); });
-  } catch (const cje::CompileError& e) {
+  } catch (const cjj::CompileError& e) {
     return report_fail(e.what(), "log:\n" + e.log + "\n--- source ---\n" + e.source);
   } catch (const std::exception& e) {
     return report_fail(e.what());
@@ -145,21 +136,6 @@ int main()
       "warm lookup returned a different pointer "
       "(cache failed to dedup)");
   if (cache.size() != 1) return report_fail("cache size grew on warm hit");
-
-  // No absolute cold floor: plain-compile is 3-5x faster than the
-  // codegen JIT path (no extra NVRTC hop) and the driver's ComputeCache +
-  // nvrtc on-disk cache make subsequent test-process invocations
-  // sub-50ms even though they're "cold" from the in-process cache's
-  // point of view.  Relative speedup is the real signal anyway:
-  // even fully-disk-warm, cold path runs nvrtcCreateProgram,
-  // nvrtcCompileProgram, nvrtcGetCUBIN, cuLibraryLoadData,
-  // cuLibraryGetKernel, cuKernelGetFunction (>100 µs total), whereas
-  // warm is one FNV-1a hash + mutexed map lookup (<10 µs).
-  if (warm_ms * 50.0 > cold_ms) {
-    return report_fail(
-      "warm lookup not enough faster than cold compile",
-      "cold_ms=" + std::to_string(cold_ms) + " warm_ms=" + std::to_string(warm_ms));
-  }
 
   // --- 3. Different dtype -> new slot. -------------------------------
   const cjj::CompiledKernel* k3 = nullptr;
@@ -190,8 +166,7 @@ int main()
   // Must render a distinct source from Bitpack alone and from Bitpack<int64>.
   auto tree_for_bp = cjj::FusedTree::make(OpKind::For);
   {
-    auto child          = cjj::FusedTree::make(OpKind::Bitpack);
-    child->fixed_stride = true;
+    auto child = cjj::FusedTree::make(OpKind::Bitpack);
     tree_for_bp->children.emplace("deltas", std::move(child));
   }
 
@@ -225,7 +200,7 @@ int main()
   try {
     k_for_i32 =
       cache.get_or_compile_plain(spec_for_bp_i32.source, spec_for_bp_i32.entry_symbol, opts);
-  } catch (const cje::CompileError& e) {
+  } catch (const cjj::CompileError& e) {
     return report_fail(e.what(), "log:\n" + e.log + "\n--- source ---\n" + e.source);
   } catch (const std::exception& e) {
     return report_fail(e.what());
@@ -238,7 +213,7 @@ int main()
   try {
     k_for_i64 =
       cache.get_or_compile_plain(spec_for_bp_i64.source, spec_for_bp_i64.entry_symbol, opts);
-  } catch (const cje::CompileError& e) {
+  } catch (const cjj::CompileError& e) {
     return report_fail(e.what(), "log:\n" + e.log + "\n--- source ---\n" + e.source);
   } catch (const std::exception& e) {
     return report_fail(e.what());

@@ -30,11 +30,14 @@
 //
 // where the input channels are exactly the decode-relevant manifest
 // fields per node:
-//   * Bitpack : chunk_min, chunk_bits, packed, [bp_offsets if Compact]
-//               (chunk_count is unused at decode and intentionally
-//                omitted from the signature)
+//   * Bitpack : chunk_min, chunk_bits, packed, bp_offsets (decode is
+//               Compact-only, so bp_offsets — synthesized on-device — is
+//               always present; chunk_count is unused at decode and
+//               intentionally omitted from the signature)
 //   * Delta   : delta_first
 //   * Rle     : rle_runs_offsets
+//   * For     : references (one per chunk)
+//   * Zigzag  : zigzag (leaf store); no channel when inline-fused
 //
 // `buffers` lists those channels in the order the kernel expects them;
 // the launcher binds device pointers by (node_id, field) and pushes
@@ -90,8 +93,9 @@ struct RenderError : std::runtime_error {
 // source alone.
 //
 // Supported ops: Bitpack (leaf), Delta (inline-fused), Rle (stage
-// boundary), For (semi-inline transformer), composed arbitrarily.  Raw
-// throws RenderError (only valid as an Rle child).
+// boundary), For (semi-inline transformer), Zigzag (inline transform or
+// leaf store), and Raw (verbatim-passthrough leaf, valid as a
+// delta/rle/for child), composed arbitrarily.
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks);

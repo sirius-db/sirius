@@ -10,22 +10,22 @@
 //   1. synthesize_decode_transients adds decode-only buffers the encoder does
 //      not store: Bitpack's bp_offsets cumsum (CUB ExclusiveSum + 1-thread tail
 //      patch, see offsets_cumsum.cu) and RLE scratch, into RMM-pool transients.
-//   2. KernelCache::get_or_compile_plain resolves shape -> CUfunction (keyed
+//   2. KernelCache::get_or_compile_plain resolves shape -> CUkernel (keyed
 //      on a hash of the rendered CUDA source, so a shape hits the cache
 //      across compress and decompress). First touch pays the nvrtc compile;
-//      warm hits are cheap.
+//      warm hits are cheap. CUfunction is derived per-device at launch time.
 //   3. cuLaunchKernel binds the labeled buffers as flat per-field device
 //      pointers in the kernel's parameter order, runs over the rendered
 //      __global__ kernel, syncs the stream, and frees the transients.
 //
-// Restrictions: int32/int64 dtypes; leaf kinds bitpack/delta/rle.
+// Restrictions: int32/int64 dtypes; fused leaf kinds bitpack/delta/rle/for/
+// zigzag (+ the synthesized raw passthrough).
 // Other kinds fall through (caller routes to the legacy operator path).
 // Every stored bitpack rep is dense (compact_in_place runs before publish), so
 // decode always uses the Compact gather over bp_offsets.
 // Failures log to stderr and return nullptr / -1.
 
 #include "codegen/decode/jit/renderer.hpp"
-#include "codegen/encode/jit/plain_compile.hpp"
 #include "codegen/encode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
@@ -272,40 +272,6 @@ const char* dtype_to_cxx(const char* dtype)
 
 // Query the active CUDA device's compute capability and return it as a
 // two-digit integer (e.g. 89 for sm_89 / Ada).  Using the device's actual
-// CC guarantees the SASS we produce can run here.
-//
-// Falls back to 80 (Ampere — broadest coverage) if the
-// driver query fails for any reason.  ``ensure_cuda_context`` has
-// already been called by the caller so cuCtxGetDevice should
-// succeed; the defensive fallback is only there to avoid throwing
-// from a path that's expected to be best-effort.
-//
-// Cached behind a thread-local — every call lands in the same
-// process with the same active device, so re-querying is wasted work
-// after the first decompress on a hot loop.
-int detect_arch_cc() noexcept
-{
-  // cudaGetDevice uses the runtime API and does not require a driver context
-  // to be current — safe to call before any ensure_cuda_context().
-  int device_id = 0;
-  if (cudaGetDevice(&device_id) != cudaSuccess) return 80;
-
-  // Thread-local cache keyed by device ordinal for multi-GPU correctness.
-  thread_local std::unordered_map<int, int> cache;
-  auto it = cache.find(device_id);
-  if (it != cache.end()) return it->second;
-
-  CUdevice dev = 0;
-  if (cuDeviceGet(&dev, device_id) != CUDA_SUCCESS) return cache[device_id] = 80;
-  int major = 0, minor = 0;
-  if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) !=
-        CUDA_SUCCESS ||
-      cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) !=
-        CUDA_SUCCESS) {
-    return cache[device_id] = 80;
-  }
-  return cache[device_id] = major * 10 + minor;
-}
 
 // Launch the plain-CUDA rendered decode kernel (symmetric to the
 // encode renderer).  Returns 1 on success, -1 on failure.  Reuses the
@@ -339,7 +305,7 @@ int run_rendered_decode(const jit::FusedTree& tree,
   }
 
   jit::CompileOptions opts;
-  opts.arch_cc = detect_arch_cc();
+  opts.arch_cc = jit::arch_cc_for_current_device();
   // The rendered decode source includes rle_block.cuh (→ tree.hpp), whose
   // unannotated constexpr accessors require nvrtc's -default-device.
   opts.default_device               = true;
@@ -460,19 +426,13 @@ int run_rendered_decode(const jit::FusedTree& tree,
   return 1;
 }
 
-// Force-link anchor so a JIT lib symbol is referenced from this TU
-// even on the failure paths.  Keeps the codegen_jit_bridge .a
-// from being archive-pruned when the bridge is never reached at run time.
-[[maybe_unused]] auto const* const kCodegenCppLinkAnchor =
-  reinterpret_cast<void const*>(&jit::ensure_cuda_context);
-
 }  // namespace
 
 namespace simpatico {
 
 // Decode one codegen-fused subtree. The caller (``dispatch_codegen_subtree``)
 // already holds the subtree structurally: it passes a fully-built ``FusedTree``
-// (every Bitpack node ``fixed_stride=false`` — decode is Compact-only) and a
+// (decode is Compact-only) and a
 // ``LabeledBuffers`` of the real device buffers, keyed by DFS-preorder
 // ``buffer_key(node_id, field)`` — exactly the ids ``run_rendered_decode``
 // resolves against. This function only adds the decode-only transients the
@@ -613,9 +573,8 @@ std::optional<CodegenHead> extract_fusable_subtree(PlanTree const& tree,
 
   // Build the fused-region FusedTree with the SAME builder the decode binder
   // uses (bridge/fused_tree_build) — the two sides can never drift on structure
-  // or node-id order. The encode layout sets fixed_stride=true on every Bitpack
-  // node (OverAllocate scratch); decode passes false (Compact).
-  auto built = build_fused_tree(tree, start_node, /*fixed_stride=*/true);
+  // or node-id order. The encode kernel always emits the OverAllocate layout.
+  auto built = build_fused_tree(tree, start_node);
   if (!built) { return fail("no fusable subtree rooted at node " + std::to_string(start_node)); }
 
   CodegenHead head;
@@ -705,13 +664,13 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
     // same fused-tree shape and dtype hits the cached compile —
     // including different files / different num_rows.  Cache owns the
     // CompiledKernel; we hold a non-owning pointer for the launch.
-    cje::CompileOptions copts;
-    copts.arch_cc                     = detect_arch_cc();
-    const cje::CompiledKernel* kernel = nullptr;
+    jit::CompileOptions copts;
+    copts.arch_cc                     = jit::arch_cc_for_current_device();
+    const jit::CompiledKernel* kernel = nullptr;
     try {
       kernel =
         jit::KernelCache::instance().get_or_compile_plain(spec.source, spec.entry_symbol, copts);
-    } catch (const cje::CompileError& e) {
+    } catch (const jit::CompileError& e) {
       std::fprintf(stderr,
                    "simpatico::codegen: cpp encode: nvrtc rejected source: %s\n--- log ---\n%s\n",
                    e.what(),
@@ -877,13 +836,10 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                            rmm::device_buffer(0, stream),
                                            0);
 
-          // Construct the OverAllocate (sparse) rep from the encode
-          // kernel's output, then EAGERLY compact it so every fused
-          // subtree's bitpack output is born Compact (dense).  This lets
-          // decode take the uniform Compact path: the binder leaves
-          // node.fixed_stride=false (is_sparse() is now false) and
-          // synthesize_decode_transients() rebuilds bp_offsets on-device
-          // from chunk_count × chunk_bits.
+          // Construct the OverAllocate rep from the encode kernel's output,
+          // then EAGERLY compact it so every fused subtree's bitpack output is
+          // born Compact (dense) — see bitpack_compressed_representation for the
+          // OverAllocate→Compact layout contract.
           //
           // FUTURE (plan: drop-overalloc — "sync+scan-halfway"): evaluate
           // doing a sync+scan partway through the encode to obtain the

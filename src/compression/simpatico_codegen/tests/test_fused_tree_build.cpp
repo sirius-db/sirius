@@ -2,8 +2,7 @@
 //
 // Structural tests for the shared PlanTree -> jit::FusedTree builder
 // (bridge/fused_tree_build.{hpp,cpp}). Host-only (no GPU): asserts tree shape,
-// DFS-preorder node-id ordering, fixed_stride propagation, and the rle raw
-// passthrough leaf.
+// DFS-preorder node-id ordering, and the rle raw passthrough leaf.
 
 #include "codegen/bridge/fused_tree_build.hpp"
 #include "codegen/plan/plan_tree.hpp"
@@ -47,7 +46,7 @@ void test_cascade_shape_and_preorder()
     "delta.differences.runs -> bitpack\n");
   simpatico::NodeId delta = node_for_op(t, "delta");
 
-  auto built = simpatico::build_fused_tree(t, delta, /*fixed_stride=*/true);
+  auto built = simpatico::build_fused_tree(t, delta);
   expect(built.has_value(), "build_fused_tree returned nullopt for valid cascade");
 
   auto const& root = *built->tree;
@@ -60,7 +59,6 @@ void test_cascade_shape_and_preorder()
          "rle has runs+values children");
   expect(rle.children.at("runs")->op == OpKind::Bitpack, "runs child Bitpack");
   expect(rle.children.at("values")->op == OpKind::Bitpack, "values child Bitpack");
-  expect(rle.children.at("runs")->fixed_stride, "bitpack fixed_stride=true");
 
   // Preorder: delta, rle, bitpack(runs), bitpack(values) — children lex order.
   expect(built->preorder.size() == 4, "4 nodes in preorder");
@@ -77,14 +75,13 @@ void test_cascade_shape_and_preorder()
   }
 }
 
-void test_fixed_stride_false_for_decode()
+void test_lone_bitpack()
 {
   auto t               = build_tree("input -> bitpack\n");
   simpatico::NodeId bp = node_for_op(t, "bitpack");
-  auto built           = simpatico::build_fused_tree(t, bp, /*fixed_stride=*/false);
+  auto built           = simpatico::build_fused_tree(t, bp);
   expect(built.has_value(), "lone bitpack builds");
   expect(built->tree->op == OpKind::Bitpack, "root Bitpack");
-  expect(!built->tree->fixed_stride, "decode fixed_stride=false");
   expect(built->preorder.size() == 1, "single preorder node");
 }
 
@@ -94,7 +91,7 @@ void test_rle_raw_values_passthrough()
     "input -> rle -> values, runs\n"
     "rle.runs -> bitpack\n");
   simpatico::NodeId rle = node_for_op(t, "rle");
-  auto built            = simpatico::build_fused_tree(t, rle, /*fixed_stride=*/true);
+  auto built            = simpatico::build_fused_tree(t, rle);
   expect(built.has_value(), "rle+raw-values builds");
 
   auto const& root = *built->tree;
@@ -118,7 +115,7 @@ void test_delta_raw_differences_passthrough()
     "input -> delta -> differences\n"
     "delta.differences -> ans\n");
   simpatico::NodeId delta = node_for_op(t, "delta");
-  auto built              = simpatico::build_fused_tree(t, delta, /*fixed_stride=*/true);
+  auto built              = simpatico::build_fused_tree(t, delta);
   expect(built.has_value(), "delta with ans child -> valid Raw passthrough tree");
 
   auto const& root = *built->tree;
@@ -143,7 +140,7 @@ int main()
 {
   try {
     test_cascade_shape_and_preorder();
-    test_fixed_stride_false_for_decode();
+    test_lone_bitpack();
     test_rle_raw_values_passthrough();
     test_delta_raw_differences_passthrough();
     std::printf("test_fused_tree_build: PASS\n");

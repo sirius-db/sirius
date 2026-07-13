@@ -144,7 +144,7 @@ struct compressed_representation {
   }
 
   // ---- Leaf descriptor hooks (serialization / describe()) ----
-  virtual PlanLeafKind kind() const { return PlanLeafKind::Unknown; }
+  virtual OpId kind() const { return OpId::Unknown; }
   virtual cudf::data_type decoded_type() const { return original_type; }
   virtual leaf_meta_v describe_meta() const { return leaf_meta::none{}; }
 };
@@ -179,7 +179,7 @@ struct identity_compressed_representation : compressed_representation {
     if (col == nullptr) return {};
     return {{"data", col->view()}};
   }
-  PlanLeafKind kind() const override { return PlanLeafKind::Identity; }
+  OpId kind() const override { return OpId::Identity; }
 };
 
 /// Base compressor: compress(column, stream, mr) -> compressed_representation, decompress(stream,
@@ -381,7 +381,7 @@ struct dictionary_compressed_representation : compressed_representation {
     }
     return nullptr;
   }
-  PlanLeafKind kind() const override { return PlanLeafKind::Dictionary; }
+  OpId kind() const override { return OpId::Dictionary; }
 
  private:
   // Copy `source`'s validity bitmask into the owned UINT8 null_mask_copy
@@ -527,7 +527,7 @@ struct bitpack_compressed_representation : compressed_representation {
   std::int32_t stride_words_{0};
   std::int64_t live_packed_bytes_sparse_{0};
 
-  PlanLeafKind kind() const override { return PlanLeafKind::Bitpack; }
+  OpId kind() const override { return OpId::Bitpack; }
 
   /// Live byte count of the ``packed`` channel (UINT32 words: size x elem width).
   std::int64_t live_packed_bytes() const
@@ -730,13 +730,6 @@ struct ans_compressed_representation : nvcomp_payload_rep {
     std::string* error_out,
     leaf_meta_v const& meta = leaf_meta::none{});
 
-  // STRING path (original_type == STRING): compressed_data holds the offsets
-  // codec stream (first `offsets_compressed_size` bytes) followed by the chars
-  // stream; `uncompressed_size` is the chars byte count. Zero for fixed-width.
-  size_t offsets_compressed_size   = 0;
-  size_t offsets_uncompressed_size = 0;
-  cudf::data_type offsets_type{cudf::type_id::INT32};
-
   ans_compressed_representation(cudf::data_type t,
                                 cudf::size_type n,
                                 std::unique_ptr<rmm::device_buffer> data,
@@ -749,17 +742,10 @@ struct ans_compressed_representation : nvcomp_payload_rep {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  PlanLeafKind kind() const override { return PlanLeafKind::Ans; }
+  OpId kind() const override { return OpId::Ans; }
   leaf_meta_v describe_meta() const override
   {
-    leaf_meta::ans a{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
-    if (original_type.id() == cudf::type_id::STRING) {
-      a.strings = {offsets_compressed_size,
-                   offsets_uncompressed_size,
-                   static_cast<std::int32_t>(offsets_type.id()),
-                   num_rows};
-    }
-    return a;
+    return leaf_meta::ans{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
   }
 };
 
@@ -789,15 +775,8 @@ struct bitcomp_compressed_representation : nvcomp_payload_rep {
     std::string* error_out,
     leaf_meta_v const& meta = leaf_meta::none{});
 
-  // Algorithm used at compress time so decompress hits the same
-  // Manager cache slot.
+  // Algorithm used at compress time so decompress hits the same Manager cache slot.
   int compress_algorithm;
-  // STRING path (original_type == STRING): compressed_data holds the offsets
-  // codec stream (first `offsets_compressed_size` bytes) then the chars stream;
-  // `uncompressed_size` is the chars byte count. Zero for fixed-width.
-  size_t offsets_compressed_size   = 0;
-  size_t offsets_uncompressed_size = 0;
-  cudf::data_type offsets_type{cudf::type_id::INT32};
 
   bitcomp_compressed_representation(cudf::data_type t,
                                     cudf::size_type n,
@@ -813,18 +792,11 @@ struct bitcomp_compressed_representation : nvcomp_payload_rep {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  PlanLeafKind kind() const override { return PlanLeafKind::Bitcomp; }
+  OpId kind() const override { return OpId::Bitcomp; }
   leaf_meta_v describe_meta() const override
   {
-    leaf_meta::bitcomp b{
+    return leaf_meta::bitcomp{
       uncompressed_size, static_cast<std::int32_t>(original_type.id()), compress_algorithm};
-    if (original_type.id() == cudf::type_id::STRING) {
-      b.strings = {offsets_compressed_size,
-                   offsets_uncompressed_size,
-                   static_cast<std::int32_t>(offsets_type.id()),
-                   num_rows};
-    }
-    return b;
   }
 };
 
@@ -894,7 +866,7 @@ struct cascaded_compressed_representation : nvcomp_payload_rep {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  PlanLeafKind kind() const override { return PlanLeafKind::NvcompCascaded; }
+  OpId kind() const override { return OpId::NvcompCascaded; }
   leaf_meta_v describe_meta() const override
   {
     return leaf_meta::nvcomp_cascaded{uncompressed_size,
@@ -935,11 +907,11 @@ struct cascaded_compressor : compressor {
 //  - from_outputs() — defined in representation_factory.cpp
 // -----------------------------------------------------------------------------
 
-template <PlanLeafKind K, typename MetaT>
+template <OpId K, typename MetaT>
 struct nvcomp_simple_rep_base : nvcomp_payload_rep {
   using nvcomp_payload_rep::nvcomp_payload_rep;
 
-  PlanLeafKind kind() const override { return K; }
+  OpId kind() const override { return K; }
   leaf_meta_v describe_meta() const override
   {
     return MetaT{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
@@ -950,8 +922,7 @@ struct nvcomp_simple_rep_base : nvcomp_payload_rep {
                                            rmm::device_async_resource_ref mr) const override = 0;
 };
 
-struct snappy_compressed_representation
-  : nvcomp_simple_rep_base<PlanLeafKind::Snappy, leaf_meta::snappy> {
+struct snappy_compressed_representation : nvcomp_simple_rep_base<OpId::Snappy, leaf_meta::snappy> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
@@ -964,7 +935,7 @@ struct snappy_compressed_representation
                                            rmm::device_async_resource_ref mr) const override;
 };
 
-struct lz4_compressed_representation : nvcomp_simple_rep_base<PlanLeafKind::Lz4, leaf_meta::lz4> {
+struct lz4_compressed_representation : nvcomp_simple_rep_base<OpId::Lz4, leaf_meta::lz4> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
@@ -978,7 +949,7 @@ struct lz4_compressed_representation : nvcomp_simple_rep_base<PlanLeafKind::Lz4,
 };
 
 struct deflate_compressed_representation
-  : nvcomp_simple_rep_base<PlanLeafKind::Deflate, leaf_meta::deflate> {
+  : nvcomp_simple_rep_base<OpId::Deflate, leaf_meta::deflate> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
@@ -1068,7 +1039,7 @@ struct alp_compressed_representation : compressed_representation {
     if (name == "metadata" && metadata) return std::move(metadata);
     return nullptr;
   }
-  PlanLeafKind kind() const override { return PlanLeafKind::Alp; }
+  OpId kind() const override { return OpId::Alp; }
 };
 
 struct alp_compressor : compressor {
@@ -1140,7 +1111,7 @@ struct alp_rd_compressed_representation : compressed_representation {
     if (name == "exception_positions" && exception_positions) return std::move(exception_positions);
     return nullptr;
   }
-  PlanLeafKind kind() const override { return PlanLeafKind::AlpRd; }
+  OpId kind() const override { return OpId::AlpRd; }
   leaf_meta_v describe_meta() const override { return leaf_meta::alp_rd{right_bw}; }
 };
 
@@ -1501,21 +1472,21 @@ struct codegen_fused_representation : compressed_representation {
     return out;
   }
 
-  PlanLeafKind kind() const override
+  OpId kind() const override
   {
-    if (kind_tag == "delta") return PlanLeafKind::Delta;
-    if (kind_tag == "rle") return PlanLeafKind::Rle;
-    if (kind_tag == "bitpack") return PlanLeafKind::Bitpack;
-    if (kind_tag == "for") return PlanLeafKind::For;
-    if (kind_tag == "zigzag") return PlanLeafKind::Zigzag;
-    if (kind_tag == "RawFused") return PlanLeafKind::Identity;
-    return PlanLeafKind::Unknown;
+    if (kind_tag == "delta") return OpId::Delta;
+    if (kind_tag == "rle") return OpId::Rle;
+    if (kind_tag == "bitpack") return OpId::Bitpack;
+    if (kind_tag == "for") return OpId::For;
+    if (kind_tag == "zigzag") return OpId::Zigzag;
+    if (kind_tag == "RawFused") return OpId::Identity;
+    return OpId::Unknown;
   }
 };
 
 /// Resolve a DSL compressor name to a compressor instance, or nullptr if
-/// the name is unknown. The fused ops (delta / rle / bitpack) are not here —
-/// they go through the JIT codegen encoder, not a compressor factory.
+/// the name is unknown. The fused ops (delta / rle / bitpack / for / zigzag) are
+/// not here — they go through the JIT codegen encoder, not a compressor factory.
 ///
 /// Recognised names (incl. parameterised suffix forms):
 ///   identity, dictionary, for, alp, alp_rd, ans,

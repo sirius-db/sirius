@@ -36,11 +36,7 @@ static double timed_ms(F&& fn)
 
 int main()
 {
-  try {
-    jit::ensure_cuda_context();
-  } catch (const std::exception& e) {
-    return report_fail("ensure_cuda_context", e.what());
-  }
+  if (cudaSetDevice(0) != cudaSuccess) return report_fail("cudaSetDevice(0) failed");
 
   {
     auto a = jit::source_digest("hello world");
@@ -56,11 +52,11 @@ int main()
   }
 
   jit::CompileOptions opts;
-  opts.arch_cc        = detect_arch_cc();
+  opts.arch_cc        = jit::arch_cc_for_current_device();
   opts.default_device = true;
 
   auto tree_bp = jit::FusedTree::make(OpKind::Bitpack);
-  // Decode is Compact-only (drop-overalloc): fixed_stride is ignored here.
+  // Decode is Compact-only (drop-overalloc).
 
   cdj::DecodeKernelSpec spec_a;
   try {

@@ -70,29 +70,38 @@ void test_path_map()
     "delta.differences.runs -> bitpack\n";
 
   std::string err;
-  simpatico::PlanPathMap pm;
-  auto tree = simpatico::plan_tree_from_dsl(dsl, &err, &pm);
+  auto tree = simpatico::plan_tree_from_dsl(dsl, &err);
   expect(tree.has_value(), err.empty() ? "plan_tree_from_dsl failed" : err.c_str());
 
-  // Root.
-  expect(pm.node.at("input") == 0, "input -> node 0");
-  expect(pm.channel.at("input") == "input", "input channel");
+  // Resolve a produced path to (producer node, channel) straight from the tree's
+  // output wiring: node.output_paths[k] is produced by that node on channel
+  // node.output_names[k]. (This is the structure PlanPathMap used to expose.)
+  auto producer_of = [&](std::string const& path) -> std::pair<simpatico::NodeId, std::string> {
+    for (simpatico::NodeId i = 0; i < tree->nodes.size(); ++i) {
+      auto const& n = tree->nodes[i];
+      for (std::size_t k = 0; k < n.output_paths.size(); ++k)
+        if (n.output_paths[k] == path) return {i, n.output_names[k]};
+    }
+    return {static_cast<simpatico::NodeId>(tree->nodes.size()), std::string{}};
+  };
+
+  expect(tree->nodes[0].op == "input", "node 0 is input");
 
   // delta produces "delta.differences" (channel "differences") at the delta node.
-  simpatico::NodeId delta_node = pm.node.at("delta.differences");
+  auto [delta_node, delta_chan] = producer_of("delta.differences");
   expect(tree->nodes[delta_node].op == "delta", "delta.differences produced by delta node");
-  expect(pm.channel.at("delta.differences") == "differences", "differences channel");
+  expect(delta_chan == "differences", "differences channel");
 
   // rle produces both values and runs at the SAME (rle) node, distinct channels.
-  simpatico::NodeId values_node = pm.node.at("delta.differences.values");
-  simpatico::NodeId runs_node   = pm.node.at("delta.differences.runs");
+  auto [values_node, values_chan] = producer_of("delta.differences.values");
+  auto [runs_node, runs_chan]     = producer_of("delta.differences.runs");
   expect(values_node == runs_node, "rle values+runs share one producing node");
   expect(tree->nodes[values_node].op == "rle", "values/runs produced by rle node");
-  expect(pm.channel.at("delta.differences.values") == "values", "values channel");
-  expect(pm.channel.at("delta.differences.runs") == "runs", "runs channel");
+  expect(values_chan == "values", "values channel");
+  expect(runs_chan == "runs", "runs channel");
 
-  // Terminal bitpack nodes produce no downstream path (not map producers).
-  expect(pm.node.find("delta.differences.values.bitpack") == pm.node.end(),
+  // Terminal bitpack nodes produce no downstream path.
+  expect(producer_of("delta.differences.values.bitpack").first == tree->nodes.size(),
          "terminal bitpack produces no path");
 }
 
@@ -130,8 +139,8 @@ void test_operator_registry()
   expect(op_id_from_name("bitpack") == OpId::Bitpack, "bitpack -> Bitpack");
   expect(op_id_from_name("bitcomp") == OpId::Bitcomp, "bitcomp -> Bitcomp");
   expect(op_id_from_name("bitcomp_sparse") == OpId::Bitcomp, "bitcomp_sparse -> Bitcomp");
-  expect(op_id_from_name("nvcomp_cascaded") == OpId::Cascaded, "nvcomp_cascaded -> Cascaded");
-  expect(op_id_from_name("nvcomp_cascaded_2D1R1B") == OpId::Cascaded,
+  expect(op_id_from_name("nvcomp_cascaded") == OpId::NvcompCascaded, "nvcomp_cascaded -> Cascaded");
+  expect(op_id_from_name("nvcomp_cascaded_2D1R1B") == OpId::NvcompCascaded,
          "cascaded suffix -> Cascaded");
   expect(op_id_from_name("bitextract_f32") == OpId::Bitextract, "bitextract_f32 -> Bitextract");
   expect(op_id_from_name("bitextract_3hi_5lo") == OpId::Bitextract,

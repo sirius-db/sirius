@@ -16,10 +16,8 @@
 
 #include "simpatico_bridge.hpp"
 
-#include <codegen/jit/nvrtc_compiler.hpp>
-
 namespace sirius::compression {
 
-void initialize_simpatico_jit() { codegen::jit::ensure_cuda_context(); }
+void initialize_simpatico_jit() {}
 
 }  // namespace sirius::compression

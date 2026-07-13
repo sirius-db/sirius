@@ -63,9 +63,10 @@
 //
 // Failure handling
 // ----------------
-// Unsupported shapes (e.g. a FOR transformer) throw RenderError with a
-// clear diagnostic.  Bitpack / Delta / Rle / Raw all render; Raw is a
-// verbatim passthrough leaf usable as an Rle child.
+// Bitpack / Delta / Rle / For / Zigzag / Raw all render; Raw is a verbatim
+// passthrough leaf synthesized for a delta/rle/for channel that isn't further
+// fused.  An op the renderer can't emit throws RenderError with a clear
+// diagnostic.
 
 #include "codegen/encode/jit/renderer.hpp"
 
@@ -1054,12 +1055,6 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       "render: Bitpack must be a leaf (no children) — encode "
       "chain ends at Bitpack; tail codecs (bitcomp/ANS) attach "
       "to the `packed` channel downstream, not as fused children");
-  }
-  if (!node.fixed_stride) {
-    throw RenderError(
-      "render: Bitpack node must have fixed_stride=true "
-      "(encoder produces OverAllocate layout); pass through "
-      "compact_in_place() to obtain Compact-layout buffers");
   }
   // Per-op dtype lookup — the LaneInput is the source of truth.  A
   // Bitpack under Rle's `runs` subtree sees in.elem_type=int32_t

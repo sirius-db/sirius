@@ -44,32 +44,28 @@ namespace {
 // Place one produced rep onto its owning node in `tree`, keyed by the DSL
 // `path`.
 //
-// Placement rule (total over all leaf paths — see plan_tree.hpp PlanNode docs):
-//   * If path P is consumed by a real (non-synthetic) op C, the rep is C's own
-//     representation (keyed by its input path) -> `consumer_by_input[P]`.rep.
-//     (Synthetic identity drains have no tree node, so a terminal output
-//     consumed only by a synthetic drain falls through to the channels branch.)
-//   * Otherwise P is a terminal/identity OUTPUT of its producing node ->
-//     `path_map.node[P]`.channels[P].
-// A leaf that matches neither (should not happen for a well-formed plan) is
-// parked on the root node's channels so it is never leaked/lost.
+// Placement rule (see plan_tree.hpp PlanNode docs):
+//   * If path P is consumed by a real op C, the rep is C's own representation
+//     (keyed by its input path) -> `consumer_by_input[P]`.rep.
+//   * Otherwise P is a terminal/identity OUTPUT of `producer` (the node the
+//     caller is currently emitting) -> `tree.nodes[producer]`.channels[P].
 void place_rep_on_node(PlanTree& tree,
-                       PlanPathMap const& path_map,
                        std::unordered_map<std::string, NodeId> const& consumer_by_input,
+                       NodeId producer,
                        std::string const& path,
                        std::unique_ptr<compressed_representation> rep)
 {
   if (!rep) return;
   auto cit = consumer_by_input.find(path);
   if (cit != consumer_by_input.end()) {
-    auto& node    = tree.nodes[cit->second];
-    node.rep      = std::move(rep);
-    node.rep_path = path;
+    auto& node = tree.nodes[cit->second];
+    node.rep   = std::move(rep);
     return;
   }
-  auto pit           = path_map.node.find(path);
-  NodeId const owner = (pit != path_map.node.end()) ? pit->second : 0;
-  tree.nodes[owner].channels.emplace(path, std::move(rep));
+  // Terminal output (nothing consumes `path`): park on the producing node's
+  // channels. `producer` is the node the caller is currently emitting, which
+  // produces this output path.
+  tree.nodes[producer].channels.emplace(path, std::move(rep));
 }
 
 // Returns the DSL output path for `name` on `node` (output_paths[i] where
@@ -89,10 +85,9 @@ std::string const* output_path_for_name(PlanNode const& node, std::string const&
 void place_fused_leaves(PlanTree& tree, plan_compound_builder& builder)
 {
   for (auto& [nodeid, rep] : builder.leaves) {
-    auto& nd    = tree.nodes[nodeid];
-    nd.rep      = std::move(rep);
-    nd.rep_path = nd.input_path;
-    nd.meta     = nd.rep->describe_meta();
+    auto& nd = tree.nodes[nodeid];
+    nd.rep   = std::move(rep);
+    nd.meta  = nd.rep->describe_meta();
   }
 }
 
@@ -136,7 +131,6 @@ struct CompressWalk {
   std::unordered_map<std::string, NodeId> const& consumer_by_input;
   std::unordered_map<std::string, cudf::column_view>& columns;
   std::unordered_map<std::string, std::unique_ptr<compressed_representation>>& reprs_by_input;
-  PlanPathMap const& path_map;
   std::vector<bool>& visited;
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
@@ -155,9 +149,11 @@ struct CompressWalk {
     if (error_out) *error_out = std::move(msg);
   }
 
-  void place(std::string const& path, std::unique_ptr<compressed_representation> rep)
+  void place(NodeId producer,
+             std::string const& path,
+             std::unique_ptr<compressed_representation> rep)
   {
-    place_rep_on_node(tree, path_map, consumer_by_input, path, std::move(rep));
+    place_rep_on_node(tree, consumer_by_input, producer, path, std::move(rep));
   }
 
   // Drop the live column view at `path`; if it was the last consumed output of
@@ -263,7 +259,7 @@ void CompressWalk::emit_bitjoin_node(NodeId n)
     node.output_paths.empty() || !consumer_by_input.count(node.output_paths[0]);
   columns.emplace(out_key, out_col->view());
   if (output_is_terminal) {
-    place(out_key, std::make_unique<identity_compressed_representation>(std::move(out_col)));
+    place(n, out_key, std::make_unique<identity_compressed_representation>(std::move(out_col)));
     release_node_inputs(node);
   } else {
     std::string const repr_key = node.input_paths[0];
@@ -445,7 +441,7 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
 
   if (node.output_names.empty()) {
     release_column(path);
-    place(path, std::move(repr));
+    place(n, path, std::move(repr));
     return;
   }
 
@@ -495,7 +491,8 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
         set_error("failed to get column for identity leaf '" + output_path + "'");
         return;
       }
-      place(output_path, std::make_unique<identity_compressed_representation>(std::move(leaf_col)));
+      place(
+        n, output_path, std::make_unique<identity_compressed_representation>(std::move(leaf_col)));
     } else {
       ++pending;
       col_to_repr_key[output_path] = repr_key;
@@ -522,11 +519,11 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
 
 }  // namespace
 
-std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
-                                               std::string_view plan_dsl,
-                                               rmm::cuda_stream_view stream,
-                                               rmm::device_async_resource_ref mr,
-                                               std::string* error_out)
+std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
+                                          std::string_view plan_dsl,
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr,
+                                          std::string* error_out)
 {
   // Single-stream per column: all work runs on `stream`. Cross-column
   // parallelism is the caller's job (one column per worker thread, each on its
@@ -541,18 +538,17 @@ std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
     if (error_out) *error_out = parse_error;
     return nullptr;
   }
-  auto compound = std::make_unique<plan_compound>();
-  PlanPathMap path_map;
+  auto compound = std::make_unique<PlanTree>();
   {
     std::string tree_err;
-    auto tree = plan_tree_from_steps(steps, &tree_err, &path_map);
+    auto tree = plan_tree_from_steps(steps, &tree_err);
     if (!tree) {
       if (error_out) *error_out = "plan-tree build: " + tree_err;
       return nullptr;
     }
-    compound->tree = std::move(*tree);
+    *compound = std::move(*tree);
   }
-  PlanTree& tree = compound->tree;
+  PlanTree& tree = *compound;
 
   // consumer_by_input[P] = the node that consumes path P, derived straight from
   // the tree's input metadata. First-consumer-wins, matching parse_plan_dsl. Only
@@ -577,7 +573,7 @@ std::unique_ptr<plan_compound> compress_column(cudf::column_view input,
   std::vector<bool> visited(tree.nodes.size(), false);
 
   CompressWalk walk{
-    tree, consumer_by_input, columns, reprs_by_input, path_map, visited, stream, mr, error_out};
+    tree, consumer_by_input, columns, reprs_by_input, visited, stream, mr, error_out};
   walk.emit_path("input");
   if (walk.failed) return nullptr;
 
@@ -625,7 +621,7 @@ fused_op_channels canonical_fused_channels(std::string const& op)
 // the real transformed streams) while owning the whole compound so the channel
 // views stay valid and byte accounting stays complete.
 struct single_op_representation : compressed_representation {
-  std::unique_ptr<plan_compound> compound;
+  std::unique_ptr<PlanTree> compound;
   std::vector<compressible_output> chans;
 
   single_op_representation(cudf::data_type t, cudf::size_type n) : compressed_representation(t, n)
@@ -643,7 +639,7 @@ struct single_op_representation : compressed_representation {
   {
     size_t total = 0;
     if (!compound) return total;
-    for (auto const& node : compound->tree.nodes) {
+    for (auto const& node : compound->nodes) {
       if (node.rep) total += node.rep->compressed_size_bytes(stream);
       for (auto const& [path, rep] : node.channels) {
         if (rep) total += rep->compressed_size_bytes(stream);
@@ -713,9 +709,9 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
 
   // Locate the op node (index 1 for a single-step plan).
   PlanNode* op_node = nullptr;
-  for (std::size_t i = 1; i < compound->tree.nodes.size(); ++i) {
-    if (compound->tree.nodes[i].op == op_name) {
-      op_node = &compound->tree.nodes[i];
+  for (std::size_t i = 1; i < compound->nodes.size(); ++i) {
+    if (compound->nodes[i].op == op_name) {
+      op_node = &compound->nodes[i];
       break;
     }
   }
@@ -749,8 +745,8 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
 
     bool found = false;
 
-    for (std::size_t j = 1; j < compound->tree.nodes.size() && !found; ++j) {
-      auto& nj = compound->tree.nodes[j];
+    for (std::size_t j = 1; j < compound->nodes.size() && !found; ++j) {
+      auto& nj = compound->nodes[j];
       if (nj.op != "identity" || nj.input_paths.empty()) continue;
       if (nj.input_paths[0] != chan_path || !nj.rep) continue;
       auto leaf_chans = nj.rep->named_channels(stream);

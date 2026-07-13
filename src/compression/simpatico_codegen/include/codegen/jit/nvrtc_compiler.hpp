@@ -24,10 +24,13 @@ struct CompileError : std::runtime_error {
 };
 
 struct CompileOptions {
-  int arch_cc             = 80;
-  std::string kernel_name = "codegen_jit_kernel";
-  bool default_device     = false;
+  int arch_cc         = 0;  // must be set by caller via arch_cc_for_current_device()
+  bool default_device = false;
 };
+
+// Returns major*10+minor for the current CUDA device (e.g. 90 for H100).
+// Throws std::runtime_error if the device cannot be queried.
+int arch_cc_for_current_device();
 
 struct CompiledKernel {
   CUlibrary library = nullptr;
@@ -36,8 +39,6 @@ struct CompiledKernel {
   CUkernel kern = nullptr;
   std::vector<char> cubin;
   std::string rendered_source;
-  unsigned block_dim_x      = 1;
-  unsigned shared_mem_bytes = 0;
 
   // Returns the CUfunction for the current CUDA device, deriving and caching it
   // on first call per device. Returns nullptr if kern is null or derivation fails.
@@ -55,9 +56,18 @@ struct CompiledKernel {
   mutable std::unordered_map<int, CUfunction> func_per_dev_;
 };
 
-// Ensure a CUDA driver context is current on this thread. Idempotent; safe to
-// call from multiple threads. Throws std::runtime_error if the driver cannot
-// be initialised (no GPU, missing libcuda, etc.).
-void ensure_cuda_context();
+// Compile a raw CUDA-C++ source string via nvrtc and load the resulting cubin.
+// Throws CompileError on nvrtc rejection (with .log and .source) and
+// std::runtime_error on driver-API failures.
+CompiledKernel compile_plain_kernel(const std::string& source,
+                                    const std::string& entry_symbol,
+                                    const CompileOptions& opts = {});
+
+// Load a CompiledKernel from an already-compiled cubin (skips nvrtc).
+// rendered_source is stored for diagnostics only; it need not match the cubin.
+// Throws std::runtime_error on driver-API failure so callers can fall back.
+CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
+                                      const std::string& entry_symbol,
+                                      std::string rendered_source = {});
 
 }  // namespace codegen::jit

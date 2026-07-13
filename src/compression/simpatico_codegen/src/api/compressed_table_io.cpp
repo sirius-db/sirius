@@ -5,6 +5,7 @@
 
 #include "api/compressed_table_io.hpp"
 
+#include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 
@@ -17,6 +18,8 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -30,41 +33,23 @@ namespace simpatico {
 namespace {
 
 // ---------------------------------------------------------------------------
-// LE binary write helpers
+// LE binary helpers — std::bit_cast (C++20); asserts little-endian platform.
 // ---------------------------------------------------------------------------
-static void push_u8(std::vector<std::uint8_t>& v, std::uint8_t x) { v.push_back(x); }
-static void push_u16le(std::vector<std::uint8_t>& v, std::uint16_t x)
+static_assert(std::endian::native == std::endian::little, "LE-only serialization");
+
+template <typename T>
+static void push_le(std::vector<std::uint8_t>& v, T x)
 {
-  v.push_back(static_cast<std::uint8_t>(x));
-  v.push_back(static_cast<std::uint8_t>(x >> 8));
+  auto b = std::bit_cast<std::array<std::uint8_t, sizeof(T)>>(x);
+  v.insert(v.end(), b.begin(), b.end());
 }
-static void push_u32le(std::vector<std::uint8_t>& v, std::uint32_t x)
-{
-  for (int i = 0; i < 4; ++i)
-    v.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
-}
-static void push_i32le(std::vector<std::uint8_t>& v, std::int32_t x)
-{
-  push_u32le(v, static_cast<std::uint32_t>(x));
-}
-static void push_u64le(std::vector<std::uint8_t>& v, std::uint64_t x)
-{
-  for (int i = 0; i < 8; ++i)
-    v.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
-}
-static void push_i64le(std::vector<std::uint8_t>& v, std::int64_t x)
-{
-  push_u64le(v, static_cast<std::uint64_t>(x));
-}
+
 static void push_str16(std::vector<std::uint8_t>& v, std::string const& s)
 {
-  push_u16le(v, static_cast<std::uint16_t>(s.size()));
+  push_le(v, static_cast<std::uint16_t>(s.size()));
   v.insert(v.end(), s.begin(), s.end());
 }
 
-// ---------------------------------------------------------------------------
-// LE binary read helpers
-// ---------------------------------------------------------------------------
 struct Reader {
   const std::uint8_t* p = nullptr;
   std::size_t rem       = 0;
@@ -77,50 +62,20 @@ struct Reader {
     rem -= n;
     return true;
   }
-  bool read_u8(std::uint8_t& x) { return read(&x, 1); }
-  bool read_u16le(std::uint16_t& x)
+
+  template <typename T>
+  bool read_le(T& x)
   {
-    std::uint8_t b[2];
-    if (!read(b, 2)) return false;
-    x = static_cast<std::uint16_t>(b[0]) | (static_cast<std::uint16_t>(b[1]) << 8);
+    std::array<std::uint8_t, sizeof(T)> b;
+    if (!read(b.data(), sizeof(T))) return false;
+    x = std::bit_cast<T>(b);
     return true;
   }
-  bool read_u32le(std::uint32_t& x)
-  {
-    std::uint8_t b[4];
-    if (!read(b, 4)) return false;
-    x = 0;
-    for (int i = 0; i < 4; ++i)
-      x |= static_cast<std::uint32_t>(b[i]) << (8 * i);
-    return true;
-  }
-  bool read_i32le(std::int32_t& x)
-  {
-    std::uint32_t u;
-    if (!read_u32le(u)) return false;
-    x = static_cast<std::int32_t>(u);
-    return true;
-  }
-  bool read_u64le(std::uint64_t& x)
-  {
-    std::uint8_t b[8];
-    if (!read(b, 8)) return false;
-    x = 0;
-    for (int i = 0; i < 8; ++i)
-      x |= static_cast<std::uint64_t>(b[i]) << (8 * i);
-    return true;
-  }
-  bool read_i64le(std::int64_t& x)
-  {
-    std::uint64_t u;
-    if (!read_u64le(u)) return false;
-    x = static_cast<std::int64_t>(u);
-    return true;
-  }
+
   bool read_str16(std::string& s)
   {
     std::uint16_t len;
-    if (!read_u16le(len)) return false;
+    if (!read_le(len)) return false;
     if (len > rem) return false;
     s.assign(reinterpret_cast<const char*>(p), len);
     p += len;
@@ -144,72 +99,55 @@ enum : std::uint8_t {
   META_DEFLATE  = 7,
 };
 
-// String extras appended to ANS/bitcomp meta (all-zero for fixed-width columns).
-static void push_string_extras(std::vector<std::uint8_t>& v, leaf_meta::string_extras const& s)
-{
-  push_u64le(v, s.offsets_compressed_size);
-  push_u64le(v, s.offsets_uncompressed_size);
-  push_i32le(v, s.offsets_type_id);
-  push_i64le(v, s.num_rows);
-}
-
-static bool read_string_extras(Reader& r, leaf_meta::string_extras& s)
-{
-  return r.read_u64le(s.offsets_compressed_size) && r.read_u64le(s.offsets_uncompressed_size) &&
-         r.read_i32le(s.offsets_type_id) && r.read_i64le(s.num_rows);
-}
-
 static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
 {
   struct Visitor {
     std::vector<std::uint8_t>& v;
-    void operator()(leaf_meta::none const&) { push_u8(v, META_NONE); }
+    void operator()(leaf_meta::none const&) { push_le(v, META_NONE); }
     void operator()(leaf_meta::alp_rd const& a)
     {
-      push_u8(v, META_ALP_RD);
-      push_u8(v, a.right_bw);
+      push_le(v, META_ALP_RD);
+      push_le(v, a.right_bw);
     }
     void operator()(leaf_meta::ans const& a)
     {
-      push_u8(v, META_ANS);
-      push_u64le(v, a.uncompressed_size);
-      push_i32le(v, a.original_type_id);
-      push_string_extras(v, a.strings);
+      push_le(v, META_ANS);
+      push_le(v, a.uncompressed_size);
+      push_le(v, a.original_type_id);
     }
     void operator()(leaf_meta::bitcomp const& b)
     {
-      push_u8(v, META_BITCOMP);
-      push_u64le(v, b.uncompressed_size);
-      push_i32le(v, b.original_type_id);
-      push_i32le(v, b.algorithm);
-      push_string_extras(v, b.strings);
+      push_le(v, META_BITCOMP);
+      push_le(v, b.uncompressed_size);
+      push_le(v, b.original_type_id);
+      push_le(v, b.algorithm);
     }
     void operator()(leaf_meta::nvcomp_cascaded const& c)
     {
-      push_u8(v, META_CASCADED);
-      push_u64le(v, c.uncompressed_size);
-      push_i32le(v, c.original_type_id);
-      push_i32le(v, c.num_deltas);
-      push_i32le(v, c.num_RLEs);
-      push_i32le(v, c.use_bp);
+      push_le(v, META_CASCADED);
+      push_le(v, c.uncompressed_size);
+      push_le(v, c.original_type_id);
+      push_le(v, c.num_deltas);
+      push_le(v, c.num_RLEs);
+      push_le(v, c.use_bp);
     }
     void operator()(leaf_meta::snappy const& s)
     {
-      push_u8(v, META_SNAPPY);
-      push_u64le(v, s.uncompressed_size);
-      push_i32le(v, s.original_type_id);
+      push_le(v, META_SNAPPY);
+      push_le(v, s.uncompressed_size);
+      push_le(v, s.original_type_id);
     }
     void operator()(leaf_meta::lz4 const& l)
     {
-      push_u8(v, META_LZ4);
-      push_u64le(v, l.uncompressed_size);
-      push_i32le(v, l.original_type_id);
+      push_le(v, META_LZ4);
+      push_le(v, l.uncompressed_size);
+      push_le(v, l.original_type_id);
     }
     void operator()(leaf_meta::deflate const& d)
     {
-      push_u8(v, META_DEFLATE);
-      push_u64le(v, d.uncompressed_size);
-      push_i32le(v, d.original_type_id);
+      push_le(v, META_DEFLATE);
+      push_le(v, d.uncompressed_size);
+      push_le(v, d.original_type_id);
     }
   };
   std::visit(Visitor{v}, m);
@@ -218,27 +156,25 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
 static bool read_meta(Reader& r, leaf_meta_v& out)
 {
   std::uint8_t mk;
-  if (!r.read_u8(mk)) return false;
+  if (!r.read_le(mk)) return false;
   switch (mk) {
     case META_NONE: out = leaf_meta::none{}; return true;
     case META_ALP_RD: {
       std::uint8_t rbw;
-      if (!r.read_u8(rbw)) return false;
+      if (!r.read_le(rbw)) return false;
       out = leaf_meta::alp_rd{rbw};
       return true;
     }
     case META_ANS: {
       leaf_meta::ans a;
-      if (!r.read_u64le(a.uncompressed_size) || !r.read_i32le(a.original_type_id) ||
-          !read_string_extras(r, a.strings))
-        return false;
+      if (!r.read_le(a.uncompressed_size) || !r.read_le(a.original_type_id)) return false;
       out = a;
       return true;
     }
     case META_BITCOMP: {
       leaf_meta::bitcomp b;
-      if (!r.read_u64le(b.uncompressed_size) || !r.read_i32le(b.original_type_id) ||
-          !r.read_i32le(b.algorithm) || !read_string_extras(r, b.strings))
+      if (!r.read_le(b.uncompressed_size) || !r.read_le(b.original_type_id) ||
+          !r.read_le(b.algorithm))
         return false;
       out = b;
       return true;
@@ -246,8 +182,7 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
     case META_CASCADED: {
       std::uint64_t us;
       std::int32_t ti, nd, nr, bp;
-      if (!r.read_u64le(us) || !r.read_i32le(ti) || !r.read_i32le(nd) || !r.read_i32le(nr) ||
-          !r.read_i32le(bp))
+      if (!r.read_le(us) || !r.read_le(ti) || !r.read_le(nd) || !r.read_le(nr) || !r.read_le(bp))
         return false;
       out = leaf_meta::nvcomp_cascaded{us, ti, nd, nr, bp};
       return true;
@@ -255,50 +190,25 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
     case META_SNAPPY: {
       std::uint64_t us;
       std::int32_t ti;
-      if (!r.read_u64le(us) || !r.read_i32le(ti)) return false;
+      if (!r.read_le(us) || !r.read_le(ti)) return false;
       out = leaf_meta::snappy{us, ti};
       return true;
     }
     case META_LZ4: {
       std::uint64_t us;
       std::int32_t ti;
-      if (!r.read_u64le(us) || !r.read_i32le(ti)) return false;
+      if (!r.read_le(us) || !r.read_le(ti)) return false;
       out = leaf_meta::lz4{us, ti};
       return true;
     }
     case META_DEFLATE: {
       std::uint64_t us;
       std::int32_t ti;
-      if (!r.read_u64le(us) || !r.read_i32le(ti)) return false;
+      if (!r.read_le(us) || !r.read_le(ti)) return false;
       out = leaf_meta::deflate{us, ti};
       return true;
     }
     default: return false;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// PlanLeafKind → compressor name (for reconstruct_representation)
-// ---------------------------------------------------------------------------
-static const char* leaf_kind_to_compressor(PlanLeafKind k)
-{
-  switch (k) {
-    case PlanLeafKind::Identity: return "identity";
-    case PlanLeafKind::Delta: return "delta";
-    case PlanLeafKind::Rle: return "rle";
-    case PlanLeafKind::Dictionary: return "dictionary";
-    case PlanLeafKind::Bitpack: return "bitpack";
-    case PlanLeafKind::For: return "for";
-    case PlanLeafKind::Zigzag: return "zigzag";
-    case PlanLeafKind::Alp: return "alp";
-    case PlanLeafKind::AlpRd: return "alp_rd";
-    case PlanLeafKind::Ans: return "ans";
-    case PlanLeafKind::Bitcomp: return "bitcomp";
-    case PlanLeafKind::NvcompCascaded: return "nvcomp_cascaded";
-    case PlanLeafKind::Snappy: return "snappy";
-    case PlanLeafKind::Lz4: return "lz4";
-    case PlanLeafKind::Deflate: return "deflate";
-    default: return nullptr;
   }
 }
 
@@ -352,18 +262,22 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     return std::unique_ptr<compressed_representation>(std::move(rep));
   };
 
-  if (ld.kind == PlanLeafKind::Delta) { return make_fused_rep("delta"); }
-  if (ld.kind == PlanLeafKind::Rle) { return make_fused_rep("rle"); }
-  if (ld.kind == PlanLeafKind::For) { return make_fused_rep("for"); }
-  if (ld.kind == PlanLeafKind::Zigzag) { return make_fused_rep("zigzag"); }
-  if (ld.kind == PlanLeafKind::Identity) {
+  if (ld.kind == OpId::Delta) { return make_fused_rep("delta"); }
+  if (ld.kind == OpId::Rle) { return make_fused_rep("rle"); }
+  if (ld.kind == OpId::For) { return make_fused_rep("for"); }
+  if (ld.kind == OpId::Zigzag) { return make_fused_rep("zigzag"); }
+  if (ld.kind == OpId::Identity) {
     bool is_fused = !(bufs.size() == 1 && bufs[0].name == "data");
     if (is_fused) return make_fused_rep("RawFused");
   }
 
   // All other kinds (and non-fused identity): route through reconstruct_representation.
-  const char* cname = leaf_kind_to_compressor(ld.kind);
-  if (!cname) {
+  if (ld.kind == OpId::Unknown) {
+    if (err) *err = "rep_from_leaf_desc: unknown leaf kind in file";
+    return nullptr;
+  }
+  std::string_view cname = op_info(ld.kind).name;
+  if (cname.empty()) {
     if (err)
       *err = "rep_from_leaf_desc: unsupported kind " + std::to_string(static_cast<int>(ld.kind));
     return nullptr;
@@ -376,13 +290,11 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     names.push_back(bufs[i].name);
     cols.push_back(make_col(i));
   }
-  return reconstruct_representation(cname, names, std::move(cols), stream, mr, err, ld.meta);
+  return reconstruct_representation(
+    std::string(cname), names, std::move(cols), stream, mr, err, ld.meta);
 }
 
-// v10 combines the per-column fixed-point scale (decimal support) with the
-// ANS/bitcomp string-extras meta; both landed independently as "v9" on separate
-// branches, so the merged format takes a fresh number.
-static constexpr std::uint8_t kVersion = 11;
+static constexpr std::uint8_t kVersion = 10;
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -391,27 +303,30 @@ static void push_node(std::vector<std::uint8_t>& hdr, PlanNode const& node)
   push_str16(hdr, node.op);
   if (node.attrs.bitjoin.has_value()) {
     auto const& bj = *node.attrs.bitjoin;
-    push_u8(hdr, 1);
-    push_u8(hdr, dtype_to_tag(bj.output_type));
-    push_u16le(hdr, static_cast<std::uint16_t>(bj.inputs.size()));
+    // Flags are read back as std::uint8_t — write them at that exact width.
+    // (push_le deduces T from the argument, so a bare `1`/`0` would emit a
+    // 4-byte int and desync the reader.)
+    push_le(hdr, std::uint8_t{1});
+    push_le(hdr, dtype_to_tag(bj.output_type));
+    push_le(hdr, static_cast<std::uint16_t>(bj.inputs.size()));
     for (auto const& in : bj.inputs) {
-      push_u32le(hdr, in.node);
+      push_le(hdr, in.node);
       push_str16(hdr, in.channel);
-      push_u8(hdr, in.range.has_value() ? 1 : 0);
+      push_le(hdr, static_cast<std::uint8_t>(in.range.has_value() ? 1 : 0));
       if (in.range.has_value()) {
-        push_u32le(hdr, in.range->first);
-        push_u32le(hdr, in.range->second);
+        push_le(hdr, in.range->first);
+        push_le(hdr, in.range->second);
       }
     }
   } else {
-    push_u8(hdr, 0);
+    push_le(hdr, std::uint8_t{0});
   }
-  push_u16le(hdr, static_cast<std::uint16_t>(node.children.size()));
+  push_le(hdr, static_cast<std::uint16_t>(node.children.size()));
   for (auto const& e : node.children) {
     push_str16(hdr, e.channel);
-    push_u32le(hdr, e.child);
+    push_le(hdr, e.child);
   }
-  push_u16le(hdr, static_cast<std::uint16_t>(node.output_names.size()));
+  push_le(hdr, static_cast<std::uint16_t>(node.output_names.size()));
   for (auto const& n : node.output_names)
     push_str16(hdr, n);
 }
@@ -423,22 +338,22 @@ static bool read_node(Reader& r, PlanNode& node)
 {
   if (!r.read_str16(node.op)) return false;
   std::uint8_t is_bitjoin;
-  if (!r.read_u8(is_bitjoin)) return false;
+  if (!r.read_le(is_bitjoin)) return false;
   if (is_bitjoin) {
     bitjoin_attrs bj;
     std::uint8_t ot;
-    if (!r.read_u8(ot)) return false;
+    if (!r.read_le(ot)) return false;
     bj.output_type = tag_to_dtype(ot);
     std::uint16_t nin;
-    if (!r.read_u16le(nin)) return false;
+    if (!r.read_le(nin)) return false;
     bj.inputs.resize(nin);
     for (auto& in : bj.inputs) {
-      if (!r.read_u32le(in.node) || !r.read_str16(in.channel)) return false;
+      if (!r.read_le(in.node) || !r.read_str16(in.channel)) return false;
       std::uint8_t has_range;
-      if (!r.read_u8(has_range)) return false;
+      if (!r.read_le(has_range)) return false;
       if (has_range) {
         std::uint32_t hi, lo;
-        if (!r.read_u32le(hi) || !r.read_u32le(lo)) return false;
+        if (!r.read_le(hi) || !r.read_le(lo)) return false;
         in.range = bit_range{hi, lo};
       }
     }
@@ -449,13 +364,13 @@ static bool read_node(Reader& r, PlanNode& node)
     node.attrs.bitjoin = std::move(bj);
   }
   std::uint16_t ne;
-  if (!r.read_u16le(ne)) return false;
+  if (!r.read_le(ne)) return false;
   node.children.resize(ne);
   for (auto& e : node.children) {
-    if (!r.read_str16(e.channel) || !r.read_u32le(e.child)) return false;
+    if (!r.read_str16(e.channel) || !r.read_le(e.child)) return false;
   }
   std::uint16_t no;
-  if (!r.read_u16le(no)) return false;
+  if (!r.read_le(no)) return false;
   node.output_names.resize(no);
   node.output_paths.resize(no);
   for (std::uint16_t i = 0; i < no; ++i) {
@@ -492,58 +407,58 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
   if (magic[0] != 'H' || magic[1] != 'P' || magic[2] != 'L' || magic[3] != 'N')
     return bad("not a HPLN file");
   std::uint8_t ver;
-  if (!r.read_u8(ver)) return bad("truncated header");
+  if (!r.read_le(ver)) return bad("truncated header");
   if (ver != kVersion)
     return bad("unsupported version " + std::to_string(ver) + " (expected " +
                std::to_string(kVersion) + ")");
 
   std::uint16_t num_cols;
-  if (!r.read_u16le(num_cols)) return bad("truncated header");
+  if (!r.read_le(num_cols)) return bad("truncated header");
   out.clear();
   out.resize(num_cols);
 
   for (std::uint16_t ci = 0; ci < num_cols; ++ci) {
     auto& cr = out[ci];
     if (!r.read_str16(cr.name)) return bad("truncated col name");
-    if (!r.read_u8(cr.dtype_tag)) return bad("truncated col dtype");
-    if (!r.read_i32le(cr.scale)) return bad("truncated col scale");
-    if (!r.read_i64le(cr.num_rows)) return bad("truncated col num_rows");
+    if (!r.read_le(cr.dtype_tag)) return bad("truncated col dtype");
+    if (!r.read_le(cr.scale)) return bad("truncated col scale");
+    if (!r.read_le(cr.num_rows)) return bad("truncated col num_rows");
 
     std::uint16_t nn;
-    if (!r.read_u16le(nn)) return bad("truncated num_nodes");
+    if (!r.read_le(nn)) return bad("truncated num_nodes");
     cr.tree.nodes.resize(nn);
     for (std::uint16_t ni = 0; ni < nn; ++ni) {
       if (!read_node(r, cr.tree.nodes[ni])) return bad("truncated plan node");
     }
 
     std::uint16_t nl;
-    if (!r.read_u16le(nl)) return bad("truncated num_leaves");
+    if (!r.read_le(nl)) return bad("truncated num_leaves");
     cr.leaf_descs.resize(nl);
     cr.buf_offsets.resize(nl);
 
     for (std::uint16_t li = 0; li < nl; ++li) {
       auto& ld = cr.leaf_descs[li];
-      if (!r.read_u32le(ld.node_index)) return bad("truncated leaf node_index");
-      if (!r.read_i32le(ld.slot)) return bad("truncated leaf slot");
+      if (!r.read_le(ld.node_index)) return bad("truncated leaf node_index");
+      if (!r.read_le(ld.slot)) return bad("truncated leaf slot");
       std::uint8_t k;
-      if (!r.read_u8(k)) return bad("truncated leaf kind");
-      ld.kind = static_cast<PlanLeafKind>(k);
-      if (!r.read_u8(ld.type_tag)) return bad("truncated leaf type_tag");
-      if (!r.read_u64le(ld.num_rows)) return bad("truncated leaf num_rows");
+      if (!r.read_le(k)) return bad("truncated leaf kind");
+      ld.kind = static_cast<OpId>(k);
+      if (!r.read_le(ld.type_tag)) return bad("truncated leaf type_tag");
+      if (!r.read_le(ld.num_rows)) return bad("truncated leaf num_rows");
       if (!read_meta(r, ld.meta)) return bad("truncated/unknown leaf meta");
 
       std::uint8_t nb;
-      if (!r.read_u8(nb)) return bad("truncated num_bufs");
+      if (!r.read_le(nb)) return bad("truncated num_bufs");
       ld.buffers.resize(nb);
       cr.buf_offsets[li].resize(nb);
 
       for (std::uint8_t bi = 0; bi < nb; ++bi) {
         auto& bd = ld.buffers[bi];
         if (!r.read_str16(bd.name)) return bad("truncated buf name");
-        if (!r.read_u8(bd.type_tag)) return bad("truncated buf type_tag");
-        if (!r.read_u64le(bd.size_bytes)) return bad("truncated buf size_bytes");
+        if (!r.read_le(bd.type_tag)) return bad("truncated buf type_tag");
+        if (!r.read_le(bd.size_bytes)) return bad("truncated buf size_bytes");
         std::uint64_t poff;
-        if (!r.read_u64le(poff)) return bad("truncated buf payload_offset");
+        if (!r.read_le(poff)) return bad("truncated buf payload_offset");
         cr.buf_offsets[li][bi] = poff;
         bd.num_rows =
           (bd.size_bytes > 0 && bd.type_tag < 255)
@@ -586,9 +501,9 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
 
     if (cr.tree.nodes.empty()) continue;  // column stored without a plan
 
-    auto compound  = std::make_unique<plan_compound>();
-    compound->tree = std::move(cr.tree);
-    auto& nodes    = compound->tree.nodes;
+    auto compound = std::make_unique<PlanTree>();
+    *compound     = std::move(cr.tree);
+    auto& nodes   = compound->nodes;
 
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       auto const& ld    = cr.leaf_descs[li];
@@ -616,7 +531,7 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
       }
     }
 
-    compute_input_sources(compound->tree);
+    compute_input_sources(*compound);
     out_col.compound = std::move(compound);
   }
 
@@ -724,7 +639,7 @@ std::string build_compressed_table_header(compressed_table const& table,
   // exposing a fabricated contiguous payload range.
   for (auto const& descs : all_descs) {
     for (auto const& desc : descs) {
-      if (desc.kind == PlanLeafKind::Identity &&
+      if (desc.kind == OpId::Identity &&
           tag_to_dtype(desc.type_tag).id() == cudf::type_id::STRING) {
         out_header.clear();
         out_buffers.clear();
@@ -751,8 +666,8 @@ std::string build_compressed_table_header(compressed_table const& table,
   hdr.push_back('P');
   hdr.push_back('L');
   hdr.push_back('N');
-  push_u8(hdr, kVersion);
-  push_u16le(hdr, static_cast<std::uint16_t>(table.columns.size()));
+  push_le(hdr, kVersion);
+  push_le(hdr, static_cast<std::uint16_t>(table.columns.size()));
 
   std::uint64_t payload_offset = 0;
 
@@ -762,32 +677,32 @@ std::string build_compressed_table_header(compressed_table const& table,
     auto const& descs = all_descs[ci];
 
     push_str16(hdr, col.name.value_or(std::string{}));
-    push_u8(hdr, dtype_to_tag(col.dtype));
-    push_i32le(hdr, col.dtype.scale());  // fixed-point scale (0 for non-decimal)
-    push_i64le(hdr, col.num_rows);
+    push_le(hdr, dtype_to_tag(col.dtype));
+    push_le(hdr, col.dtype.scale());  // fixed-point scale (0 for non-decimal)
+    push_le(hdr, col.num_rows);
 
     // Structural plan tree (identical layout to the file header, so the same
     // parser reconstructs it): the node array is the source of truth on read.
-    PlanTree const& tree = col.compound ? col.compound->tree : kEmptyTree;
-    push_u16le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
+    PlanTree const& tree = col.compound ? *col.compound : kEmptyTree;
+    push_le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
     for (auto const& node : tree.nodes)
       push_node(hdr, node);
 
-    push_u16le(hdr, static_cast<std::uint16_t>(descs.size()));
+    push_le(hdr, static_cast<std::uint16_t>(descs.size()));
     for (auto const& ld : descs) {
-      push_u32le(hdr, ld.node_index);
-      push_i32le(hdr, ld.slot);
-      push_u8(hdr, static_cast<std::uint8_t>(ld.kind));
-      push_u8(hdr, ld.type_tag);
-      push_u64le(hdr, ld.num_rows);
+      push_le(hdr, ld.node_index);
+      push_le(hdr, ld.slot);
+      push_le(hdr, static_cast<std::uint8_t>(ld.kind));
+      push_le(hdr, ld.type_tag);
+      push_le(hdr, ld.num_rows);
       push_meta(hdr, ld.meta);
-      push_u8(hdr, static_cast<std::uint8_t>(ld.buffers.size()));
+      push_le(hdr, static_cast<std::uint8_t>(ld.buffers.size()));
 
       for (auto const& bd : ld.buffers) {
         push_str16(hdr, bd.name);
-        push_u8(hdr, bd.type_tag);
-        push_u64le(hdr, bd.size_bytes);
-        push_u64le(hdr, payload_offset);
+        push_le(hdr, bd.type_tag);
+        push_le(hdr, bd.size_bytes);
+        push_le(hdr, payload_offset);
 
         // Record the buffer for the caller to stage out of device memory; no
         // bytes are copied here.

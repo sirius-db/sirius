@@ -94,7 +94,6 @@ std::unique_ptr<cudf::column> deflate_compressor::decompress(compressed_represen
 }
 
 namespace detail {
-void release_deflate_manager_scratch() {}  // no cached manager under the batched API
 }  // namespace detail
 
 }  // namespace simpatico

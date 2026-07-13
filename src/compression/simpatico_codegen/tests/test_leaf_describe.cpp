@@ -21,10 +21,9 @@ void expect(bool cond, char const* msg)
   if (!cond) throw std::runtime_error(msg);
 }
 
-simpatico::compressed_representation const* find_bitpack_leaf(
-  simpatico::plan_compound const& compound)
+simpatico::compressed_representation const* find_bitpack_leaf(simpatico::PlanTree const& tree)
 {
-  for (auto const& node : compound.tree.nodes) {
+  for (auto const& node : tree.nodes) {
     if (node.rep &&
         dynamic_cast<simpatico::bitpack_compressed_representation const*>(node.rep.get())) {
       return node.rep.get();
@@ -47,7 +46,6 @@ int main()
     std::fprintf(stderr, "test_leaf_describe: cudaSetDevice failed\n");
     return 1;
   }
-  codegen::jit::ensure_cuda_context();
   try {
     constexpr int num_rows = 4096;
     std::vector<int32_t> host(num_rows);
@@ -75,7 +73,7 @@ int main()
 
     auto const* rep = find_bitpack_leaf(*ct.columns[0].compound);
     expect(rep != nullptr, "bitpack leaf found");
-    expect(rep->kind() == simpatico::PlanLeafKind::Bitpack, "bitpack kind");
+    expect(rep->kind() == simpatico::OpId::Bitpack, "bitpack kind");
     expect(rep->decoded_type().id() == cudf::type_id::INT32, "decoded type");
 
     auto meta = rep->describe_meta();

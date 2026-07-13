@@ -24,22 +24,15 @@ struct plan_step {
   std::vector<std::string> output_names;  // raw names from DSL line (e.g. values, runs)
   std::vector<std::string> output_paths;  // fully-qualified paths derived from input_paths
   std::vector<std::optional<bit_range>> output_ranges;  // parallel to output_names
-  // True when `parse_plan_dsl` injected this step to drain an unconsumed
-  // output path (always `identity` with no outputs). Distinguishes those
-  // auto-generated leaves from user-written leaf-only steps like
-  // `input -> lc_sp_speed`, which must round-trip through the renderer.
-  bool synthetic = false;
 };
 
-/// Parse line-based DSL into a flat list of plan steps (with synthetic identity
-/// drains appended for unconsumed output paths). Returns false on error;
+/// Parse line-based DSL into a flat list of plan steps. Returns false on error;
 /// error_out (if non-null) gets a message. This is a parse-time intermediate;
 /// the canonical runtime structure is the PlanTree (plan_tree_from_steps).
 bool parse_plan_dsl(std::string_view dsl, std::vector<plan_step>* out, std::string* error_out);
 
 /// Render parsed plan steps back to DSL text (`input -> compressor -> outputs`
-/// per line). Skips the synthetic identity leaf steps that `parse_plan_dsl`
-/// appends. Output re-parses with `parse_plan_dsl` to an equivalent step list
+/// per line). Output re-parses with `parse_plan_dsl` to an equivalent step list
 /// (modulo whitespace/comments).
 std::string render_plan_steps(std::vector<plan_step> const& steps);
 

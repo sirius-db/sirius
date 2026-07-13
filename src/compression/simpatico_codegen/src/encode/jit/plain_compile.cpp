@@ -1,4 +1,4 @@
-#include "codegen/encode/jit/plain_compile.hpp"
+#include "codegen/jit/nvrtc_compiler.hpp"
 
 #include <cuda.h>
 
@@ -24,7 +24,7 @@
 #error "CODEGEN_JIT_PROJECT_INCLUDE must be set by CMake (project include)"
 #endif
 
-namespace codegen::encode::jit {
+namespace codegen::jit {
 
 namespace {
 
@@ -176,4 +176,4 @@ CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
   return out;
 }
 
-}  // namespace codegen::encode::jit
+}  // namespace codegen::jit

@@ -60,7 +60,6 @@ add_library(
   src/operators/dictionary_compressor.cu
   src/operators/str_split_compressor.cu
   src/operators/nvcomp_batched_codec.cu
-  src/operators/nvcomp_scratch.cpp
   # Plain-CUDA JIT host
   src/jit/fused_tree.cpp
   src/jit/nvrtc_compiler.cpp
@@ -132,9 +131,9 @@ add_codegen_host_test(test_jit_kernel_cache)
 add_codegen_host_test(test_fused_operator_sweep)
 add_codegen_host_test(test_operator_sweep)
 
-# simpatico multi-mode CLI (benchmark / explore / compress / decompress /
-# verify) CMake target is simpatico_cli to avoid collision with the static
-# library target; the installed binary is named 'simpatico'.
+# simpatico multi-mode CLI (benchmark / explore / compress / decompress / plan)
+# CMake target is simpatico_cli to avoid collision with the static library
+# target; the installed binary is named 'simpatico'.
 add_executable(simpatico_cli cli/simpatico_main.cpp)
 set_target_properties(simpatico_cli PROPERTIES OUTPUT_NAME simpatico)
 target_include_directories(
@@ -163,3 +162,9 @@ add_test(NAME jit_kernel_cache_plain COMMAND test_jit_kernel_cache_plain)
 add_test(NAME jit_kernel_cache COMMAND test_jit_kernel_cache)
 add_test(NAME fused_operator_sweep COMMAND test_fused_operator_sweep)
 add_test(NAME operator_sweep COMMAND test_operator_sweep)
+
+# End-to-end smoke test of the CLI itself (compress/decompress --verify).
+add_test(
+  NAME cli_roundtrip
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cli/test/cli_roundtrip_test.sh
+          $<TARGET_FILE:simpatico_cli>)

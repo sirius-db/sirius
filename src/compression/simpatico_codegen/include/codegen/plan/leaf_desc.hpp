@@ -2,6 +2,8 @@
 #ifndef CODEGEN_LEAF_DESC_HPP
 #define CODEGEN_LEAF_DESC_HPP
 
+#include "codegen/plan/operator_registry.hpp"
+
 #include <cudf/types.hpp>
 
 #include <cstdint>
@@ -11,26 +13,6 @@
 #include <vector>
 
 namespace simpatico {
-
-// Identifies which leaf representation a compressed node carries.
-enum class PlanLeafKind : std::uint8_t {
-  Delta          = 1,
-  Rle            = 2,
-  Dictionary     = 3,
-  Bitpack        = 4,
-  Identity       = 5,
-  For            = 6,
-  Snappy         = 7,
-  Deflate        = 8,
-  Lz4            = 9,
-  Ans            = 10,
-  Bitcomp        = 11,
-  NvcompCascaded = 12,
-  Alp            = 13,
-  AlpRd          = 14,
-  Zigzag         = 15,
-  Unknown        = 255,
-};
 
 // Per-leaf decode metadata reported by compressed_representation::describe_meta.
 namespace leaf_meta {
@@ -46,25 +28,11 @@ struct alp_rd {
   std::uint8_t right_bw = 0;
 };
 
-// String-column extras carried by ANS/bitcomp when the compressed column is a
-// STRING (original_type_id == cudf::type_id::STRING). The payload then holds two
-// concatenated codec streams: the offsets stream (first `offsets_compressed_size`
-// bytes) followed by the chars stream (the remainder). `uncompressed_size` is the
-// chars byte count; these fields describe the offsets stream and the row count so
-// the strings column can be rebuilt without touching the payload bytes.
-struct string_extras {
-  std::uint64_t offsets_compressed_size   = 0;  // 0 => not a string (fixed-width column)
-  std::uint64_t offsets_uncompressed_size = 0;
-  std::int32_t offsets_type_id            = 0;  // cast of cudf::type_id (INT32/INT64)
-  std::int64_t num_rows                   = 0;  // number of strings
-};
-
 // ANS: opaque byte blob — uncompressed_size and original type_id cannot be
 // recovered from the compressed payload alone.
 struct ans {
   std::uint64_t uncompressed_size = 0;
   std::int32_t original_type_id   = 0;  // cast of cudf::type_id
-  string_extras strings{};              // populated iff original_type_id == STRING
 };
 
 // Bitcomp: same as ANS, plus the algorithm knob used at compress time.
@@ -72,7 +40,6 @@ struct bitcomp {
   std::uint64_t uncompressed_size = 0;
   std::int32_t original_type_id   = 0;
   std::int32_t algorithm          = 0;
-  string_extras strings{};  // populated iff original_type_id == STRING
 };
 
 // NvcompCascaded: uncompressed_size + type + the three opts knobs (num_deltas,
@@ -135,7 +102,7 @@ inline constexpr std::int32_t kSelfRepSlot = -1;
 struct leaf_desc {
   std::uint32_t node_index = 0;
   std::int32_t slot        = kSelfRepSlot;
-  PlanLeafKind kind        = PlanLeafKind::Unknown;
+  OpId kind                = OpId::Unknown;
   std::uint8_t type_tag    = 0;  // decoded column dtype tag
   // This node's own output length (elements). For a nested fused subtree this is
   // the channel length, which can be far smaller than the enclosing column's row

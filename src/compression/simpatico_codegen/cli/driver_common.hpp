@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Shared front-end utilities for the simpatico CLI driver.
-// Included only by cli/simpatico_main.cpp (via cli/benchmark.hpp); all
-// functions are inline so no ODR issues arise.
+// Shared utilities for the simpatico CLI driver: input loading / dtype parsing,
+// roundtrip verification, and the `benchmark` mode helpers (the latter
+// originally in bench/compress_with_plan_benchmark.cpp). Included only by
+// cli/simpatico_main.cpp; all functions are inline so no ODR issues arise.
 #pragma once
 
 #include "api/simpatico_codegen.hpp"
+#include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/util/stream_pool.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/csv.hpp>
@@ -26,6 +29,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,9 +37,11 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -113,6 +119,40 @@ inline std::string dtype_name(cudf::data_type const& t)
     case cudf::type_id::STRING: return "str";
     default: return "t" + std::to_string(static_cast<int>(t.id()));
   }
+}
+
+// ── Shared argument parsing ───────────────────────────────────────────────────
+
+inline input_format parse_input_format(std::string const& v)
+{
+  if (v == "parquet") return input_format::parquet;
+  if (v == "csv") return input_format::csv;
+  if (v == "binary") return input_format::binary;
+  die("--format: use parquet|csv|binary");
+}
+
+// Handle the input-loading flags shared by the benchmark/explore/compress modes
+// (--input / --format / --dtype). `need(flag)` returns the flag's value and
+// advances the caller's scan index. Returns true if `arg` was one of these
+// flags (and has been consumed), false otherwise so the caller can keep matching
+// its own flags.
+template <typename NeedFn>
+inline bool parse_input_flag(std::string const& arg,
+                             NeedFn&& need,
+                             std::string& path,
+                             std::optional<input_format>& fmt,
+                             std::optional<std::string>& dtype)
+{
+  if (arg == "--input") {
+    path = need("--input");
+  } else if (arg == "--format") {
+    fmt = parse_input_format(need("--format"));
+  } else if (arg == "--dtype") {
+    dtype = need("--dtype");
+  } else {
+    return false;
+  }
+  return true;
 }
 
 // ── File I/O helpers ──────────────────────────────────────────────────────────
@@ -302,7 +342,7 @@ inline std::vector<bool> host_validity_bits(cudf::column_view v)
              words.size() * sizeof(uint32_t),
              cudaMemcpyDeviceToHost);
   for (cudf::size_type r = 0; r < v.size(); ++r) {
-    std::size_t const bit = static_cast<std::size_t>(v.offset() + r);
+    std::size_t const bit              = static_cast<std::size_t>(v.offset() + r);
     valid[static_cast<std::size_t>(r)] = (words[bit / 32 - first_word] >> (bit % 32)) & 1u;
   }
   return valid;
@@ -366,4 +406,255 @@ inline bool verify_roundtrip(cudf::table_view source, simpatico::compressed_tabl
     ct, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
   if (!out || out->num_columns() != source.num_columns()) return false;
   return tables_equal(source, out->view());
+}
+
+// ══ `benchmark` mode ══════════════════════════════════════════════════════════
+// Timed compress/decompress over a loaded table, with per-column or full-table
+// modes and CSV / human-readable reporting.
+
+// ── Compressed-size accounting ────────────────────────────────────────────────
+
+inline std::size_t rep_bytes(simpatico::compressed_representation const* rep,
+                             rmm::cuda_stream_view stream = cudf::get_default_stream())
+{
+  return rep ? rep->compressed_size_bytes(stream) : 0;
+}
+
+inline std::size_t compound_compressed_bytes(
+  simpatico::PlanTree const& tree, rmm::cuda_stream_view stream = cudf::get_default_stream())
+{
+  std::size_t total = 0;
+  for (auto const& node : tree.nodes) {
+    total += rep_bytes(node.rep.get(), stream);
+    for (auto const& [path, rep] : node.channels)
+      total += rep_bytes(rep.get(), stream);
+  }
+  return total;
+}
+
+inline std::size_t compressed_table_bytes(simpatico::compressed_table const& ct,
+                                          rmm::cuda_stream_view stream = cudf::get_default_stream())
+{
+  std::size_t total = 0;
+  for (auto const& col : ct.columns)
+    if (col.compound) total += compound_compressed_bytes(*col.compound, stream);
+  return total;
+}
+
+// ── Benchmark result row ──────────────────────────────────────────────────────
+
+struct bench_row {
+  std::string column;
+  std::string dtype;
+  std::int64_t rows            = 0;
+  std::size_t input_bytes      = 0;
+  std::size_t compressed_bytes = 0;
+  timing_stats compress_ms;
+  timing_stats decompress_ms;
+  bool verify_ok = false;
+
+  double ratio_val() const { return compression_ratio(input_bytes, compressed_bytes); }
+  double compress_gbps_median() const { return gbps(input_bytes, compress_ms.median); }
+  double decompress_gbps_median() const { return gbps(input_bytes, decompress_ms.median); }
+};
+
+// Time `body` over `iters` runs after `warmup` untimed runs, returning the
+// per-run stats. `reset` runs before each timed iteration (untimed, e.g. to drop
+// the previous result); a drain sync then separates iterations. `body` owns any
+// GPU-completion sync it wants counted in its own timing — so a compress body
+// that measures launch-only omits it, while one measuring completion ends with
+// cuda_sync().
+template <typename Reset, typename Body>
+inline timing_stats time_iters(int warmup, int iters, Reset&& reset, Body&& body)
+{
+  for (int w = 0; w < warmup; ++w)
+    body();
+  cuda_sync();
+
+  std::vector<double> samples;
+  samples.reserve(static_cast<std::size_t>(iters));
+  for (int i = 0; i < iters; ++i) {
+    reset();
+    cuda_sync();  // drain previous iter
+    auto t0 = std::chrono::steady_clock::now();
+    body();
+    auto t1 = std::chrono::steady_clock::now();
+    samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+  }
+  return compute_stats(samples);
+}
+
+// ── Per-column benchmark ─────────────────────────────────────────────────────
+
+inline bench_row bench_single_column(cudf::column_view col,
+                                     std::string_view plan_block,
+                                     std::string const& col_name,
+                                     int warmup,
+                                     int iters)
+{
+  bench_row row;
+  row.column      = col_name;
+  row.dtype       = dtype_name(col.type());
+  row.rows        = col.size();
+  row.input_bytes = column_input_bytes(col);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::make_unique<cudf::column>(col));
+  cudf::table single(std::move(cols));
+
+  simpatico::compressed_table last_ct;
+  row.compress_ms = time_iters(
+    warmup,
+    iters,
+    [&]() { last_ct = simpatico::compressed_table{}; },
+    [&]() {
+      last_ct = simpatico::compress_with_plan(single.view(),
+                                              plan_block,
+                                              cudf::get_default_stream(),
+                                              rmm::mr::get_current_device_resource_ref());
+      cuda_sync();  // wait for GPU completion
+    });
+  row.compressed_bytes = compressed_table_bytes(last_ct);
+
+  row.decompress_ms = time_iters(
+    warmup,
+    iters,
+    []() {},
+    [&]() {
+      auto out = simpatico::decompress(
+        last_ct, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+      (void)out;
+      cuda_sync();  // wait for GPU completion
+    });
+  row.verify_ok = verify_roundtrip(single.view(), last_ct);
+  return row;
+}
+
+// ── Full-table benchmark ──────────────────────────────────────────────────────
+
+inline bench_row bench_full_table(
+  cudf::table_view tv, std::string_view plan_dsl, int threads, int warmup, int iters)
+{
+  bench_row row;
+  row.column      = "TOTAL";
+  row.dtype       = "(all)";
+  row.rows        = tv.num_rows();
+  row.input_bytes = table_input_bytes(tv);
+
+  simpatico::stream_pool pool;
+  if (!pool.init(static_cast<std::size_t>(std::max(1, threads))))
+    throw std::runtime_error("failed to initialize stream_pool");
+
+  // The pooled compress_with_plan already joins its worker streams, so the
+  // compress body measures completion without an extra sync.
+  simpatico::compressed_table last_ct;
+  row.compress_ms = time_iters(
+    warmup,
+    iters,
+    [&]() { last_ct = simpatico::compressed_table{}; },
+    [&]() {
+      last_ct = simpatico::compress_with_plan(
+        tv, plan_dsl, pool, rmm::mr::get_current_device_resource_ref());
+    });
+  row.compressed_bytes = compressed_table_bytes(last_ct);
+
+  row.decompress_ms = time_iters(
+    warmup,
+    iters,
+    []() {},
+    [&]() {
+      auto out = simpatico::decompress(last_ct, pool, rmm::mr::get_current_device_resource_ref());
+      (void)out;
+      cuda_sync();  // wait for GPU completion
+    });
+  row.verify_ok = verify_roundtrip(tv, last_ct);
+  return row;
+}
+
+// ── Aggregation ───────────────────────────────────────────────────────────────
+
+inline bench_row make_total_row(std::vector<bench_row> const& rows)
+{
+  bench_row total;
+  total.column    = "TOTAL";
+  total.dtype     = "(all)";
+  total.rows      = rows.empty() ? 0 : rows.front().rows;
+  total.verify_ok = true;
+  for (auto const& r : rows) {
+    total.input_bytes += r.input_bytes;
+    total.compressed_bytes += r.compressed_bytes;
+    total.compress_ms.min += r.compress_ms.min;
+    total.compress_ms.median += r.compress_ms.median;
+    total.compress_ms.mean += r.compress_ms.mean;
+    total.decompress_ms.min += r.decompress_ms.min;
+    total.decompress_ms.median += r.decompress_ms.median;
+    total.decompress_ms.mean += r.decompress_ms.mean;
+    total.verify_ok = total.verify_ok && r.verify_ok;
+  }
+  return total;
+}
+
+// ── Output formatting ─────────────────────────────────────────────────────────
+
+inline void write_row_csv(std::ostream& os, bench_row const& r)
+{
+  os << r.column << ',' << r.dtype << ',' << r.rows << ',' << r.input_bytes << ','
+     << r.compressed_bytes << ',' << r.ratio_val() << ',' << r.compress_ms.min << ','
+     << r.compress_ms.median << ',' << r.compress_ms.mean << ',' << r.compress_gbps_median() << ','
+     << r.decompress_ms.min << ',' << r.decompress_ms.median << ',' << r.decompress_ms.mean << ','
+     << r.decompress_gbps_median() << ',' << (r.verify_ok ? 1 : 0) << '\n';
+}
+
+inline void write_csv(std::string const& path, std::vector<bench_row> const& rows)
+{
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot write csv: " + path);
+  out << "column,dtype,rows,input_bytes,compressed_bytes,ratio,"
+         "compress_ms_min,compress_ms_median,compress_ms_mean,compress_gbps_median,"
+         "decompress_ms_min,decompress_ms_median,decompress_ms_mean,decompress_gbps_median,"
+         "verify_ok\n";
+  for (auto const& r : rows)
+    write_row_csv(out, r);
+}
+
+struct bench_config {
+  std::string input_path;
+  std::optional<input_format> format;
+  std::optional<std::string> dtype;
+  std::string plan_path;
+  enum class mode_t { per_column, full_table } mode = mode_t::per_column;
+  int threads                                       = 0;
+  int warmup                                        = 3;
+  int iters                                         = 10;
+  std::string table_out;
+  std::string csv_out;
+};
+
+inline void write_bench_table(std::ostream& os,
+                              std::vector<bench_row> const& rows,
+                              bench_config const& cfg)
+{
+  using mode_t = bench_config::mode_t;
+  os << "# benchmark mode=" << (cfg.mode == mode_t::per_column ? "per-column" : "full-table")
+     << " warmup=" << cfg.warmup << " iters=" << cfg.iters << '\n';
+  os << "# column | dtype | rows | input_bytes | compressed_bytes | ratio | "
+        "comp_ms(min/med/mean) | comp_GBps | decomp_ms(min/med/mean) | decomp_GBps | verify\n";
+  auto fmt3 = [](double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.3f", v);
+    return std::string(buf);
+  };
+  auto fmt2 = [](double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2f", v);
+    return std::string(buf);
+  };
+  for (auto const& r : rows) {
+    os << r.column << " | " << r.dtype << " | " << r.rows << " | " << r.input_bytes << " | "
+       << r.compressed_bytes << " | " << fmt3(r.ratio_val()) << "x | " << fmt3(r.compress_ms.min)
+       << "/" << fmt3(r.compress_ms.median) << "/" << fmt3(r.compress_ms.mean) << " | "
+       << fmt2(r.compress_gbps_median()) << " | " << fmt3(r.decompress_ms.min) << "/"
+       << fmt3(r.decompress_ms.median) << "/" << fmt3(r.decompress_ms.mean) << " | "
+       << fmt2(r.decompress_gbps_median()) << " | " << (r.verify_ok ? "ok" : "FAIL") << '\n';
+  }
 }

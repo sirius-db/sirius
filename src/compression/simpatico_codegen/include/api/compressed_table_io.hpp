@@ -28,7 +28,7 @@
 //       per leaf:
 //         node_index (uint32 LE)
 //         slot (int32 LE)                   [-1 = node's own rep, else output port]
-//         kind (uint8)                      [PlanLeafKind]
+//         kind (uint8)                      [OpId]
 //         type_tag (uint8)                  [decoded element type]
 //         meta_kind (uint8)  0=none 1=alp_rd 2=ans 3=bitcomp 4=cascaded 5=snappy 6=lz4 7=deflate
 //         meta bytes (variable per meta_kind; see push_meta)
@@ -71,10 +71,8 @@ compressed_table read_compressed_table(
 //
 // Splits the .hpln v9 stream into its two natural regions so the caller can keep
 // the (large) payload in its own store — e.g. cuCascade pinned host memory —
-// while the (small) structural header stays a flat byte vector. This avoids the
-// /dev/shm round-trip: the payload's device buffers are copied straight into the
-// caller's pinned allocation, and decompression re-parses the header (a compact
-// binary node array — cheap) instead of reopening a file.
+// while the (small) structural header stays a flat byte vector that can be re-parsed
+// quickly during decompression.
 
 /// One payload buffer to be staged out of device memory by the caller.
 /// `device_ptr` is borrowed from the source compressed_table and stays valid

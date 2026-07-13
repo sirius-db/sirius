@@ -4,9 +4,7 @@
 // src/bridge/codegen_runtime.cpp::run_rendered_decode:
 //   decode::jit::render -> KernelCache::get_or_compile_plain -> flat-buffer launch.
 //
-// Encode-side fixtures come from gpu_encode.hpp (OverAllocate layout,
-// fixed_stride=true on Bitpack nodes).  The decode FusedTree must match
-// the layout the renderer expects (fixed_stride on Bitpack nodes).
+// Encode-side fixtures come from gpu_encode.hpp (OverAllocate layout).
 
 #pragma once
 
@@ -58,8 +56,6 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
                                             GpuEncoded& scratch,
                                             int arch_cc)
 {
-  jit::ensure_cuda_context();
-
   const std::int32_t num_chunks = codegen::num_chunks_for(n);
 
   cdj::DecodeKernelSpec spec;

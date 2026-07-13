@@ -8,6 +8,17 @@
 
 namespace codegen::jit {
 
+int arch_cc_for_current_device()
+{
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess)
+    throw std::runtime_error("arch_cc_for_current_device: cudaGetDevice failed");
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
+    throw std::runtime_error("arch_cc_for_current_device: cudaGetDeviceProperties failed");
+  return prop.major * 10 + prop.minor;
+}
+
 namespace {
 
 std::string cu_err_str(CUresult r)
@@ -26,31 +37,6 @@ std::string cu_err_str(CUresult r)
   } while (0)
 
 }  // namespace
-
-void ensure_cuda_context()
-{
-  CU_OR_THROW(cuInit(0));
-
-  // Use the runtime API to identify the current device so we retain its
-  // primary context rather than always forcing device 0.
-  int device_id = 0;
-  cudaGetDevice(&device_id);  // ignore error — falls back to ordinal 0
-
-  static std::mutex mu;
-  static std::unordered_map<int, CUcontext> ctx_by_device;
-
-  std::lock_guard<std::mutex> lock(mu);
-  auto it = ctx_by_device.find(device_id);
-  if (it == ctx_by_device.end()) {
-    CUdevice dev = 0;
-    CU_OR_THROW(cuDeviceGet(&dev, device_id));
-    CUcontext ctx = nullptr;
-    CU_OR_THROW(cuDevicePrimaryCtxRetain(&ctx, dev));
-    ctx_by_device[device_id] = ctx;
-    it                       = ctx_by_device.find(device_id);
-  }
-  CU_OR_THROW(cuCtxSetCurrent(it->second));
-}
 
 CUfunction CompiledKernel::func_for_current_device() const
 {
@@ -88,9 +74,7 @@ CompiledKernel::CompiledKernel(CompiledKernel&& other) noexcept
   : library(other.library),
     kern(other.kern),
     cubin(std::move(other.cubin)),
-    rendered_source(std::move(other.rendered_source)),
-    block_dim_x(other.block_dim_x),
-    shared_mem_bytes(other.shared_mem_bytes)
+    rendered_source(std::move(other.rendered_source))
 {
   func_per_dev_ = std::move(other.func_per_dev_);
   other.library = nullptr;
@@ -101,15 +85,13 @@ CompiledKernel& CompiledKernel::operator=(CompiledKernel&& other) noexcept
 {
   if (this != &other) {
     if (library) cuLibraryUnload(library);
-    library          = other.library;
-    kern             = other.kern;
-    cubin            = std::move(other.cubin);
-    rendered_source  = std::move(other.rendered_source);
-    block_dim_x      = other.block_dim_x;
-    shared_mem_bytes = other.shared_mem_bytes;
-    func_per_dev_    = std::move(other.func_per_dev_);
-    other.library    = nullptr;
-    other.kern       = nullptr;
+    library         = other.library;
+    kern            = other.kern;
+    cubin           = std::move(other.cubin);
+    rendered_source = std::move(other.rendered_source);
+    func_per_dev_   = std::move(other.func_per_dev_);
+    other.library   = nullptr;
+    other.kern      = nullptr;
   }
   return *this;
 }

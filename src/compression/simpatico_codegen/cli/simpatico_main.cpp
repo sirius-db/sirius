@@ -5,14 +5,12 @@
 // Modes:
 //   benchmark  Timed compress+decompress over a Parquet/binary/CSV input
 //   explore    BFS cascade search for a single column
-//   compress   Compress input to a .hpln file
-//   decompress Decompress a .hpln file to Parquet
-//   verify     Compress (or read .hpln) and check byte-exact roundtrip
+//   compress   Compress input to a .hpln file (--verify round-trips it)
+//   decompress Decompress a .hpln file to Parquet (--verify checks vs source)
+//   plan       Print each column's compression plan (DSL) from a .hpln file
 
 #include "api/compressed_table_io.hpp"
 #include "api/simpatico_codegen.hpp"
-#include "benchmark.hpp"
-#include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/plan/plan_interpreter.hpp"  // plan_compound, render_plan_tree
 #include "driver_common.hpp"
 #include "explore/compression_explorer.hpp"
@@ -42,10 +40,9 @@ static void usage_top()
                "Modes:\n"
                "  benchmark   Timed compress+decompress (Parquet/binary/CSV input, plan file)\n"
                "  explore     BFS cascade search for the best plan for a single column\n"
-               "  compress    Compress input to a .hpln file\n"
-               "  decompress  Decompress a .hpln file to Parquet\n"
+               "  compress    Compress input to a .hpln file (--verify round-trips it)\n"
+               "  decompress  Decompress a .hpln file to Parquet (--verify checks vs source)\n"
                "  plan        Print each column's compression plan (DSL) from a .hpln file\n"
-               "  verify      Roundtrip equality check\n"
                "\n"
                "Run 'simpatico <mode> --help' for per-mode options.\n");
 }
@@ -58,7 +55,6 @@ static void init_gpu()
 {
   if (cudaSetDevice(0) != cudaSuccess) die("cudaSetDevice(0) failed");
   g_mr.install();
-  codegen::jit::ensure_cuda_context();
 }
 
 /// Explicit, non-default stream for all driver work, created once as a
@@ -108,22 +104,10 @@ static int run_benchmark(int argc, char** argv)
     if (arg == "--help" || arg == "-h") {
       usage_benchmark();
       return 0;
-    } else if (arg == "--input") {
-      cfg.input_path = need("--input");
+    } else if (parse_input_flag(arg, need, cfg.input_path, cfg.format, cfg.dtype)) {
+      // handled: --input / --format / --dtype
     } else if (arg == "--plan") {
       cfg.plan_path = need("--plan");
-    } else if (arg == "--format") {
-      auto v = need("--format");
-      if (v == "parquet")
-        cfg.format = input_format::parquet;
-      else if (v == "csv")
-        cfg.format = input_format::csv;
-      else if (v == "binary")
-        cfg.format = input_format::binary;
-      else
-        die("--format: use parquet|csv|binary");
-    } else if (arg == "--dtype") {
-      cfg.dtype = need("--dtype");
     } else if (arg == "--mode") {
       auto v = need("--mode");
       if (v == "per-column")
@@ -253,22 +237,10 @@ static int run_explore(int argc, char** argv)
     if (arg == "--help" || arg == "-h") {
       usage_explore();
       return 0;
-    } else if (arg == "--input") {
-      cfg.input_path = need("--input");
+    } else if (parse_input_flag(arg, need, cfg.input_path, cfg.format, cfg.dtype)) {
+      // handled: --input / --format / --dtype
     } else if (arg == "--col") {
       cfg.col = std::stoi(need("--col"));
-    } else if (arg == "--format") {
-      auto v = need("--format");
-      if (v == "parquet")
-        cfg.format = input_format::parquet;
-      else if (v == "csv")
-        cfg.format = input_format::csv;
-      else if (v == "binary")
-        cfg.format = input_format::binary;
-      else
-        die("--format: use parquet|csv|binary");
-    } else if (arg == "--dtype") {
-      cfg.dtype = need("--dtype");
     } else if (arg == "--beam-width") {
       cfg.ecfg.beam_width = static_cast<std::size_t>(std::stoul(need("--beam-width")));
     } else if (arg == "--max-depth") {
@@ -393,7 +365,8 @@ static void usage_compress()
                "  --plan PATH               Plan DSL file (required)\n"
                "  --out PATH                Output .hpln file (required)\n"
                "  --format {parquet|csv|binary}\n"
-               "  --dtype {i32|i64|...}     Element type for binary input\n");
+               "  --dtype {i32|i64|...}     Element type for binary input\n"
+               "  --verify                  After writing, decompress and check it round-trips\n");
 }
 
 static int run_compress(int argc, char** argv)
@@ -401,6 +374,7 @@ static int run_compress(int argc, char** argv)
   std::string input_path, plan_path, out_path;
   std::optional<input_format> fmt;
   std::optional<std::string> dtype;
+  bool verify = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -411,24 +385,14 @@ static int run_compress(int argc, char** argv)
     if (arg == "--help" || arg == "-h") {
       usage_compress();
       return 0;
-    } else if (arg == "--input") {
-      input_path = need("--input");
+    } else if (parse_input_flag(arg, need, input_path, fmt, dtype)) {
+      // handled: --input / --format / --dtype
     } else if (arg == "--plan") {
       plan_path = need("--plan");
     } else if (arg == "--out") {
       out_path = need("--out");
-    } else if (arg == "--format") {
-      auto v = need("--format");
-      if (v == "parquet")
-        fmt = input_format::parquet;
-      else if (v == "csv")
-        fmt = input_format::csv;
-      else if (v == "binary")
-        fmt = input_format::binary;
-      else
-        die("--format: use parquet|csv|binary");
-    } else if (arg == "--dtype") {
-      dtype = need("--dtype");
+    } else if (arg == "--verify") {
+      verify = true;
     } else {
       die("compress: unknown flag '" + arg + "'");
     }
@@ -461,6 +425,12 @@ static int run_compress(int argc, char** argv)
               comp_b,
               compression_ratio(input_b, comp_b),
               out_path.c_str());
+
+  if (verify) {
+    bool ok = verify_roundtrip(loaded.table->view(), ct);
+    std::printf("verify: %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) return 1;
+  }
   return 0;
 }
 
@@ -469,15 +439,20 @@ static int run_compress(int argc, char** argv)
 static void usage_decompress()
 {
   std::fprintf(stderr,
-               "Usage: simpatico decompress --input FILE.hpln [--out PATH.parquet]\n"
+               "Usage: simpatico decompress --input FILE.hpln [--out PATH.parquet] [options]\n"
                "\n"
                "  --input PATH   .hpln compressed file (required)\n"
-               "  --out PATH     Output Parquet file (optional; prints stats if omitted)\n");
+               "  --out PATH     Output Parquet file (optional; prints stats if omitted)\n"
+               "  --verify PATH  Source file to check the decompressed output against\n"
+               "  --format {parquet|csv|binary}   Format of the --verify source\n"
+               "  --dtype {i32|i64|...}           Element type for a binary --verify source\n");
 }
 
 static int run_decompress(int argc, char** argv)
 {
-  std::string in_path, out_path;
+  std::string in_path, out_path, verify_path;
+  std::optional<input_format> fmt;
+  std::optional<std::string> dtype;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -492,6 +467,12 @@ static int run_decompress(int argc, char** argv)
       in_path = need("--input");
     } else if (arg == "--out") {
       out_path = need("--out");
+    } else if (arg == "--verify") {
+      verify_path = need("--verify");
+    } else if (arg == "--format") {
+      fmt = parse_input_format(need("--format"));
+    } else if (arg == "--dtype") {
+      dtype = need("--dtype");
     } else {
       die("decompress: unknown flag '" + arg + "'");
     }
@@ -539,6 +520,17 @@ static int run_decompress(int argc, char** argv)
         .build();
     cudf::io::write_parquet(opts);
     std::printf("wrote %s\n", out_path.c_str());
+  }
+
+  if (!verify_path.empty()) {
+    if (!fmt) fmt = infer_format(verify_path);
+    auto source = load_input(verify_path, *fmt, dtype);
+    if (source.table->num_columns() != out->num_columns())
+      die("verify: source has " + std::to_string(source.table->num_columns()) +
+          " columns but .hpln decompressed to " + std::to_string(out->num_columns()));
+    bool ok = tables_equal(source.table->view(), out->view());
+    std::printf("verify: %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) return 1;
   }
   return 0;
 }
@@ -588,91 +580,9 @@ static int run_plan(int argc, char** argv)
     if (ci > 0) std::printf("---\n");
     auto const& col = ct.columns[ci];
     std::printf("# column %zu: %s\n", ci, col.name.value_or("").c_str());
-    if (col.compound) std::printf("%s", simpatico::render_plan_tree(col.compound->tree).c_str());
+    if (col.compound) std::printf("%s", simpatico::render_plan_tree(*col.compound).c_str());
   }
   return 0;
-}
-
-// ── VERIFY mode ───────────────────────────────────────────────────────────────
-
-static void usage_verify()
-{
-  std::fprintf(stderr,
-               "Usage: simpatico verify --input SRC (--plan PATH | --hpln FILE) [options]\n"
-               "\n"
-               "  --input PATH              Source data (Parquet/CSV/.tbl/binary) (required)\n"
-               "  --plan PATH               Compress in-memory with this plan, then check\n"
-               "  --hpln PATH               Read this .hpln file, then check\n"
-               "  --format {parquet|csv|binary}\n"
-               "  --dtype {i32|i64|...}     Element type for binary input\n");
-}
-
-static int run_verify(int argc, char** argv)
-{
-  std::string input_path, plan_path, hpln_path;
-  std::optional<input_format> fmt;
-  std::optional<std::string> dtype;
-
-  for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
-    auto need       = [&](char const* flag) -> std::string {
-      if (i + 1 >= argc) die(std::string(flag) + " requires a value");
-      return argv[++i];
-    };
-    if (arg == "--help" || arg == "-h") {
-      usage_verify();
-      return 0;
-    } else if (arg == "--input") {
-      input_path = need("--input");
-    } else if (arg == "--plan") {
-      plan_path = need("--plan");
-    } else if (arg == "--hpln") {
-      hpln_path = need("--hpln");
-    } else if (arg == "--format") {
-      auto v = need("--format");
-      if (v == "parquet")
-        fmt = input_format::parquet;
-      else if (v == "csv")
-        fmt = input_format::csv;
-      else if (v == "binary")
-        fmt = input_format::binary;
-      else
-        die("--format: use parquet|csv|binary");
-    } else if (arg == "--dtype") {
-      dtype = need("--dtype");
-    } else {
-      die("verify: unknown flag '" + arg + "'");
-    }
-  }
-
-  if (input_path.empty()) die("verify: --input required");
-  if (plan_path.empty() && hpln_path.empty()) die("verify: one of --plan or --hpln required");
-  if (!plan_path.empty() && !hpln_path.empty())
-    die("verify: --plan and --hpln are mutually exclusive");
-  if (!fmt) fmt = infer_format(input_path);
-
-  init_gpu();
-  auto loaded = load_input(input_path, *fmt, dtype);
-  auto stream = driver_stream();
-  auto mr     = rmm::mr::get_current_device_resource_ref();
-
-  simpatico::compressed_table ct;
-  if (!plan_path.empty()) {
-    auto plan_dsl = read_file(plan_path);
-    ct            = simpatico::compress_with_plan(
-      loaded.table->view(), plan_dsl, stream, mr, loaded.column_names);
-  } else {
-    std::string err;
-    ct = simpatico::read_compressed_table(hpln_path, stream, mr, &err);
-    if (!err.empty()) die("verify: read_compressed_table: " + err);
-    if (ct.num_columns() != static_cast<std::size_t>(loaded.table->num_columns()))
-      die("verify: .hpln has " + std::to_string(ct.num_columns()) + " columns but input has " +
-          std::to_string(loaded.table->num_columns()));
-  }
-
-  bool ok = verify_roundtrip(loaded.table->view(), ct);
-  std::printf("verify: %s\n", ok ? "PASS" : "FAIL");
-  return ok ? 0 : 1;
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -697,7 +607,6 @@ int main(int argc, char** argv)
     if (mode == "compress") return run_compress(argc - 1, argv + 1);
     if (mode == "decompress") return run_decompress(argc - 1, argv + 1);
     if (mode == "plan") return run_plan(argc - 1, argv + 1);
-    if (mode == "verify") return run_verify(argc - 1, argv + 1);
 
     std::fprintf(stderr, "simpatico: unknown mode '%s'\n", mode.c_str());
     usage_top();

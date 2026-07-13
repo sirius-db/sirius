@@ -18,6 +18,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -36,32 +37,33 @@ void verify_plan_tree(compressed_table const& ct, char const* label)
 {
   for (auto const& col : ct.columns) {
     expect(col.compound != nullptr, (std::string(label) + ": null compound").c_str());
-    auto const& tree = col.compound->tree;
+    auto const& tree = *col.compound;
     expect(tree.nodes.size() >= 2,
            (std::string(label) + ": PlanTree not built (need >= 2 nodes)").c_str());
     expect(tree.nodes[0].op == "input",
            (std::string(label) + ": PlanTree root is not 'input'").c_str());
-    simpatico::PlanPathMap map;
-    auto rebuilt = simpatico::plan_tree_from_dsl(simpatico::render_plan_tree(tree), nullptr, &map);
+    auto rebuilt = simpatico::plan_tree_from_dsl(simpatico::render_plan_tree(tree), nullptr);
     expect(rebuilt.has_value(),
            (std::string(label) + ": rendered DSL does not parse to a PlanTree").c_str());
 
+    // Every path the rebuilt tree produces (each node's output_paths, plus the
+    // root "input"). Each owned rep's path must be one of these.
+    std::unordered_set<std::string> known_paths{"input"};
+    for (auto const& rn : rebuilt->nodes)
+      for (auto const& op : rn.output_paths)
+        known_paths.insert(op);
+
     // Collect every rep pointer the tree owns (node.rep + node.channels) and
-    // verify each has a corresponding path in the DSL-rebuilt map.
+    // verify each corresponds to a path the rebuilt tree produces.
     std::size_t owned_count = 0;
     for (auto const& node : tree.nodes) {
-      if (node.rep) {
-        ++owned_count;
-        expect(!node.rep_path.empty() && map.node.find(node.rep_path) != map.node.end(),
-               (std::string(label) + ": node.rep has no map entry for path '" + node.rep_path + "'")
-                 .c_str());
-      }
+      if (node.rep) ++owned_count;
       for (auto const& [path, rep] : node.channels) {
         if (rep) {
           ++owned_count;
-          expect(map.node.find(path) != map.node.end(),
-                 (std::string(label) + ": channel rep has no map entry for path '" + path + "'")
-                   .c_str());
+          expect(
+            known_paths.count(path) > 0,
+            (std::string(label) + ": channel rep has no path entry for '" + path + "'").c_str());
         }
       }
     }
@@ -117,7 +119,6 @@ int main()
     std::fprintf(stderr, "test_compress_with_plan_roundtrip: cudaSetDevice failed\n");
     return 1;
   }
-  codegen::jit::ensure_cuda_context();
   try {
     test_split_mismatch();
 
@@ -764,8 +765,8 @@ int main()
       auto stream = cudf::get_default_stream();
       auto mr     = rmm::mr::get_current_device_resource_ref();
 
-      for (char const* plan : {"input -> dictionary\n", "input -> dictionary_fast\n",
-                               "input -> str_split\n"}) {
+      for (char const* plan :
+           {"input -> dictionary\n", "input -> dictionary_fast\n", "input -> str_split\n"}) {
         // describe() runs on a FRESH compress: str_split's single-shot
         // decompress consumes its channels, so describe-after-decompress
         // legitimately enumerates nothing.
@@ -781,8 +782,8 @@ int main()
         expect(strings_equal(tn->view().column(0), dn->view().column(0), stream),
                "string_all_null: data");
 
-        auto te = make_strings_table({"", "", ""}, {}, stream);
-        roundtrip_once(te->view(), plan, 1, "string_all_empty");
+        auto empty_strings = make_strings_table({"", "", ""}, {}, stream);
+        roundtrip_once(empty_strings->view(), plan, 1, "string_all_empty");
       }
 
       // The canonical childless empty column (cudf::make_empty_column).
@@ -798,12 +799,12 @@ int main()
       // Sliced STRING views: str_split must normalize a head slice (whose
       // offsets child still spans the parent) and a non-zero-offset slice.
       auto stream = cudf::get_default_stream();
-      auto full   = make_strings_column(
-        {"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh"},
-        {true, false, true, true, true, true, true, false},
-        stream);
-      auto head = cudf::slice(full->view(), {0, 5});
-      roundtrip_once(cudf::table_view({head[0]}), "input -> str_split\n", 1, "str_split_head_slice");
+      auto full   = make_strings_column({"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh"},
+                                        {true, false, true, true, true, true, true, false},
+                                      stream);
+      auto head   = cudf::slice(full->view(), {0, 5});
+      roundtrip_once(
+        cudf::table_view({head[0]}), "input -> str_split\n", 1, "str_split_head_slice");
       auto tail = cudf::slice(full->view(), {3, 8});
       roundtrip_once(
         cudf::table_view({tail[0]}), "input -> str_split\n", 1, "str_split_offset_slice");
@@ -840,15 +841,15 @@ int main()
       // validity must survive the from_outputs rebuild.
       auto stream             = cudf::get_default_stream();
       std::vector<bool> valid = {true, false, true, true};
-      auto tn = make_strings_table({"apple", "", "cherry", "apple"}, valid, stream);
-      auto ct = roundtrip_once(tn->view(),
+      auto tn                 = make_strings_table({"apple", "", "cherry", "apple"}, valid, stream);
+      auto ct                 = roundtrip_once(tn->view(),
                                "input -> dictionary -> keys_offsets, keys_chars, indices, "
-                               "null_mask\n"
-                               "dictionary.indices -> bitpack\n"
-                               "dictionary.null_mask -> identity\n",
+                                               "null_mask\n"
+                                               "dictionary.indices -> bitpack\n"
+                                               "dictionary.null_mask -> identity\n",
                                1,
                                "dictionary_decomposed_nulls");
-      auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
+      auto decoded            = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
       expect(decoded->view().column(0).null_count() == 1, "dictionary_decomposed_nulls: count");
     }
 
@@ -862,13 +863,13 @@ int main()
         v64.push_back("val" + std::to_string(i % 7));
         b64.push_back(i != 13 && i != 47);
       }
-      auto tn = make_strings_table(v64, b64, stream);
-      auto ct = roundtrip_once(tn->view(),
+      auto tn      = make_strings_table(v64, b64, stream);
+      auto ct      = roundtrip_once(tn->view(),
                                "input -> str_split -> offsets, chars, null_mask\n"
-                               "str_split.offsets -> delta -> differences\n"
-                               "str_split.offsets.differences -> bitpack\n"
-                               "str_split.chars -> lz4\n"
-                               "str_split.null_mask -> rle -> runs, values\n",
+                                    "str_split.offsets -> delta -> differences\n"
+                                    "str_split.offsets.differences -> bitpack\n"
+                                    "str_split.chars -> lz4\n"
+                                    "str_split.null_mask -> rle -> runs, values\n",
                                1,
                                "str_split_null_mask_rle_u8");
       auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
