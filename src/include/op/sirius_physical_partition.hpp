@@ -116,6 +116,11 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// Looks at the amount of data waiting on the input port and determines the number of partitions
   /// to create. Returns a pair of (num_partitions, total_bytes).
   std::pair<int, uint64_t> determine_num_partitions();
+
+  /// Grow the downstream hash-join input repository for this partition's side to
+  /// `num_partitions`. No-op when this partition does not feed a hash join.
+  void resize_join_input_repo(int num_partitions);
+  sirius_physical_operator* _parent_op            = nullptr;
   sirius_physical_operator* _sibling_partition_op = nullptr;
   sirius_physical_operator* _hash_join_op =
     nullptr;  // hash join operator that this partition operator feeds into (optional: for
