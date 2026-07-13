@@ -56,13 +56,12 @@ bool jit_encode_subtree(PlanTree const& tree,
 /// DFS-preorder ``buffer_key(node_id, field)``. This adds the decode-only
 /// transients (Compact ``bp_offsets`` scan, RLE scratch) into ``labeled``,
 /// compiles/launches the rendered kernel, and writes ``num_rows`` decoded
-/// elements to ``out_ptr`` on ``stream_ptr``. Returns 1 on success, -1 on
-/// failure.
-int decode_fused_subtree(codegen::jit::FusedTree const& tree,
-                         codegen::jit::LabeledBuffers& labeled,
-                         char const* dtype,
-                         std::int64_t num_rows,
-                         std::uintptr_t out_ptr,
-                         std::uintptr_t stream_ptr);
+/// elements to ``out`` on ``stream``. Returns true on success.
+bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
+                          codegen::jit::LabeledBuffers& labeled,
+                          char const* dtype,
+                          std::int64_t num_rows,
+                          void* out,
+                          rmm::cuda_stream_view stream);
 
 }  // namespace simpatico

@@ -13,11 +13,7 @@
 // produce byte-identical rendered output, which is what the cubin
 // cache hashes on.
 //
-// Op tags reuse `codegen::OpKind` from `tree.hpp`.
-
 #pragma once
-
-#include "../tree.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +23,21 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+
+namespace codegen {
+
+enum class OpKind : int { Bitpack, For, Delta, Rle, Raw, Zigzag, None };
+
+inline constexpr int kChunkSize = 1024;
+inline constexpr int kTBSize    = 128;
+
+inline constexpr int32_t num_chunks_for(int64_t n) noexcept
+{
+  int64_t nc = (n + kChunkSize - 1) / kChunkSize;
+  return static_cast<int32_t>(nc < 1 ? 1 : nc);
+}
+
+}  // namespace codegen
 
 namespace codegen::jit {
 

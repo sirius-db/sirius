@@ -5,7 +5,8 @@
 #ifndef __CUDACC_RTC__
 #include <cuda_runtime.h>
 #endif
-#include "codegen/tree.hpp"  // kChunkSize, kTBSize
+inline constexpr int kChunkSize = 1024;
+inline constexpr int kTBSize    = 128;
 
 #include <cub/block/block_scan.cuh>
 

@@ -5,8 +5,8 @@
 // DFS-preorder node-id ordering, and the rle raw passthrough leaf.
 
 #include "codegen/bridge/fused_tree_build.hpp"
+#include "codegen/jit/fused_tree.hpp"
 #include "codegen/plan/plan_tree.hpp"
-#include "codegen/tree.hpp"
 
 #include <cstdio>
 #include <stdexcept>

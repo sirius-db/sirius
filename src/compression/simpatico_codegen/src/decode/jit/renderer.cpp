@@ -37,7 +37,6 @@
 #include "codegen/decode/jit/renderer.hpp"
 
 #include "codegen/jit/fused_tree.hpp"
-#include "codegen/tree.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -916,8 +915,8 @@ ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& 
   // duplicate load).  base == chunk_start (chunk_id*CHUNK), known at entry.
   // Cast through the exact-width unsigned so a negative stored byte doesn't
   // sign-extend garbage into the shift domain.
-  const std::string load = "static_cast<" + utype + ">(static_cast<" +
-                           exact_unsigned(esize) + ">(" + p_data + "[chunk_start + (__POS__)]))";
+  const std::string load = "static_cast<" + utype + ">(static_cast<" + exact_unsigned(esize) +
+                           ">(" + p_data + "[chunk_start + (__POS__)]))";
 
   ValueSource vs;
   vs.elem_type = elem_type;

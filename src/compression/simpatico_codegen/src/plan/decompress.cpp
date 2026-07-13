@@ -484,15 +484,13 @@ std::unique_ptr<cudf::column> dispatch_codegen_subtree(NodeId root_nid,
     if (error_out) *error_out = "codegen decompress: output column alloc failed";
     return nullptr;
   }
-  std::uintptr_t out_ptr = reinterpret_cast<std::uintptr_t>(out_col->mutable_view().head<void>());
-
-  int rc = decode_fused_subtree(*fused,
-                                labeled,
-                                dtype,
-                                static_cast<std::int64_t>(num_rows),
-                                out_ptr,
-                                reinterpret_cast<std::uintptr_t>(stream.value()));
-  if (rc != 1) {
+  bool ok = decode_fused_subtree(*fused,
+                                 labeled,
+                                 dtype,
+                                 static_cast<std::int64_t>(num_rows),
+                                 out_col->mutable_view().head<void>(),
+                                 stream);
+  if (!ok) {
     if (error_out) *error_out = "codegen decompress: decode failed";
     return nullptr;
   }

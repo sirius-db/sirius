@@ -30,7 +30,6 @@
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"
-#include "codegen/tree.hpp"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -443,12 +442,12 @@ namespace simpatico {
 // returns. ``labeled`` is mutated in place (transients are added).
 //
 // Returns 1 on success, -1 on any failure (logged to stderr).
-int decode_fused_subtree(codegen::jit::FusedTree const& tree,
-                         codegen::jit::LabeledBuffers& labeled,
-                         char const* dtype,
-                         std::int64_t num_rows,
-                         std::uintptr_t out_ptr,
-                         std::uintptr_t stream_ptr)
+bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
+                          codegen::jit::LabeledBuffers& labeled,
+                          char const* dtype,
+                          std::int64_t num_rows,
+                          void* out,
+                          rmm::cuda_stream_view stream)
 {
   try {
     const bool _timing = std::getenv("SIMPATICO_DECODE_TIMING") != nullptr;
@@ -468,7 +467,7 @@ int decode_fused_subtree(codegen::jit::FusedTree const& tree,
       std::fprintf(stderr,
                    "simpatico::codegen: decode_fused_subtree: unsupported dtype '%s'\n",
                    dtype ? dtype : "(null)");
-      return -1;
+      return false;
     }
     const std::size_t elem_size = (std::strcmp(cxx_dtype, "int64_t") == 0)  ? 8u
                                   : (std::strcmp(cxx_dtype, "int8_t") == 0) ? 1u
@@ -476,12 +475,11 @@ int decode_fused_subtree(codegen::jit::FusedTree const& tree,
 
     // Device transients (bp_offsets/scratch) from the RMM async pool, freed
     // async on return.
-    rmm::cuda_stream_view stream_view{reinterpret_cast<cudaStream_t>(stream_ptr)};
     rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref();
     std::vector<rmm::device_buffer> transients;
     transients.reserve(8);
     auto alloc = [&](std::size_t bytes) -> CUdeviceptr {
-      transients.emplace_back(bytes, stream_view, mr);
+      transients.emplace_back(bytes, stream, mr);
       return reinterpret_cast<CUdeviceptr>(transients.back().data());
     };
 
@@ -489,34 +487,39 @@ int decode_fused_subtree(codegen::jit::FusedTree const& tree,
     if (!synthesize_decode_transients(tree,
                                       elem_size,
                                       alloc,
-                                      reinterpret_cast<void*>(stream_ptr),
+                                      stream.value(),
                                       labeled,
                                       &err,
                                       /*alloc_rle_transients=*/false)) {
       std::fprintf(stderr,
                    "simpatico::codegen: decode_fused_subtree: transient synth failed: %s\n",
                    err.c_str());
-      return -1;
+      return false;
     }
 
     _lap("labeled");
 
-    return run_rendered_decode(
-      tree, cxx_dtype, labeled, num_rows, out_ptr, stream_ptr, [&](const char* what) {
-        _lap(what);
-      });
+    // run_rendered_decode is an internal helper with a uintptr_t ABI; the public
+    // signature is C++-typed, so convert once here.
+    return run_rendered_decode(tree,
+                               cxx_dtype,
+                               labeled,
+                               num_rows,
+                               reinterpret_cast<std::uintptr_t>(out),
+                               reinterpret_cast<std::uintptr_t>(stream.value()),
+                               [&](const char* what) { _lap(what); }) == 1;
   } catch (const jit::CompileError& e) {
     std::fprintf(stderr,
                  "simpatico::codegen: decode_fused_subtree: CompileError: %s\n--- log ---\n%s\n",
                  e.what(),
                  e.log.c_str());
-    return -1;
+    return false;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "simpatico::codegen: decode_fused_subtree: %s\n", e.what());
-    return -1;
+    return false;
   } catch (...) {
     std::fprintf(stderr, "simpatico::codegen: decode_fused_subtree: unknown exception\n");
-    return -1;
+    return false;
   }
 }
 

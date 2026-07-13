@@ -70,7 +70,7 @@
 
 #include "codegen/encode/jit/renderer.hpp"
 
-#include "codegen/tree.hpp"
+#include "codegen/jit/fused_tree.hpp"
 
 #include <cctype>
 #include <cstdint>

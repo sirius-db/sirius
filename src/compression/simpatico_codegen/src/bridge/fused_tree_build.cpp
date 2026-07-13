@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/bridge/fused_tree_build.hpp"
 
+#include "codegen/jit/fused_tree.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
-#include "codegen/tree.hpp"
 
 namespace simpatico {
 namespace {
