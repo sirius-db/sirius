@@ -23,10 +23,9 @@
 // results, never the MVCC-blind disk-native read. Cache-served queries keep
 // the {1, 0, 1} signature compare_gpu_vs_cpu asserts.
 //
-// The walk-based plan-time guards (post-pin UPDATE chains on pinned tables;
-// all guards for scans of unpinned tables, #1143) are disabled in the planner
-// — #1160 tracks their execution-time replacement — so their cases below are
-// disabled to match.
+// Walk-based guards (post-pin UPDATE chains on pinned tables; scans of
+// unpinned tables, #1143) are disabled in the planner — #1160 tracks the
+// execution-time replacement; their coverage lands with that work.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -300,34 +299,6 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CALL unpin_table('t');");
 }
 
-#if 0
-// Disabled with the planner's update-chain walk (#1160): post-pin UPDATE
-// chains serve stale cached values (#1162), so this case would fail.
-TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "mvcc guards: in-place updates decline to CPU with correct values",
-                 "[integration][gpu_execution][pin_table_mvcc_delete]")
-{
-  run_ok(
-    "CREATE TABLE t AS SELECT range::INTEGER AS k, (range * 2)::INTEGER AS v "
-    "FROM range(50000);");
-  run_ok("CHECKPOINT;");
-  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
-
-  SECTION("value update")
-  {
-    run_ok("UPDATE t SET v = v + 1 WHERE k < 10;");
-    expect_fallback_matches_cpu(*this, "SELECT sum(v) FROM t;");
-  }
-
-  SECTION("validity-only update (SET NULL)")
-  {
-    run_ok("UPDATE t SET v = NULL WHERE k < 10;");
-    expect_fallback_matches_cpu(*this, "SELECT count(v), count(*) FROM t;");
-  }
-  run_ok("CALL unpin_table('t');");
-}
-#endif
-
 TEST_CASE_METHOD(PinMvccDeleteFixture,
                  "mvcc guards: column-mismatch always declines while MVCC-pinned",
                  "[integration][gpu_execution][pin_table_mvcc_delete]")
@@ -389,60 +360,3 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   compare_gpu_vs_cpu("SELECT u.g, count(*) FROM t JOIN u ON t.k = u.k GROUP BY u.g ORDER BY u.g;");
   run_ok("CALL unpin_table('t');");
 }
-
-//===----------------------------------------------------------------------===//
-// Unpinned tables: the disk-native read must decline any divergence (#1143)
-//===----------------------------------------------------------------------===//
-
-#if 0
-// Disabled with the planner's guards for scans of unpinned tables (#1160):
-// those scans are MVCC-blind (#1143), so these cases would GPU-execute and
-// return wrong rows instead of falling back.
-TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "native mvcc guard: uncheckpointed deletes on an unpinned table fall back",
-                 "[integration][gpu_execution][duckdb_native_mvcc_guard]")
-{
-  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(300000);");
-  // Session-written table: probe-dirty but every row visible — stays on GPU.
-  compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
-
-  run_ok("DELETE FROM t WHERE k IN (0, 2048, 122880) OR k % 50000 = 17;");
-  expect_fallback_matches_cpu(*this, "SELECT count(*), sum(k) FROM t;");
-  // rowid queries must not see deleted rows.
-  expect_fallback_matches_cpu(*this, "SELECT min(rowid), count(*) FROM t;");
-}
-
-TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "native mvcc guard: update chains gate only the scanned columns",
-                 "[integration][gpu_execution][duckdb_native_mvcc_guard]")
-{
-  run_ok(
-    "CREATE TABLE t AS SELECT range::INTEGER AS k, (range * 2)::INTEGER AS v "
-    "FROM range(200000);");
-  compare_gpu_vs_cpu("SELECT sum(v) FROM t;");
-
-  run_ok("UPDATE t SET v = v + 1 WHERE k % 1000 = 3;");
-  expect_fallback_matches_cpu(*this, "SELECT sum(v) FROM t;");
-  // The untouched column carries no chains — still GPU-served.
-  compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
-
-  run_ok("CHECKPOINT;");  // folds the chains into the base data
-  compare_gpu_vs_cpu("SELECT sum(v) FROM t;");
-}
-
-TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "native mvcc guard: transaction-local inserts fall back until resolved",
-                 "[integration][gpu_execution][duckdb_native_mvcc_guard]")
-{
-  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(200000);");
-  compare_gpu_vs_cpu("SELECT count(*), max(k) FROM t;");
-
-  run_ok("BEGIN TRANSACTION;");
-  run_ok("INSERT INTO t VALUES (1000000);");
-  // The txn must see its own row; the disk-native read cannot.
-  expect_fallback_matches_cpu(*this, "SELECT count(*), max(k) FROM t;");
-  run_ok("ROLLBACK;");
-
-  compare_gpu_vs_cpu("SELECT count(*), max(k) FROM t;");
-}
-#endif
