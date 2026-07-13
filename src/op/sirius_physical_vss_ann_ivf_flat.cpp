@@ -207,9 +207,10 @@ std::unique_ptr<operator_data> sirius_physical_vss_ann_ivf_flat::execute(
                                                name,
                                                sirius::vss::pinned_column_alloc_size(*pin, name),
                                                target_gpu,
-                                               [&](rmm::device_async_resource_ref build_mr) {
+                                               [&](rmm::device_async_resource_ref build_mr,
+                                                   rmm::cuda_stream_view build_stream) {
                                                  return sirius::vss::concat_pinned_column(
-                                                   *pin, name, *space, stream, build_mr);
+                                                   *pin, name, *space, build_stream, build_mr);
                                                }));
   }
 

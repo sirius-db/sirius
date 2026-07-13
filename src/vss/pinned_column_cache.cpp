@@ -21,6 +21,8 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <utility>
 
 namespace sirius::vss {
@@ -47,12 +49,23 @@ pinned_column_cache::pinned_column_cache(
 // reservation, forward-declared in the header) are destroyed here.
 pinned_column_cache::~pinned_column_cache() = default;
 
+rmm::cuda_stream_view pinned_column_cache::stream_for_device(int device_id)
+{
+  auto it = build_streams_.find(device_id);
+  if (it == build_streams_.end()) {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+    it = build_streams_.try_emplace(device_id).first;
+  }
+  return it->second.view();
+}
+
 std::shared_ptr<cudf::column> pinned_column_cache::get_or_build(
   const std::string& table,
   const std::string& column,
   std::size_t estimated_bytes,
   int preferred_gpu,
-  const std::function<std::unique_ptr<cudf::column>(rmm::device_async_resource_ref)>& build)
+  const std::function<std::unique_ptr<cudf::column>(rmm::device_async_resource_ref,
+                                                    rmm::cuda_stream_view)>& build)
 {
   auto const key = make_key(table, column);
   {
@@ -72,10 +85,24 @@ std::shared_ptr<cudf::column> pinned_column_cache::get_or_build(
                                             estimated_bytes)
                                           : reservation_manager_.request_reservation(
                                             any_memory_space_in_tier(Tier::GPU), estimated_bytes);
-  std::unique_ptr<cudf::column> built = build(resv->get_memory_resource());
+
+  // Build on a cache-owned stream (per device) so the column's buffers free
+  // themselves on a stream that lives as long as the cache, not the caller.
+  int const build_device =
+    preferred_gpu >= 0 ? preferred_gpu : rmm::get_current_cuda_device().value();
+  rmm::cuda_stream_view build_stream;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    build_stream = stream_for_device(build_device);
+  }
+
+  std::unique_ptr<cudf::column> built = build(resv->get_memory_resource(), build_stream);
   // estimated_bytes over-estimates (concat merges offsets/masks), so return the
   // slack to the budget now that the real footprint is allocated.
   resv->shrink_to_fit();
+  // The column will be shared and read on other (caller) streams, so make sure
+  // the coalesce is complete before we hand it out.
+  build_stream.synchronize();
 
   // Hand back a shared column whose deleter keeps the reservation alive: the device buffers
   // are freed first (deleter runs), then the captured reservation is released.
