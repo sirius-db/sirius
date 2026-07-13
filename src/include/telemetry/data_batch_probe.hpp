@@ -24,7 +24,6 @@
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/data/data_batch.hpp>
-#include <spdlog/fmt/fmt.h>
 
 #include <functional>
 #include <memory>
@@ -93,8 +92,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
       auto maybe_memory_handle =
         memory_context_->get_memory_handle(data.get_memory_space().get_id());
       if (not maybe_memory_handle) {
-        SIRIUS_LOG_WARN(
-          fmt::format("No quent memory handle found for {}", data.get_memory_space().to_string()));
+        SIRIUS_LOG_WARN("No quent memory handle found for {}", data.get_memory_space().to_string());
         return;
       }
 
@@ -116,26 +114,24 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
       auto maybe_source_memory_handle =
         memory_context_->get_memory_handle(current_data.get_memory_space().get_id());
       if (not maybe_source_memory_handle) {
-        SIRIUS_LOG_WARN(fmt::format("No quent memory handle found for {}",
-                                    current_data.get_memory_space().to_string()));
+        SIRIUS_LOG_WARN("No quent memory handle found for {}",
+                        current_data.get_memory_space().to_string());
         return;
       }
 
       auto maybe_dest_memory_handle =
         memory_context_->get_memory_handle(target_memory_space->get_id());
       if (not maybe_dest_memory_handle) {
-        SIRIUS_LOG_WARN(
-          fmt::format("No quent memory handle found for {}", target_memory_space->to_string()));
+        SIRIUS_LOG_WARN("No quent memory handle found for {}", target_memory_space->to_string());
         return;
       }
 
       auto maybe_channel_handle = memory_context_->get_channel_handle(
         current_data.get_memory_space().get_id(), target_memory_space->get_id());
       if (not maybe_channel_handle) {
-        SIRIUS_LOG_WARN(
-          fmt::format("No quent channel handle found for the channel between {} and {}",
-                      current_data.get_memory_space().to_string(),
-                      target_memory_space->to_string()));
+        SIRIUS_LOG_WARN("No quent channel handle found for the channel between {} and {}",
+                        current_data.get_memory_space().to_string(),
+                        target_memory_space->to_string());
         return;
       }
 
@@ -158,8 +154,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
       auto maybe_memory_handle =
         memory_context_->get_memory_handle(data.get_memory_space().get_id());
       if (not maybe_memory_handle) {
-        SIRIUS_LOG_WARN(
-          fmt::format("No quent memory handle found for {}", data.get_memory_space().to_string()));
+        SIRIUS_LOG_WARN("No quent memory handle found for {}", data.get_memory_space().to_string());
         return;
       }
 
@@ -178,8 +173,8 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
       auto maybe_memory_handle =
         memory_context_->get_memory_handle(new_data.get_memory_space().get_id());
       if (not maybe_memory_handle) {
-        SIRIUS_LOG_WARN(fmt::format("No quent memory handle found for {}",
-                                    new_data.get_memory_space().to_string()));
+        SIRIUS_LOG_WARN("No quent memory handle found for {}",
+                        new_data.get_memory_space().to_string());
         return;
       }
       handle_->stationary({

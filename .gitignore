@@ -44,7 +44,7 @@ AGENTS.override.md
 CLAUDE.local.md
 newplan.md
 telemetry_data/
-log/
+/log/
 .ai-helper/
 
 .planning/

@@ -106,7 +106,7 @@ int main(int argc, char* argv[])
   // Initialize the logger
   std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
   Config::LOG_DIR     = log_dir;
-  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
 
   // Create shared test environments. Both start PAUSED and are only activated
   // by the listener for tests with the matching tag. This avoids GPU memory

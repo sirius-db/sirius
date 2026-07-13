@@ -17,6 +17,7 @@
 #include "telemetry/memory_context.hpp"
 
 #include <cstdint>
+#include <format>
 #include <optional>
 
 namespace {
@@ -63,7 +64,7 @@ memory_context::memory_context(uuid::UUID engine_uuid,
         channel_key{.source = space_id_1, .destination = space_id_2},
         quent::channel::create(context,
                                {
-                                 .instance_name   = fmt::format("{}-{}->{}-{}",
+                                 .instance_name   = std::format("{}-{}->{}-{}",
                                                               tier_to_string(space_id_1.tier),
                                                               space_id_1.device_id,
                                                               tier_to_string(space_id_2.tier),
