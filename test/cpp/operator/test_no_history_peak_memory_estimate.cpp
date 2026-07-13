@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
@@ -211,4 +212,19 @@ TEST_CASE("parquet scan no_history_peak_memory_estimate returns 8x bytes",
   REQUIRE(scan.no_history_peak_memory_estimate({0, 0}) == 0);
   REQUIRE(scan.no_history_peak_memory_estimate({1, 100}) == 800);
   REQUIRE(scan.no_history_peak_memory_estimate({4, 512}) == 4096);
+}
+
+TEST_CASE("GPU scan adds filter-only decode bytes to its no-history estimate",
+          "[no_history_peak_memory_estimate][gpu_scan]")
+{
+  scan::sirius_gpu_scan_operator scan{/*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+
+  CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, false, 100}) ==
+        800);
+  CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, false, 700}) ==
+        1400);
+  CHECK(scan.no_history_peak_memory_estimate({1, 0, operator_data_type::GPU_SCAN, false, 600}) ==
+        600);
+  CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, true, 700}) ==
+        100);
 }

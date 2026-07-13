@@ -135,13 +135,12 @@ class task_scheduler {
   }
 
   /**
-   * @brief Set the priority scan operators
+   * @brief Prepare scheduler state for a query.
    *
-   * Sets the scan operators that should be executed with priority.
-   * First element in vector will be first out of the queue.
-   * Also prepares the scan executor cache for these operators.
+   * Drains tasks left by the previous query, installs the new query and completion handler,
+   * and resets per-query scheduler state.
    *
-   * @param scans Vector of scan operators (first in vector = first out of queue)
+   * @param query Query whose tasks will be scheduled
    */
   void prepare_for_query(duckdb::shared_ptr<planner::query> query);
 

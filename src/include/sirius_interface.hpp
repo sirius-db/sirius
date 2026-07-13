@@ -28,7 +28,7 @@ class sirius_prepared_statement_data {
   sirius_prepared_statement_data(
     duckdb::shared_ptr<duckdb::PreparedStatementData> _prepared,
     duckdb::unique_ptr<op::sirius_physical_operator> _sirius_physical_plan)
-    : prepared(_prepared), sirius_physical_plan(std::move(_sirius_physical_plan))
+    : sirius_physical_plan(std::move(_sirius_physical_plan)), prepared(_prepared)
   {
   }
   //! The sirius physical plan

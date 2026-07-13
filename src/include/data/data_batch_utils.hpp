@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "telemetry/data_batch_probe.hpp"
+
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -102,16 +104,25 @@ inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
  * @param writer_stream The stream on which @p table's data was last written.
  *                      MUST be the actual writer stream — passing the wrong
  *                      stream re-opens the race this contract closes.
+ * @param telemetry_info Telemetry context threaded into the batch's quent probe so the new batch
+ *                       is linked into the query's telemetry lineage. Pass the producing
+ *                       operator's batch_telemetry(); pass a default-constructed value only when
+ *                       no lineage is available (e.g. tests).
  * @return std::shared_ptr<cucascade::data_batch> The new data batch.
  */
 inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   cudf::table&& table,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view writer_stream)
+  rmm::cuda_stream_view writer_stream,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+  const auto batch_id = get_next_batch_id();
+  return cucascade::data_batch::make(
+    batch_id,
+    std::move(gpu_repr),
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
 }
 
 /**
@@ -119,16 +130,21 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
  * event.
  *
  * @copydoc make_data_batch(cudf::table&&, cucascade::memory::memory_space&,
- *                          rmm::cuda_stream_view)
+ *                          rmm::cuda_stream_view, const telemetry::batch_telemetry_info&)
  */
 inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   std::unique_ptr<cudf::table> table,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view writer_stream)
+  rmm::cuda_stream_view writer_stream,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+  const auto batch_id = get_next_batch_id();
+  return cucascade::data_batch::make(
+    batch_id,
+    std::move(gpu_repr),
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
 }
 
 /**
@@ -150,6 +166,10 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
  * @param alloc_size Allocation size in bytes attributed to this batch.
  * @param memory_space The memory space where the viewed data resides.
  * @param writer_stream Stream ordered after the writes that produced @p view's data.
+ * @param telemetry_info Telemetry context threaded into the batch's quent probe so the new batch
+ *                       is linked into the query's telemetry lineage. Pass the producing
+ *                       operator's batch_telemetry(); pass a default-constructed value only when
+ *                       no lineage is available (e.g. tests).
  */
 template <typename Owner>
 inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
@@ -157,11 +177,16 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
   Owner&& owner,
   std::size_t alloc_size,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view writer_stream)
+  rmm::cuda_stream_view writer_stream,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     view, std::forward<Owner>(owner), alloc_size, memory_space, writer_stream);
-  return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+  const auto batch_id = get_next_batch_id();
+  return cucascade::data_batch::make(
+    batch_id,
+    std::move(gpu_repr),
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
 }
 
 }  // namespace sirius

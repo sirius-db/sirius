@@ -82,6 +82,25 @@ struct config {
   std::chrono::milliseconds retry_backoff_base{50};
   std::chrono::milliseconds retry_jitter{50};
   bool honor_retry_after{true};
+
+  /// When set, the reactor records the per-chunk micro timings (chunk_get,
+  /// queue_wait, ttfb, h2d_observed) into its perf counters.  The retry,
+  /// terminal-failure and device-stream-sync counters are always recorded,
+  /// independent of this flag.
+  bool perf_instrumentation{false};
+
+  /// Suffix-range window (bytes) for the parquet footer probe
+  /// (@c open_hint::parquet_footer_probe): one `Range: bytes=-N` GET resolves the
+  /// object size and stashes its last N bytes, so cuDF's trailer/footer reads are
+  /// served locally.  Tradeoff — a parquet footer is ~0.037% of the file (SF1
+  /// lineitem 207 MB -> 78 KiB, SF10 2.2 GB -> 771 KiB): N must cover the footer,
+  /// else the probe wastes the suffix and re-GETs the footer body (worse than a
+  /// plain HEAD), so err large; the over-read when N exceeds the footer is a
+  /// one-time bind transfer (~10 ms on a high-bandwidth link).  The 512 KiB
+  /// default covers files up to ~1.4 GB in one GET (the common range); raise it
+  /// for multi-GB single files, lower it for many-tiny-file / low-bandwidth
+  /// workloads.
+  std::size_t footer_probe_bytes{512UL << 10};  // 512 KiB
 };
 
 }  // namespace sirius::io::rest

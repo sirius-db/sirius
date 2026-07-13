@@ -49,7 +49,7 @@ namespace {
 // the write side so callers don't need to remember which side does it. Used
 // by both register_ioctx and lookup so a register("S3", ...) is found by a
 // lookup("s3"), and vice versa.
-std::string to_lower_scheme(std::string_view s)
+[[maybe_unused]] std::string to_lower_scheme(std::string_view s)
 {
   std::string out;
   out.reserve(s.size());
@@ -202,13 +202,25 @@ void io_context_registry::register_ioctx(io_context_type type,
   _entries[type] = {type, std::move(checker), std::move(factory)};
 }
 
-std::optional<io_context_type> io_context_registry::lookup(std::string_view scheme) const noexcept
+std::optional<io_context_type> io_context_registry::lookup_path(
+  std::string_view path) const noexcept
 {
   std::shared_lock lk{_mtx};
+  // kvikio's checker matches everything; _entries iterates in unspecified order,
+  // so defer the catch-all and let an explicit backend (uring/restful) win.
+  std::optional<io_context_type> fallback;
   for (const auto& [type, entry] : _entries) {
-    if (entry.checker(scheme)) return type;
+    if (!entry.checker(path)) continue;
+    if (type == io_context_type::kvikio) {
+      fallback = type;
+      continue;
+    }
+    // use_sirius_datasource=false disables the uring local datasource: let local
+    // files fall through to the kvikio catch-all instead of letting uring claim them.
+    if (type == io_context_type::uring && _prefer_kvikio_for_file_scheme) { continue; }
+    return type;
   }
-  return std::nullopt;
+  return fallback;
 }
 
 std::shared_ptr<sirius_ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept

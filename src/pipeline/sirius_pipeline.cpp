@@ -16,6 +16,7 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
+#include "config.hpp"
 #include "creator/task_creator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
@@ -25,7 +26,6 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -38,7 +38,7 @@ namespace sirius {
 namespace pipeline {
 
 sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
-  : build_ctx_(ctx), ready(false), initialized(false), source(nullptr), sink(nullptr)
+  : ready(false), initialized(false), source(nullptr), sink(nullptr), build_ctx_(ctx)
 {
 }
 
@@ -54,7 +54,7 @@ bool sirius_pipeline::is_order_dependent() const
     if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
     if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!build_ctx_.preserve_insertion_order) { return false; }
+  if (!build_ctx_.preserve_insertion_order()) { return false; }
   if (sink && sink->sink_order_dependent()) { return true; }
   return false;
 }
@@ -131,6 +131,12 @@ void sirius_pipeline::is_ready()
   if (ready) { return; }
   ready = true;
   std::reverse(operators.begin(), operators.end());
+  if (!operators.empty()) {
+    // Derive source/sink from operators[] (meta-pipeline pre-populated the sink;
+    // build_pipelines appended intermediates/sources before the reverse above).
+    source = &operators.front().get();
+    sink   = &operators.back().get();
+  }
 }
 
 void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline)
@@ -386,8 +392,18 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
           break;
         }
       }
-      if (limit_exhausted ||
-          (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
+      // Source-exhaustion conjunct: the task
+      // counters can be transiently balanced (0==0 before the first split
+      // arrives, or all-done-before-close), so finishing additionally requires
+      // the pipeline's SOURCE MEMBER — get_operators()/first_node excludes it —
+      // to be past the point where it could ever create another task. For a GPU
+      // scan source, all_ports_empty() is split_connector::is_closed() (closed
+      // AND drained); port-less sources are trivially exhausted. limit_exhausted
+      // keeps its early exit: it finishes without draining the source.
+      bool source_exhausted =
+        !source || (source->is_source_pipeline_finished() && source->all_ports_empty());
+      if (limit_exhausted || (source_exhausted && first_node->is_source_pipeline_finished() &&
+                              first_node->all_ports_empty())) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
           for (auto& op : get_operators()) {

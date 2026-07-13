@@ -11,6 +11,7 @@ Outputs to <out>/ (default ./log_analysis/<log_basename>/):
     _index.csv                 # one row per kept analytical query
     _summary.json              # totals, parser version, format-drift warnings
     _pipeline_aggregates.csv   # one row per (query, pipeline_id)
+    _operator_aggregates.csv   # one row per (query, pipeline_id, operator_id)
     <ts>/                      # one folder per kept query, named by QueryBegin ts
         query.sql
         query_meta.json
@@ -204,13 +205,19 @@ def process_query(seg, out_dir: Path, warnings: FormatWarnings) -> dict:
     (qdir / "query_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
     # Aggregate rows for this query (to be written cross-query later).
-    agg_rows = aggregator.build_rows(
+    pipeline_agg_rows = aggregator.build_pipeline_rows(
         query_begin_ts=seg.begin_ts,
         sql_preview=sql_preview,
         task_inputs=ti_rows,
         task_outputs=to_rows,
         memory_reservations=mr_rows,
         memory_history=mh_rows,
+    )
+    operator_agg_rows = aggregator.build_operator_rows(
+        query_begin_ts=seg.begin_ts,
+        sql_preview=sql_preview,
+        task_inputs=ti_rows,
+        task_outputs=to_rows,
     )
 
     return {
@@ -222,7 +229,8 @@ def process_query(seg, out_dir: Path, warnings: FormatWarnings) -> dict:
             "folder": folder_name,
             "sql_preview": sql_preview,
         },
-        "agg_rows": agg_rows,
+        "pipeline_agg_rows": pipeline_agg_rows,
+        "operator_agg_rows": operator_agg_rows,
     }
 
 
@@ -254,11 +262,13 @@ def main() -> int:
     warnings = FormatWarnings()
 
     index_rows = []
-    agg_rows_all = []
+    pipeline_agg_rows_all = []
+    operator_agg_rows_all = []
     for seg in segments:
         result = process_query(seg, out_dir, warnings)
         index_rows.append(result["index_row"])
-        agg_rows_all.extend(result["agg_rows"])
+        pipeline_agg_rows_all.extend(result["pipeline_agg_rows"])
+        operator_agg_rows_all.extend(result["operator_agg_rows"])
 
     # _index.csv
     _write_csv(
@@ -277,8 +287,27 @@ def main() -> int:
     # _pipeline_aggregates.csv
     _write_csv(
         out_dir / "_pipeline_aggregates.csv",
-        aggregator.AGG_COLUMNS,
-        agg_rows_all,
+        aggregator.PIPELINE_AGG_COLUMNS,
+        pipeline_agg_rows_all,
+    )
+
+    # _operator_aggregates.csv — sorted by query, then pipeline, then operator
+    # run order (operator_begin), then operator_id. build_operator_rows already
+    # applies the intra-query ordering; sorting here keeps it stable while
+    # ordering queries by query_begin_ts.
+    operator_agg_rows_all.sort(
+        key=lambda r: (
+            r["query_begin_ts"] or "",
+            r["pipeline_id"],
+            r["operator_begin"] is None,
+            r["operator_begin"] or "",
+            r["operator_id"],
+        )
+    )
+    _write_csv(
+        out_dir / "_operator_aggregates.csv",
+        aggregator.OPERATOR_AGG_COLUMNS,
+        operator_agg_rows_all,
     )
 
     # _summary.json

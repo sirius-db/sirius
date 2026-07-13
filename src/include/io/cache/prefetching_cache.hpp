@@ -107,7 +107,7 @@ class prefetching_handle {
 
  private:
   friend class prefetching_cache;
-  struct prefetch_lifecycle_manager;
+  class prefetch_lifecycle_manager;
 
   prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept;
 
@@ -174,6 +174,11 @@ class prefetching_cache {
   [[nodiscard]] std::string summary() const;
 
   void prepare_for_query(const sirius::planner::query& query) noexcept;
+
+  [[nodiscard]] uint32_t query_epoch() const noexcept
+  {
+    return _ticker.load(std::memory_order_relaxed);
+  }
 
  private:
   [[nodiscard]] prefetching_handle insert(const sirius_io_object& obj,

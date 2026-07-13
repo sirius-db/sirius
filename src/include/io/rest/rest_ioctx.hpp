@@ -49,11 +49,29 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
+  /// Pool-aggregated perf counters: every reactor's snapshot summed (ns totals,
+  /// counts, retries, terminal, device-sync), maxes maxed, and ttfb the first
+  /// non-zero reactor value.  Lock-free; drives the s3-bench JSON baseline.
+  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
+
  protected:
   /// Backend hook invoked by @c sirius_ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
+
+  /// @c open_hint::parquet_footer_probe resolves the size and stashes the
+  /// parquet footer together via a single suffix-range GET, carried on the
+  /// returned io_object; every other hint falls back to the plain HEAD path above.
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint) override;
+
+ private:
+  /// Resolve @p path with a single suffix-range GET: it discovers the size and
+  /// stashes the object's trailing bytes on the returned io_object so cuDF's
+  /// footer reads are served locally by @c rest_reactor::host_read.  Falls back
+  /// to a HEAD when the suffix response is unusable.  The stash lives only as
+  /// long as the returned io_object — a per-open transport shortcut, not a cache.
+  std::shared_ptr<sirius_io_object> create_footer_probe_object(std::string path);
 };
 
 }  // namespace sirius::io::rest

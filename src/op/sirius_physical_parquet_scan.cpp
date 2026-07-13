@@ -17,7 +17,7 @@
 #include "op/sirius_physical_parquet_scan.hpp"
 
 #include "expression/ast/from_duckdb.hpp"
-#include "expression_executor/gpu_expression_translator_internal.hpp"
+#include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -62,6 +62,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table
       table_scan,  // Pass pointer to the table scan for filter pushdown
       std::move(gpu_device_ids))
 {
+  dynamic_filters        = table_scan->dynamic_filters;
+  sirius_dynamic_filters = table_scan->sirius_dynamic_filters;
 }
 
 sirius_physical_parquet_scan::sirius_physical_parquet_scan(

@@ -77,8 +77,8 @@ static void write_backtrace_line(int fd, int frame_no, const char* raw_line)
   write(fd, "\n", 1);
 }
 
-// Best-effort flush of the spdlog logger so the most recent log lines reach
-// disk before we terminate. This is NOT async-signal-safe: the _mt sink takes
+// Best-effort flush of the global logger so the most recent log lines reach
+// disk before we terminate. This is NOT async-signal-safe: the sink takes
 // a mutex and may allocate, so if the crash happened while a thread held the
 // logging mutex (or inside the allocator) the flush could deadlock. We bound
 // that risk with alarm(): SIGALRM's default disposition terminates the
@@ -88,10 +88,8 @@ static void flush_logs_best_effort()
 {
   signal(SIGALRM, SIG_DFL);  // ensure default (terminate) disposition
   alarm(3);                  // hard deadline for the log + flush below
-  if (auto* logger = spdlog::default_logger_raw()) {
-    SPDLOG_LOGGER_WARN(logger, "SIRIUS signal handler triggered, flushing logs");
-    logger->flush();
-  }
+  SIRIUS_LOG_WARN("SIRIUS signal handler triggered, flushing logs");
+  sirius::FlushGlobalLogger();
   alarm(0);  // flush returned in time; cancel the deadline
 }
 
@@ -206,7 +204,7 @@ void install_segfault_backtrace_handler()
   // writing a core dump; leaving it uninstalled lets the default disposition
   // produce a core (with `ulimit -c unlimited`). See docs/super-sirius/debugging.md.
   if (env_flag_enabled("DISABLE_SIRIUS_SIGNAL_HANDLER")) {
-    spdlog::warn(
+    SIRIUS_LOG_WARN(
       "Sirius crash backtrace handler DISABLED via DISABLE_SIRIUS_SIGNAL_HANDLER — "
       "the OS default disposition is in effect (core dumps enabled if `ulimit -c` allows)");
     return;

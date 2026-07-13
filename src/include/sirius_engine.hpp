@@ -21,14 +21,12 @@
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/execution/task_error_manager.hpp"
-#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry-bridge/gen/query.rs.h"
-#include "telemetry-bridge/gen/query_group.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
 
@@ -70,8 +68,6 @@ class sirius_engine {
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_pipelines;
   //! The root pipelines of the query
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_root_pipelines;
-  //! Storage for pipeline breaker created during pipeline splitting
-  duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> new_pipeline_breakers;
   //! The current root pipeline index
   std::size_t root_pipeline_idx;
   //! The total amount of pipelines in the query
@@ -90,16 +86,6 @@ class sirius_engine {
   void reset();
   //! Cancel the tasks
   void cancel_tasks();
-  //! Construct the sirius specific operator
-  duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(
-    op::sirius_physical_operator* op);
-  //! Construct a sirius iceberg scan operator, populating delete file lists from cache.
-  duckdb::unique_ptr<op::sirius_physical_operator> construct_iceberg_scan_operator(
-    op::sirius_physical_table_scan& scan_op);
-  //! Pre-fetch iceberg table metadata (delete files) for all iceberg scans in the plan.
-  //! Must be called from initialize() BEFORE initialize_internal() assigns operator IDs
-  //! to pipeline-breaker operators (PARTITION, CONCAT, etc.).
-  void prefetch_iceberg_delete_data(op::sirius_physical_operator& plan);
   //! Create a child pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
@@ -113,19 +99,8 @@ class sirius_engine {
   //! Whether the query has finished
   bool query_finished;
 
-  // ---------------------------------------------------------------------------
-  // Iceberg metadata cache
-  //
-  // Populated by prefetch_iceberg_delete_data() in initialize(), BEFORE
-  // initialize_internal() runs.  Keyed by iceberg table path string.
-  // ---------------------------------------------------------------------------
-  std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
-    iceberg_delete_data_cache_;
-
  private:
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
-  uuid::UUID query_group_uuid_;
-  rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
   rust::Box<quent::query::QueryHandle> query_handle_;
 };
 

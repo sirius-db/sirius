@@ -27,6 +27,7 @@
 #include <duckdb/planner/filter/optional_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
+#include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <unistd.h>
 #include <utils/utils.hpp>
@@ -37,15 +38,10 @@
 #include <string>
 #include <vector>
 
-// TEMPORARILY DISABLED: these cases call the removed monolithic walk_duckdb_native_metadata().
-// TODO: migrate to prepare_duckdb_native_walk() + walk_duckdb_native_row_group_range() and
-// re-enable — the duckdb_native_row_group_range result exposes the same .viable / .row_groups /
-// .viability_failure_reason / .pruned_row_groups these asserts use.
-#if 0
-
 using namespace sirius;
 using namespace sirius::op::scan;
 
+// Shared helpers, kept outside the disabled block below so live cases can use them.
 namespace {
 
 // `Connection::Query` returns a non-null result on failure (error lives in
@@ -81,6 +77,107 @@ projected_column real_col(duckdb::idx_t col_id)
   pc.is_rowid    = false;
   return pc;
 }
+
+/// Runs the pre-step plus a single full-table range and combines them into one
+/// result. Exercises `prepare_duckdb_native_walk` and
+/// `walk_duckdb_native_row_group_range`. Optional filters drive statistics
+/// pruning.
+struct walk_result {
+  std::vector<duckdb_row_group_metadata> row_groups;
+  bool viable = false;
+  std::string viability_failure_reason;
+  std::size_t pruned_row_groups    = 0;
+  std::size_t pruned_decoded_bytes = 0;
+};
+
+walk_result walk_all(duckdb::DataTable& storage,
+                     duckdb::ClientContext& ctx,
+                     const std::vector<projected_column>& cols,
+                     const std::vector<sirius::logical_type>& types,
+                     const duckdb::TableFilterSet* table_filters           = nullptr,
+                     const duckdb::vector<duckdb::ColumnIndex>* column_ids = nullptr)
+{
+  auto plan = prepare_duckdb_native_walk(storage, ctx, cols, types, table_filters, column_ids);
+  if (!plan.viable) {
+    return {{},
+            false,
+            std::move(plan.viability_failure_reason),
+            plan.pruned_row_groups,
+            plan.pruned_decoded_bytes};
+  }
+  auto range = walk_duckdb_native_row_group_range(plan, 0, plan.n_row_groups);
+  return {std::move(range.row_groups),
+          range.viable,
+          std::move(range.viability_failure_reason),
+          range.pruned_row_groups,
+          range.pruned_decoded_bytes};
+}
+
+}  // namespace
+
+//===--------------------------------------------------------------------===//
+// Overflow (big-string) refusal — strings at/over GetStringBlockLimit (4,096 B
+// at the default block size) live in overflow blocks the GPU string decoder
+// cannot resolve; the walker must refuse at prepare time.
+//===--------------------------------------------------------------------===//
+
+TEST_CASE("walker refuses varchar containing overflow-length strings",
+          "[scan][duckdb_native_walker][overflow_string]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(s VARCHAR)");
+  exec_ok(con, "INSERT INTO t VALUES (repeat('x', 5000))");
+  exec_ok(con, "INSERT INTO t SELECT 'short' FROM range(0, 100)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE_FALSE(md.viable);
+  REQUIRE(md.viability_failure_reason.find("overflow") != std::string::npos);
+}
+
+TEST_CASE("walker refuses varchar exactly at the overflow limit",
+          "[scan][duckdb_native_walker][overflow_string]")
+{
+  // Overflow triggers at length >= limit, so the refusal boundary must match.
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(s VARCHAR)");
+  exec_ok(con, "INSERT INTO t VALUES (repeat('x', 4096))");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE_FALSE(md.viable);
+  REQUIRE(md.viability_failure_reason.find("overflow") != std::string::npos);
+}
+
+TEST_CASE("walker accepts varchar below the overflow limit",
+          "[scan][duckdb_native_walker][overflow_string]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(s VARCHAR)");
+  exec_ok(con, "INSERT INTO t SELECT repeat('x', 4000) FROM range(0, 100)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+}
+
+// TEMPORARILY DISABLED: these cases call the removed monolithic walk_duckdb_native_metadata().
+// TODO: migrate to prepare_duckdb_native_walk() + walk_duckdb_native_row_group_range() and
+// re-enable — the duckdb_native_row_group_range result exposes the same .viable / .row_groups /
+// .viability_failure_reason / .pruned_row_groups these asserts use.
+#if 0
+
+namespace {
 
 projected_column rowid_col()
 {
@@ -138,41 +235,6 @@ filter_ctx make_constant_filter(duckdb::idx_t col_key,
   ctx.column_ids.resize(col_key + 1, duckdb::ColumnIndex(storage_idx));
   ctx.column_ids[col_key] = duckdb::ColumnIndex(storage_idx);
   return ctx;
-}
-
-/// Runs the pre-step plus a single full-table range and combines them into one
-/// result. Exercises `prepare_duckdb_native_walk` and
-/// `walk_duckdb_native_row_group_range`. Optional filters drive statistics
-/// pruning.
-struct walk_result {
-  std::vector<duckdb_row_group_metadata> row_groups;
-  bool viable = false;
-  std::string viability_failure_reason;
-  std::size_t pruned_row_groups    = 0;
-  std::size_t pruned_decoded_bytes = 0;
-};
-
-walk_result walk_all(duckdb::DataTable& storage,
-                     duckdb::ClientContext& ctx,
-                     const std::vector<projected_column>& cols,
-                     const std::vector<sirius::logical_type>& types,
-                     const duckdb::TableFilterSet* table_filters           = nullptr,
-                     const duckdb::vector<duckdb::ColumnIndex>* column_ids = nullptr)
-{
-  auto plan = prepare_duckdb_native_walk(storage, ctx, cols, types, table_filters, column_ids);
-  if (!plan.viable) {
-    return {{},
-            false,
-            std::move(plan.viability_failure_reason),
-            plan.pruned_row_groups,
-            plan.pruned_decoded_bytes};
-  }
-  auto range = walk_duckdb_native_row_group_range(plan, 0, plan.n_row_groups);
-  return {std::move(range.row_groups),
-          range.viable,
-          std::move(range.viability_failure_reason),
-          range.pruned_row_groups,
-          range.pruned_decoded_bytes};
 }
 
 }  // namespace
@@ -470,6 +532,152 @@ TEST_CASE("walker refuses LIST projected type", "[scan][duckdb_native_walker]")
   auto md                              = walk_all(storage, *con.context, cols, ts);
   REQUIRE_FALSE(md.viable);
   REQUIRE(md.viability_failure_reason.find("LIST") != std::string::npos);
+}
+
+// A fixed-size ARRAY column is ArrayColumnData, walked by walk_array_column:
+// array-level validity routes into data_segments (NOT validity_segments), and
+// the child column's data/validity land in the array_child_* vectors.
+static sirius::logical_type array_of(sirius::type_id child, std::uint64_t size)
+{
+  return sirius::logical_type::make_array(sirius::logical_type::make(child), size);
+}
+
+TEST_CASE("walker emits child data and marks is_array for ARRAY column",
+          "[scan][duckdb_native_walker]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER[3])");
+  // Crosses a vector boundary so we get at least one materialized segment
+  exec_ok(con, "INSERT INTO t SELECT [range, range + 1, range + 2] FROM range(0, 3000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {array_of(sirius::type_id::INTEGER, 3)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE(md.viable);
+  REQUIRE(md.viability_failure_reason.empty());
+  REQUIRE_FALSE(md.row_groups.empty());
+
+  for (const auto& rg : md.row_groups) {
+    REQUIRE(rg.columns.size() == 1);
+    const auto& col = rg.columns[0];
+    REQUIRE(col.is_array);
+    // Child element data lands in array_child_data_segments
+    REQUIRE_FALSE(col.array_child_data_segments.empty());
+    for (const auto& d : col.array_child_data_segments) {
+      REQUIRE(d.segment_count > 0);
+    }
+    // Array-level validity is routed to data_segments
+    // top-level validity_segments is unused for ARRAY columns
+    REQUIRE(col.validity_segments.empty());
+    REQUIRE(rg.decoded_bytes_budget > 0);
+  }
+}
+
+TEST_CASE("walker routes ARRAY-level validity into data_segments for NULL arrays",
+          "[scan][duckdb_native_walker]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER[3])");
+  // Whole-array NULLs populate the array-level validity (path [col,0])
+  exec_ok(con, "INSERT INTO t VALUES ([1, 2, 3]), (NULL), ([7, 8, 9]), (NULL), ([4, 5, 6])");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {array_of(sirius::type_id::INTEGER, 3)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+
+  bool saw_array_validity = false;
+  for (const auto& rg : md.row_groups) {
+    const auto& col = rg.columns[0];
+    REQUIRE(col.is_array);
+    // Array validity must never leak into the top-level validity_segments
+    REQUIRE(col.validity_segments.empty());
+    if (!col.data_segments.empty()) { saw_array_validity = true; }
+  }
+  REQUIRE(saw_array_validity);
+}
+
+TEST_CASE("walker emits ARRAY child validity segments for NULL elements",
+          "[scan][duckdb_native_walker]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER[3])");
+  // Element-level NULLs (path [col,1,0]) i.e., the array is present, elements null
+  exec_ok(con, "INSERT INTO t VALUES ([1, NULL, 3]), ([4, 5, 6]), ([NULL, NULL, NULL])");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {array_of(sirius::type_id::INTEGER, 3)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+
+  bool saw_child_validity = false;
+  for (const auto& rg : md.row_groups) {
+    if (!rg.columns[0].array_child_validity_segments.empty()) {
+      saw_child_validity = true;
+      break;
+    }
+  }
+  REQUIRE(saw_child_validity);
+}
+
+TEST_CASE("walker refuses ARRAY with non-fixed-width element", "[scan][duckdb_native_walker]")
+{
+  // Type check should catch before the segment walk for non-fixed-width element
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t VALUES (1)");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {array_of(sirius::type_id::VARCHAR, 3)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE_FALSE(md.viable);
+  REQUIRE(md.viability_failure_reason.find("non-fixed-width") != std::string::npos);
+}
+
+TEST_CASE("walker refuses ARRAY without child type metadata", "[scan][duckdb_native_walker]")
+{
+  // An ARRAY id built without make_array() carries no child type to validate
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER)");
+  exec_ok(con, "INSERT INTO t VALUES (1)");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::ARRAY)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE_FALSE(md.viable);
+  REQUIRE(md.viability_failure_reason.find("without child") != std::string::npos);
+}
+
+// checked_array_child_advance guards the ARRAY child-element cursor against
+// overflowing cudf::size_type (int32), the type of the downstream LIST offsets.
+TEST_CASE("checked_array_child_advance rejects size_type overflow", "[scan][array]")
+{
+  auto const kMax = static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
+
+  // Normal advance: cursor + row_count * array_size.
+  REQUIRE(checked_array_child_advance(0, 122880, 768) == static_cast<uint32_t>(122880u * 768u));
+  REQUIRE(checked_array_child_advance(1000, 10, 4) == 1040u);
+
+  // Exactly at the int32 limit is allowed; one past it overflows.
+  REQUIRE(checked_array_child_advance(0, kMax, 1).value() == static_cast<uint32_t>(kMax));
+  REQUIRE_FALSE(checked_array_child_advance(0, kMax + 1, 1).has_value());
+
+  // 6M rows * 768 dims = 4.6B > int32 max.
+  REQUIRE_FALSE(checked_array_child_advance(0, 6'000'000, 768).has_value());
+
+  // Accumulation tips it over even when a single step is fine.
+  REQUIRE(checked_array_child_advance(0, 2'000'000, 768).has_value());  // 1.536B ok
+  REQUIRE_FALSE(checked_array_child_advance(1'536'000'000u, 2'000'000, 768).has_value());
 }
 
 // Driving the walker into an unsupported codec via real DuckDB storage is

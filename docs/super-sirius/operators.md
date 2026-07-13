@@ -41,7 +41,7 @@ These operators produce data for pipelines. See [Scan](scan.md) for in-depth cov
 ### `sirius_physical_table_scan` — `TABLE_SCAN`
 **File:** `src/include/op/sirius_physical_table_scan.hpp`
 
-Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. During pipeline construction, converted to either DUCKDB_SCAN or PARQUET_SCAN.
+Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. During pipeline construction it is converted into a format-specific wrapper (`DUCKDB_SCAN` or `PARQUET_SCAN`) for the CPU / DuckDB-source path; the GPU read path for parquet and DuckDB-native tables is instead rewritten into a `GPU_SCAN` source (see below).
 
 ### `sirius_physical_duckdb_scan` — `DUCKDB_SCAN`
 **File:** `src/include/op/sirius_physical_duckdb_scan.hpp`
@@ -51,27 +51,16 @@ Sequential scan using DuckDB's execution engine. Accumulates chunks into fixed-s
 ### `sirius_physical_parquet_scan` — `PARQUET_SCAN`
 **File:** `src/include/op/sirius_physical_parquet_scan.hpp`
 
-Direct Parquet file scan. Reads column-chunk byte ranges and optionally materializes (decompresses) to table format. Tracks `has_more_partitions` atomic flag. Row groups are partitioned by `approximate_batch_size`.
+Wrapper for the DuckDB-source parquet path. Reads column-chunk byte ranges and optionally materializes (decompresses) to table format. Tracks `has_more_partitions` atomic flag. Row groups are partitioned by `approximate_batch_size`.
 
-### `sirius_physical_iceberg_scan` — `ICEBERG_SCAN`
-**File:** `src/include/op/sirius_physical_iceberg_scan.hpp`
+### `sirius_gpu_scan_operator` — `GPU_SCAN`
+**File:** `src/include/op/scan/sirius_gpu_scan_operator.hpp`
 
-Apache Iceberg table scan with GPU-accelerated delete filters. Inherits from `sirius_physical_parquet_scan` since Iceberg uses Parquet as the data layer. Supports Iceberg V1 (append-only), V2 (positional and equality deletes, including heterogeneous equality-delete schemas), and V3 (deletion vectors via PUFFIN files). Handles schema evolution, snapshot time-travel, and partition evolution.
+Unified GPU scan source operator for reading table data from storage. It carries no format-specific code: it pulls pre-built splits off a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible`, one implementation per source format (`parquet_gpu_ingestible` for Parquet, `duckdb_native_gpu_ingestible` for DuckDB-native `.duckdb` tables, `cached_parquet_gpu_ingestible` for pinned-cache hits).
 
-- **Delete filter pipeline:** Composes `positional_delete_filter`, `equality_delete_filter` (per-key-schema groups, sequence-scoped), and a deletion-vector filter for V3 to apply deletes entirely on GPU with no D2H copies
-- **Metadata:** Manifest discovery delegates to DuckDB's `iceberg_metadata()`; the custom `iceberg_avro_reader` is the fallback for V3 deletion-vector PUFFIN files
+The pipeline converter rewrites a DuckDB parquet or DuckDB-native table scan into a `GPU_SCAN` source: it lowers the bind data into the appropriate `ingestible_table_info`, builds the `gpu_ingestible`, and inserts the operator at `operators[0]` of the pipeline. Before a query runs, `sirius_scan_manager` prepares scan-side state — matching pinned-cache entries or building a `split_provider` over each operator's ingestible — and drives metadata production, split coalescing, and per-GPU balancing, pushing splits onto each operator's `split_connector`. `execute()` calls `gpu_ingestible::materialize_table` and, when a split carries filter/projection info, `gpu_ingestible::post_filter_and_project`.
 
-See [Scan — Iceberg Scan](scan.md#iceberg-scan) for details.
-
-### `sirius_gpu_parquet_scan_operator` — `GPU_PARQUET_SCAN`
-**File:** `src/include/op/scan/sirius_gpu_parquet_scan_operator.hpp`
-
-Source operator for parquet scans (local or S3). Carries a `scan_info` (concrete subclass: `parquet_scan_info`) populated by the pipeline converter and pulls splits from a `split_connector` populated by `sirius_scan_manager` on its own thread pool. Each `parquet_scan_data` split drives a `cudf::io::read_parquet` call followed by `scan_plan`-driven output assembly (data columns, hive-partition synthesis, output ordering). See [Scan — Scan Manager](scan.md#scan-manager).
-
-### `sirius_gpu_duckdb_native_scan_operator` — `GPU_DUCKDB_NATIVE_SCAN`
-**File:** `src/include/op/scan/sirius_gpu_duckdb_native_scan_operator.hpp`
-
-Source operator for GPU-native reading of DuckDB `.duckdb` format tables. Carries a `duckdb_native_scan_info` and pulls splits from a `split_connector` fed by a `duckdb_native_split_provider`. Each split carries a slice of per-row-group segment metadata; `execute()` decodes the segments into a `cudf::table` using the native DuckDB format decode kernels. See [Scan — GPU DuckDB-Native Scan](scan.md#sirius_gpu_duckdb_native_scan_operator----gpu_duckdb_native_scan).
+See [Scan](scan.md) for the full scan subsystem (scan manager, `gpu_ingestible`, pinned-table caching, and the IO layer).
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -92,7 +81,7 @@ These operators process data in a single pass without buffering.
 
 Applies a predicate expression to filter rows.
 
-- **GPU execution:** `gpu_expression_executor::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
+- **GPU execution:** `expression_evaluator::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
 - **Key members:** `expression` (filter predicate)
 
 ### `sirius_physical_projection` — `PROJECTION`
@@ -101,11 +90,11 @@ Applies a predicate expression to filter rows.
 Evaluates a list of expressions to produce output columns.
 
 - **GPU execution:** the operator classifies each `select_list` entry as either a pure column passthrough (a `sirius::ast::reference` / BOUND_REF) or an expression that must be evaluated, then takes one of three paths per input batch:
-  - **All evaluated:** `gpu_expression_executor::execute()` produces an owned `cudf::table` of new columns.
+  - **All evaluated:** `expression_evaluator::evaluate()` produces an owned `cudf::table` of new columns.
   - **All passthrough:** the output is a zero-copy `cudf::table_view` over the input columns. The output batch is a view-backed `gpu_table_representation` (see [data management](data-management.md)) whose owner is the input's `read_only_data_batch` lock, which keeps the source columns alive and read-only-pinned for the output's lifetime — no device copies.
   - **Mixed:** only the non-passthrough entries are evaluated; the output view mixes the freshly-evaluated columns with the input's passthrough columns, owned jointly by the evaluated table and the input lock.
 
-  Only the entries that need evaluation are passed to the expression executor (via its `std::vector<sirius::ast::node const*>` constructor). See [expression executor](expression-executor.md).
+  Only the entries that need evaluation are passed to the expression evaluator (via its `std::vector<sirius::ast::node const*>` constructor). See [expression evaluator](expression-executor.md).
 - **Key members:** `select_list` (output expressions)
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
@@ -128,11 +117,19 @@ Three execution modes:
 | Mode | When Used | cuDF API |
 |------|-----------|----------|
 | `STANDARD` | Default, multi-partition Cartesian product | `cudf::inner_join()`, `cudf::left_join()`, etc. |
-| `BUILD_PROBE` | Small build side (< `max_build_hash_table_bytes`, 1 partition) | `cudf::hash_join` or `cudf::distinct_hash_join` (build once, probe many) |
+| `BUILD_PROBE` | Single partition, small build side (< `max_build_hash_table_bytes`) foldable to one batch | `cudf::hash_join`, `cudf::distinct_hash_join`, or `cudf::filtered_join` — built once, probed many times |
 | `MIXED_JOIN` | Equality + inequality conditions on disjoint columns | `cudf::mixed_join()` with cuDF AST |
 
+`update_join_exec_mode()` selects BUILD_PROBE when there is one partition, the build side fits and folds to a single batch, and the join type is not SEMI, ANTI, or RIGHT (these stay in STANDARD mode). INNER, LEFT, OUTER, and MARK joins are all eligible.
+
+#### MARK joins
+A MARK join emits every left row plus a `BOOL8` mark column indicating whether each left row had a match. Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column.
+
+- **STANDARD mode (adaptive build side):** by default the filter (right) side is built into a `cudf::filtered_join` and probed with the left, whose `semi_join` yields left-row match indices. When the right (probe) side is much larger than the left (output) side, Sirius instead builds the smaller left side into a `cudf::mark_join` and probes with the right. The switch is gated by `mark_join_build_switch_ratio` (build on left when `right_rows >= ratio * left_rows`; `0` disables). Both paths produce identical output.
+- **BUILD_PROBE mode:** a single `cudf::filtered_join` is built once on the right (filter) keys and persisted as `_filtered_table`; each streamed left probe batch calls `semi_join` against it, reusing the hash table across probes.
+
 #### Distinct Hash Join Optimization
-In BUILD_PROBE mode, when the build-side keys are proven unique, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join`. This optimization applies when:
+For INNER/LEFT joins in BUILD_PROBE mode, when the build-side keys are proven unique, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join`. This optimization applies when:
 - Join type is INNER or LEFT
 - Build-side keys are proven unique via logical plan analysis (`prove_unique_columns()` in `src/planner/sirius_plan_comparison_join.cpp`)
 
@@ -157,13 +154,16 @@ When `get_next_task_hint()` is called after the operator is already finished, it
 
 Key members:
 - `conditions` — join predicates (equality and inequality)
-- `join_type` — INNER, LEFT, RIGHT, OUTER
-- `_hash_table` — cached `cudf::hash_join` or `cudf::distinct_hash_join` (BUILD_PROBE mode)
+- `join_type` — INNER, LEFT, RIGHT, OUTER, MARK
+- `_hash_table` — cached `cudf::hash_join` (BUILD_PROBE mode)
+- `_distinct_hash_table` — cached `cudf::distinct_hash_join`, used instead of `_hash_table` when build keys are proven unique
+- `_filtered_table` — reusable build-on-right `cudf::filtered_join` for MARK joins in BUILD_PROBE mode
 - `_build_table` — materialized build-side data batch
 - `key_casts` — type alignment info for hash key matching
 - `unique_build_keys` / `unique_probe_keys` — cardinality hints (used to select distinct vs standard hash join)
+- `mark_join_build_switch_ratio` — threshold for adaptively building a STANDARD MARK join on the smaller (left) side
 
-Supported join types: INNER, LEFT, RIGHT, OUTER via `cudf::inner_join()`, `cudf::left_join()`, `cudf::full_outer_join()`.
+Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, `cudf::left_join()`, `cudf::full_outer_join()`, `cudf::filtered_join`, and `cudf::mark_join`.
 
 ### `sirius_physical_nested_loop_join` — `NESTED_LOOP_JOIN`
 **File:** `src/include/op/sirius_physical_nested_loop_join.hpp`
@@ -191,7 +191,8 @@ Combined ORDER + LIMIT: selects and sorts the top N rows.
 Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 
 - **GPU execution:** `gpu_aggregate_impl::local_ungrouped_aggregate()` using `cudf::reduce()`
-- **Supported:** MIN, MAX, SUM, COUNT_ALL, COUNT_VALID
+- **Supported:** SUM, MIN, MAX, COUNT (of valid values), COUNT(*), AVG, FIRST
+- **AVG handling:** Decomposed into SUM + COUNT and finalized on-device. `make_avg_column()` divides the single-row merged sum/count columns with `cudf::binary_operation` — DECIMAL output divides directly in fixed point to preserve precision, while non-DECIMAL output casts both operands to FLOAT64 and divides. This keeps AVG off the host `long double` path, avoiding both the device→host sync and the precision loss of decimal round-trips.
 - **DECIMAL overflow handling:** DECIMAL SUM casts to a wider type before reduction — DECIMAL32→DECIMAL64, DECIMAL64→DECIMAL128 — to prevent overflow
 - **BIGINT SUM fallback:** BIGINT (INT64) SUM falls back to CPU execution because GPU lacks INT128 accumulator support. Without this, silent overflow produces incorrect results. BIGINT arithmetic operations (ADD, SUB, MUL) also fall back to CPU for the same reason.
 
@@ -216,8 +217,8 @@ Repartitions data into N buckets based on partition keys.
 
 - **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
 - **Adaptive count:** `determine_num_partitions()` computes N from actual input data size and `hash_partition_bytes` config
-- **Sibling coordination:** Build-side partition determines count; probe-side waits for the result
-- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_sibling_partition_op`
+- **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
+- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`
 
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/include/op/sirius_physical_concat.hpp`
@@ -230,11 +231,13 @@ Reassembles partitioned data back into a linear stream. Behavior depends on join
 ### `sirius_physical_sort_sample` — `SORT_SAMPLE`
 **File:** `src/include/op/sirius_physical_sort_sample.hpp`
 
-Samples N input batches to compute P-1 partition boundary rows for range partitioning.
+Samples input batches to compute P-1 partition boundary rows for range partitioning. Sampling is byte-based: it accumulates batches until `sort_sample_bytes` worth of input is available, rather than a fixed batch count.
 
-- On first execution: merge pre-sorted sample batches, compute boundaries, set `_boundaries_computed`
-- On subsequent executions: pass through data unchanged
-- Custom `get_next_task_hint()`: waits for N batches before returning READY
+Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE → SCHEDULED → DONE`.
+- `get_next_task_hint()` waits in `NOT_DONE` until enough sample bytes are available (or the upstream finishes), then signals READY; it returns `std::nullopt` while `SCHEDULED` so at most one boundary task is in flight.
+- `get_next_task_input_data()` (overridden) claims the accumulated sample batches and moves the state to `SCHEDULED`, handing them to `execute()` as a single multi-batch input.
+- `execute()` merges the pre-sorted sample batches, computes the boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
+- Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
 **File:** `src/include/op/sirius_physical_sort_partition.hpp`
@@ -306,15 +309,13 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
-| DUCKDB_SCAN | Scan | DuckDB table function |
-| PARQUET_SCAN | Scan | Direct Parquet reading |
-| ICEBERG_SCAN | Scan | Parquet reading with Iceberg delete filters |
-| GPU_PARQUET_SCAN | Scan | Source operator served by `sirius_scan_manager` (local or S3) |
-| GPU_DUCKDB_NATIVE_SCAN | Scan | GPU-native DuckDB format scan via `duckdb_native_split_provider` |
+| DUCKDB_SCAN | Scan | DuckDB table function (CPU / DuckDB-source path) |
+| PARQUET_SCAN | Scan | Parquet reading (CPU / DuckDB-source path) |
+| GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
-| FILTER | Relational | `gpu_expression_executor::select()` |
-| PROJECTION | Relational | `gpu_expression_executor::execute()` |
+| FILTER | Relational | `expression_evaluator::select()` |
+| PROJECTION | Relational | `expression_evaluator::evaluate()` |
 | STREAMING_LIMIT | Relational | Atomic claim-based |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |
@@ -325,7 +326,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | HASH_GROUP_BY | Agg | `gpu_aggregate_impl::local_grouped_aggregate()` |
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
 | MERGE_GROUP_BY | Agg | Merge grouped partitions |
-| HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()` or `cudf::distinct_hash_join` |
+| HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()`, `cudf::distinct_hash_join`, or `cudf::{filtered,mark}_join` (MARK) |
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |

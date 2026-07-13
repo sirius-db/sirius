@@ -1,6 +1,6 @@
 # Physical Plan Generation
 
-This document covers three interconnected topics: translating DuckDB logical plans to Sirius physical operators, constructing pipelines, and splitting pipelines for distributed GPU execution.
+This document covers three interconnected topics: translating DuckDB logical plans to Sirius physical operators (including the GPU pipeline operators inserted at plan time), constructing pipelines, and the pipeline shapes that result for distributed GPU execution.
 
 ## Part 1: Plan Generator
 
@@ -73,6 +73,12 @@ When a `LogicalGet` has table filters and the table function supports `FILTER_PU
 
 Projections are omitted when columns are already in the correct order (passthrough case like `PROJECTION(#0, #1, #2, ...)`).
 
+### Projection Folding
+
+After the operator tree is built, `create_plan()` runs `fold_adjacent_projections()` over the whole plan as a final pass. Sirius routes every planner-created projection through `push_projection()`, which both elides identity passthrough projections and, when its child is already a projection, composes the two select lists into one. The standalone `fold_adjacent_projections()` post-pass then collapses any remaining `PROJECTION → PROJECTION` stacks anywhere in the tree — including projection pairs that arise from separate plan-builder steps (filter `projection_map` reordering, aggregate child/filter hoisting, table-scan unsupported-filter projections, and the user's `SELECT` list) and projections sitting under other operators such as joins.
+
+Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (an unsupported-expression fallback) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `expression_evaluator` over every batch.
+
 ## Part 2: Pipeline Structure
 
 ### `sirius_pipeline`
@@ -97,10 +103,7 @@ A pipeline is an ordered list of operators:
 Key methods:
 - `mark_task_created()` — increments `tasks_created`, starts NVTX range on first task
 - `mark_task_completed()` — increments `tasks_completed`, calls `update_pipeline_status()`
-- `update_pipeline_status()` — checks source-dependent completion logic:
-  - DUCKDB_SCAN: finished when `exhausted` flag is set
-  - GPU_PARQUET_SCAN: finished when the bound `split_connector` is closed and drained and `tasks_created == tasks_completed`
-  - Others: finished when upstream done, ports empty, and all tasks completed
+- `update_pipeline_status()` — checks completion: a pipeline finishes when any of its operators has exhausted a limit, or when its first node reports `is_source_pipeline_finished()` and `all_ports_empty()`, and `tasks_created == tasks_completed`. Source-specific completion (a drained DuckDB source vs. a closed/drained scan `split_connector`) is encapsulated behind the operator's `is_source_pipeline_finished()` rather than a per-operator-type switch.
 - `is_ready()` — marks pipeline ready and reverses operators to execution order
 - `register_new_batch_index()` / `update_batch_index()` — batch ordering for order-preserving execution
 
@@ -170,56 +173,45 @@ children[1]->build_pipelines(current, meta_pipeline);  // Reference side
 
 ### Pipeline Finalization
 
-During `finalize_pipeline_structure()` in `sirius_pipeline_converter` (`src/pipeline/sirius_pipeline_converter.cpp`), after all pipeline splitting is done, each pipeline is finalized:
+Pipelines reach their final shape during construction: `create_pipeline()` pre-populates `operators` with the meta-pipeline's sink, per-operator `build_pipelines` appends intermediates and sources as it recurses, and `sirius_pipeline::is_ready()` reverses the list and derives `source`/`sink` from it.
 
-```cpp
-// Finalize pipeline structure: push sink into operators, set source
-for (auto& pipeline : new_scheduled) {
-    pipeline->operators.push_back(*pipeline->sink);
-    pipeline->source = &pipeline->operators[0].get();
-}
-```
-
-After this step:
+After `is_ready()`:
 - `operators` contains **all** operators from source to sink inclusive
 - `source` points to `operators[0]` (the first operator)
-- `sink` points to the last operator (which was just pushed in)
+- `sink` points to `operators.back()`
 - `get_operators()` returns this full list
 
-## Part 3: Pipeline Splitting Rules
+`finalize_pipeline_structure()` in `sirius_pipeline_converter` then populates each pipeline's `dependencies` from the wiring-derived parents, inserting a join's build-side CONCAT producer at slot 0 — `link_join_partition_siblings()` and `reorder_pipelines_topologically()` read the slots positionally.
 
-After meta-pipeline construction, `sirius_pipeline_converter::convert()` applies Sirius-specific pipeline splitting. This class organizes the work into focused phases:
+## Part 3: Pipeline Shapes
 
-1. `schedule_and_copy_pipelines()` — walk meta-pipeline tree, schedule and copy
-2. `split_pipelines()` — dispatches to per-operator splitting helpers (`split_table_scan_source`, `split_intermediate_joins`, `split_join_sink`, `split_group_aggregate_sink`, `split_order_by_sink`, `split_top_n_sink`, `split_delim_join_sink`)
-3. `wire_data_repositories()` — connect operator ports to data repositories
-4. `setup_pipeline_parents()` — assign parent/child pipeline relationships
-5. `finalize_pipeline_structure()` — source/sink semantic shift (see [Pipeline Finalization](#pipeline-finalization))
-6. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
-7. `log_pipeline_debug_info()` — structured debug logging
+The plan generator inserts every GPU pipeline operator into the plan tree (Part 1), so `sirius_pipeline_converter::convert()` (`src/pipeline/sirius_pipeline_converter.cpp`) is a pure topology pass over the meta-pipeline tree:
 
-`sirius_engine::initialize_internal()` is now a ~35-line orchestrator calling `sirius_pipeline_converter(*this, op_params).convert(*root_pipeline)`.
+1. `schedule_pipelines()` — walk the meta-pipeline tree and schedule pipelines in dependency order
+2. `compute_repository_wiring()` — emit sink→consumer wiring descriptors via tree-parent lookup; `resolve_port_id()` / `resolve_barrier()` pick each edge's port and barrier semantics
+3. `setup_pipeline_parents()` — derive parent pipeline edges from the wiring descriptors
+4. `finalize_pipeline_structure()` — populate `dependencies`, build-side-first for joins (see [Pipeline Finalization](#pipeline-finalization))
+5. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
+6. `configure_partition_min_partitions()` — apply the multi-GPU partition floor
+7. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
 
-Each split introduces new operators and **data repositories between pipelines**. Repositories are never placed in the middle of a pipeline — they always connect the sink of one pipeline to the source of the next.
+`sirius_engine::initialize_internal()` is a thin orchestrator calling `sirius_pipeline_converter(build_ctx, op_params).convert(*root_pipeline)` and materializing the wiring descriptors into runtime repositories and ports.
+
+The plan-time wraps introduce new operators and **data repositories between pipelines**. Repositories are never placed in the middle of a pipeline — they always connect the sink of one pipeline to the source of the next.
 
 In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` (source), C is `operators.back()` (sink), and B is intermediate. After finalization, each operator appears **exactly once** in its pipeline's `operators` list. Solid edges denote data repositories connecting pipelines, labeled with the barrier type (e.g., `FULL`, `PARTIAL`, `PIPELINE`). Dashed edges indicate internal pushes within an operator's `sink()` method.
 
-### TABLE_SCAN Splitting
+### TABLE_SCAN Rewrite
 
-TABLE_SCAN splits along two paths depending on the table function:
+During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `io::gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) dispatches on the bound table function name:
 
-**Parquet (`parquet_scan` / `read_parquet`, including `s3://` paths):** TABLE_SCAN is replaced with `GPU_PARQUET_SCAN` at `operators[0]` of the same pipeline — no separate scan pipeline is created. The DuckDB bind data is captured into a `parquet_scan_info` (a concrete `scan_info` subclass) and parked on the operator. During `prepare_for_query`, `sirius_scan_manager` reads the info, builds a `split_provider` via `scan_info::make_provider()` (parquet or cached), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+**Parquet (`parquet_scan` / `read_parquet` / `sirius_read_parquet`, including `s3://` paths):** `build_parquet_table_info()` captures the DuckDB bind data (resolved file paths, hive-partition indices, returned/column/projection ids, table filters) into a `parquet_ingestible_table_info`, builds a parquet ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
 
-**DuckDB-native (`seq_scan` against an attached `.duckdb` file):** TABLE_SCAN is replaced with `GPU_DUCKDB_NATIVE_SCAN` at `operators[0]` when the bound table entry is a native DuckDB format table. A `duckdb_native_scan_info` is parked on the operator and consumed by a `duckdb_native_split_provider` during `prepare_for_query`.
+**DuckDB-native (`seq_scan` against an attached `.duckdb` file):** `build_duckdb_native_table_info()` resolves the `DuckTableEntry`, fills a `duckdb_native_ingestible_table_info` (storage handle, client context, qualified table identity for the pin cache, projected columns/types, table filters), builds a duckdb-native ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
 
-**DuckDB-managed (`seq_scan`, `iceberg_scan`):** A separate scan pipeline is created, and the original TABLE_SCAN is kept as the first operator of the main pipeline:
+Any other scan function falls back to CPU: `create_plan(LogicalGet&)` declines it before plan generation reaches the wrap.
 
-```mermaid
-graph LR
-    SP["Scan Pipeline<br/>[DUCKDB_SCAN]"] -->|"PIPELINE, 'scan'"| MP["Main Pipeline<br/>[TABLE_SCAN, filter, ..., sink]"]
-```
-
-DUCKDB_SCAN (or ICEBERG_SCAN) is the sole operator in the scan pipeline. TABLE_SCAN stays at `operators[0]` of the main pipeline. The repository uses `PIPELINE` barrier on the `"scan"` port.
+During `prepare_for_query`, `sirius_scan_manager` takes the ingestible off each `GPU_SCAN` operator, peeks its file paths for a pinned-cache match (substituting a cached ingestible on a hit), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
 
 ### HASH_JOIN Probe Side
 
@@ -276,6 +268,14 @@ graph LR
 - PARTITION → CONCAT uses `PARTIAL` barrier (downstream is CONCAT — line 1014)
 - Build-side CONCAT pushes to the HASH_JOIN's `"build"` port with `FULL` barrier (default)
 - The probe and build PARTITION operators are linked as siblings for partition count coordination
+
+For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and
+its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and
+channel publication before downstream task creation follows that join into its **immediate** probe
+producer. This edge ordering does not gate a base scan reached transitively through an intervening
+join; such a scan samples the channel opportunistically under normal scheduler order. See
+[Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
+[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ### ORDER_BY → 3-Phase Sort
 
@@ -370,7 +370,7 @@ graph LR
 Dashed edges indicate internal pushes from `LEFT_DELIM_JOIN.sink()` to `column_data_scan` and `distinct`.
 
 - `column_data_scan` caches the input data so the internal HASH_JOIN's probe side can scan it
-- The internal HASH_JOIN is built into the probe pipeline via `join->build_pipelines()` with `build_rhs=true`, so its build side (the correlated subquery) gets a normal child meta-pipeline with standard HASH_JOIN splitting
+- The internal HASH_JOIN is built into the probe pipeline via `join->build_pipelines()`, so its build side (the correlated subquery) gets a normal child meta-pipeline with standard HASH_JOIN handling
 - `build_join_pipelines` adds the internal HASH_JOIN as an operator in the probe pipeline, with `column_data_scan` as its source: `[column_data_scan, HASH_JOIN, ..., outer_sink]`
 
 #### Key Differences
@@ -380,8 +380,8 @@ Dashed edges indicate internal pushes from `LEFT_DELIM_JOIN.sink()` to `column_d
 | Side eliminated | RHS | LHS |
 | Internal join child replaced | RHS → `dummy_scan` | LHS → `column_data_scan` |
 | Pipeline breaker | Yes (if intermediate ops exist) | Never |
-| Build-side data path | `partition_join` → CONCAT → HASH_JOIN "build" port | Standard HASH_JOIN build splitting (correlated subquery) |
-| `build_join_pipelines` call | `build_rhs=false` (build data via partition_join/concat) | `build_rhs=true` (build via child meta-pipeline) |
+| Build-side data path | `partition_join` → CONCAT → HASH_JOIN "build" port | Standard HASH_JOIN build handling (correlated subquery) |
+| Inner-join build subtree | Synthetic scaffolding (CONCAT_build → PARTITION_build → DUMMY_SCAN); `partition_join` runs inline in `sink()` | Real correlated-subquery subtree under CONCAT_build |
 | Cached data scan | N/A | `column_data_scan` feeds probe side |
 
 ## Part 4: Port Wiring

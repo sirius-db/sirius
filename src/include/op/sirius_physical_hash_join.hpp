@@ -28,12 +28,21 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
+#include "op/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter_replica_space.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
 
+#include <cudf/types.hpp>
+
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <optional>
+#include <string_view>
+#include <vector>
 
 namespace sirius {
 
@@ -43,6 +52,8 @@ class sirius_meta_pipeline;
 }  // namespace pipeline
 
 namespace op {
+
+class sirius_dynamic_filter_set;
 
 // STANDARD uses cudf APIs where the build and probe is a single operation.
 // BUILD_PROBE builds the hash table in one step and then probes it in a separate step, which allows
@@ -72,7 +83,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::vector<sirius::logical_type> delim_types,
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
-    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+    uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    dynamic_filter_publish_plan dynamic_filter_plan = {});
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -111,10 +123,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
+  //! Join Keys statistics (optional)
+  duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
-                                   sirius_physical_operator& op,
-                                   bool build_rhs = true);
+                                   sirius_physical_operator& op);
 
   /**
    * @brief Returns true if the given join conditions can be handled by this operator.
@@ -125,6 +139,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * conditional table columns.
    */
   static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions);
+
+  [[nodiscard]] bool is_right_family() const
+  {
+    return join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI ||
+           join_type == duckdb::JoinType::RIGHT_ANTI;
+  }
+
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
@@ -156,9 +177,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  //! Join Keys statistics (optional)
-  duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
-
  protected:
   // double get_progress(duckdb::ClientContext &context, duckdb::GlobalSourceState &gstate) const
   // override;
@@ -182,6 +200,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
   std::unique_ptr<cudf::filtered_join>
     _filtered_table;  // reusable build-on-right semi-join object for MARK joins in BUILD_PROBE mode
+  bool _build_has_null = false;  // whether the build/right side has a NULL in any join key column;
+                                 // needed for MARK three-valued logic in BUILD_PROBE mode
   std::optional<::cucascade::read_only_data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>
@@ -206,11 +226,76 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  protected:
   std::vector<key_cast_info> key_casts;
 
+  //===----------------------------------------------------------------------===//
+  // Dynamic Filters
+  //===----------------------------------------------------------------------===//
+  /// @brief Claim and perform this join's one dynamic-filter publication attempt.
+  ///
+  /// The only publishing caller is @ref push_data_batch_partitioned: it publishes as soon as the
+  /// single, concat-folded build batch reaches the build port, before any probe batch is required.
+  ///
+  /// The caller that changes @c OPEN to @c PUBLISHING owns construction, device replication,
+  /// and channel fan-out. GPU work runs without holding @ref op_state_mutex. A successful attempt
+  /// ends in @c FINISHED even when selectivity gates or drained targets cause it to emit no
+  /// filters. @ref on_finalize_operator never publishes; it only changes an unclaimed @c OPEN
+  /// window to @c CLOSED before releasing BUILD_PROBE state.
+  ///
+  /// @param build_view The build side to reduce / build membership over.
+  /// @param stream     Durable build-memory-space stream used for filter construction.
+  void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
+
+  enum class dynamic_filter_publication_state : std::uint8_t {
+    OPEN,        ///< The publication hook has not claimed the build table.
+    PUBLISHING,  ///< The claiming caller owns construction, replication, and fan-out.
+    FINISHED,    ///< The one publication attempt completed successfully (possibly emitting none).
+    FAILED,      ///< The claimed attempt threw; the uncertain state must not be retried.
+    CLOSED       ///< Finalization closed the window before the hook claimed it.
+  };
+
+  /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
+  dynamic_filter_publish_plan const _dynamic_filter_plan;
+  /// Exactly-once arbitration between the publication hook and finalization.
+  std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
+    dynamic_filter_publication_state::OPEN};
+  //===----------------------------------------------------------------------===//
+
  public:
+  /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
+  ///
+  /// For the @c build port of a wired @c BUILD_PROBE join, the single concat-folded batch is the
+  /// publication point. Its read-only accessor is acquired BEFORE the batch is routed: once
+  /// deposited into a repository the batch becomes a downgrade candidate, and holding the shared
+  /// lock across the deposit pins its GPU representation until publication completes. A stream
+  /// borrowed from the build memory space then waits on the batch writer event and builds and
+  /// replicates filters from the build keys without requiring a probe batch or a built hash table.
+  ///
+  /// Other ports and join modes only route. This synchronous hook completes before this join's
+  /// immediate probe producer is scheduled. A scan target reached through an intervening join is
+  /// not gated by that edge.
+  void push_data_batch_partitioned(std::string_view port_id,
+                                   std::shared_ptr<::cucascade::data_batch> batch,
+                                   std::size_t partition_idx) override;
+
+ public:
+  //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN (set in its
+  //! constructor). The delim join owns its execution: `is_sink()` returns false and
+  //! `build_join_pipelines` skips build-side externalization.
+  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
+  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
+
   // Sink Interface
-  bool is_sink() const override { return true; }
+  //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule
+  //! applies (sink iff parent is PARTITION or RIGHT_DELIM_JOIN).
+  bool is_sink() const override
+  {
+    if (_is_delim_join_inner) { return false; }
+    return sirius_physical_operator::is_sink();
+  }
 
   void on_finalize_operator() override;
+
+ protected:
+  bool _is_delim_join_inner = false;
 };
 
 }  // namespace op

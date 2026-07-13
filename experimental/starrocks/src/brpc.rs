@@ -1,11 +1,14 @@
 use std::{
     future::Future,
     net::{SocketAddr, TcpListener as StdTcpListener},
+    sync::Arc,
 };
 
 use crate::{
     compute_node_service::SiriusComputeNodeService,
-    proto::starrocks::p_internal_service_brpc::PInternalServiceRouter, prpc,
+    fragment_executor::{FragmentExecutor, StubExecutor},
+    proto::starrocks::p_internal_service_brpc::PInternalServiceRouter,
+    prpc,
 };
 use anyhow::{Context, Result};
 use tokio::{
@@ -29,9 +32,16 @@ struct BrpcServiceServer<S> {
 }
 
 impl BrpcServer {
-    /// Builds a BRPC server for Sirius compute-node RPCs over StarRocks PInternalService.
+    /// Builds a BRPC server with the placeholder stub executor (no GPU engine).
     pub fn new() -> Self {
-        let service = PInternalServiceRouter::new(SiriusComputeNodeService::new());
+        Self::with_executor(Arc::new(StubExecutor))
+    }
+
+    /// Builds a BRPC server that dispatches fragments to `executor` (the GPU-backed
+    /// `SiriusEngine`, or a stub).
+    pub fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
+        let service =
+            PInternalServiceRouter::new(SiriusComputeNodeService::with_executor(executor));
         Self {
             inner: BrpcServiceServer::with_service(service),
         }

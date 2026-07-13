@@ -71,17 +71,19 @@ curl_share::curl_share(bool share_connections)
 }
 
 void curl_share::lock_cb(CURL* /*handle*/,
-                         curl_lock_data /*data*/,
+                         curl_lock_data data,
                          curl_lock_access /*access*/,
                          void* userp)
 {
-  // Coarse single-mutex serialization across all shared data classes.
-  static_cast<curl_share*>(userp)->_mtx.lock();
+  // Per-class lock (selected by @p data): libcurl holds one class's lock while
+  // acquiring another's (cpool -> dnscache_prune), so one mutex for all classes
+  // would self-deadlock on that nesting.
+  static_cast<curl_share*>(userp)->_mtx[static_cast<std::size_t>(data)].lock();
 }
 
-void curl_share::unlock_cb(CURL* /*handle*/, curl_lock_data /*data*/, void* userp)
+void curl_share::unlock_cb(CURL* /*handle*/, curl_lock_data data, void* userp)
 {
-  static_cast<curl_share*>(userp)->_mtx.unlock();
+  static_cast<curl_share*>(userp)->_mtx[static_cast<std::size_t>(data)].unlock();
 }
 
 global_curl_context::global_init_guard::global_init_guard() { global_init_once(); }

@@ -17,6 +17,8 @@ DUCKDB_DIR ?= duckdb
 TEST_BUILD_TARGET ?= sirius_unittest
 MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 
+BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
+
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
 	legacy-release \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
@@ -41,73 +43,46 @@ build/%/build.ninja: $(CMAKE_INPUTS) | $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --preset $*
 
 release: build/release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(BUILD_TARGETS)
 
 debug: build/debug/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(BUILD_TARGETS)
 
 reldebug: relwithdebinfo
 
 debug-release: relwithdebinfo
 
 relwithdebinfo: build/relwithdebinfo/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(BUILD_TARGETS)
 
 legacy-release: build/legacy-release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset legacy-release --target $(MAIN_BUILD_TARGETS)
 
 clang-release: build/clang-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release --target $(BUILD_TARGETS)
 
 clang-debug: build/clang-debug/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug --target $(BUILD_TARGETS)
 
 clang-relwithdebinfo: build/clang-relwithdebinfo/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo --target $(BUILD_TARGETS)
 
 # AddressSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
 # llvm-symbolizer is auto-detected on PATH) with:
 #   ASAN_OPTIONS="protect_shadow_gap=0:detect_leaks=0:halt_on_error=0:abort_on_error=1" \
 #     ./build/clang-asan/extension/sirius/test/cpp/sirius_unittest
 clang-asan: build/clang-asan/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-asan --target $(BUILD_TARGETS)
 
 # ThreadSanitizer build (RelWithDebInfo + clang). Run inside `pixi shell` (so
 # llvm-symbolizer is auto-detected on PATH) with:
 #   TSAN_OPTIONS="suppressions=$$PWD/tsan.supp:ignore_noninstrumented_modules=1:halt_on_error=0:history_size=7:detect_deadlocks=0" \
 #     ./build/clang-tsan/extension/sirius/test/cpp/sirius_unittest
 clang-tsan: build/clang-tsan/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(BUILD_TARGETS)
 
 ci-release: build/ci-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(MAIN_BUILD_TARGETS)
-ifneq ($(TEST_BUILD_TARGET),)
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(TEST_BUILD_TARGET)
-endif
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(BUILD_TARGETS)
 
 configure_ci:
 	@echo "configure_ci step is skipped for this extension build..."
@@ -159,10 +134,12 @@ list-presets: $(PRESETS_LINK)
 # environment yourself first — including SIRIUS_TEST_S3_ENDPOINT — (regional S3
 # endpoint, real bucket, and assume-role TEMPORARY credentials including the
 # session token); keep usage bounded.
-# `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint.
+# `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint
+#                     ([s3][aws] minus [bench] — the aws perf benchmark is
+#                     selected by `SIRIUS_BENCH_BACKEND=aws-s3 make s3-bench`).
 # `make s3-test-aws-sigv4`
 #                     subset using Sirius's built-in SigV4 presigner only
-#                     ([s3][aws] minus [broker]).
+#                     ([s3][aws] minus [broker]/[bench]).
 # `make s3-test-aws-broker`
 #                     subset driven by an external presign broker
 #                     ([s3][aws][broker]).
@@ -206,7 +183,7 @@ s3-test-aws:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]"
+	$(S3_TEST_BIN) "[s3][aws]~[bench]"
 
 s3-test-aws-sigv4:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -215,7 +192,7 @@ s3-test-aws-sigv4:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]~[broker]"
+	$(S3_TEST_BIN) "[s3][aws]~[broker]~[bench]"
 
 s3-test-aws-broker:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -228,18 +205,20 @@ s3-test-aws-broker:
 
 # -----------------------------------------------------------------------------
 # S3 perf benchmarks. All S3 benchmarks share the hidden [.][s3][bench] tag
-# (real-AWS ones also [aws][live]); selected here by [s3][bench]~[aws]. The tag
+# (real-AWS ones also [aws][live]); the selector follows SIRIUS_BENCH_BACKEND:
+# minio (default) runs [s3][bench]~[aws], aws-s3 runs [s3][bench][aws]. The tag
 # carries [.] (out of the default `make test`) and lacks [integration] (so the
-# [s3] integration gate `make s3-test` never pulls it in). Default backend = minio
-# (read_bench_env() defaults to it — no extra env source needed): the harness
-# auto-manages MinIO (SIRIUS_TEST_S3_AUTO=1), generates/uploads the SF10 lineitem
-# fixture (SIRIUS_TEST_S3_LARGE=1), and SIRIUS_TEST_S3_STRICT=1 makes a MinIO
-# bring-up failure fail the benchmark loud instead of skipping to a false green.
-# The async JSON baseline (Family 1) sets s3_perf_instrumentation=true and emits
-# build/release/extension/sirius/test/cpp/log/perf_<ts>.json for tracking; the
-# scripted async-vs-blocking microbench (Family 2) prints console numbers.
-# Set SIRIUS_BENCH_BACKEND=aws-s3 (and the SIRIUS_BENCH_AWS_S3_* vars) to hit AWS
-# instead of MinIO; AUTO/STRICT stay off in that case.
+# [s3] integration gate `make s3-test` never pulls it in). Default backend = minio:
+# the harness auto-manages MinIO (SIRIUS_TEST_S3_AUTO=1), generates/uploads the
+# SF10 lineitem fixture (SIRIUS_TEST_S3_LARGE=1), and SIRIUS_TEST_S3_STRICT=1
+# makes a MinIO bring-up failure fail the benchmark loud instead of skipping to a
+# false green. The JSON baseline emits
+# build/release/extension/sirius/test/cpp/log/s3_rest_perf_<ts>.json and appends
+# per-run history under doc/s3support/perf-history-<backend>.jsonl.
+# Set SIRIUS_BENCH_BACKEND=aws-s3 to hit real AWS instead of MinIO (manual only —
+# export the SIRIUS_TEST_S3_* env yourself: regional endpoint, bucket, assume-role
+# TEMPORARY credentials incl. the session token; SIRIUS_BENCH_S3_KEY overrides the
+# object key); AUTO/STRICT stay off in that case and MinIO is never started.
 
 s3-bench:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -249,6 +228,10 @@ s3-bench:
 	@set -e; \
 	if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
 	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
+	  selector="[s3][bench]~[aws]"; \
+	else \
+	  selector="[s3][bench][aws]"; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
-	$(S3_TEST_BIN) "[s3][bench]~[aws]"
+	export HOSTNAME="$${HOSTNAME:-$$(hostname)}"; \
+	$(S3_TEST_BIN) "$$selector"

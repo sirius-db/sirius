@@ -29,8 +29,8 @@ namespace sirius::pipeline {
  * @brief A single observation from one completed task.
  *
  * For GPU pipeline tasks, estimated_bytes is the input data size.
- * For scan tasks, estimated_bytes is the pre-history reservation estimate
- * (e.g. approximate_batch_size or reserved_compressed_bytes).
+ * For scan tasks, estimated_bytes is the decoded projected-column estimate
+ * before row filtering.
  */
 struct task_memory_record {
   std::size_t estimated_bytes;              ///< Pre-history estimation basis

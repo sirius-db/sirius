@@ -27,8 +27,8 @@
 
 namespace sirius::scan_manager {
 
-split_provider::split_provider(op::scan::gpu_ingestible& ingestible, io::sirius_ioctx& io_ctx)
-  : _ingestible(&ingestible), _io_ctx(io_ctx.shared_from_this())
+split_provider::split_provider(op::scan::gpu_ingestible& ingestible, io::ioctx_resolver resolve)
+  : _ingestible(&ingestible), _resolve(std::move(resolve))
 {
 }
 
@@ -36,7 +36,7 @@ bool split_provider::has_more_splits() const { return !_ingestible->has_processe
 
 std::function<std::unique_ptr<op::scan::scan_info>()> split_provider::next_split_provider()
 {
-  return _ingestible->next_split_provider(_io_ctx);
+  return _ingestible->next_split_provider(_resolve);
 }
 
 template <typename Scheduler>
@@ -50,7 +50,7 @@ void split_provider::run(Scheduler& scheduler, const push_callback_t& on_split)
   while (has_more_splits()) {
     auto work = next_split_provider();
     if (!work) { continue; }
-    scheduler.enqueue([this, on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
+    scheduler.enqueue([on_split, work = std::move(work), token = ctrl.acquire()]() mutable {
       try {
         auto split = work();
         on_split(std::move(split));

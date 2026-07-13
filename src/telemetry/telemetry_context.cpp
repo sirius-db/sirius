@@ -34,18 +34,25 @@
 namespace sirius::telemetry {
 
 std::shared_ptr<const telemetry_context> telemetry_context::create(
-  const sirius::telemetry_config& config)
+  const sirius::telemetry_config& config,
+  const cucascade::memory::memory_reservation_manager* manager,
+  const std::vector<int>& gpu_device_ids)
 {
-  return std::shared_ptr<telemetry_context>(new telemetry_context(config));
+  return std::shared_ptr<telemetry_context>(new telemetry_context(config, manager, gpu_device_ids));
 }
 
-telemetry_context::telemetry_context(const sirius::telemetry_config& config)
+telemetry_context::telemetry_context(const sirius::telemetry_config& config,
+                                     const cucascade::memory::memory_reservation_manager* manager,
+                                     const std::vector<int>& gpu_device_ids)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
+    query_group_uuid_(uuid::now_v7()),
+    shared_group_uuid_(uuid::now_v7()),
     context_(
       quent::create_context(config.enable_quent ? "ndjson" : "noop", config.output_directory)),
     engine_observer_(quent::engine::create_observer(*context_)),
-    worker_observer_(quent::worker::create_observer(*context_))
+    worker_observer_(quent::worker::create_observer(*context_)),
+    query_group_observer_(quent::query_group::create_observer(*context_))
 {
   engine_observer_->init(engine_uuid_,
                          quent::engine::Init{
@@ -64,11 +71,92 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config)
                            .instance_name    = fmt::format("worker-{}", getpid()),
                          });
 
-  SIRIUS_LOG_INFO("Telemetry context initialized (engine={})", config.engine_name);
+  memory_context_ = std::make_shared<memory_context>(engine_uuid_, *context_, manager);
+
+  // One session-scoped query group under this engine; every query in this context is reported
+  // under it, so a whole run shows up as a single group rather than one group per query.
+  query_group_observer_->declaration(
+    query_group_uuid_,
+    quent::query_group::Declaration{
+      .instance_name = fmt::format("{}-session-{}", config.engine_name, getpid()),
+      .engine_id     = engine_uuid_,
+    });
+
+  // Per-GPU device groups plus per-thread-type buckets underneath, so the
+  // viewer renders threads as an engine -> gpu-N -> thread-type tree instead
+  // of a flat sibling list. Threads with no single GPU go under `shared`.
+  auto gpu_device_observer   = quent::gpu_device::create_observer(*context_);
+  auto thread_group_observer = quent::thread_group::create_observer(*context_);
+
+  thread_group_observer->declaration(shared_group_uuid_,
+                                     quent::thread_group::Declaration{
+                                       .instance_name   = "shared",
+                                       .parent_group_id = engine_uuid_,
+                                     });
+
+  for (const int device_id : gpu_device_ids) {
+    const gpu_device_group_ids ids{
+      .device           = uuid::now_v7(),
+      .executor_threads = uuid::now_v7(),
+      .manager_threads  = uuid::now_v7(),
+    };
+    gpu_device_observer->declaration(ids.device,
+                                     quent::gpu_device::Declaration{
+                                       .instance_name   = fmt::format("gpu-{}", device_id),
+                                       .parent_group_id = engine_uuid_,
+                                       .ordinal         = static_cast<uint32_t>(device_id),
+                                     });
+    thread_group_observer->declaration(ids.executor_threads,
+                                       quent::thread_group::Declaration{
+                                         .instance_name   = "executor_thread",
+                                         .parent_group_id = ids.device,
+                                       });
+    thread_group_observer->declaration(ids.manager_threads,
+                                       quent::thread_group::Declaration{
+                                         .instance_name   = "task_manager_loop_thread",
+                                         .parent_group_id = ids.device,
+                                       });
+    gpu_group_ids_.emplace(device_id, ids);
+  }
+
+  SIRIUS_LOG_INFO("Telemetry context initialized (engine={}, {} GPU device group(s))",
+                  config.engine_name,
+                  gpu_group_ids_.size());
+}
+
+const uuid::UUID& telemetry_context::gpu_device_group_id(int device_id) const
+{
+  if (const auto it = gpu_group_ids_.find(device_id); it != gpu_group_ids_.end()) {
+    return it->second.device;
+  }
+  SIRIUS_LOG_WARN("Telemetry: no device group declared for GPU {}; falling back to engine group",
+                  device_id);
+  return engine_uuid_;
+}
+
+const uuid::UUID& telemetry_context::executor_thread_group_id(int device_id) const
+{
+  if (const auto it = gpu_group_ids_.find(device_id); it != gpu_group_ids_.end()) {
+    return it->second.executor_threads;
+  }
+  SIRIUS_LOG_WARN("Telemetry: no device group declared for GPU {}; falling back to engine group",
+                  device_id);
+  return engine_uuid_;
+}
+
+const uuid::UUID& telemetry_context::manager_thread_group_id(int device_id) const
+{
+  if (const auto it = gpu_group_ids_.find(device_id); it != gpu_group_ids_.end()) {
+    return it->second.manager_threads;
+  }
+  SIRIUS_LOG_WARN("Telemetry: no device group declared for GPU {}; falling back to engine group",
+                  device_id);
+  return engine_uuid_;
 }
 
 telemetry_context::~telemetry_context()
 {
+  memory_context_.reset();
   worker_observer_->exit(worker_uuid_);
   engine_observer_->exit(engine_uuid_);
 }

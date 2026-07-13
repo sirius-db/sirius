@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_translator_internal.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <op/scan/hive_partition.hpp>  // For partition_inject_fn_t
 
 // cucascade
@@ -40,27 +40,6 @@
 #include <vector>
 
 namespace sirius {
-
-/**
- * @brief Function called after a parquet batch is decompressed to a GPU cuDF table.
- *
- * Used by the iceberg scan path to apply V2 positional and equality deletes on the
- * GPU without adding any pipeline operator. The hook receives the freshly produced
- * cudf::table, the data-file path that produced this batch, the 0-based absolute
- * row offset of the first row in the batch within the data file, and the CUDA stream.
- * It must return a (possibly filtered) replacement table.
- *
- * - data_file_path  : identifies which Iceberg data file this batch came from
- *                     (used to look up matching positional-delete records).
- * - first_row_offset: absolute row index of the first row in this batch within
- *                     the data file.  Needed to translate Iceberg V2 positional
- *                     delete `pos` values into batch-relative indices.
- */
-using post_convert_fn_t =
-  std::function<std::unique_ptr<cudf::table>(std::unique_ptr<cudf::table>,
-                                             std::string const& data_file_path,
-                                             int64_t first_row_offset,
-                                             rmm::cuda_stream_view)>;
 
 // partition_inject_fn_t is the legacy typedef declared in <op/scan/hive_partition.hpp>
 // (sirius:: namespace). It carries file_path so the schema-reconciliation closure built by
@@ -302,41 +281,11 @@ class host_parquet_representation : public cucascade::idata_representation {
     return _post_filter_projection_ids;
   }
 
-  // -------------------------------------------------------------------------
-  // Post-convert hook (used by the iceberg scan path for delete application)
-  // -------------------------------------------------------------------------
-
   /**
-   * @brief Install a post-convert hook.
+   * @brief Set the path of the data file this batch was produced from.
    *
-   * Copied from parquet_scan_task_global_state::get_post_convert_fn() in
-   * parquet_scan_task::compute_task() so that the host->GPU converter can
-   * invoke it immediately after cudf::io::read_parquet returns.
-   */
-  void set_post_convert_fn(post_convert_fn_t fn) { _post_convert_fn = std::move(fn); }
-
-  [[nodiscard]] bool has_post_convert_fn() const { return _post_convert_fn != nullptr; }
-
-  /**
-   * @brief Apply the post-convert hook to @p tbl and return the filtered table.
-   *
-   * Computes the absolute first-row offset from the parquet reader metadata and
-   * forwards it together with the data-file path to the hook.  Only call after
-   * checking has_post_convert_fn().
-   */
-  [[nodiscard]] std::unique_ptr<cudf::table> apply_post_convert(std::unique_ptr<cudf::table> tbl,
-                                                                rmm::cuda_stream_view stream)
-  {
-    return _post_convert_fn(std::move(tbl), _data_file_path, compute_first_row_offset(), stream);
-  }
-
-  [[nodiscard]] post_convert_fn_t const& get_post_convert_fn() const { return _post_convert_fn; }
-
-  /**
-   * @brief Set the path of the Iceberg data file this batch was produced from.
-   *
-   * Called by parquet_scan_task::compute_task() so the converter can forward
-   * the path to the post-convert hook.
+   * Consumed by the hive partition injection hook to look up the file's
+   * partition values.
    */
   void set_data_file_path(std::string path) { _data_file_path = std::move(path); }
 
@@ -433,8 +382,6 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::shared_ptr<cudf::io::datasource> _fallback_datasource;
   std::shared_ptr<std::unordered_map<int, translated_expression>> _filter_expression_by_device;
   std::vector<std::size_t> _post_filter_projection_ids;
-  /// Optional post-convert hook (null for plain parquet, set for iceberg V2 deletes).
-  post_convert_fn_t _post_convert_fn;
   /// Optional partition column injection hook (null unless hive-partitioned).
   partition_inject_fn_t _partition_inject_fn;
   /// Path of the data file this batch was read from.
