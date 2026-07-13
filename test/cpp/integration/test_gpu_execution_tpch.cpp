@@ -5153,12 +5153,14 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 //===----------------------------------------------------------------------===//
-// cpu_source_task tests — STATISTICS_PROPAGATION / metadata-only queries
+// Metadata-only aggregates + CPU-source fallback
 //
-// When STATISTICS_PROPAGATION is enabled, DuckDB folds ungrouped count(*),
-// MIN, and MAX into constant expressions (EXPRESSION_GET -> DUMMY_SCAN),
-// which the Sirius planner converts to COLUMN_DATA_SCAN -> cpu_source_task.
-// These tests ensure that path works and doesn't regress.
+// STATISTICS_PROPAGATION is disabled on both interception paths, so ungrouped
+// count(*)/min/max stay GPU aggregates — the aggregate tests pin that (rebind +
+// execute, zero fallback). Plans that genuinely need a CPU-materialized source
+// (bare VALUES, no-table SELECT, provably-empty scans) are rejected at plan
+// generation and must complete via the transparent CPU fallback — the fallback
+// tests at the end of this section pin that.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -5229,6 +5231,54 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "[integration][gpu_execution][parquet][cpu_source]")
 {
   compare_gpu_vs_cpu("select count(*), min(l_orderkey), max(l_orderkey) from lineitem;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - bare VALUES falls back to CPU",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  con->Query("SET gpu_execution = true;");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("VALUES (1), (2);");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  // Rejected at plan generation -> clean CPU fallback, not an assert or a hang.
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+  REQUIRE(result->RowCount() == 2);
+  CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 1);
+  CHECK(result->GetValue(0, 1).GetValue<int32_t>() == 2);
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - no-table SELECT falls back to CPU",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  con->Query("SET gpu_execution = true;");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT 40 + 2;");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  // DUMMY_SCAN source rejected at plan generation -> transparent fallback.
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - provably-empty scan falls back to CPU",
+                 "[integration][gpu_execution][cpu_source]")
+{
+  con->Query("SET gpu_execution = true;");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT n_nationkey FROM nation WHERE 1 = 0;");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  // EMPTY_RESULT source rejected at plan generation -> transparent fallback.
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+  CHECK(result->RowCount() == 0);
 }
 
 //===----------------------------------------------------------------------===//

@@ -39,7 +39,6 @@
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
-#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -275,33 +274,22 @@ void wrap_table_scan_source(
   }
 }
 
-//! Attach a leaf CPU_SOURCE as the only child of a COLUMN_DATA_SCAN, EMPTY_RESULT, or
-//! DUMMY_SCAN node. A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk
-//! scan (filled at runtime) — left as-is.
-void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
+//! Reject sources that need CPU-materialized data: a VALUES / expression-list
+//! COLUMN_DATA_SCAN (non-null `collection`), a real DUMMY_SCAN, or an EMPTY_RESULT.
+//! Nothing dispatches tasks for a CPU_SOURCE leaf, so such plans can never finish.
+//! Throwing during plan generation routes the query to the DuckDB CPU fallback.
+//! A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan
+//! (filled at runtime) — supported.
+void reject_cpu_source(const sirius::op::sirius_physical_operator& source_op)
 {
   if (!source_op.children.empty()) { return; }
-
-  duckdb::unique_ptr<sirius::op::sirius_physical_cpu_source> leaf;
-  switch (source_op.type) {
-    case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN: {
-      auto& col_scan = source_op.Cast<sirius::op::sirius_physical_column_data_scan>();
-      if (!col_scan.collection) { return; }  // LEFT_DELIM_JOIN cached chunk scan — skip
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, std::move(col_scan.collection));
-      break;
-    }
-    case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN:
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, /*produce_single_row=*/true);
-      break;
-    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, /*produce_single_row=*/false);
-      break;
-    default: return;
+  if (source_op.type == sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN &&
+      !source_op.Cast<sirius::op::sirius_physical_column_data_scan>().collection) {
+    return;
   }
-  source_op.children.push_back(std::move(leaf));
+  throw duckdb::NotImplementedException(
+    sirius::op::SiriusPhysicalOperatorToString(source_op.type) +
+    " source requires CPU-materialized data, not supported on the GPU path");
 }
 
 //! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
@@ -574,12 +562,12 @@ void insert_gpu_pipeline_operators_recursive(
       wrap_table_scan_source(slot, op_params, context);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
-    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: wrap_cpu_source(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: reject_cpu_source(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
-      // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data flow, so a
-      // CPU_SOURCE leaf would only materialize a phantom pipeline; real DUMMY_SCANs keep it.
+      // The RIGHT_DELIM_JOIN build placeholder carries no runtime data (the delim sink
+      // runs partition_join inline) — keep it. Real DUMMY_SCANs need CPU data.
       auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
-      if (!dummy.is_delim_join_placeholder()) { wrap_cpu_source(*slot); }
+      if (!dummy.is_delim_join_placeholder()) { reject_cpu_source(*slot); }
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:

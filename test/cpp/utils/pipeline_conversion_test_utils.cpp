@@ -170,6 +170,15 @@ std::string convert_query_to_dump(duckdb::Connection& con, const std::string& qu
   return dump;
 }
 
+std::string convert_query_to_raw_schedule(duckdb::Connection& con, const std::string& query)
+{
+  std::string dump;
+  with_conversion_result(con, query, [&](pipeline::pipeline_conversion_result& result) {
+    dump = pipeline::dump_pipeline_schedule_raw(result);
+  });
+  return dump;
+}
+
 std::filesystem::path tpch_queries_dir()
 {
 #ifdef SIRIUS_PROJECT_ROOT
