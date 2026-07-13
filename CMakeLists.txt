@@ -608,6 +608,7 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_pin_table_duckdb_native_cache.cpp
