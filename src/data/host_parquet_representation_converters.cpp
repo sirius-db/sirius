@@ -74,7 +74,8 @@ std::unique_ptr<cucascade::idata_representation>
 convert_host_parquet_to_gpu_with_prefetched_data_source(
   cucascade::idata_representation& source,
   cucascade::memory::memory_space const* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   // STRUCTURAL GAP (io rebase): sirius::op::scan::prefetched_data_source — the
   // in-memory cudf::io::datasource adapter that wrapped a cache_ranges and fed
@@ -98,7 +99,8 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
 std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_parquet(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view /* stream */)
+  rmm::cuda_stream_view /* stream */,
+  [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   auto& host_src       = source.cast<host_parquet_representation>();
   auto const data_size = host_src.get_size_in_bytes();
@@ -189,7 +191,8 @@ void register_parquet_converters(cucascade::representation_converter_registry& r
       .register_converter<cached_host_data_representation, cucascade::gpu_table_representation>(
         [&registry](cucascade::idata_representation& source,
                     const cucascade::memory::memory_space* target_memory_space,
-                    rmm::cuda_stream_view stream) {
+                    rmm::cuda_stream_view stream,
+                    [[maybe_unused]] cucascade::memory::reservation* reservation) {
           auto r = source.cast<cached_host_data_representation>().get_representation();
           return registry.convert<cucascade::gpu_table_representation>(
             *r, target_memory_space, stream);
@@ -202,7 +205,8 @@ void register_parquet_converters(cucascade::representation_converter_registry& r
       .register_converter<cached_host_parquet_representation, cucascade::gpu_table_representation>(
         [&registry](cucascade::idata_representation& source,
                     const cucascade::memory::memory_space* target_memory_space,
-                    rmm::cuda_stream_view stream) {
+                    rmm::cuda_stream_view stream,
+                    [[maybe_unused]] cucascade::memory::reservation* reservation) {
           auto r = source.cast<cached_host_parquet_representation>().get_representation();
           return registry.convert<cucascade::gpu_table_representation>(
             *r, target_memory_space, stream);
