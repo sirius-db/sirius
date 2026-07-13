@@ -31,14 +31,13 @@
 
 #include <cuda_runtime.h>
 
-#include <spdlog/fmt/fmt.h>
-
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <exception>
+#include <format>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -637,7 +636,7 @@ std::string prefetching_cache::summary() const
   uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
   uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
 
-  return fmt::format(
+  return std::format(
     "prefetching_cache: "
     "global[reads={} hits={} h2d={} miss={} evictions={}] "
     "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",

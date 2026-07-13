@@ -18,10 +18,9 @@
 
 #include "io/uri_parser.hpp"
 
-#include <fmt/format.h>
-
 #include <algorithm>
 #include <cstddef>
+#include <format>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -30,7 +29,7 @@ namespace sirius::io::rest {
 
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
   : templated_ioctx<rest_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
-      return std::make_unique<rest_reactor>(ctx, fmt::format("rest-{}", i++));
+      return std::make_unique<rest_reactor>(ctx, std::format("rest-{}", i++));
     })
 {
 }

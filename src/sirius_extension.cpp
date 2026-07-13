@@ -96,7 +96,7 @@ extern "C" int cudaProfilerStop();
 // Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
 // transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
 // macro that collides with the BLOCK_SIZE static member in
-// <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
+// <blockingconcurrentqueue.h> (used by pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
 #include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs

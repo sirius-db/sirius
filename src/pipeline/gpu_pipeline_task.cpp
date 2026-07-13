@@ -168,7 +168,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
   auto peak_bytes        = allocator ? allocator->get_peak_allocated_bytes(stream) : 0;
-  std::string extra_info = fmt::format(
+  std::string extra_info = std::format(
     "execution time: {:.2f} ms, "
     "peak allocated: {} bytes ({:.2f} MB)",
     duration.count() / 1000.0,
@@ -264,7 +264,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
     auto& op = operators[i].get();
     try {
       this->telemetry_handle().computing({
-        .instance_name       = fmt::format("{}({})", op.get_name(), op.get_operator_id()),
+        .instance_name       = std::format("{}({})", op.get_name(), op.get_operator_id()),
         .current_operator_id = static_cast<uint32_t>(
           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
         .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),

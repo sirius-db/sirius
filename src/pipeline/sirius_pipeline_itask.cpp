@@ -19,8 +19,7 @@
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
 
-#include <spdlog/fmt/fmt.h>
-
+#include <format>
 #include <memory>
 #include <utility>
 
@@ -34,7 +33,7 @@ sirius_pipeline_itask::sirius_pipeline_itask(
     _telemetry_task_handle(
       quent::task::create(global_state->get_telemetry_context().context(),
                           {
-                            .instance_name = fmt::format("task-{}", task_id),
+                            .instance_name = std::format("task-{}", task_id),
                             .pipeline_uuid = global_state->get_pipeline()
                                                ? global_state->get_pipeline()->pipeline_uuid()
                                                : uuid::new_nil(),
