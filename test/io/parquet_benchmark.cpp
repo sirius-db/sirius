@@ -21,8 +21,7 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
 #include <glob.h>
-#include <spdlog/common.h>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 #include <unistd.h>
 
 #include <algorithm>
@@ -134,7 +133,7 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  spdlog::set_level(spdlog::level::info);  // show per-read trace
+  sirius::SetGlobalLogLevel("info");  // show per-read trace
 
   std::cout << "Source : " << argv[2] << "\n"
             << "Files  : " << paths.size() << "\n";

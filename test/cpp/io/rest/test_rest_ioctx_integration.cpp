@@ -30,10 +30,10 @@
 #include <cuda_runtime.h>
 
 #include <arpa/inet.h>
+#include <config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <log/log_backend.hpp>
 #include <netinet/in.h>
-#include <spdlog/sinks/base_sink.h>
-#include <spdlog/spdlog.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -544,12 +544,20 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
   return make_direct_rest_ioctx(std::move(endpoint), direct_rest_test_config());
 }
 
-class capture_sink final : public spdlog::sinks::base_sink<std::mutex> {
+class capture_backend final : public sirius::log_backend {
  public:
   struct record {
-    spdlog::level::level_enum level;
+    sirius::log_level level;
     std::string payload;
   };
+
+  void log(sirius::log_level level, const std::source_location&, std::string_view message) override
+  {
+    std::lock_guard<std::mutex> lock(_records_mutex);
+    _records.push_back({level, std::string(message)});
+  }
+
+  bool flush() override { return true; }
 
   [[nodiscard]] std::vector<record> records() const
   {
@@ -557,47 +565,34 @@ class capture_sink final : public spdlog::sinks::base_sink<std::mutex> {
     return _records;
   }
 
- protected:
-  void sink_it_(spdlog::details::log_msg const& msg) override
-  {
-    std::lock_guard<std::mutex> lock(_records_mutex);
-    _records.push_back({msg.level, std::string(msg.payload.data(), msg.payload.size())});
-  }
-
-  void flush_() override {}
-
  private:
   mutable std::mutex _records_mutex;
   std::vector<record> _records;
 };
 
-class scoped_spdlog_capture {
+/// Swaps the global logging backend for a capturing one and restores the
+/// configured logger on scope exit.
+class scoped_log_capture {
  public:
-  scoped_spdlog_capture()
-    : _logger(spdlog::default_logger()),
-      _sink(std::make_shared<capture_sink>()),
-      _old_level(_logger->level())
+  scoped_log_capture() : _backend(std::make_shared<capture_backend>())
   {
-    _logger->sinks().push_back(_sink);
-    _logger->set_level(spdlog::level::trace);
+    sirius::InitGlobalLogger(_backend, "trace");
   }
 
-  ~scoped_spdlog_capture()
+  ~scoped_log_capture()
   {
-    auto& sinks = _logger->sinks();
-    sinks.erase(std::remove(sinks.begin(), sinks.end(), _sink), sinks.end());
-    _logger->set_level(_old_level);
+    using duckdb::Config;
+    sirius::InitGlobalLogger(
+      Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
   }
 
-  scoped_spdlog_capture(scoped_spdlog_capture const&)            = delete;
-  scoped_spdlog_capture& operator=(scoped_spdlog_capture const&) = delete;
+  scoped_log_capture(scoped_log_capture const&)            = delete;
+  scoped_log_capture& operator=(scoped_log_capture const&) = delete;
 
-  [[nodiscard]] std::vector<capture_sink::record> records() const { return _sink->records(); }
+  [[nodiscard]] std::vector<capture_backend::record> records() const { return _backend->records(); }
 
  private:
-  std::shared_ptr<spdlog::logger> _logger;
-  std::shared_ptr<capture_sink> _sink;
-  spdlog::level::level_enum _old_level;
+  std::shared_ptr<capture_backend> _backend;
 };
 
 }  // namespace
@@ -1127,13 +1122,13 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "retry-log-warning");
 
-    scoped_spdlog_capture logs;
+    scoped_log_capture logs;
     auto probe = reactor.fetch_footer_suffix("log-bucket", "warn-retry.parquet", 1024);
     REQUIRE(probe.bytes != nullptr);
 
     auto const records = logs.records();
     auto const found   = std::any_of(records.begin(), records.end(), [](auto const& r) {
-      return r.level == spdlog::level::warn &&
+      return r.level == sirius::log_level::warn &&
              r.payload.find("warn-retry.parquet") != std::string::npos;
     });
     CHECK(found);
@@ -1150,14 +1145,15 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "retry-log-clean");
 
-    scoped_spdlog_capture logs;
+    scoped_log_capture logs;
     auto probe = reactor.fetch_footer_suffix("log-bucket", "clean.parquet", 1024);
     REQUIRE(probe.bytes != nullptr);
     CHECK(reactor.head_object_size("log-bucket", "clean.parquet") == payload.size());
 
     auto const records        = logs.records();
-    auto const warning_or_bad = std::any_of(
-      records.begin(), records.end(), [](auto const& r) { return r.level >= spdlog::level::warn; });
+    auto const warning_or_bad = std::any_of(records.begin(), records.end(), [](auto const& r) {
+      return r.level >= sirius::log_level::warn;
+    });
     CHECK_FALSE(warning_or_bad);
   }
 }
