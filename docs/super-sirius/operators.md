@@ -96,6 +96,47 @@ session, task creation must be gated on in-flight work (e.g. counting via the ch
 hook and the task-completion path) so a fast producer cannot accumulate an arbitrarily large GPU
 backlog behind a nominally bounded channel.
 
+### `sirius_physical_streaming_sink` — `STREAMING_SINK`
+**File:** `src/include/op/sirius_physical_streaming_sink.hpp`
+
+Sink operator that marks the top boundary of an intermediate pipeline fragment. It registers each
+incoming `cucascade::data_batch` in a `cucascade::shared_data_repository` (making it spill-visible
+to the downgrade executor) and then pushes an `exec::exchange_batch_handle` (batch-id + size) to a
+bounded `exec::exchange_channel`. Used only when a fragment's output must be forwarded to another
+node over exchange; a leaf fragment keeps its normal `RESULT_COLLECTOR` sink.
+
+Key design invariants:
+- **Zero-copy emission**: the batch is registered in the output repository first, then only a
+  lightweight handle (batch-id + size) is pushed to the channel — no host clone, no
+  `ColumnDataCollection` materialization.
+- **CONCAT shape**: `is_source() && is_sink()` are both `true`. The operator heads its own
+  single-operator pipeline fed via an `"input"` port; the upstream pipeline pushes batches into
+  that port's repository via the base-class `sink()` → `push_data_batch()` path.
+- **Backpressure as admission control**: if the channel is full or `_pending` is non-empty,
+  `get_next_task_hint()` and `get_next_task_input_data()` return `WAITING{nullptr}` / `nullptr`
+  respectively, preventing new tasks from being created. Worker threads never block.
+- **FIFO `_pending` queue**: when `try_push` fails (channel full), the handle is appended to
+  `_pending`. Subsequent calls to `get_next_task_hint()` or `sink()` call `try_flush_pending()`
+  first, draining `_pending` in order before any new handles are attempted.
+- **Flush-then-close EOS**: `on_finalize_operator()` flushes what fits; if `_pending` is empty
+  it closes the channel immediately; otherwise it sets `_close_when_flushed` and defers the
+  close to the `try_flush_pending()` call triggered by the next consumer pop.
+- **Locking discipline**: whenever `_pending_lock` and the channel's internal mutex are both
+  needed, `_pending_lock` is always acquired first (consistent ordering prevents deadlock);
+  the base-class `lock` guards `ports` and is never held simultaneously with `_pending_lock`.
+- `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
+
+Hint table:
+
+| State | `get_next_task_hint()` |
+|---|---|
+| `_pending` non-empty or channel full | `WAITING{nullptr}` — stalled on consumer |
+| input port repo non-empty, channel has room | `READY{this}` |
+| port empty, upstream pipeline finished | `std::nullopt` — EOS |
+| port empty, upstream still running | `WAITING{upstream_op}` — propagate hint up the chain |
+
+**Consumer contract**: pop a handle from the channel, then call `output_repository->pop_data_batch_by_id(handle.batch_id)` to take ownership of the batch. The `try_flush_pending()` flush is triggered by `get_next_task_hint()` (called by the task-creation loop on every iteration), so consumer pops indirectly drive the pending drain.
+
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
 
@@ -345,6 +386,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
+| STREAMING_SINK | Pipeline | Exchange-output sink (CONCAT shape); registers batches in `shared_data_repository`, pushes handles to `exchange_channel` with backpressure |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
