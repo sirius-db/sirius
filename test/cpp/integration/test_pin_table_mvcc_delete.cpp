@@ -24,8 +24,9 @@
 // the {1, 0, 1} signature compare_gpu_vs_cpu asserts.
 //
 // The walk-based plan-time guards (post-pin UPDATE chains on pinned tables;
-// all unpinned-scan guards, #1143) are deferred to #1160 — their cases below
-// are disabled until the walk moves to execution time.
+// all guards for scans of unpinned tables, #1143) are disabled in the planner
+// — #1160 tracks their execution-time replacement — so their cases below are
+// disabled to match.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -300,8 +301,8 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
 }
 
 #if 0
-// Deferred to #1160: the plan-time update-chain walk is disabled — post-pin
-// UPDATE chains currently serve stale cached values, so this case would fail.
+// Disabled with the planner's update-chain walk (#1160): post-pin UPDATE
+// chains serve stale cached values (#1162), so this case would fail.
 TEST_CASE_METHOD(PinMvccDeleteFixture,
                  "mvcc guards: in-place updates decline to CPU with correct values",
                  "[integration][gpu_execution][pin_table_mvcc_delete]")
@@ -338,8 +339,8 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
 
   // The pin cannot serve column b: strict cache-or-CPU declines the scan even
-  // though every row is visible (the clean-table disk fallthrough is deferred
-  // to #1160).
+  // though every row is visible (a clean-table disk fallthrough is future
+  // work, #1160).
   expect_fallback_matches_cpu(*this, "SELECT sum(b) FROM t;");
 
   // After a committed DELETE the disk image is stale — still declined, never
@@ -394,9 +395,9 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
 //===----------------------------------------------------------------------===//
 
 #if 0
-// Deferred to #1160: the plan-time guards for unpinned duckdb-native scans are
-// disabled — unpinned tables are MVCC-blind again (#1143), so these cases
-// would GPU-execute and return wrong rows instead of falling back.
+// Disabled with the planner's guards for scans of unpinned tables (#1160):
+// those scans are MVCC-blind (#1143), so these cases would GPU-execute and
+// return wrong rows instead of falling back.
 TEST_CASE_METHOD(PinMvccDeleteFixture,
                  "native mvcc guard: uncheckpointed deletes on an unpinned table fall back",
                  "[integration][gpu_execution][duckdb_native_mvcc_guard]")

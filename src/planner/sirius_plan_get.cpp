@@ -206,21 +206,21 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
         if (!pin_serves) {
           // (d) column-mismatch: the scan would fall through to the MVCC-blind
-          // disk-native read, so it always declines. The clean-table
-          // relaxation below (#1160) allowed the fallthrough when the table
-          // provably matched its last-checkpointed image.
+          // disk-native read, so it always declines. The disabled clean-table
+          // relaxation below lets a table that provably matches its
+          // last-checkpointed image fall through instead (#1160).
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' is MVCC-pinned and the pin cannot serve the "
             "requested columns",
             table.name);
         }
 #if 0
-        // Deferred to #1160: these guards walk every row group of the table at
-        // plan time, per query. Until the walk moves to execution time, the
-        // (d) clean-table relaxation above stays off and (c) is unguarded —
-        // post-pin UPDATE chains serve stale cached values (UPDATE is out of
-        // scope for #819; pin_table still refuses tables that already carry
-        // update chains).
+        // Disabled — these guards walk every row group of the table at plan
+        // time, per query; #1160 tracks running the checks from the scan
+        // manager at execution time instead. With this block off, (d) above
+        // has no clean-table relaxation and (c) is unguarded: post-pin UPDATE
+        // chains serve stale cached values (UPDATE support is #1162; pin_table
+        // still refuses tables that already carry update chains).
         std::vector<duckdb::storage_t> projected;
         for (auto const& col_idx : column_ids) {
           if (col_idx.HasPrimaryIndex() && !col_idx.IsRowIdColumn() &&
@@ -255,19 +255,20 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 #endif
       }
 #if 0
-      // Deferred to #1160: plan-time MVCC guards for unpinned duckdb-native
-      // scans (#1143) — the exactness walk touches every row group of the
-      // table, per query. Until the walk moves to execution time, the
-      // disk-native read of an unpinned table is MVCC-blind (#1143):
-      // uncheckpointed deletes and update chains are served silently, and
-      // committed-but-uncheckpointed inserts fail loudly at execution.
+      // Disabled — plan-time MVCC guards for duckdb-native scans of unpinned
+      // tables: the exactness walk touches every row group of the table, per
+      // query; #1160 tracks running it from the scan manager at execution
+      // time instead. With this block off, the disk-native read of an
+      // unpinned table is MVCC-blind (#1143): uncheckpointed deletes and
+      // update chains are served silently, and committed-but-uncheckpointed
+      // inserts fail loudly at execution.
       if (entry == nullptr || entry->mvcc == nullptr) {
         // No MVCC-pinned cache for this table: the plan is the disk-native
         // read, which applies no visibility filtering — refuse any state it
         // would misread HERE, where the throw still becomes a clean CPU
-        // fallback (#1143). Residual race: a row committing between this
-        // check and the scan's metadata capture is read unmasked; the
-        // keep-masks planned in #819 PR6(d) close it.
+        // fallback. Residual race: a row committing between this check and
+        // the scan's metadata capture is read unmasked; the prepare-time
+        // keep-masks planned in #1143 close it.
         std::vector<duckdb::storage_t> projected;
         for (auto const& col_idx : column_ids) {
           if (col_idx.HasPrimaryIndex() && !col_idx.IsRowIdColumn() &&
