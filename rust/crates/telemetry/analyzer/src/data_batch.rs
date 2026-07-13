@@ -68,6 +68,8 @@ impl DataBatchExt for DataBatch {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
+                    attributes: transition.attributes(),
+                    derived_attributes: vec![],
                 })
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;

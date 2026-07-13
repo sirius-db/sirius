@@ -1,6 +1,7 @@
 use instrumentation_model::{Sirius, SiriusEvent};
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
+use quent_query_engine_analyzer::entities;
 use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
 use quent_query_engine_ui::{OperatorFilter, QueryBundle, QueryEntities, QueryFilter};
 use quent_ui::{
@@ -25,7 +26,7 @@ use tracing::debug;
 
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, Span,
-    fsm::{FsmTypeDeclaration, FsmUsages},
+    fsm::{FsmTypeDeclaration, FsmUsages, collection::FsmCollection},
     resource::{
         ResourceGroup, ResourceTypeDecl, Usage, Using, collection::ResourceCollection,
         tree::ResourceTreeNode,
@@ -62,7 +63,7 @@ impl QuentViewer for Viewer {
 
     fn import_events(
         dir: &std::path::Path,
-    ) -> quent_model::exporter::ImporterResult<ViewerEventStream<Self::Analyzer>> {
+    ) -> quent_model::io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
         Sirius::import_events(dir)
     }
 }
@@ -86,6 +87,30 @@ struct PerStateBuilderSlot<'a> {
     resource_id_filter: Arc<HashSet<Uuid>>,
     op_filter: OperatorFilter,
     entity_type_name: String,
+}
+
+/// Adapts the model's task map to the [`FsmCollection`] contract that
+/// [`entities::list_entities`] ranks and pages over.
+struct TaskCollection<'a>(&'a HashMap<Uuid, Task>);
+
+impl FsmCollection for TaskCollection<'_> {
+    type Fsm = Task;
+
+    fn fsms(&self) -> impl Iterator<Item = &Task> {
+        self.0.values()
+    }
+}
+
+/// Adapts the model's data-batch map to the [`FsmCollection`] contract that
+/// [`entities::list_entities`] ranks and pages over.
+struct DataBatchCollection<'a>(&'a HashMap<Uuid, DataBatch>);
+
+impl FsmCollection for DataBatchCollection<'_> {
+    type Fsm = DataBatch;
+
+    fn fsms(&self) -> impl Iterator<Item = &DataBatch> {
+        self.0.values()
+    }
 }
 
 impl UiAnalyzer for SiriusUiAnalyzer {
@@ -262,6 +287,68 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
     fn query_engine_model(&self) -> &impl QueryEngineModel {
         &self.model
+    }
+
+    fn list_entities(
+        &self,
+        request: quent_ui::entities::request::EntityListRequest<QueryFilter, OperatorFilter>,
+    ) -> AnalyzerResult<quent_ui::entities::response::EntityListResponse> {
+        let query_id = request.app_params.query_id;
+        let epoch = self.query_engine_model().query_epoch(query_id)?;
+        let entry = request.entry;
+        let window = entry.window.try_into_span(epoch)?;
+        let scope = entry
+            .filter
+            .scope
+            .as_ref()
+            .map(|s| s.resolve(&self.model))
+            .transpose()?;
+        let operator_filter = entry.application;
+
+        // Restrict candidates to the requested query: an entity belongs to a
+        // query iff its (producer) pipeline is one of that query's operators.
+        // Without this, entities from a different query sharing a resource and
+        // overlapping the window would leak in.
+        let query_operators: HashSet<Uuid> = self
+            .model
+            .query_view(query_id)?
+            .operators()
+            .map(|op| op.id())
+            .collect();
+
+        let query = entities::ListQuery {
+            scope: scope.as_ref(),
+            window,
+            filter: &entry.filter,
+            sort: entry.sort,
+            page: entry.page,
+            epoch,
+        };
+
+        // The model holds two distinct FSM types (tasks and data batches), so
+        // dispatch on the requested entity type rather than a single collection.
+        // Absent an explicit type, default to tasks.
+        match entry.filter.entity_type_name.as_deref() {
+            Some(DATA_BATCH_TYPE_NAME) => entities::list_entities(
+                &DataBatchCollection(&self.model.data_batches),
+                |data_batch| {
+                    data_batch
+                        .producer_pipeline_uuid()
+                        .is_some_and(|op| query_operators.contains(&op))
+                        && data_batch.matches_filter(&operator_filter)
+                },
+                query,
+            ),
+            _ => entities::list_entities(
+                &TaskCollection(&self.model.tasks),
+                |task| {
+                    task.pipeline_uuid()
+                        .is_some_and(|op| query_operators.contains(&op))
+                        && task.matches_filter(&operator_filter)
+                },
+                query,
+            ),
+        }
     }
 
     // TODO(johanpel): consider reusing the bulk request API with a single entry for requests like this.
@@ -992,7 +1079,11 @@ impl SiriusUiAnalyzer {
             .iter()
             .filter_map(|&id| {
                 if let Some(task) = self.model.tasks.get(&id) {
-                    Some(task.try_to_ui_fsm(epoch))
+                    let pipeline_name = task
+                        .pipeline_uuid()
+                        .and_then(|id| self.model.query_engine.operators.get(&id))
+                        .map(|operator| operator.instance_name());
+                    Some(task.try_to_ui_fsm(epoch, pipeline_name))
                 } else {
                     self.model
                         .data_batches

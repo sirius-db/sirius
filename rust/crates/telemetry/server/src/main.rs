@@ -2,7 +2,7 @@ use std::{net::ToSocketAddrs, path::PathBuf};
 
 use clap::Parser;
 use instrumentation_model::{Sirius, SiriusContext};
-use quent_exporter::{ExporterOptions, FileSystemExporterOptions, FileSystemFormat};
+use quent_io::{ExporterOptions, FileSystemExporterOptions, FileSystemFormat};
 use quent_query_engine_server::{
     analyzer_cache::index_query_engines, analyzer_service_router, collector_service,
     initialize_tracing,
@@ -77,10 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Each context exports under `output_dir/<context-id>/<entity>/`, so the
     // collector writes per-entity streams beneath output_dir.
-    let exporter_kind = ExporterOptions::FileSystem(FileSystemExporterOptions {
-        format,
-        root: output_dir,
-    });
+    let exporter_kind =
+        ExporterOptions::FileSystem(FileSystemExporterOptions::new(format, output_dir));
 
     // The collector builds a fresh sink per incoming context, replaying each
     // remote source's events under that source's own context id.
