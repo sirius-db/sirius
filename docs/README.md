@@ -10,7 +10,7 @@
   </a>
 </p>
 
-Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
+Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Starrocks (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
 
 <p align="center">
   <picture>
@@ -96,12 +96,7 @@ CALL unpin_table('lineitem');
 ```
 
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
-pinned host memory instead, for tables larger than GPU memory (a host pin streams through the
-GPU one batch at a time, so the whole table never has to fit). A pin serves any query that
-reads a subset of its pinned columns.
-
-For cache matching, memory placement, and re-pin semantics, see
-[Pinned Tables](super-sirius/scan.md#pinned-tables).
+pinned host memory instead, for tables larger than GPU memory.
 
 ## Configuration
 
@@ -172,7 +167,7 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 </p>
 
 ## Future Roadmap
-Sirius is still under major development and we are working on adding more features to Sirius, such as disk spilling, multi-GPUs, multi-node, more operators, data types, accelerating more engines, and many more.
+Sirius is still under major development and we are working on adding more features to Sirius, such as multi-node, more operators, data types, accelerating more engines, and many more.
 
 Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
 
