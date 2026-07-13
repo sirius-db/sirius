@@ -27,8 +27,7 @@ inline void log_exception_helper(const std::source_location& loc)
   try {
     throw;
   } catch (const std::exception& e) {
-    sirius::LogAt(
-      sirius::log_level::error, loc, std::format("Exception caught: {}", e.what()));
+    sirius::LogAt(sirius::log_level::error, loc, std::format("Exception caught: {}", e.what()));
   } catch (...) {
     sirius::LogAt(sirius::log_level::error, loc, "UNKNOWN exception caught");
   }

@@ -55,8 +55,7 @@ log_level ParseLogLevel(std::string_view level_str)
 
 }  // namespace
 
-void InitGlobalLogger(std::string_view log_level_str, std::string_view log_dir,
-                      int flush_seconds)
+void InitGlobalLogger(std::string_view log_level_str, std::string_view log_dir, int flush_seconds)
 {
   auto log_file  = std::format("{}/sirius.log", log_dir);
   auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);

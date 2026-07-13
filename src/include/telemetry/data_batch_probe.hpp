@@ -92,8 +92,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
       auto maybe_memory_handle =
         memory_context_->get_memory_handle(data.get_memory_space().get_id());
       if (not maybe_memory_handle) {
-        SIRIUS_LOG_WARN("No quent memory handle found for {}",
-                        data.get_memory_space().to_string());
+        SIRIUS_LOG_WARN("No quent memory handle found for {}", data.get_memory_space().to_string());
         return;
       }
 
@@ -155,8 +154,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
       auto maybe_memory_handle =
         memory_context_->get_memory_handle(data.get_memory_space().get_id());
       if (not maybe_memory_handle) {
-        SIRIUS_LOG_WARN("No quent memory handle found for {}",
-                        data.get_memory_space().to_string());
+        SIRIUS_LOG_WARN("No quent memory handle found for {}", data.get_memory_space().to_string());
         return;
       }
 

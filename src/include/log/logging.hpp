@@ -64,14 +64,15 @@ namespace sirius {
 enum class log_level { trace, debug, info, warn, error, critical, off };
 
 /// Initializes the global logger with a daily file sink at `<log_dir>/sirius.log`.
-void InitGlobalLogger(std::string_view log_level_str, std::string_view log_dir,
-                      int flush_seconds);
+void InitGlobalLogger(std::string_view log_level_str, std::string_view log_dir, int flush_seconds);
 
 /// Flushes buffered log lines of the global logger to its sink.
 void FlushGlobalLogger();
 
+/// Sets the periodic flush interval of the global logger.
 void SetGlobalLogFlush(int flush_seconds);
 
+/// Sets the level of the global logger from a level name.
 void SetGlobalLogLevel(std::string_view log_level_str);
 
 /// Logs `message` attributed to a caller-supplied source location.
