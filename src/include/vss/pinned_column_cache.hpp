@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cstddef>
@@ -68,15 +70,18 @@ class pinned_column_cache {
   /// Return the coalesced column for (@p table, @p column), building it on a miss
   /// and caching the result. On a miss, @p estimated_bytes of GPU memory is
   /// reserved (on @p preferred_gpu, or any GPU if < 0) and @p build is invoked
-  /// with the reservation's memory resource so the column allocates against it.
-  /// The returned column is shared with the cache; callers read it via .view()
-  /// and must not mutate it.
+  /// with the reservation's memory resource and a cache-owned stream so the
+  /// column allocates against them. The stream outlives the cache's columns, so
+  /// their async frees at erase/teardown run on a live stream. The returned
+  /// column is shared with the cache; callers read it via .view() and must not
+  /// mutate it.
   [[nodiscard]] std::shared_ptr<cudf::column> get_or_build(
     const std::string& table,
     const std::string& column,
     std::size_t estimated_bytes,
     int preferred_gpu,
-    const std::function<std::unique_ptr<cudf::column>(rmm::device_async_resource_ref)>& build);
+    const std::function<std::unique_ptr<cudf::column>(rmm::device_async_resource_ref,
+                                                      rmm::cuda_stream_view)>& build);
 
   /// Drop every cached column belonging to @p table (call on unpin/re-pin).
   void erase_table(std::string_view table);
@@ -85,8 +90,16 @@ class pinned_column_cache {
   void clear();
 
  private:
+  // Lazily create (or fetch) the durable build/free stream for @p device_id.
+  // Caller must hold mutex_.
+  rmm::cuda_stream_view stream_for_device(int device_id);
+
   cucascade::memory::memory_reservation_manager& reservation_manager_;
   mutable std::mutex mutex_;
+  // Per-device streams cached columns are allocated on and freed on. Declared
+  // before columns_ so it is destroyed *after* them: the columns' async frees
+  // must run on a live stream.
+  std::unordered_map<int, rmm::cuda_stream> build_streams_;
   // Key is table + '\0' + column so table names and column names can't collide.
   // Each column's deleter keeps its GPU reservation alive.
   std::unordered_map<std::string, std::shared_ptr<cudf::column>> columns_;

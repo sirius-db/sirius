@@ -127,9 +127,10 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
                                   name,
                                   pinned_column_alloc_size(*pin, name),
                                   target_gpu,
-                                  [&](rmm::device_async_resource_ref build_mr) {
+                                  [&](rmm::device_async_resource_ref build_mr,
+                                      rmm::cuda_stream_view build_stream) {
                                     return concat_pinned_column(
-                                      *pin, name, *space, stream, build_mr);
+                                      *pin, name, *space, build_stream, build_mr);
                                   });
   };
 
