@@ -19,27 +19,30 @@
 #include "log/log_backend.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 
 namespace sirius::log {
 
 namespace {
 
-// Global facade state. The level lives inside the backend (the single filter);
-// the facade only holds the swap-safe backend slot: loggers take a shared_ptr
-// snapshot, so a concurrent re-init cannot destroy a backend under an
-// in-flight log() call. Meyers singleton to avoid static-init-order issues.
-//
-// The slot is never null in steady state — it defaults to, and resets to, a
-// discarding noop backend so anything logged before the real backend is
-// installed goes to the noop rather than nowhere. Reads still guard against
-// null defensively.
+// Global facade state. The level lives inside the sink (the single filter); the
+// facade only holds the swap-safe sink slot: loggers take a shared_ptr
+// snapshot, so a concurrent set_sink cannot destroy a sink under an in-flight
+// log() call. The slot is never null: it is initialized to a discarding noop
+// and set_sink() never stores null, so anything logged before a real sink is
+// installed goes to the noop rather than nowhere.
 struct logger_state {
   std::atomic<std::shared_ptr<sink>> active{make_noop_backend()};
 };
 
 logger_state& state()
 {
+  // Meyers singleton: constructed on first use (avoids the static-init-order
+  // fiasco) and destroyed at exit, so the installed sink's destructor runs and
+  // flushes. Caveat (static-destruction order): a global that logs from its own
+  // destructor after this singleton is torn down would touch a destroyed
+  // object, so don't log from static destructors.
   static logger_state instance;
   return instance;
 }

@@ -180,15 +180,15 @@ TEST_CASE("Concurrent logging survives backend swaps", "[log]")
 
 TEST_CASE("backend_type round-trips through its string form", "[log]")
 {
-  for (auto type : {backend_type::spdlog, backend_type::noop}) {
+  for (auto type : {sink_type::spdlog, sink_type::noop}) {
     std::string name;
     REQUIRE(enum_to_string(type, name));
-    backend_type parsed{};
+    sink_type parsed{};
     REQUIRE(string_to_enum(name, parsed));
     CHECK(parsed == type);
   }
 
-  backend_type parsed{};
+  sink_type parsed{};
   CHECK_FALSE(string_to_enum("bogus", parsed));
 }
 

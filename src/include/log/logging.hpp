@@ -26,8 +26,7 @@
 
 namespace sirius::log {
 
-// Numeric mirror of `level` for the compile-time threshold below. Must stay in
-// the same order as the enum (static_asserted right after it).
+// Compile-time log severity level threshold options.
 #define SIRIUS_LOG_LEVEL_TRACE    0
 #define SIRIUS_LOG_LEVEL_DEBUG    1
 #define SIRIUS_LOG_LEVEL_INFO     2
@@ -36,16 +35,18 @@ namespace sirius::log {
 #define SIRIUS_LOG_LEVEL_CRITICAL 5
 #define SIRIUS_LOG_LEVEL_OFF      6
 
-// SIRIUS_LOG_* statements below this level expand to ((void)0): the format
-// string and arguments are compiled out entirely. Defaults to TRACE so every
-// level is compiled in; override with -DSIRIUS_ACTIVE_LOG_LEVEL=<level>.
+// Compile-time log severity level threshold.
+//
+// This allows compile-time definitions passed to the compiler to completely
+// compile out log statements using SIRIUS_LOG_* macros.
 #ifndef SIRIUS_ACTIVE_LOG_LEVEL
 #define SIRIUS_ACTIVE_LOG_LEVEL SIRIUS_LOG_LEVEL_TRACE
 #endif
 
-/// Log severity levels of the Sirius logging facade.
-enum class level { trace, debug, info, warn, error, critical, off };
+/// Run-time log severity levels.
+enum class level : uint8_t { trace, debug, info, warn, error, critical, off };
 
+// Ensure the run-time and compile-time log severity level definitions match.
 static_assert(static_cast<int>(level::trace) == SIRIUS_LOG_LEVEL_TRACE &&
                 static_cast<int>(level::debug) == SIRIUS_LOG_LEVEL_DEBUG &&
                 static_cast<int>(level::info) == SIRIUS_LOG_LEVEL_INFO &&
@@ -55,54 +56,57 @@ static_assert(static_cast<int>(level::trace) == SIRIUS_LOG_LEVEL_TRACE &&
                 static_cast<int>(level::off) == SIRIUS_LOG_LEVEL_OFF,
               "log level enum and SIRIUS_LOG_LEVEL_* macros must stay in sync");
 
-/// Selects the implementation behind the global logging facade (config option
-/// `sirius_log_backend`). String forms are parsed at the config boundaries via
-/// string_to_enum/enum_to_string in log/log_backend.hpp.
-enum class backend_type { spdlog, noop };
-
-/// Sink interface behind the global logging facade — pure interface, no state.
-///
-/// A sink owns the log level and is the sole place messages are filtered; the
-/// facade holds no level of its own, so two thresholds can never disagree.
-/// Implementations must keep `should_log` and `log` consistent (both gate on
-/// the level set by `set_level`) and must be thread-safe: all methods are
-/// called concurrently from many threads.
+/// Log sink interface.
 class sink {
  public:
   virtual ~sink() = default;
 
-  /// Sets the level below which `log` must drop messages.
-  virtual void set_level(level lvl) = 0;
+  /// Sets the threshold level below which `log` must drop messages.
+  ///
+  /// May be called while other threads are in `should_log`/`log`, so the new
+  /// level must become visible atomically.
+  virtual void set_level(level level) = 0;
 
-  /// Whether `lvl` currently passes the threshold. The facade calls this to
-  /// skip formatting for disabled statements, so it must agree with `log`.
-  [[nodiscard]] virtual bool should_log(level lvl) const = 0;
+  /// Whether `level` currently passes the threshold level.
+  [[nodiscard]] virtual bool should_log(level level) const = 0;
 
   /// Emits `message` attributed to `loc` iff `lvl` passes the threshold.
-  virtual void log(level lvl, const std::source_location& loc, std::string_view message) = 0;
+  ///
+  /// Thread-safe.
+  virtual void log(level level, const std::source_location& location, std::string_view message) = 0;
 
-  /// Best-effort flush; true iff prior messages are durable on return. May be
-  /// called from a fatal-signal handler (best-effort, alarm-bounded).
+  /// Perform a best-effort flush of any log messages in flight to their final
+  /// destination (e.g. a file or a network-based collector).
+  ///
+  /// Whether all log messages were reliably flushed is implementation-defined.
+  /// Iff the implementation was guaranteed to deliver all messages to their
+  /// final destination, this returns true. If it cannot make those guarantees,
+  /// this returns false.
+  ///
+  /// Whether this blocks the current thread until the flush is completed is
+  /// implementation-defined.
   virtual bool flush() = 0;
 };
 
-/// Installs `s` as the process-wide sink, flushing and releasing the previous
-/// one. A null `s` installs a discarding noop, so the slot is never empty.
-/// Build `s` with sirius::log::make_backend (see log/log_backend.hpp).
-void set_sink(std::shared_ptr<sink> s);
+/// Installs `sink` as the process-wide sink, flushing and releasing the
+/// previous one.
+///
+/// If `sink` holds a nullptr, this installs a new instance of the no-op sink
+/// instead.
+void set_sink(std::shared_ptr<sink> sink);
 
-/// Returns the currently installed sink (never null — a discarding noop until a
-/// real one is installed). Log through the SIRIUS_LOG_* macros or the
-/// sirius::log::<level> functions; use this to flush, change level, or emit a
-/// pre-built message, e.g. `get_sink()->flush()` or
-/// `get_sink()->set_level(level::debug)`.
+/// Returns the currently installed sink.
+///
+/// If set_sink is not used before this is called, this returns the no-op sink.
+///
+/// This function never returns a nullptr, but calling it from a static/global
+/// object's destructor at program exit is undefined behavior because the
+/// backing singleton may be destroyed.
 std::shared_ptr<sink> get_sink();
 
 namespace detail {
 
-/// Formats and logs a message through a single sink snapshot; the format is
-/// skipped when the level is disabled. Use through the SIRIUS_LOG_* macros or
-/// log functions.
+/// Format and log a message, but skip formatting if the level is disabled.
 template <typename... Args>
 void format_and_log(level lvl,
                     const std::source_location& loc,
@@ -114,14 +118,11 @@ void format_and_log(level lvl,
   }
 }
 
-/// A compile-time-checked format string paired with the caller's source
-/// location. `Args` are fixed by the enclosing log function (non-deduced here),
-/// so the format string is validated against the logged arguments; `location`
-/// defaults to the call site via the consteval constructor.
+/// A compile-time-checked format string with the caller's source location.
 template <typename... Args>
 struct format_with_location {
-  // Implicit by design: a string literal at the call site converts to this
-  // wrapper, capturing the location, so `info("x={}", x)` just works.
+  // Implicit constructor by design so a string literal at the call site
+  // converts to this wrapper, capturing the location.
   template <typename T>
   consteval format_with_location(const T& format_str,
                                  std::source_location loc = std::source_location::current())
@@ -135,20 +136,12 @@ struct format_with_location {
 
 }  // namespace detail
 
-/// Free-function logging: `sirius::log::info("x={}", x)`.
-///
-/// The source location is captured automatically (it rides in the format-string
-/// argument's consteval constructor, so it can follow the variadic pack), and
-/// the format string is checked at compile time. Formatting is skipped when the
-/// level is disabled, exactly like the SIRIUS_LOG_* macros.
+/// Factory macro to produce free-function log statements of the form
+/// `sirius::log::info("x={}", x)`.
 ///
 /// Unlike the macros, these do NOT compile out below SIRIUS_ACTIVE_LOG_LEVEL and
 /// their arguments are always evaluated at the call site — prefer the macros on
 /// hot paths where eliding argument evaluation matters.
-///
-/// Defines one free logging function per level, forwarding to format_and_log with
-/// the captured location. `std::type_identity_t` keeps the first parameter a
-/// non-deduced context so `Args` is deduced only from the trailing arguments.
 #define SIRIUS_DEFINE_LOG_FN(name, lvl)                                                      \
   template <typename... Args>                                                                \
   void name(detail::format_with_location<std::type_identity_t<Args>...> fmt, Args&&... args) \

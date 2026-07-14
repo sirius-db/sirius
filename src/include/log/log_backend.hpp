@@ -27,15 +27,18 @@
 
 namespace sirius::log {
 
+// Supported log sink implementations.
+enum class sink_type { spdlog, noop };
+
 // The `sink` interface itself lives in log/logging.hpp (the lightweight facade
 // header). This header adds the backend selector converters, the spdlog sink's
 // construction settings, and the sink factories.
 
-inline bool string_to_enum(std::string_view sv, backend_type& t)
+inline bool string_to_enum(std::string_view sv, sink_type& t)
 {
-  static const std::unordered_map<std::string_view, backend_type> map = {
-    {"spdlog", backend_type::spdlog},
-    {"noop", backend_type::noop},
+  static const std::unordered_map<std::string_view, sink_type> map = {
+    {"spdlog", sink_type::spdlog},
+    {"noop", sink_type::noop},
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -45,11 +48,11 @@ inline bool string_to_enum(std::string_view sv, backend_type& t)
   return false;
 }
 
-inline bool enum_to_string(backend_type t, std::string& s)
+inline bool enum_to_string(sink_type t, std::string& s)
 {
   switch (t) {
-    case backend_type::spdlog: s = "spdlog"; return true;
-    case backend_type::noop: s = "noop"; return true;
+    case sink_type::spdlog: s = "spdlog"; return true;
+    case sink_type::noop: s = "noop"; return true;
   }
   return false;
 }
@@ -114,6 +117,6 @@ std::shared_ptr<sink> make_noop_backend();
 std::shared_ptr<sink> make_backend(std::string_view level_str,
                                    std::string_view log_dir,
                                    uint32_t flush_ms,
-                                   backend_type type);
+                                   sink_type type);
 
 }  // namespace sirius::log
