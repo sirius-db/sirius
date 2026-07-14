@@ -1081,7 +1081,7 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
 
     auto const records = logs.records();
     auto const found   = std::any_of(records.begin(), records.end(), [](auto const& r) {
-      return r.level == sirius::log_level::warn &&
+      return r.level == sirius::log::level::warn &&
              r.message.find("warn-retry.parquet") != std::string::npos;
     });
     CHECK(found);
@@ -1105,7 +1105,7 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
 
     auto const records        = logs.records();
     auto const warning_or_bad = std::any_of(records.begin(), records.end(), [](auto const& r) {
-      return r.level >= sirius::log_level::warn;
+      return r.level >= sirius::log::level::warn;
     });
     CHECK_FALSE(warning_or_bad);
   }

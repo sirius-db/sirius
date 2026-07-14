@@ -27,9 +27,10 @@ inline void log_exception_helper(const std::source_location& loc)
   try {
     throw;
   } catch (const std::exception& e) {
-    sirius::LogAt(sirius::log_level::error, loc, std::format("Exception caught: {}", e.what()));
+    sirius::log::LogAt(
+      sirius::log::level::error, loc, std::format("Exception caught: {}", e.what()));
   } catch (...) {
-    sirius::LogAt(sirius::log_level::error, loc, "UNKNOWN exception caught");
+    sirius::log::LogAt(sirius::log::level::error, loc, "UNKNOWN exception caught");
   }
 }
 
@@ -41,9 +42,10 @@ void log_exception_helper(const std::source_location& loc, std::string_view fmt_
   try {
     throw;
   } catch (const std::exception& e) {
-    sirius::LogAt(sirius::log_level::error, loc, std::format("{}: {}", user_msg, e.what()));
+    sirius::log::LogAt(sirius::log::level::error, loc, std::format("{}: {}", user_msg, e.what()));
   } catch (...) {
-    sirius::LogAt(sirius::log_level::error, loc, std::format("{}: UNKNOWN exception", user_msg));
+    sirius::log::LogAt(
+      sirius::log::level::error, loc, std::format("{}: UNKNOWN exception", user_msg));
   }
 }
 

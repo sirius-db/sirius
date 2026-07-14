@@ -31,26 +31,26 @@
 namespace sirius::test {
 
 /// In-memory log_backend recording every message at or above its level.
-class recording_log_backend final : public sirius::log_backend {
+class recording_log_backend final : public sirius::log::sink {
  public:
   struct record {
-    sirius::log_level level;
+    sirius::log::level level;
     std::string file;
     uint32_t line;
     std::string message;
   };
 
-  void set_level(sirius::log_level level) override
+  void set_level(sirius::log::level level) override
   {
     _level.store(level, std::memory_order_relaxed);
   }
 
-  bool should_log(sirius::log_level level) const override
+  bool should_log(sirius::log::level level) const override
   {
     return static_cast<int>(level) >= static_cast<int>(_level.load(std::memory_order_relaxed));
   }
 
-  void log(sirius::log_level level,
+  void log(sirius::log::level level,
            const std::source_location& loc,
            std::string_view message) override
   {
@@ -85,7 +85,7 @@ class recording_log_backend final : public sirius::log_backend {
   }
 
  private:
-  std::atomic<sirius::log_level> _level{sirius::log_level::off};
+  std::atomic<sirius::log::level> _level{sirius::log::level::off};
   mutable std::mutex _mutex;
   std::vector<record> _records;
   int _flush_count = 0;
@@ -99,13 +99,13 @@ class scoped_recording_log_backend {
   explicit scoped_recording_log_backend(std::string_view level = "trace")
     : _backend(std::make_shared<recording_log_backend>())
   {
-    sirius::InitGlobalLogger(_backend, level);
+    sirius::log::InitGlobalLogger(_backend, level);
   }
 
   ~scoped_recording_log_backend()
   {
     using duckdb::Config;
-    sirius::InitGlobalLogger(
+    sirius::log::InitGlobalLogger(
       Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
   }
 

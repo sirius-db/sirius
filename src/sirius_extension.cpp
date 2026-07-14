@@ -1610,14 +1610,14 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
-  sirius::SetGlobalLogLevel(Config::LOG_LEVEL);
+  sirius::log::SetGlobalLogLevel(Config::LOG_LEVEL);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  sirius::InitGlobalLogger(
+  sirius::log::InitGlobalLogger(
     Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
@@ -1626,7 +1626,7 @@ static void SetLogFlushMs(ClientContext& context, SetScope scope, Value& paramet
 {
   Config::LOG_FLUSH_MS = UIntegerValue::Get(parameter);
   // The flush interval is fixed at backend construction, so re-initialize.
-  sirius::InitGlobalLogger(
+  sirius::log::InitGlobalLogger(
     Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_MS to {}", Config::LOG_FLUSH_MS);
 }
@@ -1634,13 +1634,13 @@ static void SetLogFlushMs(ClientContext& context, SetScope scope, Value& paramet
 static void SetLogBackend(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto backend_str = StringValue::Get(parameter);
-  sirius::log_backend_type backend;
-  if (!sirius::string_to_enum(backend_str, backend)) {
+  sirius::log::backend_type backend;
+  if (!sirius::log::string_to_enum(backend_str, backend)) {
     throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: spdlog, noop)",
                                 backend_str);
   }
   Config::LOG_BACKEND = backend;
-  sirius::InitGlobalLogger(
+  sirius::log::InitGlobalLogger(
     Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
   SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", backend_str);
 }
@@ -1869,7 +1869,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UINTEGER(Config::LOG_FLUSH_MS),
                             SetLogFlushMs);
   std::string log_backend_name;
-  sirius::enum_to_string(Config::LOG_BACKEND, log_backend_name);
+  sirius::log::enum_to_string(Config::LOG_BACKEND, log_backend_name);
   config.AddExtensionOption("sirius_log_backend",
                             "Logging backend for Sirius (spdlog, noop)",
                             LogicalType::VARCHAR,

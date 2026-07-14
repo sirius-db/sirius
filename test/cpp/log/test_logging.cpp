@@ -31,7 +31,7 @@
 #include <thread>
 #include <vector>
 
-using namespace sirius;
+using namespace sirius::log;
 
 using recording_backend        = sirius::test::recording_log_backend;
 using scoped_recording_backend = sirius::test::scoped_recording_log_backend;
@@ -42,20 +42,20 @@ TEST_CASE("The backend level gates by severity", "[log]")
   auto& backend = scoped.backend();
 
   SetGlobalLogLevel("info");
-  CHECK_FALSE(backend.should_log(log_level::trace));
-  CHECK_FALSE(backend.should_log(log_level::debug));
-  CHECK(backend.should_log(log_level::info));
-  CHECK(backend.should_log(log_level::warn));
-  CHECK(backend.should_log(log_level::error));
-  CHECK(backend.should_log(log_level::critical));
+  CHECK_FALSE(backend.should_log(level::trace));
+  CHECK_FALSE(backend.should_log(level::debug));
+  CHECK(backend.should_log(level::info));
+  CHECK(backend.should_log(level::warn));
+  CHECK(backend.should_log(level::error));
+  CHECK(backend.should_log(level::critical));
 
   SetGlobalLogLevel("off");
-  CHECK_FALSE(backend.should_log(log_level::trace));
-  CHECK_FALSE(backend.should_log(log_level::critical));
+  CHECK_FALSE(backend.should_log(level::trace));
+  CHECK_FALSE(backend.should_log(level::critical));
 
   SetGlobalLogLevel("trace");
-  CHECK(backend.should_log(log_level::trace));
-  CHECK(backend.should_log(log_level::critical));
+  CHECK(backend.should_log(level::trace));
+  CHECK(backend.should_log(level::critical));
 }
 
 TEST_CASE("Unknown level names fall back to info", "[log]")
@@ -63,8 +63,8 @@ TEST_CASE("Unknown level names fall back to info", "[log]")
   scoped_recording_backend scoped;
 
   SetGlobalLogLevel("verbose");
-  CHECK_FALSE(scoped.backend().should_log(log_level::debug));
-  CHECK(scoped.backend().should_log(log_level::info));
+  CHECK_FALSE(scoped.backend().should_log(level::debug));
+  CHECK(scoped.backend().should_log(level::info));
 }
 
 TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
@@ -76,7 +76,7 @@ TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
 
   auto messages = scoped.backend().records();
   REQUIRE(messages.size() == 1);
-  CHECK(messages[0].level == log_level::info);
+  CHECK(messages[0].level == level::info);
   CHECK(messages[0].message == "x=42");
   CHECK(messages[0].file.ends_with("test_logging.cpp"));
   CHECK(messages[0].line == expected_line);
@@ -92,11 +92,11 @@ TEST_CASE("sirius::log free functions format and capture the call site", "[log]"
 
   auto records = scoped.backend().records();
   REQUIRE(records.size() == 2);
-  CHECK(records[0].level == log_level::info);
+  CHECK(records[0].level == level::info);
   CHECK(records[0].message == "x=42");
   CHECK(records[0].file.ends_with("test_logging.cpp"));
   CHECK(records[0].line == info_line);
-  CHECK(records[1].level == log_level::warn);
+  CHECK(records[1].level == level::warn);
   CHECK(records[1].message == "plain");
 }
 
@@ -117,11 +117,11 @@ TEST_CASE("LogAt enforces the level gate", "[log]")
   scoped_recording_backend scoped;
 
   SetGlobalLogLevel("off");
-  LogAt(log_level::error, std::source_location::current(), "must not appear");
+  LogAt(level::error, std::source_location::current(), "must not appear");
   CHECK(scoped.backend().count() == 0);
 
   SetGlobalLogLevel("error");
-  LogAt(log_level::error, std::source_location::current(), "must appear");
+  LogAt(level::error, std::source_location::current(), "must appear");
   CHECK(scoped.backend().count() == 1);
 }
 
@@ -139,7 +139,7 @@ TEST_CASE("Resetting installs a discarding backend", "[log]")
 
   InitGlobalLogger(nullptr, "trace");  // swaps in a noop, detaching the recorder
   SIRIUS_LOG_ERROR("dropped {}", 1);
-  LogAt(log_level::critical, std::source_location::current(), "dropped");
+  LogAt(level::critical, std::source_location::current(), "dropped");
   CHECK(FlushGlobalLogger());  // the noop flush is vacuously reliable
   CHECK(scoped.backend().count() == 0);
 }
@@ -175,17 +175,17 @@ TEST_CASE("Concurrent logging survives backend swaps", "[log]")
   CHECK(backend_a->count() + backend_b->count() > 0);
 }
 
-TEST_CASE("log_backend_type round-trips through its string form", "[log]")
+TEST_CASE("backend_type round-trips through its string form", "[log]")
 {
-  for (auto type : {log_backend_type::spdlog, log_backend_type::noop}) {
+  for (auto type : {backend_type::spdlog, backend_type::noop}) {
     std::string name;
     REQUIRE(enum_to_string(type, name));
-    log_backend_type parsed{};
+    backend_type parsed{};
     REQUIRE(string_to_enum(name, parsed));
     CHECK(parsed == type);
   }
 
-  log_backend_type parsed{};
+  backend_type parsed{};
   CHECK_FALSE(string_to_enum("bogus", parsed));
 }
 
@@ -193,7 +193,7 @@ TEST_CASE("The noop backend accepts and discards everything", "[log]")
 {
   auto noop = make_noop_backend();
   REQUIRE(noop != nullptr);
-  noop->log(log_level::critical, std::source_location::current(), "into the void");
+  noop->log(level::critical, std::source_location::current(), "into the void");
   CHECK(noop->flush());
 
   scoped_recording_backend scoped;

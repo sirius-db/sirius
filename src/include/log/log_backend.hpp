@@ -25,28 +25,28 @@
 #include <string_view>
 #include <unordered_map>
 
-namespace sirius {
+namespace sirius::log {
 
 /// Sink interface behind the global logging facade — pure interface, no state.
 ///
-/// The backend owns the log level and is the sole place messages are filtered;
-/// the facade holds no level of its own, so two thresholds can never disagree.
+/// A sink owns the log level and is the sole place messages are filtered; the
+/// facade holds no level of its own, so two thresholds can never disagree.
 /// Implementations must keep `should_log` and `log` consistent (both gate on
 /// the level set by `set_level`) and must be thread-safe: all methods are
 /// called concurrently from many threads.
-class log_backend {
+class sink {
  public:
-  virtual ~log_backend() = default;
+  virtual ~sink() = default;
 
   /// Sets the level below which `log` must drop messages.
-  virtual void set_level(log_level level) = 0;
+  virtual void set_level(level lvl) = 0;
 
-  /// Whether `level` currently passes the threshold. The facade calls this to
+  /// Whether `lvl` currently passes the threshold. The facade calls this to
   /// skip formatting for disabled statements, so it must agree with `log`.
-  [[nodiscard]] virtual bool should_log(log_level level) const = 0;
+  [[nodiscard]] virtual bool should_log(level lvl) const = 0;
 
-  /// Emits `message` attributed to `loc` iff `level` passes the threshold.
-  virtual void log(log_level level, const std::source_location& loc, std::string_view message) = 0;
+  /// Emits `message` attributed to `loc` iff `lvl` passes the threshold.
+  virtual void log(level lvl, const std::source_location& loc, std::string_view message) = 0;
 
   /// Initiates a best-effort flush of buffered output.
   ///
@@ -59,11 +59,11 @@ class log_backend {
   virtual bool flush() = 0;
 };
 
-inline bool string_to_enum(std::string_view sv, log_backend_type& t)
+inline bool string_to_enum(std::string_view sv, backend_type& t)
 {
-  static const std::unordered_map<std::string_view, log_backend_type> map = {
-    {"spdlog", log_backend_type::spdlog},
-    {"noop", log_backend_type::noop},
+  static const std::unordered_map<std::string_view, backend_type> map = {
+    {"spdlog", backend_type::spdlog},
+    {"noop", backend_type::noop},
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -73,11 +73,11 @@ inline bool string_to_enum(std::string_view sv, log_backend_type& t)
   return false;
 }
 
-inline bool enum_to_string(log_backend_type t, std::string& s)
+inline bool enum_to_string(backend_type t, std::string& s)
 {
   switch (t) {
-    case log_backend_type::spdlog: s = "spdlog"; return true;
-    case log_backend_type::noop: s = "noop"; return true;
+    case backend_type::spdlog: s = "spdlog"; return true;
+    case backend_type::noop: s = "noop"; return true;
   }
   return false;
 }
@@ -91,14 +91,14 @@ struct spdlog_backend_config {
   std::optional<std::chrono::milliseconds> flush_interval;
 };
 
-/// Creates a backend writing to a daily-rotated `<log_dir>/sirius.log`.
+/// Creates a sink writing to a daily-rotated `<log_dir>/sirius.log`.
 ///
 /// Throws if the sink cannot be constructed, e.g. because the directory is
 /// not writable — misconfiguration must fail loudly, not silence logging.
-std::shared_ptr<log_backend> make_spdlog_backend(const spdlog_backend_config& config);
+std::shared_ptr<sink> make_spdlog_backend(const spdlog_backend_config& config);
 
-/// Creates a backend that discards everything. Selectable via
+/// Creates a sink that discards everything. Selectable via
 /// `SET sirius_log_backend='noop'`, e.g. to measure logging overhead.
-std::shared_ptr<log_backend> make_noop_backend();
+std::shared_ptr<sink> make_noop_backend();
 
-}  // namespace sirius
+}  // namespace sirius::log

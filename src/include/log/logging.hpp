@@ -16,8 +16,20 @@
 
 #pragma once
 
-// Numeric log levels for the compile-time threshold below. Must mirror the
-// order of sirius::log_level (static_asserted after the enum definition).
+#include <cstdint>
+#include <format>
+#include <memory>
+#include <source_location>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+
+namespace sirius::log {
+
+class sink;
+
+// Numeric mirror of `level` for the compile-time threshold below. Must stay in
+// the same order as the enum (static_asserted right after it).
 #define SIRIUS_LOG_LEVEL_TRACE    0
 #define SIRIUS_LOG_LEVEL_DEBUG    1
 #define SIRIUS_LOG_LEVEL_INFO     2
@@ -33,84 +45,92 @@
 #define SIRIUS_ACTIVE_LOG_LEVEL SIRIUS_LOG_LEVEL_TRACE
 #endif
 
-#include <cstdint>
-#include <format>
-#include <memory>
-#include <source_location>
-#include <string_view>
-#include <type_traits>
-#include <utility>
-
-namespace sirius {
-
-class log_backend;
-
 /// Log severity levels of the Sirius logging facade.
-enum class log_level { trace, debug, info, warn, error, critical, off };
+enum class level { trace, debug, info, warn, error, critical, off };
+
+static_assert(static_cast<int>(level::trace) == SIRIUS_LOG_LEVEL_TRACE &&
+                static_cast<int>(level::debug) == SIRIUS_LOG_LEVEL_DEBUG &&
+                static_cast<int>(level::info) == SIRIUS_LOG_LEVEL_INFO &&
+                static_cast<int>(level::warn) == SIRIUS_LOG_LEVEL_WARN &&
+                static_cast<int>(level::error) == SIRIUS_LOG_LEVEL_ERROR &&
+                static_cast<int>(level::critical) == SIRIUS_LOG_LEVEL_CRITICAL &&
+                static_cast<int>(level::off) == SIRIUS_LOG_LEVEL_OFF,
+              "log level enum and SIRIUS_LOG_LEVEL_* macros must stay in sync");
 
 /// Selects the implementation behind the global logging facade (config option
 /// `sirius_log_backend`). String forms are parsed at the config boundaries via
 /// string_to_enum/enum_to_string in log/log_backend.hpp.
-enum class log_backend_type { spdlog, noop };
+enum class backend_type { spdlog, noop };
 
-static_assert(static_cast<int>(log_level::trace) == SIRIUS_LOG_LEVEL_TRACE &&
-                static_cast<int>(log_level::debug) == SIRIUS_LOG_LEVEL_DEBUG &&
-                static_cast<int>(log_level::info) == SIRIUS_LOG_LEVEL_INFO &&
-                static_cast<int>(log_level::warn) == SIRIUS_LOG_LEVEL_WARN &&
-                static_cast<int>(log_level::error) == SIRIUS_LOG_LEVEL_ERROR &&
-                static_cast<int>(log_level::critical) == SIRIUS_LOG_LEVEL_CRITICAL &&
-                static_cast<int>(log_level::off) == SIRIUS_LOG_LEVEL_OFF,
-              "log_level enum and SIRIUS_LOG_LEVEL_* macros must stay in sync");
-
-/// Initializes (or re-initializes) the global logger with the given backend.
+/// Initializes (or re-initializes) the global logger with the given sink.
 ///
-/// For the spdlog backend, `log_dir` is the directory of the daily log file
+/// For the spdlog sink, `log_dir` is the directory of the daily log file
 /// and `flush_ms` the best-effort periodic flush interval (0 = no scheduled
 /// flushes); other backends interpret only the settings that apply to them.
-/// Throws if the backend cannot be constructed (e.g. an unwritable log_dir);
-/// the previously installed backend (if any) then stays active. Until the
+/// Throws if the sink cannot be constructed (e.g. an unwritable log_dir);
+/// the previously installed sink (if any) then stays active. Until the
 /// first successful call, log statements are dropped.
-void InitGlobalLogger(std::string_view log_level_str,
+void InitGlobalLogger(std::string_view level_str,
                       std::string_view log_dir,
                       uint32_t flush_ms,
-                      log_backend_type backend = log_backend_type::spdlog);
+                      backend_type type = backend_type::spdlog);
 
-/// Installs a caller-constructed backend (test seam / embedders) at
-/// `log_level_str`. Passing nullptr resets to a discarding backend.
-void InitGlobalLogger(std::shared_ptr<log_backend> backend, std::string_view log_level_str);
+/// Installs a caller-constructed sink (test seam / embedders) at
+/// `level_str`. Passing nullptr resets to a discarding sink.
+void InitGlobalLogger(std::shared_ptr<sink> sink, std::string_view level_str);
 
 /// Requests a best-effort flush of the global logger.
 ///
 /// Returns true iff all previously logged messages are durable in the
-/// backend's destination on return (false when the backend can only treat the
+/// sink's destination on return (false when the sink can only treat the
 /// flush as a hint).
 bool FlushGlobalLogger();
 
-/// Sets the level of the global logging backend from a level name.
-void SetGlobalLogLevel(std::string_view log_level_str);
+/// Sets the level of the global logging sink from a level name.
+void SetGlobalLogLevel(std::string_view level_str);
 
 /// Logs `message` attributed to a caller-supplied source location. The
-/// installed backend drops it if below the current level.
+/// installed sink drops it if below the current level.
 ///
-/// For log statements at the current location, use the SIRIUS_LOG_* macros.
-void LogAt(log_level level, const std::source_location& loc, std::string_view message);
+/// For log statements at the current location, use the SIRIUS_LOG_* macros or
+/// the sirius::log::<level> functions below.
+void LogAt(level lvl, const std::source_location& loc, std::string_view message);
 
 namespace detail {
 
-/// Whether the installed backend would emit `level`. Used only to skip
-/// formatting for disabled statements; the backend remains the sole filter.
-bool should_log(log_level level);
+/// Whether the installed sink would emit `lvl`. Used only to skip
+/// formatting for disabled statements; the sink remains the sole filter.
+bool should_log(level lvl);
 
-/// Formats and logs a message; arguments are only formatted when `level` is
-/// enabled at runtime. Use through the SIRIUS_LOG_* macros.
+/// Formats and logs a message; arguments are only formatted when `lvl` is
+/// enabled at runtime. Use through the SIRIUS_LOG_* macros or log functions.
 template <typename... Args>
-void LogFormatted(log_level level,
+void LogFormatted(level lvl,
                   const std::source_location& loc,
                   std::format_string<Args...> fmt,
                   Args&&... args)
 {
-  if (should_log(level)) { LogAt(level, loc, std::format(fmt, std::forward<Args>(args)...)); }
+  if (should_log(lvl)) { LogAt(lvl, loc, std::format(fmt, std::forward<Args>(args)...)); }
 }
+
+/// A compile-time-checked format string paired with the caller's source
+/// location. `Args` are fixed by the enclosing log function (non-deduced here),
+/// so the format string is validated against the logged arguments; `location`
+/// defaults to the call site via the consteval constructor.
+template <typename... Args>
+struct format_with_location {
+  // Implicit by design: a string literal at the call site converts to this
+  // wrapper, capturing the location, so `info("x={}", x)` just works.
+  template <typename T>
+  consteval format_with_location(const T& format_str,
+                                 std::source_location loc = std::source_location::current())
+    : format{format_str}, location{loc}
+  {
+  }
+
+  std::format_string<Args...> format;
+  std::source_location location;
+};
 
 }  // namespace detail
 
@@ -124,88 +144,63 @@ void LogFormatted(log_level level,
 /// Unlike the macros, these do NOT compile out below SIRIUS_ACTIVE_LOG_LEVEL and
 /// their arguments are always evaluated at the call site — prefer the macros on
 /// hot paths where eliding argument evaluation matters.
-namespace log {
-
-namespace detail {
-
-/// A compile-time-checked format string paired with the caller's source
-/// location. `Args` are fixed by the enclosing log function (non-deduced here),
-/// so the format string is validated against the logged arguments; `location`
-/// defaults to the call site via the consteval constructor.
-template <typename... Args>
-struct format_with_location {
-  template <typename T>
-  consteval format_with_location(  // NOLINT(google-explicit-constructor): implicit by design
-    const T& format_str,
-    std::source_location loc = std::source_location::current())
-    : format{format_str}, location{loc}
-  {
+///
+/// Defines one free logging function per level, forwarding to LogFormatted with
+/// the captured location. `std::type_identity_t` keeps the first parameter a
+/// non-deduced context so `Args` is deduced only from the trailing arguments.
+#define SIRIUS_DEFINE_LOG_FN(name, lvl)                                                      \
+  template <typename... Args>                                                                \
+  void name(detail::format_with_location<std::type_identity_t<Args>...> fmt, Args&&... args) \
+  {                                                                                          \
+    detail::LogFormatted(lvl, fmt.location, fmt.format, std::forward<Args>(args)...);        \
   }
 
-  std::format_string<Args...> format;
-  std::source_location location;
-};
-
-}  // namespace detail
-
-// Defines one free logging function per level, forwarding to the facade's
-// LogFormatted with the captured location. `std::type_identity_t` keeps the
-// first parameter a non-deduced context so `Args` is deduced only from the
-// trailing arguments.
-#define SIRIUS_DEFINE_LOG_FN(name, level)                                                         \
-  template <typename... Args>                                                                     \
-  void name(detail::format_with_location<std::type_identity_t<Args>...> fmt, Args&&... args)      \
-  {                                                                                               \
-    ::sirius::detail::LogFormatted(level, fmt.location, fmt.format, std::forward<Args>(args)...); \
-  }
-
-SIRIUS_DEFINE_LOG_FN(trace, log_level::trace)
-SIRIUS_DEFINE_LOG_FN(debug, log_level::debug)
-SIRIUS_DEFINE_LOG_FN(info, log_level::info)
-SIRIUS_DEFINE_LOG_FN(warn, log_level::warn)
-SIRIUS_DEFINE_LOG_FN(error, log_level::error)
-SIRIUS_DEFINE_LOG_FN(critical, log_level::critical)
+SIRIUS_DEFINE_LOG_FN(trace, level::trace)
+SIRIUS_DEFINE_LOG_FN(debug, level::debug)
+SIRIUS_DEFINE_LOG_FN(info, level::info)
+SIRIUS_DEFINE_LOG_FN(warn, level::warn)
+SIRIUS_DEFINE_LOG_FN(error, level::error)
+SIRIUS_DEFINE_LOG_FN(critical, level::critical)
 
 #undef SIRIUS_DEFINE_LOG_FN
 
-}  // namespace log
-}  // namespace sirius
+}  // namespace sirius::log
 
-#define SIRIUS_LOG_IMPL(level, ...) \
-  ::sirius::detail::LogFormatted(level, std::source_location::current(), __VA_ARGS__)
+#define SIRIUS_LOG_IMPL(lvl, ...) \
+  ::sirius::log::detail::LogFormatted(lvl, std::source_location::current(), __VA_ARGS__)
 
 #if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_TRACE
-#define SIRIUS_LOG_TRACE(...) SIRIUS_LOG_IMPL(::sirius::log_level::trace, __VA_ARGS__)
+#define SIRIUS_LOG_TRACE(...) SIRIUS_LOG_IMPL(::sirius::log::level::trace, __VA_ARGS__)
 #else
 #define SIRIUS_LOG_TRACE(...) ((void)0)
 #endif
 
 #if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_DEBUG
-#define SIRIUS_LOG_DEBUG(...) SIRIUS_LOG_IMPL(::sirius::log_level::debug, __VA_ARGS__)
+#define SIRIUS_LOG_DEBUG(...) SIRIUS_LOG_IMPL(::sirius::log::level::debug, __VA_ARGS__)
 #else
 #define SIRIUS_LOG_DEBUG(...) ((void)0)
 #endif
 
 #if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_INFO
-#define SIRIUS_LOG_INFO(...) SIRIUS_LOG_IMPL(::sirius::log_level::info, __VA_ARGS__)
+#define SIRIUS_LOG_INFO(...) SIRIUS_LOG_IMPL(::sirius::log::level::info, __VA_ARGS__)
 #else
 #define SIRIUS_LOG_INFO(...) ((void)0)
 #endif
 
 #if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_WARN
-#define SIRIUS_LOG_WARN(...) SIRIUS_LOG_IMPL(::sirius::log_level::warn, __VA_ARGS__)
+#define SIRIUS_LOG_WARN(...) SIRIUS_LOG_IMPL(::sirius::log::level::warn, __VA_ARGS__)
 #else
 #define SIRIUS_LOG_WARN(...) ((void)0)
 #endif
 
 #if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_ERROR
-#define SIRIUS_LOG_ERROR(...) SIRIUS_LOG_IMPL(::sirius::log_level::error, __VA_ARGS__)
+#define SIRIUS_LOG_ERROR(...) SIRIUS_LOG_IMPL(::sirius::log::level::error, __VA_ARGS__)
 #else
 #define SIRIUS_LOG_ERROR(...) ((void)0)
 #endif
 
 #if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_CRITICAL
-#define SIRIUS_LOG_FATAL(...) SIRIUS_LOG_IMPL(::sirius::log_level::critical, __VA_ARGS__)
+#define SIRIUS_LOG_FATAL(...) SIRIUS_LOG_IMPL(::sirius::log::level::critical, __VA_ARGS__)
 #else
 #define SIRIUS_LOG_FATAL(...) ((void)0)
 #endif
