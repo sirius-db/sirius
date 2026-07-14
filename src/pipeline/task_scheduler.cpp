@@ -175,17 +175,9 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 std::future<void> task_scheduler::start_query()
 {
   std::scoped_lock lock(_query_mutex);
-  const auto& scans        = _query->get_scan_operators();
-  const auto& source_roots = _query->get_source_roots();
-  if (scans.empty() && source_roots.empty()) {
-    throw std::runtime_error(
-      "task_scheduler::start_query: query has no scan or source-root operators to bootstrap");
-  }
+  const auto& scans = _query->get_scan_operators();
 
-  if (!scans.empty()) { _task_creator->schedule(scans.front()); }
-  for (auto* root : source_roots) {
-    _task_creator->schedule(root);
-  }
+  _task_creator->schedule(scans.front());
 
   return _completion_handler->get_awaitable();
 }

@@ -86,37 +86,6 @@ struct scoped_current_device_resource {
 
 }  // namespace
 
-std::unique_ptr<any_cuvs_index> build_ivf_flat_index(cudf::column_view const& vectors,
-                                                     std::int64_t dim,
-                                                     std::uint32_t n_lists,
-                                                     cuvs::distance::DistanceType metric,
-                                                     rmm::device_async_resource_ref index_mr)
-{
-  // Zero-copy row-major view over the dataset
-  auto const dataset = list_column_as_dataset_view(vectors, dim);
-
-  cuvs::neighbors::ivf_flat::index_params index_params;
-  index_params.n_lists = n_lists;
-  index_params.metric  = metric;
-
-  // Allocate the index (and its build-time scratch) through the reservation's
-  // resource so the whole thing lives in Sirius-reserved GPU memory. The handle
-  // is constructed inside the guard so RAFT's workspace resource is the
-  // reservation's too, not just the per-allocation default. The scope ends after
-  // the build, restoring the prior current device resource.
-  auto index = [&] {
-    scoped_current_device_resource route{index_mr};
-    raft::device_resources res;
-    auto built = cuvs::neighbors::ivf_flat::build(res, index_params, dataset);
-    // Synchronous contract: the index is fully resident before we restore the
-    // resource and return (the dataset view borrows caller memory only for here).
-    raft::resource::sync_stream(res);
-    return built;
-  }();
-
-  return make_cuvs_index(std::move(index));
-}
-
 std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
   std::vector<cudf::column_view> const& chunks,
   std::int64_t dim,
@@ -134,6 +103,11 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
   // Train the kmeans centroids only; the dataset is added chunk by chunk.
   index_params.add_data_on_build = false;
 
+  // Allocate the index (and its build-time scratch) through the reservation's
+  // resource so the whole thing lives in Sirius-reserved GPU memory. The handle
+  // is constructed inside the guard so RAFT's workspace resource is the
+  // reservation's too, not just the per-allocation default. The scope ends after
+  // the build, restoring the prior current device resource.
   auto index = [&] {
     scoped_current_device_resource route{index_mr};
     raft::device_resources res;
@@ -174,6 +148,8 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
       }
       base += rows;
     }
+    // Synchronous contract: the index is fully resident before we restore the
+    // resource and return (the dataset view borrows caller memory only for here).
     raft::resource::sync_stream(res);
     return idx;
   }();
@@ -214,7 +190,7 @@ ann_search_result search_ivf_flat_index(any_cuvs_index const& index,
   auto distances_view = raft::make_device_matrix_view<float, int64_t, raft::row_major>(
     distances_col->mutable_view().data<float>(), int64_t{1}, k);
 
-  raft::device_resources res;
+  raft::device_resources res{stream};
   cuvs::neighbors::ivf_flat::search_params search_params;
   search_params.n_probes = n_probes;
   cuvs::neighbors::ivf_flat::search(

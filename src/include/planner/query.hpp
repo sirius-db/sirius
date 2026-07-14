@@ -65,13 +65,6 @@ class query {
   [[nodiscard]] const duckdb::vector<op::sirius_physical_operator*>& get_scan_operators() const;
 
   /**
-   * @brief Get pure-source roots that must be handed to the task_creator to bootstrap execution.
-   *
-   * @return Reference to the vector of pure-source root operators.
-   */
-  [[nodiscard]] const duckdb::vector<op::sirius_physical_operator*>& get_source_roots() const;
-
-  /**
    * @brief Get the pipeline containing a specific physical operator.
    *
    * @param op Pointer to the physical operator to look up.
@@ -99,8 +92,6 @@ class query {
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> _pipelines;
   //! Cached scan operators in pipeline execution order
   duckdb::vector<op::sirius_physical_operator*> _scan_operators;
-  //! Pure-source roots bootstrapped directly
-  duckdb::vector<op::sirius_physical_operator*> _source_roots;
   //! Map from operator pointer to its containing pipeline
   duckdb::unordered_map<op::sirius_physical_operator*,
                         duckdb::shared_ptr<pipeline::sirius_pipeline>>

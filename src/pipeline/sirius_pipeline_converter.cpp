@@ -54,8 +54,6 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
-#include "op/sirius_physical_vss_enn.hpp"
-#include "op/sirius_physical_vss_enn_merge.hpp"
 #include "sirius_config.hpp"
 
 #include <algorithm>
@@ -103,9 +101,6 @@ duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_opera
   } else if (physical_op.type == op::SiriusPhysicalOperatorType::TOP_N) {
     auto& topn_physical_op = physical_op.Cast<op::sirius_physical_top_n>();
     return duckdb::make_uniq<op::sirius_physical_top_n_merge>(&topn_physical_op);
-  } else if (physical_op.type == op::SiriusPhysicalOperatorType::ENN) {
-    auto& vss_physical_op = physical_op.Cast<op::sirius_physical_vss_enn>();
-    return duckdb::make_uniq<op::sirius_physical_vss_enn_merge>(&vss_physical_op);
   } else if (physical_op.type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
     auto& ungrouped_agg_physical_op = physical_op.Cast<op::sirius_physical_ungrouped_aggregate>();
     return duckdb::make_uniq<op::sirius_physical_ungrouped_aggregate_merge>(
@@ -459,23 +454,6 @@ void sirius_pipeline_converter::split_cpu_source(
 
   scheduled_.push_back(new_pipeline);
   inserted_operators_.push_back(std::move(cpu_source_op));
-}
-
-void sirius_pipeline_converter::split_ann_source(
-  duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
-{
-  // ANN is a pure leaf source produced directly by the planner (no child and
-  // no split_* rewrite). Unlike scans, nothing has placed it into operators[], so
-  // finalize_pipeline_structure(), which does `source = &operators[0]` after
-  // pushing the sink into operators[], would overwrite the source with
-  // the sink (RESULT_COLLECTOR). Seat it at operators[0] exactly like
-  // split_table_scan_source does for gpu_scan, so finalize restores it as source.
-  if (current_pipeline->source == nullptr ||
-      current_pipeline->source->type != op::SiriusPhysicalOperatorType::ANN_IVF_FLAT) {
-    return;
-  }
-  current_pipeline->operators.insert(current_pipeline->operators.begin(),
-                                     *current_pipeline->source);
 }
 
 void sirius_pipeline_converter::split_intermediate_joins(
@@ -862,39 +840,6 @@ void sirius_pipeline_converter::split_top_n_sink(
   inserted_operators_.push_back(std::move(merge_op));
 }
 
-void sirius_pipeline_converter::split_enn_sink(
-  duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
-  size_t pipeline_idx)
-{
-  auto enn_op   = current_pipeline->sink;
-  auto* enn_ptr = static_cast<op::sirius_physical_vss_enn*>(enn_op.get());
-
-  // Pipeline A: current pipeline keeps ENN as sink
-  scheduled_.push_back(current_pipeline);
-
-  // Create MERGE_ENN operator
-  auto merge_op = duckdb::unique_ptr<op::sirius_physical_vss_enn_merge>(
-    new op::sirius_physical_vss_enn_merge(enn_ptr));
-  auto* merge_ptr = merge_op.get();
-
-  // Pipeline B: ENN (source) -> MERGE_ENN (sink)
-  auto merge_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-  merge_pipeline->source = enn_op.get();
-  merge_pipeline->sink   = merge_ptr;
-  scheduled_.push_back(merge_pipeline);
-
-  // Update downstream pipelines to use MERGE_ENN as source
-  for (size_t j = pipeline_idx + 1; j < copied_scheduled.size(); j++) {
-    if (copied_scheduled[j]->source.get() == enn_op.get()) {
-      copied_scheduled[j]->source = merge_ptr;
-    }
-  }
-
-  // Store ownership
-  inserted_operators_.push_back(std::move(merge_op));
-}
-
 void sirius_pipeline_converter::split_delim_join_sink(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline,
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& copied_scheduled,
@@ -1018,10 +963,6 @@ void sirius_pipeline_converter::split_pipelines(
     // into a CPU_SOURCE scan pipeline (analogous to TABLE_SCAN → PARQUET_SCAN).
     split_cpu_source(current_pipeline);
 
-    // Preprocessing: seat a pure ANN source at operators[0] so finalize keeps
-    // it as the pipeline source (no-op for every other source type).
-    split_ann_source(current_pipeline);
-
     // Preprocessing: split intermediate joins (modifies current_pipeline in place)
     split_intermediate_joins(current_pipeline);
 
@@ -1037,8 +978,6 @@ void sirius_pipeline_converter::split_pipelines(
       split_order_by_sink(current_pipeline, copied_scheduled, i);
     } else if (sink_type == op::SiriusPhysicalOperatorType::TOP_N) {
       split_top_n_sink(current_pipeline, copied_scheduled, i);
-    } else if (sink_type == op::SiriusPhysicalOperatorType::ENN) {
-      split_enn_sink(current_pipeline, copied_scheduled, i);
     } else if (sink_type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
                sink_type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
       split_delim_join_sink(current_pipeline, copied_scheduled, i);
@@ -1078,7 +1017,6 @@ void sirius_pipeline_converter::compute_repository_wiring()
     if (pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_GROUP_BY ||
         pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
         pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_TOP_N ||
-        pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_ENN ||
         pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_AGGREGATE) {
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {
         emit("default", op::MemoryBarrierType::FULL, sink_op, pipeline, dependent_pipeline);
@@ -1152,7 +1090,6 @@ void sirius_pipeline_converter::compute_repository_wiring()
     } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::PARTITION ||
                pipeline->sink->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
                pipeline->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
-               pipeline->sink->type == op::SiriusPhysicalOperatorType::ENN ||
                pipeline->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
                pipeline->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
       for (auto const& dependent_pipeline : source_to_pipelines[sink_op]) {

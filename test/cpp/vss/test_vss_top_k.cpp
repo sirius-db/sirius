@@ -23,7 +23,7 @@
 #include <catch.hpp>
 
 // sirius
-#include <op/vss_top_k.hpp>
+#include <vss/enn_top_k.hpp>
 #include <vss/vss_pattern.hpp>
 
 // cudf

@@ -93,10 +93,8 @@ extern "C" int cudaProfilerStop();
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
-#include "vss/pinned_column_cache.hpp"
 #include "vss/vector_search.hpp"
 
-#include <cudf/concatenate.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -1188,8 +1186,6 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                  std::move(mat.tables),
                                  std::move(mat.chunk_memory_spaces));
   }
-  // A re-pin replaces this table's chunks, so any coalesced columns are now stale.
-  sirius_ctx->get_pinned_column_cache().erase_table(data.args.name);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));
@@ -1230,8 +1226,6 @@ void SiriusExtension::UnpinTableFunction(ClientContext& context,
     throw InvalidInputException("unpin_table requires the Sirius context to be initialized");
   }
   sirius_ctx->get_scan_manager().remove_pinned_entry(data.name);
-  // Drop any coalesced columns cached for this table so a re-pin can't reuse them.
-  sirius_ctx->get_pinned_column_cache().erase_table(data.name);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));

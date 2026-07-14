@@ -32,15 +32,15 @@ class host_data_representation;
 namespace sirius::vss {
 
 struct vector_search_request {
-  std::string table_name;    ///< GPU-pinned base table to search.
-  std::string column_name;   ///< FLOAT[dim] vector column.
-  std::string metric;        ///< Distance metric.
-  std::vector<float> query;  ///< Query vector, length == dim.
-  std::int64_t dim{0};       ///< Vector dimensionality.
-  std::int64_t k{10};        ///< Top-k neighbors to return.
+  std::string table_name;                   ///< GPU-pinned base table to search.
+  std::string column_name;                  ///< FLOAT[dim] vector column.
+  std::string metric;                       ///< Distance metric.
+  std::vector<float> query;                 ///< Query vector, length == dim.
+  std::int64_t dim{0};                      ///< Vector dimensionality.
+  std::int64_t k{10};                       ///< Top-k neighbors to return.
   std::vector<std::string> output_columns;  ///< Base-table columns to return (in order).
   bool use_index{true};                     ///< true => ann; false => enn.
-  std::int64_t n_probes{0};  ///< IVF lists to probe for ann;
+  std::int64_t n_probes{0};                 ///< IVF lists to probe for ann;
 };
 
 /// Run a single-query k-NN search over a GPU-pinned table and return the result
