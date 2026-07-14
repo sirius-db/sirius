@@ -470,8 +470,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # converters Sirius uses; it transitively links the cudf-free core
   # (cuCascade::cucascade) and cudf::cudf.
   target_include_directories(
-    ${_target} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ctrack/include)
+    ${_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ctrack/include)
   target_compile_definitions(${_target} PRIVATE CTRACK_DISABLE_EXECUTION_POLICY)
 
   target_link_libraries(
@@ -744,7 +743,8 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ctrack/include)
-target_compile_definitions(sirius_unittest PRIVATE CTRACK_DISABLE_EXECUTION_POLICY)
+target_compile_definitions(sirius_unittest
+                           PRIVATE CTRACK_DISABLE_EXECUTION_POLICY)
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static)
 link_extension_libraries(sirius_unittest "")

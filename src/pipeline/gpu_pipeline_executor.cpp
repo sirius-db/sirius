@@ -30,6 +30,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <ctrack.hpp>
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
@@ -115,11 +116,17 @@ void gpu_pipeline_executor::manager_loop()
     auto ready       = std::make_unique<task_request>();
     ready->kind      = task_request_kind::device_ready;
     ready->device_id = _memory_space->get_device_id();
-    if (!_task_request_publisher.send(std::move(ready))) {
-      SIRIUS_LOG_INFO("GPU Pipeline Executor: task_request channel closed, stopping manager loop");
-      break;
+
+    std::unique_ptr<parallel::itask> pipeline_task = nullptr;
+    {
+      CTRACK_NAME("request_rtt");
+      if (!_task_request_publisher.send(std::move(ready))) {
+        SIRIUS_LOG_INFO(
+          "GPU Pipeline Executor: task_request channel closed, stopping manager loop");
+        break;
+      }
+      pipeline_task = _task_queue.pop();  // block till a task is available
     }
-    auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;

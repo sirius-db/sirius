@@ -379,10 +379,10 @@ void task_scheduler::management_eventloop()
         });
       }
 
-      // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
-      // load-bearing — verification greps depend on it.
-      SIRIUS_LOG_INFO(
-        "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
+      // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
+      // // load-bearing — verification greps depend on it.
+      // SIRIUS_LOG_INFO(
+      //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
       _gpu_executors.at(device_id)->schedule(std::move(task));
       it = _ready_devices.erase(it);
     }

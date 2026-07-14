@@ -260,9 +260,9 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
       continue;
     }
     if (hint.value().hint == op::TaskCreationHint::READY) {
-      SIRIUS_LOG_INFO("Task Creator: scheduling lookahead for operator {} (id {})",
-                      node->get_name(),
-                      node->get_operator_id());
+      SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
+                       node->get_name(),
+                       node->get_operator_id());
       auto request  = std::make_unique<task_creation_request>();
       request->node = node;
       request->type = request_type::lookahead;
