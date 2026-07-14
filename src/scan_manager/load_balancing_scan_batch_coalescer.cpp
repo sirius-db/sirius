@@ -93,9 +93,9 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
     auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
     auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
-    SIRIUS_LOG_INFO("[coalesce-debug] load_balancer emit pipeline={} -> preferred GPU {}",
-                    state.pipeline_id,
-                    dev_id.has_value() ? dev_id.value() : -1);
+    SIRIUS_LOG_DEBUG("[coalesce-debug] load_balancer emit pipeline={} -> preferred GPU {}",
+                     state.pipeline_id,
+                     dev_id.has_value() ? dev_id.value() : -1);
     if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
 
     auto fadvise_hints = op_data->get_fadvise_hints();
