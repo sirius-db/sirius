@@ -18,10 +18,10 @@
 
 #include <cudf/column/column.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
-
-#include <rmm/cuda_device.hpp>
 
 #include <utility>
 

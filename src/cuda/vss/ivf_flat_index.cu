@@ -25,13 +25,20 @@
 #include <raft/core/device_resources.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 
+#include <rmm/device_uvector.hpp>
+#include <rmm/exec_policy.hpp>
+
 #include <cuda/memory_resource>
+#include <thrust/sequence.h>
 
 #include <cuvs/neighbors/ivf_flat.hpp>
 
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius::vss {
 
@@ -105,6 +112,70 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index(cudf::column_view const& ve
     // resource and return (the dataset view borrows caller memory only for here).
     raft::resource::sync_stream(res);
     return built;
+  }();
+
+  return make_cuvs_index(std::move(index));
+}
+
+std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
+  std::vector<cudf::column_view> const& chunks,
+  std::int64_t dim,
+  std::uint32_t n_lists,
+  cuvs::distance::DistanceType metric,
+  rmm::device_async_resource_ref index_mr)
+{
+  if (chunks.empty()) {
+    throw std::invalid_argument("build_ivf_flat_index_from_chunks: no chunks to index");
+  }
+
+  cuvs::neighbors::ivf_flat::index_params index_params;
+  index_params.n_lists = n_lists;
+  index_params.metric  = metric;
+  // Train the kmeans centroids only; the dataset is added chunk by chunk.
+  index_params.add_data_on_build = false;
+
+  auto index = [&] {
+    scoped_current_device_resource route{index_mr};
+    raft::device_resources res;
+    auto const stream = raft::resource::get_cuda_stream(res);
+
+    // Centroids are trained on the first non-empty chunk.
+    // NOTE: could improve recall if we do a cross-chunk training sample
+    cudf::column_view const* train_chunk = nullptr;
+    for (auto const& chunk : chunks) {
+      if (chunk.size() > 0) {
+        train_chunk = &chunk;
+        break;
+      }
+    }
+    if (train_chunk == nullptr) {
+      throw std::invalid_argument("build_ivf_flat_index_from_chunks: all chunks are empty");
+    }
+    auto const train_view = list_column_as_dataset_view(*train_chunk, dim);
+    auto idx              = cuvs::neighbors::ivf_flat::build(res, index_params, train_view);
+
+    // Populate the index chunk by chunk, tagging each vector with its global row id
+    // (offset by the rows already added) so search returns dataset-global indices.
+    std::int64_t base = 0;
+    for (auto const& chunk : chunks) {
+      auto const chunk_view = list_column_as_dataset_view(chunk, dim);
+      auto const rows       = chunk_view.extent(0);
+      if (rows == 0) { continue; }
+      if (base == 0) {
+        // Index is still empty: nullopt implies the contiguous range [0, rows).
+        cuvs::neighbors::ivf_flat::extend(res, chunk_view, std::nullopt, &idx);
+      } else {
+        rmm::device_uvector<std::int64_t> ids(static_cast<std::size_t>(rows), stream, index_mr);
+        thrust::sequence(rmm::exec_policy(stream), ids.begin(), ids.end(), base);
+        auto const ids_view =
+          raft::make_device_vector_view<const std::int64_t, std::int64_t>(ids.data(), rows);
+        cuvs::neighbors::ivf_flat::extend(res, chunk_view, std::optional{ids_view}, &idx);
+        // ids is freed async on `stream` at scope exit, ordered after this extend.
+      }
+      base += rows;
+    }
+    raft::resource::sync_stream(res);
+    return idx;
   }();
 
   return make_cuvs_index(std::move(index));
