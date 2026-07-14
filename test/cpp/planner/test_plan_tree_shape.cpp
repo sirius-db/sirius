@@ -335,20 +335,24 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - CPU-source plans are rejected toward CPU fallback",
+                 "plan tree shape - materialized sources are replaced by GPU_VALUES",
                  "[plan_tree_shape][isolated_context]")
 {
-  // Each needs a CPU-materialized source, which nothing executes, so plan generation
-  // must throw — transparent interception catches this and keeps DuckDB's CPU plan.
-  // The delim-join internals stay accepted (covered by the delim-join cases above).
+  auto require_gpu_values_source = [&](const std::string& query) {
+    auto plan = generate_sirius_plan(*con, query);
+    INFO(tree_to_string(plan.get()));
+
+    auto gpu_values = collect(plan.get(), SiriusPhysicalOperatorType::GPU_VALUES);
+    REQUIRE(gpu_values.size() == 1);
+    CHECK(gpu_values.front()->children.empty());
+  };
 
   // VALUES -> COLUMN_DATA_SCAN holding a materialized collection.
-  CHECK_THROWS_AS(generate_sirius_plan(*con, "VALUES (1), (2)"), duckdb::NotImplementedException);
+  require_gpu_values_source("VALUES (1), (2)");
   // No-table SELECT -> DUMMY_SCAN.
-  CHECK_THROWS_AS(generate_sirius_plan(*con, "SELECT 40 + 2"), duckdb::NotImplementedException);
+  require_gpu_values_source("SELECT 40 + 2");
   // Provably-empty scan -> EMPTY_RESULT.
-  CHECK_THROWS_AS(generate_sirius_plan(*con, "SELECT val FROM big_left WHERE 1 = 0"),
-                  duckdb::NotImplementedException);
+  require_gpu_values_source("SELECT val FROM big_left WHERE 1 = 0");
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
