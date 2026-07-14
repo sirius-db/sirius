@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use instrumentation_model::{SiriusEvent, task};
+use instrumentation_model::{SiriusEvent, batch, task};
 use quent_time::TimeUnixNanoSec;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -35,6 +35,7 @@ use quent_simulator_ui::EntityRef;
 use uuid::Uuid;
 
 use crate::{
+    batch::{Batch, BatchBuilder},
     task::{Task, TaskBuilder, TaskExt},
     view::SiriusModelQueryView,
 };
@@ -43,6 +44,10 @@ const TASK_QUEUE_TYPE_NAME: &str = "task_queue";
 const TASK_MANAGER_LOOP_THREAD_TYPE_NAME: &str = "task_manager_loop_thread";
 const EXECUTOR_THREAD_TYPE_NAME: &str = "executor_thread";
 const QUEUE_ENTRIES_CAPACITY_NAME: &str = "capacity_entries";
+/// Type name of the MemoryTier resources as recorded by the model.
+pub(crate) const MEMORY_TIER_TYPE_NAME: &str = "memory_tier";
+/// Capacity name of the MemoryTier `bytes` capacity as recorded by the model.
+pub(crate) const MEMORY_TIER_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
 
 fn validate_resource_type(actual: &str, expected: &str, id: Uuid) -> AnalyzerResult<()> {
     if actual == expected {
@@ -70,6 +75,13 @@ fn insert_task_resource_types(resources: &mut InMemoryResources) {
         EXECUTOR_THREAD_TYPE_NAME.to_string(),
         ResourceTypeDecl::unit(EXECUTOR_THREAD_TYPE_NAME),
     );
+    resources.resource_types.insert(
+        MEMORY_TIER_TYPE_NAME.to_string(),
+        ResourceTypeDecl::new(
+            MEMORY_TIER_TYPE_NAME,
+            [CapacityDecl::new_occupancy(MEMORY_TIER_BYTES_CAPACITY_NAME)],
+        ),
+    );
 }
 
 /// A model of the simulator engine
@@ -77,6 +89,7 @@ pub struct SiriusModel {
     pub(crate) query_engine: InMemoryQueryEngineModel,
     pub(crate) arbitrary_resources: InMemoryResources,
     pub(crate) tasks: HashMap<Uuid, Task>,
+    pub(crate) batches: HashMap<Uuid, Batch>,
     pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
 }
 
@@ -250,9 +263,65 @@ impl ResourceCollection for SiriusModel {
     }
 }
 
+/// A usage from either a Task or a Batch FSM. Unifies the two distinct opaque
+/// `impl Usage` types so [`SiriusModel::usages`] can chain them.
+enum EitherUsage<A, B> {
+    Task(A),
+    Batch(B),
+}
+
+enum EitherIter<A, B> {
+    Task(A),
+    Batch(B),
+}
+
+impl<I, A: Iterator<Item = I>, B: Iterator<Item = I>> Iterator for EitherIter<A, B> {
+    type Item = I;
+    fn next(&mut self) -> Option<I> {
+        match self {
+            EitherIter::Task(iter) => iter.next(),
+            EitherIter::Batch(iter) => iter.next(),
+        }
+    }
+}
+
+impl<'a, A: Usage<'a>, B: Usage<'a>> Usage<'a> for EitherUsage<A, B> {
+    fn entity_id(&self) -> Uuid {
+        match self {
+            EitherUsage::Task(usage) => usage.entity_id(),
+            EitherUsage::Batch(usage) => usage.entity_id(),
+        }
+    }
+    fn resource_id(&self) -> Uuid {
+        match self {
+            EitherUsage::Task(usage) => usage.resource_id(),
+            EitherUsage::Batch(usage) => usage.resource_id(),
+        }
+    }
+    fn capacities(&self) -> impl Iterator<Item = &'a CapacityValue> {
+        match self {
+            EitherUsage::Task(usage) => EitherIter::Task(usage.capacities()),
+            EitherUsage::Batch(usage) => EitherIter::Batch(usage.capacities()),
+        }
+    }
+    fn span(&self) -> quent_time::span::SpanUnixNanoSec {
+        match self {
+            EitherUsage::Task(usage) => usage.span(),
+            EitherUsage::Batch(usage) => usage.span(),
+        }
+    }
+}
+
 impl Using for SiriusModel {
     fn usages(&self) -> impl Iterator<Item = impl Usage<'_>> {
-        self.tasks.values().flat_map(|task| task.usages())
+        self.tasks
+            .values()
+            .flat_map(|task| task.usages().map(EitherUsage::Task))
+            .chain(
+                self.batches
+                    .values()
+                    .flat_map(|batch| batch.usages().map(EitherUsage::Batch)),
+            )
     }
 }
 
@@ -260,6 +329,7 @@ pub struct SiriusModelBuilder {
     query_engine: InMemoryQueryEngineModelBuilder,
     arbitrary_resources: InMemoryResourcesBuilder,
     tasks: HashMap<Uuid, TaskBuilder>,
+    batches: HashMap<Uuid, BatchBuilder>,
 }
 
 impl SiriusModelBuilder {
@@ -268,6 +338,7 @@ impl SiriusModelBuilder {
             query_engine: InMemoryQueryEngineModelBuilder::try_new(engine_id)?,
             arbitrary_resources: InMemoryResourcesBuilder::default(),
             tasks: HashMap::default(),
+            batches: HashMap::default(),
         })
     }
 
@@ -320,7 +391,54 @@ impl SiriusModelBuilder {
                 self.push_task_manager_loop_thread(id, timestamp, e)
             }
             SiriusEvent::ExecutorThread(e) => self.push_executor_thread(id, timestamp, e),
+            SiriusEvent::Batch(b) => {
+                let batch_builder = self
+                    .batches
+                    .entry(id)
+                    .or_insert_with(|| BatchBuilder::try_new(id).unwrap());
+                batch_builder.push(Event::new(id, timestamp, b));
+                Ok(())
+            }
+            SiriusEvent::MemoryTier(e) => self.push_memory_tier(id, timestamp, e),
         }
+    }
+
+    fn push_memory_tier(
+        &mut self,
+        id: Uuid,
+        timestamp: TimeUnixNanoSec,
+        event: batch::MemoryTierEvent,
+    ) -> AnalyzerResult<()> {
+        use batch::MemoryTierTransition;
+        match event.state {
+            MemoryTierTransition::MemoryTierInitializing(init) => {
+                validate_resource_type(&init.resource_type_name, MEMORY_TIER_TYPE_NAME, id)?;
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Init(timestamp));
+                builder.set_type_name(init.resource_type_name);
+                builder.set_instance_name(Some(init.instance_name));
+                builder.set_parent_group_id(init.parent_group_id);
+            }
+            MemoryTierTransition::MemoryTierOperating(operating) => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Operating(
+                    timestamp,
+                    ResourceCapacities(vec![CapacityValue::new(
+                        MEMORY_TIER_BYTES_CAPACITY_NAME,
+                        operating.capacity_bytes.value.unwrap_or(0),
+                    )]),
+                ));
+            }
+            MemoryTierTransition::MemoryTierFinalizing(_) => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Finalizing(timestamp));
+            }
+            MemoryTierTransition::Exit => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Exit(timestamp));
+            }
+        }
+        Ok(())
     }
 
     fn push_task_queue(
@@ -473,12 +591,33 @@ impl SiriusModelBuilder {
             tasks.insert(task_id, task);
         }
 
+        let mut batches = HashMap::default();
+        for (batch_id, batch_builder) in self.batches.into_iter() {
+            let batch = batch_builder.try_build()?;
+            for usage in batch.usages() {
+                let resource_type_name = resources
+                    .resource(usage.resource_id())?
+                    .type_name()
+                    .to_owned();
+                let set = &mut resources
+                    .resource_types
+                    .get_mut(&resource_type_name)
+                    .unwrap()
+                    .used_by;
+                if !set.contains(batch.type_name()) {
+                    set.insert(batch.type_name().to_owned());
+                }
+            }
+            batches.insert(batch_id, batch);
+        }
+
         // Construct the model without group type decls being populated yet, we
         // will populate it based on the resource tree.
         let temp_model = SiriusModel {
             query_engine,
             arbitrary_resources: resources,
             tasks,
+            batches,
             resource_group_types: HashMap::default(),
         };
         let mut resource_group_types = derive_resource_group_types(&temp_model)?;
@@ -502,6 +641,7 @@ impl SiriusModelBuilder {
             query_engine: temp_model.query_engine,
             arbitrary_resources: temp_model.arbitrary_resources,
             tasks: temp_model.tasks,
+            batches: temp_model.batches,
             resource_group_types,
         })
     }

@@ -26,6 +26,7 @@ use quent_simulator_ui::EntityRef;
 use uuid::Uuid;
 
 use crate::{
+    batch::{Batch, BatchExt},
     model::SiriusModel,
     task::{Task, TaskExt},
 };
@@ -42,6 +43,7 @@ pub(crate) struct SiriusModelQueryView<'a> {
     resources: HashMap<Uuid, &'a RtResource>,
     resource_groups: HashMap<Uuid, &'a RtResourceGroup>,
     tasks: HashMap<Uuid, &'a Task>,
+    batches: HashMap<Uuid, &'a Batch>,
 }
 
 impl<'a> SiriusModelQueryView<'a> {
@@ -85,6 +87,7 @@ impl<'a> SiriusModelQueryView<'a> {
             resource_groups,
             resources,
             tasks: HashMap::default(),
+            batches: HashMap::default(),
         };
 
         let pipeline_ids = result
@@ -100,6 +103,16 @@ impl<'a> SiriusModelQueryView<'a> {
                     .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
             })
             .map(|task| (task.id(), task))
+            .collect();
+        result.batches = model
+            .batches
+            .values()
+            .filter(|batch| {
+                batch
+                    .pipeline_uuid()
+                    .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
+            })
+            .map(|batch| (batch.id(), batch))
             .collect();
         Ok(result)
     }
@@ -143,6 +156,10 @@ impl<'a> SiriusModelQueryView<'a> {
 
     pub(crate) fn tasks(&self) -> impl Iterator<Item = &'a Task> + '_ {
         self.tasks.values().copied()
+    }
+
+    pub(crate) fn batches(&self) -> impl Iterator<Item = &'a Batch> + '_ {
+        self.batches.values().copied()
     }
 
     pub(crate) fn runtime_resources(&self) -> impl Iterator<Item = &'a RtResource> + '_ {

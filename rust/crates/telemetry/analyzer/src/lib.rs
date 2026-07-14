@@ -1,12 +1,22 @@
 use instrumentation_model::{Sirius, SiriusEvent};
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
-use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
-use quent_query_engine_ui::{OperatorFilter, QueryBundle, QueryEntities, QueryFilter};
+use quent_query_engine_analyzer::{
+    entities,
+    ui::{QuentViewer, UiAnalyzer, ViewerEventStream},
+};
+use quent_query_engine_ui::{
+    OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
+    data_flow::{DataFlowTimelineBinned, DataFlowTimelineResponse},
+};
 use quent_ui::{
     FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
-    quantity::QuantitySpec,
+    quantity::{CapacityKind, QuantitySpec},
     timeline::{
+        distribution::{
+            DimensionKeyDecl, DistributionDecl, DistributionSeries, DistributionTimelineRequest,
+            MeasureDecl,
+        },
         request::{
             BulkChunkedTimelineRequest, BulkTimelineRequest, EntityFilter, SingleTimelineRequest,
             TimelineRequest,
@@ -25,31 +35,44 @@ use tracing::debug;
 
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, Span,
-    fsm::{FsmTypeDeclaration, FsmUsages},
+    fsm::{FsmTypeDeclaration, FsmUsages, Transition},
     resource::{
         ResourceGroup, ResourceTypeDecl, Usage, Using, collection::ResourceCollection,
         tree::ResourceTreeNode,
     },
-    timeline::binned::resource::{
-        ResourceTimeline, ResourceTimelineBuilder, ResourceTimelineByKey,
-        ResourceTimelineByKeyBuilder,
+    timeline::binned::{
+        distribution::{DistributionKey, DistributionTimelineBuilder},
+        resource::{
+            ResourceTimeline, ResourceTimelineBuilder, ResourceTimelineByKey,
+            ResourceTimelineByKeyBuilder,
+        },
     },
 };
-use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, to_nanosecs, to_secs};
+use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanosecs, to_secs};
 use quent_simulator_ui::EntityRef;
 use uuid::Uuid;
 
 use crate::{
-    model::{SiriusModel, SiriusModelBuilder},
+    batch::{Batch, BatchExt},
+    model::{MEMORY_TIER_TYPE_NAME, SiriusModel, SiriusModelBuilder},
     task::{Task, TaskExt},
     view::SiriusModelQueryView,
 };
 
+pub mod batch;
 pub mod model;
 pub mod task;
+#[cfg(test)]
+mod tests;
 pub mod view;
 
 const TASK_TYPE_NAME: &str = "task";
+/// Data-flow measure counting batches residing in each (state, tier) cell.
+const MEASURE_COUNT: &str = "count";
+/// Data-flow measure summing batch bytes held in each (state, tier) cell.
+const MEASURE_BYTES: &str = "bytes";
+/// The memory tiers in stable stacking/legend order.
+const MEMORY_TIER_ORDER: [&str; 3] = ["GPU", "HOST", "DISK"];
 
 /// `quent-open` viewer entry: renders Sirius events with [`SiriusUiAnalyzer`].
 pub struct Viewer;
@@ -59,7 +82,7 @@ impl QuentViewer for Viewer {
 
     fn import_events(
         dir: &std::path::Path,
-    ) -> quent_model::exporter::ImporterResult<ViewerEventStream<Self::Analyzer>> {
+    ) -> quent_model::io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
         Sirius::import_events(dir)
     }
 }
@@ -117,6 +140,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             resource_types = model.arbitrary_resources.resource_types.len(),
             resource_group_types = model.resource_group_types.len(),
             tasks = model.tasks.len(),
+            batches = model.batches.len(),
         );
 
         Ok(Self { model })
@@ -203,7 +227,13 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .collect();
 
         let task_decl = Task::fsm_type_declaration();
-        let fsm_types = [(task_decl.name.clone(), task_decl)].into_iter().collect();
+        let batch_decl = Batch::fsm_type_declaration();
+        let fsm_types = [
+            (task_decl.name.clone(), task_decl),
+            (batch_decl.name.clone(), batch_decl),
+        ]
+        .into_iter()
+        .collect();
 
         let entities = QueryEntities {
             engine,
@@ -241,6 +271,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             unique_operator_names,
             quantity_specs: [
                 ("capacity_entries".into(), QuantitySpec::unit()),
+                ("capacity_bytes".into(), QuantitySpec::bytes()),
                 ("unit".into(), QuantitySpec::unit()),
             ]
             .into(),
@@ -251,6 +282,52 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
     fn query_engine_model(&self) -> &impl QueryEngineModel {
         &self.model
+    }
+
+    fn list_entities(
+        &self,
+        request: quent_ui::entities::request::EntityListRequest<QueryFilter, OperatorFilter>,
+    ) -> AnalyzerResult<quent_ui::entities::response::EntityListResponse> {
+        let query_id = request.app_params.query_id;
+        let epoch = self.query_engine_model().query_epoch(query_id)?;
+        let entry = request.entry;
+        let window = entry.window.try_into_span(epoch)?;
+        let scope = entry
+            .filter
+            .scope
+            .as_ref()
+            .map(|s| s.resolve(&self.model))
+            .transpose()?;
+        let operator_filter = entry.application.operator_id;
+
+        // Restrict candidates to the requested query: a task belongs to a query
+        // iff its pipeline (== quent operator) is one of that query's
+        // operators. Without this, tasks from a different query sharing a
+        // resource and overlapping the window would leak in.
+        let query_operators: HashSet<Uuid> = self
+            .model
+            .query_view(query_id)?
+            .operators()
+            .map(|op| op.id())
+            .collect();
+
+        entities::list_entities(
+            &self.model,
+            |task| {
+                task.pipeline_uuid().is_some_and(|pipeline_uuid| {
+                    query_operators.contains(&pipeline_uuid)
+                        && operator_filter.is_none_or(|filter| pipeline_uuid == filter)
+                })
+            },
+            entities::ListQuery {
+                scope: scope.as_ref(),
+                window,
+                filter: &entry.filter,
+                sort: entry.sort,
+                page: entry.page,
+                epoch,
+            },
+        )
     }
 
     // TODO(johanpel): consider reusing the bulk request API with a single entry for requests like this.
@@ -698,6 +775,178 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .collect::<AnalyzerResult<std::collections::HashMap<_, _>>>()?;
 
         Ok(BulkChunkedTimelinesResponse { entries })
+    }
+
+    fn data_flow_timeline(
+        &self,
+        request: DistributionTimelineRequest<QueryFilter>,
+    ) -> AnalyzerResult<DataFlowTimelineResponse> {
+        // Datasets recorded before Batch instrumentation existed have no batch
+        // events; report the feature as unsupported so the UI hides the view.
+        if self.model.batches.is_empty() {
+            return Ok(DataFlowTimelineResponse::Unsupported);
+        }
+
+        let query_id = request.app_params.query_id;
+        let epoch = self.query_engine_model().query_epoch(query_id)?;
+        let config = request.config.try_into_binned_span(epoch)?;
+
+        // Which of the declared measures to compute; empty means all.
+        let want =
+            |name: &str| request.measures.is_empty() || request.measures.iter().any(|m| m == name);
+        let want_count = want(MEASURE_COUNT);
+        let want_bytes = want(MEASURE_BYTES);
+        if !want_count && !want_bytes {
+            return Err(AnalyzerError::InvalidArgument(format!(
+                "unknown measures {:?}; declared measures are '{MEASURE_COUNT}' and '{MEASURE_BYTES}'",
+                request.measures
+            )));
+        }
+
+        let view = self.model.query_view(query_id)?;
+
+        // The dimension of the distribution is the memory tier a batch resides
+        // in: the instance name ("GPU"/"HOST"/"DISK") of the memory_tier-typed
+        // resource its state's tier usage points at.
+        let tier_names: HashMap<Uuid, &str> = self
+            .model
+            .arbitrary_resources
+            .resources()
+            .filter(|r| r.type_name() == MEMORY_TIER_TYPE_NAME)
+            .map(|r| (r.id(), r.instance_name()))
+            .collect();
+
+        let mut builder = DistributionTimelineBuilder::<Uuid>::new(config);
+        // The view's batches are already restricted to this query's operators.
+        for batch in view.batches() {
+            let Some(operator_id) = batch.pipeline_uuid() else {
+                continue;
+            };
+            // Walk state spans: state `i` spans transition `i` to `i + 1`. Use
+            // raw transitions rather than `usages_with_state_names` so a tier
+            // change (self-transition with a different tier usage) splits the
+            // state's residency across both dimension keys.
+            for pair in batch.transitions().windows(2) {
+                let (from, to) = (&pair[0], &pair[1]);
+                let Ok(span) = SpanNanoSec::try_new(from.timestamp(), to.timestamp()) else {
+                    continue;
+                };
+                let state = from.name();
+                // States without a tier usage (terminal batch_consumed) hold no
+                // residency and contribute to no dimension key.
+                let Some(tier_usage) = from
+                    .usages
+                    .iter()
+                    .find(|u| tier_names.contains_key(&u.resource_id))
+                else {
+                    continue;
+                };
+                let dimension = tier_names[&tier_usage.resource_id];
+                if want_count {
+                    builder.try_push(
+                        DistributionKey {
+                            series: operator_id,
+                            measure: MEASURE_COUNT,
+                            state,
+                            dimension,
+                        },
+                        span,
+                        1.0,
+                    )?;
+                }
+                if want_bytes {
+                    let bytes: u64 = tier_usage
+                        .capacities
+                        .iter()
+                        .filter(|c| c.name == crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME)
+                        .filter_map(|c| c.value)
+                        .sum();
+                    if bytes > 0 {
+                        builder.try_push(
+                            DistributionKey {
+                                series: operator_id,
+                                measure: MEASURE_BYTES,
+                                state,
+                                dimension,
+                            },
+                            span,
+                            bytes as f64,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Pivot the flat aggregation into per-operator nested series. All-zero
+        // series (e.g. from zero-duration states) are omitted; the protocol
+        // treats absent entries as all-zero bins.
+        let mut operators: StdHashMap<Uuid, DistributionSeries> = StdHashMap::new();
+        for (key, bins) in builder.build().data {
+            if bins.iter().all(|v| *v == 0.0) {
+                continue;
+            }
+            operators
+                .entry(key.series)
+                .or_default()
+                .values
+                .entry(key.measure.to_owned())
+                .or_default()
+                .entry(key.state.to_owned())
+                .or_default()
+                .insert(key.dimension.to_owned(), bins);
+        }
+
+        // Declare the dimension keys in stable GPU/HOST/DISK stacking order,
+        // restricted to the tiers actually present in this model. Unexpected
+        // tier names (none are recorded today) sort after the known ones so
+        // every pushed dimension stays declared.
+        let present_tiers: HashSet<&str> = tier_names.values().copied().collect();
+        let mut ordered_tiers: Vec<&str> = MEMORY_TIER_ORDER
+            .into_iter()
+            .filter(|tier| present_tiers.contains(tier))
+            .collect();
+        let mut unexpected_tiers: Vec<&str> = present_tiers
+            .into_iter()
+            .filter(|tier| !MEMORY_TIER_ORDER.contains(tier))
+            .collect();
+        unexpected_tiers.sort_unstable();
+        ordered_tiers.extend(unexpected_tiers);
+        let dimension_keys: Vec<DimensionKeyDecl> = ordered_tiers
+            .into_iter()
+            .map(|tier| DimensionKeyDecl {
+                key: tier.to_owned(),
+                display_name: tier.to_owned(),
+            })
+            .collect();
+
+        let mut measures = Vec::new();
+        if want_count {
+            measures.push(MeasureDecl {
+                name: MEASURE_COUNT.to_owned(),
+                display_name: "Batches".to_owned(),
+                quantity: "unit".to_owned(),
+                kind: CapacityKind::Occupancy,
+            });
+        }
+        if want_bytes {
+            measures.push(MeasureDecl {
+                name: MEASURE_BYTES.to_owned(),
+                display_name: "Batch bytes".to_owned(),
+                quantity: "capacity_bytes".to_owned(),
+                kind: CapacityKind::Occupancy,
+            });
+        }
+
+        Ok(DataFlowTimelineResponse::Binned(DataFlowTimelineBinned {
+            config: config.try_to_secs_relative(epoch)?,
+            decl: DistributionDecl {
+                entity_type_name: Batch::fsm_type_declaration().name,
+                dimension_name: "Memory Tier".to_owned(),
+                dimension_keys,
+                measures,
+            },
+            operators,
+        }))
     }
 }
 
