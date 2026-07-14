@@ -32,11 +32,13 @@ sirius_physical_dynamic_filter::sirius_physical_dynamic_filter(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
-  double gate_keep_threshold)
+  double gate_keep_threshold,
+  dynamic_filter_apply_mode mode)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::DYNAMIC_FILTER, std::move(types), estimated_cardinality),
     _filters(std::move(filters)),
-    _gate(gate_keep_threshold)
+    _gate(gate_keep_threshold),
+    _mode(mode)
 {
 }
 
@@ -69,13 +71,12 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
     auto const& ro = ro_batches[i];
     // A null result means nothing was dropped — the gate declined, or no published filter matched.
     // Forward the batch unchanged (zero-copy; its columns stay co-owned via the idle shared_ptr).
-    auto filtered =
-      apply_dynamic_filters_gated_view(sirius::get_cudf_table_view(ro),
-                                       *_filters,
-                                       _gate,
-                                       stream,
-                                       dynamic_filter_apply_mode::membership_masks_only,
-                                       ro.get_memory_space()->get_device_id());
+    auto filtered = apply_dynamic_filters_gated_view(sirius::get_cudf_table_view(ro),
+                                                     *_filters,
+                                                     _gate,
+                                                     stream,
+                                                     _mode,
+                                                     ro.get_memory_space()->get_device_id());
     if (filtered) {
       output_batches.push_back(sirius::make_data_batch(
         std::move(filtered), *ro.get_memory_space(), stream, batch_telemetry()));
