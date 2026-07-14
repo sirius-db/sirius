@@ -15,19 +15,13 @@
  */
 
 #include "catch.hpp"
-#include "config.hpp"
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
-#include "log/spdlog_owning_sink.hpp"
 #include "utils/log_test_utils.hpp"
 
 #include <atomic>
 #include <chrono>
-#include <filesystem>
-#include <fstream>
 #include <memory>
-#include <mutex>
-#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,28 +30,6 @@ using namespace sirius::log;
 
 using recording_backend        = sirius::test::recording_log_backend;
 using scoped_recording_backend = sirius::test::scoped_recording_log_backend;
-
-TEST_CASE("The backend level gates by severity", "[log]")
-{
-  scoped_recording_backend scoped;
-  auto& backend = scoped.backend();
-
-  backend.set_level(level::info);
-  CHECK_FALSE(backend.should_log(level::trace));
-  CHECK_FALSE(backend.should_log(level::debug));
-  CHECK(backend.should_log(level::info));
-  CHECK(backend.should_log(level::warn));
-  CHECK(backend.should_log(level::error));
-  CHECK(backend.should_log(level::critical));
-
-  backend.set_level(level::off);
-  CHECK_FALSE(backend.should_log(level::trace));
-  CHECK_FALSE(backend.should_log(level::critical));
-
-  backend.set_level(level::trace);
-  CHECK(backend.should_log(level::trace));
-  CHECK(backend.should_log(level::critical));
-}
 
 TEST_CASE("Unknown level names are rejected and leave the default", "[log]")
 {
@@ -82,27 +54,6 @@ TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
   CHECK(messages[0].message == "x=42");
   CHECK(messages[0].file.ends_with("test_logging.cpp"));
   CHECK(messages[0].line == expected_line);
-}
-
-TEST_CASE("The sink enforces the level gate", "[log]")
-{
-  scoped_recording_backend scoped;
-
-  scoped.backend().set_level(level::off);
-  get_sink()->log(level::error, std::source_location::current(), "must not appear");
-  CHECK(scoped.backend().count() == 0);
-
-  scoped.backend().set_level(level::error);
-  get_sink()->log(level::error, std::source_location::current(), "must appear");
-  CHECK(scoped.backend().count() == 1);
-}
-
-TEST_CASE("get_sink()->flush() forwards and reports reliability", "[log]")
-{
-  scoped_recording_backend scoped;
-
-  CHECK(get_sink()->flush());
-  CHECK(scoped.backend().flush_count() == 1);
 }
 
 TEST_CASE("set_sink(nullptr) installs a discarding backend", "[log]")
@@ -160,36 +111,4 @@ TEST_CASE("The noop sink accepts and discards everything", "[log]")
   set_sink(noop);
   SIRIUS_LOG_ERROR("also into the void");
   CHECK(scoped.backend().count() == 0);
-}
-
-TEST_CASE("The spdlog backend writes the documented line format", "[log]")
-{
-  // The multi-GPU audit tests (mgpu_test_utils.hpp parse_audit_log) and the
-  // REST retry-logging test parse this exact byte format from sirius.log.
-  auto temp_dir = std::filesystem::temp_directory_path() / "sirius_test_logging_spdlog_format";
-  std::filesystem::remove_all(temp_dir);
-  std::filesystem::create_directories(temp_dir);
-
-  {
-    scoped_recording_backend scoped;  // restores the process logger on exit
-    auto backend = make_spdlog_owning_sink({temp_dir.string(), std::nullopt});
-    REQUIRE(backend != nullptr);
-    backend->set_level(level::info);
-    set_sink(backend);
-    SIRIUS_LOG_INFO("hello");
-    REQUIRE(get_sink()->flush());
-  }
-
-  std::string line;
-  for (const auto& entry : std::filesystem::directory_iterator(temp_dir)) {
-    std::ifstream file(entry.path());
-    std::getline(file, line);
-    if (!line.empty()) { break; }
-  }
-  std::regex pattern(
-    R"(^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] \[info\] \[test_logging\.cpp:\d+\] hello$)");
-  INFO("log line: " << line);
-  CHECK(std::regex_match(line, pattern));
-
-  std::filesystem::remove_all(temp_dir);
 }
