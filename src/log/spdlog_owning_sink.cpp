@@ -57,22 +57,22 @@ class spdlog_owning_sink final : public sink {
 
     _logger = std::make_shared<spdlog::logger>(logger_name, spdlog::sinks_init_list{file_sink});
 
-    // Publish through the registry so flush_every reaches this logger. drop()
-    // first because register_logger throws on a duplicate name: set_sink rebuilds
-    // the sink (e.g. SET sirius_log_dir), and the prior instance is still
-    // registered under this name.
-    spdlog::drop(logger_name);
-    spdlog::register_logger(_logger);
-    // spdlog's periodic flusher works at second granularity.
-    if (config.flush_interval) {
-      spdlog::flush_every(std::chrono::duration_cast<std::chrono::seconds>(*config.flush_interval));
-    }
+    // We own spdlog: install as the default logger. set_default_logger swaps
+    // under a single registry lock — atomic across concurrent sink rebuilds and
+    // never throwing on a duplicate name — and registers the logger so
+    // spdlog::flush_every reaches it. flush_every works at second granularity; a
+    // 0s interval cancels any previously-armed flusher, so a nullopt disables it.
+    spdlog::set_default_logger(_logger);
+    spdlog::flush_every(config.flush_interval
+                          ? std::chrono::duration_cast<std::chrono::seconds>(*config.flush_interval)
+                          : std::chrono::seconds{0});
   }
 
-  // No destructor drop: touching spdlog's registry at process exit risks a
-  // static-destruction-order problem with spdlog's own registry singleton. On
-  // destruction the logger stays registered (harmlessly unused); spdlog flushes
-  // and reaps it at shutdown, and the next constructor's drop() clears staleness.
+  // No destructor deregistration: touching spdlog's registry at process exit
+  // risks a static-destruction-order problem with spdlog's own registry
+  // singleton. On destruction the logger stays registered (harmlessly unused);
+  // spdlog flushes and reaps it at shutdown, and the next constructor's
+  // set_default_logger replaces it.
 
   // The level lives in the spdlog logger itself — the single source of truth.
   void set_level(level lvl) override { _logger->set_level(to_spdlog_level(lvl)); }
