@@ -20,3 +20,24 @@ edition = "2024"
 cxx = "1"
 cxx-build = "1"
 sirius-sys = { path = "crates/sirius-sys" }
+
+# TEMPORARY (batch data-flow telemetry development): override the pinned quent
+# git revs with a local quent worktree carrying the new distribution-timeline
+# protocol. Remove once quent lands on main and the revs are bumped.
+[patch."https://github.com/rapidsai/quent.git"]
+quent-analyzer = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/analyzer" }
+quent-attributes = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/attributes" }
+quent-build-info = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/build-info" }
+quent-codegen = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/codegen" }
+quent-collector = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/collector/server" }
+quent-events = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/events" }
+quent-io = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/io" }
+quent-model = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/model" }
+quent-query-engine-analyzer = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/domains/query_engine/analyzer" }
+quent-query-engine-model = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/domains/query_engine/model" }
+quent-query-engine-server = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/domains/query_engine/server" }
+quent-query-engine-ui = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/domains/query_engine/ui" }
+quent-simulator-ui = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/examples/simulator/ui" }
+quent-stdlib = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/stdlib" }
+quent-time = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/time" }
+quent-ui = { path = "/home/felipe/projects/quent/.claude/worktrees/dag-data-flow-timeline-d6f6e4/crates/ui" }

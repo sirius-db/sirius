@@ -1,5 +1,6 @@
 use quent_model::{instrumentation, model};
 
+pub mod batch;
 pub mod task;
 
 model! {
@@ -16,6 +17,8 @@ model! {
         task::TaskQueue,
         task::TaskManagerLoopThread,
         task::ExecutorThread,
+        batch::Batch,
+        batch::MemoryTier,
     },
     analyzer: "sirius-telemetry-analyzer",
 }
