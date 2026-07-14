@@ -58,6 +58,38 @@ std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf)
   return fut;
 }
 
+/// Telemetry-carrying variant: the callback owns the sink (emission never
+/// depends on another object's lifetime) and classifies cancellation
+/// structurally from the settled exception.
+std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf,
+                                       std::shared_ptr<io_telemetry_sink> sink,
+                                       logical_io_record record)
+{
+  auto p   = std::make_shared<std::promise<size_t>>();
+  auto fut = p->get_future();
+  std::move(sf).install_callback(
+    [p = std::move(p), sink = std::move(sink), record](exec::try_t<size_t>&& t) mutable {
+      record.t_end_ns = io_now_ns();
+      record.outcome  = io_outcome::ok;
+      if (t.has_exception()) {
+        record.outcome = io_outcome::error;
+        try {
+          std::rethrow_exception(t.exception());
+        } catch (const std::system_error& e) {
+          if (e.code() == std::errc::operation_canceled) { record.outcome = io_outcome::cancelled; }
+        } catch (...) {
+        }
+      }
+      sink->on_logical_read(record);
+      if (t.has_exception()) {
+        p->set_exception(std::move(t).exception());
+      } else {
+        p->set_value(std::move(t).value());
+      }
+    });
+  return fut;
+}
+
 }  // namespace
 
 sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
@@ -100,11 +132,35 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
+  // The cache route stays silent until hit/miss join semantics land, so a
+  // backend-served miss can never masquerade as a cache hit.
   if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
+    return _io_ctx->cache()->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
   }
-  return _io_ctx->host_read_io(*_io_object, offset, size, dst);
+  auto* sink = _io_ctx->io_telemetry();
+  if (sink == nullptr) { return _io_ctx->host_read_io(*_io_object, offset, size, dst); }
+  const io_read_context rctx{_attribution, make_io_read_id(), _io_object->telemetry_object_id()};
+  logical_io_record record{
+    .read_id     = rctx.read_id,
+    .attribution = _attribution,
+    .route       = io_route::direct,
+    .object_id   = rctx.object_id,
+    .offset      = offset,
+    .bytes       = size,
+    .t_begin_ns  = io_now_ns(),
+  };
+  try {
+    size_t n        = _io_ctx->host_read_io(*_io_object, offset, size, dst, &rctx);
+    record.t_end_ns = io_now_ns();
+    record.outcome  = io_outcome::ok;
+    sink->on_logical_read(record);
+    return n;
+  } catch (...) {
+    record.t_end_ns = io_now_ns();
+    record.outcome  = io_outcome::error;
+    sink->on_logical_read(record);
+    throw;
+  }
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
@@ -118,14 +174,26 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    semi        = cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
-  } else {
-    semi = _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
+    return bridge_semi_to_std(
+      _io_ctx->cache()->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle));
   }
-  return bridge_semi_to_std(std::move(semi));
+  if (_io_ctx->io_telemetry() == nullptr) {
+    return bridge_semi_to_std(_io_ctx->host_read_async_io(*_io_object, offset, size, dst));
+  }
+  const io_read_context rctx{_attribution, make_io_read_id(), _io_object->telemetry_object_id()};
+  logical_io_record record{
+    .read_id     = rctx.read_id,
+    .attribution = _attribution,
+    .route       = io_route::direct,
+    .object_id   = rctx.object_id,
+    .offset      = offset,
+    .bytes       = size,
+    .t_begin_ns  = io_now_ns(),
+  };
+  return bridge_semi_to_std(_io_ctx->host_read_async_io(*_io_object, offset, size, dst, &rctx),
+                            _io_ctx->io_telemetry_shared(),
+                            record);
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -168,14 +236,28 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
-  exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    semi = cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
-  } else {
-    semi = _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
+    return bridge_semi_to_std(_io_ctx->cache()->device_read_async(
+      *_io_object, offset, size, dst, stream, &_prefetch_handle));
   }
-  return bridge_semi_to_std(std::move(semi));
+  if (_io_ctx->io_telemetry() == nullptr) {
+    return bridge_semi_to_std(
+      _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream));
+  }
+  const io_read_context rctx{_attribution, make_io_read_id(), _io_object->telemetry_object_id()};
+  logical_io_record record{
+    .read_id     = rctx.read_id,
+    .attribution = _attribution,
+    .route       = io_route::direct,
+    .object_id   = rctx.object_id,
+    .offset      = offset,
+    .bytes       = size,
+    .t_begin_ns  = io_now_ns(),
+  };
+  return bridge_semi_to_std(
+    _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream, &rctx),
+    _io_ctx->io_telemetry_shared(),
+    record);
 }
 
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const

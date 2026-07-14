@@ -23,6 +23,12 @@
 #include "io/rest/config.hpp"
 #include "io/uring/config.hpp"
 
+#include <memory>
+
+namespace sirius::io {
+class io_telemetry_sink;
+}
+
 namespace sirius::scan_manager {
 
 /**
@@ -69,6 +75,11 @@ struct scan_manager_config {
   /// Object-store credentials and endpoint consumed by the REST reactor.
   /// Empty fields disable the S3/REST backend.
   io::object_store_config object_store{};
+
+  /// Optional IO telemetry sink (io/io_telemetry.hpp), runtime-injected — not
+  /// file-settable. Null (the default) keeps the IO layer's emission points
+  /// structurally inert.
+  std::shared_ptr<io::io_telemetry_sink> io_telemetry{};
 };
 
 }  // namespace sirius::scan_manager

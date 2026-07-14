@@ -156,7 +156,7 @@ factory_type make_rest_ioctx_factory(
       rest_cfg.ca_bundle_path = config.object_store.ca_bundle_path;
       rest_cfg.tls_verify     = config.object_store.tls_verify;
       auto ctx                = std::make_shared<rest::rest_reactor::reactor_context>(
-        std::move(rest_cfg), std::move(authorizer), host_mr);
+        std::move(rest_cfg), std::move(authorizer), host_mr, config.io_telemetry);
       return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());

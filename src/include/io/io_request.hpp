@@ -25,6 +25,7 @@
 // dispatch layer splits across the reactor pool.
 
 #include "exec/semi_future.hpp"
+#include "io/io_telemetry.hpp"
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
@@ -67,6 +68,7 @@ class request_manager {
 
   ~request_manager()
   {
+    emit_backend_record();
     if (has_error()) {
       promise.set_exception(first_exception);
     } else {
@@ -78,16 +80,33 @@ class request_manager {
     }
   }
 
+  /// Must be called before the request's chunks are enqueued; the backend
+  /// record is emitted exactly once from the destructor, before the future
+  /// settles. An untracked request pays exactly one null pointer.
+  void install_telemetry(std::shared_ptr<io_telemetry_sink> sink, const io_read_context& ctx)
+  {
+    telemetry = std::make_unique<telemetry_state>(std::move(sink), ctx, io_now_ns());
+  }
+
   void chunk_complete(std::size_t n_bytes)
   {
     bytes_read.fetch_add(n_bytes, std::memory_order_acq_rel);
     chunks_completed.fetch_add(1, std::memory_order_acq_rel);
   }
 
-  void report_error(const error_type& e, std::source_location loc = std::source_location::current())
+  /// Counted at schedule time so failed requests report their retries too.
+  void note_retry() noexcept
+  {
+    if (telemetry) { telemetry->retries.fetch_add(1, std::memory_order_relaxed); }
+  }
+
+  void report_error(const error_type& e,
+                    std::source_location loc   = std::source_location::current(),
+                    io_terminal_class terminal = io_terminal_class::transport_error)
   {
     if (!error_reported.exchange(true, std::memory_order_acq_rel)) {
       first_exception = to_exception_ptr(e, loc);
+      if (telemetry) { telemetry->terminal = terminal; }
     }
   }
 
@@ -123,11 +142,43 @@ class request_manager {
     return nullptr;  // Should never reach here
   }
 
+  struct telemetry_state {
+    telemetry_state(std::shared_ptr<io_telemetry_sink> s, const io_read_context& c, uint64_t t)
+      : sink(std::move(s)), ctx(c), t_create_ns(t)
+    {
+    }
+    std::shared_ptr<io_telemetry_sink> sink;
+    io_read_context ctx;
+    uint64_t t_create_ns{0};
+    std::atomic<uint32_t> retries{0};
+    io_terminal_class terminal{io_terminal_class::transport_error};
+  };
+
+  void emit_backend_record() noexcept
+  {
+    if (!telemetry) { return; }
+    backend_io_record record{
+      .read_id          = telemetry->ctx.read_id,
+      .attribution      = telemetry->ctx.attribution,
+      .object_id        = telemetry->ctx.object_id,
+      .bytes_requested  = bytes_requested,
+      .bytes_delivered  = bytes_read.load(std::memory_order_acquire),
+      .chunks_total     = static_cast<uint32_t>(total_chunks),
+      .chunks_completed = static_cast<uint32_t>(chunks_completed.load(std::memory_order_acquire)),
+      .retries          = telemetry->retries.load(std::memory_order_relaxed),
+      .terminal         = has_error() ? telemetry->terminal : io_terminal_class::ok,
+      .t_create_ns      = telemetry->t_create_ns,
+      .t_complete_ns    = io_now_ns(),
+    };
+    telemetry->sink->on_backend_read(record);
+  }
+
   std::atomic<std::size_t> bytes_read{0};
   std::atomic<std::size_t> chunks_completed{0};
   std::atomic<bool> error_reported{false};
   std::exception_ptr first_exception{nullptr};
   exec::promise<size_t> promise;
+  std::unique_ptr<telemetry_state> telemetry;
 };
 
 struct device_cpy_request {
@@ -230,6 +281,14 @@ struct rx_request_t {
   }
 
   std::vector<std::unique_ptr<Chunk>> get_all_chunks() noexcept { return std::move(requests); }
+
+  /// Attach sink + read identity to the shared manager; no-op for empty
+  /// requests.
+  void install_telemetry(std::shared_ptr<io_telemetry_sink> sink, const io_read_context& ctx)
+  {
+    if (requests.empty() || !sink) { return; }
+    requests.front()->manager->install_telemetry(std::move(sink), ctx);
+  }
 
   exec::semi_future<size_t> get_future() noexcept
   {

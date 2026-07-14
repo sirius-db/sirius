@@ -20,6 +20,7 @@
 #include "io/cache/config.hpp"
 #include "io/cache/metadata_store.hpp"
 #include "io/cache/types.hpp"
+#include "io/io_telemetry.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -180,6 +181,14 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   [[nodiscard]] cache::prefetching_cache* cache() noexcept { return _cache.get(); }
 
+  /// Optional telemetry sink; null (the default) keeps every emission point
+  /// structurally inert.
+  [[nodiscard]] io_telemetry_sink* io_telemetry() const noexcept { return _io_telemetry.get(); }
+  [[nodiscard]] const std::shared_ptr<io_telemetry_sink>& io_telemetry_shared() const noexcept
+  {
+    return _io_telemetry;
+  }
+
   /// True iff @c host_read / @c device_read should consult the cache
   /// before falling through to the backend.  Computed live so it tracks
   /// @ref initialize_cache / @ref shutdown_cache transitions.
@@ -237,6 +246,64 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   virtual exec::semi_future<size_t> host_read_ranges_async_io(
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
 
+  // -- Telemetry-carrying read overloads ---------------------------------------
+  //
+  // Default: drop the context and forward to the plain read, so a backend that
+  // has not adopted telemetry keeps its original five methods and cannot
+  // half-attach (its sink stays null, which keeps the datasource layer inert).
+  // Adopting backends (REST) override these to thread the read identity into
+  // their request layer.
+
+  virtual size_t host_read_io(const sirius_io_object& obj,
+                              size_t offset,
+                              size_t size,
+                              uint8_t* dst,
+                              const io_read_context* /*telemetry_ctx*/)
+  {
+    return host_read_io(obj, offset, size, dst);
+  }
+
+  virtual exec::semi_future<size_t> host_read_async_io(
+    const sirius_io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    const io_read_context* /*telemetry_ctx*/) noexcept
+  {
+    return host_read_async_io(obj, offset, size, dst);
+  }
+
+  virtual exec::semi_future<size_t> device_read_async_io(
+    const sirius_io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    rmm::cuda_stream_view stream,
+    const io_read_context* /*telemetry_ctx*/) noexcept
+  {
+    return device_read_async_io(obj, offset, size, dst, stream);
+  }
+
+  virtual exec::semi_future<size_t> host_to_device_read_async_io(
+    const sirius_io_object& obj,
+    std::span<io_object_segment> slices,
+    size_t offset,
+    size_t size,
+    uint8_t* device_dst,
+    rmm::cuda_stream_view stream,
+    const io_read_context* /*telemetry_ctx*/) noexcept
+  {
+    return host_to_device_read_async_io(obj, slices, offset, size, device_dst, stream);
+  }
+
+  virtual exec::semi_future<size_t> host_read_ranges_async_io(
+    const sirius_io_object& obj,
+    std::span<io_object_segment> segments,
+    const io_read_context* /*telemetry_ctx*/) noexcept
+  {
+    return host_read_ranges_async_io(obj, segments);
+  }
+
   bool can_use_prefetching_cache() const noexcept
   {
     return supports_vector_host_read() || supports_host_to_device_read();
@@ -264,11 +331,19 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path,
                                                              std::uint64_t known_size);
 
+  /// Set once at construction; never mutated afterwards.
+  void set_io_telemetry(std::shared_ptr<io_telemetry_sink> sink) noexcept
+  {
+    _io_telemetry = std::move(sink);
+  }
+
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
   /// though callers are expected to drive the lifecycle explicitly so
   /// reactors stay alive while workers drain).
   std::unique_ptr<cache::prefetching_cache> _cache;
+
+  std::shared_ptr<io_telemetry_sink> _io_telemetry;
 
   /// Independent of the prefetching machinery — exposed via @c metadata_store().
   cache::metadata_store _metadata_store;

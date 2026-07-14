@@ -136,11 +136,21 @@ class sirius_datasource : public cudf::io::datasource {
 
   void prefetch(cache::prefetching_stage site);
 
+  /// Attribution carried into every record this datasource emits; must be set
+  /// before reads are issued. Copied by @c duplicate().
+  void set_io_attribution(const io_attribution& attribution) noexcept
+  {
+    _attribution = attribution;
+  }
+  void set_io_device(int device_id) noexcept { _attribution.device_id = device_id; }
+  [[nodiscard]] const io_attribution& get_io_attribution() const noexcept { return _attribution; }
+
  private:
   [[nodiscard]] bool uses_prefetching_cache();
 
   std::shared_ptr<sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius_io_object> _io_object;
+  io_attribution _attribution{};
   /// Handle of the most recent speculative/immediate insert into the
   /// prefetching cache, or empty if none was made.  fadvise(disposable)
   /// uses this to cancel still-pending work.
