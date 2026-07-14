@@ -49,8 +49,6 @@ void query::build_indices()
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::GPU_VALUES) {
         _scan_operators.push_back(source.get());
-      } else if (source->type == op::SiriusPhysicalOperatorType::ANN_IVF_FLAT) {
-        _source_roots.push_back(source.get());
       }
     }
 
@@ -67,11 +65,6 @@ void query::build_indices()
 const duckdb::vector<op::sirius_physical_operator*>& query::get_scan_operators() const
 {
   return _scan_operators;
-}
-
-const duckdb::vector<op::sirius_physical_operator*>& query::get_source_roots() const
-{
-  return _source_roots;
 }
 
 duckdb::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_physical_operator* op)

@@ -33,43 +33,14 @@
 
 namespace sirius::vss {
 
-/// Map a user metric string to the cuVS DistanceType.
-///
-/// The values are chosen to agree with what the VSS recognizer derives from the
-/// distance function (`array_distance` to L2SqrtExpanded, `array_cosine_distance`
-/// to CosineExpanded; see `vss_pattern.cpp::metric_for_function`), so a pinned
-/// index's metric compares equal during auto-route matching. Throws
-/// `std::invalid_argument` on an unknown metric.
+/// Map a user metric string to the cuVS DistanceType for ann.
 cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metric);
 
-/// Map a user metric string to the cuVS DistanceType for an exact BRUTE-FORCE
-/// search over raw vectors. Same as @ref ann_distance_type_from_metric except l2
-/// uses the Unexpanded form (`||a-b||^2` directly) to avoid catastrophic
+/// Map a user metric string to the cuVS DistanceType for enn.
+/// Same as @ref ann_distance_type_from_metric except l2 uses the
+/// Unexpanded form (`||a-b||^2` directly) to avoid catastrophic
 /// cancellation on large-magnitude vectors.
 cuvs::distance::DistanceType enn_distance_type_from_metric(std::string_view metric);
-
-/// Build an IVF-Flat index over @p vectors (a contiguous, unsliced, gap-free
-/// FLOAT32 LIST column of fixed width @p dim), allocating the index through
-/// @p index_mr, the GPU reservation's memory resource, so the whole index lives
-/// in Sirius-reserved GPU memory. The current CUDA device must already be the
-/// reservation's device. And it's synchronous so the index is fully built and
-/// resident on return.
-///
-/// Returned type-erased so callers need not name the cuVS index type; recover the
-/// concrete `ivf_flat::index<float, int64_t>` with
-/// `pinned_index_entry::index_as<...>()`. @p vectors is only read during the
-/// build (the index keeps its own copy via `add_data_on_build`).
-///
-/// \param vectors   Fixed-width FLOAT32 LIST column holding all dataset vectors.
-/// \param dim       Vector dimensionality.
-/// \param n_lists   IVF-Flat inverted-list count (1 <= n_lists <= n_rows).
-/// \param metric    Distance metric (must be IVF-Flat-supported, e.g. L2SqrtExpanded).
-/// \param index_mr  Reservation-backed device resource the index allocates through.
-std::unique_ptr<any_cuvs_index> build_ivf_flat_index(cudf::column_view const& vectors,
-                                                     std::int64_t dim,
-                                                     std::uint32_t n_lists,
-                                                     cuvs::distance::DistanceType metric,
-                                                     rmm::device_async_resource_ref index_mr);
 
 /// Build an IVF-Flat index from the dataset held as many separate FLOAT32 LIST
 /// @p chunks (each unsliced, gap-free, fixed width @p dim), without concatenating

@@ -309,8 +309,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_sort_sample.cpp
     src/op/sirius_physical_table_scan.cpp
     src/op/sirius_physical_top_n.cpp
-    src/op/sirius_physical_vss_ann_ivf_flat.cpp
-    src/op/sirius_physical_vss_enn.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
@@ -342,7 +340,6 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection_utils.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
-    src/planner/vss_pattern.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
     src/scan_manager/pinned_chunk_stats.cpp
@@ -364,8 +361,8 @@ set(EXTENSION_SOURCES
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp
     src/vss/cuvs_index_cache.cpp
+    src/vss/enn_top_k.cpp
     src/vss/pinned_column.cpp
-    src/vss/pinned_column_cache.cpp
     src/vss/vector_search.cpp
     src/vss/vector_search_ann.cpp
     src/vss/vector_search_enn.cpp)
@@ -707,8 +704,6 @@ set(TEST_SOURCES
     test/cpp/vss/test_cudf_raft_interop.cpp
     test/cpp/vss/test_ivf_flat_index.cpp
     test/cpp/vss/test_cuvs_index_cache.cpp
-    test/cpp/vss/test_pinned_column.cpp
-    test/cpp/vss/test_vss_top_k.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp

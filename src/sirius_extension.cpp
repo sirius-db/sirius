@@ -96,10 +96,8 @@ extern "C" int cudaProfilerStop();
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
-#include "vss/pinned_column_cache.hpp"
 #include "vss/vector_search.hpp"
 
-#include <cudf/concatenate.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 

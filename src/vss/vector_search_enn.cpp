@@ -15,26 +15,20 @@
  */
 
 #include "duckdb/common/exception.hpp"
-#include "op/vss_top_k.hpp"
-#include "vss/ivf_flat_index.hpp"
+#include "vss/enn_top_k.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search_internal.hpp"
-#include "vss/vss_pattern.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/types.hpp>
-
-#include <raft/core/device_mdspan.hpp>
 
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cstddef>
 #include <memory>
-#include <optional>
 #include <vector>
 
 namespace sirius::vss {
@@ -58,26 +52,9 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
     out_chunks.push_back(std::move(views));
   }
 
-  // One pattern reused across chunks. The per-chunk input table is laid out as
-  // [vector, out0, out1, ...]; the outputs are the passthroughs (input_index
-  // 1..N) followed by the distance column, matching the table function's
-  // [output_columns..., distance] schema.
-  vss_top_k_pattern pattern;
-  pattern.vector_column_index = 0;
-  pattern.query               = req.query;
-  pattern.dim                 = req.dim;
-  pattern.metric              = enn_distance_type_from_metric(req.metric);
-  for (std::size_t i = 0; i < req.output_columns.size(); ++i) {
-    pattern.output_columns.push_back(
-      {vss_output_column::kind::gather_input, static_cast<cudf::size_type>(i + 1)});
-  }
-  pattern.output_columns.push_back({vss_output_column::kind::distance, 0});
-  pattern.distance_output_index = static_cast<cudf::size_type>(req.output_columns.size());
-
-  auto const query_view = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
-    c.query_device, int64_t{1}, req.dim);
-
-  // Brute-force top-k per chunk.
+  // Brute-force top-k per chunk. The per-chunk input table is laid out as
+  // [vector, out0, out1, ...]; compute_enn_top_k returns [out0, ..., distance],
+  // matching the table function's [output_columns..., distance] schema.
   std::vector<std::unique_ptr<cudf::table>> candidates;
   candidates.reserve(n_chunks);
   for (std::size_t ci = 0; ci < n_chunks; ++ci) {
@@ -87,13 +64,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
     for (auto const& oc : out_chunks) {
       cols.push_back(oc[ci]);
     }
-    auto cand = sirius::op::compute_vss_top_k(cudf::table_view(cols),
-                                              pattern,
-                                              static_cast<std::size_t>(c.k),
-                                              0,
-                                              c.stream,
-                                              c.mr,
-                                              query_view);
+    auto cand = compute_enn_top_k(c, cudf::table_view(cols));
     if (cand->num_rows() > 0) { candidates.push_back(std::move(cand)); }
   }
 
@@ -114,12 +85,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
     combined = cudf::concatenate(views, c.stream, c.mr);
   }
 
-  auto merged = sirius::op::merge_vss_top_k(combined->view(),
-                                            pattern.distance_output_index,
-                                            static_cast<std::size_t>(c.k),
-                                            0,
-                                            c.stream,
-                                            c.mr);
+  auto merged = merge_enn_top_k(c, combined->view());
   return vss_result_to_host(c, std::move(merged));
 }
 
