@@ -1607,9 +1607,17 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
 }
 
+// Rebuilds the global sink from the current logging config.
+static void ReinstallLogSink()
+{
+  sirius::log::set_sink(
+    sirius::log::make_spdlog_sink(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
+}
+
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::LOG_LEVEL      = StringValue::Get(parameter);
+  Config::LOG_LEVEL = StringValue::Get(parameter);
+  // A level change only re-targets the current sink; no need to rebuild it.
   sirius::log::level lvl = sirius::log::level::info;
   sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
   if (auto sink = sirius::log::get_sink()) { sink->set_level(lvl); }
@@ -1619,13 +1627,16 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  // Rebuild the sink for the new directory, preserving the current level.
-  sirius::log::level lvl = sirius::log::level::info;
-  sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
-  auto sink = sirius::log::make_spdlog_sink({Config::LOG_DIR});
-  sink->set_level(lvl);
-  sirius::log::set_sink(std::move(sink));
+  ReinstallLogSink();
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
+}
+
+static void SetLogFlushMs(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::LOG_FLUSH_MS = UIntegerValue::Get(parameter);
+  // The flush interval is fixed at sink construction, so rebuild the sink.
+  ReinstallLogSink();
+  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_MS to {}", Config::LOG_FLUSH_MS);
 }
 
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -1845,6 +1856,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::VARCHAR,
                             Value(Config::LOG_DIR),
                             SetLogDir);
+  config.AddExtensionOption("sirius_log_flush_ms",
+                            "Interval in milliseconds between scheduled best-effort log flushes "
+                            "(0 = no scheduled flushes)",
+                            LogicalType::UINTEGER,
+                            Value::UINTEGER(Config::LOG_FLUSH_MS),
+                            SetLogFlushMs);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

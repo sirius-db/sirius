@@ -18,8 +18,12 @@
 
 #include "log/sink.hpp"
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace sirius::log {
 
@@ -27,13 +31,22 @@ namespace sirius::log {
 struct spdlog_sink_config {
   /// Directory the daily log file `sirius.log` is written to.
   std::string log_dir;
+  /// Interval between scheduled best-effort flushes; nullopt schedules none.
+  std::optional<std::chrono::milliseconds> flush_interval;
 };
 
-/// Creates a sink writing to a daily-rotated `<log_dir>/sirius.log`. The sink
-/// starts at the default level; set it with `set_level`.
+/// Creates a sink writing to a daily-rotated `<log_dir>/sirius.log`.
 ///
 /// Throws if the sink cannot be constructed, e.g. because the directory is
 /// not writable — misconfiguration must fail loudly, not silence logging.
 std::shared_ptr<sink> make_spdlog_sink(const spdlog_sink_config& config);
+
+/// Convenience overload building a spdlog sink from raw config values: writes to
+/// `<log_dir>/sirius.log`, flushes every `flush_ms` (0 = none), and sets the
+/// level named by `level_str` (unknown names default to info). Install it via
+/// set_sink.
+std::shared_ptr<sink> make_spdlog_sink(std::string_view level_str,
+                                       std::string_view log_dir,
+                                       uint32_t flush_ms);
 
 }  // namespace sirius::log

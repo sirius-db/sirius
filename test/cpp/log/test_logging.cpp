@@ -172,7 +172,7 @@ TEST_CASE("The spdlog backend writes the documented line format", "[log]")
 
   {
     scoped_recording_backend scoped;  // restores the process logger on exit
-    auto backend = make_spdlog_sink({temp_dir.string()});
+    auto backend = make_spdlog_sink({temp_dir.string(), std::nullopt});
     REQUIRE(backend != nullptr);
     backend->set_level(level::info);
     set_sink(backend);

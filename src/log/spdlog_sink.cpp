@@ -19,9 +19,14 @@
 #include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <format>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 
 namespace sirius::log {
 
@@ -42,9 +47,9 @@ spdlog::level::level_enum to_spdlog_level(level lvl)
   return spdlog::level::info;
 }
 
-/// Writes to a daily-rotated `<log_dir>/sirius.log`. The logger is kept out of
-/// spdlog's global registry so its lifetime matches this sink and registry
-/// teardown at process exit never touches it.
+/// Writes to a daily-rotated `<log_dir>/sirius.log`. Kept out of spdlog's global
+/// registry (its static state and periodic flusher would outlive this sink);
+/// periodic flushing is a sink-owned thread instead.
 class spdlog_sink final : public sink {
  public:
   explicit spdlog_sink(const spdlog_sink_config& config)
@@ -52,16 +57,32 @@ class spdlog_sink final : public sink {
     auto log_file  = std::format("{}/sirius.log", config.log_dir);
     auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
     file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
+
     _logger = std::make_shared<spdlog::logger>("sirius", spdlog::sinks_init_list{file_sink});
+
+    if (config.flush_interval) {
+      _flusher = std::jthread(
+        [logger = _logger, interval = *config.flush_interval](const std::stop_token& stop) {
+          std::mutex mutex;
+          std::condition_variable_any cv;
+          std::unique_lock lock(mutex);
+          // wait_for returns true when stop was requested (the predicate).
+          while (!cv.wait_for(lock, stop, interval, [&stop] { return stop.stop_requested(); })) {
+            logger->flush();
+          }
+        });
+    }
   }
+
+  // The implicit destructor stops and joins the flusher (jthread), then
+  // releases the logger; the file sink flushes on destruction.
 
   // The level lives in the spdlog logger itself — the single source of truth.
-  void set_level(level lvl) override { _logger->set_level(to_spdlog_level(lvl)); }
-
-  [[nodiscard]] bool should_log(level lvl) const override
-  {
-    return _logger->should_log(to_spdlog_level(lvl));
+  void set_level(level lvl) override { _logger->set_level(to_spdlog_level(lvl));
   }
+
+  [[nodiscard]] bool should_log(level lvl) const override { return
+  _logger->should_log(to_spdlog_level(lvl)); }
 
   void log(level lvl, const std::source_location& loc, std::string_view message) override
   {
@@ -79,6 +100,9 @@ class spdlog_sink final : public sink {
 
  private:
   std::shared_ptr<spdlog::logger> _logger;
+  // Declared last: joined (and thus done touching _logger) before members are
+  // destroyed.
+  std::jthread _flusher;
 };
 
 }  // namespace
@@ -89,6 +113,20 @@ std::shared_ptr<sink> make_spdlog_sink(const spdlog_sink_config& config)
   // caller so a bad `SET sirius_log_dir` fails loudly instead of silently
   // disabling logging.
   return std::make_shared<spdlog_sink>(config);
+}
+
+std::shared_ptr<sink> make_spdlog_sink(std::string_view level_str,
+                                       std::string_view log_dir,
+                                       uint32_t flush_ms)
+{
+  auto flush_interval =
+    flush_ms == 0 ? std::nullopt : std::optional{std::chrono::milliseconds{flush_ms}};
+  auto s = make_spdlog_sink(spdlog_sink_config{std::string{log_dir}, flush_interval});
+
+  level lvl = level::info;  // unknown names default to info
+  string_to_enum(level_str, lvl);
+  s->set_level(lvl);
+  return s;
 }
 
 }  // namespace sirius::log
