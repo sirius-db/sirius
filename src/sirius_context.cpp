@@ -999,8 +999,11 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
-  sirius::log::set_sink(
-    sirius::log::make_spdlog_sink(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
+  sirius::log::level lvl = sirius::log::level::info;
+  sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
+  auto sink = sirius::log::make_spdlog_sink({Config::LOG_DIR});
+  sink->set_level(lvl);
+  sirius::log::set_sink(std::move(sink));
   read_config_file_if_exists();
 }
 

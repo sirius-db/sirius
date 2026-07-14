@@ -264,11 +264,10 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
     REQUIRE_FALSE(unpin->HasError());
   }
 
-  // Force-flush the log file sink BEFORE tearing down the env. The default
-  // log flush is every 3s (Config::LOG_FLUSH_MS) and the SF1 query
-  // completes well under that, so without an explicit flush the [mgpu-audit]
-  // emissions in src/pipeline/task_scheduler.cpp:275 stay in the sink's
-  // buffer and never reach disk before parse_audit_log() reads it.
+  // Force-flush the log file sink BEFORE tearing down the env. The sink only
+  // flushes on flush()/destruction, so without this explicit flush the
+  // [mgpu-audit] emissions in src/pipeline/task_scheduler.cpp:275 stay in the
+  // sink's buffer and never reach disk before parse_audit_log() reads it.
   if (auto sink = sirius::log::get_sink()) { sink->flush(); }
 
   // Tear down the SiriusContext + DuckDB. Verbatim equivalent of

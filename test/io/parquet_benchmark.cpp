@@ -136,7 +136,9 @@ int main(int argc, char** argv)
 
   // Per-read trace goes to log/sirius.log (no backend is installed until the
   // logger is initialized; without this every log statement is dropped).
-  sirius::log::set_sink(sirius::log::make_spdlog_sink("info", "log", 0));
+  auto log_sink = sirius::log::make_spdlog_sink({"log"});
+  log_sink->set_level(sirius::log::level::info);
+  sirius::log::set_sink(std::move(log_sink));
 
   std::cout << "Source : " << argv[2] << "\n"
             << "Files  : " << paths.size() << "\n";
