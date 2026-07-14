@@ -38,6 +38,7 @@
 #include <memory>
 #include <source_location>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace sirius {
@@ -112,6 +113,62 @@ void LogFormatted(log_level level,
 }
 
 }  // namespace detail
+
+/// Free-function logging: `sirius::log::info("x={}", x)`.
+///
+/// The source location is captured automatically (it rides in the format-string
+/// argument's consteval constructor, so it can follow the variadic pack), and
+/// the format string is checked at compile time. Formatting is skipped when the
+/// level is disabled, exactly like the SIRIUS_LOG_* macros.
+///
+/// Unlike the macros, these do NOT compile out below SIRIUS_ACTIVE_LOG_LEVEL and
+/// their arguments are always evaluated at the call site — prefer the macros on
+/// hot paths where eliding argument evaluation matters.
+namespace log {
+
+namespace detail {
+
+/// A compile-time-checked format string paired with the caller's source
+/// location. `Args` are fixed by the enclosing log function (non-deduced here),
+/// so the format string is validated against the logged arguments; `location`
+/// defaults to the call site via the consteval constructor.
+template <typename... Args>
+struct format_with_location {
+  template <typename T>
+  consteval format_with_location(  // NOLINT(google-explicit-constructor): implicit by design
+    const T& format_str,
+    std::source_location loc = std::source_location::current())
+    : format{format_str}, location{loc}
+  {
+  }
+
+  std::format_string<Args...> format;
+  std::source_location location;
+};
+
+}  // namespace detail
+
+// Defines one free logging function per level, forwarding to the facade's
+// LogFormatted with the captured location. `std::type_identity_t` keeps the
+// first parameter a non-deduced context so `Args` is deduced only from the
+// trailing arguments.
+#define SIRIUS_DEFINE_LOG_FN(name, level)                                                         \
+  template <typename... Args>                                                                     \
+  void name(detail::format_with_location<std::type_identity_t<Args>...> fmt, Args&&... args)      \
+  {                                                                                               \
+    ::sirius::detail::LogFormatted(level, fmt.location, fmt.format, std::forward<Args>(args)...); \
+  }
+
+SIRIUS_DEFINE_LOG_FN(trace, log_level::trace)
+SIRIUS_DEFINE_LOG_FN(debug, log_level::debug)
+SIRIUS_DEFINE_LOG_FN(info, log_level::info)
+SIRIUS_DEFINE_LOG_FN(warn, log_level::warn)
+SIRIUS_DEFINE_LOG_FN(error, log_level::error)
+SIRIUS_DEFINE_LOG_FN(critical, log_level::critical)
+
+#undef SIRIUS_DEFINE_LOG_FN
+
+}  // namespace log
 }  // namespace sirius
 
 #define SIRIUS_LOG_IMPL(level, ...) \

@@ -82,6 +82,36 @@ TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
   CHECK(messages[0].line == expected_line);
 }
 
+TEST_CASE("sirius::log free functions format and capture the call site", "[log]")
+{
+  scoped_recording_backend scoped;
+
+  sirius::log::info("x={}", 42);
+  const uint32_t info_line = __LINE__ - 1;
+  sirius::log::warn("plain");
+
+  auto records = scoped.backend().records();
+  REQUIRE(records.size() == 2);
+  CHECK(records[0].level == log_level::info);
+  CHECK(records[0].message == "x=42");
+  CHECK(records[0].file.ends_with("test_logging.cpp"));
+  CHECK(records[0].line == info_line);
+  CHECK(records[1].level == log_level::warn);
+  CHECK(records[1].message == "plain");
+}
+
+TEST_CASE("sirius::log free functions respect the level", "[log]")
+{
+  scoped_recording_backend scoped;
+
+  SetGlobalLogLevel("warn");
+  sirius::log::debug("dropped {}", 1);
+  sirius::log::error("kept");
+  auto records = scoped.backend().records();
+  REQUIRE(records.size() == 1);
+  CHECK(records[0].message == "kept");
+}
+
 TEST_CASE("LogAt enforces the level gate", "[log]")
 {
   scoped_recording_backend scoped;
