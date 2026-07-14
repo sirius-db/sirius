@@ -25,7 +25,6 @@
 inline void log_exception_helper(const std::source_location& loc)
 {
   auto sink = sirius::log::get_sink();
-  if (!sink) { return; }
   try {
     throw;
   } catch (const std::exception& e) {
@@ -38,8 +37,7 @@ inline void log_exception_helper(const std::source_location& loc)
 template <typename... Args>
 void log_exception_helper(const std::source_location& loc, std::string_view fmt_str, Args&&... args)
 {
-  auto sink = sirius::log::get_sink();
-  if (!sink) { return; }
+  auto sink            = sirius::log::get_sink();
   std::string user_msg = std::vformat(fmt_str, std::make_format_args(args...));
 
   try {

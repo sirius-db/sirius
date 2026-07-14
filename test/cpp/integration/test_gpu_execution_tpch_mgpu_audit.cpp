@@ -238,7 +238,7 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   }
 
   // Complete the log file before parsing it; pause() tears down the instance.
-  if (auto sink = sirius::log::get_sink()) { sink->flush(); }
+  sirius::log::get_sink()->flush();
   env->pause();
 
   auto counts = parse_audit_log(tmp_log_dir);

@@ -1627,7 +1627,7 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
   // A level change only re-targets the current sink; no need to rebuild it.
   sirius::log::level lvl = sirius::log::level::info;
   sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
-  if (auto sink = sirius::log::get_sink()) { sink->set_level(lvl); }
+  sirius::log::get_sink()->set_level(lvl);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 

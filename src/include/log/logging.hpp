@@ -32,7 +32,7 @@ void format_and_log(level level,
                     std::format_string<Args...> format_string,
                     Args&&... format_args)
 {
-  if (auto s = get_sink(); s && s->should_log(level)) {
+  if (auto s = get_sink(); s->should_log(level)) {
     s->log(level, location, std::format(format_string, std::forward<Args>(format_args)...));
   }
 }
