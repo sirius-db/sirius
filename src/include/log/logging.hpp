@@ -74,29 +74,31 @@ void InitGlobalLogger(std::string_view log_level_str,
                       uint32_t flush_ms,
                       log_backend_type backend = log_backend_type::spdlog);
 
-/// Installs a caller-constructed backend (test seam / embedders). Passing
-/// nullptr resets the facade to its pre-init state (all statements dropped).
+/// Installs a caller-constructed backend (test seam / embedders) at
+/// `log_level_str`. Passing nullptr resets to a discarding backend.
 void InitGlobalLogger(std::shared_ptr<log_backend> backend, std::string_view log_level_str);
 
 /// Requests a best-effort flush of the global logger.
 ///
 /// Returns true iff all previously logged messages are durable in the
-/// backend's destination on return (false with no backend installed, or when
-/// the backend can only treat the flush as a hint).
+/// backend's destination on return (false when the backend can only treat the
+/// flush as a hint).
 bool FlushGlobalLogger();
 
-/// Sets the level of the global logger from a level name.
+/// Sets the level of the global logging backend from a level name.
 void SetGlobalLogLevel(std::string_view log_level_str);
 
-/// Returns whether the global logger currently emits `level`.
-bool ShouldLog(log_level level);
-
-/// Logs `message` attributed to a caller-supplied source location.
+/// Logs `message` attributed to a caller-supplied source location. The
+/// installed backend drops it if below the current level.
 ///
 /// For log statements at the current location, use the SIRIUS_LOG_* macros.
 void LogAt(log_level level, const std::source_location& loc, std::string_view message);
 
 namespace detail {
+
+/// Whether the installed backend would emit `level`. Used only to skip
+/// formatting for disabled statements; the backend remains the sole filter.
+bool should_log(log_level level);
 
 /// Formats and logs a message; arguments are only formatted when `level` is
 /// enabled at runtime. Use through the SIRIUS_LOG_* macros.
@@ -106,7 +108,7 @@ void LogFormatted(log_level level,
                   std::format_string<Args...> fmt,
                   Args&&... args)
 {
-  if (ShouldLog(level)) { LogAt(level, loc, std::format(fmt, std::forward<Args>(args)...)); }
+  if (should_log(level)) { LogAt(level, loc, std::format(fmt, std::forward<Args>(args)...)); }
 }
 
 }  // namespace detail

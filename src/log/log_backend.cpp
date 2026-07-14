@@ -24,9 +24,11 @@ namespace {
 
 class noop_backend final : public log_backend {
  public:
-  void log(log_level, const std::source_location&, std::string_view) override {}
   // Vacuously reliable: nothing is ever buffered.
   bool flush() override { return true; }
+
+ protected:
+  void emit(log_level, const std::source_location&, std::string_view) override {}
 };
 
 }  // namespace

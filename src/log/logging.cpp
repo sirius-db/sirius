@@ -27,14 +27,17 @@ namespace sirius {
 
 namespace {
 
-// Global facade state. Level filtering is facade-owned (one relaxed atomic on
-// the hot path); the backend slot is swap-safe: loggers take a shared_ptr
+// Global facade state. The level lives inside the backend (the single filter);
+// the facade only holds the swap-safe backend slot: loggers take a shared_ptr
 // snapshot, so a concurrent re-init cannot destroy a backend under an
 // in-flight log() call. Meyers singleton to avoid static-init-order issues.
+//
+// The slot is never null in steady state — it defaults to, and resets to, a
+// discarding noop backend so anything logged before the real backend is
+// installed goes to the noop rather than nowhere. Reads still guard against
+// null defensively.
 struct logger_state {
-  // Pre-init: everything below `off` is dropped and there is no backend.
-  std::atomic<int> level{SIRIUS_LOG_LEVEL_OFF};
-  std::atomic<std::shared_ptr<log_backend>> backend{};
+  std::atomic<std::shared_ptr<log_backend>> backend{make_noop_backend()};
 };
 
 logger_state& state()
@@ -57,16 +60,16 @@ log_level ParseLogLevel(std::string_view level_str)
   return info;
 }
 
-// Installs `backend` (kept unchanged if null) and then opens the level gate.
+// Installs `backend` at `log_level_str`. A null `backend` is treated as "keep
+// the current one"; callers that want a reset pass a fresh noop.
 void install(std::shared_ptr<log_backend> backend, std::string_view log_level_str)
 {
-  if (backend) {
-    // Flush the displaced backend before its last reference may be released.
-    if (auto displaced = state().backend.exchange(std::move(backend), std::memory_order_acq_rel)) {
-      displaced->flush();
-    }
+  if (!backend) { return; }
+  backend->set_level(ParseLogLevel(log_level_str));
+  // Flush the displaced backend before its last reference may be released.
+  if (auto displaced = state().backend.exchange(std::move(backend), std::memory_order_acq_rel)) {
+    displaced->flush();
   }
-  state().level.store(static_cast<int>(ParseLogLevel(log_level_str)), std::memory_order_relaxed);
 }
 
 }  // namespace
@@ -93,15 +96,8 @@ void InitGlobalLogger(std::string_view log_level_str,
 
 void InitGlobalLogger(std::shared_ptr<log_backend> backend, std::string_view log_level_str)
 {
-  if (backend == nullptr) {
-    // Reset to the pre-init state: drop everything, release the backend.
-    state().level.store(SIRIUS_LOG_LEVEL_OFF, std::memory_order_relaxed);
-    if (auto displaced = state().backend.exchange(nullptr, std::memory_order_acq_rel)) {
-      displaced->flush();
-    }
-    return;
-  }
-  install(std::move(backend), log_level_str);
+  // nullptr resets to a discarding backend rather than leaving none installed.
+  install(backend ? std::move(backend) : make_noop_backend(), log_level_str);
 }
 
 bool FlushGlobalLogger()
@@ -116,20 +112,27 @@ bool FlushGlobalLogger()
 
 void SetGlobalLogLevel(std::string_view log_level_str)
 {
-  state().level.store(static_cast<int>(ParseLogLevel(log_level_str)), std::memory_order_relaxed);
-}
-
-bool ShouldLog(log_level level)
-{
-  return static_cast<int>(level) >= state().level.load(std::memory_order_relaxed);
+  if (auto backend = state().backend.load(std::memory_order_acquire)) {
+    backend->set_level(ParseLogLevel(log_level_str));
+  }
 }
 
 void LogAt(log_level level, const std::source_location& loc, std::string_view message)
 {
-  if (!ShouldLog(level)) { return; }
+  // The backend applies the level filter; the facade just dispatches.
   if (auto backend = state().backend.load(std::memory_order_acquire)) {
     backend->log(level, loc, message);
   }
 }
+
+namespace detail {
+
+bool should_log(log_level level)
+{
+  auto backend = state().backend.load(std::memory_order_acquire);
+  return backend && backend->should_log(level);
+}
+
+}  // namespace detail
 
 }  // namespace sirius

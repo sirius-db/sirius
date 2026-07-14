@@ -36,25 +36,26 @@ using namespace sirius;
 using recording_backend        = sirius::test::recording_log_backend;
 using scoped_recording_backend = sirius::test::scoped_recording_log_backend;
 
-TEST_CASE("ShouldLog gates by the global level", "[log]")
+TEST_CASE("The backend level gates by severity", "[log]")
 {
   scoped_recording_backend scoped;
+  auto& backend = scoped.backend();
 
   SetGlobalLogLevel("info");
-  CHECK_FALSE(ShouldLog(log_level::trace));
-  CHECK_FALSE(ShouldLog(log_level::debug));
-  CHECK(ShouldLog(log_level::info));
-  CHECK(ShouldLog(log_level::warn));
-  CHECK(ShouldLog(log_level::error));
-  CHECK(ShouldLog(log_level::critical));
+  CHECK_FALSE(backend.should_log(log_level::trace));
+  CHECK_FALSE(backend.should_log(log_level::debug));
+  CHECK(backend.should_log(log_level::info));
+  CHECK(backend.should_log(log_level::warn));
+  CHECK(backend.should_log(log_level::error));
+  CHECK(backend.should_log(log_level::critical));
 
   SetGlobalLogLevel("off");
-  CHECK_FALSE(ShouldLog(log_level::trace));
-  CHECK_FALSE(ShouldLog(log_level::critical));
+  CHECK_FALSE(backend.should_log(log_level::trace));
+  CHECK_FALSE(backend.should_log(log_level::critical));
 
   SetGlobalLogLevel("trace");
-  CHECK(ShouldLog(log_level::trace));
-  CHECK(ShouldLog(log_level::critical));
+  CHECK(backend.should_log(log_level::trace));
+  CHECK(backend.should_log(log_level::critical));
 }
 
 TEST_CASE("Unknown level names fall back to info", "[log]")
@@ -62,8 +63,8 @@ TEST_CASE("Unknown level names fall back to info", "[log]")
   scoped_recording_backend scoped;
 
   SetGlobalLogLevel("verbose");
-  CHECK_FALSE(ShouldLog(log_level::debug));
-  CHECK(ShouldLog(log_level::info));
+  CHECK_FALSE(scoped.backend().should_log(log_level::debug));
+  CHECK(scoped.backend().should_log(log_level::info));
 }
 
 TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
@@ -102,18 +103,14 @@ TEST_CASE("FlushGlobalLogger forwards to the backend and reports reliability", "
   CHECK(scoped.backend().flush_count() == 1);
 }
 
-TEST_CASE("A null backend resets to the pre-init state", "[log]")
+TEST_CASE("Resetting installs a discarding backend", "[log]")
 {
   scoped_recording_backend scoped;
 
-  InitGlobalLogger(nullptr, "trace");
-  CHECK_FALSE(ShouldLog(log_level::critical));
+  InitGlobalLogger(nullptr, "trace");  // swaps in a noop, detaching the recorder
   SIRIUS_LOG_ERROR("dropped {}", 1);
   LogAt(log_level::critical, std::source_location::current(), "dropped");
-  CHECK_FALSE(FlushGlobalLogger());
-  SetGlobalLogLevel("trace");
-  // The level gate opens but there is still no backend; logging stays safe.
-  SIRIUS_LOG_ERROR("still dropped");
+  CHECK(FlushGlobalLogger());  // the noop flush is vacuously reliable
   CHECK(scoped.backend().count() == 0);
 }
 

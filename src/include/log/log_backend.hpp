@@ -18,6 +18,7 @@
 
 #include "log/logging.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -29,18 +30,33 @@ namespace sirius {
 
 /// Sink interface behind the global logging facade.
 ///
-/// The facade's level filter is authoritative: `log` is only invoked for
-/// messages at or above the global level, so implementations must be
-/// constructed wide-open (pass-through) and apply no severity filtering of
-/// their own. Both methods are called concurrently from many threads;
-/// implementations must be thread-safe.
+/// The backend owns the log level and is the sole place messages are
+/// filtered — the facade holds no level of its own, so there is no risk of
+/// two thresholds disagreeing. `emit` is only reached for messages at or
+/// above the level; implementations therefore do no filtering themselves.
+/// `set_level`, `log` and `flush` are called concurrently from many threads
+/// and must be thread-safe (the level is atomic; `emit`/`flush` guard their
+/// own state).
 class log_backend {
  public:
   virtual ~log_backend() = default;
 
-  /// Emits one already-formatted, already-level-filtered message attributed
-  /// to `loc`.
-  virtual void log(log_level level, const std::source_location& loc, std::string_view message) = 0;
+  /// Sets the level below which messages are dropped.
+  void set_level(log_level level) noexcept { _level.store(level, std::memory_order_relaxed); }
+
+  /// Whether `level` currently passes the backend's threshold. Inline, for the
+  /// facade's pre-format gate; the backend is the single source of truth.
+  [[nodiscard]] bool should_log(log_level level) const noexcept
+  {
+    return static_cast<int>(level) >= static_cast<int>(_level.load(std::memory_order_relaxed));
+  }
+
+  /// Filters `message` against the level, then emits it. Not virtual: filtering
+  /// happens here exactly once, so no backend can double-filter or skip it.
+  void log(log_level level, const std::source_location& loc, std::string_view message)
+  {
+    if (should_log(level)) { emit(level, loc, message); }
+  }
 
   /// Initiates a best-effort flush of buffered output.
   ///
@@ -51,6 +67,14 @@ class log_backend {
   /// be async-signal-safe — the caller bounds a potential deadlock with
   /// alarm() — but it must not wait unboundedly beyond ordinary sink mutexes.
   virtual bool flush() = 0;
+
+ protected:
+  /// Writes one message that has already passed the level filter.
+  virtual void emit(log_level level, const std::source_location& loc, std::string_view message) = 0;
+
+ private:
+  // Pre-init / default: drop everything until a level is set.
+  std::atomic<log_level> _level{log_level::off};
 };
 
 inline bool string_to_enum(std::string_view sv, log_backend_type& t)

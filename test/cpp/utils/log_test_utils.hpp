@@ -39,14 +39,6 @@ class recording_log_backend final : public sirius::log_backend {
     std::string message;
   };
 
-  void log(sirius::log_level level,
-           const std::source_location& loc,
-           std::string_view message) override
-  {
-    std::lock_guard lock(_mutex);
-    _records.push_back({level, loc.file_name(), loc.line(), std::string{message}});
-  }
-
   bool flush() override
   {
     std::lock_guard lock(_mutex);
@@ -70,6 +62,15 @@ class recording_log_backend final : public sirius::log_backend {
   {
     std::lock_guard lock(_mutex);
     return _flush_count;
+  }
+
+ protected:
+  void emit(sirius::log_level level,
+            const std::source_location& loc,
+            std::string_view message) override
+  {
+    std::lock_guard lock(_mutex);
+    _records.push_back({level, loc.file_name(), loc.line(), std::string{message}});
   }
 
  private:
