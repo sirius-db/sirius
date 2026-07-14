@@ -18,7 +18,7 @@
 
 #include "config.hpp"
 #include "log/logging.hpp"
-#include "log/spdlog_sink.hpp"
+#include "log/spdlog_owning_sink.hpp"
 
 #include <atomic>
 #include <memory>
@@ -108,8 +108,8 @@ class scoped_recording_log_backend {
   ~scoped_recording_log_backend()
   {
     using duckdb::Config;
-    sirius::log::set_sink(
-      sirius::log::make_spdlog_sink(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
+    sirius::log::set_sink(sirius::log::make_spdlog_owning_sink(
+      Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
   }
 
   scoped_recording_log_backend(const scoped_recording_log_backend&)            = delete;

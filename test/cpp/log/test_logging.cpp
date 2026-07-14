@@ -18,7 +18,7 @@
 #include "config.hpp"
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
-#include "log/spdlog_sink.hpp"
+#include "log/spdlog_owning_sink.hpp"
 #include "utils/log_test_utils.hpp"
 
 #include <atomic>
@@ -172,7 +172,7 @@ TEST_CASE("The spdlog backend writes the documented line format", "[log]")
 
   {
     scoped_recording_backend scoped;  // restores the process logger on exit
-    auto backend = make_spdlog_sink({temp_dir.string(), std::nullopt});
+    auto backend = make_spdlog_owning_sink({temp_dir.string(), std::nullopt});
     REQUIRE(backend != nullptr);
     backend->set_level(level::info);
     set_sink(backend);

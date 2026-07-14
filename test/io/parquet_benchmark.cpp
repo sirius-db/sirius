@@ -22,7 +22,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <log/logging.hpp>
-#include <log/spdlog_sink.hpp>
+#include <log/spdlog_owning_sink.hpp>
 #include <unistd.h>
 
 #include <algorithm>
@@ -136,7 +136,7 @@ int main(int argc, char** argv)
 
   // Per-read trace goes to log/sirius.log (no backend is installed until the
   // logger is initialized; without this every log statement is dropped).
-  sirius::log::set_sink(sirius::log::make_spdlog_sink("info", "log", 0));
+  sirius::log::set_sink(sirius::log::make_spdlog_owning_sink("info", "log", 0));
 
   std::cout << "Source : " << argv[2] << "\n"
             << "Files  : " << paths.size() << "\n";

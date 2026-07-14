@@ -76,7 +76,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
-#include "log/spdlog_sink.hpp"
+#include "log/spdlog_owning_sink.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -1611,7 +1611,7 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
 static void ReinstallLogSink()
 {
   sirius::log::set_sink(
-    sirius::log::make_spdlog_sink(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
+    sirius::log::make_spdlog_owning_sink(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
 }
 
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)

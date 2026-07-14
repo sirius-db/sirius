@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "log/spdlog_sink.hpp"
+#include "log/spdlog_owning_sink.hpp"
 
 #include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
@@ -47,12 +47,14 @@ spdlog::level::level_enum to_spdlog_level(level lvl)
   return spdlog::level::info;
 }
 
-/// Writes to a daily-rotated `<log_dir>/sirius.log`. Kept out of spdlog's global
-/// registry (its static state and periodic flusher would outlive this sink);
-/// periodic flushing is a sink-owned thread instead.
-class spdlog_sink final : public sink {
+/// Owns Sirius's spdlog logging: a private logger writing to a daily-rotated
+/// `<log_dir>/sirius.log`, with its own level and flush thread. It could use
+/// spdlog's global periodic flusher (spdlog::flush_every), but that flushes only
+/// registered loggers, and a registered logger's destructor races spdlog's
+/// registry teardown at exit — so periodic flushing is a private thread instead.
+class spdlog_owning_sink final : public sink {
  public:
-  explicit spdlog_sink(const spdlog_sink_config& config)
+  explicit spdlog_owning_sink(const spdlog_owning_config& config)
   {
     auto log_file  = std::format("{}/sirius.log", config.log_dir);
     auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
@@ -78,11 +80,12 @@ class spdlog_sink final : public sink {
   // releases the logger; the file sink flushes on destruction.
 
   // The level lives in the spdlog logger itself — the single source of truth.
-  void set_level(level lvl) override { _logger->set_level(to_spdlog_level(lvl));
-  }
+  void set_level(level lvl) override { _logger->set_level(to_spdlog_level(lvl)); }
 
-  [[nodiscard]] bool should_log(level lvl) const override { return
-  _logger->should_log(to_spdlog_level(lvl)); }
+  [[nodiscard]] bool should_log(level lvl) const override
+  {
+    return _logger->should_log(to_spdlog_level(lvl));
+  }
 
   void log(level lvl, const std::source_location& loc, std::string_view message) override
   {
@@ -107,21 +110,21 @@ class spdlog_sink final : public sink {
 
 }  // namespace
 
-std::shared_ptr<sink> make_spdlog_sink(const spdlog_sink_config& config)
+std::shared_ptr<sink> make_spdlog_owning_sink(const spdlog_owning_config& config)
 {
   // Sink-construction failures (e.g. an unwritable log_dir) propagate to the
   // caller so a bad `SET sirius_log_dir` fails loudly instead of silently
   // disabling logging.
-  return std::make_shared<spdlog_sink>(config);
+  return std::make_shared<spdlog_owning_sink>(config);
 }
 
-std::shared_ptr<sink> make_spdlog_sink(std::string_view level_str,
-                                       std::string_view log_dir,
-                                       uint32_t flush_ms)
+std::shared_ptr<sink> make_spdlog_owning_sink(std::string_view level_str,
+                                              std::string_view log_dir,
+                                              uint32_t flush_ms)
 {
   auto flush_interval =
     flush_ms == 0 ? std::nullopt : std::optional{std::chrono::milliseconds{flush_ms}};
-  auto s = make_spdlog_sink(spdlog_sink_config{std::string{log_dir}, flush_interval});
+  auto s = make_spdlog_owning_sink(spdlog_owning_config{std::string{log_dir}, flush_interval});
 
   level lvl = level::info;  // unknown names default to info
   string_to_enum(level_str, lvl);

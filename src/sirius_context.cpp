@@ -26,7 +26,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
-#include "log/spdlog_sink.hpp"
+#include "log/spdlog_owning_sink.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -1000,7 +1000,7 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
   sirius::log::set_sink(
-    sirius::log::make_spdlog_sink(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
+    sirius::log::make_spdlog_owning_sink(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
   read_config_file_if_exists();
 }
 
