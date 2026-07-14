@@ -14,8 +14,19 @@ use quent_events::Event;
 use quent_model::{Capacity, FsmEvent, Ref, Usage};
 use quent_query_engine_analyzer::ui::UiAnalyzer;
 use quent_query_engine_model::{engine, operator, plan, query, query_group, worker};
-use quent_query_engine_ui::{QueryFilter, data_flow::DataFlowTimelineResponse};
-use quent_ui::timeline::{distribution::DistributionTimelineRequest, request::TimelineConfig};
+use quent_query_engine_ui::{OperatorFilter, QueryFilter, data_flow::DataFlowTimelineResponse};
+use quent_ui::entities::request::{
+    EntityListEntry, EntityListFilter, EntityListRequest, EntityScope, EntitySortKey, Sort,
+    SortDir, TimeWindow,
+};
+use quent_ui::timeline::{
+    distribution::DistributionTimelineRequest,
+    request::{
+        EntityFilter, ResourceTimelineRequest, SingleTimelineRequest, TimelineConfig,
+        TimelineRequest,
+    },
+    response::ResourceTimeline as UiResourceTimeline,
+};
 use uuid::Uuid;
 
 use crate::{SiriusUiAnalyzer, batch::BatchExt};
@@ -455,4 +466,143 @@ fn data_flow_timeline_measures_filter() {
         .data_flow_timeline(request(fixture.query_id, &["bogus"]))
         .expect_err("unknown measures are rejected");
     assert!(matches!(error, AnalyzerError::InvalidArgument(_)));
+}
+
+/// A single-timeline request for one resource over the query window
+/// [0, 1000) ns in 10 bins of 100 ns.
+fn single_timeline_request(
+    query_id: Uuid,
+    resource_id: Uuid,
+    entity_type_name: Option<&str>,
+) -> SingleTimelineRequest<QueryFilter, OperatorFilter> {
+    SingleTimelineRequest {
+        entry: TimelineRequest::Resource(ResourceTimelineRequest {
+            resource_id,
+            long_entities_threshold_s: None,
+            entity_filter: EntityFilter {
+                entity_type_name: entity_type_name.map(|name| name.to_string()),
+            },
+            application: OperatorFilter { operator_id: None },
+            config: TimelineConfig {
+                num_bins: 10,
+                start: 0.0,
+                end: 1e-6,
+            },
+        }),
+        app_params: QueryFilter { query_id },
+    }
+}
+
+#[test]
+fn batch_keyed_timeline_over_memory_tier_resource() {
+    let mut fixture = fixture(true);
+    let analyzer = analyzer(&mut fixture);
+
+    // Per-state timeline of the GPU tier resource sliced by the batch FSM.
+    let response = analyzer
+        .single_resource_timeline(single_timeline_request(
+            fixture.query_id,
+            fixture.gpu_id,
+            Some("batch"),
+        ))
+        .expect("batch keyed timeline over a memory_tier resource");
+    let UiResourceTimeline::BinnedByState(by_state) = response.data else {
+        panic!("expected a per-state binned response");
+    };
+
+    let states = &by_state.capacities_states_values["capacity_bytes"];
+    assert_eq!(
+        states["batch_queued"],
+        [1000.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        states["batch_processing"],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0]
+    );
+    // batch_packaged held the batch on HOST, not GPU.
+    assert!(!states.contains_key("batch_packaged"));
+
+    // The task path over the same resource keeps working (tasks never use
+    // memory tiers, so it is simply empty).
+    let response = analyzer
+        .single_resource_timeline(single_timeline_request(
+            fixture.query_id,
+            fixture.gpu_id,
+            Some("task"),
+        ))
+        .expect("task keyed timeline over a memory_tier resource");
+    let UiResourceTimeline::BinnedByState(by_state) = response.data else {
+        panic!("expected a per-state binned response");
+    };
+    assert!(by_state.capacities_states_values.is_empty());
+
+    // Unknown entity types are still rejected.
+    let error = analyzer
+        .single_resource_timeline(single_timeline_request(
+            fixture.query_id,
+            fixture.gpu_id,
+            Some("widget"),
+        ))
+        .expect_err("unknown entity types are rejected");
+    assert!(matches!(error, AnalyzerError::InvalidArgument(_)));
+}
+
+#[test]
+fn plain_timeline_over_memory_tier_resource_includes_batches() {
+    let mut fixture = fixture(true);
+    let analyzer = analyzer(&mut fixture);
+
+    let response = analyzer
+        .single_resource_timeline(single_timeline_request(
+            fixture.query_id,
+            fixture.gpu_id,
+            None,
+        ))
+        .expect("plain timeline over a memory_tier resource");
+    let UiResourceTimeline::Binned(binned) = response.data else {
+        panic!("expected a plain binned response");
+    };
+
+    // The GPU residency of batch A: queued [0, 300) + processing [800, 1000).
+    assert_eq!(
+        binned.capacities_values["capacity_bytes"],
+        [1000.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0]
+    );
+}
+
+#[test]
+fn list_entities_scoped_to_memory_tier_resource_is_empty() {
+    let mut fixture = fixture(true);
+    let analyzer = analyzer(&mut fixture);
+
+    // Only tasks are listable v1; a memory_tier scope must not error, it just
+    // matches no tasks.
+    let response = analyzer
+        .list_entities(EntityListRequest {
+            entry: EntityListEntry {
+                window: TimeWindow {
+                    start: 0.0,
+                    end: 1e-6,
+                },
+                filter: EntityListFilter {
+                    scope: Some(EntityScope::Resource {
+                        resource_id: fixture.gpu_id,
+                    }),
+                    entity_type_name: None,
+                    min_usage_s: None,
+                },
+                sort: Sort {
+                    key: EntitySortKey::UsageDuration,
+                    dir: SortDir::Desc,
+                },
+                page: None,
+                application: OperatorFilter { operator_id: None },
+            },
+            app_params: QueryFilter {
+                query_id: fixture.query_id,
+            },
+        })
+        .expect("list entities scoped to a memory_tier resource");
+    assert_eq!(response.total, 0);
+    assert!(response.items.is_empty());
 }

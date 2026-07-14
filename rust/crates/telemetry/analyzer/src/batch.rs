@@ -15,6 +15,7 @@ use quent_analyzer::{
         events::{FsmEvents, FsmEventsBuilder},
     },
 };
+use quent_query_engine_ui::OperatorFilter;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
 use uuid::Uuid;
@@ -35,6 +36,7 @@ pub trait BatchExt {
     fn pipeline_uuid(&self) -> Option<Uuid>;
     /// The most recent task this batch was packaged into or processed by.
     fn task_uuid(&self) -> Option<Uuid>;
+    fn matches_filter(&self, filter: &OperatorFilter) -> bool;
     fn active_span(&self) -> Option<SpanUnixNanoSec>;
     fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine>;
 }
@@ -63,6 +65,12 @@ impl BatchExt for Batch {
                 ModelBatchTransition::BatchProcessing(data) => Some(data.task_uuid),
                 _ => None,
             })
+    }
+
+    fn matches_filter(&self, filter: &OperatorFilter) -> bool {
+        filter
+            .operator_id
+            .is_none_or(|pipeline_uuid| self.pipeline_uuid() == Some(pipeline_uuid))
     }
 
     fn active_span(&self) -> Option<SpanUnixNanoSec> {
