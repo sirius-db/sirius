@@ -182,6 +182,18 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
 }
 
 TEST_CASE_METHOD(TransparentExecutionFixture,
+                 "transparent execution: statistics-propagated aggregates",
+                 "[transparent][integration][gpu_values]")
+{
+  con->Query("CREATE TABLE test_stats AS SELECT i AS id FROM range(1000) t(i);");
+
+  // DuckDB can fold these aggregates from table statistics into constant
+  // EXPRESSION_GET/DUMMY_SCAN sources. Transparent execution must leave
+  // STATISTICS_PROPAGATION enabled and execute the resulting GPU_VALUES plan.
+  compare_transparent_vs_cpu("SELECT count(*), min(id), max(id) FROM test_stats;");
+}
+
+TEST_CASE_METHOD(TransparentExecutionFixture,
                  "transparent execution: join",
                  "[transparent][integration]")
 {

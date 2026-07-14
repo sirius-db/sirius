@@ -211,9 +211,8 @@ class sirius_physical_plan_generator {
 
  private:
   //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
-  //! merge operators, scan companions) so the tree carries the full execution structure
-  //! before the pipeline converter runs. Sources that would need CPU-materialized data are
-  //! rejected here (see reject_cpu_source).
+  //! merge operators, scan companions, GPU_VALUES) so the tree carries the full execution
+  //! structure before the pipeline converter runs.
   void insert_gpu_pipeline_operators(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
 };

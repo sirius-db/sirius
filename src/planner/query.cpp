@@ -43,9 +43,11 @@ void query::build_indices()
       // Add to operator-to-pipeline map
       _operator_to_pipeline[source.get()] = pipeline;
 
-      // If it's a scan-like source, add to scan operators vector
+      // If it's a scan-like source, add to scan operators vector. GPU_VALUES
+      // must be included: task_scheduler::start_query() schedules the first
+      // scan operator, which is the only kickoff a VALUES-only plan gets.
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES) {
         _scan_operators.push_back(source.get());
       }
     }

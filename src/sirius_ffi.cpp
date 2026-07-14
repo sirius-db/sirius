@@ -89,20 +89,17 @@ struct Context::Impl {
       auto load = conn->Query("LOAD '" + escaped + "'");
       if (load->HasError()) { load->ThrowError(); }
     }
-    // Register the engine on the connection and disable the DuckDB optimizer rewrites the
-    // GPU planner cannot execute. This is the transparent path's GPU-incompatible set
-    // (IN_CLAUSE, COMPRESSED_MATERIALIZATION, STATISTICS_PROPAGATION; see
-    // sirius_extension.cpp) plus, because this FFI has no CPU fallback, COLUMN_LIFETIME and
-    // LATE_MATERIALIZATION unconditionally (the transparent path disables COLUMN_LIFETIME
-    // only in debug and tolerates LATE_MATERIALIZATION via fallback).
+    // Register the engine on the connection and disable DuckDB optimizer rewrites this
+    // no-fallback FFI path cannot safely execute. The transparent path only disables
+    // IN_CLAUSE and COMPRESSED_MATERIALIZATION here; this path remains more conservative.
     auto& client = *conn->context;
     client.registered_state->Insert(kSiriusStateKey, context);
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-    // Folds ungrouped MIN/MAX aggregates into EXPRESSION_GET + DUMMY_SCAN the GPU
-    // pipeline cannot schedule; keep the query on the scan -> aggregate path.
+    // Keep this FFI-only restriction until its no-fallback execution path has
+    // dedicated GPU_VALUES coverage.
     disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
     disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
     // Rewrites an ORDER BY ... LIMIT parquet scan into a semi-join on virtual
