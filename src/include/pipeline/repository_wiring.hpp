@@ -62,14 +62,6 @@ struct repository_wiring {
 //!      (the first operator of `dest_pipeline`, or its sink if there are no operators).
 //!   3. Records the destination on the source operator via `add_next_port_after_sink`.
 //!
-//! Special cases preserved from the previous in-engine implementation:
-//!   - When the destination's type is `RIGHT_DELIM_JOIN`, an additional `FULL`-barrier
-//!     port is also added to its `partition_join` sibling so the partitioned join branch
-//!     can read the same repository.
-//!   - When the destination's type is `LEFT_DELIM_JOIN`, this throws — a left delim join
-//!     should never act as a destination of the directed edge/source operator of the destination
-//!     pipeline.
-//!
 //! Precondition: every `source_pipeline` and `dest_pipeline` referenced in `wirings` must
 //! already have its pipeline id assigned (see `sirius_pipeline::set_pipeline_id`). Port
 //! insertion uses pipeline ids to keep `_ports_list` ordered.
