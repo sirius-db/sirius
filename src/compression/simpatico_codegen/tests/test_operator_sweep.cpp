@@ -142,9 +142,12 @@ std::unique_ptr<cudf::table> make_u8_table(int num_rows, int seed)
 }
 
 // Canonical fixture order, shared by the orchestrator (sizing/labeling only,
-// no CUDA touched) and each shard (which actually builds them).
-constexpr std::array<char const*, 6> kFixtureNames = {
-  "i32", "i64", "f32", "f64", "u8_binary", "string"};
+// no CUDA touched) and each shard (which actually builds them). MUST stay in
+// lockstep with build_fixtures() below — the orchestrator sizes/labels work by
+// index into this list, so a shorter list silently drops the trailing fixtures
+// from the sweep.
+constexpr std::array<char const*, 9> kFixtureNames = {
+  "i32", "i64", "u32", "u64", "f32", "f64", "u8_binary", "date", "string"};
 
 struct fixture {
   std::string name;

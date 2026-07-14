@@ -75,7 +75,7 @@ void test_path_map()
 
   // Resolve a produced path to (producer node, channel) straight from the tree's
   // output wiring: node.output_paths[k] is produced by that node on channel
-  // node.output_names[k]. (This is the structure PlanPathMap used to expose.)
+  // node.output_names[k].
   auto producer_of = [&](std::string const& path) -> std::pair<simpatico::NodeId, std::string> {
     for (simpatico::NodeId i = 0; i < tree->nodes.size(); ++i) {
       auto const& n = tree->nodes[i];
