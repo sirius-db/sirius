@@ -404,7 +404,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   }
   telemetry_handle().preparing({
     .instance_name               = "",
-    .origin_tier                 = local_state.get_input_origin_tiers(),
+    .origin_tier                 = local_state._input_data->get_origin_tiers(),
     .target_tier                 = "GPU",
     .input_bytes                 = local_state._input_data->get_estimated_size_in_bytes(),
     .executor_thread_resource_id = executor_thread_resource_id,
