@@ -4,13 +4,13 @@ A **dynamic filter** is a predicate that is computed at query runtime by one ope
 
 This is a category, not a single feature. It spans:
 
-- **Dynamic table-filter pushdown** — an eligible `BUILD_PROBE` hash-join build pushes runtime membership filters into a downstream parquet scan; an optional zone-map can additionally prune row groups against the actual build-side key range. It is a pure optimization — redundant with the join, so it never changes results. Membership pushdown is **on by default**; zone maps are off by default.
+- **Dynamic table-filter pushdown** — an eligible `BUILD_PROBE` hash-join build pushes runtime membership filters into a downstream GPU scan (parquet or duckdb-native); an optional zone-map can additionally prune parquet row groups against the actual build-side key range. It is a pure optimization — redundant with the join, so it never changes results. Membership pushdown is **on by default**; zone maps are off by default.
 - **Sideways information passing (SIP)** — a hash-join build pushes a filter into another join's probe input, so the second join can reject probe-side rows that can't possibly match.
 - **Aggregation-driven pushdown** — a `GROUP BY` or `DISTINCT` exposes its distinct-value set to downstream consumers.
 - **Sort- or top-N-driven pruning** — a post-sort min/max is exact and free; a top-N's current threshold tightens upstream filters.
 - **Adaptive runtime predicates** — operators that observe data and refine filters over the lifetime of a pipeline.
 
-This document describes the implemented Phase 1 framework and the design-only directions that could generalize it. Phase 1 has a `BUILD_PROBE` hash-join-build producer, a parquet-scan consumer, and three filter kinds (zone map, IN-list, and Bloom). Membership pushdown is enabled by default; the workload-specific zone-map path remains opt-in. Phases 2–4 below are not implemented.
+This document describes the implemented Phase 1 framework and the design-only directions that could generalize it. Phase 1 has a `BUILD_PROBE` hash-join-build producer, a GPU-scan consumer (parquet and duckdb-native), and three filter kinds (zone map, IN-list, and Bloom). Membership pushdown is enabled by default; the workload-specific zone-map path remains opt-in. Phases 2–4 below are not implemented.
 
 ## How the phases generalize
 
@@ -19,7 +19,7 @@ The framework has four axes of generality. Each phase opens one axis:
 | Axis | Phase 1 | Phase 2 | Phase 3 | Phase 4 |
 |------|---------|---------|---------|---------|
 | Filter kind | zone map + Bloom + IN-list | (reuses Phase 1's filter zoo) | (reuses) | (reuses) |
-| Consumer kind | parquet reader + post-decode scan operator | + hash-join probe | + any operator with a column input | (unchanged) |
+| Consumer kind | parquet reader + post-decode scan operator (parquet + duckdb-native) | + hash-join probe | + any operator with a column input | (unchanged) |
 | Producer kind | `BUILD_PROBE` hash-join build only | (unchanged) | + agg, sort, filter | (unchanged) |
 | Coordination | single-shot build-port publication; direct probes ordered, transitive scan targets opportunistic | topology-aware coordination for join-probe consumers | (unchanged) | streaming / incremental refinement |
 
@@ -49,8 +49,8 @@ flowchart LR
     subgraph RUN["Runtime"]
         JOIN["sirius_physical_hash_join<br/>dynamic_filter_publisher"]
         CHANNEL["shared sirius_dynamic_filter_set<br/>append-only publication channel"]
-        READER["parquet_gpu_ingestible<br/>zone-map AST at read"]
-        APPLY["sirius_physical_dynamic_filter<br/>IN-list / Bloom post-decode"]
+        READER["parquet_gpu_ingestible<br/>zone-map AST at read (parquet only)"]
+        APPLY["sirius_physical_dynamic_filter<br/>IN-list / Bloom post-decode<br/>+ zone-map row masks on duckdb-native"]
         DOWN["PARTITION → CONCAT → authoritative hash-join probe"]
 
         PUBPLAN --> JOIN
@@ -251,7 +251,9 @@ The static and dynamic filters live on **separate, non-interfering paths**, whic
 
 The dynamic zone-map AST is merged onto the static filter root when the static filter translated, or built standalone when it did not, so the earlier "translation failed ⇒ dynamic pushdown skipped" restriction no longer applies: the dynamic side contributes regardless of the static filter's translation outcome, and the static filter keeps its own path unchanged.
 
-This mixing rule is a property of the consumer (parquet GPU scan), not the framework. Other consumers (hash-join probe in Phase 2) have their own merge rules.
+The duckdb-native GPU scan is post-decode only. It has no reader-side filter hook — decode is Sirius's own native path and static filters are evaluated in `post_filter_and_project` — so its `sirius_physical_dynamic_filter` runs in `include_ast_row_masks` mode: an opted-in zone map is evaluated row-wise via `cudf::compute_column` alongside the membership masks, behind the same gate. Row-group stat pruning in the native metadata walk remains static-only. The native ingestible's wiring role is installing the channel's column_ids → output-position remap at construction, before any producer publishes.
+
+This mixing rule is a property of the consumer scan format, not the framework. Other consumers (hash-join probe in Phase 2) have their own merge rules.
 
 ```mermaid
 flowchart TB
@@ -283,7 +285,7 @@ flowchart TB
 **Goal:** establish the framework end-to-end against a single (producer, consumer) pair — `BUILD_PROBE` hash-join build → parquet scan — and exercise filter-kind polymorphism via progressively richer filters.
 
 **Producer:** `BUILD_PROBE` hash-join build side.
-**Consumer:** parquet GPU scan (`parquet_gpu_ingestible`).
+**Consumer:** GPU scan — parquet (`parquet_gpu_ingestible`: reader zone-map + post-decode operator) and duckdb-native (post-decode operator only).
 **Routing:** DuckDB-paired (`DynamicTableFilterSet*` route key).
 **Coordination:** synchronous build-side CONCAT publication strictly precedes the producing join's immediate probe data scan; transitive scan targets remain nonblocking and race publication under normal scheduler order.
 
@@ -294,7 +296,7 @@ Wires the scaffolding into operators end-to-end against a degenerate single-zone
 Plan-gen / type plumbing:
 
 - `sirius_physical_plan_generator::dynamic_filter_channels` map (the router), gated by `enable_dynamic_filter_pushdown`
-- `sirius_physical_table_scan` / transient `sirius_physical_parquet_scan` `sirius_dynamic_filters` field (consumer endpoint, propagated through `parquet_ingestible_table_info` to `parquet_gpu_ingestible`)
+- `sirius_physical_table_scan`'s `sirius_dynamic_filters` field (consumer endpoint, propagated through `parquet_ingestible_table_info` to `parquet_gpu_ingestible` and through `duckdb_native_ingestible_table_info` to the native ingestible, which installs the channel's output-position remap)
 - `dynamic_filter_publish_plan::probe_target` entries plus non-owning paired GPU/HOST replica spaces (producer endpoint, held privately by the hash join)
 - Plan-gen wiring in `sirius_plan_get.cpp` and `sirius_plan_comparison_join.cpp`; the join attaches a channel per target
 
@@ -321,7 +323,7 @@ A batch that arrives already non-GPU-resident (possible only when it was shared 
 
 Replica bytes use direct peer DMA where empirically verified, otherwise they borrow chunked pre-pinned storage from the planned Sirius/CuCascade HOST memory space. The dynamic-filter code performs no direct pinned allocation and does not modify CuCascade. See [dynamic-filters-multi-gpu.md](dynamic-filters-multi-gpu.md) for the replica design and validation.
 
-**Application in the target scan.** A dynamic join filter is *redundant with the join that produced it*: the join discards every non-matching probe row, so the filter is a conjunctive superset and never has to be exact. The zone map rides the parquet reader's filter: `merge_dynamic_filters_into_ast` AND-merges it onto the reader root and `materialize_metadata_to_table` installs it via `reader_options::set_filter`, so cuDF can prune row groups by statistics and evaluates the predicate during decode. Membership filters (IN-list / Bloom) are not AST-lowerable and ride the **post-decode** path (`sirius_physical_dynamic_filter` → `apply_dynamic_filters_to_view`, `membership_masks_only` mode). The shared `dynamic_filter_gate` measures scan-level and per-filter usefulness before allowing that post-decode cost to repeat. The static filter is untouched and remains authoritative.
+**Application in the target scan.** A dynamic join filter is *redundant with the join that produced it*: the join discards every non-matching probe row, so the filter is a conjunctive superset and never has to be exact. The zone map rides the parquet reader's filter: `merge_dynamic_filters_into_ast` AND-merges it onto the reader root and `materialize_metadata_to_table` installs it via `reader_options::set_filter`, so cuDF can prune row groups by statistics and evaluates the predicate during decode. Membership filters (IN-list / Bloom) are not AST-lowerable and ride the **post-decode** path (`sirius_physical_dynamic_filter` → `apply_dynamic_filters_to_view`, `membership_masks_only` mode). On the duckdb-native scan, which has no reader filter, the operator instead runs in `include_ast_row_masks` mode so zone maps apply row-wise there too. The shared `dynamic_filter_gate` measures scan-level and per-filter usefulness before allowing that post-decode cost to repeat. The static filter is untouched and remains authoritative.
 >
 > **Follow-up — zone-map row-GROUP-only.** Merging the zone-map into `set_filter` keeps cuDF's row-group stats-pruning win but also pays a row-level evaluation cost during decode. A row-group-*only* path — evaluate the zone-map against `filter_row_groups_with_stats` and feed only `reader_options::set_row_groups`, never `set_filter` — would drop that row-level cost but is **not yet implemented**. The cost is bounded today: the zone-map is off by default (`enable_dynamic_zone_map_filter`) and TPC-H's scattered keys prune nothing.
 
@@ -345,7 +347,7 @@ The zone-map captures only the build keys' `[min,max]` range, which is useless f
 
 A second switch, `enable_dynamic_zone_map_filter` (default **off**, requires the master), *additionally* emits a **zone map** (build-key min/max) per key for **read-time row-group pruning** — a complementary consumer path. It is off by default because on TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes range-derivable builds, while scattered keys span the domain and prune nothing. At publication, a numeric zone range covering at least `dynamic_filter_domain_coverage_threshold` (default 90%) of the key-domain estimate is skipped before it reaches the reader. The zone-map path has no post-decode `dynamic_filter_gate`.
 
-**Consumer**: membership rides the post-decode `apply_dynamic_filters_to_view` path (`membership_masks_only` mode); the zone-map rides the parquet reader's `set_filter` (cuDF prunes row groups by stats and evaluates it during decode). Because membership is applied *post-decode*, it never saves the scan I/O/decode — only the *downstream* work on dropped rows; so it wins on selective builds feeding expensive downstream and is neutral on scan-dominated single joins.
+**Consumer**: membership rides the post-decode `apply_dynamic_filters_to_view` path (`membership_masks_only` mode); the zone-map rides the parquet reader's `set_filter` (cuDF prunes row groups by stats and evaluates it during decode) and, on duckdb-native scans, the post-decode path as an AST row mask. Because membership is applied *post-decode*, it never saves the scan I/O/decode — only the *downstream* work on dropped rows; so it wins on selective builds feeding expensive downstream and is neutral on scan-dominated single joins.
 
 The cutover is **hardware-adaptive** — it replaced an earlier fixed `2M`-row-count threshold — landing at ≈1.5M INT64 keys on a 24 MB L2, ~2.5M at 40 MB, ~6M at 96 MB. A TPC-H SF50 sweep showed the IN-list↔bloom choice is **wall-clock-neutral** (every query whose kind flips is flat across `[500K, 8M]`; forcing the affected builds all the way to *none* moved them ≤1.5%, within run-to-run noise) — membership is post-decode behind the adaptive gate, so the structure, and even whether one exists, barely moves the clock. The L2 policy was adopted not for an SF50 win but because it is principled: the exact IN-list is used only while it fits L2, otherwise the ~8×-smaller Bloom is built (even when its bitset spills L2, as it stays the only viable membership structure for very large builds). All result sets stay bit-identical across IN-list / Bloom / none.
 
@@ -362,7 +364,7 @@ The cutover is **hardware-adaptive** — it replaced an earlier fixed `2M`-row-c
 #### Configuration
 
 - `enable_dynamic_filter_pushdown` (bool, default **true**) — master switch; when off, the router hands out no channels so neither side wires anything and there is zero overhead. Enabled by default to wire the membership (IN-list / Bloom) filters.
-- `enable_dynamic_zone_map_filter` (bool, default **false**, requires the master) — additionally emit a read-time zone map for row-group pruning. Off by default: static pushdown already handles range-derivable builds and scattered keys prune nothing, so it is reserved for clustered-keyset workloads whose narrow range is runtime-determined. The publication range-coverage gate skips obviously non-pruning numeric ranges.
+- `enable_dynamic_zone_map_filter` (bool, default **false**, requires the master) — additionally emit a read-time zone map for row-group pruning. Off by default: static pushdown already handles range-derivable builds and scattered keys prune nothing, so it is reserved for clustered-keyset workloads whose narrow range is runtime-determined. The publication range-coverage gate skips obviously non-pruning numeric ranges. On duckdb-native scans the zone map applies post-decode (row-wise), not at read time.
 - `dynamic_filter_domain_coverage_threshold` (double, default **0.9**) — skip publishing a key's filters when the build covers at least this fraction of the key's domain (rows gate and zone-map range gate); ≥ 1.0 effectively disables the gate.
 - `dynamic_filter_keep_threshold` (double, default **0.9**) — consumer-side scan gate: disable a scan's post-decode filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on.
 

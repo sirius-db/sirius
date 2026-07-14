@@ -44,6 +44,10 @@ namespace duckdb {
 class SingleFileBlockManager;
 }
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -59,6 +63,11 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
+  /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
+  /// wired. The ingestible installs the consumer column remap on the channel; the downstream
+  /// dynamic-filter operator applies the filters post-decode (the native scan has no read-time
+  /// dynamic path).
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   duckdb::DataTable* storage     = nullptr;
