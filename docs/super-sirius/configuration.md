@@ -429,7 +429,7 @@ SET enable_dynamic_zone_map_filter = false;
 |----------|---------|-------------|
 | `print_gpu_table_max_rows` | - | Max rows to print in debug output |
 | `enable_fallback_check` | - | Enable fallback validation |
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU on Sirius errors. Matches the legacy `gpu_processing` path. Set to `false` to surface Sirius errors instead of silently falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. The default is seeded from the `sirius.enable_duckdb_fallback` YAML key; a per-session `SET` overrides it. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 ## Legacy Config Flags
