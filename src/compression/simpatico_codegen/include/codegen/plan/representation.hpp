@@ -284,6 +284,9 @@ struct dictionary_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> indices_only;  // Indices column (for fast reconstruction)
   bool fast_mode = false;                      // True if using keys+indices mode
 
+  // Constant key byte-width, measured lazily at first decompress (0 = variable, -1 = unmeasured).
+  mutable std::int64_t constant_key_width = -1;
+
   explicit dictionary_compressed_representation(std::unique_ptr<cudf::column> dict_col)
     : dict_column(std::move(dict_col)), keys_chars_copy(nullptr), fast_mode(false)
   {
