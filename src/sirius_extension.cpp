@@ -1610,8 +1610,14 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
 // Rebuilds the global sink from the current logging config.
 static void ReinstallLogSink()
 {
-  sirius::log::set_sink(
-    sirius::log::make_spdlog_owning_sink(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS));
+  sirius::log::level lvl = sirius::log::level::info;
+  sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
+  auto flush = Config::LOG_FLUSH_MS == 0
+                 ? std::nullopt
+                 : std::optional{std::chrono::milliseconds{Config::LOG_FLUSH_MS}};
+  auto sink  = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+  sink->set_level(lvl);
+  sirius::log::set_sink(std::move(sink));
 }
 
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)

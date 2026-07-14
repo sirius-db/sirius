@@ -112,24 +112,8 @@ class spdlog_owning_sink final : public sink {
 
 std::shared_ptr<sink> make_spdlog_owning_sink(const spdlog_owning_config& config)
 {
-  // Sink-construction failures (e.g. an unwritable log_dir) propagate to the
-  // caller so a bad `SET sirius_log_dir` fails loudly instead of silently
-  // disabling logging.
+  // Sink-construction failures (e.g. an unwritable log_dir) propagate to the caller.
   return std::make_shared<spdlog_owning_sink>(config);
-}
-
-std::shared_ptr<sink> make_spdlog_owning_sink(std::string_view level_str,
-                                              std::string_view log_dir,
-                                              uint32_t flush_ms)
-{
-  auto flush_interval =
-    flush_ms == 0 ? std::nullopt : std::optional{std::chrono::milliseconds{flush_ms}};
-  auto s = make_spdlog_owning_sink(spdlog_owning_config{std::string{log_dir}, flush_interval});
-
-  level lvl = level::info;  // unknown names default to info
-  string_to_enum(level_str, lvl);
-  s->set_level(lvl);
-  return s;
 }
 
 }  // namespace sirius::log
