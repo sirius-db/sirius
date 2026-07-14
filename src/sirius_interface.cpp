@@ -170,9 +170,8 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
       duckdb::ErrorData("Error in sirius_pending_statement_internal"));
   }
   D_ASSERT(sirius_collector->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
-  // Use the full DuckDB result types (with nested children) — sirius::logical_type
-  // cannot represent STRUCT/LIST/MAP children, so to_duckdb_vec(get_types()) would
-  // drop them (and throws outright for LIST).
+  // sirius::logical_type drops STRUCT/LIST/MAP children (and throws for LIST),
+  // so use the full DuckDB result types.
   auto types = sirius_collector->result_column_types;
   D_ASSERT(types == statement.types);
   engine.initialize(std::move(sirius_collector));

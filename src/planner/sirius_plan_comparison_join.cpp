@@ -468,8 +468,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // now visit the children
   D_ASSERT(op.children.size() == 2);
 
-  // Phase-1 boundary: reject joining on a nested (STRUCT/LIST/MAP) column. Checked
-  // before planning either child so the clear error surfaces ahead of any scan work.
+  // Reject nested join keys before planning either child.
   for (auto const& condition : op.conditions) {
     reject_nested_column_operation(*condition.left, "a join condition");
     reject_nested_column_operation(*condition.right, "a join condition");

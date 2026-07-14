@@ -185,8 +185,8 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
     case type_id::VARCHAR: return cudf::data_type(cudf::type_id::STRING);
     case type_id::STRUCT: return cudf::data_type(cudf::type_id::STRUCT);
     case type_id::ARRAY: return cudf::data_type(cudf::type_id::LIST);
-    // cudf::data_type carries no child metadata (only id + scale), which is enough for the
-    // by-id comparisons against a real nested cuDF column. MAP rides the LIST placeholder.
+    // cudf::data_type has no child metadata; id-only is enough for these comparisons.
+    // MAP rides the LIST placeholder.
     case type_id::LIST: return cudf::data_type(cudf::type_id::LIST);
     case type_id::SQLNULL:
     case type_id::INVALID:

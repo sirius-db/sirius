@@ -641,8 +641,7 @@ void insert_gpu_pipeline_operators_recursive(
 void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,
                                                                     std::string_view operation)
 {
-  // A nested-typed column reference is the clearest signal that the query operates
-  // on a nested column (WHERE / GROUP BY / JOIN ON). Report it by name.
+  // A nested-typed BOUND_REF names the offending column directly.
   if (is_nested_logical_type(expr.return_type) &&
       expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
     auto name = expr.GetName();
@@ -654,15 +653,14 @@ void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expr
                              "them yet");
   }
 
-  // Recurse first so a nested column reference nested inside the expression is
-  // reported (by name) in preference to a constructed nested value.
+  // Recurse first so a column reference wins over a constructed nested value.
   duckdb::ExpressionIterator::EnumerateChildren(expr,
                                                 [&operation](duckdb::Expression const& child) {
                                                   reject_nested_column_operation(child, operation);
                                                 });
 
-  // A nested-typed non-reference expression (e.g. struct_pack(...) / a list
-  // constructor) cannot be evaluated on the GPU path either.
+  // Constructed nested values (struct_pack, list constructors, ...) cannot run
+  // on the GPU path either.
   if (is_nested_logical_type(expr.return_type)) {
     throw std::runtime_error("nested column operation on '" + expr.ToString() + "' (" +
                              expr.return_type.ToString() + ") is unsupported in " +

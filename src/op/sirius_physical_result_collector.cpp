@@ -59,8 +59,8 @@ sirius_physical_result_collector::sirius_physical_result_collector(
     names(data.prepared->names)
 {
   this->types = sirius::from_duckdb_vec(data.prepared->types);
-  // Keep the full DuckDB types (with nested children) — sirius::logical_type cannot represent them,
-  // so nested result vectors must be built from these.
+  // Full DuckDB types incl. nested children — sirius::logical_type cannot
+  // represent them.
   this->result_column_types = data.prepared->types;
 }
 

@@ -86,10 +86,9 @@ host_table_chunk_reader::column_reader::column_reader(
     } else {
       offset_accessor_32.initialize(col.children[0].data_offset, allocation);
     }
-    // Value child: a recursive child reader for read_into, plus — when it is a flat
-    // fixed-width child — data_accessor + element-level null mask for the fixed-size ARRAY
-    // fast path (copy_array). A nested value child (STRUCT / LIST, e.g. MAP) owns no flat
-    // buffer, so data_accessor stays unset and copy_array is never taken for it.
+    // Value child: a recursive reader for read_into, plus data_accessor + null
+    // mask when flat fixed-width (the copy_array ARRAY fast path). A nested value
+    // child owns no flat buffer, so copy_array never fires for it.
     auto const& values_child = col.children[1];
     if (values_child.has_data) { data_accessor.initialize(values_child.data_offset, allocation); }
     child_null_count =
@@ -120,16 +119,14 @@ void host_table_chunk_reader::column_reader::copy_validity_range(
   if (null_count == 0) { return; }
 
   if (utils::mod_8(row_offset) == 0) {
-    // Byte-aligned start (every flat top-level chunk, and any list child slice that
-    // happens to begin on a byte boundary): bulk-copy the packed validity bytes.
+    // Byte-aligned start: bulk-copy the packed validity bytes.
     mask_accessor.set_cursor(mask_accessor.initial_byte_offset + row_offset / 8);
     auto* validity_ptr       = reinterpret_cast<uint8_t*>(validity.GetData());
     auto const bytes_to_copy = utils::ceil_div_8(count);
     mask_accessor.memcpy_to(allocation, validity_ptr, bytes_to_copy);
   } else {
-    // Misaligned start (a LIST child slice that does not begin on a byte boundary):
-    // the packed source bits straddle bytes, so read them one row at a time. Both
-    // cuDF and DuckDB pack validity LSB-first, so bit (row_offset+i) maps to row i.
+    // Misaligned start (LIST child slice): read bit-by-bit. Both cuDF and DuckDB
+    // pack validity LSB-first, so bit (row_offset+i) maps to row i.
     for (size_t i = 0; i < count; ++i) {
       size_t const bit       = row_offset + i;
       uint8_t const src_byte = mask_accessor.get(bit / 8, allocation);
@@ -308,8 +305,7 @@ void host_table_chunk_reader::column_reader::copy_array(
   }
 }
 
-// Flat-only convenience overload: delegates after converting sirius types to DuckDB. Nested types
-// lose their children in this conversion, so this overload must only be used for flat columns.
+// Flat-only overload: the sirius->DuckDB conversion drops nested children.
 host_table_chunk_reader::host_table_chunk_reader(
   duckdb::ClientContext& client_ctx,
   cucascade::host_data_representation const& host_table,
@@ -403,8 +399,8 @@ void host_table_chunk_reader::column_reader::read_into(
 {
   switch (cudf_col_type.id()) {
     case cudf::type_id::STRUCT: {
-      // One child vector per field, each over the same row range; then the struct's
-      // own validity (a null struct vs. a struct with null fields are distinct).
+      // One child vector per field over the same range, then the struct's own
+      // validity (null struct != struct with null fields).
       vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
       auto& entries = duckdb::StructVector::GetEntries(vector);
       assert(entries.size() == children.size());
@@ -415,11 +411,10 @@ void host_table_chunk_reader::column_reader::read_into(
       break;
     }
     case cudf::type_id::LIST: {
-      // cuDF stores N+1 offsets; the lists in [row_offset, row_offset+count) cover
-      // child elements [offsets[row_offset], offsets[row_offset+count]). DuckDB
-      // list_entry_t offsets are relative to the (freshly materialized) child
-      // vector, so subtract the slice base. A DuckDB MAP is physically a LIST whose
-      // value child is a STRUCT<key, value>, so this path serves MAP unchanged.
+      // cuDF stores N+1 offsets; lists in [row_offset, row_offset+count) cover
+      // child elements [offsets[row_offset], offsets[row_offset+count]).
+      // list_entry_t offsets are relative to the fresh child vector — subtract
+      // the slice base. MAP is physically LIST<STRUCT<key,value>>: same path.
       vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
       auto const offset_at = [this, &allocation](size_t idx) -> int64_t {
         return use_int64_offsets ? offset_accessor_64.get(idx, allocation)
@@ -452,8 +447,7 @@ void host_table_chunk_reader::column_reader::read_into(
       break;
     }
     default: {
-      // Fixed-width leaf, possibly needing a type-widening cast — mirrors the flat
-      // dispatch in get_next_chunk().
+      // Fixed-width leaf, possibly type-widened — mirrors get_next_chunk().
       auto const src_type = cudf_type_to_duckdb(cudf_col_type);
       if (src_type.id() == duckdb::LogicalTypeId::SQLNULL ||
           src_type.InternalType() == vector.GetType().InternalType()) {
@@ -499,8 +493,8 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
       // Nested STRUCT top-level column: materialize recursively into the pre-typed vector.
       _column_readers[col_idx].read_into(_client_ctx, vec, _row_offset, count, _allocation);
     } else if (actual_id == cudf::type_id::LIST) {
-      // A cuDF LIST maps to a DuckDB fixed-size ARRAY (the #901 fast path) or, for a
-      // variable-length LIST / MAP, to a DuckDB LIST / MAP materialized recursively.
+      // cuDF LIST -> DuckDB fixed-size ARRAY (fast path) or, when variable-length,
+      // LIST/MAP materialized recursively.
       if (vec.GetType().id() == duckdb::LogicalTypeId::ARRAY) {
         _column_readers[col_idx].copy_array(vec, _row_offset, count, _allocation);
       } else {

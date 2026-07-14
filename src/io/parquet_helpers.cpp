@@ -169,8 +169,8 @@ duckdb::LogicalType leaf_to_duckdb_type(pq::SchemaElement const& el)
                            el.name + "'");
 }
 
-// A group annotated LIST (`LogicalType::LIST` / `ConvertedType::LIST`) wraps the
-// standard 3-level encoding: `<col>(LIST) -> repeated group -> element`.
+// A LIST-annotated group wraps the standard 3-level encoding:
+// `<col>(LIST) -> repeated group -> element`.
 bool is_list_annotated(pq::SchemaElement const& el)
 {
   if (el.logical_type.has_value() && el.logical_type->type == pq::LogicalType::LIST) {
@@ -179,26 +179,24 @@ bool is_list_annotated(pq::SchemaElement const& el)
   return el.converted_type.has_value() && *el.converted_type == pq::ConvertedType::LIST;
 }
 
-// A group annotated MAP wraps `<col>(MAP) -> repeated key_value group -> {key, value}`.
-// MAP_KEY_VALUE annotates the inner key_value group, not the outer column, so it is
-// not treated as a map here.
+// A MAP-annotated group wraps `<col>(MAP) -> repeated key_value -> {key, value}`.
+// MAP_KEY_VALUE marks the inner key_value group, not the outer column — not a map.
 bool is_map_annotated(pq::SchemaElement const& el)
 {
   if (el.logical_type.has_value() && el.logical_type->type == pq::LogicalType::MAP) { return true; }
   return el.converted_type.has_value() && *el.converted_type == pq::ConvertedType::MAP;
 }
 
-// Result of mapping one schema subtree: the DuckDB type plus the index of the next
-// sibling element (one past this subtree) in the preorder-flattened schema array.
+// One mapped subtree: the DuckDB type plus the index of the next sibling in the
+// preorder-flattened schema array.
 struct mapped_subtree {
   duckdb::LogicalType type;
   std::size_t next;
 };
 
-// Recursively map the schema subtree rooted at `idx` (preorder) to a DuckDB
-// LogicalType. STRUCT/LIST/MAP groups recurse into their children; leaves use
-// leaf_to_duckdb_type. Advances past the whole subtree so the caller resumes at
-// the next sibling. Throws on a truncated / malformed nested subtree.
+// Map the subtree rooted at `idx` (preorder) to a DuckDB LogicalType, advancing
+// past it so the caller resumes at the next sibling. Throws on a truncated or
+// malformed nested subtree.
 mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx)
 {
   if (idx >= meta.schema.size()) {

@@ -144,10 +144,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   if (!op.table_filters.filters.empty()) {
     table_filters = create_table_filter_set(op.table_filters, column_ids);
-    // Phase-1 boundary: a predicate pushed down into the scan's table_filters bypasses
-    // the LogicalFilter guard, so reject filtering on a nested (STRUCT/LIST/MAP) column
-    // here too (e.g. `WHERE items IS NULL`). Without this it would later hit the lossy
-    // sirius type conversion in the scan filter path and fail unclearly.
+    // Predicates pushed into table_filters bypass the LogicalFilter guard —
+    // reject nested columns here too (e.g. `WHERE items IS NULL`).
     for (auto const& entry : table_filters->filters) {
       auto const column_id = column_ids[entry.first].GetPrimaryIndex();
       if (column_id < op.returned_types.size()) {
