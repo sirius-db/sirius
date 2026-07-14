@@ -16,10 +16,9 @@
 
 #include "log/logging.hpp"
 
-#include "log/log_backend.hpp"
+#include "log/noop_sink.hpp"
 
 #include <atomic>
-#include <cstdlib>
 #include <memory>
 
 namespace sirius::log {
@@ -33,7 +32,7 @@ namespace {
 // and set_sink() never stores null, so anything logged before a real sink is
 // installed goes to the noop rather than nowhere.
 struct logger_state {
-  std::atomic<std::shared_ptr<sink>> active{make_noop_backend()};
+  std::atomic<std::shared_ptr<sink>> active{make_noop_sink()};
 };
 
 logger_state& state()
@@ -52,7 +51,7 @@ logger_state& state()
 void set_sink(std::shared_ptr<sink> s)
 {
   // A null sink installs a discarding noop, so the slot is never empty.
-  auto next = s ? std::move(s) : make_noop_backend();
+  auto next = s ? std::move(s) : make_noop_sink();
   // Flush the displaced sink before its last reference may be released.
   if (auto displaced = state().active.exchange(std::move(next), std::memory_order_acq_rel)) {
     displaced->flush();

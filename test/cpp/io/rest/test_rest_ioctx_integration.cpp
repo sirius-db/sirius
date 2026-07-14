@@ -32,7 +32,7 @@
 #include <arpa/inet.h>
 #include <config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
-#include <log/log_backend.hpp>
+#include <log/logging.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>

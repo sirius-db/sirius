@@ -21,7 +21,6 @@
 #include <memory>
 #include <source_location>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 
 namespace sirius::log {
@@ -55,6 +54,30 @@ static_assert(static_cast<int>(level::trace) == SIRIUS_LOG_LEVEL_TRACE &&
                 static_cast<int>(level::critical) == SIRIUS_LOG_LEVEL_CRITICAL &&
                 static_cast<int>(level::off) == SIRIUS_LOG_LEVEL_OFF,
               "log level enum and SIRIUS_LOG_LEVEL_* macros must stay in sync");
+
+/// Parses a level name ("trace" .. "critical", "off") into `lvl`. Returns false
+/// (leaving `lvl` unchanged) for an unrecognized name.
+inline bool string_to_enum(std::string_view name, level& lvl)
+{
+  if (name == "trace") {
+    lvl = level::trace;
+  } else if (name == "debug") {
+    lvl = level::debug;
+  } else if (name == "info") {
+    lvl = level::info;
+  } else if (name == "warn") {
+    lvl = level::warn;
+  } else if (name == "error") {
+    lvl = level::error;
+  } else if (name == "critical") {
+    lvl = level::critical;
+  } else if (name == "off") {
+    lvl = level::off;
+  } else {
+    return false;
+  }
+  return true;
+}
 
 /// Log sink interface.
 class sink {
@@ -118,45 +141,7 @@ void format_and_log(level lvl,
   }
 }
 
-/// A compile-time-checked format string with the caller's source location.
-template <typename... Args>
-struct format_with_location {
-  // Implicit constructor by design so a string literal at the call site
-  // converts to this wrapper, capturing the location.
-  template <typename T>
-  consteval format_with_location(const T& format_str,
-                                 std::source_location loc = std::source_location::current())
-    : format{format_str}, location{loc}
-  {
-  }
-
-  std::format_string<Args...> format;
-  std::source_location location;
-};
-
 }  // namespace detail
-
-/// Factory macro to produce free-function log statements of the form
-/// `sirius::log::info("x={}", x)`.
-///
-/// Unlike the macros, these do NOT compile out below SIRIUS_ACTIVE_LOG_LEVEL and
-/// their arguments are always evaluated at the call site — prefer the macros on
-/// hot paths where eliding argument evaluation matters.
-#define SIRIUS_DEFINE_LOG_FN(name, lvl)                                                      \
-  template <typename... Args>                                                                \
-  void name(detail::format_with_location<std::type_identity_t<Args>...> fmt, Args&&... args) \
-  {                                                                                          \
-    detail::format_and_log(lvl, fmt.location, fmt.format, std::forward<Args>(args)...);      \
-  }
-
-SIRIUS_DEFINE_LOG_FN(trace, level::trace)
-SIRIUS_DEFINE_LOG_FN(debug, level::debug)
-SIRIUS_DEFINE_LOG_FN(info, level::info)
-SIRIUS_DEFINE_LOG_FN(warn, level::warn)
-SIRIUS_DEFINE_LOG_FN(error, level::error)
-SIRIUS_DEFINE_LOG_FN(critical, level::critical)
-
-#undef SIRIUS_DEFINE_LOG_FN
 
 }  // namespace sirius::log
 

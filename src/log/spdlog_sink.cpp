@@ -14,15 +14,18 @@
  * limitations under the License.
  */
 
-#include "log/log_backend.hpp"
+#include "log/spdlog_sink.hpp"
 
 #include <spdlog/sinks/daily_file_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <format>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
 
 namespace sirius::log {
@@ -44,15 +47,12 @@ spdlog::level::level_enum to_spdlog_level(level lvl)
   return spdlog::level::info;
 }
 
-/// Writes to a daily-rotated `<log_dir>/sirius.log` through a multi-threaded
-/// file sink. The logger is deliberately NOT put into spdlog's global registry:
-/// registry-owned static state can be destroyed before this sink at process
-/// exit, and the global periodic flusher (spdlog::flush_every) would outlive a
-/// sink swap. Periodic flushing is a sink-owned thread instead, whose lifetime
-/// exactly matches the sink's.
-class spdlog_backend final : public sink {
+/// Writes to a daily-rotated `<log_dir>/sirius.log`. Kept out of spdlog's global
+/// registry (its static state and periodic flusher would outlive this sink);
+/// periodic flushing is a sink-owned thread instead.
+class spdlog_sink final : public sink {
  public:
-  explicit spdlog_backend(const spdlog_backend_config& config)
+  explicit spdlog_sink(const spdlog_sink_config& config)
   {
     auto log_file  = std::format("{}/sirius.log", config.log_dir);
     auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
@@ -105,12 +105,26 @@ class spdlog_backend final : public sink {
 
 }  // namespace
 
-std::shared_ptr<sink> make_spdlog_backend(const spdlog_backend_config& config)
+std::shared_ptr<sink> make_spdlog_sink(const spdlog_sink_config& config)
 {
   // Sink-construction failures (e.g. an unwritable log_dir) propagate to the
   // caller so a bad `SET sirius_log_dir` fails loudly instead of silently
   // disabling logging.
-  return std::make_shared<spdlog_backend>(config);
+  return std::make_shared<spdlog_sink>(config);
+}
+
+std::shared_ptr<sink> make_spdlog_sink(std::string_view level_str,
+                                       std::string_view log_dir,
+                                       uint32_t flush_ms)
+{
+  auto flush_interval =
+    flush_ms == 0 ? std::nullopt : std::optional{std::chrono::milliseconds{flush_ms}};
+  auto s = make_spdlog_sink(spdlog_sink_config{std::string{log_dir}, flush_interval});
+
+  level lvl = level::info;  // unknown names default to info
+  string_to_enum(level_str, lvl);
+  s->set_level(lvl);
+  return s;
 }
 
 }  // namespace sirius::log

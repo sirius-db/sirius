@@ -16,8 +16,9 @@
 
 #include "catch.hpp"
 #include "config.hpp"
-#include "log/log_backend.hpp"
 #include "log/logging.hpp"
+#include "log/noop_sink.hpp"
+#include "log/spdlog_sink.hpp"
 #include "utils/log_test_utils.hpp"
 
 #include <atomic>
@@ -81,36 +82,6 @@ TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
   CHECK(messages[0].message == "x=42");
   CHECK(messages[0].file.ends_with("test_logging.cpp"));
   CHECK(messages[0].line == expected_line);
-}
-
-TEST_CASE("sirius::log free functions format and capture the call site", "[log]")
-{
-  scoped_recording_backend scoped;
-
-  sirius::log::info("x={}", 42);
-  const uint32_t info_line = __LINE__ - 1;
-  sirius::log::warn("plain");
-
-  auto records = scoped.backend().records();
-  REQUIRE(records.size() == 2);
-  CHECK(records[0].level == level::info);
-  CHECK(records[0].message == "x=42");
-  CHECK(records[0].file.ends_with("test_logging.cpp"));
-  CHECK(records[0].line == info_line);
-  CHECK(records[1].level == level::warn);
-  CHECK(records[1].message == "plain");
-}
-
-TEST_CASE("sirius::log free functions respect the level", "[log]")
-{
-  scoped_recording_backend scoped;
-
-  scoped.backend().set_level(level::warn);
-  sirius::log::debug("dropped {}", 1);
-  sirius::log::error("kept");
-  auto records = scoped.backend().records();
-  REQUIRE(records.size() == 1);
-  CHECK(records[0].message == "kept");
 }
 
 TEST_CASE("The sink enforces the level gate", "[log]")
@@ -178,23 +149,9 @@ TEST_CASE("Concurrent logging survives backend swaps", "[log]")
   CHECK(backend_a->count() + backend_b->count() > 0);
 }
 
-TEST_CASE("backend_type round-trips through its string form", "[log]")
+TEST_CASE("The noop sink accepts and discards everything", "[log]")
 {
-  for (auto type : {sink_type::spdlog, sink_type::noop}) {
-    std::string name;
-    REQUIRE(enum_to_string(type, name));
-    sink_type parsed{};
-    REQUIRE(string_to_enum(name, parsed));
-    CHECK(parsed == type);
-  }
-
-  sink_type parsed{};
-  CHECK_FALSE(string_to_enum("bogus", parsed));
-}
-
-TEST_CASE("The noop backend accepts and discards everything", "[log]")
-{
-  auto noop = make_noop_backend();
+  auto noop = make_noop_sink();
   REQUIRE(noop != nullptr);
   noop->log(level::critical, std::source_location::current(), "into the void");
   CHECK(noop->flush());
@@ -215,7 +172,7 @@ TEST_CASE("The spdlog backend writes the documented line format", "[log]")
 
   {
     scoped_recording_backend scoped;  // restores the process logger on exit
-    auto backend = make_spdlog_backend({temp_dir.string(), std::nullopt});
+    auto backend = make_spdlog_sink({temp_dir.string(), std::nullopt});
     REQUIRE(backend != nullptr);
     backend->set_level(level::info);
     set_sink(backend);

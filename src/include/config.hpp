@@ -21,12 +21,6 @@
 #include <cstdint>
 #include <string>
 
-namespace sirius::log {
-// Opaque declaration: the full definition lives in log/logging.hpp; TUs that
-// only pass Config::LOG_BACKEND around don't need the logging headers.
-enum class backend_type;
-}  // namespace sirius::log
-
 namespace duckdb {
 
 // If you are adding a new field to this struct, then you also need to make the following changes:
@@ -84,7 +78,6 @@ struct Config {
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;
   static uint32_t LOG_FLUSH_MS;
-  static sirius::log::backend_type LOG_BACKEND;
 };
 
 }  // namespace duckdb
