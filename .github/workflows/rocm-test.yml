@@ -61,7 +61,11 @@ jobs:
             wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
             echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.2 noble main" | sudo tee /etc/apt/sources.list.d/rocm.list
             sudo apt-get update
-            sudo apt-get install -y rocm-dev rocm-utils hipblas-dev hipcub-dev rocthrust-dev
+            # ubuntu-latest's base image ships an older, partial ROCm-adjacent package set
+            # (rocminfo/hipcc/rocm-cmake at versions that conflict with the 6.2 repo's).
+            # --allow-downgrades + --allow-change-held-packages lets apt actually resolve
+            # to the versions this workflow needs instead of failing with unmet deps.
+            sudo apt-get install -y --allow-downgrades --allow-change-held-packages               rocm-dev rocm-utils hipblas-dev hipcub-dev rocthrust-dev
           else
             echo "hipcc already available: $(hipcc --version | head -1)"
           fi
