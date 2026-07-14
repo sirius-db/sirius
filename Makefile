@@ -24,7 +24,7 @@ BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
-	s3-test s3-test-large \
+	s3-test s3-test-large s3-tpch \
 	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
@@ -166,10 +166,25 @@ s3-test-large:
 	@# group. Catch2 OR-combines specs within one argument via commas (multiple
 	@# positional args are AND-concatenated instead), so each group runs in a
 	@# single process where same-config cases share one SiriusContext lifecycle.
+	@# SIRIUS_TEST_S3_TPCH is scoped to the first group only: it gates both the
+	@# SF1 TPC-H fixture upload at bring-up and the [tpch][large] case, so the
+	@# second group's bring-up must not see it (it would re-generate/upload).
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join]"; \
+	SIRIUS_TEST_S3_TPCH=1 $(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join],[s3][integration][sql][tpch][large]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm],[s3][sql][large][large-q1-no-prewarm],[s3][sql][large][large-join-no-prewarm]"
+
+# TPC-H-over-S3 correctness tier (Q1-Q22 == local CPU oracle, GPU-only). Uploads
+# the SF1 TPC-H fixture (SIRIUS_TEST_S3_TPCH=1) and runs both the tiny and SF1
+# correctness cases; excludes the [bench] perf arm. MinIO auto-managed.
+s3-tpch:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-tpch: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 SIRIUS_TEST_S3_TPCH=1; \
+	$(S3_TEST_BIN) "[s3][integration][sql][tpch]~[bench]"
 
 # Manual real-AWS gates. These never start MinIO/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
@@ -225,12 +240,17 @@ s3-bench:
 	  echo "s3-bench: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
+	@# The TPC-H query benchmark ([s3][bench][tpch]) is excluded from the routine
+	@# run and its SF1 fixture (SIRIUS_TEST_S3_TPCH) is not uploaded, unless the
+	@# caller opts in with SIRIUS_BENCH_S3_TPCH=1.
 	@set -e; \
+	tpch_excl="~[tpch]"; \
+	if [ -n "$${SIRIUS_BENCH_S3_TPCH:-}" ]; then tpch_excl=""; fi; \
 	if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
 	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	  selector="[s3][bench]~[aws]"; \
+	  selector="[s3][bench]~[aws]$$tpch_excl"; \
 	else \
-	  selector="[s3][bench][aws]"; \
+	  selector="[s3][bench][aws]$$tpch_excl"; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
 	export HOSTNAME="$${HOSTNAME:-$$(hostname)}"; \
