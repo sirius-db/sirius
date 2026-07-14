@@ -20,13 +20,9 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
-#include <condition_variable>
 #include <format>
 #include <memory>
-#include <mutex>
-#include <optional>
 #include <string>
-#include <thread>
 
 namespace sirius::log {
 
@@ -48,10 +44,9 @@ spdlog::level::level_enum to_spdlog_level(level lvl)
 }
 
 /// Owns Sirius's spdlog logging: a private logger writing to a daily-rotated
-/// `<log_dir>/sirius.log`, with its own level and flush thread. It could use
-/// spdlog's global periodic flusher (spdlog::flush_every), but that flushes only
-/// registered loggers, and a registered logger's destructor races spdlog's
-/// registry teardown at exit — so periodic flushing is a private thread instead.
+/// `<log_dir>/sirius.log`. As the owning variant it publishes the logger through
+/// spdlog's global registry so spdlog's periodic flusher (spdlog::flush_every)
+/// drives best-effort flushing.
 class spdlog_owning_sink final : public sink {
  public:
   explicit spdlog_owning_sink(const spdlog_owning_config& config)
@@ -60,24 +55,24 @@ class spdlog_owning_sink final : public sink {
     auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
     file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
-    _logger = std::make_shared<spdlog::logger>("sirius", spdlog::sinks_init_list{file_sink});
+    _logger = std::make_shared<spdlog::logger>(logger_name, spdlog::sinks_init_list{file_sink});
 
+    // Publish through the registry so flush_every reaches this logger. drop()
+    // first because register_logger throws on a duplicate name: set_sink rebuilds
+    // the sink (e.g. SET sirius_log_dir), and the prior instance is still
+    // registered under this name.
+    spdlog::drop(logger_name);
+    spdlog::register_logger(_logger);
+    // spdlog's periodic flusher works at second granularity.
     if (config.flush_interval) {
-      _flusher = std::jthread(
-        [logger = _logger, interval = *config.flush_interval](const std::stop_token& stop) {
-          std::mutex mutex;
-          std::condition_variable_any cv;
-          std::unique_lock lock(mutex);
-          // wait_for returns true when stop was requested (the predicate).
-          while (!cv.wait_for(lock, stop, interval, [&stop] { return stop.stop_requested(); })) {
-            logger->flush();
-          }
-        });
+      spdlog::flush_every(std::chrono::duration_cast<std::chrono::seconds>(*config.flush_interval));
     }
   }
 
-  // The implicit destructor stops and joins the flusher (jthread), then
-  // releases the logger; the file sink flushes on destruction.
+  // No destructor drop: touching spdlog's registry at process exit risks a
+  // static-destruction-order problem with spdlog's own registry singleton. On
+  // destruction the logger stays registered (harmlessly unused); spdlog flushes
+  // and reaps it at shutdown, and the next constructor's drop() clears staleness.
 
   // The level lives in the spdlog logger itself — the single source of truth.
   void set_level(level lvl) override { _logger->set_level(to_spdlog_level(lvl)); }
@@ -102,10 +97,8 @@ class spdlog_owning_sink final : public sink {
   }
 
  private:
+  static constexpr const char* logger_name = "sirius";
   std::shared_ptr<spdlog::logger> _logger;
-  // Declared last: joined (and thus done touching _logger) before members are
-  // destroyed.
-  std::jthread _flusher;
 };
 
 }  // namespace

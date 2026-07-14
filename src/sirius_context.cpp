@@ -1001,10 +1001,11 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
   sirius::log::level lvl = sirius::log::level::info;
   sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
-  auto flush = Config::LOG_FLUSH_MS == 0
-                 ? std::nullopt
-                 : std::optional{std::chrono::milliseconds{Config::LOG_FLUSH_MS}};
-  auto sink  = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+  auto flush =
+    Config::LOG_FLUSH_SECONDS <= 0
+      ? std::nullopt
+      : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
+  auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
   sink->set_level(lvl);
   sirius::log::set_sink(std::move(sink));
   read_config_file_if_exists();

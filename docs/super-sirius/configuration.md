@@ -356,8 +356,7 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 |----------|---------|-------------|
 | `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error |
 | `sirius_log_dir` | `log` | Log output directory |
-| `sirius_log_flush_ms` | 3000 | Interval between scheduled best-effort log flushes in milliseconds (0 = none) |
-| `sirius_log_backend` | `spdlog` | Logging backend: `spdlog` (daily file) or `noop` (discard) |
+| `sirius_log_flush_seconds` | 5 | Log flush interval |
 
 ### Memory
 

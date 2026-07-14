@@ -1612,10 +1612,11 @@ static void ReinstallLogSink()
 {
   sirius::log::level lvl = sirius::log::level::info;
   sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
-  auto flush = Config::LOG_FLUSH_MS == 0
-                 ? std::nullopt
-                 : std::optional{std::chrono::milliseconds{Config::LOG_FLUSH_MS}};
-  auto sink  = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+  auto flush =
+    Config::LOG_FLUSH_SECONDS <= 0
+      ? std::nullopt
+      : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
+  auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
   sink->set_level(lvl);
   sirius::log::set_sink(std::move(sink));
 }
@@ -1637,12 +1638,12 @@ static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
-static void SetLogFlushMs(ClientContext& context, SetScope scope, Value& parameter)
+static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
-  Config::LOG_FLUSH_MS = UIntegerValue::Get(parameter);
+  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
   // The flush interval is fixed at sink construction, so rebuild the sink.
   ReinstallLogSink();
-  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_MS to {}", Config::LOG_FLUSH_MS);
+  SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -1862,12 +1863,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::VARCHAR,
                             Value(Config::LOG_DIR),
                             SetLogDir);
-  config.AddExtensionOption("sirius_log_flush_ms",
-                            "Interval in milliseconds between scheduled best-effort log flushes "
-                            "(0 = no scheduled flushes)",
-                            LogicalType::UINTEGER,
-                            Value::UINTEGER(Config::LOG_FLUSH_MS),
-                            SetLogFlushMs);
+  config.AddExtensionOption("sirius_log_flush_seconds",
+                            "Interval in seconds between automatic log flushes",
+                            LogicalType::INTEGER,
+                            Value::INTEGER(Config::LOG_FLUSH_SECONDS),
+                            SetLogFlushSeconds);
 
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",

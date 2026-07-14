@@ -126,7 +126,7 @@ Both can also be configured at runtime via DuckDB's `SET` command:
 ```sql
 SET sirius_log_dir = '/path/to/logs';
 SET sirius_log_level = 'trace';
-SET sirius_log_flush_ms = 1000;
+SET sirius_log_flush_seconds = 1;
 ```
 
 ## Tracing
