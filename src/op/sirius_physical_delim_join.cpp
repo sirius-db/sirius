@@ -84,8 +84,9 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
 
   children.push_back(std::move(join->children[1]));
 
-  // Mark the placeholder so the CPU-source rejection skips it: it carries no runtime
-  // data (sink() runs partition_join inline) and must not force a CPU fallback.
+  // Mark the placeholder so replace_with_gpu_values skips it: it carries no runtime
+  // data (sink() runs partition_join inline), so a GPU_VALUES replacement would
+  // materialize a phantom source.
   auto dummy_placeholder =
     duckdb::make_uniq<sirius_physical_dummy_scan>(children[0]->get_types(), estimated_cardinality);
   dummy_placeholder->set_delim_join_placeholder(true);
