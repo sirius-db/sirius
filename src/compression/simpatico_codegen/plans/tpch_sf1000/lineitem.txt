@@ -1,180 +1,88 @@
-# column: l_orderkey  dtype: i64  ratio: 13.495x  depth: 10
-# comp: 96.57 GB/s  decomp: 275.64 GB/s
-input -> rle -> runs, values
-rle.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-rle.values.packed -> lz4
-rle.runs.packed -> deflate
-rle.values.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-rle.values.chunk_count -> rle -> runs, values
-rle.runs.chunk_count -> rle -> runs, values
-rle.runs.chunk_min -> rle -> runs, values
-rle.runs.chunk_bits -> rle -> runs, values
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# column: l_orderkey  dtype: i64  ratio: 20.711x  depth: 2
+# comp: 531.34 GB/s  decomp: 626.76 GB/s
+input -> delta -> differences
+delta.differences -> ans
 
 ---
-# column: l_partkey  dtype: i32  ratio: 1.138x  depth: 10
-# comp: 70.44 GB/s  decomp: 185.22 GB/s
+# column: l_partkey  dtype: i32  ratio: 1.140x  depth: 1
+# comp: 681.79 GB/s  decomp: 1496.30 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_min.packed -> deflate
-bitpack.chunk_count.runs -> rle -> runs, values
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_min.chunk_count -> rle -> runs, values
-bitpack.chunk_min.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min.chunk_bits -> rle -> runs, values
 
 ---
-# column: l_suppkey  dtype: i32  ratio: 1.328x  depth: 10
-# comp: 69.98 GB/s  decomp: 186.42 GB/s
+# column: l_suppkey  dtype: i32  ratio: 1.329x  depth: 1
+# comp: 665.35 GB/s  decomp: 1499.53 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_min.packed -> deflate
-bitpack.chunk_min.chunk_count -> rle -> runs, values
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_count.runs -> rle -> runs, values
-bitpack.chunk_min.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min.chunk_bits -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: l_linenumber  dtype: i32  ratio: 6.883x  depth: 9
-# comp: 26.37 GB/s  decomp: 203.49 GB/s
+# column: l_linenumber  dtype: i32  ratio: 10.422x  depth: 1
+# comp: 726.41 GB/s  decomp: 2122.72 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.packed -> deflate
-bitpack.chunk_min -> rle -> runs, values
-bitpack.chunk_count -> rle -> runs, values
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_min.values -> rle -> runs, values
-bitpack.chunk_count.runs -> rle -> runs, values
-bitpack.chunk_min.runs -> rle -> runs, values
 
 ---
-# column: l_quantity  dtype: t26  ratio: 3.404x  depth: 1
-# comp: 538.81 GB/s  decomp: 633.79 GB/s
+# column: l_quantity  dtype: t26  ratio: 3.959x  depth: 1
+# comp: 25.11 GB/s  decomp: 305.06 GB/s
+input -> snappy
+
+---
+# column: l_extendedprice  dtype: t26  ratio: 1.984x  depth: 1
+# comp: 361.34 GB/s  decomp: 581.72 GB/s
 input -> ans
 
 ---
-# column: l_extendedprice  dtype: t26  ratio: 1.992x  depth: 1
-# comp: 480.40 GB/s  decomp: 597.89 GB/s
+# column: l_discount  dtype: t26  ratio: 8.250x  depth: 1
+# comp: 594.35 GB/s  decomp: 685.57 GB/s
 input -> ans
 
 ---
-# column: l_discount  dtype: t26  ratio: 8.413x  depth: 1
-# comp: 665.67 GB/s  decomp: 703.08 GB/s
+# column: l_tax  dtype: t26  ratio: 8.817x  depth: 1
+# comp: 598.08 GB/s  decomp: 691.28 GB/s
 input -> ans
 
 ---
-# column: l_tax  dtype: t26  ratio: 8.860x  depth: 1
-# comp: 669.59 GB/s  decomp: 712.84 GB/s
-input -> ans
-
----
-# column: l_returnflag  dtype: str  ratio: 11.954x  depth: 10
-# comp: 39.08 GB/s  decomp: 88.60 GB/s
+# column: l_returnflag  dtype: str  ratio: 19.321x  depth: 2
+# comp: 97.85 GB/s  decomp: 846.70 GB/s
 input -> dictionary -> keys_offsets, keys_chars, indices
 dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-dictionary.indices.packed -> deflate
-dictionary.indices.chunk_min -> rle -> runs, values
-dictionary.indices.chunk_count -> rle -> runs, values
-dictionary.indices.chunk_bits -> bitcomp
-dictionary.indices.chunk_count.values -> rle -> runs, values
-dictionary.indices.chunk_min.values -> rle -> runs, values
-dictionary.indices.chunk_min.runs -> rle -> runs, values
-dictionary.indices.chunk_count.runs -> rle -> runs, values
 
 ---
-# column: l_linestatus  dtype: str  ratio: 23.196x  depth: 10
-# comp: 45.14 GB/s  decomp: 90.09 GB/s
+# column: l_linestatus  dtype: str  ratio: 37.372x  depth: 2
+# comp: 90.41 GB/s  decomp: 876.63 GB/s
 input -> dictionary -> keys_offsets, keys_chars, indices
 dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-dictionary.indices.chunk_count -> rle -> runs, values
-dictionary.indices.packed -> deflate
-dictionary.indices.chunk_min -> rle -> runs, values
-dictionary.indices.chunk_bits -> bitcomp
-dictionary.indices.chunk_min.values -> rle -> runs, values
-dictionary.indices.chunk_count.values -> rle -> runs, values
-dictionary.indices.chunk_count.runs -> rle -> runs, values
-dictionary.indices.chunk_min.runs -> rle -> runs, values
 
 ---
-# column: l_shipdate  dtype: t12  ratio: 1.333x  depth: 10
-# comp: 28.02 GB/s  decomp: 94.14 GB/s
+# column: l_shipdate  dtype: t12  ratio: 2.651x  depth: 1
+# comp: 762.53 GB/s  decomp: 1686.72 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.packed -> deflate
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_min.packed -> deflate
-bitpack.chunk_min.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_count.runs -> rle -> runs, values
-bitpack.chunk_min.chunk_count -> rle -> runs, values
 
 ---
-# column: l_commitdate  dtype: t12  ratio: 1.333x  depth: 10
-# comp: 28.08 GB/s  decomp: 94.34 GB/s
+# column: l_commitdate  dtype: t12  ratio: 2.651x  depth: 1
+# comp: 757.54 GB/s  decomp: 1668.48 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.packed -> deflate
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_min.packed -> deflate
-bitpack.chunk_min.chunk_count -> rle -> runs, values
-bitpack.chunk_min.chunk_min -> rle -> runs, values
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_count.runs -> rle -> runs, values
 
 ---
-# column: l_receiptdate  dtype: t12  ratio: 1.333x  depth: 10
-# comp: 28.06 GB/s  decomp: 94.86 GB/s
+# column: l_receiptdate  dtype: t12  ratio: 2.651x  depth: 1
+# comp: 750.44 GB/s  decomp: 1680.60 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.packed -> deflate
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_count.runs -> rle -> runs, values
-bitpack.chunk_min.packed -> deflate
-bitpack.chunk_min.chunk_count -> rle -> runs, values
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_min.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: l_shipinstruct  dtype: str  ratio: 61.802x  depth: 10
-# comp: 296.61 GB/s  decomp: 271.32 GB/s
+# column: l_shipinstruct  dtype: str  ratio: 61.823x  depth: 3
+# comp: 218.92 GB/s  decomp: 286.94 GB/s
 input -> dictionary -> keys_offsets, keys_chars, indices
-dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-dictionary.indices.chunk_count -> rle -> runs, values
-dictionary.indices.chunk_min -> rle -> runs, values
-dictionary.indices.chunk_bits -> bitcomp
-dictionary.indices.chunk_min.runs -> rle -> runs, values
-dictionary.indices.chunk_count.values -> rle -> runs, values
-dictionary.indices.chunk_min.values -> rle -> runs, values
-dictionary.indices.chunk_count.runs -> rle -> runs, values
 dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-
----
-# column: l_shipmode  dtype: str  ratio: 9.553x  depth: 10
-# comp: 73.36 GB/s  decomp: 131.32 GB/s
-input -> dictionary -> keys_offsets, keys_chars, indices
-dictionary.indices -> zigzag -> zigzag
-dictionary.indices.zigzag -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-dictionary.indices.zigzag.packed -> deflate
-dictionary.indices.zigzag.chunk_count -> rle -> runs, values
-dictionary.indices.zigzag.chunk_min -> rle -> runs, values
-dictionary.indices.zigzag.chunk_bits -> bitcomp
-dictionary.indices.zigzag.chunk_count.runs -> rle -> runs, values
-dictionary.indices.zigzag.chunk_count.values -> rle -> runs, values
-dictionary.indices.zigzag.chunk_min.values -> rle -> runs, values
-
----
-# column: l_comment  dtype: str  ratio: 2.731x  depth: 5
-# note: carried from sf1 plan; sf1000 explore hit the >2GB-string codec overflow
-input -> dictionary -> keys_offsets, keys_chars, indices
-dictionary.keys_offsets -> delta -> differences
-dictionary.keys_chars -> snappy
 dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-dictionary.keys_offsets.differences -> ans
+
+---
+# column: l_shipmode  dtype: str  ratio: 1.700x  depth: 2
+# comp: 330.83 GB/s  decomp: 822.91 GB/s
+input -> str_split -> offsets, chars
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_comment  dtype: str  ratio: 2.510x  depth: 4
+# comp: 22.28 GB/s  decomp: 264.33 GB/s
+input -> str_split -> offsets, chars
+str_split.offsets -> delta -> differences
+str_split.chars -> snappy
+str_split.offsets.differences -> ans

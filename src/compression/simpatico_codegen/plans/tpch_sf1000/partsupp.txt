@@ -1,51 +1,29 @@
-# column: ps_partkey  dtype: i32  ratio: 3.919x  depth: 10
-# comp: 159.17 GB/s  decomp: 349.39 GB/s
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# column: ps_partkey  dtype: i32  ratio: 101.136x  depth: 2
+# comp: 251.44 GB/s  decomp: 714.73 GB/s
+input -> delta -> differences
+delta.differences -> lz4
+
+---
+# column: ps_suppkey  dtype: i32  ratio: 37.380x  depth: 2
+# comp: 82.06 GB/s  decomp: 426.30 GB/s
+input -> delta -> differences
+delta.differences -> deflate
+
+---
+# column: ps_availqty  dtype: i32  ratio: 2.274x  depth: 1
+# comp: 724.97 GB/s  decomp: 1573.71 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.packed -> delta -> differences
-bitpack.packed.differences -> lz4
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.chunk_min.packed -> lz4
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_min.chunk_count -> rle -> runs, values
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_count.runs -> rle -> runs, values
 
 ---
-# column: ps_suppkey  dtype: i32  ratio: 1.321x  depth: 10
-# comp: 56.64 GB/s  decomp: 166.09 GB/s
-input -> identity
-
----
-# column: ps_availqty  dtype: i32  ratio: 2.272x  depth: 10
-# comp: 71.02 GB/s  decomp: 188.26 GB/s
-input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_count -> rle -> runs, values
-bitpack.chunk_bits -> bitcomp
-bitpack.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min.packed -> deflate
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_min.chunk_count -> rle -> runs, values
-bitpack.chunk_min.chunk_min -> rle -> runs, values
-bitpack.chunk_count.runs -> rle -> runs, values
-bitpack.chunk_min.chunk_bits -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-
----
-# column: ps_supplycost  dtype: t26  ratio: 2.545x  depth: 1
-# comp: 542.35 GB/s  decomp: 602.20 GB/s
+# column: ps_supplycost  dtype: t26  ratio: 2.532x  depth: 1
+# comp: 423.53 GB/s  decomp: 587.18 GB/s
 input -> ans
 
 ---
-# column: ps_comment  dtype: str  ratio: 2.945x  depth: 5
-# note: carried from sf1 plan; sf1000 explore hit the >2GB-string codec overflow
-# comp: 3.21 GB/s  decomp: 42.09 GB/s
+# column: ps_comment  dtype: str  ratio: 1.019x  depth: 3
+# note: chars stay raw — its ~12GB buffer compresses to >INT32_MAX bytes, which
+# cannot be serialized as a single nvcomp leaf (.hpln header is a UINT8 column)
 input -> str_split -> offsets, chars
-str_split.chars -> snappy
-str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-str_split.offsets.chunk_count -> rle -> runs, values
-str_split.offsets.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-str_split.offsets.chunk_bits -> rle -> runs, values
-str_split.offsets.chunk_min.chunk_count -> rle -> runs, values
-str_split.offsets.chunk_count.values -> rle -> runs, values
-str_split.offsets.chunk_count.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-str_split.offsets.chunk_bits.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+str_split.offsets -> delta -> differences
+str_split.offsets.differences -> ans

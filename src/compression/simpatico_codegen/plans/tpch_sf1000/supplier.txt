@@ -1,69 +1,49 @@
-# column: s_suppkey  dtype: i32  ratio: 254.033x  depth: 5
-# comp: 53.39 GB/s  decomp: 92.79 GB/s
-input -> zigzag -> zigzag
-zigzag.zigzag -> delta -> differences
-zigzag.zigzag.differences -> rle -> runs, values
-zigzag.zigzag.differences.runs -> bitcomp
-zigzag.zigzag.differences.values -> deflate
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# column: s_suppkey  dtype: i32  ratio: 170.650x  depth: 2
+# comp: 248.66 GB/s  decomp: 500.20 GB/s
+input -> delta -> differences
+delta.differences -> rle -> runs, values
 
 ---
-# column: s_name  dtype: str  ratio: 6.686x  depth: 10
-# comp: 27.75 GB/s  decomp: 113.18 GB/s
+# column: s_name  dtype: str  ratio: 3.200x  depth: 5
+# comp: 44.77 GB/s  decomp: 251.86 GB/s
 input -> str_split -> offsets, chars
-str_split.offsets -> delta -> differences
-str_split.chars -> deflate
-str_split.offsets.differences -> rle -> runs, values
-str_split.offsets.differences.values -> deflate
-str_split.offsets.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-str_split.offsets.differences.runs.packed -> lz4
-str_split.offsets.differences.runs.chunk_bits -> rle -> runs, values
-str_split.offsets.differences.runs.chunk_min -> rle -> runs, values
-str_split.offsets.differences.runs.chunk_count -> rle -> runs, values
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+str_split.offsets.chunk_bits -> rle -> runs, values
+str_split.offsets.chunk_bits.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+str_split.chars -> snappy
 
 ---
-# column: s_address  dtype: str  ratio: 1.446x  depth: 4
-# comp: 19.10 GB/s  decomp: 95.71 GB/s
+# column: s_address  dtype: str  ratio: 1.433x  depth: 4
+# comp: 208.01 GB/s  decomp: 479.60 GB/s
 input -> str_split -> offsets, chars
 str_split.offsets -> delta -> differences
-str_split.chars -> deflate
+str_split.chars -> ans
 str_split.offsets.differences -> ans
 
 ---
-# column: s_nationkey  dtype: i32  ratio: 3.194x  depth: 10
-# comp: 7.79 GB/s  decomp: 22.66 GB/s
+# column: s_nationkey  dtype: i32  ratio: 6.311x  depth: 1
+# comp: 306.82 GB/s  decomp: 787.15 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-bitpack.chunk_min -> rle -> runs, values
-bitpack.chunk_count -> rle -> runs, values
-bitpack.packed -> deflate
-bitpack.chunk_bits -> rle -> runs, values
-bitpack.chunk_min.values -> rle -> runs, values
-bitpack.chunk_count.values -> rle -> runs, values
-bitpack.chunk_bits.runs -> rle -> runs, values
-bitpack.chunk_min.runs -> rle -> runs, values
-bitpack.chunk_count.runs -> rle -> runs, values
 
 ---
-# column: s_phone  dtype: str  ratio: 1.369x  depth: 10
-# comp: 20.97 GB/s  decomp: 69.57 GB/s
-# constant-length (15): offsets deltas are one RLE run, so the chain ends at rle
+# column: s_phone  dtype: str  ratio: 2.496x  depth: 6
+# comp: 192.53 GB/s  decomp: 500.93 GB/s
 input -> str_split -> offsets, chars
 str_split.offsets -> delta -> differences
 str_split.offsets.differences -> rle -> runs, values
 str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-str_split.chars.packed -> deflate
-str_split.chars.chunk_count -> rle -> runs, values
-str_split.chars.chunk_bits -> bitcomp
 str_split.chars.chunk_min -> rle -> runs, values
+str_split.chars.chunk_min.values -> rle -> runs, values
 
 ---
-# column: s_acctbal  dtype: t26  ratio: 1.962x  depth: 1
-# comp: 261.51 GB/s  decomp: 333.02 GB/s
+# column: s_acctbal  dtype: t26  ratio: 1.950x  depth: 1
+# comp: 237.62 GB/s  decomp: 377.07 GB/s
 input -> ans
 
 ---
-# column: s_comment  dtype: str  ratio: 2.987x  depth: 4
-# comp: 19.48 GB/s  decomp: 166.69 GB/s
+# column: s_comment  dtype: str  ratio: 2.730x  depth: 3
+# comp: 21.09 GB/s  decomp: 253.02 GB/s
 input -> str_split -> offsets, chars
-str_split.chars -> deflate
-str_split.offsets -> delta -> differences
-str_split.offsets.differences -> ans
+str_split.chars -> snappy
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
