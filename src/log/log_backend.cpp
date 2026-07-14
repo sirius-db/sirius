@@ -16,7 +16,10 @@
 
 #include "log/log_backend.hpp"
 
+#include <chrono>
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace sirius::log {
 
@@ -35,5 +38,27 @@ class noop_backend final : public sink {
 }  // namespace
 
 std::shared_ptr<sink> make_noop_backend() { return std::make_shared<noop_backend>(); }
+
+std::shared_ptr<sink> make_backend(std::string_view level_str,
+                                   std::string_view log_dir,
+                                   uint32_t flush_ms,
+                                   backend_type type)
+{
+  std::shared_ptr<sink> s;
+  switch (type) {
+    case backend_type::spdlog: {
+      auto flush_interval =
+        flush_ms == 0 ? std::nullopt : std::optional{std::chrono::milliseconds{flush_ms}};
+      s = make_spdlog_backend({std::string{log_dir}, flush_interval});
+      break;
+    }
+    case backend_type::noop: s = make_noop_backend(); break;
+  }
+
+  level lvl = level::info;  // unknown names default to info
+  string_to_enum(level_str, lvl);
+  s->set_level(lvl);
+  return s;
+}
 
 }  // namespace sirius::log

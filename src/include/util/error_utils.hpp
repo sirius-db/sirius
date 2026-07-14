@@ -24,28 +24,30 @@
 
 inline void log_exception_helper(const std::source_location& loc)
 {
+  auto sink = sirius::log::get_sink();
+  if (!sink) { return; }
   try {
     throw;
   } catch (const std::exception& e) {
-    sirius::log::LogAt(
-      sirius::log::level::error, loc, std::format("Exception caught: {}", e.what()));
+    sink->log(sirius::log::level::error, loc, std::format("Exception caught: {}", e.what()));
   } catch (...) {
-    sirius::log::LogAt(sirius::log::level::error, loc, "UNKNOWN exception caught");
+    sink->log(sirius::log::level::error, loc, "UNKNOWN exception caught");
   }
 }
 
 template <typename... Args>
 void log_exception_helper(const std::source_location& loc, std::string_view fmt_str, Args&&... args)
 {
+  auto sink = sirius::log::get_sink();
+  if (!sink) { return; }
   std::string user_msg = std::vformat(fmt_str, std::make_format_args(args...));
 
   try {
     throw;
   } catch (const std::exception& e) {
-    sirius::log::LogAt(sirius::log::level::error, loc, std::format("{}: {}", user_msg, e.what()));
+    sink->log(sirius::log::level::error, loc, std::format("{}: {}", user_msg, e.what()));
   } catch (...) {
-    sirius::log::LogAt(
-      sirius::log::level::error, loc, std::format("{}: UNKNOWN exception", user_msg));
+    sink->log(sirius::log::level::error, loc, std::format("{}: UNKNOWN exception", user_msg));
   }
 }
 

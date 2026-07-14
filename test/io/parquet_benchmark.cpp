@@ -21,6 +21,7 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
 #include <glob.h>
+#include <log/log_backend.hpp>
 #include <log/logging.hpp>
 #include <unistd.h>
 
@@ -135,7 +136,8 @@ int main(int argc, char** argv)
 
   // Per-read trace goes to log/sirius.log (no backend is installed until the
   // logger is initialized; without this every log statement is dropped).
-  sirius::log::InitGlobalLogger("info", "log", 0);
+  sirius::log::set_sink(
+    sirius::log::make_backend("info", "log", 0, sirius::log::backend_type::spdlog));
 
   std::cout << "Source : " << argv[2] << "\n"
             << "Files  : " << paths.size() << "\n";

@@ -269,7 +269,7 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   // completes well under that, so without an explicit flush the [mgpu-audit]
   // emissions in src/pipeline/task_scheduler.cpp:275 stay in the sink's
   // buffer and never reach disk before parse_audit_log() reads it.
-  sirius::log::FlushGlobalLogger();
+  if (auto sink = sirius::log::get_sink()) { sink->flush(); }
 
   // Tear down the SiriusContext + DuckDB. Verbatim equivalent of
   // env->pause() in test_gpu_execution_tpch_mgpu_audit.cpp:233 —
@@ -679,7 +679,7 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
 
   // Flush the log and tear down the env so the audit file is complete on disk
   // before parse_audit_log reads it.
-  sirius::log::FlushGlobalLogger();
+  if (auto sink = sirius::log::get_sink()) { sink->flush(); }
   env.reset();
 
   auto counts      = parse_audit_log(logs.path());

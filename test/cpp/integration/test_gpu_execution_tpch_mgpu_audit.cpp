@@ -24,7 +24,7 @@
 //      SiriusContextExtensionCallback reads these env vars in its constructor
 //      (src/sirius_context.cpp:569-571)
 //   4. run the TPC-H query via compare_gpu_vs_cpu (fallback disabled)
-//   5. FlushGlobalLogger() + pause() the env — the explicit best-effort flush
+//   5. get_sink()->flush() + pause() the env — the explicit best-effort flush
 //      completes the log file before it is parsed
 //   6. open the log file (${SIRIUS_LOG_DIR}/sirius.log, daily-rotated), regex
 //      the emission payload 08-03 landed:
@@ -238,7 +238,7 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   }
 
   // Complete the log file before parsing it; pause() tears down the instance.
-  sirius::log::FlushGlobalLogger();
+  if (auto sink = sirius::log::get_sink()) { sink->flush(); }
   env->pause();
 
   auto counts = parse_audit_log(tmp_log_dir);

@@ -89,7 +89,7 @@ static void flush_logs_best_effort()
   signal(SIGALRM, SIG_DFL);  // ensure default (terminate) disposition
   alarm(3);                  // hard deadline for the log + flush below
   SIRIUS_LOG_WARN("SIRIUS signal handler triggered, flushing logs");
-  sirius::log::FlushGlobalLogger();
+  if (auto sink = sirius::log::get_sink()) { sink->flush(); }
   alarm(0);  // flush returned in time; cancel the deadline
 }
 

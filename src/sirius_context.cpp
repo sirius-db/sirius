@@ -1003,8 +1003,8 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   if (auto* env = std::getenv("SIRIUS_LOG_BACKEND")) {
     if (!sirius::log::string_to_enum(env, Config::LOG_BACKEND)) { bad_backend_env = env; }
   }
-  sirius::log::InitGlobalLogger(
-    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
+  sirius::log::set_sink(sirius::log::make_backend(
+    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND));
   if (bad_backend_env != nullptr) {
     SIRIUS_LOG_WARN("Unknown SIRIUS_LOG_BACKEND '{}' (expected: spdlog, noop); keeping default",
                     bad_backend_env);

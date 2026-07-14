@@ -1607,27 +1607,35 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
 }
 
+// Rebuilds the global sink from the current logging config.
+static void ReinstallLogSink()
+{
+  sirius::log::set_sink(sirius::log::make_backend(
+    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND));
+}
+
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
-  sirius::log::SetGlobalLogLevel(Config::LOG_LEVEL);
+  // A level change only re-targets the current sink; no need to rebuild it.
+  sirius::log::level lvl = sirius::log::level::info;
+  sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
+  if (auto sink = sirius::log::get_sink()) { sink->set_level(lvl); }
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  sirius::log::InitGlobalLogger(
-    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
+  ReinstallLogSink();
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushMs(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_FLUSH_MS = UIntegerValue::Get(parameter);
-  // The flush interval is fixed at backend construction, so re-initialize.
-  sirius::log::InitGlobalLogger(
-    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
+  // The flush interval is fixed at sink construction, so rebuild the sink.
+  ReinstallLogSink();
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_MS to {}", Config::LOG_FLUSH_MS);
 }
 
@@ -1640,8 +1648,7 @@ static void SetLogBackend(ClientContext& context, SetScope scope, Value& paramet
                                 backend_str);
   }
   Config::LOG_BACKEND = backend;
-  sirius::log::InitGlobalLogger(
-    Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
+  ReinstallLogSink();
   SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", backend_str);
 }
 

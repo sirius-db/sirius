@@ -99,14 +99,17 @@ class scoped_recording_log_backend {
   explicit scoped_recording_log_backend(std::string_view level = "trace")
     : _backend(std::make_shared<recording_log_backend>())
   {
-    sirius::log::InitGlobalLogger(_backend, level);
+    sirius::log::level lvl = sirius::log::level::info;
+    sirius::log::string_to_enum(level, lvl);
+    _backend->set_level(lvl);
+    sirius::log::set_sink(_backend);
   }
 
   ~scoped_recording_log_backend()
   {
     using duckdb::Config;
-    sirius::log::InitGlobalLogger(
-      Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND);
+    sirius::log::set_sink(sirius::log::make_backend(
+      Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_MS, Config::LOG_BACKEND));
   }
 
   scoped_recording_log_backend(const scoped_recording_log_backend&)            = delete;

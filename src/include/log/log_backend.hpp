@@ -27,37 +27,9 @@
 
 namespace sirius::log {
 
-/// Sink interface behind the global logging facade — pure interface, no state.
-///
-/// A sink owns the log level and is the sole place messages are filtered; the
-/// facade holds no level of its own, so two thresholds can never disagree.
-/// Implementations must keep `should_log` and `log` consistent (both gate on
-/// the level set by `set_level`) and must be thread-safe: all methods are
-/// called concurrently from many threads.
-class sink {
- public:
-  virtual ~sink() = default;
-
-  /// Sets the level below which `log` must drop messages.
-  virtual void set_level(level lvl) = 0;
-
-  /// Whether `lvl` currently passes the threshold. The facade calls this to
-  /// skip formatting for disabled statements, so it must agree with `log`.
-  [[nodiscard]] virtual bool should_log(level lvl) const = 0;
-
-  /// Emits `message` attributed to `loc` iff `lvl` passes the threshold.
-  virtual void log(level lvl, const std::source_location& loc, std::string_view message) = 0;
-
-  /// Initiates a best-effort flush of buffered output.
-  ///
-  /// Returns true iff all previously logged messages are durable in the
-  /// sink's destination on return; false means the flush was at most a hint
-  /// (e.g. queued to an asynchronous worker). May also be called from a
-  /// fatal-signal handler (util/segfault_backtrace_handler.cpp): it need not
-  /// be async-signal-safe — the caller bounds a potential deadlock with
-  /// alarm() — but it must not wait unboundedly beyond ordinary sink mutexes.
-  virtual bool flush() = 0;
-};
+// The `sink` interface itself lives in log/logging.hpp (the lightweight facade
+// header). This header adds the backend selector converters, the spdlog sink's
+// construction settings, and the sink factories.
 
 inline bool string_to_enum(std::string_view sv, backend_type& t)
 {
@@ -82,6 +54,39 @@ inline bool enum_to_string(backend_type t, std::string& s)
   return false;
 }
 
+inline bool string_to_enum(std::string_view sv, level& lvl)
+{
+  static const std::unordered_map<std::string_view, level> map = {
+    {"trace", level::trace},
+    {"debug", level::debug},
+    {"info", level::info},
+    {"warn", level::warn},
+    {"error", level::error},
+    {"critical", level::critical},
+    {"off", level::off},
+  };
+  auto it = map.find(sv);
+  if (it != map.end()) {
+    lvl = it->second;
+    return true;
+  }
+  return false;
+}
+
+inline bool enum_to_string(level lvl, std::string& s)
+{
+  switch (lvl) {
+    case level::trace: s = "trace"; return true;
+    case level::debug: s = "debug"; return true;
+    case level::info: s = "info"; return true;
+    case level::warn: s = "warn"; return true;
+    case level::error: s = "error"; return true;
+    case level::critical: s = "critical"; return true;
+    case level::off: s = "off"; return true;
+  }
+  return false;
+}
+
 /// Construction settings of the spdlog backend. Backend settings are
 /// per-backend by design — there is no config struct common to all backends.
 struct spdlog_backend_config {
@@ -100,5 +105,15 @@ std::shared_ptr<sink> make_spdlog_backend(const spdlog_backend_config& config);
 /// Creates a sink that discards everything. Selectable via
 /// `SET sirius_log_backend='noop'`, e.g. to measure logging overhead.
 std::shared_ptr<sink> make_noop_backend();
+
+/// Builds and configures the sink selected by `type` from config values: for
+/// spdlog it writes to `<log_dir>/sirius.log` and schedules a best-effort flush
+/// every `flush_ms` (0 = none); noop ignores those. The returned sink's level
+/// is set from `level_str` (unknown names default to info). Throws if the sink
+/// cannot be constructed (e.g. an unwritable log_dir). Install it via set_sink.
+std::shared_ptr<sink> make_backend(std::string_view level_str,
+                                   std::string_view log_dir,
+                                   uint32_t flush_ms,
+                                   backend_type type);
 
 }  // namespace sirius::log

@@ -41,7 +41,7 @@ TEST_CASE("The backend level gates by severity", "[log]")
   scoped_recording_backend scoped;
   auto& backend = scoped.backend();
 
-  SetGlobalLogLevel("info");
+  backend.set_level(level::info);
   CHECK_FALSE(backend.should_log(level::trace));
   CHECK_FALSE(backend.should_log(level::debug));
   CHECK(backend.should_log(level::info));
@@ -49,22 +49,23 @@ TEST_CASE("The backend level gates by severity", "[log]")
   CHECK(backend.should_log(level::error));
   CHECK(backend.should_log(level::critical));
 
-  SetGlobalLogLevel("off");
+  backend.set_level(level::off);
   CHECK_FALSE(backend.should_log(level::trace));
   CHECK_FALSE(backend.should_log(level::critical));
 
-  SetGlobalLogLevel("trace");
+  backend.set_level(level::trace);
   CHECK(backend.should_log(level::trace));
   CHECK(backend.should_log(level::critical));
 }
 
-TEST_CASE("Unknown level names fall back to info", "[log]")
+TEST_CASE("Unknown level names are rejected and leave the default", "[log]")
 {
-  scoped_recording_backend scoped;
-
-  SetGlobalLogLevel("verbose");
-  CHECK_FALSE(scoped.backend().should_log(level::debug));
-  CHECK(scoped.backend().should_log(level::info));
+  // The config layer relies on this: it seeds `info` and keeps it on a bad name.
+  level lvl = level::info;
+  CHECK_FALSE(string_to_enum("verbose", lvl));
+  CHECK(lvl == level::info);
+  CHECK(string_to_enum("warn", lvl));
+  CHECK(lvl == level::warn);
 }
 
 TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
@@ -104,7 +105,7 @@ TEST_CASE("sirius::log free functions respect the level", "[log]")
 {
   scoped_recording_backend scoped;
 
-  SetGlobalLogLevel("warn");
+  scoped.backend().set_level(level::warn);
   sirius::log::debug("dropped {}", 1);
   sirius::log::error("kept");
   auto records = scoped.backend().records();
@@ -112,35 +113,35 @@ TEST_CASE("sirius::log free functions respect the level", "[log]")
   CHECK(records[0].message == "kept");
 }
 
-TEST_CASE("LogAt enforces the level gate", "[log]")
+TEST_CASE("The sink enforces the level gate", "[log]")
 {
   scoped_recording_backend scoped;
 
-  SetGlobalLogLevel("off");
-  LogAt(level::error, std::source_location::current(), "must not appear");
+  scoped.backend().set_level(level::off);
+  get_sink()->log(level::error, std::source_location::current(), "must not appear");
   CHECK(scoped.backend().count() == 0);
 
-  SetGlobalLogLevel("error");
-  LogAt(level::error, std::source_location::current(), "must appear");
+  scoped.backend().set_level(level::error);
+  get_sink()->log(level::error, std::source_location::current(), "must appear");
   CHECK(scoped.backend().count() == 1);
 }
 
-TEST_CASE("FlushGlobalLogger forwards to the backend and reports reliability", "[log]")
+TEST_CASE("get_sink()->flush() forwards and reports reliability", "[log]")
 {
   scoped_recording_backend scoped;
 
-  CHECK(FlushGlobalLogger());
+  CHECK(get_sink()->flush());
   CHECK(scoped.backend().flush_count() == 1);
 }
 
-TEST_CASE("Resetting installs a discarding backend", "[log]")
+TEST_CASE("set_sink(nullptr) installs a discarding backend", "[log]")
 {
   scoped_recording_backend scoped;
 
-  InitGlobalLogger(nullptr, "trace");  // swaps in a noop, detaching the recorder
+  set_sink(nullptr);  // swaps in a noop, detaching the recorder
   SIRIUS_LOG_ERROR("dropped {}", 1);
-  LogAt(level::critical, std::source_location::current(), "dropped");
-  CHECK(FlushGlobalLogger());  // the noop flush is vacuously reliable
+  get_sink()->log(level::critical, std::source_location::current(), "dropped");
+  CHECK(get_sink()->flush());  // the noop flush is vacuously reliable
   CHECK(scoped.backend().count() == 0);
 }
 
@@ -149,6 +150,8 @@ TEST_CASE("Concurrent logging survives backend swaps", "[log]")
   scoped_recording_backend scoped;
   auto backend_a = scoped.backend_ptr();
   auto backend_b = std::make_shared<recording_backend>();
+  backend_a->set_level(level::trace);
+  backend_b->set_level(level::trace);
 
   std::atomic<bool> stop{false};
   std::vector<std::thread> loggers;
@@ -164,7 +167,7 @@ TEST_CASE("Concurrent logging survives backend swaps", "[log]")
   auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   bool use_a    = false;
   while (std::chrono::steady_clock::now() < deadline) {
-    InitGlobalLogger(use_a ? backend_a : backend_b, "trace");
+    set_sink(use_a ? backend_a : backend_b);
     use_a = !use_a;
   }
   stop.store(true, std::memory_order_relaxed);
@@ -197,7 +200,7 @@ TEST_CASE("The noop backend accepts and discards everything", "[log]")
   CHECK(noop->flush());
 
   scoped_recording_backend scoped;
-  InitGlobalLogger(noop, "trace");
+  set_sink(noop);
   SIRIUS_LOG_ERROR("also into the void");
   CHECK(scoped.backend().count() == 0);
 }
@@ -214,9 +217,10 @@ TEST_CASE("The spdlog backend writes the documented line format", "[log]")
     scoped_recording_backend scoped;  // restores the process logger on exit
     auto backend = make_spdlog_backend({temp_dir.string(), std::nullopt});
     REQUIRE(backend != nullptr);
-    InitGlobalLogger(backend, "info");
+    backend->set_level(level::info);
+    set_sink(backend);
     SIRIUS_LOG_INFO("hello");
-    REQUIRE(FlushGlobalLogger());
+    REQUIRE(get_sink()->flush());
   }
 
   std::string line;
