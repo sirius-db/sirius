@@ -44,7 +44,16 @@ task_scheduler::task_scheduler(
   exec::queue_ordering task_queue_ordering,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _task_queue(task_queue_ordering), _telemetry_context(std::move(telemetry_context))
+  : _task_queue([](const sirius::parallel::itask& task) -> exec::queue_priority {
+      // Order the pipeline-level queue by per-task priority. Non-pipeline tasks (and tasks
+      // whose priority was never assigned) fall back to 0, preserving FIFO among equals.
+      if (const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&task)) {
+        return gpu_task->get_priority();
+      }
+      return 0;
+    }),
+    _task_queue_ordering(task_queue_ordering),
+    _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue");

@@ -24,6 +24,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
+#include "planner/query_index.hpp"
 #include "sirius_context.hpp"
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -104,6 +105,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
     sirius_ctx->get_telemetry_context();
 
+  auto pipeline_priorities = compute_pipeline_priorities(query);
+
   for (const auto& pipeline : pipelines) {
     pipeline->set_task_creator(this);
     auto source_operator = pipeline->get_source();
@@ -114,8 +117,55 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     size_t operator_id = source_operator->get_operator_id();
     auto gs =
       std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    if (auto it = pipeline_priorities.find(pipeline.get()); it != pipeline_priorities.end()) {
+      gs->set_priority(it->second);
+    }
     _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
   }
+}
+
+std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority>
+task_creator::compute_pipeline_priorities(const sirius::planner::query& query) const
+{
+  // Partition the pipeline DAG into branches (linear chains between branch points) and give each
+  // pipeline a scheduling priority. Higher priority is dispatched first by the pipeline-level
+  // priority queue. The rules (see query_index for the branch definition):
+  //   - Branches are ordered by plan order; an earlier branch is ALWAYS strictly higher priority
+  //     than a later one (guaranteed by a per-branch stride larger than any branch length).
+  //   - Within a branch, FIFO ranks the head (closest to the scan) highest; LIFO reverses it.
+  //   - A pipeline shared by several branches (a join/merge endpoint) takes the MAX priority of
+  //     the branches that reach it, so it runs as soon as its earliest-needed branch wants it.
+  std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority> priorities;
+
+  auto index    = planner::query_index::build_index(query);
+  auto branches = index->get_branches();
+  if (branches.empty()) { return priorities; }
+
+  const bool lifo = _task_scheduler != nullptr &&
+                    _task_scheduler->get_task_queue_ordering() == exec::queue_ordering::LIFO;
+
+  // Stride larger than any branch length keeps cross-branch ordering strictly dominant over the
+  // within-branch offset.
+  std::size_t max_branch_len = 0;
+  for (const auto& chain : branches) {
+    max_branch_len = std::max(max_branch_len, chain.size());
+  }
+  const exec::queue_priority stride = static_cast<exec::queue_priority>(max_branch_len) + 1;
+
+  const std::size_t num_branches = branches.size();
+  for (std::size_t b = 0; b < num_branches; ++b) {
+    const auto& chain               = branches[b];
+    const auto len                  = chain.size();
+    const exec::queue_priority base = static_cast<exec::queue_priority>(num_branches - b) * stride;
+    for (std::size_t pos = 0; pos < len; ++pos) {
+      const exec::queue_priority within   = lifo ? static_cast<exec::queue_priority>(pos + 1)
+                                                 : static_cast<exec::queue_priority>(len - pos);
+      const exec::queue_priority priority = base + within;
+      auto [it, inserted]                 = priorities.try_emplace(chain[pos], priority);
+      if (!inserted) { it->second = std::max(it->second, priority); }
+    }
+  }
+  return priorities;
 }
 
 void task_creator::signal_query_complete()

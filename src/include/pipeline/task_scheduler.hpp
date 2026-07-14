@@ -19,6 +19,7 @@
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/inspectable_mpsc.hpp"
+#include "exec/inspectable_priority_queue.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -129,9 +130,22 @@ class task_scheduler {
   /**
    * @brief Get a pointer to the pipeline-level task queue.
    */
-  [[nodiscard]] exec::inspectable_mpsc<sirius::parallel::itask>* get_pipeline_task_queue() noexcept
+  [[nodiscard]] exec::inspectable_priority_queue<sirius::parallel::itask>*
+  get_pipeline_task_queue() noexcept
   {
     return &_task_queue;
+  }
+
+  /**
+   * @brief Get the configured task-queue ordering (FIFO/LIFO).
+   *
+   * The pipeline-level queue is now ordered strictly by task priority; this setting no longer
+   * controls the queue itself. It is consumed by task_creator when assigning per-pipeline
+   * priorities: FIFO keeps plan order within a branch, LIFO reverses it.
+   */
+  [[nodiscard]] exec::queue_ordering get_task_queue_ordering() const noexcept
+  {
+    return _task_queue_ordering;
   }
 
   /**
@@ -220,7 +234,11 @@ class task_scheduler {
   std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
 
-  exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
+  /// Pipeline-level task queue, ordered by task priority (highest dispatched first).
+  exec::inspectable_priority_queue<sirius::parallel::itask> _task_queue;
+  /// Configured FIFO/LIFO ordering. No longer applied to the queue (which is priority-ordered);
+  /// read by task_creator to decide within-branch priority direction. See get_task_queue_ordering.
+  exec::queue_ordering _task_queue_ordering;
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;
   /// Publisher used by schedule() to wake the management event loop when a new
   /// task is pushed into _task_queue. The event loop blocks on _task_request_channel

@@ -170,6 +170,23 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   }
 
   /**
+   * @brief Get the scheduling priority for this task.
+   *
+   * Priority is a pipeline-level property carried on the shared global state, so every task of a
+   * pipeline reports the same value. Higher priorities are dispatched first by the pipeline-level
+   * priority queue. Defaults to 0 when no global state is attached.
+   *
+   * @return The scheduling priority for this task.
+   */
+  [[nodiscard]] exec::queue_priority get_priority() const
+  {
+    if (auto gs = std::dynamic_pointer_cast<const gpu_pipeline_task_global_state>(_global_state)) {
+      return gs->get_priority();
+    }
+    return 0;
+  }
+
+  /**
    * @brief Get the GPU pipeline associated with this task
    *
    * @return const duckdb::sirius_pipeline* Pointer to the GPU pipeline
