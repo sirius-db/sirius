@@ -28,8 +28,10 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace sirius {
@@ -123,6 +125,33 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
       }
     }
     return input_size;
+  }
+
+  /**
+   * @brief Summarize the memory tiers the input batches currently live on.
+   *
+   * Returns a '+'-joined set in tier order (e.g. "GPU+HOST"), or "UNKNOWN" when the
+   * input is not batch-backed.
+   */
+  [[nodiscard]] std::string get_input_origin_tiers() const
+  {
+    auto* pipelineable_input =
+      dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
+    if (!pipelineable_input) { return "UNKNOWN"; }
+    std::array<bool, static_cast<std::size_t>(cucascade::memory::Tier::SIZE)> present{};
+    for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
+      if (!ro.get_data()) { continue; }
+      auto tier = static_cast<std::size_t>(ro.get_current_tier());
+      if (tier < present.size()) { present[tier] = true; }
+    }
+    static constexpr std::array<const char*, 3> tier_names{"GPU", "HOST", "DISK"};
+    std::string result;
+    for (std::size_t i = 0; i < tier_names.size(); ++i) {
+      if (!present[i]) { continue; }
+      if (!result.empty()) { result += '+'; }
+      result += tier_names[i];
+    }
+    return result.empty() ? "UNKNOWN" : result;
   }
 
  private:
