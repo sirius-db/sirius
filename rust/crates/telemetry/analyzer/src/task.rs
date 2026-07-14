@@ -15,6 +15,7 @@ use quent_analyzer::{
         events::{FsmEvents, FsmEventsBuilder},
     },
 };
+use quent_attributes::Attribute;
 use quent_query_engine_ui::OperatorFilter;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
@@ -38,7 +39,11 @@ pub trait TaskExt {
     fn operator_active_spans(&self) -> Vec<(Uuid, SpanUnixNanoSec)>;
     /// The stable UUIDs of the physical operators this task computed, in transition order.
     fn computed_operator_uuids(&self) -> impl Iterator<Item = Uuid> + '_;
-    fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine>;
+    fn try_to_ui_fsm(
+        &self,
+        epoch: TimeUnixNanoSec,
+        pipeline_name: Option<&str>,
+    ) -> AnalyzerResult<FiniteStateMachine>;
 }
 
 impl TaskExt for Task {
@@ -102,11 +107,34 @@ impl TaskExt for Task {
             })
     }
 
-    fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine> {
-        let transitions = self
-            .transitions()
+    fn try_to_ui_fsm(
+        &self,
+        epoch: TimeUnixNanoSec,
+        pipeline_name: Option<&str>,
+    ) -> AnalyzerResult<FiniteStateMachine> {
+        let raw = self.transitions();
+        let transitions = raw
             .iter()
-            .map(|transition| {
+            .enumerate()
+            .map(|(i, transition)| {
+                // Derive the processing rate from input_bytes over the span.
+                let mut derived_attributes = vec![];
+                if let ModelTaskTransition::Computing(data) = &transition.data
+                    && let Some(next) = raw.get(i + 1)
+                {
+                    let span_secs = (next.timestamp() - transition.timestamp()) as f64 / 1e9;
+                    if span_secs > 0.0 {
+                        derived_attributes.push(Attribute::f64(
+                            "bytes_per_sec",
+                            data.input_bytes as f64 / span_secs,
+                        ));
+                    }
+                }
+                // Stamped on every transition — created, which carries
+                // pipeline_uuid, is filtered off resource lanes.
+                if let Some(name) = pipeline_name {
+                    derived_attributes.push(Attribute::string("pipeline", name));
+                }
                 Ok(FsmTransition {
                     name: transition.name().to_string(),
                     usages: transition
@@ -122,6 +150,8 @@ impl TaskExt for Task {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
+                    attributes: transition.attributes(),
+                    derived_attributes,
                 })
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;
