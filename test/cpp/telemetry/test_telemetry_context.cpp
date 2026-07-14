@@ -75,20 +75,21 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   config.output_directory = out_dir.string();
   config.engine_name      = "test-engine";
 
-  std::string engine_id;
+  std::string engine_id, worker_id;
   std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id, shared_id;
   {
     auto context = telemetry_context::create(config, /*manager=*/nullptr, {0, 1});
     engine_id    = uuid_str(context->engine_id());
+    worker_id    = uuid_str(context->worker_id());
     gpu0_id      = uuid_str(context->gpu_device_group_id(0));
     gpu1_id      = uuid_str(context->gpu_device_group_id(1));
     gpu0_exec_id = uuid_str(context->executor_thread_group_id(0));
     gpu0_mgr_id  = uuid_str(context->manager_thread_group_id(0));
     shared_id    = uuid_str(context->shared_group_id());
 
-    // Every id is distinct and none collapses onto the engine.
+    // Every id is distinct and none collapses onto the engine or worker.
     const std::vector<std::string> ids{
-      engine_id, gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id, shared_id};
+      engine_id, worker_id, gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id, shared_id};
     for (size_t i = 0; i < ids.size(); i++) {
       for (size_t j = i + 1; j < ids.size(); j++) {
         REQUIRE(ids[i] != ids[j]);
@@ -114,14 +115,16 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   const auto lines = read_all_telemetry_lines(out_dir);
   REQUIRE(!lines.empty());
 
-  // Device groups are declared under the engine, with matching ids.
-  REQUIRE(any_line_with_all(lines, {"\"gpu-0\"", engine_id, gpu0_id}));
-  REQUIRE(any_line_with_all(lines, {"\"gpu-1\"", engine_id, gpu1_id}));
+  // Device groups are declared under the worker (the process that owns the execution
+  // resources; the query page's resource tree prunes empty groups, so the worker must
+  // parent these for the per-operator timeline lane to render), with matching ids.
+  REQUIRE(any_line_with_all(lines, {"\"gpu-0\"", worker_id, gpu0_id}));
+  REQUIRE(any_line_with_all(lines, {"\"gpu-1\"", worker_id, gpu1_id}));
   // Per-thread-type buckets are declared under the gpu-0 device group.
   REQUIRE(any_line_with_all(lines, {"\"executor_thread\"", gpu0_id, gpu0_exec_id}));
   REQUIRE(any_line_with_all(lines, {"\"task_manager_loop_thread\"", gpu0_id, gpu0_mgr_id}));
-  // The shared group hangs off the engine.
-  REQUIRE(any_line_with_all(lines, {"\"shared\"", engine_id, shared_id}));
+  // The shared group hangs off the worker too.
+  REQUIRE(any_line_with_all(lines, {"\"shared\"", worker_id, shared_id}));
 
   // Threads and queues point at their group, not at the engine.
   REQUIRE(any_line_with_all(lines, {"test-gpu0-exec-0", gpu0_exec_id}));
