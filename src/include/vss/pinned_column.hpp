@@ -22,9 +22,11 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace cudf {
 class column;
+class column_view;
 }  // namespace cudf
 namespace cucascade::memory {
 class memory_space;
@@ -65,5 +67,18 @@ std::unique_ptr<cudf::column> concat_pinned_column(const scan_manager::pinned_en
 /// Sum of the pinned column's chunk allocation sizes.
 [[nodiscard]] std::size_t pinned_column_alloc_size(const scan_manager::pinned_entry& pin,
                                                    const std::string& column_name);
+
+/// Return the pinned column's GPU chunks as column_views in pin / index-build
+/// order, without concatenating them. Enforces the same single-GPU invariant as
+/// @ref concat_pinned_column (every chunk must live on @p space's device). The
+/// views borrow the pinned chunks, so @p pin must outlive their use. Used by the
+/// chunked ANN index build to feed cuVS one chunk at a time.
+///
+/// @throws internal_exception if @p column_name is absent, or any chunk resides
+///         on a different GPU than @p space.
+[[nodiscard]] std::vector<cudf::column_view> pinned_column_chunk_views(
+  const scan_manager::pinned_entry& pin,
+  const std::string& column_name,
+  cucascade::memory::memory_space& space);
 
 }  // namespace sirius::vss

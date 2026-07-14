@@ -65,6 +65,29 @@ std::unique_ptr<cudf::column> concat_pinned_column(const scan_manager::pinned_en
   return cudf::concatenate(views, stream, mr);
 }
 
+std::vector<cudf::column_view> pinned_column_chunk_views(const scan_manager::pinned_entry& pin,
+                                                         const std::string& column_name,
+                                                         cucascade::memory::memory_space& space)
+{
+  auto it = pin.data_batches_by_column.find(column_name);
+  if (it == pin.data_batches_by_column.end() || it->second.empty()) {
+    throw internal_exception("VSS: pinned table missing column '" + column_name + "'");
+  }
+  auto const& chunks = it->second;
+
+  std::vector<cudf::column_view> views;
+  views.reserve(chunks.size());
+  for (std::size_t c = 0; c < chunks.size(); ++c) {
+    if (c < pin.chunk_memory_spaces.size() && pin.chunk_memory_spaces[c] != nullptr &&
+        pin.chunk_memory_spaces[c]->get_device_id() != space.get_device_id()) {
+      throw internal_exception(
+        "VSS: pinned table spans multiple GPUs (multi-GPU not supported yet)");
+    }
+    views.push_back(chunks[c]->view());
+  }
+  return views;
+}
+
 std::size_t pinned_column_alloc_size(const scan_manager::pinned_entry& pin,
                                      const std::string& column_name)
 {

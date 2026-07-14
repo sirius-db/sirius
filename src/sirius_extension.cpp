@@ -1494,13 +1494,16 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   int const target_gpu = target_space->get_device_id();
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu}};
 
-  std::unique_ptr<cudf::column> vectors;
   auto& scan_mgr  = sirius_ctx->get_scan_manager();
   const auto* pin = scan_mgr.find_pinned_entry(entry.name);
+
+  // Collect the vector column's GPU chunks as views:
+  // a full coalesce of a large dataset overflows cudf's 2^31-element per-column limit
+  // in the LIST child. The chunked builder feeds cuVS one chunk at a time via ivf_flat::extend.
+  std::vector<cudf::column_view> chunk_views;
+  sirius::materialized_pin mat;  // keep-alive for the non-pinned path
   if (pin != nullptr && pin->tier == cucascade::memory::Tier::GPU) {
-    vectors = sirius::vss::concat_pinned_column(
-      *pin, data.column_name, *target_space, cudf::get_default_stream());
-    cudf::get_default_stream().synchronize();
+    chunk_views = sirius::vss::pinned_column_chunk_views(*pin, data.column_name, *target_space);
   } else {
     std::size_t const batch_size =
       sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
@@ -1511,24 +1514,23 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
     auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
 
     std::vector<cucascade::memory::memory_space*> single_space{target_space};
-    auto mat = sirius::materialize_all_batches(*ingestible, single_space, *scan_mgr.io_ctx());
+    mat = sirius::materialize_all_batches(*ingestible, single_space, *scan_mgr.io_ctx());
     if (mat.tables.empty()) {
       throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
                                   "' produced no rows to index");
     }
-
-    std::vector<cudf::column_view> chunk_views;
+    // Materialized on the default stream; sync before the raft-stream build reads them.
+    cudf::get_default_stream().synchronize();
     chunk_views.reserve(mat.tables.size());
     for (auto const& tbl : mat.tables) {
       chunk_views.push_back(tbl->view().column(0));
     }
-    vectors = cudf::concatenate(
-      chunk_views, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
-    cudf::get_default_stream().synchronize();
-    mat.tables.clear();
   }
 
-  auto const n_rows = static_cast<int64_t>(vectors->size());
+  int64_t n_rows = 0;
+  for (auto const& v : chunk_views) {
+    n_rows += static_cast<int64_t>(v.size());
+  }
   if (n_rows <= 0) { throw InvalidInputException("sirius_create_ann_index: empty vector column"); }
 
   std::uint32_t n_lists =
@@ -1547,8 +1549,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   auto reservation  = index_cache.reserve_index_memory(footprint, target_gpu);
 
   // Build IVF-Flat through the reservation's resource, then pin it
-  auto handle = sirius::vss::build_ivf_flat_index(
-    vectors->view(), dim, n_lists, metric, reservation->get_memory_resource());
+  auto handle = sirius::vss::build_ivf_flat_index_from_chunks(
+    chunk_views, dim, n_lists, metric, reservation->get_memory_resource());
+  reservation->shrink_to_fit();
 
   sirius::vss::index_metadata meta;
   meta.kind           = ann_index_kind_from_type(data.index_type);
@@ -1558,7 +1561,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.num_rows       = n_rows;
   meta.n_lists        = static_cast<int64_t>(n_lists);
   meta.metric         = metric;
-  meta.reserved_bytes = footprint;
+  meta.reserved_bytes = reservation->size();
   index_cache.insert(data.index_name, std::move(meta), std::move(handle), std::move(reservation));
 
   output.SetCardinality(1);

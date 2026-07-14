@@ -366,7 +366,9 @@ set(EXTENSION_SOURCES
     src/vss/cuvs_index_cache.cpp
     src/vss/pinned_column.cpp
     src/vss/pinned_column_cache.cpp
-    src/vss/vector_search.cpp)
+    src/vss/vector_search.cpp
+    src/vss/vector_search_ann.cpp
+    src/vss/vector_search_enn.cpp)
 # cmake-format: on
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
