@@ -16,6 +16,7 @@
 
 #include "creator/task_creator.hpp"
 
+#include "ctrack.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -96,6 +97,7 @@ void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_sch
 
 void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
+  CTRACK;
   {
     std::lock_guard<std::mutex> lock(_global_state_mutex);
 

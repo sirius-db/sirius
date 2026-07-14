@@ -16,6 +16,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "ctrack.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
@@ -324,6 +325,7 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                             bool enable_pinned_zone_map_pruning)
 {
+  CTRACK;
   _pruning_enabled = enable_pinned_zone_map_pruning;
   reset();
 
@@ -451,10 +453,11 @@ void sirius_scan_manager::reset()
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }
 
-void sirius_scan_manager::start() {}
+void sirius_scan_manager::start() { CTRACK; }
 
 void sirius_scan_manager::stop()
 {
+  CTRACK;
   reset();
   _thread_pool.stop();
 }

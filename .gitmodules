@@ -27,3 +27,6 @@
 [submodule "starrocks/brpc"]
 	path = experimental/starrocks/brpc
 	url = https://github.com/apache/brpc
+[submodule "third_party/ctrack"]
+	path = third_party/ctrack
+	url = https://github.com/Compaile/ctrack
