@@ -274,29 +274,35 @@ exploration_result explore_column_compression(cudf::column_view input,
                                               rmm::device_async_resource_ref mr)
 {
   size_t const full_size = column_size_bytes_ex(input, stream);
-  // For large columns the ratio-guided BFS runs on a representative
-  // contiguous prefix (a single block preserves the local run/monotonicity
-  // structure order-sensitive codecs exploit — multiple far-apart blocks
-  // would inject fake jumps that wreck delta/rle). Finalists are re-measured
-  // on the full column below, so the reported numbers stay exact. Zero-copy
-  // for fixed-width; a STRING sample is materialized: the zero-copy head
-  // slice still views the parent's full offsets/chars children, which the
-  // nvcomp string codecs reject outright (silently collapsing the search to
-  // dictionary-rooted plans) and which inflates the chars_size baseline.
-  // Materialization cost is proportional to sample_rows — the premise of
-  // sampling.
-  bool const sampled =
-    config.sample_rows > 0 && static_cast<size_t>(input.size()) > config.sample_rows;
-  std::vector<cudf::column_view> sample_slice;
-  std::unique_ptr<cudf::column> sample_owned;
-  if (sampled) {
-    sample_slice = cudf::slice(input, {0, static_cast<cudf::size_type>(config.sample_rows)});
-    if (input.type().id() == cudf::type_id::STRING) {
-      sample_owned = copy_column_view(sample_slice[0], stream, mr);
-    }
+
+  // Head-prefix of `input` (rows). Strings are materialized — a zero-copy slice
+  // still views the parent's full offsets/chars, which the byte codecs reject.
+  auto prefix = [&](cudf::size_type rows,
+                    std::unique_ptr<cudf::column>& owned) -> cudf::column_view {
+    auto head = cudf::slice(input, {0, rows}).front();
+    if (input.type().id() != cudf::type_id::STRING) return head;
+    owned = copy_column_view(head, stream, mr);
+    return owned->view();
+  };
+
+  // max_explore_bytes caps the measurement column too, so a huge column never
+  // reaches compress at full size; the reported ratio is measured on this view.
+  std::unique_ptr<cudf::column> measure_owned;
+  cudf::column_view measure_col = input;
+  if (config.max_explore_bytes > 0 && full_size > config.max_explore_bytes && input.size() > 1) {
+    auto const cap_rows = std::max<cudf::size_type>(
+      1,
+      static_cast<cudf::size_type>(static_cast<double>(input.size()) *
+                                   static_cast<double>(config.max_explore_bytes) / full_size));
+    if (cap_rows < input.size()) measure_col = prefix(cap_rows, measure_owned);
   }
-  cudf::column_view const bfs_input =
-    sample_owned ? sample_owned->view() : (sampled ? sample_slice[0] : input);
+  size_t const measure_size = column_size_bytes_ex(measure_col, stream);
+
+  // The throwaway BFS ranking may run on an even smaller prefix (sample_rows).
+  std::unique_ptr<cudf::column> bfs_owned;
+  cudf::column_view bfs_input = measure_col;
+  if (config.sample_rows > 0 && config.sample_rows < static_cast<size_t>(measure_col.size()))
+    bfs_input = prefix(static_cast<cudf::size_type>(config.sample_rows), bfs_owned);
   size_t original_size  = column_size_bytes_ex(bfs_input, stream);
   size_t max_candidates = config.beam_width > 0 ? config.beam_width : 100;
 
@@ -579,14 +585,14 @@ exploration_result explore_column_compression(cudf::column_view input,
   // Always re-measure every finalist's compressed size through the real
   // fused `compress_column` path — never report the BFS's own unfused
   // byte estimate, which can be off by several x for cascades chaining 2+
-  // codegen ops (see measure_compressed_bytes). `sampled` no longer needs
-  // special-casing here: this runs regardless, on the full `input`.
+  // codegen ops (see measure_compressed_bytes). Measured on `measure_col`
+  // (the full column, or its byte-capped prefix).
   if (!finalists.empty() && !need_throughput) {
-    double const orig = (double)full_size;
+    double const orig = (double)measure_size;
     std::vector<ranked_candidate> sized;
     for (auto const& f : finalists) {
       size_t bytes = f.compressed_size_bytes;
-      if (!measure_compressed_bytes(input, f.plan_dsl, stream, mr, bytes, nullptr)) continue;
+      if (!measure_compressed_bytes(measure_col, f.plan_dsl, stream, mr, bytes, nullptr)) continue;
       sized.push_back({f.plan_dsl, orig / std::max<size_t>(bytes, 1), bytes, 0.0, 0.0});
     }
     cudaDeviceSynchronize();
@@ -595,7 +601,7 @@ exploration_result explore_column_compression(cudf::column_view input,
     {
       double a, b;
       size_t c2;
-      round_trip_time_rr(input, finalists.front().plan_dsl, stream, mr, a, b, c2, nullptr);
+      round_trip_time_rr(measure_col, finalists.front().plan_dsl, stream, mr, a, b, c2, nullptr);
       cudaDeviceSynchronize();
     }
 
@@ -621,7 +627,7 @@ exploration_result explore_column_compression(cudf::column_view input,
         size_t bytes = accs[i].bytes;
         std::string err;
         bool ok = round_trip_time_rr(
-          input, finalists[i].plan_dsl, stream, mr, comp_ms, decomp_ms, bytes, &err);
+          measure_col, finalists[i].plan_dsl, stream, mr, comp_ms, decomp_ms, bytes, &err);
         cudaDeviceSynchronize();
         if (!ok) continue;
         accs[i].any_ok = true;
@@ -630,7 +636,7 @@ exploration_result explore_column_compression(cudf::column_view input,
         if (decomp_ms < accs[i].best_decomp_ms) accs[i].best_decomp_ms = decomp_ms;
       }
     }
-    double const orig = (double)full_size;
+    double const orig = (double)measure_size;
     std::vector<ranked_candidate> timed;
     for (auto const& a : accs) {
       if (!a.any_ok) continue;
@@ -686,7 +692,7 @@ exploration_result explore_column_compression(cudf::column_view input,
   cudaDeviceSynchronize();
 
   exploration_result result;
-  result.original_size_bytes = full_size;
+  result.original_size_bytes = measure_size;  // ratio/compressed measured on measure_col
   result.cascade_depth       = best_depth;
 
   if (pool.empty()) {

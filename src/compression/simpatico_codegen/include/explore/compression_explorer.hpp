@@ -49,6 +49,11 @@ struct exploration_config {
   /// materialized (not a zero-copy slice) so the byte codecs accept it and
   /// its measured size is exact; cost is proportional to sample_rows.
   size_t sample_rows = 0;
+
+  /// Per-column byte budget for the whole exploration (BFS + rerank): a column
+  /// bigger than this is trimmed to a representative row-prefix so no codec
+  /// allocates buffers larger than device memory. Default 2 GiB; 0 = unlimited.
+  size_t max_explore_bytes = 2ull << 30;
 };
 
 // ---------------------------------------------------------------------------

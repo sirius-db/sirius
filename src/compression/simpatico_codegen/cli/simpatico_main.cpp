@@ -858,6 +858,9 @@ void usage_explore()
     "                            N-row prefix (finalists still measured on the full\n"
     "                            column). Default 0 = full column. May pick worse\n"
     "                            plans for sorted/monotonic columns.\n"
+    "  --max-col-bytes N         Per-column byte budget for BFS + rerank; larger\n"
+    "                            columns are trimmed to a representative prefix so no\n"
+    "                            codec OOMs. Default 2147483648 (2 GiB). 0 = off.\n"
     "  --verbose                 Print BFS progress\n");
 }
 
@@ -910,6 +913,8 @@ int run_explore(int argc, char** argv)
       cfg.ecfg.simplicity_slots = static_cast<std::size_t>(std::stoul(need("--simplicity-slots")));
     } else if (arg == "--sample-rows") {
       cfg.ecfg.sample_rows = static_cast<std::size_t>(std::stoul(need("--sample-rows")));
+    } else if (arg == "--max-col-bytes") {
+      cfg.ecfg.max_explore_bytes = static_cast<std::size_t>(std::stoull(need("--max-col-bytes")));
     } else if (arg == "--verbose") {
       cfg.ecfg.verbose = true;
     } else {
