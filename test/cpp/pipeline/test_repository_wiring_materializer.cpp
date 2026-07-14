@@ -229,10 +229,10 @@ TEST_CASE("materialize: multiple wirings to the same destination attach distinct
 TEST_CASE("materialize: delim join destinations use the generic path with no sibling side effects",
           "[repository_wiring][materializer]")
 {
-  // A delim join is now a fan-out source, not a wiring destination, and the materializer no
-  // longer special-cases RIGHT/LEFT delim joins: no extra port is grafted onto a partition_join
-  // sibling, and a LEFT delim join does not throw. If a delim join ever appears as a
-  // destination's first operator, it is wired exactly like any other operator.
+  // A delim join is a fan-out source, not a wiring destination; the materializer does not
+  // special-case RIGHT/LEFT delim joins: no extra port is grafted onto a partition_join sibling,
+  // and a LEFT delim join does not throw. If a delim join ever appears as a destination's first
+  // operator, it is wired exactly like any other operator.
   wiring_test_env env;
   cucascade::shared_data_repository_manager mgr;
   duckdb::vector<sirius::logical_type> empty_types;
@@ -280,6 +280,6 @@ TEST_CASE("materialize: delim join destinations use the generic path with no sib
   REQUIRE(delim_port != nullptr);
   CHECK(delim_port->repo != nullptr);
 
-  // No sibling port is grafted onto partition_join anymore.
+  // No sibling port is grafted onto partition_join.
   CHECK(partition_join->get_port_ids().empty());
 }

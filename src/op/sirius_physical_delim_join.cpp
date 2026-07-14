@@ -60,8 +60,8 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
 {
   D_ASSERT(join->children.size() == 2);
 
-  // The inner join is executed inline by our sink() and is never a standalone pipeline
-  // sink — tag it so is_sink() and the build-side externalization gate skip it.
+  // The inner join is the source of the delim join's output pipeline (built via
+  // build_join_pipelines), not a standalone pipeline sink — tag it so is_sink() returns false.
   // RIGHT_DELIM_JOIN only: LEFT's inner join feeds a real build subtree.
   if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(join.get())) {
     hj->set_delim_join_inner(true);
@@ -71,9 +71,9 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
 
   children.push_back(std::move(join->children[1]));
 
-  // Mark the placeholder so replace_with_gpu_values skips it: it carries no runtime
-  // data (sink() runs partition_join inline), so a GPU_VALUES replacement would
-  // materialize a phantom source.
+  // Mark the placeholder so replace_with_gpu_values skips it: it carries no runtime data
+  // (the delim join fans its input directly to PARTITION_build), so a GPU_VALUES replacement
+  // would only materialize a phantom source.
   auto dummy_placeholder =
     duckdb::make_uniq<sirius_physical_dummy_scan>(children[0]->get_types(), estimated_cardinality);
   dummy_placeholder->set_delim_join_placeholder(true);

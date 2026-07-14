@@ -294,12 +294,12 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
     if (sink_op->type == T::RIGHT_DELIM_JOIN || sink_op->type == T::LEFT_DELIM_JOIN) {
       auto& delim = sink_op->Cast<op::sirius_physical_delim_join>();
       // Branch 1: the side that feeds the inner join (RHS build / LHS probe).
-      op::sirius_physical_operator* join_side =
-        (sink_op->type == T::RIGHT_DELIM_JOIN)
-          ? static_cast<op::sirius_physical_operator*>(
-              sink_op->Cast<op::sirius_physical_right_delim_join>().partition_join)
-          : static_cast<op::sirius_physical_operator*>(
-              sink_op->Cast<op::sirius_physical_left_delim_join>().column_data_scan);
+      op::sirius_physical_operator* join_side = nullptr;
+      if (sink_op->type == T::RIGHT_DELIM_JOIN) {
+        join_side = sink_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
+      } else {
+        join_side = sink_op->Cast<op::sirius_physical_left_delim_join>().column_data_scan;
+      }
       // Branch 2: the duplicate-elimination (distinct) side.
       op::sirius_physical_operator* distinct_op = delim.distinct;
       for (auto* branch : {join_side, distinct_op}) {
@@ -433,9 +433,9 @@ void sirius_pipeline_converter::link_join_partition_siblings()
         build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
         build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
       // A RIGHT_DELIM_JOIN's inner join bootstraps its probe subtree from build-side (distinct)
-      // data, so the build side must drive the partition count. Detect it off the join's tree
-      // parent (the same predicate resolve_barrier uses) — the build partition is now a real
-      // PARTITION pipeline like any other, so the sink-type test no longer identifies it.
+      // data, so the build side drives the partition count. Detect it off the join's tree parent
+      // (the same predicate resolve_barrier uses), since the build partition is a plain PARTITION
+      // that the sink type alone does not distinguish.
       bool const inner_join_of_rdj =
         pipeline->source->get_parent_op() != nullptr &&
         pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;

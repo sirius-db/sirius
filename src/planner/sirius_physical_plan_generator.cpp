@@ -513,7 +513,7 @@ void insert_gpu_pipeline_operators_recursive(
 
 //! Replace a DELIM JOIN's `distinct_root` (the bare DISTINCT) with `DISTINCT_MERGE ->
 //! PARTITION_DISTINCT -> original DISTINCT`. The non-owning `delim_base.distinct` borrow stays
-//! valid — moving a unique_ptr never relocates the object — and the inline sink path uses it.
+//! valid — moving a unique_ptr never relocates the object — and the fan-out wiring uses it.
 void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
                          const sirius::operator_params& op_params)
 {
@@ -611,9 +611,9 @@ void insert_gpu_pipeline_operators_recursive(
                                 : op_params.scan_task_batch_size);
       break;
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
-      // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data flow, so a
-      // GPU_VALUES replacement would only materialize a phantom source; real DUMMY_SCANs
-      // are replaced.
+      // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data (the delim join
+      // fans its input directly to PARTITION_build), so a GPU_VALUES replacement would only
+      // materialize a phantom source; real DUMMY_SCANs are replaced.
       auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
       if (!dummy.is_delim_join_placeholder()) {
         replace_with_gpu_values(slot,

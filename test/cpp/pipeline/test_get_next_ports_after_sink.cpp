@@ -104,7 +104,7 @@ TEST_CASE("yields nothing for standard sink with no ports", "[pipeline][get_next
   }
 }
 
-// A delim join is now a fan-out sink: its sub-operators (partition_join / column_data_scan /
+// A delim join is a fan-out sink: its sub-operators (partition_join / column_data_scan /
 // distinct) are first-class pipelines, so the delim join carries its OWN next_port_after_sink
 // edges (one per branch) and get_next_ports_after_sink returns them directly like any standard
 // sink — no special-casing of the sub-operators' ports.
