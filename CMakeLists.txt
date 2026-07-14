@@ -366,7 +366,6 @@ set(EXTENSION_SOURCES
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/partition/crc32_partition_hash.cu
-    src/op/scan/equality_delete_mask.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
