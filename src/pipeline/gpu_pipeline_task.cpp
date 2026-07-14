@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "telemetry/batch_telemetry.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -206,11 +207,28 @@ gpu_pipeline_task::gpu_pipeline_task(
   }
   if (auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()) {
     pipeline->mark_task_created();
+    // Claim the input batches for this task: queued -> packaged (or lazy
+    // registration for OOM-reschedule intermediates telemetry never saw).
+    auto& registry = telemetry::batch_telemetry_registry::instance();
+    for (const auto& batch : _input_batches) {
+      registry.on_packaged(batch, pipeline->pipeline_uuid(), telemetry_handle().uuid());
+    }
   }
 }
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
+  // Release this task's claim on its input batches. Placements re-claimed by
+  // a rescheduled task (whose ctor ran before this dtor) carry that task's
+  // uuid and are skipped inside the registry.
+  {
+    auto& registry       = telemetry::batch_telemetry_registry::instance();
+    const auto task_uuid = telemetry_handle().uuid();
+    for (const auto& batch : _input_batches) {
+      if (batch) { registry.on_consumed(batch->get_batch_id(), task_uuid); }
+    }
+  }
+
   // Unsubscribe from all input data_batches
   for (const auto& batch : _input_batches) {
     if (batch) {
@@ -444,6 +462,14 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // All input batches are now locked for reading via _read_only_data_batches inside
   // local_state._input_data. The locks are released when the pipelineable_operator_data
   // is destroyed after the first operator's execute() consumes it.
+  {
+    // packaged -> processing; tier re-read to reflect prepare-time upgrades.
+    auto& registry       = telemetry::batch_telemetry_registry::instance();
+    const auto task_uuid = telemetry_handle().uuid();
+    for (const auto& batch : _input_batches) {
+      registry.on_processing(batch, task_uuid);
+    }
+  }
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline

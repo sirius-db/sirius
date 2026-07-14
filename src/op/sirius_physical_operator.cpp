@@ -21,6 +21,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/batch_telemetry.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -257,7 +258,12 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
                                                std::shared_ptr<::cucascade::data_batch> batch)
 {
   auto* p = get_port(port_id);
-  if (p && p->repo) { p->repo->add_data_batch(std::move(batch)); }
+  if (p && p->repo) {
+    // Emit before the batch becomes poppable so `queued` precedes `packaged`.
+    telemetry::batch_telemetry_registry::instance().on_published(
+      batch, p->repo, "operator_output");
+    p->repo->add_data_batch(std::move(batch));
+  }
 }
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)

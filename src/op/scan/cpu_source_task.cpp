@@ -21,6 +21,7 @@
 #include "helper/type_conversions.hpp"
 #include "helper/utils.hpp"
 #include "log/logging.hpp"
+#include "telemetry/batch_telemetry.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -396,6 +397,7 @@ void cpu_source_task::publish_output(op::operator_data& output_data, rmm::cuda_s
       if (!ro.get_data()) { continue; }
     }
     for (auto* repo : _data_repos) {
+      telemetry::batch_telemetry_registry::instance().on_published(batch, repo, "cpu_source");
       repo->add_data_batch(batch);
     }
   }

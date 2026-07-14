@@ -18,6 +18,7 @@
 
 #include "cudf/list_offset_fixup.hpp"
 #include "log/logging.hpp"
+#include "telemetry/batch_telemetry.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -105,6 +106,11 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
                        mut_accessor.get_batch_id());
       return std::nullopt;
   }
+
+  telemetry::batch_telemetry_registry::instance().on_tier_change(
+    mut_accessor.get_batch_id(),
+    target_space->get_tier(),
+    mut_accessor.get_data()->get_size_in_bytes());
 
   // Downgrade the exclusive lock back to a shared read-only lock
   return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));

@@ -28,6 +28,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "telemetry/batch_telemetry.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
@@ -224,6 +225,10 @@ void SiriusContext::QueryEnd()
       executor->drain();
     }
 
+    // Close out batch placements still alive (un-consumed repo contents,
+    // result-collector outputs) before their repositories are cleared.
+    sirius::telemetry::batch_telemetry_registry::instance().on_query_end();
+
     // Clear all data repositories between queries.
     // Any batches still present are leaked — operators should have popped everything.
     if (data_repository_manager_) {
@@ -303,6 +308,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  if (config_.get_telemetry_config().enable_quent &&
+      config_.get_telemetry_config().enable_batch_events) {
+    sirius::telemetry::batch_telemetry_registry::instance().install(telemetry_context_,
+                                                                    *memory_manager_);
+  }
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
@@ -534,6 +545,7 @@ void SiriusContext::terminate()
     executor->stop();
   }
   downgrade_executors_.clear();
+  sirius::telemetry::batch_telemetry_registry::instance().uninstall();
   telemetry_context_.reset();
 
   peer_access_enabled_pairs_.clear();

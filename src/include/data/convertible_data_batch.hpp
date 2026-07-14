@@ -19,6 +19,7 @@
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
+#include "telemetry/batch_telemetry.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -138,6 +139,11 @@ class convertible_data_batch : public convertible_data {
           break;
         default: continue;
       }
+
+      // Report the move while still holding the exclusive lock; the registry
+      // takes plain values here precisely so it never re-locks the batch.
+      sirius::telemetry::batch_telemetry_registry::instance().on_tier_change(
+        mut.get_batch_id(), space->get_tier(), mut.get_data()->get_size_in_bytes());
 
       // RAII: mutable_data_batch destructor releases the mutable lock and transitions back to idle
       // automatically.
