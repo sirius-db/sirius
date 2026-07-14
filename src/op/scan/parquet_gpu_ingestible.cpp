@@ -212,7 +212,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
-    SIRIUS_LOG_INFO(
+    SIRIUS_LOG_DEBUG(
       "[coalesce-debug] parquet_batch_coalescer emit #{}: {} slice(s), output_bytes={}, "
       "decode_working_bytes={}, cap={}",
       ++_emit_count,
