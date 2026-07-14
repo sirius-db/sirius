@@ -91,6 +91,7 @@ jobs:
           #include <cub/cub.cuh>
           #include <cuda/std/limits>
           #include <cuda/functional>
+          #include <cuda/cmath>
           #include <cooperative_groups.h>
           __global__ void k(int* o) {
             int v = cub::ShuffleIndex<64>(1, 0, 0xFFFFFFFFFFFFFFFFull);
