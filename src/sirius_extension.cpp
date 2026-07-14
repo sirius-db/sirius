@@ -103,6 +103,8 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <unordered_map>
 
@@ -569,6 +571,25 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   if (auto it = input.named_parameters.find(QUERY_LABEL_PARAM_KEY);
       it != input.named_parameters.end() && not it->second.IsNull()) {
     query_label = it->second.ToString();
+  }
+  // With no explicit label, fall back to the SQL text (whitespace-collapsed, truncated) so
+  // telemetry viewers show a recognizable name instead of a placeholder.
+  if (not query_label) {
+    constexpr size_t MAX_QUERY_LABEL_CHARS = 120;
+    std::string label;
+    label.reserve(std::min(result->query.size(), MAX_QUERY_LABEL_CHARS + 3));
+    bool last_was_space = false;
+    for (const char c : result->query) {
+      const bool is_space = std::isspace(static_cast<unsigned char>(c)) != 0;
+      if (is_space && last_was_space) { continue; }
+      label.push_back(is_space ? ' ' : c);
+      last_was_space = is_space;
+      if (label.size() >= MAX_QUERY_LABEL_CHARS) {
+        label += "...";
+        break;
+      }
+    }
+    if (not label.empty()) { query_label = std::move(label); }
   }
 
   result->sirius_iface = make_uniq<::sirius::sirius_interface>(context, std::move(query_label));

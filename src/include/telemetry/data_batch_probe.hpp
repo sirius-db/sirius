@@ -39,6 +39,9 @@ namespace sirius::telemetry {
 struct batch_telemetry_info {
   const telemetry_context* context = nullptr;
   uuid::UUID producer_pipeline_uuid{};
+  //! Stable UUID of the physical operator that produced the batch (the quent operator entity
+  //! id); per-operator attribution in the analyzer keys off this.
+  uuid::UUID producer_operator_uuid{};
 };
 
 /**
@@ -75,8 +78,11 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
     if (telemetry_info.context == nullptr) {
       return std::make_unique<cucascade::idata_batch_probe>();
     }
-    return std::unique_ptr<quent_data_batch_probe>(new quent_data_batch_probe(
-      *(telemetry_info.context), batch_id, telemetry_info.producer_pipeline_uuid));
+    return std::unique_ptr<quent_data_batch_probe>(
+      new quent_data_batch_probe(*(telemetry_info.context),
+                                 batch_id,
+                                 telemetry_info.producer_pipeline_uuid,
+                                 telemetry_info.producer_operator_uuid));
   }
 
   ~quent_data_batch_probe() override
@@ -195,15 +201,18 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
    *
    * @param ctx The telemetry context providing instrumentation and memory UUIDs.
    * @param producer_pipeline_uuid UUID of the pipeline that produced this batch.
+   * @param producer_operator_uuid Stable UUID of the physical operator that produced this batch.
    */
   quent_data_batch_probe(const telemetry_context& ctx,
                          const uint64_t batch_id,
-                         uuid::UUID producer_pipeline_uuid)
+                         uuid::UUID producer_pipeline_uuid,
+                         uuid::UUID producer_operator_uuid)
     : handle_(quent::data_batch::create(ctx.context(),
                                         {
                                           .instance_name          = "batch",
                                           .data_batch_id          = batch_id,
                                           .producer_pipeline_uuid = producer_pipeline_uuid,
+                                          .producer_operator_uuid = producer_operator_uuid,
                                         })),
       memory_context_(ctx.get_memory_context())
   {

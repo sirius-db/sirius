@@ -90,7 +90,10 @@ impl<'a> SiriusModelQueryView<'a> {
             data_batches: HashMap::default(),
         };
 
-        let pipeline_ids = result
+        // Operator entities are declared per physical operator, so a task belongs to this query's
+        // view iff it computed one of the query's operators, and a data batch iff it was produced
+        // by one of them.
+        let operator_ids = result
             .operators()
             .map(|operator| operator.id())
             .collect::<HashSet<_>>();
@@ -99,8 +102,8 @@ impl<'a> SiriusModelQueryView<'a> {
             .tasks
             .values()
             .filter(|task| {
-                task.pipeline_uuid()
-                    .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
+                task.computed_operator_uuids()
+                    .any(|operator_uuid| operator_ids.contains(&operator_uuid))
             })
             .map(|task| (task.id(), task))
             .collect();
@@ -110,8 +113,8 @@ impl<'a> SiriusModelQueryView<'a> {
             .values()
             .filter(|data_batch| {
                 data_batch
-                    .producer_pipeline_uuid()
-                    .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
+                    .producer_operator_uuid()
+                    .is_some_and(|operator_uuid| operator_ids.contains(&operator_uuid))
             })
             .map(|data_batch| (data_batch.id(), data_batch))
             .collect();

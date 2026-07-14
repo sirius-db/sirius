@@ -267,6 +267,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         .instance_name       = std::format("{}({})", op.get_name(), op.get_operator_id()),
         .current_operator_id = static_cast<uint32_t>(
           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
+        .operator_uuid               = op.get_operator_uuid(),
         .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),
         .executor_thread_resource_id = executor_thread_resource_id,
       });

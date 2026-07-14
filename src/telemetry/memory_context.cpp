@@ -34,7 +34,7 @@ std::string tier_to_string(cucascade::memory::Tier tier)
 
 namespace sirius::telemetry {
 
-memory_context::memory_context(uuid::UUID engine_uuid,
+memory_context::memory_context(uuid::UUID parent_group_id,
                                const quent::Context& context,
                                const cucascade::memory::memory_reservation_manager* manager)
 {
@@ -44,7 +44,7 @@ memory_context::memory_context(uuid::UUID engine_uuid,
     auto handle = quent::memory::create(context,
                                         {
                                           .instance_name   = mem_space->to_string(),
-                                          .parent_group_id = engine_uuid,
+                                          .parent_group_id = parent_group_id,
                                         });
     handle->operating({
       .capacity_bytes = mem_space->get_max_memory(),
@@ -69,7 +69,7 @@ memory_context::memory_context(uuid::UUID engine_uuid,
                                                               space_id_1.device_id,
                                                               tier_to_string(space_id_2.tier),
                                                               space_id_2.device_id),
-                                 .parent_group_id = engine_uuid,
+                                 .parent_group_id = parent_group_id,
                                  .source_id       = handle_1->uuid(),
                                  .target_id       = handle_2->uuid(),
                                }),

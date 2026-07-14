@@ -23,6 +23,7 @@ pub type DataBatchBuilder = FsmEventsBuilder<ModelDataBatchTransition>;
 /// Application-specific methods on the DataBatch FSM.
 pub trait DataBatchExt {
     fn producer_pipeline_uuid(&self) -> Option<Uuid>;
+    fn producer_operator_uuid(&self) -> Option<Uuid>;
     fn matches_filter(&self, filter: &OperatorFilter) -> bool;
     fn active_span(&self) -> Option<SpanUnixNanoSec>;
     fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine>;
@@ -36,10 +37,19 @@ impl DataBatchExt for DataBatch {
         })
     }
 
+    fn producer_operator_uuid(&self) -> Option<Uuid> {
+        self.first_data().and_then(|t| match t {
+            ModelDataBatchTransition::Constructed(data) => Some(data.producer_operator_uuid),
+            _ => None,
+        })
+    }
+
     fn matches_filter(&self, filter: &OperatorFilter) -> bool {
+        // Operator entities are declared per physical operator, so an operator filter matches
+        // the batch produced by that specific operator.
         filter
             .operator_id
-            .is_none_or(|pipeline_uuid| self.producer_pipeline_uuid() == Some(pipeline_uuid))
+            .is_none_or(|operator_uuid| self.producer_operator_uuid() == Some(operator_uuid))
     }
 
     fn active_span(&self) -> Option<SpanUnixNanoSec> {

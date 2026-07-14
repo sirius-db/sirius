@@ -29,10 +29,22 @@
 
 #include <format>
 #include <memory>
-#include <ranges>
 #include <string>
+#include <unordered_set>
 
 namespace sirius::telemetry {
+
+namespace {
+//! Hasher for `uuid::UUID` (the cxx-generated type provides `operator==` but no `std::hash`),
+//! so operator UUIDs can be deduplicated in an `unordered_set` while declaring the plan.
+struct uuid_hash {
+  std::size_t operator()(const uuid::UUID& id) const noexcept
+  {
+    return std::hash<std::uint64_t>{}(id.high_bits) ^
+           (std::hash<std::uint64_t>{}(id.low_bits) << 1);
+  }
+};
+}  // namespace
 
 std::shared_ptr<const telemetry_context> telemetry_context::create(
   const sirius::telemetry_config& config,
@@ -72,7 +84,9 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
                            .instance_name    = std::format("worker-{}", getpid()),
                          });
 
-  memory_context_ = std::make_shared<memory_context>(engine_uuid_, *context_, manager);
+  // Memory spaces and transfer channels are owned by this worker process, so they render
+  // under the worker row alongside the gpu-N / shared execution groups.
+  memory_context_ = std::make_shared<memory_context>(worker_uuid_, *context_, manager);
 
   // One session-scoped query group under this engine; every query in this context is reported
   // under it, so a whole run shows up as a single group rather than one group per query.
@@ -84,15 +98,19 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
     });
 
   // Per-GPU device groups plus per-thread-type buckets underneath, so the
-  // viewer renders threads as an engine -> gpu-N -> thread-type tree instead
+  // viewer renders threads as a worker -> gpu-N -> thread-type tree instead
   // of a flat sibling list. Threads with no single GPU go under `shared`.
+  // These groups parent to the WORKER (not the engine): the query page's
+  // resource tree prunes empty groups, so the worker row — which the quent UI
+  // needs in order to inject the per-operator "Operator timeline" lane — only
+  // renders if the execution groups hang beneath it.
   auto gpu_device_observer   = quent::gpu_device::create_observer(*context_);
   auto thread_group_observer = quent::thread_group::create_observer(*context_);
 
   thread_group_observer->declaration(shared_group_uuid_,
                                      quent::thread_group::Declaration{
                                        .instance_name   = "shared",
-                                       .parent_group_id = engine_uuid_,
+                                       .parent_group_id = worker_uuid_,
                                      });
 
   for (const int device_id : gpu_device_ids) {
@@ -104,7 +122,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
     gpu_device_observer->declaration(ids.device,
                                      quent::gpu_device::Declaration{
                                        .instance_name   = std::format("gpu-{}", device_id),
-                                       .parent_group_id = engine_uuid_,
+                                       .parent_group_id = worker_uuid_,
                                        .ordinal         = static_cast<uint32_t>(device_id),
                                      });
     thread_group_observer->declaration(ids.executor_threads,
@@ -175,33 +193,47 @@ void emit_plan_telemetry(
   // Collect edges while iterating
   rust::Vec<quent::plan::Edges> edges;
 
-  for (const auto& pipeline : pipelines) {
-    const auto pipeline_uuid         = pipeline->pipeline_uuid();
-    const auto operators             = pipeline->get_operators();
-    const std::string operator_chain = [&operators]() {
-      std::string chain{};
-      for (const auto& name : operators | std::views::transform([](const auto& op) {
-                                return std::format(
-                                  "{}({})", op.get().get_name(), op.get().operator_id);
-                              })) {
-        if (chain.empty()) {
-          chain = name;
-          continue;
-        }
-        chain = std::format("{} -> {}", chain, name);
-      }
-      return chain;
-    }();
+  // A physical operator can appear in more than one pipeline (e.g. a join whose build side is a
+  // pipeline sink and whose probe side is the next pipeline's source is the same operator object).
+  // Its `operator_uuid` is the quent entity id, so declare each operator at most once.
+  std::unordered_set<uuid::UUID, uuid_hash> declared_operators;
 
-    operator_obs->declaration(
-      pipeline_uuid,
-      quent::operator_::Declaration{
-        .plan_id             = plan_id,
-        .parent_operator_ids = {},
-        .instance_name       = operator_chain,
-        .type_name           = std::format("Pipeline Id {}", pipeline->get_pipeline_id()),
-        .custom_attributes   = {},
-      });
+  for (const auto& pipeline : pipelines) {
+    const auto operators = pipeline->get_operators();
+
+    // Declare each physical operator as its own quent Operator so it renders as an individual
+    // activity bar in the "Operator timeline" lane (instead of one bar per pipeline). Parent
+    // links are left empty (matching the quent demo); the operator DAG is conveyed via the plan
+    // edges below, and the activity bars only require an id + type_name.
+    for (const auto& op_ref : operators) {
+      const auto& op = op_ref.get();
+      if (!declared_operators.insert(op.get_operator_uuid()).second) { continue; }
+      operator_obs->declaration(
+        op.get_operator_uuid(),
+        quent::operator_::Declaration{
+          .plan_id             = plan_id,
+          .parent_operator_ids = {},
+          .instance_name       = std::format("{}-{}", op.get_name(), op.get_operator_id()),
+          .type_name           = op.get_name(),
+          .custom_attributes   = {},
+        });
+
+      // Operator metadata, shown in the viewer's operator info panel. `params` carries the
+      // operator-specific description (join conditions, projected expressions, ...).
+      quent::CustomAttributes stats{};
+      stats.i64_attrs.push_back(
+        quent::I64Attr{.key = "operator_id", .value = static_cast<int64_t>(op.get_operator_id())});
+      stats.i64_attrs.push_back(quent::I64Attr{
+        .key = "pipeline_id", .value = static_cast<int64_t>(pipeline->get_pipeline_id())});
+      stats.i64_attrs.push_back(quent::I64Attr{
+        .key = "estimated_cardinality", .value = static_cast<int64_t>(op.estimated_cardinality)});
+      if (auto params = op.params_to_string(); !params.empty()) {
+        stats.string_attrs.push_back(
+          quent::StringAttr{.key = "params", .value = std::move(params)});
+      }
+      operator_obs->statistics(op.get_operator_uuid(),
+                               quent::operator_::Statistics{.custom_attributes = std::move(stats)});
+    }
 
     // Receiver ports on pipeline source operators.
     if (auto source = pipeline->get_source()) {
@@ -209,20 +241,21 @@ void emit_plan_telemetry(
         if (const op::sirius_physical_operator::port* port = source->get_port(port_id)) {
           port_obs->declaration(port->source_port_uuid,
                                 quent::port::Declaration{
-                                  .operator_id   = pipeline_uuid,
+                                  .operator_id   = source->get_operator_uuid(),
                                   .instance_name = std::format("{}_receiver", port_id),
                                 });
         }
       }
     }
 
-    // Sender ports on pipeline sink(last) operators.
+    // Sender pseudo-ports on the pipeline's sink operator.
+    const auto sink = pipeline->get_sink();
     for (const auto& [next_operator, next_operator_port_name, pseudo_sink_port_uuid] :
          pipeline->get_next_ports_after_sink()) {
-      // Declare the pseudo-sink port
+      // Declare the pseudo-sink port, attributed to the sink operator that owns it.
       port_obs->declaration(pseudo_sink_port_uuid,
                             quent::port::Declaration{
-                              .operator_id   = pipeline_uuid,
+                              .operator_id   = sink ? sink->get_operator_uuid() : uuid::new_nil(),
                               .instance_name = std::format("{}_sender", next_operator_port_name),
                             });
 

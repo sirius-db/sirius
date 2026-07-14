@@ -87,6 +87,10 @@ state! {
     Computing {
         attributes: {
             current_operator_id: u32,
+            // Stable, globally-unique id of the physical operator being computed. `current_operator_id`
+            // is a per-query human-readable label that resets each query, so the analyzer keys
+            // per-operator activity spans off this UUID instead.
+            operator_uuid: Uuid,
             input_bytes: u64,
         },
         usages: {
