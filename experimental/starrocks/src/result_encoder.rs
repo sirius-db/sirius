@@ -10,10 +10,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use starrocks_thrift::data::TResultBatch;
-use thrift::{
-    protocol::{TBinaryOutputProtocol, TSerializable},
-    transport::{TBufferChannel, TIoChannel},
-};
+use thrift::protocol::{TBinaryOutputProtocol, TSerializable};
 
 /// Encodes Arrow result batches into a StarRocks `TResultBatch` of MySQL text rows.
 #[derive(Default)]
@@ -150,15 +147,13 @@ pub(crate) trait ThriftBinary {
 
 impl<T: TSerializable> ThriftBinary for T {
     fn to_binary(&self) -> Result<Vec<u8>, String> {
-        let channel = TBufferChannel::with_capacity(0, 64 * 1024);
-        let (_, write) = channel
-            .clone()
-            .split()
-            .map_err(|err| format!("failed to split thrift channel: {err}"))?;
-        let mut protocol = TBinaryOutputProtocol::new(write, true);
+        // A plain growable buffer: result batches can be arbitrarily large, so a fixed-capacity
+        // channel would truncate (surface as a transport error) on big results.
+        let mut buffer = Vec::new();
+        let mut protocol = TBinaryOutputProtocol::new(&mut buffer, true);
         self.write_to_out_protocol(&mut protocol)
             .map_err(|err| format!("failed to serialize thrift value: {err}"))?;
-        Ok(channel.write_bytes())
+        Ok(buffer)
     }
 }
 
