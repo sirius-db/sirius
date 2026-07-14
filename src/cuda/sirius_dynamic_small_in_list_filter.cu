@@ -34,6 +34,7 @@
 #include <cub/device/device_for.cuh>
 
 // cucascade
+#include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // rmm
@@ -101,6 +102,11 @@ struct sirius_dynamic_small_in_list_filter::needle_store {
       : device_id{device_id}, needles{std::move(needles)}
     {
     }
+
+    needle_replica(needle_replica const&)            = delete;
+    needle_replica& operator=(needle_replica const&) = delete;
+    needle_replica(needle_replica&&)                 = delete;
+    needle_replica& operator=(needle_replica&&)      = delete;
 
     ~needle_replica() noexcept
     {
@@ -181,18 +187,18 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   switch (_key_type.id()) {
     case cudf::type_id::INT32: {
       auto const* needles = static_cast<std::int32_t const*>(replica->needles.data());
-      cub::DeviceFor::Bulk(
+      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
         n,
         small_in_list_scan<std::int32_t>{probe.data<std::int32_t>(), needles, m, outp},
-        stream.value());
+        stream.value()));
       break;
     }
     case cudf::type_id::INT64: {
       auto const* needles = static_cast<std::int64_t const*>(replica->needles.data());
-      cub::DeviceFor::Bulk(
+      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
         n,
         small_in_list_scan<std::int64_t>{probe.data<std::int64_t>(), needles, m, outp},
-        stream.value());
+        stream.value()));
       break;
     }
     default: return nullptr;

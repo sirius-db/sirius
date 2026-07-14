@@ -2,9 +2,9 @@
 
 > **Status: implemented.** The hash-IN-list, Bloom, and zone-map replica paths
 > were revalidated on 2026-07-06. Dynamic-filter consumers remain nonblocking
-> and safe on multiple GPUs. The producer builds each filter once, materializes
-> its compact representation on every active probe GPU (copying raw needles,
-> finalized hash-set slots, or Bloom words, or reconstructing exact zone
+> and safe on multiple GPUs. The producer builds each filter once and attempts
+> to materialize its compact representation on every active probe GPU (copying
+> raw needles, finalized hash-set slots, or Bloom words, or reconstructing exact zone
 > scalars), and publishes one immutable logical filter only after every
 > successful device-local replica is ready. TPC-H Q2 passed on physical GPUs 1
 > and 2. In the recorded pinned-host SF300 Q1-Q22 A/B, the sum of warm per-query
@@ -135,8 +135,8 @@ uses must finish before filter destruction. This was already required by the
 replicas' non-owning RMM allocator references. Carrying the memory space makes
 the allocator-and-stream lifetime contract explicit in the placement type.
 
-The producer first selects the raw-needle IN-list when the actual build column
-passes its bounded-cardinality/type gate. For remaining supported columns, the
+The producer first selects the raw-needle IN-list for 1–12 null-free INT32/INT64
+build rows, counting duplicates. For remaining supported columns, the
 hash-IN-list/Bloom choice uses the minimum L2 size across the planned devices.
 The hash IN-list is selected only when it fits the least-capable probe GPU;
 otherwise the publisher selects the smaller Bloom, which may itself exceed L2
@@ -170,13 +170,11 @@ is never held while reducing keys, building filters, copying replicas, or
 synchronizing CUDA work.
 
 At the early build-port site, a stream borrowed from the build memory space
-first waits on the build representation's writer event. The fallback also
-switches from the worker stream to a stream from that same durable pool after
-the hash-table build is drained. Persistent cuDF/cuCO/RMM filter storage may retain
-its allocation stream for eventual asynchronous deallocation, so it must not
-retain a worker stream whose executor can be torn down earlier. Publication
-remains independent of a probe batch and preserves the existing join task state
-machine.
+first waits on the build representation's writer event. Persistent
+cuDF/cuCO/RMM filter storage may retain that durable pooled stream for eventual
+asynchronous deallocation, so it must not retain a worker stream whose executor
+can be torn down earlier. Publication remains independent of a probe batch and
+preserves the existing join task state machine.
 
 ### 3. Expose replication as a producer-only capability
 
@@ -351,10 +349,10 @@ disable a filter already proven useful.
 Publication adds `O(filter_size * (GPU_count - 1))` transfer work per join, not
 one rehash/rebuild per GPU. A verified pair uses one direct peer-DMA leg; only an
 unusable pair pays the HOST-staged D2H/H2D fallback. The steady-state probe
-remains entirely device-local: the bounded first tier scans raw needles, the
+remains entirely device-local: the 1–12-row first tier scans raw needles, the
 hash IN-list is selected to fit the smallest active L2 where possible, and the
 Bloom remains the compact fallback. The raw tier's probe work is
-`O(probe_rows * num_keys)`; its cardinality gate bounds that work, but no
+`O(probe_rows * num_keys)`; its row-count gate bounds that work, but no
 raw-versus-hash performance result is claimed here. No key column is retained,
 no scan is pinned to the build GPU, and scan parallelism is unchanged.
 

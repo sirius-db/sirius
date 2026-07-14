@@ -343,8 +343,9 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
  * sirius_dynamic_in_list_filter, whose static_set never stores @c numeric_limits<KeyT>::min()).
  *
  * Like its siblings it is @ref sirius_device_replicable: the constructor builds the source-device
- * snapshot and @ref replicate_to_devices fans a tiny per-device copy out to each probe device
- * before publication. The needle buffers are PIMPL'd so rmm/device headers stay out of this header.
+ * snapshot and @ref replicate_to_devices attempts to fan a tiny copy out to every planned probe
+ * device before publication. Each successful replica owns its snapshot. The needle buffers are
+ * PIMPL'd so rmm/device headers stay out of this header.
  */
 class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
                                                   public sirius_mask_applicable,
@@ -355,8 +356,11 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
   static constexpr std::size_t k_max_keys = 12;
 
   /// @param keys   The build keys (INT32/INT64, no nulls; the producer restricts the count to
-  ///               <= @ref k_max_keys). The view need only remain valid for the constructor, which
-  ///               eagerly snapshots the keys into an owned source-device buffer.
+  ///               <= @ref k_max_keys). The column-view object need only remain valid for the
+  ///               constructor call.
+  /// @pre          The backing device storage for @p keys remains valid until the snapshot copy
+  ///               enqueued on @p stream completes. The publisher satisfies this precondition by
+  ///               pinning the build representation and synchronizing @p stream before fan-out.
   /// @param stream Producer stream the snapshot is enqueued on; the publish path synchronizes it
   ///               before fan-out, so consumer streams never observe a partial copy.
   /// @param mr     Device memory resource backing the source snapshot.
@@ -369,6 +373,9 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
   sirius_dynamic_small_in_list_filter(sirius_dynamic_small_in_list_filter const&) = delete;
   sirius_dynamic_small_in_list_filter& operator=(sirius_dynamic_small_in_list_filter const&) =
     delete;
+  sirius_dynamic_small_in_list_filter(sirius_dynamic_small_in_list_filter&&) =
+    delete;
+  sirius_dynamic_small_in_list_filter& operator=(sirius_dynamic_small_in_list_filter&&) = delete;
 
   [[nodiscard]] sirius_dynamic_filter_kind kind() const override
   {
