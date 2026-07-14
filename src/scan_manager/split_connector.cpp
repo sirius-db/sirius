@@ -16,6 +16,7 @@
 
 #include "scan_manager/split_connector.hpp"
 
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cassert>
@@ -59,6 +60,7 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
   if (!_splits.empty()) {
     auto split = std::move(_splits.front());
     _splits.pop_front();
+    _pop_count.fetch_add(1, std::memory_order_relaxed);
     return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
   }
   return std::nullopt;
@@ -74,6 +76,21 @@ bool split_connector::is_closed() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
   return !_splits.empty();
+}
+
+std::vector<std::shared_ptr<::cucascade::data_batch>> split_connector::peek_resident_batches()
+  const
+{
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+  std::lock_guard<std::mutex> lock(_mutex);
+  batches.reserve(_splits.size());
+  for (const auto& split : _splits) {
+    auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(split.get());
+    if (scan_input != nullptr && scan_input->is_resident()) {
+      batches.push_back(scan_input->get_cached_batch());
+    }
+  }
+  return batches;
 }
 
 }  // namespace sirius::scan_manager

@@ -125,6 +125,13 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   scan_manager::split_connector& get_split_connector();
 
+  /// Shared handle to the connector, for components (e.g. the scan prefetcher)
+  /// that must outlive-safely reference it from a background thread.
+  [[nodiscard]] std::shared_ptr<scan_manager::split_connector> get_split_connector_ptr() const
+  {
+    return _split_connector;
+  }
+
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;

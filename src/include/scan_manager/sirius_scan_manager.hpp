@@ -28,6 +28,7 @@
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
+#include "scan_manager/scan_prefetcher.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -470,6 +471,10 @@ class sirius_scan_manager {
   [[nodiscard]] std::optional<cached_assignment> try_match_cached_entry(
     op::scan::sirius_gpu_scan_operator* op);
 
+  /// Build and start the per-query host->GPU scan prefetcher when enabled via
+  /// SIRIUS_SCAN_PREFETCH=1 (see scan_prefetcher.hpp). No-op otherwise.
+  void maybe_start_scan_prefetcher();
+
   /// Resolve the ioctx that should serve @p path (normalized internally, so callers
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
   /// building it once per backend on first use.  Routes by path through the registry
@@ -516,6 +521,10 @@ class sirius_scan_manager {
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
   std::unique_ptr<load_balancing_scan_batch_coalescer> _metadata_processor;
+  /// Per-query background host->GPU upgrader for queued pinned-cache splits
+  /// (built in start_metadata_processing when SIRIUS_SCAN_PREFETCH=1, torn
+  /// down in reset()).
+  std::unique_ptr<scan_prefetcher> _prefetcher;
   io::io_context_registry _ioctx_registry;
 };
 

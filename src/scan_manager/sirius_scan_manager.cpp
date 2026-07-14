@@ -54,6 +54,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <iterator>
 #include <memory>
@@ -438,6 +439,46 @@ void sirius_scan_manager::start_metadata_processing()
     if (it == _providers_by_op.end()) { continue; }
     it->second->run(*_dispatcher, _metadata_processor->get_split_provider_bridge(op));
   }
+  maybe_start_scan_prefetcher();
+}
+
+void sirius_scan_manager::maybe_start_scan_prefetcher()
+{
+  const char* enabled = std::getenv("SIRIUS_SCAN_PREFETCH");
+  if (enabled == nullptr || std::string_view{enabled} != "1") { return; }
+
+  // Prototype scope: a single GPU space. Multi-GPU needs the task creator's
+  // NUMA-locality derivation to pick the per-batch target device; converting
+  // to the wrong space would strand data cross-device.
+  auto gpu_spaces = _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.size() != 1) {
+    SIRIUS_LOG_WARN(
+      "[scan_prefetcher] disabled: prototype supports exactly 1 GPU space (found {})",
+      gpu_spaces.size());
+    return;
+  }
+  auto* gpu_space = _reservation_manager.get_memory_space(
+    cucascade::memory::Tier::GPU, gpu_spaces.front()->get_device_id());
+  if (gpu_space == nullptr) { return; }
+
+  std::vector<std::shared_ptr<split_connector>> connectors;
+  connectors.reserve(_scan_op_order.size());
+  for (auto* op : _scan_op_order) {
+    connectors.push_back(op->get_split_connector_ptr());
+  }
+
+  scan_prefetcher::config cfg{};
+  if (const char* threads = std::getenv("SIRIUS_SCAN_PREFETCH_THREADS")) {
+    cfg.num_threads = std::max(1UL, std::strtoul(threads, nullptr, 10));
+  }
+  if (const char* frac = std::getenv("SIRIUS_SCAN_PREFETCH_MIN_FREE_FRACTION")) {
+    cfg.min_free_fraction = std::clamp(std::strtod(frac, nullptr), 0.05, 0.95);
+  }
+  if (const char* quiet = std::getenv("SIRIUS_SCAN_PREFETCH_QUIET_MS")) {
+    cfg.drain_quiet_ms = std::strtoul(quiet, nullptr, 10);
+  }
+
+  _prefetcher = std::make_unique<scan_prefetcher>(cfg, std::move(connectors), gpu_space);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
@@ -552,6 +593,9 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(st
 
 void sirius_scan_manager::reset()
 {
+  // Stop the prefetcher first: it holds shared_ptrs to the operators'
+  // connectors and must not convert batches while per-query state is torn down.
+  _prefetcher.reset();
   _dispatcher->request_stop();
   _dispatcher->wait_for_all();
   _scan_op_order.clear();

@@ -18,12 +18,19 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
+
+namespace cucascade {
+class data_batch;
+}  // namespace cucascade
 
 namespace sirius::scan_manager {
 
@@ -79,6 +86,27 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
 
   [[nodiscard]] bool has_more_splits() const;
 
+  /// \brief Snapshot the data batches of pending RESIDENT splits (pinned-cache hits),
+  ///        in queue (consumption) order, without popping anything.
+  ///
+  /// Used by the scan prefetcher to upgrade queued host-resident batches to GPU
+  /// tier ahead of task creation. Fresh-read splits (scan metadata) are skipped.
+  /// The returned shared_ptrs are copies; the batch state machine arbitrates any
+  /// race with a consumer that pops the split concurrently.
+  [[nodiscard]] std::vector<std::shared_ptr<::cucascade::data_batch>> peek_resident_batches()
+    const;
+
+  /// \brief Number of splits ever popped via get_next_split(). Monotonic.
+  ///
+  /// The scan prefetcher samples this between sweeps: a changing count means
+  /// the scan is actively draining this connector (its tasks convert their own
+  /// batches concurrently), so prefetching it would only serialize those
+  /// conversions behind the prefetcher's exclusive locks.
+  [[nodiscard]] std::uint64_t pop_count() const
+  {
+    return _pop_count.load(std::memory_order_relaxed);
+  }
+
  private:
   friend class load_balancing_scan_batch_coalescer;
 
@@ -92,6 +120,7 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   std::deque<std::unique_ptr<op::operator_data>> _splits;
   bool _closed{false};
   std::exception_ptr _exception;
+  std::atomic<std::uint64_t> _pop_count{0};
 };
 
 }  // namespace sirius::scan_manager
