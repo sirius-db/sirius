@@ -24,11 +24,12 @@ namespace {
 
 class noop_backend final : public log_backend {
  public:
+  void set_level(log_level) override {}
+  // Discards everything; reporting "never" also lets the facade skip formatting.
+  bool should_log(log_level) const override { return false; }
+  void log(log_level, const std::source_location&, std::string_view) override {}
   // Vacuously reliable: nothing is ever buffered.
   bool flush() override { return true; }
-
- protected:
-  void emit(log_level, const std::source_location&, std::string_view) override {}
 };
 
 }  // namespace

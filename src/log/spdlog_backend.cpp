@@ -59,8 +59,6 @@ class spdlog_backend final : public log_backend {
     file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
     _logger = std::make_shared<spdlog::logger>("sirius", spdlog::sinks_init_list{file_sink});
-    // Pass-through: log_backend already filtered by the time emit() runs.
-    _logger->set_level(spdlog::level::trace);
 
     if (config.flush_interval) {
       _flusher = std::jthread(
@@ -79,18 +77,26 @@ class spdlog_backend final : public log_backend {
   // The implicit destructor stops and joins the flusher (jthread), then
   // releases the logger; the file sink flushes on destruction.
 
+  // The level lives in the spdlog logger itself — the single source of truth.
+  void set_level(log_level level) override { _logger->set_level(to_spdlog_level(level)); }
+
+  bool should_log(log_level level) const override
+  {
+    return _logger->should_log(to_spdlog_level(level));
+  }
+
+  void log(log_level level, const std::source_location& loc, std::string_view message) override
+  {
+    spdlog::source_loc spd_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
+    // spdlog's logger applies its own level filter before writing.
+    _logger->log(spd_loc, to_spdlog_level(level), "{}", message);
+  }
+
   bool flush() override
   {
     _logger->flush();
     // The file sink flushes synchronously.
     return true;
-  }
-
- protected:
-  void emit(log_level level, const std::source_location& loc, std::string_view message) override
-  {
-    spdlog::source_loc spd_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
-    _logger->log(spd_loc, to_spdlog_level(level), "{}", message);
   }
 
  private:

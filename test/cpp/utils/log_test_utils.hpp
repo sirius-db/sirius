@@ -20,6 +20,7 @@
 #include "log/log_backend.hpp"
 #include "log/logging.hpp"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <source_location>
@@ -29,7 +30,7 @@
 
 namespace sirius::test {
 
-/// In-memory log_backend recording every message it receives.
+/// In-memory log_backend recording every message at or above its level.
 class recording_log_backend final : public sirius::log_backend {
  public:
   struct record {
@@ -38,6 +39,25 @@ class recording_log_backend final : public sirius::log_backend {
     uint32_t line;
     std::string message;
   };
+
+  void set_level(sirius::log_level level) override
+  {
+    _level.store(level, std::memory_order_relaxed);
+  }
+
+  bool should_log(sirius::log_level level) const override
+  {
+    return static_cast<int>(level) >= static_cast<int>(_level.load(std::memory_order_relaxed));
+  }
+
+  void log(sirius::log_level level,
+           const std::source_location& loc,
+           std::string_view message) override
+  {
+    if (!should_log(level)) { return; }
+    std::lock_guard lock(_mutex);
+    _records.push_back({level, loc.file_name(), loc.line(), std::string{message}});
+  }
 
   bool flush() override
   {
@@ -64,16 +84,8 @@ class recording_log_backend final : public sirius::log_backend {
     return _flush_count;
   }
 
- protected:
-  void emit(sirius::log_level level,
-            const std::source_location& loc,
-            std::string_view message) override
-  {
-    std::lock_guard lock(_mutex);
-    _records.push_back({level, loc.file_name(), loc.line(), std::string{message}});
-  }
-
  private:
+  std::atomic<sirius::log_level> _level{sirius::log_level::off};
   mutable std::mutex _mutex;
   std::vector<record> _records;
   int _flush_count = 0;
