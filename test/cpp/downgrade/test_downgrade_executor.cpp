@@ -39,6 +39,7 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -108,7 +109,8 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
 
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
 
-  return sirius::make_data_batch(std::move(table), gpu_space, stream);
+  return sirius::make_data_batch(
+    std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 }
 
 /**
@@ -121,7 +123,8 @@ downgrade_executor make_test_executor(cucascade::shared_data_repository_manager&
                                       sirius::memory::sirius_memory_reservation_manager& mem_mgr)
 {
   sirius::exec::downgrade_executor_config config{
-    .thread_pool = {.num_threads = 1, .thread_name_prefix = "downgrade"}, .monitor_period_ms = 0};
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = std::chrono::milliseconds{0}};
   return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 

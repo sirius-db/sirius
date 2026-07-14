@@ -22,6 +22,7 @@
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -148,7 +149,27 @@ struct pinned_entry {
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
+  /// MVCC snapshot metadata for duckdb-native pins, attached by
+  /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
+  /// for parquet pins (immutable sources need no visibility reconciliation).
+  std::unique_ptr<duckdb_mvcc_metadata> mvcc;
 };
+
+/// Validate that @p entry can serve @p selected_columns (positions into
+/// @c entry.cache_info.column_ids) without truncation. GPU tier: every
+/// selected column must be present in @c data_batches_by_column with exactly
+/// n_chunks non-null chunks, and @c chunk_memory_spaces must cover every chunk
+/// with non-null spaces. HOST tier: every host chunk must be non-null.
+/// Zero-chunk entries are legitimate and pass. Throws std::runtime_error
+/// naming the offending column/condition.
+///
+/// Serve-time defense against malformed entries: the cached serving loop reads
+/// a nullptr batch as end-of-stream, so a column with fewer chunks (or a null
+/// chunk) would silently end the scan early — fewer rows than requested, no
+/// error. @ref sirius_scan_manager::try_assign_cached_entries calls this before
+/// attaching the provider and converts a throw into a disk-read fallback.
+void validate_pinned_entry_for_serving(pinned_entry const& entry,
+                                       std::span<std::size_t const> selected_columns);
 
 /**
  * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
@@ -282,6 +303,17 @@ class sirius_scan_manager {
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
     cucascade::memory::memory_space& memory_space);
 
+  /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
+  ///
+  /// Called by the duckdb-format pin path immediately after insert_pinned_entry /
+  /// insert_pinned_entry_host. Overwrites any previous metadata: on a re-pin that
+  /// merged into an existing entry, the refreshed (newer) v_base is the more
+  /// conservative snapshot fence for every cached column, and the refreshed
+  /// per-chunk counts stay valid for every column because the merge path rejects
+  /// materializations whose per-chunk row counts differ from the existing
+  /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
+  void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
+
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
@@ -296,7 +328,7 @@ class sirius_scan_manager {
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path);
+    std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.

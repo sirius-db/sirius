@@ -65,8 +65,10 @@ namespace sirius::scan_manager {
 namespace {
 
 struct cached_databatch_provider : public databatch_provider {
-  explicit cached_databatch_provider(pinned_entry const& entry, std::span<size_t> selected_columns)
-    : _entry(entry)
+  cached_databatch_provider(pinned_entry const& entry,
+                            std::span<size_t> selected_columns,
+                            const telemetry::batch_telemetry_info& telemetry_info)
+    : _entry(entry), _telemetry_info(telemetry_info)
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -103,8 +105,12 @@ struct cached_databatch_provider : public databatch_provider {
     if (index >= _entry.host_chunks.size()) { return nullptr; }
     const auto& chunk = _entry.host_chunks.at(index);
     if (!chunk) { return nullptr; }
-    auto data_rep = chunk->slice(_column_indices);
-    return cucascade::data_batch::make(get_next_batch_id(), std::move(data_rep));
+    auto data_rep       = chunk->slice(_column_indices);
+    const auto batch_id = get_next_batch_id();
+    return cucascade::data_batch::make(
+      batch_id,
+      std::move(data_rep),
+      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
   std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
@@ -125,20 +131,27 @@ struct cached_databatch_provider : public databatch_provider {
                                                             : _entry.memory_space;
     auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
       view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-    return ::cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
+    const auto batch_id = ::sirius::get_next_batch_id();
+    return ::cucascade::data_batch::make(
+      batch_id,
+      std::move(gpu_repr),
+      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
   std::size_t _n_chunks;
   std::vector<std::string> _column_names;
   std::vector<size_t> _column_indices;
   const pinned_entry& _entry;
+  telemetry::batch_telemetry_info _telemetry_info;
   std::atomic<std::size_t> _index{0};
 };
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry, std::span<size_t> selected_columns)
+  pinned_entry const& entry,
+  std::span<size_t> selected_columns,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
-  return std::make_unique<cached_databatch_provider>(entry, selected_columns);
+  return std::make_unique<cached_databatch_provider>(entry, selected_columns, telemetry_info);
 }
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
@@ -246,7 +259,16 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  auto datasource = create_datasource(uri);
+  // Footer-probe only when we will actually read + parse the footer.  On a warm
+  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
+  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
+  auto const cache_key     = normalize_path(uri);
+  auto const io_ctx        = ioctx_for_path(uri);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+  auto const hint =
+    footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
+
+  auto datasource = create_datasource(uri, hint);
   if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
@@ -339,7 +361,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   }
 
   if (_scan_op_order.empty()) {
-    spdlog::warn("[sirius_scan_manager::prepare_for_query] no GPU scan operators found in query");
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::prepare_for_query] no GPU scan operators found in query");
     return;
   }
 
@@ -357,14 +380,14 @@ void sirius_scan_manager::start_metadata_processing()
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path)
+  std::string_view path, sirius::io::open_hint hint)
 {
   auto file_path = normalize_path(std::string(path));
   auto io_ctx    = ioctx_for_path(file_path);
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
-  return io_ctx->open_datasource(file_path);
+  return io_ctx->open_datasource(file_path, hint);
 }
 
 std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
@@ -598,6 +621,33 @@ void sirius_scan_manager::insert_pinned_entry(
             std::to_string(i) + "] differs between existing and new entry");
         }
       }
+      // Per-chunk ROW counts must match too: the byte-budget coalescer can slice
+      // the same table at different row-group boundaries for a different column
+      // set (varchar byte budgets are data-dependent), which still yields equal
+      // chunk counts and — because round-robin placement is a function of chunk
+      // index alone — identical memory_spaces. Merging such chunks would corrupt
+      // the entry positionally (columns disagreeing on chunk boundaries) and
+      // silently invalidate the per-chunk MVCC row-count map a duckdb pin stamps
+      // via attach_mvcc_metadata. Reject loudly instead.
+      if (!entry.data_batches_by_column.empty()) {
+        auto const& existing_chunks = entry.data_batches_by_column.begin()->second;
+        if (existing_chunks.size() != data_tables.size()) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — existing entry has " +
+            std::to_string(existing_chunks.size()) + " chunks but the new materialization has " +
+            std::to_string(data_tables.size()));
+        }
+        for (std::size_t i = 0; i < data_tables.size(); ++i) {
+          if (!data_tables[i]) { continue; }
+          if (existing_chunks[i]->size() != data_tables[i]->num_rows()) {
+            throw std::runtime_error(
+              "[sirius_scan_manager::insert_pinned_entry] merge mismatch — chunk " +
+              std::to_string(i) + " has " + std::to_string(existing_chunks[i]->size()) +
+              " rows in the existing entry but " + std::to_string(data_tables[i]->num_rows()) +
+              " in the new materialization (same total, different chunk boundaries)");
+          }
+        }
+      }
       // Same row count → merge unique columns into the existing entry.
       // Decide which column INDICES are new BEFORE iterating chunks. Doing
       // the contains() check per-chunk would let chunk 0 install a new
@@ -695,6 +745,16 @@ void sirius_scan_manager::insert_pinned_entry_host(
   _pinned_entries[name] = std::move(entry);
 }
 
+void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
+                                               duckdb_mvcc_metadata metadata)
+{
+  auto it = _pinned_entries.find(name);
+  if (it == _pinned_entries.end()) {
+    throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
+  }
+  it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
+}
+
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
   _pinned_entries.erase(name);
@@ -706,6 +766,45 @@ void sirius_scan_manager::visit_pinned_entries(
   for (auto const& [name, entry] : _pinned_entries) {
     if (!visitor(name, entry)) { break; }
   }
+}
+
+void validate_pinned_entry_for_serving(pinned_entry const& entry,
+                                       std::span<std::size_t const> selected_columns)
+{
+  auto const& entry_column_names = entry.cache_info.column_names();
+
+  if (entry.tier == cucascade::memory::Tier::GPU) {
+    if (entry.data_batches_by_column.empty()) { return; }  // legitimate zero-chunk entry
+    auto const n_chunks = entry.data_batches_by_column.begin()->second.size();
+    if (entry.chunk_memory_spaces.size() != n_chunks) {
+      throw std::runtime_error(
+        "pinned entry's chunk_memory_spaces does not cover every chunk of the entry");
+    }
+    for (auto const* space : entry.chunk_memory_spaces) {
+      if (!space) { throw std::runtime_error("pinned entry has a null chunk memory_space"); }
+    }
+    for (auto idx : selected_columns) {
+      auto const& name = entry_column_names.at(idx);
+      auto it          = entry.data_batches_by_column.find(name);
+      if (it == entry.data_batches_by_column.end() || it->second.size() != n_chunks) {
+        throw std::runtime_error("pinned column '" + name +
+                                 "' does not cover every chunk of the entry");
+      }
+      for (auto const& chunk : it->second) {
+        if (!chunk) { throw std::runtime_error("pinned column '" + name + "' has a null chunk"); }
+      }
+    }
+    return;
+  }
+
+  if (entry.tier == cucascade::memory::Tier::HOST) {
+    for (auto const& chunk : entry.host_chunks) {
+      if (!chunk) { throw std::runtime_error("pinned entry has a null host chunk"); }
+    }
+    return;
+  }
+
+  throw std::runtime_error("pinned entry has an unsupported tier");
 }
 
 bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
@@ -723,15 +822,26 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
       auto cols = gather_by_primary_index(entry.cache_info.column_ids,
                                           op->get_ingestible().materialized_column_order());
       if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
-      auto provider = make_provider_for_pinned_entry(entry, cols);
+      // Serve-time defense: a malformed entry would end the cached batch stream
+      // early (nullptr mid-stream reads as end-of-stream) and silently truncate
+      // the scan; validate up front so it throws here and the catch below falls
+      // back to the disk read instead.
+      validate_pinned_entry_for_serving(entry, cols);
+      auto provider = make_provider_for_pinned_entry(entry, cols, op->batch_telemetry());
       _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
-      spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
-                   pinned_name,
-                   op->get_operator_id());
+      SIRIUS_LOG_INFO("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
+                      pinned_name,
+                      op->get_operator_id());
       return true;
     }
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_ERROR(
+      "[sirius_scan_manager] error while trying to assign cached entries to "
+      "operator '{}': {}",
+      op->get_operator_id(),
+      e.what());
   } catch (...) {
-    spdlog::error(
+    SIRIUS_LOG_ERROR(
       "[sirius_scan_manager] error while trying to assign cached entries to "
       "operator '{}'",
       op->get_operator_id());

@@ -39,8 +39,7 @@ The publication and application contracts are distinct:
   execution begins.
 - A base scan reached transitively through an intervening join can execute
   earlier. It snapshots whatever fully ready filters are visible at its
-  reader and post-decode checkpoints; soft build-subtree task priority improves
-  the coverage of later splits without imposing a barrier.
+  reader and post-decode checkpoints under normal scheduler order.
 - A scan never waits for a dynamic filter and never assumes one was emitted.
 - An empty or policy-gated publication and an allocation-unavailable local
   replica are safe pass-through cases; the authoritative join guarantees
@@ -54,9 +53,13 @@ The publication and application contracts are distinct:
 Probe metadata parsing and prefetch preparation are independent of publication.
 For an immediate probe, the actual `read_parquet`/decode task starts after the
 ordered build-port publication attempt has returned. A transitive target may
-start sooner: it selects zone maps immediately before `read_parquet` and selects
-membership filters in the following post-decode operator. See
-[Transitive scan targets and build-task priority](dynamic-filters.md#transitive-scan-targets-and-build-task-priority).
+start sooner, and where it snapshots the channel depends on the scan format: a
+parquet target has two checkpoints — it selects zone maps into the reader AST
+immediately before `read_parquet`, then selects membership filters in the
+following post-decode operator; a duckdb-native target has one — the post-decode
+operator, which has no reader filter to ride and therefore selects zone maps
+(evaluated row-wise as AST masks) and membership filters together. See
+[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ## Reproduction and diagnosis
 
@@ -326,10 +329,12 @@ generations. A transitive target may still race the producer's successive
 The scan paths pass their memory-space device ID into dynamic-filter lowering and
 mask computation:
 
-- parquet AST merge selects device-local zone-map scalars;
-- post-decode membership apply selects the local raw needles, static set, or
+- the parquet reader AST merge selects device-local zone-map scalars;
+- the post-decode AST row-mask apply (duckdb-native scans,
+  `include_ast_row_masks`) selects device-local zone-map scalars;
+- the post-decode membership apply selects the local raw needles, static set, or
   Bloom;
-- `is_available_on_device` is checked before either path.
+- `is_available_on_device` is checked before every path.
 
 There is no remote kernel dereference and no consumer-side synchronization with
 the producer.
@@ -359,8 +364,8 @@ legs to overlap on three or more GPUs. For an immediate probe, publication
 completion is upstream of data-scan execution, so replica latency is on the
 probe-start critical path. For a transitive target, earlier work may proceed
 unfiltered while replication is in progress; replica latency instead delays
-filter availability and reduces the number of splits it can prune. Soft
-build-subtree priority minimizes that window. Raw needles are bounded by the
+filter availability and reduces the number of splits it can prune. The scheduler
+does not reorder work to minimize that window. Raw needles are bounded by the
 producer policy, while hash-set slots and Bloom words are copied rather than
 rebuilt; for a two-GPU query this is one remote replica per emitted filter.
 

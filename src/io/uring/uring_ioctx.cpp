@@ -18,13 +18,14 @@
 
 #include "io/uring/uring_reactor.hpp"
 
+#include <format>
 #include <memory>
 
 namespace sirius::io::uring {
 
 uring_ioctx::uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx)
   : templated_ioctx<uring_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
-      return std::make_unique<uring_reactor>(ctx, fmt::format("reactor-{}", i++));
+      return std::make_unique<uring_reactor>(ctx, std::format("reactor-{}", i++));
     })
 {
 }

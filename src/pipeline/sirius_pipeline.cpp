@@ -16,17 +16,14 @@
 
 #include "pipeline/sirius_pipeline.hpp"
 
+#include "config.hpp"
 #include "creator/task_creator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
 
@@ -38,7 +35,7 @@ namespace sirius {
 namespace pipeline {
 
 sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
-  : build_ctx_(ctx), ready(false), initialized(false), source(nullptr), sink(nullptr)
+  : ready(false), initialized(false), source(nullptr), sink(nullptr), build_ctx_(ctx)
 {
 }
 
@@ -54,7 +51,7 @@ bool sirius_pipeline::is_order_dependent() const
     if (op.operator_order() == sirius::OrderPreservationType::NO_ORDER) { return false; }
     if (op.operator_order() == sirius::OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!build_ctx_.preserve_insertion_order) { return false; }
+  if (!build_ctx_.preserve_insertion_order()) { return false; }
   if (sink && sink->sink_order_dependent()) { return true; }
   return false;
 }
@@ -131,6 +128,12 @@ void sirius_pipeline::is_ready()
   if (ready) { return; }
   ready = true;
   std::reverse(operators.begin(), operators.end());
+  if (!operators.empty()) {
+    // Derive source/sink from operators[] (meta-pipeline pre-populated the sink;
+    // build_pipelines appended intermediates/sources before the reverse above).
+    source = &operators.front().get();
+    sink   = &operators.back().get();
+  }
 }
 
 void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline)
@@ -332,10 +335,6 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // no parent pipeline whose status needs updating. Returning early avoids
   // racing with engine teardown after mark_completed() signals the future.
   if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    // If the pipeline finished with zero tasks (e.g. WHERE 1=0 empty result or
-    // DUMMY_SCAN), gpu_pipeline_executor is never invoked and mark_completed()
-    // would never be called — signal completion here instead.
-    if (tasks_created.load() == 0 && _task_creator) { _task_creator->signal_query_complete(); }
     return;
   }
 

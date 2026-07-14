@@ -22,6 +22,8 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/common/enums/optimizer_type.hpp>
+#include <duckdb/main/config.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -39,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -835,6 +838,46 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu(
     "select n.n_name, c.c_custkey, c.c_name  from nation n join customer c on "
     "n.n_nationkey = c.c_nationkey;");
+}
+
+// issue #329: expressions in hash-join equality conditions. The join key is materialized into a
+// column below the join and partitioned on that column; the compare_gpu_vs_cpu delta assertion
+// (1 GPU exec, 0 fallbacks) also proves these run on the GPU rather than falling back to CPU.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with expression key on build side",
+                 "[integration][gpu_execution][join]")
+{
+  // The canonical issue #329 example: expression on the (small) nation side.
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, c.c_custkey from customer c "
+    "join nation n on c.c_custkey = n.n_nationkey * 10;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with expression key on probe side",
+                 "[integration][gpu_execution][join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, c.c_custkey from customer c "
+    "join nation n on c.c_nationkey * 2 = n.n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - join with expressions on both sides",
+                 "[integration][gpu_execution][join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, c.c_custkey from customer c "
+    "join nation n on c.c_nationkey * 10 = n.n_nationkey * 10;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - mixed join with expression equality key and inequality",
+                 "[integration][gpu_execution][join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, c.c_custkey from customer c "
+    "join nation n on c.c_custkey = n.n_nationkey * 10 and c.c_custkey > n.n_nationkey;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -5113,113 +5156,285 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 //===----------------------------------------------------------------------===//
-// cpu_source_task tests — STATISTICS_PROPAGATION / metadata-only queries
+// GPU_VALUES tests — plan-materialized sources
 //
-// When STATISTICS_PROPAGATION is enabled, DuckDB folds ungrouped count(*),
-// MIN, and MAX into constant expressions (EXPRESSION_GET -> DUMMY_SCAN),
-// which the Sirius planner converts to COLUMN_DATA_SCAN -> cpu_source_task.
-// These tests ensure that path works and doesn't regress.
+// The GPU_VALUES source operator serves COLUMN_DATA_SCAN (VALUES clauses,
+// materialized subqueries, STATISTICS_PROPAGATION constant folds), DUMMY_SCAN
+// (constant-only queries), and EMPTY_RESULT (WHERE false). When
+// STATISTICS_PROPAGATION is enabled, DuckDB folds ungrouped count(*), MIN,
+// and MAX into constant expressions (EXPRESSION_GET -> DUMMY_SCAN), which
+// the Sirius planner converts to a GPU_VALUES source. These tests ensure
+// those paths work and don't regress.
 //===----------------------------------------------------------------------===//
+
+struct scan_task_batch_size_guard {
+  duckdb::Connection& con;
+  explicit scan_task_batch_size_guard(duckdb::Connection& con, std::size_t size) : con(con)
+  {
+    con.Query("SET scan_task_batch_size = " + std::to_string(size));
+  }
+  ~scan_task_batch_size_guard() { con.Query("RESET scan_task_batch_size"); }
+};
+
+struct optimizer_disable_guard {
+  duckdb::ClientContext& context;
+  std::set<duckdb::OptimizerType> original_disabled;
+
+  optimizer_disable_guard(duckdb::ClientContext& context, duckdb::OptimizerType optimizer)
+    : context(context),
+      original_disabled(duckdb::DBConfig::GetConfig(context).options.disabled_optimizers)
+  {
+    auto disabled = original_disabled;
+    disabled.insert(optimizer);
+    duckdb::DBConfig::GetConfig(context).options.disabled_optimizers = std::move(disabled);
+  }
+
+  ~optimizer_disable_guard()
+  {
+    duckdb::DBConfig::GetConfig(context).options.disabled_optimizers = std::move(original_disabled);
+  }
+};
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty result (WHERE false)",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select n_nationkey from nation where 1=0;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - aggregate over empty result",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select count(*) from nation where 1=0;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - dummy scan (SELECT literal)",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select 42 as x;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values source",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select b from (values (1), (2), (3)) t(b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - count over projection-pruned values preserves cardinality",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // Prevent DuckDB from folding the aggregate to a constant: UNUSED_COLUMNS
+  // can then prune the VALUES payload while preserving its three logical rows.
+  // GPU_VALUES must retain those rows even though cuDF cannot represent a
+  // positive-row table with zero columns.
+  optimizer_disable_guard guard(*con->context, duckdb::OptimizerType::STATISTICS_PROPAGATION);
+  compare_gpu_vs_cpu("select count(*) from (values (1), (2), (3)) t(i);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - boolean values",
+                 "[integration][gpu_execution][gpu_values][types]")
+{
+  compare_gpu_vs_cpu("select b from (values (true), (false), (NULL::BOOLEAN)) t(b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - temporal values",
+                 "[integration][gpu_execution][gpu_values][types]")
+{
+  compare_gpu_vs_cpu(
+    "select d, ts from (values "
+    "(DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.123456'), "
+    "(DATE '1999-12-31', TIMESTAMP '1999-12-31 23:59:59.999999'), "
+    "(NULL::DATE, NULL::TIMESTAMP)) t(d, ts);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - DECIMAL32, DECIMAL64, and DECIMAL128 values",
+                 "[integration][gpu_execution][gpu_values][types][decimal]")
+{
+  compare_gpu_vs_cpu(
+    "select d32, d64, d128 from (values "
+    "(CAST('1234567.89' AS DECIMAL(9,2)), "
+    " CAST('12345678901234.5678' AS DECIMAL(18,4)), "
+    " CAST('12345678901234567890123456789012.345678' AS DECIMAL(38,6))), "
+    "(NULL::DECIMAL(9,2), NULL::DECIMAL(18,4), NULL::DECIMAL(38,6))) "
+    "t(d32, d64, d128);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values with varchar and nulls",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu(
+    "select a, b from (values (1, 'alpha'), (NULL, 'beta'), (3, NULL)) t(a, b) order by a nulls "
+    "first;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values spanning multiple chunks",
+                 "[integration][gpu_execution][gpu_values][large_input]")
+{
+  // > STANDARD_VECTOR_SIZE (2048) rows so the ColumnDataCollection scans
+  // multiple DataChunks through the GPU_VALUES staging path. Disable
+  // statistics propagation so the aggregate cannot be folded before staging.
+  optimizer_disable_guard guard(*con->context, duckdb::OptimizerType::STATISTICS_PROPAGATION);
+  std::string query = "select count(*), min(i), max(i) from (values (0)";
+  for (int i = 1; i < 5000; i++) {
+    query += ", (" + std::to_string(i) + ")";
+  }
+  query += ") t(i);";
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values source fanned out to multiple consumers",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // A VALUES-backed CTE referenced twice fans the GPU_VALUES output out to
+  // multiple downstream data repositories.
+  compare_gpu_vs_cpu(
+    "with t(b) as (values (1), (2), (3)) select a.b, c.b from t a join t c using (b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values joined with base table",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // GPU_VALUES and GPU_SCAN sources in one plan: exercises kickoff when the
+  // task scheduler only schedules the first scan-like source directly.
+  compare_gpu_vs_cpu(
+    "select n.n_name from nation n join (values (0), (1), (2)) t(k) on n.n_nationkey = t.k order "
+    "by n.n_name;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - oversized values source falls back before GPU materialization",
+                 "[integration][gpu_execution][gpu_values][fallback][large_input]")
+{
+  // GPU_VALUES is intentionally a single-table source. Force a tiny source
+  // cap and verify an oversized collection is refused during planning, where
+  // transparent execution can safely replay it on DuckDB's streaming path.
+  scan_task_batch_size_guard guard(*con, 64);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+
+  std::string const payload(128, 'x');
+  auto result = con->Query("select sum(length(s)) from (values ('" + payload + "'), ('" + payload +
+                           "')) t(s);");
+  REQUIRE(result);
+  if (result->HasError()) {
+    UNSCOPED_INFO("oversized VALUES fallback error: " << result->GetError());
+  }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 256);
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before,
+                                                    after,
+                                                    /*expected_rebind_delta=*/0,
+                                                    /*expected_fallback_delta=*/1,
+                                                    /*expected_execution_delta=*/0);
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - unsupported HUGEINT values fall back",
+                 "[integration][gpu_execution][gpu_values][fallback][types]")
+{
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query(
+    "select x from (values "
+    "(CAST('9223372036854775808' AS HUGEINT)), "
+    "(CAST('-9223372036854775809' AS HUGEINT))) t(x) order by x;");
+
+  REQUIRE(result);
+  if (result->HasError()) {
+    UNSCOPED_INFO("unsupported HUGEINT VALUES fallback error: " << result->GetError());
+  }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->RowCount() == 2);
+  REQUIRE(result->GetValue(0, 0).ToString() == "-9223372036854775809");
+  REQUIRE(result->GetValue(0, 1).ToString() == "9223372036854775808");
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before,
+                                                    after,
+                                                    /*expected_rebind_delta=*/0,
+                                                    /*expected_fallback_delta=*/1,
+                                                    /*expected_execution_delta=*/0);
+}
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped count(*)",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped count(*) parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped min",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped min parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select max(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped min and max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(n_nationkey), max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped min and max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(l_orderkey), max(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped count(*) with min and max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*), min(n_nationkey), max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped count(*) with min and max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*), min(l_orderkey), max(l_orderkey) from lineitem;");
-}
-
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - empty result (WHERE false)",
-                 "[integration][gpu_execution][cpu_source]")
-{
-  compare_gpu_vs_cpu("select n_nationkey from nation where 1=0;");
-}
-
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - dummy scan (SELECT literal)",
-                 "[integration][gpu_execution][cpu_source]")
-{
-  compare_gpu_vs_cpu("select 42 as x;");
-}
-
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - values CPU source",
-                 "[integration][gpu_execution][cpu_source]")
-{
-  compare_gpu_vs_cpu("select b from (values (1), (2), (3)) t(b);");
-}
-
-TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
-                 "gpu_execution - CPU source with multiple downstream repositories",
-                 "[integration][gpu_execution][cpu_source]")
-{
-  // A VALUES-backed CTE referenced twice fans the cpu_source output out to
-  // multiple downstream data repositories.
-  compare_gpu_vs_cpu(
-    "with t(b) as (values (1), (2), (3)) select a.b, c.b from t a join t c using (b);");
 }
 
 //===----------------------------------------------------------------------===//
@@ -5353,6 +5568,66 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   auto unpin_result = con->Query("CALL unpin_table('lineitem');");
   REQUIRE(unpin_result);
   REQUIRE_FALSE(unpin_result->HasError());
+}
+
+// Overflow (big-string) refusal: strings at/over GetStringBlockLimit (4 KB at the
+// default block size) live in overflow blocks the GPU scan cannot decode. The query
+// must route to DuckDB CPU and return correct results; pin_table must fail cleanly.
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - duckdb-native overflow strings fall back to CPU",
+                 "[integration][gpu_execution][duckdb_native][overflow_string]")
+{
+  auto db_file = fs::temp_directory_path() / "sirius_overflow_strings_test.db";
+  fs::remove(db_file);
+  fs::remove(fs::path(db_file.string() + ".wal"));
+
+  auto exec = [&](const std::string& q) {
+    auto result = con->Query(q);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("query error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+
+  exec("ATTACH '" + db_file.string() + "' AS ovf;");
+  exec(
+    "CREATE TABLE ovf.main.bigstr AS SELECT range AS id, "
+    "CASE WHEN range = 7 THEN repeat('x', 5000) ELSE 'short_' || range END AS s "
+    "FROM range(0, 1000);");
+  exec("CHECKPOINT ovf;");
+
+  // The 5000-char string must come back intact. These queries are DESIGNED to fall
+  // back, so assert the fallback counters positively instead of compare_gpu_vs_cpu
+  // (whose contract demands a successful GPU rebind).
+  auto stats_before = sirius::test::get_transparent_execution_stats(*con);
+
+  auto check = con->Query("SELECT max(length(s)), count(*) FROM ovf.main.bigstr;");
+  REQUIRE(check);
+  if (check->HasError()) { UNSCOPED_INFO("intercepted query error: " << check->GetError()); }
+  REQUIRE_FALSE(check->HasError());
+  REQUIRE(check->GetValue(0, 0).GetValue<int64_t>() == 5000);
+  REQUIRE(check->GetValue(1, 0).GetValue<int64_t>() == 1000);
+
+  auto intact = con->Query("SELECT s = repeat('x', 5000) FROM ovf.main.bigstr WHERE id = 7;");
+  REQUIRE(intact);
+  REQUIRE_FALSE(intact->HasError());
+  REQUIRE(intact->GetValue(0, 0).GetValue<bool>());
+
+  auto stats_after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(stats_before,
+                                                    stats_after,
+                                                    /*expected_rebind_delta=*/0,
+                                                    /*expected_fallback_delta=*/2,
+                                                    /*expected_execution_delta=*/0);
+
+  // Pinning the table must fail with the refusal reason, not cache garbage.
+  auto pin_result =
+    con->Query("CALL pin_table(format='duckdb', name='ovf.main.bigstr', tier='gpu');");
+  REQUIRE(pin_result);
+  REQUIRE(pin_result->HasError());
+  REQUIRE(pin_result->GetError().find("overflow") != std::string::npos);
+
+  exec("DETACH ovf;");
+  fs::remove(db_file);
 }
 
 // Pin a column subset (cols=[...]) and then run a query that requests a strict

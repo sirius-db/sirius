@@ -115,6 +115,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
   r.optional("honor_retry_after", opt.honor_retry_after);
   r.optional("perf_instrumentation", opt.perf_instrumentation);
+  r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.reject_unknown();
 }
 
@@ -194,7 +195,7 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("monitor_period_ms", opt.monitor_period_ms);
+  r.optional("monitor_period", opt.monitor_period);
   r.reject_unknown();
 }
 
