@@ -28,6 +28,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -65,6 +66,16 @@ double time_cuda_ms(cudaStream_t stream, Fn&& fn)
 
 inline bool weights_need_timing(double const w[3]) { return w[1] != 0.0 || w[2] != 0.0; }
 
+// Relative decode cost per codec (beam-retention proxy), accumulated as cost x bytes processed.
+inline double op_decode_cost(std::string_view op)
+{
+  if (op == "identity" || op == "str_split") return 0.15;
+  if (op == "deflate" || op == "lz4" || op == "snappy" || op == "cascaded") return 5.0;
+  if (op == "dictionary") return 3.0;
+  if (op == "ans" || op == "bitcomp" || op == "alp" || op == "alp_rd") return 2.0;
+  return 1.0;  // bitpack, rle, delta, zigzag, for, bitextract — fast
+}
+
 inline double weighted_score(double ratio, double comp, double decomp, double const w[3])
 {
   return std::pow(std::max(ratio, 1e-12), w[0]) * std::pow(std::max(comp, 1e-12), w[1]) *
@@ -95,6 +106,7 @@ struct bfs_candidate {
   std::string dsl;
   double compression_ratio = 1.0;
   size_t total_leaf_bytes  = 0;
+  double decode_cost       = 0.0;  // Σ per-op decode cost × bytes processed (speed proxy)
 
   std::vector<pending_item> pending;
   std::vector<pending_item> leaves;
@@ -268,6 +280,69 @@ size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view 
 // BFS Explorer
 // ---------------------------------------------------------------------------
 
+// Beam retention: reserve half the slots for top-ratio candidates (so a pure-
+// ratio search is never starved of its best subtree), and fill the rest from the
+// (ratio, estimated decode speed) Pareto frontier of the remainder — thinned by
+// NSGA-II crowding distance when it overflows, since dictionary spawns many
+// near-identical frontier points and a ratio trim would starve the fast/low-
+// ratio end (e.g. str_split before its channels are compressed). Dropped
+// candidates free their GPU reprs on return.
+void prune_beam(std::vector<std::unique_ptr<bfs_candidate>>& beam,
+                size_t cap,
+                size_t original_size)
+{
+  size_t const n = beam.size();
+  if (n <= cap) return;
+  std::vector<double> r(n), s(n);
+  for (size_t i = 0; i < n; ++i) {
+    r[i] = beam[i]->compression_ratio;
+    s[i] = (double)original_size / std::max(beam[i]->decode_cost, 1.0);
+  }
+
+  std::vector<size_t> idx(n);
+  std::iota(idx.begin(), idx.end(), size_t{0});
+  std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return r[a] > r[b]; });
+
+  size_t const ratio_slots = cap / 2;
+  std::vector<size_t> keep(idx.begin(), idx.begin() + ratio_slots);
+  std::vector<size_t> pool(idx.begin() + ratio_slots, idx.end());
+  size_t const want = cap - keep.size();
+
+  std::vector<char> dominated(n, 0);
+  for (size_t i : pool)
+    for (size_t j : pool)
+      if (j != i && r[j] >= r[i] && s[j] >= s[i] && (r[j] > r[i] || s[j] > s[i])) {
+        dominated[i] = 1;
+        break;
+      }
+  std::vector<size_t> front, rest;
+  for (size_t i : pool) (dominated[i] ? rest : front).push_back(i);
+
+  if (front.size() <= want) {
+    keep.insert(keep.end(), front.begin(), front.end());
+    for (size_t i = 0; i < rest.size() && keep.size() < cap; ++i)
+      keep.push_back(rest[i]);  // rest is already ratio-ordered via idx
+  } else {
+    // Thin an over-large frontier by crowding distance (boundary points = inf).
+    std::vector<double> crowd(n, 0.0);
+    for (double const* obj : {r.data(), s.data()}) {
+      auto by_obj = front;
+      std::sort(by_obj.begin(), by_obj.end(), [&](size_t a, size_t b) { return obj[a] < obj[b]; });
+      double span = std::max(obj[by_obj.back()] - obj[by_obj.front()], 1e-12);
+      crowd[by_obj.front()] = crowd[by_obj.back()] = std::numeric_limits<double>::infinity();
+      for (size_t k = 1; k + 1 < by_obj.size(); ++k)
+        crowd[by_obj[k]] += (obj[by_obj[k + 1]] - obj[by_obj[k - 1]]) / span;
+    }
+    std::sort(front.begin(), front.end(), [&](size_t a, size_t b) { return crowd[a] > crowd[b]; });
+    keep.insert(keep.end(), front.begin(), front.begin() + want);
+  }
+
+  std::vector<std::unique_ptr<bfs_candidate>> kept;
+  kept.reserve(keep.size());
+  for (size_t i : keep) kept.push_back(std::move(beam[i]));
+  beam.swap(kept);  // old beam (with the dropped tail) freed on return
+}
+
 exploration_result explore_column_compression(cudf::column_view input,
                                               exploration_config const& config,
                                               rmm::cuda_stream_view stream,
@@ -347,14 +422,9 @@ exploration_result explore_column_compression(cudf::column_view input,
       std::cerr << "[explore] Depth " << depth << ": " << beam.size()
                 << " candidates, best=" << best_ratio << "\n";
 
-    // Min-heap (worst ratio at front) of the top max_candidates children; losers
-    // are freed as they arrive, capping peak memory at ~beam_width candidates
-    // rather than beam_width × pending × ops. Surviving set is identical.
+    // Children buffer, pruned back to max_candidates at 2x so losers are freed
+    // as the depth progresses rather than all held to the end.
     std::vector<std::unique_ptr<bfs_candidate>> next_beam;
-    auto ratio_gt = [](std::unique_ptr<bfs_candidate> const& a,
-                       std::unique_ptr<bfs_candidate> const& b) {
-      return a->compression_ratio > b->compression_ratio;
-    };
 
     for (auto& candidate : beam) {
       if (candidate->pending.empty()) {
@@ -433,6 +503,8 @@ exploration_result explore_column_compression(cudf::column_view input,
           for (auto const& p : child->pending)
             child->total_leaf_bytes += p.size_bytes;
           child->compression_ratio = (double)original_size / child->total_leaf_bytes;
+          child->decode_cost =
+            candidate->decode_cost + op_decode_cost(op_name) * (double)pend.size_bytes;
 
           if (child->compression_ratio > best_ratio) {
             best_ratio      = child->compression_ratio;
@@ -447,19 +519,19 @@ exploration_result explore_column_compression(cudf::column_view input,
           if (saved_shallow.size() < max_candidates)
             saved_shallow.push_back(
               {child->dsl, child->compression_ratio, child->total_leaf_bytes, child->steps.size()});
-          if (next_beam.size() < max_candidates) {
-            next_beam.push_back(std::move(child));
-            std::push_heap(next_beam.begin(), next_beam.end(), ratio_gt);
-          } else if (child->compression_ratio > next_beam.front()->compression_ratio) {
-            std::pop_heap(next_beam.begin(), next_beam.end(), ratio_gt);
-            next_beam.back() = std::move(child);
-            std::push_heap(next_beam.begin(), next_beam.end(), ratio_gt);
-          }
+          // Buffer children and prune to the hybrid (top-ratio + Pareto
+          // frontier) beam at 2x cap, so low-ratio-but-fast branches (e.g. a
+          // bare str_split) aren't evicted before their channels are compressed.
+          next_beam.push_back(std::move(child));
+          if (next_beam.size() >= 2 * max_candidates)
+            prune_beam(next_beam, max_candidates, original_size);
         }
       }
     }
 
     if (next_beam.empty()) break;
+
+    prune_beam(next_beam, max_candidates, original_size);
 
     std::sort(next_beam.begin(), next_beam.end(), [](auto const& a, auto const& b) {
       return a->compression_ratio > b->compression_ratio;
@@ -497,19 +569,21 @@ exploration_result explore_column_compression(cudf::column_view input,
     size_t compressed_size_bytes;
     double compress_throughput_gbps;
     double decompress_throughput_gbps;
+    double decode_cost = 0.0;  // proxy for pareto_beam finalist selection
   };
   std::vector<ranked_candidate> finalists;
-  auto add_finalist = [&](std::string dsl, double ratio, size_t bytes) {
+  auto add_finalist = [&](std::string dsl, double ratio, size_t bytes, double dc) {
     if (dsl.empty()) return;
     for (auto const& f : finalists)
       if (f.plan_dsl == dsl) return;
-    finalists.push_back({std::move(dsl), ratio, bytes, 0.0, 0.0});
+    finalists.push_back({std::move(dsl), ratio, bytes, 0.0, 0.0, dc});
   };
-  if (!best_dsl.empty()) add_finalist(best_dsl, best_ratio, best_leaf_bytes);
+  // Beam first so the real decode_cost is recorded; best_dsl/identity dedup to it.
   for (auto& c2 : beam)
-    if (c2) add_finalist(c2->dsl, c2->compression_ratio, c2->total_leaf_bytes);
+    if (c2) add_finalist(c2->dsl, c2->compression_ratio, c2->total_leaf_bytes, c2->decode_cost);
+  if (!best_dsl.empty()) add_finalist(best_dsl, best_ratio, best_leaf_bytes, 0.0);
   if (best_ratio <= 1.0 || config.rerank_mode == score_mode::Pareto)
-    add_finalist("input -> identity", 1.0, original_size);
+    add_finalist("input -> identity", 1.0, original_size, 0.0);
   std::sort(finalists.begin(), finalists.end(), [](auto const& a, auto const& b) {
     return a.compression_ratio > b.compression_ratio;
   });
@@ -521,24 +595,42 @@ exploration_result explore_column_compression(cudf::column_view input,
   size_t const rerank_top       = config.rerank_top > 0 ? config.rerank_top : 8;
   size_t const simplicity_slots = config.simplicity_slots;
 
-  // Trim the ratio pool first, then append simplicity candidates so the trim
-  // cannot evict them. The identity plan rescue runs before the trim.
-  {
-    // Preserve identity plan if it would be evicted by the ratio trim
-    auto id_it = std::find_if(finalists.begin(), finalists.end(), [](auto const& f) {
-      return f.plan_dsl == "input -> identity";
-    });
-    bool id_needs_rescue =
-      id_it != finalists.end() && id_it >= finalists.begin() + (std::ptrdiff_t)rerank_top;
-    ranked_candidate id_kept;
-    if (id_needs_rescue) id_kept = *id_it;
+  // Trim to rerank_top: half the slots go to the top-ratio finalists (so the
+  // ratio-best plan is always timed), the rest to a (ratio, proxy-speed)
+  // crowding-diverse subset so throughput-friendly mid-ratio plans (e.g.
+  // str_split cascades) get timed too. Identity is rescued if evicted.
+  if (finalists.size() > rerank_top) {
+    size_t const m          = finalists.size();
+    size_t const keep_ratio = std::max<size_t>(1, rerank_top / 2);
+    // finalists are ratio-sorted: reserve the head, diversify over the tail.
+    std::vector<ranked_candidate> kept(finalists.begin(), finalists.begin() + keep_ratio);
+    std::vector<size_t> pool(m - keep_ratio);
+    std::iota(pool.begin(), pool.end(), keep_ratio);
 
-    if (finalists.size() > rerank_top) finalists.resize(rerank_top);
+    std::vector<double> rr(m), ss(m), crowd(m, 0.0);
+    for (size_t i = 0; i < m; ++i) {
+      rr[i] = finalists[i].compression_ratio;
+      ss[i] = finalists[i].decode_cost > 0.0
+                ? (double)original_size / finalists[i].decode_cost
+                : std::numeric_limits<double>::infinity();
+    }
+    for (double const* obj : {rr.data(), ss.data()}) {
+      auto by = pool;
+      std::sort(by.begin(), by.end(), [&](size_t a, size_t b) { return obj[a] < obj[b]; });
+      double span = std::max(obj[by.back()] - obj[by.front()], 1e-12);
+      crowd[by.front()] = crowd[by.back()] = std::numeric_limits<double>::infinity();
+      for (size_t k = 1; k + 1 < by.size(); ++k)
+        crowd[by[k]] += (obj[by[k + 1]] - obj[by[k - 1]]) / span;
+    }
+    std::sort(pool.begin(), pool.end(), [&](size_t a, size_t b) { return crowd[a] > crowd[b]; });
+    for (size_t k = 0; k < pool.size() && kept.size() < rerank_top; ++k)
+      kept.push_back(finalists[pool[k]]);
 
-    if (id_needs_rescue && std::none_of(finalists.begin(), finalists.end(), [](auto const& f) {
-          return f.plan_dsl == "input -> identity";
-        }))
-      finalists.back() = id_kept;
+    auto is_id = [](ranked_candidate const& f) { return f.plan_dsl == "input -> identity"; };
+    auto id_it = std::find_if(finalists.begin(), finalists.end(), is_id);
+    if (id_it != finalists.end() && std::none_of(kept.begin(), kept.end(), is_id))
+      kept.back() = *id_it;
+    finalists = std::move(kept);
   }
 
   // Inject the top simplicity_slots completed plans per step-count level so
@@ -647,6 +739,134 @@ exploration_result explore_column_compression(cudf::column_view input,
                        a.best_decomp_ms > 0 ? orig / a.best_decomp_ms / 1.0e6 : 0.0});
     }
     if (!timed.empty()) finalists = std::move(timed);
+  }
+
+  // Local refinement: hill-climb around the measured finalists. The beam lands
+  // near an optimum but not necessarily on it (greedy expansion + a crude decode
+  // proxy), so measure one-op neighbors of each finalist — swap a terminal leaf's
+  // codec, or drop a terminal leaf line (that channel is then stored identity) —
+  // and let the final selection pick across seeds and neighbors alike.
+  if (!finalists.empty()) {
+    static constexpr size_t kMaxNeighborMeasurements = 24;
+    static constexpr std::string_view kSwapOps[]     = {
+      "ans", "bitcomp", "lz4", "snappy", "deflate"};
+
+    auto measure_dsl = [&](std::string const& dsl, ranked_candidate& out) -> bool {
+      size_t bytes      = 0;
+      double const orig = (double)measure_size;
+      if (need_throughput) {
+        double cms = 0, dms = 0;
+        if (!round_trip_time_rr(measure_col, dsl, stream, mr, cms, dms, bytes, nullptr))
+          return false;
+        out = {dsl,
+               orig / std::max<size_t>(bytes, 1),
+               bytes,
+               cms > 0 ? orig / cms / 1.0e6 : 0.0,
+               dms > 0 ? orig / dms / 1.0e6 : 0.0};
+      } else {
+        if (!measure_compressed_bytes(measure_col, dsl, stream, mr, bytes, nullptr)) return false;
+        out = {dsl, orig / std::max<size_t>(bytes, 1), bytes, 0.0, 0.0};
+      }
+      return true;
+    };
+    auto known = [&](std::string const& dsl) {
+      return std::any_of(
+        finalists.begin(), finalists.end(), [&](auto const& f) { return f.plan_dsl == dsl; });
+    };
+
+    // Refine best-scoring seeds first so the measurement budget goes where it counts.
+    auto seeds = finalists;
+    if (!use_pareto)
+      std::sort(seeds.begin(), seeds.end(), [&](auto const& a, auto const& b) {
+        return weighted_score(a.compression_ratio,
+                              a.compress_throughput_gbps,
+                              a.decompress_throughput_gbps,
+                              config.rerank_weights) > weighted_score(b.compression_ratio,
+                                                                      b.compress_throughput_gbps,
+                                                                      b.decompress_throughput_gbps,
+                                                                      config.rerank_weights);
+      });
+
+    // Split the budget across seeds so one many-leaved plan can't starve the rest.
+    size_t const per_seed =
+      std::max<size_t>(4, kMaxNeighborMeasurements / std::max<size_t>(seeds.size(), 1));
+    size_t measured = 0, seed_left = 0;
+    auto try_dsl = [&](std::string const& dsl) {
+      if (dsl.empty() || seed_left == 0 || measured >= kMaxNeighborMeasurements || known(dsl))
+        return;
+      --seed_left;
+      ++measured;
+      ranked_candidate rc;
+      bool ok = false;
+      try {  // a neighbor may pair a codec with an incompatible channel; skip it
+        ok = measure_dsl(dsl, rc);
+      } catch (std::exception const&) {
+      }
+      if (ok) finalists.push_back(std::move(rc));
+    };
+
+    for (auto const& seed : seeds) {
+      if (measured >= kMaxNeighborMeasurements) break;
+      if (seed.plan_dsl == "input -> identity") continue;
+      seed_left = per_seed;
+      std::vector<std::string> lines;
+      {
+        std::istringstream is(seed.plan_dsl);
+        for (std::string l; std::getline(is, l);)
+          if (!l.empty()) lines.push_back(l);
+      }
+
+      // Parse structure: LHS paths and every declared child channel.
+      std::vector<std::string> lhs_paths, children;
+      for (auto const& line : lines) {
+        auto a1 = line.find(" -> ");
+        if (a1 == std::string::npos) continue;
+        std::string lhs = line.substr(0, a1);
+        lhs_paths.push_back(lhs);
+        std::string tail = line.substr(a1 + 4);
+        auto a2          = tail.find(" -> ");
+        if (a2 == std::string::npos) continue;
+        std::string op            = tail.substr(0, a2);
+        std::string outs          = tail.substr(a2 + 4);
+        std::string const& prefix = (lhs == "input") ? op : lhs;
+        for (size_t pos = 0; pos < outs.size();) {
+          auto comma      = outs.find(", ", pos);
+          std::string out = outs.substr(pos, comma == std::string::npos ? comma : comma - pos);
+          children.push_back(prefix + "." + out);
+          pos = comma == std::string::npos ? outs.size() : comma + 2;
+        }
+      }
+
+      // Move 1 — cover an uncovered channel with a terminal codec (an implicit
+      // identity leaf may be the plan's biggest remaining win, e.g. raw chars).
+      for (auto const& ch : children) {
+        if (std::find(lhs_paths.begin(), lhs_paths.end(), ch) != lhs_paths.end()) continue;
+        for (auto alt : kSwapOps)
+          try_dsl(seed.plan_dsl + "\n" + ch + " -> " + std::string(alt));
+      }
+
+      // Moves 2 & 3 — swap a terminal leaf's codec / drop a terminal leaf line
+      // (its channel is then stored identity).
+      for (size_t li = 0; li < lines.size() && measured < kMaxNeighborMeasurements; ++li) {
+        auto arrow     = lines[li].find(" -> ");
+        std::string op = lines[li].substr(arrow + 4);
+        if (op.find(" -> ") != std::string::npos) continue;  // has outputs: not a leaf
+        if (!is_terminal_compressor(op)) continue;
+
+        auto rebuild = [&](std::string const& replacement_line) {
+          std::string dsl;
+          for (size_t j = 0; j < lines.size(); ++j) {
+            if (j == li && replacement_line.empty()) continue;  // drop the line
+            dsl += (dsl.empty() ? "" : "\n") + (j == li ? replacement_line : lines[j]);
+          }
+          return dsl;
+        };
+        for (auto alt : kSwapOps)
+          if (alt != op) try_dsl(rebuild(lines[li].substr(0, arrow + 4) + std::string(alt)));
+        if (lines.size() > 1) try_dsl(rebuild(""));
+      }
+    }
+    cudaDeviceSynchronize();
   }
 
   // Pareto frontier
