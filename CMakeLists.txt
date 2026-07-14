@@ -254,6 +254,7 @@ set(EXTENSION_SOURCES
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
+    src/log/level.cpp
     src/log/logging.cpp
     src/log/noop_sink.cpp
     src/log/spdlog_sink.cpp

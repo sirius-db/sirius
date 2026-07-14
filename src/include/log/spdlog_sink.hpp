@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "log/logging.hpp"
+#include "log/sink.hpp"
 
 #include <chrono>
 #include <cstdint>

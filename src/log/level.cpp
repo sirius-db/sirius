@@ -14,25 +14,30 @@
  * limitations under the License.
  */
 
-#include "log/noop_sink.hpp"
-
-#include <memory>
+#include "log/level.hpp"
 
 namespace sirius::log {
 
-namespace {
-
-/// A log sink that discards everything, irrespective of the level.
-class noop_sink final : public sink {
- public:
-  void set_level(level) override {}
-  [[nodiscard]] bool should_log(level) const override { return false; }
-  void log(level, const std::source_location&, std::string_view) override {}
-  bool flush() override { return true; }
-};
-
-}  // namespace
-
-std::shared_ptr<sink> make_noop_sink() { return std::make_shared<noop_sink>(); }
+bool string_to_enum(std::string_view name, level& lvl)
+{
+  if (name == "trace") {
+    lvl = level::trace;
+  } else if (name == "debug") {
+    lvl = level::debug;
+  } else if (name == "info") {
+    lvl = level::info;
+  } else if (name == "warn") {
+    lvl = level::warn;
+  } else if (name == "error") {
+    lvl = level::error;
+  } else if (name == "critical") {
+    lvl = level::critical;
+  } else if (name == "off") {
+    lvl = level::off;
+  } else {
+    return false;
+  }
+  return true;
+}
 
 }  // namespace sirius::log

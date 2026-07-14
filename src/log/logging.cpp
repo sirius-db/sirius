@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 
-#include "log/logging.hpp"
-
 #include "log/noop_sink.hpp"
+#include "log/sink.hpp"
 
 #include <atomic>
 #include <memory>
@@ -25,45 +24,35 @@ namespace sirius::log {
 
 namespace {
 
-// Global facade state. The level lives inside the sink (the single filter); the
-// facade only holds the swap-safe sink slot: loggers take a shared_ptr
-// snapshot, so a concurrent set_sink cannot destroy a sink under an in-flight
-// log() call. The slot is never null: it is initialized to a discarding noop
-// and set_sink() never stores null, so anything logged before a real sink is
-// installed goes to the noop rather than nowhere.
+// Global logging state.
 struct logger_state {
   std::atomic<std::shared_ptr<sink>> active{make_noop_sink()};
 };
 
 logger_state& state()
 {
-  // Meyers singleton: constructed on first use (avoids the static-init-order
-  // fiasco) and destroyed at exit, so the installed sink's destructor runs and
-  // flushes. Caveat (static-destruction order): a global that logs from its own
-  // destructor after this singleton is torn down would touch a destroyed
-  // object, so don't log from static destructors.
+  // Destroyed at exit, so the sink's destructor flushes
+  // This may be gone if logs are emitted from static destructors.
   static logger_state instance;
   return instance;
 }
 
 }  // namespace
 
-void set_sink(std::shared_ptr<sink> s)
+void set_sink(std::shared_ptr<sink> sink)
 {
-  // A null sink installs a discarding noop, so the slot is never empty.
-  auto next = s ? std::move(s) : make_noop_sink();
-  // Flush the displaced sink before its last reference may be released.
-  if (auto displaced = state().active.exchange(std::move(next), std::memory_order_acq_rel)) {
-    displaced->flush();
+  auto new_sink = sink ? std::move(sink) : make_noop_sink();
+  // For good measure, flush the sink being replaced before dropping the last
+  // reference to it.
+  if (auto old_sink = state().active.exchange(std::move(new_sink), std::memory_order_acq_rel)) {
+    old_sink->flush();
   }
 }
 
 std::shared_ptr<sink> get_sink()
 {
-  // A shared_ptr snapshot: a concurrent set_sink can swap the slot but cannot
-  // destroy the sink a caller is mid-use of. The load is lock-based in
-  // libstdc++; when reached from the fatal-signal handler
-  // (segfault_backtrace_handler.cpp) that is accepted and alarm-bounded.
+  // Return a shared_ptr copy so a concurrent set_sink can swap the slot without
+  // destroying the sink this caller is about to use.
   return state().active.load(std::memory_order_acquire);
 }
 
