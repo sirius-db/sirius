@@ -183,7 +183,8 @@ std::unique_ptr<op::operator_data> run_one_operator(
 
 }  // namespace
 
-std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input() const
+std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input(
+  const cucascade::memory::memory_space* target_space) const
 {
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
@@ -201,7 +202,11 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
   auto* pipelineable_input = dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
   if (pipelineable_input) {
     for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
-      if (ro.get_data() && ro.get_current_tier() != cucascade::memory::Tier::GPU) {
+      if (!ro.get_data()) { continue; }
+      const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
+      const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
+                               ro.get_memory_space()->get_id() != target_space->get_id();
+      if (non_gpu || cross_space) {
         input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
       }
     }

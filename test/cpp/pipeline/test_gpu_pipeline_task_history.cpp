@@ -215,7 +215,7 @@ struct cached_scan_pipeline_context {
 cached_scan_pipeline_context create_cached_scan_pipeline_context()
 {
   cached_scan_pipeline_context ctx;
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(43);
   ctx.scan_op = std::make_unique<sirius::op::scan::sirius_gpu_scan_operator>(
