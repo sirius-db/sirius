@@ -346,3 +346,27 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/include/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
 
 **Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and reactor counts
+
+### Zone-Map Pruning on Pinned Chunks (PR #1154)
+
+**Motivation:** Warm scans previously replayed every pinned chunk, including chunks that a filter
+could not match. HOST-pinned chunks also paid an unnecessary H2D copy before being filtered out.
+
+**Mechanism:** At pin time, Sirius runs one min/max reduction for each supported column in every
+decoded chunk and stores the results with the pinned entry. This happens before GPU storage or
+HOST conversion, so both tiers use the same capture path.
+
+At cache-serve time, static pushed-down filters are checked with DuckDB's `CheckStatistics`.
+Chunks proven unable to match are omitted from the cached scan plan; on the HOST tier this also
+avoids their H2D copies. Runtime dynamic filters do not participate in this chunk-level pruning.
+
+Unsupported types or filters and missing statistics keep the chunk. If all chunks are pruned,
+chunk 0 is retained as a sentinel and emptied by the GPU filter so the pipeline still completes.
+
+**Code path:** `src/pin_table.cpp` captures the statistics;
+`src/scan_manager/pinned_chunk_stats.cpp` owns the statistics and safety checks; and
+`src/scan_manager/sirius_scan_manager.cpp` builds and serves the survivor plan.
+
+**Config:** `enable_pinned_zone_map_pruning` (default: `true`) is available through YAML and
+DuckDB `SET`. It gates both capture and pruning; entries pinned while it is disabled remain
+statless until re-pinned. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
