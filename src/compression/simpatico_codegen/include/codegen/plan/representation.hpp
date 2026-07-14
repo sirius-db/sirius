@@ -2,7 +2,7 @@
 #define SIMPATICO_REPRESENTATION_HPP
 
 #include "codegen/plan/leaf_desc.hpp"
-#include "dictionary_view_helper.hpp"  // src/util on include path
+#include "codegen/util/dictionary_view_helper.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>

@@ -149,7 +149,8 @@ using pin_batch_sink = std::function<void(std::unique_ptr<cudf::table>,
                                           cucascade::memory::memory_space* target,
                                           rmm::cuda_stream_view stream)>;
 
-/// Shared driver behind @ref materialize_all_batches and @ref materialize_pin_to_host: walk the
+/// Shared driver behind @ref materialize_all_batches and the pin_to_host/device_with_compression
+/// drivers: walk the
 /// ingestible's metadata + batch coalescer to completion, materialize each emitted batch onto a
 /// round-robin GPU, and hand it to @p on_batch. The single-threaded, deterministic round-robin
 /// placement means re-pinning the same source yields identical placement (required by
@@ -263,42 +264,6 @@ materialized_pin materialize_all_batches(
       out.tables.emplace_back(std::move(tbl));
       out.chunk_memory_spaces.push_back(target);
     });
-  return out;
-}
-
-materialized_host_pin materialize_pin_to_host(
-  op::scan::gpu_ingestible& ingestible,
-  std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
-  io::sirius_ioctx& io_ctx)
-{
-  auto& registry = converter_registry::get();
-  materialized_host_pin out;
-
-  materialize_pin_batches(
-    ingestible,
-    gpu_spaces,
-    io_ctx,
-    [&](std::unique_ptr<cudf::table> tbl,
-        cucascade::memory::memory_space* src_space,
-        rmm::cuda_stream_view stream) {
-      // Stream this freshly-materialized batch straight to pinned host memory and let the GPU
-      // table free before the next batch is materialized — so peak GPU residency stays at ~one
-      // batch and the whole table never needs to fit in GPU memory. The chunk is pinned on the
-      // source GPU's NUMA-local host space (host_space_by_gpu), so on multi-GPU systems the
-      // chunks land round-robin across NUMA nodes. The conversion reuses the decode stream; the
-      // GPU->HOST converter (convert_gpu_to_host_fast) synchronizes internally before returning,
-      // so the host copy is complete once convert() returns. The explicit sync below is
-      // belt-and-suspenders before gpu_repr (which owns the GPU table's buffers) leaves scope.
-      auto* target_host_space = host_space_by_gpu.at(src_space->get_device_id());
-      out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
-      cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
-      auto host_repr =
-        registry.convert<cucascade::host_data_representation>(gpu_repr, target_host_space, stream);
-      stream.synchronize();
-      out.host_chunks.emplace_back(std::move(host_repr));
-    });
-
   return out;
 }
 

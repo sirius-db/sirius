@@ -11,6 +11,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -181,10 +182,11 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
     }
     case META_CASCADED: {
       std::uint64_t us;
-      std::int32_t ti, nd, nr, bp;
-      if (!r.read_le(us) || !r.read_le(ti) || !r.read_le(nd) || !r.read_le(nr) || !r.read_le(bp))
+      std::int32_t ti, num_deltas, nr, bp;
+      if (!r.read_le(us) || !r.read_le(ti) || !r.read_le(num_deltas) || !r.read_le(nr) ||
+          !r.read_le(bp))
         return false;
-      out = leaf_meta::nvcomp_cascaded{us, ti, nd, nr, bp};
+      out = leaf_meta::nvcomp_cascaded{us, ti, num_deltas, nr, bp};
       return true;
     }
     case META_SNAPPY: {
@@ -342,12 +344,12 @@ static bool read_node(Reader& r, PlanNode& node)
   if (!r.read_le(is_bitjoin)) return false;
   if (is_bitjoin) {
     bitjoin_attrs bj;
-    std::uint8_t ot;
-    if (!r.read_le(ot)) return false;
-    bj.output_type = tag_to_dtype(ot);
-    std::uint16_t nin;
-    if (!r.read_le(nin)) return false;
-    bj.inputs.resize(nin);
+    std::uint8_t out_tag;
+    if (!r.read_le(out_tag)) return false;
+    bj.output_type = tag_to_dtype(out_tag);
+    std::uint16_t num_inputs;
+    if (!r.read_le(num_inputs)) return false;
+    bj.inputs.resize(num_inputs);
     for (auto& in : bj.inputs) {
       if (!r.read_le(in.node) || !r.read_str16(in.channel)) return false;
       std::uint8_t has_range;
@@ -618,6 +620,95 @@ compressed_table read_compressed_table(std::string const& path,
     };
 
   return reconstruct_from_records(col_records, fetch, stream, mr, error_out);
+}
+
+// ---------------------------------------------------------------------------
+// compressed_table::describe() — the leaf manifest the writer below walks.
+// ---------------------------------------------------------------------------
+namespace {
+
+leaf_desc make_leaf_desc(std::uint32_t node_index,
+                         std::int32_t slot,
+                         OpId kind,
+                         compressed_representation const* rep,
+                         rmm::cuda_stream_view stream)
+{
+  leaf_desc d;
+  d.node_index = node_index;
+  d.slot       = slot;
+  d.kind       = kind;
+  d.type_tag   = dtype_to_tag(rep->decoded_type());
+  // The node's own output length. Decode sizes the codegen kernel grid from this,
+  // so a nested fused subtree (whose length is far below the column row count)
+  // must round-trip its true length rather than inherit the column's.
+  d.num_rows = rep->num_rows > 0 ? static_cast<std::uint64_t>(rep->num_rows) : 0;
+  d.meta     = rep->describe_meta();
+  for (auto const& ch : rep->named_channels(stream)) {
+    leaf_buffer_desc bd;
+    bd.name     = ch.name;
+    bd.type_tag = dtype_to_tag(ch.view.type());
+    bd.num_rows = static_cast<std::uint64_t>(ch.view.size());
+    // cudf::size_of() only supports fixed-width types (e.g. dictionary's
+    // fast-mode "keys" channel is a raw STRING column) — account for
+    // offsets + chars directly instead of calling it on a STRING view.
+    if (ch.view.type().id() == cudf::type_id::STRING) {
+      if (ch.view.num_children() == 0) {
+        if (ch.view.size() != 0) {
+          throw std::logic_error("non-empty STRING channel has no offsets child.");
+        }
+        bd.size_bytes = 0;
+      } else {
+        cudf::strings_column_view scv(ch.view);
+        auto const offsets_width = static_cast<size_t>(cudf::size_of(scv.offsets().type()));
+        bd.size_bytes            = static_cast<std::uint64_t>(ch.view.size() + 1) * offsets_width +
+                        static_cast<std::uint64_t>(scv.chars_size(stream));
+      }
+    } else {
+      bd.size_bytes = static_cast<std::uint64_t>(ch.view.size()) *
+                      static_cast<std::uint64_t>(cudf::size_of(ch.view.type()));
+    }
+    bd.device_ptr = ch.view.head<void>();
+    d.buffers.push_back(std::move(bd));
+  }
+  return d;
+}
+
+}  // namespace
+
+// Walk each column's PlanTree; for every stored rep emit one leaf_desc. Two
+// storage slots per PlanNode:
+//   * node.rep      (the op's own representation)
+//   * node.channels (path = the map key)
+// rep->kind() is used for all rep types including codegen_fused_representation,
+// which maps its fused op tag to a leaf kind (delta->Delta, rle->Rle,
+// bitpack->Bitpack, for->For, zigzag->Zigzag, RawFused->Identity).
+std::vector<std::vector<leaf_desc>> compressed_table::describe(rmm::cuda_stream_view stream) const
+{
+  std::vector<std::vector<leaf_desc>> result;
+  result.reserve(columns.size());
+  for (auto const& col : columns) {
+    std::vector<leaf_desc> descs;
+    if (!col.compound) {
+      result.push_back({});
+      continue;
+    }
+    auto const& nodes = col.compound->nodes;
+    for (std::uint32_t ni = 0; ni < nodes.size(); ++ni) {
+      auto const& node = nodes[ni];
+      if (node.rep) {
+        descs.push_back(make_leaf_desc(ni, kSelfRepSlot, node.rep->kind(), node.rep.get(), stream));
+      }
+      for (std::size_t k = 0; k < node.output_paths.size(); ++k) {
+        auto it = node.channels.find(node.output_paths[k]);
+        if (it != node.channels.end() && it->second) {
+          descs.push_back(make_leaf_desc(
+            ni, static_cast<std::int32_t>(k), it->second->kind(), it->second.get(), stream));
+        }
+      }
+    }
+    result.push_back(std::move(descs));
+  }
+  return result;
 }
 
 // ─── In-memory (pinned host) serialization ──────────────────────────────────

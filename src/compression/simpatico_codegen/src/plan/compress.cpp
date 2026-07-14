@@ -33,8 +33,8 @@
 #include <unordered_set>
 #include <vector>
 
-// The C++-native JIT codegen encode entry points (``jit_encode_subtree``,
-// ``extract_fusable_subtree``) are declared in codegen_bridge.hpp above.
+// The C++-native JIT codegen encode entry point (``encode_fused_subtree``) is
+// declared in codegen_bridge.hpp above.
 // make_compressor (operator_registry.hpp), and the bitjoin_layout /
 // copy_column_view{,_as_uint8} helpers (bitjoin_layout.hpp) are shared with decode.
 
@@ -87,14 +87,14 @@ void place_rep_on_node(PlanTree& tree,
   tree.nodes[producer].channels.emplace(out_path, std::move(rep));
 }
 
-// Move each NodeId-keyed leaf rep produced by a jit_encode_subtree() call onto
+// Move each NodeId-keyed leaf rep produced by an encode_fused_subtree() call onto
 // its owning PlanTree node.
 void place_fused_leaves(PlanTree& tree, plan_compound_builder& builder)
 {
   for (auto& [nodeid, rep] : builder.leaves) {
-    auto& nd = tree.nodes[nodeid];
-    nd.rep   = std::move(rep);
-    nd.meta  = nd.rep->describe_meta();
+    auto& node = tree.nodes[nodeid];
+    node.rep   = std::move(rep);
+    node.meta  = node.rep->describe_meta();
   }
 }
 
@@ -113,6 +113,17 @@ std::unique_ptr<cudf::column> copy_identity_leaf(cudf::column_view const& view,
 {
   return is_keys_chars_path(path) ? copy_column_view_as_uint8(view, stream, mr)
                                   : copy_column_view(view, stream, mr);
+}
+
+// Find the channel named `name` in a rep's named_channels() result, or nullptr.
+// The returned view points into `chans`, which must outlive its use.
+cudf::column_view const* find_named_channel(std::vector<compressible_output> const& chans,
+                                            std::string_view name)
+{
+  for (auto const& c : chans) {
+    if (c.name == name) return &c.view;
+  }
+  return nullptr;
 }
 
 // Forward, pre-order recursion over the PlanTree keyed by column path. The
@@ -307,7 +318,7 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
   plan_compound_builder builder;
   std::string jit_err;
   CodegenHead head;
-  if (!jit_encode_subtree(tree, n, col, stream, mr, builder, &jit_err, &head)) {
+  if (!encode_fused_subtree(tree, n, col, stream, mr, builder, &jit_err, &head)) {
     // A codegen-only op (bitpack/delta/rle/...) has no generic compressor, so a
     // real encode failure would otherwise surface as a misleading "unknown
     // compressor" from the generic fallback. Report the actual reason.
@@ -414,13 +425,7 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
         return true;
       }
       auto chans                    = rep->named_channels(stream);
-      cudf::column_view const* view = nullptr;
-      for (auto const& c : chans) {
-        if (c.name == cnode.output_names[k]) {
-          view = &c.view;
-          break;
-        }
-      }
+      cudf::column_view const* view = find_named_channel(chans, cnode.output_names[k]);
       if (!view) {
         set_error("fused boundary: rep at node " + std::to_string(cn) + " has no channel '" +
                   cnode.output_names[k] + "'");
@@ -610,7 +615,7 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
 
   // Single recursive walk from "input", placing reps as it goes. When the
   // whole plan fuses into one JIT kernel, emit_fused_node (called from
-  // emit_path via CompressWalk below) performs that single jit_encode_subtree
+  // emit_path via CompressWalk below) performs that single encode_fused_subtree
   // call itself and handles both the all-terminal case and the entropy-tail
   // case (a raw-passthrough or boundary channel with a downstream consumer)
   // uniformly — so there is no separate fast path to maintain here.
@@ -632,10 +637,10 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   for (NodeId i = 1; i < tree.nodes.size(); ++i) {
     if (visited[i]) continue;
     if (error_out) {
-      PlanNode const& nd   = tree.nodes[i];
+      PlanNode const& node = tree.nodes[i];
       std::string in_label = dotted_label(tree, i);
       if (in_label.empty()) in_label = "?";
-      *error_out = "plan node[" + std::to_string(i) + "] '" + in_label + " -> " + nd.op +
+      *error_out = "plan node[" + std::to_string(i) + "] '" + in_label + " -> " + node.op +
                    "' was not resolved (missing inputs or cycle)";
     }
     return nullptr;
@@ -810,12 +815,10 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
     }
 
     if (!found && op_node->rep) {
-      for (auto const& c : op_node->rep->named_channels(stream)) {
-        if (c.name == chan_name) {
-          result->chans.push_back({chan_name, c.view});
-          found = true;
-          break;
-        }
+      auto rep_chans = op_node->rep->named_channels(stream);
+      if (auto const* v = find_named_channel(rep_chans, chan_name)) {
+        result->chans.push_back({chan_name, *v});
+        found = true;
       }
     }
 
@@ -823,13 +826,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
       auto ch_it = op_node->channels.find(chan_path);
       if (ch_it != op_node->channels.end() && ch_it->second) {
         auto pch                   = ch_it->second->named_channels(stream);
-        cudf::column_view const* v = nullptr;
-        for (auto const& c : pch) {
-          if (c.name == "data") {
-            v = &c.view;
-            break;
-          }
-        }
+        cudf::column_view const* v = find_named_channel(pch, "data");
         if (!v && !pch.empty()) v = &pch.front().view;
         if (v) {
           result->chans.push_back({chan_name, *v});

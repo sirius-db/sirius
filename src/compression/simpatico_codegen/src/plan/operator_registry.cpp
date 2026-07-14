@@ -8,6 +8,7 @@
 
 #include "codegen/plan/operator_registry.hpp"
 
+#include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 
 #include <string_view>
@@ -32,48 +33,32 @@ std::vector<OperatorInfo> const& operator_registry()
 {
   // Catalog order: all_compressor_names() flattens catalog_names in this order.
   // channels mirror each rep's named_channels(); {} = variable-arity.
+  // clang-format off
+  // One row per operator; kept on a single line each (formatting disabled).
+  //  id               name              channels                                                                 catalog_names                      term   pre    cg
   static const std::vector<OperatorInfo> kTable = {
-    // id                name           channels catalog_names            term   pre    cg
-    {OpId::Delta, "delta", {"differences"}, {"delta"}, false, true, true},
-    {OpId::Rle, "rle", {"runs", "values"}, {"rle"}, false, true, true},
-    {OpId::Bitpack,
-     "bitpack",
-     {"chunk_min", "chunk_count", "chunk_bits", "packed"},
-     {"bitpack"},
-     false,
-     false,
-     true},
-    {OpId::For, "for", {"deltas", "references"}, {"for"}, false, true, true},
-    {OpId::Zigzag, "zigzag", {"zigzag"}, {"zigzag"}, false, true, true},
-    {OpId::Dictionary, "dictionary", {}, {"dictionary"}, false, false, false},
-    {OpId::Alp,
-     "alp",
-     {"integers", "exceptions", "exception_positions", "metadata"},
-     {"alp"},
-     false,
-     true,
-     false},
-    {OpId::AlpRd,
-     "alp_rd",
-     {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"},
-     {"alp_rd"},
-     false,
-     true,
-     false},
-    {OpId::Ans, "ans", {"output"}, {"ans"}, true, false, false},
-    {OpId::Bitcomp, "bitcomp", {"output"}, {"bitcomp"}, true, false, false},
-    {OpId::Snappy, "snappy", {"output"}, {"snappy"}, true, false, false},
-    {OpId::Deflate, "deflate", {"output"}, {"deflate"}, true, false, false},
-    {OpId::Lz4, "lz4", {"output"}, {"lz4"}, true, false, false},
-    {OpId::Bitextract, "bitextract", {}, {"bitextract_f32", "bitextract_f64"}, false, true, false},
-    {OpId::Identity, "identity", {"data"}, {}, false, false, false},
-    {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"}, {}, false, false, false},
+    {OpId::Delta,          "delta",           {"differences"},                                                        {"delta"},                         false, true,  true},
+    {OpId::Rle,            "rle",             {"runs", "values"},                                                     {"rle"},                           false, true,  true},
+    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   {"bitpack"},                       false, false, true},
+    {OpId::For,            "for",             {"deltas", "references"},                                               {"for"},                           false, true,  true},
+    {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             {"zigzag"},                        false, true,  true},
+    {OpId::Dictionary,     "dictionary",      {},                                                                     {"dictionary"},                    false, false, false},
+    {OpId::Alp,            "alp",             {"integers", "exceptions", "exception_positions", "metadata"},          {"alp"},                           false, true,  false},
+    {OpId::AlpRd,          "alp_rd",          {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"}, {"alp_rd"},      false, true,  false},
+    {OpId::Ans,            "ans",             {"output"},                                                             {"ans"},                           true,  false, false},
+    {OpId::Bitcomp,        "bitcomp",         {"output"},                                                             {"bitcomp"},                       true,  false, false},
+    {OpId::Snappy,         "snappy",          {"output"},                                                             {"snappy"},                        true,  false, false},
+    {OpId::Deflate,        "deflate",         {"output"},                                                             {"deflate"},                       true,  false, false},
+    {OpId::Lz4,            "lz4",             {"output"},                                                             {"lz4"},                           true,  false, false},
+    {OpId::Bitextract,     "bitextract",      {},                                                                     {"bitextract_f32", "bitextract_f64"}, false, true, false},
+    {OpId::Identity,       "identity",        {"data"},                                                               {},                                false, false, false},
+    {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             {},                                false, false, false},
     // Variable arity (2 or 3: offsets, chars[, null_mask]) -> empty channels, like Dictionary.
     // Cataloged so string exploration can discover the decomposed shape
-    // (offsets -> delta -> bitpack, chars -> byte codec); STRING-only via the
-    // try_operator static gate.
-    {OpId::StrSplit, "str_split", {}, {"str_split"}, false, true, false},
+    // (offsets -> delta -> bitpack, chars -> byte codec); STRING-only via the try_operator static gate.
+    {OpId::StrSplit,       "str_split",       {},                                                                     {"str_split"},                     false, true,  false},
   };
+  // clang-format on
   return kTable;
 }
 
@@ -177,6 +162,14 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
     case OpId::Zigzag: return nullptr;
   }
   return nullptr;
+}
+
+// A node is codegen-fusable iff its OperatorInfo (registry table above) carries
+// the `codegen` flag.
+bool is_codegen_compressor(std::string const& op)
+{
+  auto id = op_id_from_name(op);
+  return id && op_info(*id).codegen;
 }
 
 }  // namespace simpatico

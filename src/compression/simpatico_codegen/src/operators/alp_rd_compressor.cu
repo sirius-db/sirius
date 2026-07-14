@@ -27,26 +27,19 @@
 // types. This matches the upstream cwida convention.
 
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/cuda_check.hpp"
+#include "operators/alp_common.cuh"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
-#include <rmm/exec_policy.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
-#include <thrust/copy.h>
-#include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/reduce.h>
-#include <thrust/sort.h>
-#include <thrust/transform.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -220,7 +213,7 @@ rd_choice find_best_choice(const typename alp_rd_traits<T>::uint_t* sample, size
 //
 // Inputs:  raw bit patterns of the input column, the chosen (right_bw, dict)
 // Outputs: right_parts[i], dict_indices[i], exception_left[i], flag[i]
-//          (full exception_positions/exceptions are gathered by thrust::copy_if
+//          (full exception_positions/exceptions are gathered by compact_exceptions
 //           in the host orchestrator, same pattern as plain ALP)
 //
 // The dict (≤ K = 8 UINT16 entries) lives in shared memory so all 256 threads
@@ -397,18 +390,15 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
       size_t max_idx = (n_sz - 1) / stride;
       safe_sample_n  = std::min<size_t>(safe_sample_n, max_idx + 1);
     }
-    cudaError_t cpy_err = cudaMemcpy2DAsync(h_sample.data(),
-                                            sizeof(T),
-                                            col.data<T>(),
-                                            stride * sizeof(T),
-                                            sizeof(T),
-                                            safe_sample_n,
-                                            cudaMemcpyDeviceToHost,
-                                            stream.value());
-    if (cpy_err != cudaSuccess) {
-      throw std::runtime_error(std::string("alp_rd sample copy (2D) failed: ") +
-                               cudaGetErrorString(cpy_err));
-    }
+    throw_if_cuda_error(cudaMemcpy2DAsync(h_sample.data(),
+                                          sizeof(T),
+                                          col.data<T>(),
+                                          stride * sizeof(T),
+                                          sizeof(T),
+                                          safe_sample_n,
+                                          cudaMemcpyDeviceToHost,
+                                          stream.value()),
+                        "alp_rd sample copy (2D)");
     cudaStreamSynchronize(stream.value());
     if (safe_sample_n < sample_n) {
       uint_t pad = safe_sample_n > 0 ? h_sample[safe_sample_n - 1] : uint_t{0};
@@ -460,38 +450,11 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
                                          d_exception_left.data(),
                                          d_flags.data());
 
-  // Step 4: compact exceptions.
-  auto exec         = rmm::exec_policy_nosync(stream, mr);
-  int64_t exc_count = thrust::reduce(exec,
-                                     thrust::device_pointer_cast(d_flags.data()),
-                                     thrust::device_pointer_cast(d_flags.data() + n),
-                                     int64_t{0},
-                                     thrust::plus<int64_t>{});
+  // Step 4: compact exceptions into (positions, rejected left parts).
+  auto exc = compact_exceptions<uint16_t>(
+    d_flags.data(), n, d_exception_left.data(), cudf::type_id::UINT16, stream, mr);
 
-  cudf::size_type exc_n = static_cast<cudf::size_type>(exc_count);
-  auto exceptions_col   = cudf::make_fixed_width_column(
-    cudf::data_type(cudf::type_id::UINT16), exc_n, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto positions_col = cudf::make_fixed_width_column(
-    cudf::data_type(cudf::type_id::INT32), exc_n, cudf::mask_state::UNALLOCATED, stream, mr);
-
-  if (exc_n > 0) {
-    auto counting = thrust::make_counting_iterator(int32_t{0});
-    thrust::copy_if(exec,
-                    counting,
-                    counting + n,
-                    thrust::device_pointer_cast(d_flags.data()),
-                    thrust::device_pointer_cast(positions_col->mutable_view().data<int32_t>()),
-                    [] __device__(uint8_t f) { return f != 0; });
-    thrust::copy_if(exec,
-                    thrust::device_pointer_cast(d_exception_left.data()),
-                    thrust::device_pointer_cast(d_exception_left.data() + n),
-                    thrust::device_pointer_cast(d_flags.data()),
-                    thrust::device_pointer_cast(exceptions_col->mutable_view().data<uint16_t>()),
-                    [] __device__(uint8_t f) { return f != 0; });
-  }
-
-  cudaError_t err = cudaStreamSynchronize(stream.value());
-  if (err != cudaSuccess) { throw std::runtime_error("alp_rd_compress_impl sync failed"); }
+  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_rd_compress_impl sync");
 
   return std::make_unique<alp_rd_compressed_representation>(col.type(),
                                                             n,
@@ -500,8 +463,8 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
                                                             std::move(dict_indices_col),
                                                             std::move(dict_col),
                                                             std::move(metadata_col),
-                                                            std::move(exceptions_col),
-                                                            std::move(positions_col));
+                                                            std::move(exc.values),
+                                                            std::move(exc.positions));
 }
 
 template <typename T>
@@ -542,8 +505,7 @@ std::unique_ptr<cudf::column> alp_rd_decompress_impl(alp_rd_compressed_represent
                                             out->mutable_view().data<T>());
   }
 
-  cudaError_t err = cudaStreamSynchronize(stream.value());
-  if (err != cudaSuccess) { throw std::runtime_error("alp_rd_decompress sync failed"); }
+  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_rd_decompress sync");
   return out;
 }
 

@@ -33,9 +33,8 @@ set(CUDA_TOOLKIT_INCLUDE
 set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
 
 include_directories(
-  ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/util
-  "${CONDA_PREFIX}/include" "${CONDA_PREFIX}/include/rapids"
-  "${CUDA_TOOLKIT_INCLUDE}")
+  ${CMAKE_CURRENT_SOURCE_DIR}/include "${CONDA_PREFIX}/include"
+  "${CONDA_PREFIX}/include/rapids" "${CUDA_TOOLKIT_INCLUDE}")
 
 add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
@@ -47,7 +46,6 @@ add_library(
   simpatico STATIC
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
-  src/bridge/bitpack_compact.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -61,16 +59,13 @@ add_library(
   src/operators/str_split_compressor.cu
   src/operators/nvcomp_batched_codec.cu
   # Plain-CUDA JIT host
-  src/jit/fused_tree.cpp
   src/jit/nvrtc_compiler.cpp
   src/jit/kernel_cache.cpp
-  src/encode/jit/plain_compile.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp
-  src/plan/fusion.cpp
   src/plan/operator_registry.cpp
   src/plan/representation_factory.cpp
   src/plan/bitjoin_layout.cpp
@@ -131,14 +126,12 @@ add_codegen_host_test(test_jit_kernel_cache)
 add_codegen_host_test(test_fused_operator_sweep)
 add_codegen_host_test(test_operator_sweep)
 
-# simpatico multi-mode CLI (benchmark / explore / compress / decompress / plan)
-# CMake target is simpatico_cli to avoid collision with the static library
-# target; the installed binary is named 'simpatico'.
+# Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
+# the installed binary is named 'simpatico'.
 add_executable(simpatico_cli cli/simpatico_main.cpp)
 set_target_properties(simpatico_cli PROPERTIES OUTPUT_NAME simpatico)
-target_include_directories(
-  simpatico_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                        ${CMAKE_CURRENT_SOURCE_DIR}/cli)
+target_include_directories(simpatico_cli
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(
   simpatico_cli
   PRIVATE simpatico
@@ -162,9 +155,3 @@ add_test(NAME jit_kernel_cache_plain COMMAND test_jit_kernel_cache_plain)
 add_test(NAME jit_kernel_cache COMMAND test_jit_kernel_cache)
 add_test(NAME fused_operator_sweep COMMAND test_fused_operator_sweep)
 add_test(NAME operator_sweep COMMAND test_operator_sweep)
-
-# End-to-end smoke test of the CLI itself (compress/decompress --verify).
-add_test(
-  NAME cli_roundtrip
-  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cli/test/cli_roundtrip_test.sh
-          $<TARGET_FILE:simpatico_cli>)

@@ -11,6 +11,7 @@
  */
 
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/cuda_check.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -85,13 +86,6 @@ __global__ void check_truncation_kernel(const TIn* __restrict__ input,
 static constexpr int kBlockSize = 256;
 
 inline int64_t grid_size(int64_t n) { return (n + kBlockSize - 1) / kBlockSize; }
-
-inline void throw_if_cuda_error(cudaError_t err, const char* context)
-{
-  if (err != cudaSuccess) {
-    throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(err));
-  }
-}
 
 void launch_bitextract_field(cudf::column_view const& input_col,
                              cudf::mutable_column_view const& output_col,

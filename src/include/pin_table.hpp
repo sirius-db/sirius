@@ -97,14 +97,6 @@ struct materialized_pin {
   std::vector<std::size_t> base_row_count_per_chunk;
 };
 
-/// Host-pinned chunks produced by @ref materialize_pin_to_host — one
-/// host_data_representation per emitted batch, with the batch row counts captured
-/// alongside (parallel to @c host_chunks), mirroring @ref materialized_pin.
-struct materialized_host_pin {
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
-  std::vector<std::size_t> base_row_count_per_chunk;
-};
-
 /// Pin-time validation of the coalescer invariant the MVCC delta merge relies on
 /// (#819): every duckdb-native batch must be a contiguous run of WHOLE row groups
 /// starting at @p rows_before_chunk, and its row-group metadata must cover exactly
@@ -173,8 +165,8 @@ struct device_pin_result {
   std::vector<std::size_t> base_row_count_per_chunk;
 };
 
-/// Drive @p ingestible to completion like @ref materialize_pin_to_host, optionally
-/// compressing each batch with Simpatico before storing it in host memory.
+/// Drive @p ingestible to completion, streaming each emitted batch to pinned host memory
+/// (peak GPU residency ~one batch), optionally compressing each batch with Simpatico first.
 host_pin_result materialize_pin_to_host_with_compression(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
@@ -192,27 +184,5 @@ device_pin_result materialize_pin_to_device_with_compression(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
   compression_pin_config const& compression);
-
-/// Drive @p ingestible to completion like @ref materialize_all_batches, but stream each
-/// emitted batch straight to pinned host memory instead of collecting GPU-resident tables:
-/// materialize one batch on its round-robin GPU, convert it to a @c host_data_representation
-/// on that GPU's NUMA-local host space, then free the GPU table before the next batch. Peak
-/// GPU residency is therefore ~one batch (governed by @c scan_task_batch_size), so a host pin
-/// never needs the whole table to fit in GPU memory.
-///
-/// \param ingestible        Source ingestible (parquet or duckdb-native).
-/// \param gpu_spaces        Non-empty set of GPU memory spaces to round-robin materialization
-/// across.
-/// \param host_space_by_gpu Maps each GPU device id to the host memory_space its batches should
-///                          be pinned on (NUMA-local). Must contain an entry for every device id
-///                          in @p gpu_spaces.
-/// \param io_ctx            IO context the metadata reads run on (owned by the scan manager).
-/// \return The pinned host chunks in materialization (round-robin) order — one per emitted
-///         batch — plus their per-chunk row counts.
-materialized_host_pin materialize_pin_to_host(
-  op::scan::gpu_ingestible& ingestible,
-  std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
-  io::sirius_ioctx& io_ctx);
 
 }  // namespace sirius

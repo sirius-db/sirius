@@ -41,7 +41,6 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
-#include "compression/simpatico_bridge.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -2130,12 +2129,6 @@ static void LoadInternal(ExtensionLoader& loader)
   auto* callback_ptr = callback.get();
   config.GetCallbackManager().Register(std::move(callback));
   sirius::converter_registry::initialize();
-  try {
-    sirius::compression::initialize_simpatico_jit();
-  } catch (const std::exception& e) {
-    SIRIUS_LOG_WARN("Simpatico JIT context initialization failed (compression disabled): {}",
-                    e.what());
-  }
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
 

@@ -2,6 +2,7 @@
 // Implementation of the low-level (batched) nvcomp codec driver. See the header
 // for the frame format and rationale.
 
+#include "codegen/util/cuda_check.hpp"
 #include "nvcomp_batched_codec.hpp"
 
 #include <cuda_runtime.h>
@@ -19,19 +20,13 @@ namespace {
 
 inline std::size_t align_up(std::size_t x, std::size_t a) { return (x + a - 1) / a * a; }
 
+// nvcomp-status check stays local; CUDA-error checks use the shared
+// throw_if_cuda_error (cuda_check.hpp).
 inline void check(nvcompStatus_t s, char const* what)
 {
   if (s != nvcompSuccess) {
     throw std::runtime_error(std::string("nvcomp batched: ") + what + " failed (status " +
                              std::to_string(static_cast<int>(s)) + ")");
-  }
-}
-
-inline void check(cudaError_t e, char const* what)
-{
-  if (e != cudaSuccess) {
-    throw std::runtime_error(std::string("nvcomp batched: ") + what + " failed (" +
-                             cudaGetErrorString(e) + ")");
   }
 }
 
@@ -97,24 +92,24 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
   rmm::device_buffer d_comp_ptrs(num_chunks * sizeof(void*), stream, mr);
   rmm::device_buffer d_comp_bytes(num_chunks * sizeof(std::size_t), stream, mr);
   rmm::device_buffer d_statuses(num_chunks * sizeof(nvcompStatus_t), stream, mr);
-  check(cudaMemcpyAsync(d_uncomp_ptrs.data(),
-                        h_uncomp_ptrs.data(),
-                        num_chunks * sizeof(void*),
-                        cudaMemcpyHostToDevice,
-                        s),
-        "H2D uncomp ptrs");
-  check(cudaMemcpyAsync(d_uncomp_bytes.data(),
-                        h_uncomp_bytes.data(),
-                        num_chunks * sizeof(std::size_t),
-                        cudaMemcpyHostToDevice,
-                        s),
-        "H2D uncomp bytes");
-  check(cudaMemcpyAsync(d_comp_ptrs.data(),
-                        h_comp_ptrs.data(),
-                        num_chunks * sizeof(void*),
-                        cudaMemcpyHostToDevice,
-                        s),
-        "H2D comp ptrs");
+  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_ptrs.data(),
+                                      h_uncomp_ptrs.data(),
+                                      num_chunks * sizeof(void*),
+                                      cudaMemcpyHostToDevice,
+                                      s),
+                      "H2D uncomp ptrs");
+  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_bytes.data(),
+                                      h_uncomp_bytes.data(),
+                                      num_chunks * sizeof(std::size_t),
+                                      cudaMemcpyHostToDevice,
+                                      s),
+                      "H2D uncomp bytes");
+  throw_if_cuda_error(cudaMemcpyAsync(d_comp_ptrs.data(),
+                                      h_comp_ptrs.data(),
+                                      num_chunks * sizeof(void*),
+                                      cudaMemcpyHostToDevice,
+                                      s),
+                      "H2D comp ptrs");
 
   check(ops.compress_async(static_cast<void const* const*>(d_uncomp_ptrs.data()),
                            static_cast<std::size_t const*>(d_uncomp_bytes.data()),
@@ -129,13 +124,13 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
         "compress_async");
 
   std::vector<std::size_t> h_comp_bytes(num_chunks);
-  check(cudaMemcpyAsync(h_comp_bytes.data(),
-                        d_comp_bytes.data(),
-                        num_chunks * sizeof(std::size_t),
-                        cudaMemcpyDeviceToHost,
-                        s),
-        "D2H comp bytes");
-  check(cudaStreamSynchronize(s), "sync after compress");
+  throw_if_cuda_error(cudaMemcpyAsync(h_comp_bytes.data(),
+                                      d_comp_bytes.data(),
+                                      num_chunks * sizeof(std::size_t),
+                                      cudaMemcpyDeviceToHost,
+                                      s),
+                      "D2H comp bytes");
+  throw_if_cuda_error(cudaStreamSynchronize(s), "sync after compress");
 
   // Lay out the compact frame: header + per-chunk sizes, then 256-aligned chunks.
   std::size_t const header = align_up(16 + num_chunks * sizeof(std::size_t), kFrameAlign);
@@ -156,16 +151,17 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
   std::memcpy(h_hdr.data(), &nc, sizeof(nc));
   std::memcpy(h_hdr.data() + 8, &cs, sizeof(cs));
   std::memcpy(h_hdr.data() + 16, h_comp_bytes.data(), num_chunks * sizeof(std::size_t));
-  check(cudaMemcpyAsync(frame->data(), h_hdr.data(), header, cudaMemcpyHostToDevice, s),
-        "H2D frame header");
+  throw_if_cuda_error(
+    cudaMemcpyAsync(frame->data(), h_hdr.data(), header, cudaMemcpyHostToDevice, s),
+    "H2D frame header");
 
   rmm::device_buffer d_dst_off(num_chunks * sizeof(std::size_t), stream, mr);
-  check(cudaMemcpyAsync(d_dst_off.data(),
-                        h_dst_off.data(),
-                        num_chunks * sizeof(std::size_t),
-                        cudaMemcpyHostToDevice,
-                        s),
-        "H2D dst offsets");
+  throw_if_cuda_error(cudaMemcpyAsync(d_dst_off.data(),
+                                      h_dst_off.data(),
+                                      num_chunks * sizeof(std::size_t),
+                                      cudaMemcpyHostToDevice,
+                                      s),
+                      "H2D dst offsets");
 
   scatter_chunks_kernel<<<static_cast<unsigned>(num_chunks), 256, 0, s>>>(
     static_cast<std::uint8_t const*>(scratch.data()),
@@ -174,8 +170,8 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
     static_cast<std::size_t const*>(d_dst_off.data()),
     static_cast<std::size_t const*>(d_comp_bytes.data()),
     num_chunks);
-  check(cudaGetLastError(), "scatter kernel launch");
-  check(cudaStreamSynchronize(s), "sync after scatter");
+  throw_if_cuda_error(cudaGetLastError(), "scatter kernel launch");
+  throw_if_cuda_error(cudaStreamSynchronize(s), "sync after scatter");
 
   return {std::move(frame), frame_size};
 }
@@ -194,8 +190,9 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
   auto const* fbase = static_cast<std::uint8_t const*>(frame);
 
   std::uint64_t hdr[2] = {0, 0};
-  check(cudaMemcpyAsync(hdr, fbase, sizeof(hdr), cudaMemcpyDeviceToHost, s), "D2H frame header");
-  check(cudaStreamSynchronize(s), "sync frame header");
+  throw_if_cuda_error(cudaMemcpyAsync(hdr, fbase, sizeof(hdr), cudaMemcpyDeviceToHost, s),
+                      "D2H frame header");
+  throw_if_cuda_error(cudaStreamSynchronize(s), "sync frame header");
   std::size_t const num_chunks = static_cast<std::size_t>(hdr[0]);
   std::size_t const chunk      = static_cast<std::size_t>(hdr[1]);
   if (num_chunks == 0 || chunk == 0) {
@@ -203,11 +200,11 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
   }
 
   std::vector<std::size_t> h_comp_bytes(num_chunks);
-  check(
+  throw_if_cuda_error(
     cudaMemcpyAsync(
       h_comp_bytes.data(), fbase + 16, num_chunks * sizeof(std::size_t), cudaMemcpyDeviceToHost, s),
     "D2H comp sizes");
-  check(cudaStreamSynchronize(s), "sync comp sizes");
+  throw_if_cuda_error(cudaStreamSynchronize(s), "sync comp sizes");
 
   std::size_t const header = align_up(16 + num_chunks * sizeof(std::size_t), kFrameAlign);
   std::vector<void const*> h_comp_ptrs(num_chunks);
@@ -226,30 +223,30 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
   rmm::device_buffer d_comp_bytes(num_chunks * sizeof(std::size_t), stream, mr);
   rmm::device_buffer d_uncomp_bytes(num_chunks * sizeof(std::size_t), stream, mr);
   rmm::device_buffer d_uncomp_ptrs(num_chunks * sizeof(void*), stream, mr);
-  check(cudaMemcpyAsync(d_comp_ptrs.data(),
-                        h_comp_ptrs.data(),
-                        num_chunks * sizeof(void*),
-                        cudaMemcpyHostToDevice,
-                        s),
-        "H2D comp ptrs");
-  check(cudaMemcpyAsync(d_comp_bytes.data(),
-                        h_comp_bytes.data(),
-                        num_chunks * sizeof(std::size_t),
-                        cudaMemcpyHostToDevice,
-                        s),
-        "H2D comp bytes");
-  check(cudaMemcpyAsync(d_uncomp_bytes.data(),
-                        h_uncomp_bytes.data(),
-                        num_chunks * sizeof(std::size_t),
-                        cudaMemcpyHostToDevice,
-                        s),
-        "H2D uncomp bytes");
-  check(cudaMemcpyAsync(d_uncomp_ptrs.data(),
-                        h_uncomp_ptrs.data(),
-                        num_chunks * sizeof(void*),
-                        cudaMemcpyHostToDevice,
-                        s),
-        "H2D uncomp ptrs");
+  throw_if_cuda_error(cudaMemcpyAsync(d_comp_ptrs.data(),
+                                      h_comp_ptrs.data(),
+                                      num_chunks * sizeof(void*),
+                                      cudaMemcpyHostToDevice,
+                                      s),
+                      "H2D comp ptrs");
+  throw_if_cuda_error(cudaMemcpyAsync(d_comp_bytes.data(),
+                                      h_comp_bytes.data(),
+                                      num_chunks * sizeof(std::size_t),
+                                      cudaMemcpyHostToDevice,
+                                      s),
+                      "H2D comp bytes");
+  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_bytes.data(),
+                                      h_uncomp_bytes.data(),
+                                      num_chunks * sizeof(std::size_t),
+                                      cudaMemcpyHostToDevice,
+                                      s),
+                      "H2D uncomp bytes");
+  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_ptrs.data(),
+                                      h_uncomp_ptrs.data(),
+                                      num_chunks * sizeof(void*),
+                                      cudaMemcpyHostToDevice,
+                                      s),
+                      "H2D uncomp ptrs");
 
   std::size_t temp_bytes = 0;
   check(ops.decompress_get_temp_size(num_chunks, chunk, &temp_bytes, out_bytes),
@@ -273,7 +270,7 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
                              static_cast<nvcompStatus_t*>(d_statuses.data()),
                              s),
         "decompress_async");
-  check(cudaStreamSynchronize(s), "sync after decompress");
+  throw_if_cuda_error(cudaStreamSynchronize(s), "sync after decompress");
 }
 
 }  // namespace detail

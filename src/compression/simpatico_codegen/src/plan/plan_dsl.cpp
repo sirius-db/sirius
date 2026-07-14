@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <optional>
 #include <sstream>
 #include <vector>
@@ -55,14 +56,9 @@ void canonicalize_output_order(std::vector<std::string> const& canon, plan_step&
 
 bool parse_uint(std::string_view s, uint32_t* out)
 {
-  if (s.empty()) return false;
-  uint32_t v = 0;
-  for (char c : s) {
-    if (std::isdigit(static_cast<unsigned char>(c)) == 0) return false;
-    v = v * 10u + static_cast<uint32_t>(c - '0');
-  }
-  *out = v;
-  return true;
+  auto const* end = s.data() + s.size();
+  auto [ptr, ec]  = std::from_chars(s.data(), end, *out);
+  return ec == std::errc{} && ptr == end;
 }
 
 // Parses a token of the form `<path>` or `<path>_<hi>:<lo>`.

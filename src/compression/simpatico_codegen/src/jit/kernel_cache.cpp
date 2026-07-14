@@ -110,8 +110,6 @@ void write_cubin_file_atomic(const std::string& path, const std::vector<char>& b
 }
 }  // namespace
 
-std::string jit_disk_cache_dir() { return disk_cache_dir(); }
-
 void clear_jit_disk_cache()
 {
   const std::string& d = disk_cache_dir();

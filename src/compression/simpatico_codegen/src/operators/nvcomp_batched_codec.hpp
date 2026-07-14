@@ -1,31 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
-// Low-level (batched) nvcomp codec driver.
+// Low-level (batched) nvcomp codec driver — turns a contiguous device byte
+// range into a self-describing "frame" and back. Used by the byte-stream nvcomp
+// codecs (LZ4, Snappy, GDeflate, Cascaded, ANS, bitcomp) through the shared
+// helpers in nvcomp_simple_compressor.hpp.
 //
-// Unlike nvcomp's high-level Manager (HLIF) API, the batched C API lets the
-// CALLER own every device allocation: the temporary workspace, the per-chunk
-// output buffers, and the pointer/size arrays. nvcomp itself allocates *nothing*
-// on the device. That is the whole point of this layer: under memory pressure an
-// out-of-memory condition surfaces as a clean throw at our own RMM allocation
-// site, which the explorer catches to skip a candidate -- instead of nvcomp's
-// internal allocator silently failing and handing a kernel an unbacked buffer,
-// which faults (Warp MMU Fault) and permanently corrupts the CUDA context.
+// Why the batched API and not nvcomp's high-level Manager: it leaves every
+// device allocation to the caller (RMM), so we keep memory management in our own
+// hands — an OOM throws cleanly at our alloc site instead of nvcomp faulting a
+// kernel and corrupting the CUDA context.
 //
-// A codec is described by a `batched_codec_ops` bundle of type-erased calls;
-// each codec bakes its own compress/decompress opts into the lambdas. The two
-// primitives below turn a contiguous device byte range into a self-describing
-// "frame" and back. The frame is compact and self-contained, so it is a drop-in
-// replacement for the HLIF bitstream the representations previously stored.
+// A `batched_codec_ops` bundle carries a codec's type-erased entry points with
+// its compress/decompress opts pre-bound.
 //
-//   frame layout (little-endian; the only supported arch is x86-64):
+//   frame layout (little-endian, x86-64 only):
 //     u64  num_chunks
 //     u64  chunk_size                 // uncompressed bytes per chunk (last is smaller)
 //     u64  comp_sizes[num_chunks]     // actual compressed bytes per chunk
 //     <pad to 256>
-//     compressed chunk data, each chunk 256-byte aligned within the frame
-//
-// 256-byte chunk alignment safely exceeds every codec's per-buffer alignment
-// requirement (LZ4 needs 1, others a small power of two), matching RMM's default
-// allocation alignment so nvcomp sees fresh-allocation-grade alignment.
+//     compressed chunk data, each chunk 256-byte (kFrameAlign) aligned
 
 #pragma once
 

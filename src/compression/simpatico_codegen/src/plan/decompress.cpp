@@ -183,6 +183,16 @@ std::size_t elem_size_for_slot(std::string const& slot, std::size_t element_size
   return element_size;  // chunk_min, delta_first, data, rle_run_values
 }
 
+// name → view map of a rep's channels, for repeated per-slot lookups.
+std::unordered_map<std::string, cudf::column_view> channels_by_name(
+  compressed_representation const& rep, rmm::cuda_stream_view stream)
+{
+  std::unordered_map<std::string, cudf::column_view> by_name;
+  for (auto const& o : rep.named_channels(stream))
+    by_name.emplace(o.name, o.view);
+  return by_name;
+}
+
 // Reconstructs node `nid`'s produced value into the shared memo and returns a
 // non-owning view the memo keeps alive. One resolver serves the top-level walk
 // and fused-region tail binding, so both share a single memo. Defined below.
@@ -224,10 +234,9 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
                                   DecodeMemo& decompressed,
                                   std::string* error_out)
 {
-  // Use the explicit channel name. Fall back to the old heuristic for
-  // forward-compatibility with any preorder that pre-dates parent_channel.
-  std::string const channel_name =
-    parent_channel.empty() ? ((parent_op == "for") ? "deltas" : "values") : parent_channel;
+  // The fused-tree builder always records the materialized channel name on the
+  // raw-passthrough origin (differences / runs / values / deltas).
+  std::string const& channel_name = parent_channel;
 
   // run-count elements are always int32, regardless of the original column type.
   const std::size_t data_elem_size = (channel_name == "runs") ? sizeof(std::int32_t) : element_size;
@@ -252,10 +261,7 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
     return false;
   }
 
-  std::vector<compressible_output> nb = rep->named_channels(stream);
-  std::unordered_map<std::string, cudf::column_view> by_name;
-  for (auto const& o : nb)
-    by_name.emplace(o.name, o.view);
+  auto by_name = channels_by_name(*rep, stream);
 
   for (auto const& slot : consumed_slots("RawFused")) {
     if (slot == "data" && by_name.find(slot) == by_name.end()) {
@@ -344,11 +350,7 @@ bool bind_real_node_buffers(std::int32_t node_id,
     return false;
   }
 
-  std::vector<compressible_output> nb = repr->named_channels(stream);
-  std::unordered_map<std::string, cudf::column_view> by_name;
-  by_name.reserve(nb.size());
-  for (auto const& o : nb)
-    by_name.emplace(o.name, o.view);
+  auto by_name = channels_by_name(*repr, stream);
 
   std::unordered_map<std::string, NodeId> edge_by_channel;
   edge_by_channel.reserve(node.children.size());
@@ -782,6 +784,4 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// tree_from_leaves
 }  // namespace simpatico

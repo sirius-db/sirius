@@ -59,20 +59,9 @@ std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps
           node.attrs.bitextract = bitextract_attrs{spec.fields, spec.output_type};
         }
       }
-      // bitextract is always single-input; wire the same PlanEdge the
-      // generic single-input branch below would, so downstream consumers
-      // (e.g. entropy-tail resolve at decode time) can find this node as a
-      // child of its parent.
-      auto const& parent_path = step.input_paths[0];
-      auto pit                = path_to_node.find(parent_path);
-      if (pit == path_to_node.end()) {
-        if (error_out) { *error_out = "plan_tree: unknown input path '" + parent_path + "'"; }
-        return std::nullopt;
-      }
-      std::string channel = (parent_path == "input") ? bitextract_canonical_name(step.compressor)
-                                                     : path_to_channel.at(parent_path);
-      tree.nodes[pit->second].children.push_back(PlanEdge{channel, nid});
-    } else if (is_bitjoin_compressor(step.compressor)) {
+    }
+
+    if (is_bitjoin_compressor(step.compressor)) {
       auto spec = parse_bitjoin_spec(bitjoin_spec_suffix(step.compressor));
       bitjoin_attrs bj;
       bj.output_type = spec.output_type;

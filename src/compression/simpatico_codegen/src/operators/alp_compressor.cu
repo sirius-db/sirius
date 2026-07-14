@@ -17,24 +17,19 @@
 // path, so kernel improvements apply to both precisions automatically.
 
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/cuda_check.hpp"
+#include "operators/alp_common.cuh"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
-#include <rmm/exec_policy.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
-#include <thrust/copy.h>
-#include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/reduce.h>
 
 #include <cmath>
 #include <cstdint>
@@ -570,44 +565,18 @@ std::unique_ptr<alp_compressed_representation> alp_compress_impl(cudf::column_vi
     metadata_col->mutable_view().data<uint16_t>(),
     d_flags.data());
 
-  auto exec         = rmm::exec_policy_nosync(stream, mr);
-  int64_t exc_count = thrust::reduce(exec,
-                                     thrust::device_pointer_cast(d_flags.data()),
-                                     thrust::device_pointer_cast(d_flags.data() + n),
-                                     int64_t{0},
-                                     thrust::plus<int64_t>{});
+  // Compact the per-row exception flags into (positions, exception values).
+  auto exc =
+    compact_exceptions<T>(d_flags.data(), n, col.data<T>(), traits::value_type_id, stream, mr);
 
-  cudf::size_type exc_n = static_cast<cudf::size_type>(exc_count);
-  auto exceptions_col   = cudf::make_fixed_width_column(
-    cudf::data_type(traits::value_type_id), exc_n, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto positions_col = cudf::make_fixed_width_column(
-    cudf::data_type(cudf::type_id::INT32), exc_n, cudf::mask_state::UNALLOCATED, stream, mr);
-
-  if (exc_n > 0) {
-    auto counting = thrust::make_counting_iterator(int32_t{0});
-    thrust::copy_if(exec,
-                    counting,
-                    counting + n,
-                    thrust::device_pointer_cast(d_flags.data()),
-                    thrust::device_pointer_cast(positions_col->mutable_view().data<int32_t>()),
-                    [] __device__(uint8_t f) { return f != 0; });
-    thrust::copy_if(exec,
-                    thrust::device_pointer_cast(col.data<T>()),
-                    thrust::device_pointer_cast(col.data<T>() + n),
-                    thrust::device_pointer_cast(d_flags.data()),
-                    thrust::device_pointer_cast(exceptions_col->mutable_view().data<T>()),
-                    [] __device__(uint8_t f) { return f != 0; });
-  }
-
-  cudaError_t err = cudaStreamSynchronize(stream.value());
-  if (err != cudaSuccess) { throw std::runtime_error("alp_compress_impl sync failed"); }
+  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_compress_impl sync");
 
   return std::make_unique<alp_compressed_representation>(col.type(),
                                                          n,
                                                          num_vectors,
                                                          std::move(integers_col),
-                                                         std::move(exceptions_col),
-                                                         std::move(positions_col),
+                                                         std::move(exc.values),
+                                                         std::move(exc.positions),
                                                          std::move(metadata_col));
 }
 
@@ -646,8 +615,7 @@ std::unique_ptr<cudf::column> alp_decompress_impl(alp_compressed_representation 
                                             out->mutable_view().data<T>());
   }
 
-  cudaError_t err = cudaStreamSynchronize(stream.value());
-  if (err != cudaSuccess) { throw std::runtime_error("alp_decompress sync failed"); }
+  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_decompress sync");
   return out;
 }
 

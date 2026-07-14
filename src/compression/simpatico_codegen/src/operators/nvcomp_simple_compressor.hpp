@@ -32,32 +32,6 @@
 namespace simpatico {
 namespace detail {
 
-// Compress a raw device byte range through `ops`. Returns the compressed frame
-// and its exact byte size. Shared by the fixed-width path and the STRING path
-// (which compresses the offsets and chars sub-streams independently).
-inline std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> nvcomp_compress_bytes(
-  batched_codec_ops const& ops,
-  void const* src,
-  std::size_t n_bytes,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  return batched_compress_bytes(ops, src, n_bytes, stream, mr);
-}
-
-// Decompress a frame produced by nvcomp_compress_bytes into `dst` (device),
-// which must hold exactly `out_bytes`. Enqueued on `stream`; synchronizes.
-inline void nvcomp_decompress_bytes(batched_codec_ops const& ops,
-                                    void const* comp,
-                                    std::size_t comp_size,
-                                    void* dst,
-                                    std::size_t out_bytes,
-                                    rmm::cuda_stream_view stream,
-                                    rmm::device_async_resource_ref mr)
-{
-  batched_decompress_bytes(ops, comp, comp_size, dst, out_bytes, stream, mr);
-}
-
 // Compress a fixed-width column through `ops`. Returns the compressed frame and
 // its actual byte count.
 inline std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> nvcomp_compress_impl(

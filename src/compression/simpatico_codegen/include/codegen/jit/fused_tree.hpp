@@ -69,15 +69,20 @@ struct FusedTree {
   }
 };
 
-// Effective dtype for a child branch.  Single source of truth for the
-// "RLE.runs is always int32" rule, threaded through every recursive
-// call by the encode/decode renderers.
-std::string child_dtype(OpKind parent_op,
-                        const std::string& child_key,
-                        const std::string& parent_dtype);
-
 // Human-readable op tag for diagnostics (error messages).
-std::string op_kind_name(OpKind op);
+inline std::string op_kind_name(OpKind op)
+{
+  switch (op) {
+    case OpKind::Bitpack: return "BITPACK";
+    case OpKind::For: return "FOR";
+    case OpKind::Delta: return "DELTA";
+    case OpKind::Rle: return "RLE";
+    case OpKind::Raw: return "RAW";
+    case OpKind::Zigzag: return "ZIGZAG";
+    case OpKind::None: return "NONE";
+  }
+  return "UNKNOWN";
+}
 
 // ---------------------------------------------------------------------------
 // Buffer contract between the JIT encoder and decoder: a tree-wide set of

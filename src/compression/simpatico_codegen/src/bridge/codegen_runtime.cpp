@@ -2,7 +2,7 @@
 //
 // JIT backend for the fused codegen compress/decompress path. Decode entry
 // points are called from plan/decompress.cpp; the encode entry point
-// (jit_encode_subtree) from plan/compress.cpp.
+// (encode_fused_subtree) from plan/compress.cpp.
 //
 // Decode pipeline: decompress.cpp builds the runtime jit::FusedTree and a
 // jit::LabeledBuffers of the real device buffers from the stored reps, keyed by
@@ -105,6 +105,143 @@ int simpatico_compact_raw_values(const void* d_padded_v,
                                  void* stream_v);
 }
 
+// ---------------------------------------------------------------------------
+// bitpack_compressed_representation::compact_in_place — densify a rep's
+// OverAllocate ``packed`` buffer into a tight Compact buffer.
+//
+// The fused encode kernel (renderer.cpp::emit_bitpack) emits ``packed`` in
+// slot-strided OverAllocate layout: chunk c's live data sits at
+// ``packed[c*stride_words .. +live_words[c])`` with the tail zeroed. That is
+// correct and fast for the decoder (per-chunk stride reads) but wrong for
+// anything that transit-emits dense bytes (file write, tail-codec input). This
+// is the single place that turns the former into the latter — the only caller
+// is the bitpack branch of the encode bridge below, right after it builds the
+// OverAllocate rep. It reuses the exact machinery ``synthesize_decode_transients``
+// runs for every bitpack column on decode:
+//   1. Derive per-chunk offsets from chunk_bits x chunk_count via
+//      simpatico_compute_bp_offsets_scan + _tail — an exclusive scan of the
+//      live-word counts plus the [num_chunks] sentinel, so
+//      bp_offsets[c+1] - bp_offsets[c] == live_words[c].
+//   2. Gather the live words into a tight dense buffer with the shared
+//      simpatico_compact_raw_values strided gather (elem_size = 4 = uint32
+//      words), which reads each chunk's run length from consecutive offsets.
+//   3. Swap the dense buffer in for ``packed`` and clear the OverAllocate
+//      scratch (stride_words_ = 0) so the rep is dense.
+//
+// Stream-ordered: the transient bp_offsets + CUB scratch are enqueued on the
+// caller's stream and RAII-freed on it; the caller syncs before reading the
+// dense bytes from another stream. No-op for a rep already dense
+// (stride_words_ == 0); chunk_min/count/bits are left untouched (no clone).
+// ---------------------------------------------------------------------------
+namespace simpatico {
+
+void bitpack_compressed_representation::compact_in_place(rmm::cuda_stream_view stream,
+                                                         rmm::device_async_resource_ref mr)
+{
+  if (stride_words_ == 0) return;  // already dense — nothing to do.
+
+  auto check_rc = [](int rc, const char* what) {
+    if (rc != 0)
+      throw std::runtime_error(std::string("compact_in_place: ") + what +
+                               " failed (rc=" + std::to_string(rc) + ")");
+  };
+
+  // Tight output size, captured from the OverAllocate ctor before we clear the
+  // scratch below.
+  const std::size_t live = static_cast<std::size_t>(live_packed_bytes_sparse_);
+
+  // The decode bit-unpack gather (simpatico_bitunpack_one) loads three
+  // consecutive uint32 words unconditionally, so decoding the last element of
+  // the last chunk touches up to two uint32 words past the live packed bytes.
+  // Allocate that much readable trailing slack (masked out of every decoded
+  // value); without it the gather over-reads the dense allocation — a real OOB
+  // caught by compute-sanitizer. The column's logical size stays ``live`` so
+  // live_packed_bytes()/serialization remain tight.
+  constexpr std::size_t kDecodeGatherSlackBytes = 2 * sizeof(std::uint32_t);
+
+  rmm::device_buffer dense(live + kDecodeGatherSlackBytes, stream, mr);
+  if (live > 0) {
+    if (!packed) {
+      throw std::runtime_error(
+        "bitpack_compressed_representation::compact_in_place: packed "
+        "column is null but live_packed_bytes > 0");
+    }
+
+    const cudf::size_type num_chunks = chunk_count->size();
+    const void* cc_p                 = chunk_count->view().head<void>();
+    const void* cb_p                 = chunk_bits->view().head<void>();
+
+    // Per-chunk destination offsets: exclusive scan of the live-word counts
+    // derived from chunk_bits x chunk_count, plus the [num_chunks] sentinel —
+    // the same derivation synthesize_decode_transients runs on decode, so
+    // bp_offsets[c+1] - bp_offsets[c] == live_words[c]. The scan reads its input
+    // through a fused transform iterator, so no live_words array is materialised
+    // and there is no CUB raw-input over-read to pad against.
+    rmm::device_buffer bp_offsets_buf(
+      (static_cast<std::size_t>(num_chunks) + 1) * sizeof(std::int32_t), stream, mr);
+    void* d_bp_off = bp_offsets_buf.data();
+
+    std::size_t scratch_bytes = 0;
+    check_rc(simpatico_compute_bp_offsets_scan(cc_p,
+                                               cb_p,
+                                               static_cast<std::int32_t>(num_chunks),
+                                               d_bp_off,
+                                               /*d_temp_storage=*/nullptr,
+                                               &scratch_bytes,
+                                               stream.value()),
+             "bp_offsets scan probe");
+
+    rmm::device_buffer scratch_buf;
+    void* d_scratch = nullptr;
+    if (scratch_bytes > 0) {
+      scratch_buf = rmm::device_buffer(scratch_bytes, stream, mr);
+      d_scratch   = scratch_buf.data();
+    }
+    check_rc(simpatico_compute_bp_offsets_scan(cc_p,
+                                               cb_p,
+                                               static_cast<std::int32_t>(num_chunks),
+                                               d_bp_off,
+                                               d_scratch,
+                                               &scratch_bytes,
+                                               stream.value()),
+             "bp_offsets scan");
+    check_rc(simpatico_compute_bp_offsets_tail(
+               cc_p, cb_p, static_cast<std::int32_t>(num_chunks), d_bp_off, stream.value()),
+             "bp_offsets tail");
+
+    // Strided gather: copy live_words[c] = bp_offsets[c+1] - bp_offsets[c]
+    // uint32 words from packed[c*stride_words ..] to dense[bp_offsets[c] ..].
+    // The same shared gather the RLE raw-values path uses, with elem_size = 4
+    // (uint32 words) and chunk_size = stride_words.
+    check_rc(simpatico_compact_raw_values(packed->view().head<void>(),
+                                          dense.data(),
+                                          d_bp_off,
+                                          static_cast<std::int32_t>(num_chunks),
+                                          static_cast<std::int32_t>(stride_words_),
+                                          static_cast<std::int32_t>(sizeof(std::uint32_t)),
+                                          stream.value()),
+             "compact gather");
+  }
+
+  // Zero the trailing gather slack so the decode over-read returns deterministic
+  // (masked-out) bytes rather than uninitialised memory.
+  cudaMemsetAsync(
+    static_cast<std::uint8_t*>(dense.data()) + live, 0, kDecodeGatherSlackBytes, stream.value());
+
+  // Swap the dense buffer in for ``packed`` and degrade to a plain dense rep.
+  // packed is uint32 words; UINT32 (size = words) keeps a >2GB dense buffer
+  // under cudf's 2^31-element cap. `live` is a byte count, always a multiple of 4.
+  packed                    = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
+                                          static_cast<cudf::size_type>(live / 4),
+                                          std::move(dense),
+                                          rmm::device_buffer(0, stream, mr),
+                                          0);
+  stride_words_             = 0;
+  live_packed_bytes_sparse_ = 0;
+}
+
+}  // namespace simpatico
+
 namespace {
 
 constexpr int kChunkSize = cc::kChunkSize;  // 1024
@@ -128,15 +265,15 @@ void dfs_nodes(const jit::FusedTree& node, std::vector<const jit::FusedTree*>& o
 //   * Bitpack bp_offsets: exclusive cumsum of n_words[c] via CUB (device-side
 //       scan + 1-thread tail patch), reading chunk_count/chunk_bits from `out`.
 //   * Rle scatter-scan-gather transients (rle_scratch / rle_run_values):
-//       real buffers only for a root RLE (node 0); nullptr otherwise.
+//       registered as null placeholders (length only) — the rendered RLE decode
+//       kernel sizes its grid from them but does not read their contents.
 // ---------------------------------------------------------------------------
 bool synthesize_decode_transients(const jit::FusedTree& tree,
                                   std::size_t element_size,
                                   const std::function<CUdeviceptr(std::size_t)>& alloc,
                                   void* stream_v,
                                   jit::LabeledBuffers& out,
-                                  std::string* err,
-                                  bool alloc_rle_transients)
+                                  std::string* err)
 {
   std::vector<const jit::FusedTree*> nodes;
   dfs_nodes(tree, nodes);
@@ -219,30 +356,10 @@ bool synthesize_decode_transients(const jit::FusedTree& tree,
       const std::int64_t ro_l           = static_cast<std::int64_t>(ro_it->second.length);
       const std::int64_t rle_num_chunks = ro_l > 0 ? ro_l - 1 : 0;
       const std::size_t scratch_len     = static_cast<std::size_t>(rle_num_chunks) * kChunkSize;
-      if (node_id == 0 && scratch_len > 0 && alloc_rle_transients) {
-        const std::size_t scratch_bytes = scratch_len * sizeof(std::int32_t);
-        CUdeviceptr d_scratch           = alloc(scratch_bytes);
-        CUresult mr =
-          cuMemsetD8Async(d_scratch, 0, scratch_bytes, reinterpret_cast<CUstream>(stream_v));
-        if (mr != CUDA_SUCCESS) {
-          if (err)
-            *err = "cuMemsetD8Async(rle_scratch) failed (CUresult=" +
-                   std::to_string(static_cast<int>(mr)) + ")";
-          return false;
-        }
-        out[jit::buffer_key(node_id, "rle_scratch")] = {
-          reinterpret_cast<const void*>(d_scratch), scratch_len, sizeof(std::int32_t)};
-
-        const std::size_t rv_bytes                      = scratch_len * element_size;
-        CUdeviceptr d_run_values                        = alloc(rv_bytes);
-        out[jit::buffer_key(node_id, "rle_run_values")] = {
-          reinterpret_cast<const void*>(d_run_values), scratch_len, element_size};
-      } else {
-        out[jit::buffer_key(node_id, "rle_scratch")] = {
-          /*ptr=*/nullptr, scratch_len, sizeof(std::int32_t)};
-        out[jit::buffer_key(node_id, "rle_run_values")] = {
-          /*ptr=*/nullptr, scratch_len, element_size};
-      }
+      out[jit::buffer_key(node_id, "rle_scratch")] = {
+        /*ptr=*/nullptr, scratch_len, sizeof(std::int32_t)};
+      out[jit::buffer_key(node_id, "rle_run_values")] = {
+        /*ptr=*/nullptr, scratch_len, element_size};
     }
   }
   return true;
@@ -268,9 +385,6 @@ const char* dtype_to_cxx(const char* dtype)
   if (s == "uint64" || s == "uint64_t") return "int64_t";
   return nullptr;
 }
-
-// Query the active CUDA device's compute capability and return it as a
-// two-digit integer (e.g. 89 for sm_89 / Ada).  Using the device's actual
 
 // Launch the plain-CUDA rendered decode kernel (symmetric to the
 // encode renderer).  Returns 1 on success, -1 on failure.  Reuses the
@@ -484,13 +598,7 @@ bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
     };
 
     std::string err;
-    if (!synthesize_decode_transients(tree,
-                                      elem_size,
-                                      alloc,
-                                      stream.value(),
-                                      labeled,
-                                      &err,
-                                      /*alloc_rle_transients=*/false)) {
+    if (!synthesize_decode_transients(tree, elem_size, alloc, stream.value(), labeled, &err)) {
       std::fprintf(stderr,
                    "simpatico::codegen: decode_fused_subtree: transient synth failed: %s\n",
                    err.c_str());
@@ -530,7 +638,7 @@ bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
 // =====================================================================
 //
 // Counterpart to the make/launch/release decompress trio above. The compress
-// driver (plan/compress.cpp) calls ``jit_encode_subtree`` (defined at the
+// driver (plan/compress.cpp) calls ``encode_fused_subtree`` (defined at the
 // bottom of this section) for each plan node that roots a fusable region.
 //
 // Pipeline (per region)
@@ -559,12 +667,17 @@ bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
 //      steps on the region's boundary outputs are scheduled by the recursive
 //      compress walk (plan/compress.cpp), not here.
 
-namespace simpatico {
-
-std::optional<CodegenHead> extract_fusable_subtree(PlanTree const& tree,
-                                                   NodeId start_node,
-                                                   std::string* err)
+// Extract the maximal fusable region rooted at ``start_node`` into a
+// CodegenHead. Encode-internal helper (mirrors the decode binder's use of the
+// shared build_fused_tree in plan/decompress.cpp); folded into the file so the
+// encode/decode bridge exposes just the encode_fused_subtree / decode_fused_subtree
+// pair. Not part of the public header.
+static std::optional<simpatico::CodegenHead> extract_fusable_subtree(
+  simpatico::PlanTree const& tree, simpatico::NodeId start_node, std::string* err)
 {
+  using simpatico::build_fused_tree;
+  using simpatico::CodegenHead;
+
   auto fail = [&](const std::string& reason) -> std::optional<CodegenHead> {
     if (err) *err = reason;
     return std::nullopt;
@@ -597,8 +710,6 @@ std::optional<CodegenHead> extract_fusable_subtree(PlanTree const& tree,
   head.preorder = built->preorder;
   return head;
 }
-
-}  // namespace simpatico
 
 namespace {
 
@@ -684,7 +795,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
     // Allocate one rmm::device_buffer per BufferSpec.  Buffers are moved
     // into cudf::columns during rep construction below — the vector
     // serves as the kernel-arg backing storage in the meantime.
-    // ``stream`` is always supplied by the caller (jit_encode_subtree →
+    // ``stream`` is always supplied by the caller (encode_fused_subtree →
     // CompressWalk stream); no default-stream fallback.
 
     std::vector<rmm::device_buffer> bufs;
@@ -1213,14 +1324,14 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
 
 namespace simpatico {
 
-bool jit_encode_subtree(PlanTree const& tree,
-                        NodeId start_node,
-                        cudf::column_view input_col,
-                        rmm::cuda_stream_view stream,
-                        rmm::device_async_resource_ref mr,
-                        plan_compound_builder& builder,
-                        std::string* error_out,
-                        CodegenHead* head_out)
+bool encode_fused_subtree(PlanTree const& tree,
+                          NodeId start_node,
+                          cudf::column_view input_col,
+                          rmm::cuda_stream_view stream,
+                          rmm::device_async_resource_ref mr,
+                          plan_compound_builder& builder,
+                          std::string* error_out,
+                          CodegenHead* head_out)
 {
   // Fixed-point columns are physically their storage integer (DECIMAL32 -> INT32,
   // DECIMAL64 -> INT64); the codecs run losslessly on those bits. We encode/decode
@@ -1296,7 +1407,7 @@ bool jit_encode_subtree(PlanTree const& tree,
     if (error_out) *error_out = "encode declined (non-fusable subtree shape)";
     return false;
   }
-  if (error_out) *error_out = err.empty() ? "jit_encode_subtree failed" : err;
+  if (error_out) *error_out = err.empty() ? "encode_fused_subtree failed" : err;
   return false;
 }
 

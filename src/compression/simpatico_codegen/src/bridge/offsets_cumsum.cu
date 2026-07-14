@@ -191,55 +191,6 @@ int simpatico_compute_rle_offsets_inclusive_scan(void* d_rle_offsets_v,  // int3
   return 0;
 }
 
-// Compute per-chunk live word counts on-device:
-//   live_words[c] = (chunk_count[c] * chunk_bits[c] + 31) / 32
-//   live_words[c] = 1                                   when count[c] == 0
-// Used by compact_in_place() when the per-chunk live_words array is absent
-// (e.g. the encoder used sharded atomics instead of a per-chunk write).
-//
-// The empty-chunk -> 1 sentinel MUST match both the encoder's lw_shards
-// accounting (emit_bitpack's bp_len<=0 branch adds 1 word) and the
-// decode-side bp_offsets derivation (NwordsFromChunk above), otherwise the
-// gathered dense stream is shorter than live_packed_bytes() and misaligned
-// vs the offsets the decoder reconstructs for chunks after the empty one.
-namespace {
-__global__ void compute_live_words_kernel(const std::int32_t* counts,
-                                          const std::uint8_t* bits,
-                                          std::int32_t n,
-                                          std::int32_t* lw)
-{
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    const std::int32_t cnt = counts[i];
-    lw[i]                  = (cnt == 0)
-                               ? 1
-                               : static_cast<std::int32_t>(
-                  (static_cast<std::int64_t>(cnt) * static_cast<std::int64_t>(bits[i]) + 31) / 32);
-  }
-}
-}  // namespace
-
-int simpatico_compute_live_words(const void* d_chunk_count_v,  // const int32_t*
-                                 const void* d_chunk_bits_v,   // const uint8_t*
-                                 std::int32_t num_chunks,
-                                 void* d_live_words_v,  // int32_t*
-                                 void* stream_v)
-{
-  if (num_chunks < 0) return 1;
-  if (num_chunks == 0) return 0;
-  if (!d_chunk_count_v || !d_chunk_bits_v || !d_live_words_v) return 1;
-  const int block = 256;
-  const int grid  = (num_chunks + block - 1) / block;
-  auto stream     = static_cast<cudaStream_t>(stream_v);
-  compute_live_words_kernel<<<grid, block, 0, stream>>>(
-    static_cast<const std::int32_t*>(d_chunk_count_v),
-    static_cast<const std::uint8_t*>(d_chunk_bits_v),
-    num_chunks,
-    static_cast<std::int32_t*>(d_live_words_v));
-  cudaError_t e = cudaGetLastError();
-  return static_cast<int>(e);
-}
-
 }  // extern "C"
 
 // Compact a padded-stride raw values buffer into a dense layout.
