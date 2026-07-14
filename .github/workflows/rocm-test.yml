@@ -98,8 +98,12 @@ jobs:
           }
           int main() { return 0; }
           EOF
+          # cuda-compat-shims puts its headers under include/ (verified against the real
+          # cuda2rocm repo layout), and the fetch step above extracts that subproject's
+          # contents directly into cmake/rocm_compat/ -- so the actual header root is
+          # cmake/rocm_compat/include, not cmake/rocm_compat itself.
           hipcc -c -x hip /tmp/test_shim.cu -o /dev/null \
-            -I cmake/rocm_compat --offload-arch=gfx942 2>&1
+            -I cmake/rocm_compat/include --offload-arch=gfx942 2>&1
           echo "Shim compile: EXIT=$?"
 
       - name: Compile + run cuco-rocm tests
@@ -110,12 +114,12 @@ jobs:
 
           # Bloom filter test
           hipcc -o /tmp/test_bf /tmp/cuda2rocm/cuco-rocm/tests/test_bloom_filter.cu \
-            -I /tmp/cuda2rocm/cuco-rocm/include -I cmake/rocm_compat --offload-arch=gfx942 2>&1
+            -I /tmp/cuda2rocm/cuco-rocm/include -I cmake/rocm_compat/include --offload-arch=gfx942 2>&1
           /tmp/test_bf
 
           # Static set test
           hipcc -o /tmp/test_ss /tmp/cuda2rocm/cuco-rocm/tests/test_static_set.cu \
-            -I /tmp/cuda2rocm/cuco-rocm/include -I cmake/rocm_compat --offload-arch=gfx942 2>&1
+            -I /tmp/cuda2rocm/cuco-rocm/include -I cmake/rocm_compat/include --offload-arch=gfx942 2>&1
           /tmp/test_ss
 
   full-build:
