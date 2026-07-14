@@ -373,8 +373,7 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
   sirius_dynamic_small_in_list_filter(sirius_dynamic_small_in_list_filter const&) = delete;
   sirius_dynamic_small_in_list_filter& operator=(sirius_dynamic_small_in_list_filter const&) =
     delete;
-  sirius_dynamic_small_in_list_filter(sirius_dynamic_small_in_list_filter&&) =
-    delete;
+  sirius_dynamic_small_in_list_filter(sirius_dynamic_small_in_list_filter&&)            = delete;
   sirius_dynamic_small_in_list_filter& operator=(sirius_dynamic_small_in_list_filter&&) = delete;
 
   [[nodiscard]] sirius_dynamic_filter_kind kind() const override
