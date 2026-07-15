@@ -27,6 +27,7 @@
 
 #include <unistd.h>
 
+#include <format>
 #include <memory>
 #include <ranges>
 #include <string>
@@ -68,7 +69,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
   worker_observer_->init(worker_uuid_,
                          quent::worker::Init{
                            .parent_engine_id = engine_uuid_,
-                           .instance_name    = fmt::format("worker-{}", getpid()),
+                           .instance_name    = std::format("worker-{}", getpid()),
                          });
 
   memory_context_ = std::make_shared<memory_context>(engine_uuid_, *context_, manager);
@@ -78,7 +79,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
   query_group_observer_->declaration(
     query_group_uuid_,
     quent::query_group::Declaration{
-      .instance_name = fmt::format("{}-session-{}", config.engine_name, getpid()),
+      .instance_name = std::format("{}-session-{}", config.engine_name, getpid()),
       .engine_id     = engine_uuid_,
     });
 
@@ -102,7 +103,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
     };
     gpu_device_observer->declaration(ids.device,
                                      quent::gpu_device::Declaration{
-                                       .instance_name   = fmt::format("gpu-{}", device_id),
+                                       .instance_name   = std::format("gpu-{}", device_id),
                                        .parent_group_id = engine_uuid_,
                                        .ordinal         = static_cast<uint32_t>(device_id),
                                      });
@@ -180,14 +181,14 @@ void emit_plan_telemetry(
     const std::string operator_chain = [&operators]() {
       std::string chain{};
       for (const auto& name : operators | std::views::transform([](const auto& op) {
-                                return fmt::format(
+                                return std::format(
                                   "{}({})", op.get().get_name(), op.get().operator_id);
                               })) {
         if (chain.empty()) {
           chain = name;
           continue;
         }
-        chain = fmt::format("{} -> {}", chain, name);
+        chain = std::format("{} -> {}", chain, name);
       }
       return chain;
     }();
@@ -198,7 +199,7 @@ void emit_plan_telemetry(
         .plan_id             = plan_id,
         .parent_operator_ids = {},
         .instance_name       = operator_chain,
-        .type_name           = fmt::format("Pipeline Id {}", pipeline->get_pipeline_id()),
+        .type_name           = std::format("Pipeline Id {}", pipeline->get_pipeline_id()),
         .custom_attributes   = {},
       });
 
@@ -209,7 +210,7 @@ void emit_plan_telemetry(
           port_obs->declaration(port->source_port_uuid,
                                 quent::port::Declaration{
                                   .operator_id   = pipeline_uuid,
-                                  .instance_name = fmt::format("{}_receiver", port_id),
+                                  .instance_name = std::format("{}_receiver", port_id),
                                 });
         }
       }
@@ -222,7 +223,7 @@ void emit_plan_telemetry(
       port_obs->declaration(pseudo_sink_port_uuid,
                             quent::port::Declaration{
                               .operator_id   = pipeline_uuid,
-                              .instance_name = fmt::format("{}_sender", next_operator_port_name),
+                              .instance_name = std::format("{}_sender", next_operator_port_name),
                             });
 
       // Find the target port on the downstream operator

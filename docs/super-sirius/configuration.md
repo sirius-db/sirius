@@ -95,6 +95,7 @@ sirius:
     enable_dynamic_zone_map_filter: false  # optional read-time min/max filter
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
+    enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -247,6 +248,7 @@ Four optional nested sub-configs tune the individual backends and caches:
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds for read-time row-group pruning. Requires `enable_dynamic_filter_pushdown`; intended for clustered-keyset workloads. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
 | `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
+| `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -417,6 +419,24 @@ SET enable_dynamic_filter_pushdown = true;
 SET enable_dynamic_zone_map_filter = false;
 ```
 
+### Pinned Tables
+
+This setting is accepted both as a DuckDB `SET` variable and in YAML under
+`sirius.operator_params`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_pinned_zone_map_pruning` | true | Capture pinned-chunk zone maps at pin time and use them to prune cached scans. |
+
+Setting this to `false` before `pin_table` avoids the extra GPU reductions and creates a
+statless entry. Enabling it later does not add statistics to that entry; re-pin the table with
+the setting enabled. Disabling it only for a query leaves existing statistics intact. See
+[Pinned-table zone maps](scan.md#zone-maps) for supported types, pruning, and re-pin behavior.
+
+```sql
+SET enable_pinned_zone_map_pruning = false;
+```
+
 ### Transparent Execution
 
 | Variable | Default | Description |
@@ -429,7 +449,7 @@ SET enable_dynamic_zone_map_filter = false;
 |----------|---------|-------------|
 | `print_gpu_table_max_rows` | - | Max rows to print in debug output |
 | `enable_fallback_check` | - | Enable fallback validation |
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU on Sirius errors. Matches the legacy `gpu_processing` path. Set to `false` to surface Sirius errors instead of silently falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 ## Legacy Config Flags

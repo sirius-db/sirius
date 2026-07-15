@@ -76,6 +76,7 @@ enum class operator_data_type : uint8_t {
   PIPELINEABLE,
   PARTITIONED,
   GPU_SCAN,
+  GPU_VALUES,
 };
 
 /**
@@ -590,7 +591,7 @@ class sirius_physical_operator {
   //! Get pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
 
-  void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
+  virtual void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
  protected:
   duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;

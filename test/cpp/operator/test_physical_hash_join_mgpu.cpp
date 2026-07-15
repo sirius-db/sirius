@@ -178,9 +178,8 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
   // Both GPUs saw SOME pipeline work — under the PARQUET_METADATA_SCAN
   // → GPU_SCAN pipeline architecture, parquet reads dispatch as
   // gpu_pipeline_task entries (logged via [mgpu-audit] pipeline_task
-  // dispatched) rather than scan_executor scan_batch entries (which are
-  // reserved for the duckdb_scan_task / cpu_source_task / legacy
-  // PARQUET_SCAN path through duckdb_scan_executor::select_target_gpu).
+  // dispatched) rather than scan_executor scan_batch entries (an emission
+  // of the deleted duckdb_scan_executor path).
   // BUILD_PROBE pins post-partition probe tasks to one GPU via SCHED-00,
   // but the metadata + GPU_SCAN pipelines upstream of the join
   // are not partition-pinned and distribute across both GPUs, so

@@ -22,11 +22,8 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
 
@@ -65,27 +62,8 @@ sirius_pipeline::get_next_ports_after_sink() const
   std::vector<op::sirius_physical_operator::next_port_info> ports;
   if (!sink) { return ports; }
 
-  auto append = [&ports](const std::vector<op::sirius_physical_operator::next_port_info>& src) {
-    ports.insert(ports.end(), src.begin(), src.end());
-  };
-
-  if (sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& right_delim_join = sink->Cast<op::sirius_physical_right_delim_join>();
-    const auto& part_1     = right_delim_join.partition_join->get_next_ports_after_sink();
-    const auto& part_2     = right_delim_join.distinct->get_next_ports_after_sink();
-    ports.reserve(part_1.size() + part_2.size());
-    append(part_1);
-    append(part_2);
-  } else if (sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-    auto& left_delim_join = sink->Cast<op::sirius_physical_left_delim_join>();
-    const auto& part_1    = left_delim_join.column_data_scan->get_next_ports_after_sink();
-    const auto& part_2    = left_delim_join.distinct->get_next_ports_after_sink();
-    ports.reserve(part_1.size() + part_2.size());
-    append(part_1);
-    append(part_2);
-  } else {
-    append(sink->get_next_ports_after_sink());
-  }
+  const auto& sink_ports = sink->get_next_ports_after_sink();
+  ports.insert(ports.end(), sink_ports.begin(), sink_ports.end());
   return ports;
 }
 

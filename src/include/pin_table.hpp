@@ -16,6 +16,10 @@
 
 #pragma once
 
+#include <duckdb/common/types.hpp>
+#include <duckdb/common/vector.hpp>
+#include <duckdb/storage/statistics/base_statistics.hpp>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -95,6 +99,11 @@ struct materialized_pin {
   /// pins these become @c duckdb_mvcc_metadata::base_row_count_per_chunk — the
   /// positional chunk→rowid-range map query-time MVCC merge relies on.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// Per-chunk zone-map capture: chunk_stats[c][i] = stats of batch column i of
+  /// chunk c (null = none). Parallel to @c tables when capture ran; empty when
+  /// capture was skipped (no pinned column types). Fed together with the
+  /// pin-time column types into @c sirius_scan_manager::insert_pinned_entry.
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
 };
 
 /// Pin-time validation of the coalescer invariant the MVCC delta merge relies on
@@ -116,14 +125,18 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 /// re-pinning the same source yields identical @c chunk_memory_spaces (required by
 /// @c sirius_scan_manager::insert_pinned_entry 's merge path).
 ///
-/// \param ingestible  Source ingestible (parquet or duckdb-native). Consumed by repeated
-///                    next_split_provider / materialize calls.
-/// \param gpu_spaces  Non-empty set of GPU memory spaces to round-robin across.
-/// \param io_ctx      IO context the metadata reads run on (owned by the scan manager).
+/// \param ingestible          Source ingestible (parquet or duckdb-native). Consumed by repeated
+///                            next_split_provider / materialize calls.
+/// \param gpu_spaces          Non-empty set of GPU memory spaces to round-robin across.
+/// \param io_ctx              IO context the metadata reads run on (owned by the scan manager).
+/// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
+///                            (column_ids) order — drives the per-chunk zone-map capture
+///                            (compute_pinned_chunk_stats). Empty skips capture (statless pin).
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx);
+  io::sirius_ioctx& io_ctx,
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types);
 
 /// Result of driving a host-tier pin with optional Simpatico compression.
 /// When every batch compresses successfully, @c compressed_chunks is non-empty

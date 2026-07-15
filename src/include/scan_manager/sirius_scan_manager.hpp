@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "duckdb/planner/table_filter.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
@@ -24,6 +25,7 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -37,6 +39,7 @@
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
+#include <duckdb/storage/statistics/base_statistics.hpp>
 #include <io/types.hpp>
 
 namespace cucascade::memory {
@@ -160,6 +163,11 @@ struct pinned_entry {
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
+  /// Zone-map sidecar: pin-time DuckDB types + per-chunk min/max statistics,
+  /// positional with cache_info.column_ids. Absent (never prunes) when the
+  /// capture was statless or degraded; see @ref pinned_zone_maps for the
+  /// invariant and merge semantics.
+  pinned_zone_maps zone_maps;
   /// MVCC snapshot metadata for duckdb-native pins, attached by
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
@@ -181,6 +189,24 @@ struct pinned_entry {
 /// attaching the provider and converts a throw into a disk-read fallback.
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
+
+/**
+ * @brief Cache-serve-time survivor plan for one cached scan.
+ */
+struct cached_scan_plan {
+  std::vector<std::size_t> survivor_chunk_indices;  ///< indices of chunks that survived pruning
+  std::size_t pruned{0};
+};
+
+/**
+ * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
+ * @p table_filters applied. A chunk is pruned when any usable filter proves it empty against the
+ * pinned entry's zone-map statistics.
+ */
+[[nodiscard]] cached_scan_plan build_cached_scan_plan(
+  pinned_entry const& entry,
+  duckdb::TableFilterSet const* table_filters,
+  duckdb::vector<duckdb::ColumnIndex> const* requested_column_ids);
 
 /**
  * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
@@ -241,8 +267,13 @@ class sirius_scan_manager {
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
   ///
-  /// @param query        The query whose scan operators must be prepared.
-  void prepare_for_query(const sirius::planner::query& query);
+  /// @param query                           The query whose scan operators must be prepared.
+  /// @param enable_pinned_zone_map_pruning  Per-query snapshot of the serve-side pruning flag (the
+  ///                                        manager's _config is a construction-time copy, so SET
+  ///                                        changes must be forwarded per query by the caller).
+  ///                                        Consulted by try_assign_cached_entries when building
+  ///                                        the survivor plan.
+  void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -273,6 +304,10 @@ class sirius_scan_manager {
   ///   - If row counts differ, the existing entry is dropped and replaced. (An
   ///     n_rows-capped "partial" pin therefore never merges with a full pin of the
   ///     same table, since their row counts differ.)
+  ///   - Zone-map types/statistics mirror the data decisions: kept when a merge
+  ///     drops duplicate columns, appended for new columns that received chunks,
+  ///     and degraded to statless when the union column set cannot stay
+  ///     positionally aligned (data serving is unaffected).
   ///
   /// \param name                  Table name key.
   /// \param cache_info            Cache identity (parquet file set or duckdb
@@ -285,10 +320,17 @@ class sirius_scan_manager {
   /// \param chunk_memory_spaces   Per-chunk memory space placement; size MUST equal
   ///                              data_tables.size() (the value at index i is shared by
   ///                              all columns at chunk i).
-  void insert_pinned_entry(const std::string& name,
-                           cache_entry_info cache_info,
-                           std::vector<std::unique_ptr<cudf::table>> data_tables,
-                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
+  /// \param column_types          Pin-time DuckDB type of each cached column, positional
+  ///                              with @p cache_info's column_ids; empty pins statless.
+  /// \param chunk_stats           Per-chunk zone-map stats (chunk_stats[c][i] = column i
+  ///                              of chunk c, as compute_pinned_chunk_stats emits).
+  void insert_pinned_entry(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<std::unique_ptr<cudf::table>> data_tables,
+    std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
+    duckdb::vector<duckdb::LogicalType> column_types                                 = {},
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
 
   /// \brief Pin the host-tier entry for a table.
   ///
@@ -308,11 +350,17 @@ class sirius_scan_manager {
   /// \param memory_space  Representative host memory space the chunks reside in
   ///                      (metadata only; each chunk carries its own per-GPU
   ///                      NUMA-local memory_space).
+  /// \param column_types  Pin-time DuckDB type of each cached column, positional
+  ///                      with @p cache_info's column_ids; empty pins statless.
+  /// \param chunk_stats   Per-chunk zone-map stats (chunk_stats[c][i] = column i of chunk c, as
+  ///                      compute_pinned_chunk_stats emits).
   void insert_pinned_entry_host(
     const std::string& name,
     cache_entry_info cache_info,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    duckdb::vector<duckdb::LogicalType> column_types                                 = {},
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
 
   /// \brief Pin the entry for a table on the host tier using Simpatico-compressed chunks.
   ///
@@ -412,6 +460,7 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+  bool _pruning_enabled{true};
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached

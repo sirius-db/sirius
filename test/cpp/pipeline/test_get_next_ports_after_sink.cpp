@@ -104,7 +104,11 @@ TEST_CASE("yields nothing for standard sink with no ports", "[pipeline][get_next
   }
 }
 
-TEST_CASE("RIGHT_DELIM_JOIN: concatenates partition_join then distinct ports",
+// A delim join is a fan-out sink: its sub-operators (partition_join / column_data_scan /
+// distinct) are first-class pipelines, so the delim join carries its OWN next_port_after_sink
+// edges (one per branch) and get_next_ports_after_sink returns them directly like any standard
+// sink — no special-casing of the sub-operators' ports.
+TEST_CASE("RIGHT_DELIM_JOIN: returns its own fan-out ports",
           "[pipeline][get_next_ports_after_sink]")
 {
   sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
@@ -117,30 +121,10 @@ TEST_CASE("RIGHT_DELIM_JOIN: concatenates partition_join then distinct ports",
     0,
     duckdb::optional_idx());
 
-  // sirius_physical_partition needs a parent_op whose `type` field is one of the supported
-  // values. NESTED_LOOP_JOIN takes a no-op branch and avoids a downcast, so a standard
-  // sirius_physical_operator with that type is enough.
-  auto fake_parent = duckdb::make_uniq<sirius_physical_operator>(
-    SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, empty_types, 0);
-  auto partition_join =
-    duckdb::make_uniq<sirius_physical_partition>(empty_types, 0, fake_parent.get());
-
-  auto distinct = duckdb::make_uniq<sirius_physical_grouped_aggregate>(
-    empty_types,
-    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
-    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
-    0);
-
-  sirius_physical_operator partition_consumer_x;
-  sirius_physical_operator partition_consumer_y;
-  sirius_physical_operator distinct_consumer;
-  partition_join->add_next_port_after_sink({&partition_consumer_x, "port_x"});
-  partition_join->add_next_port_after_sink({&partition_consumer_y, "port_y"});
-  distinct->add_next_port_after_sink({&distinct_consumer, "distinct_port"});
-
-  right_delim->partition_join = partition_join.get();
-  right_delim->distinct       = distinct.get();
-  right_delim->distinct_root  = std::move(distinct);
+  sirius_physical_operator partition_branch;
+  sirius_physical_operator distinct_branch;
+  right_delim->add_next_port_after_sink({&partition_branch, "default"});
+  right_delim->add_next_port_after_sink({&distinct_branch, "default"});
 
   sirius_pipeline_build_state build_state;
   build_state.set_pipeline_sink(pipeline, right_delim.get(), 0);
@@ -149,17 +133,12 @@ TEST_CASE("RIGHT_DELIM_JOIN: concatenates partition_join then distinct ports",
   for (const auto& port : pipeline.get_next_ports_after_sink()) {
     ports.push_back(port);
   }
-  REQUIRE(ports.size() == 3);
-  CHECK(ports[0].next_operator == &partition_consumer_x);
-  CHECK(ports[0].next_operator_port_name == "port_x");
-  CHECK(ports[1].next_operator == &partition_consumer_y);
-  CHECK(ports[1].next_operator_port_name == "port_y");
-  CHECK(ports[2].next_operator == &distinct_consumer);
-  CHECK(ports[2].next_operator_port_name == "distinct_port");
+  REQUIRE(ports.size() == 2);
+  CHECK(ports[0].next_operator == &partition_branch);
+  CHECK(ports[1].next_operator == &distinct_branch);
 }
 
-TEST_CASE("LEFT_DELIM_JOIN: concatenates column_data_scan then distinct ports",
-          "[pipeline][get_next_ports_after_sink]")
+TEST_CASE("LEFT_DELIM_JOIN: returns its own fan-out ports", "[pipeline][get_next_ports_after_sink]")
 {
   sirius_pipeline pipeline(sirius::pipeline::pipeline_build_context{nullptr});
   duckdb::vector<sirius::logical_type> empty_types;
@@ -171,25 +150,10 @@ TEST_CASE("LEFT_DELIM_JOIN: concatenates column_data_scan then distinct ports",
     0,
     duckdb::optional_idx());
 
-  auto column_data_scan = duckdb::make_uniq<sirius_physical_column_data_scan>(
-    empty_types, SiriusPhysicalOperatorType::COLUMN_DATA_SCAN, 0, static_cast<std::size_t>(0));
-
-  auto distinct = duckdb::make_uniq<sirius_physical_grouped_aggregate>(
-    empty_types,
-    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
-    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
-    0);
-
-  sirius_physical_operator scan_consumer;
-  sirius_physical_operator distinct_consumer_p;
-  sirius_physical_operator distinct_consumer_q;
-  column_data_scan->add_next_port_after_sink({&scan_consumer, "scan_port"});
-  distinct->add_next_port_after_sink({&distinct_consumer_p, "distinct_p"});
-  distinct->add_next_port_after_sink({&distinct_consumer_q, "distinct_q"});
-
-  left_delim->column_data_scan = column_data_scan.get();
-  left_delim->distinct         = distinct.get();
-  left_delim->distinct_root    = std::move(distinct);
+  sirius_physical_operator scan_branch;
+  sirius_physical_operator distinct_branch;
+  left_delim->add_next_port_after_sink({&scan_branch, "default"});
+  left_delim->add_next_port_after_sink({&distinct_branch, "default"});
 
   sirius_pipeline_build_state build_state;
   build_state.set_pipeline_sink(pipeline, left_delim.get(), 0);
@@ -198,11 +162,7 @@ TEST_CASE("LEFT_DELIM_JOIN: concatenates column_data_scan then distinct ports",
   for (const auto& port : pipeline.get_next_ports_after_sink()) {
     ports.push_back(port);
   }
-  REQUIRE(ports.size() == 3);
-  CHECK(ports[0].next_operator == &scan_consumer);
-  CHECK(ports[0].next_operator_port_name == "scan_port");
-  CHECK(ports[1].next_operator == &distinct_consumer_p);
-  CHECK(ports[1].next_operator_port_name == "distinct_p");
-  CHECK(ports[2].next_operator == &distinct_consumer_q);
-  CHECK(ports[2].next_operator_port_name == "distinct_q");
+  REQUIRE(ports.size() == 2);
+  CHECK(ports[0].next_operator == &scan_branch);
+  CHECK(ports[1].next_operator == &distinct_branch);
 }

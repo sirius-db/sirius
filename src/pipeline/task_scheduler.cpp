@@ -177,6 +177,12 @@ std::future<void> task_scheduler::start_query()
   std::scoped_lock lock(_query_mutex);
   const auto& scans = _query->get_scan_operators();
 
+  // A query with no schedulable scan can never complete. Plan generation should have
+  // rejected it, so fail loudly instead of dereferencing an empty vector.
+  if (scans.empty()) {
+    throw std::runtime_error("task_scheduler: query has no schedulable scan sources");
+  }
+
   _task_creator->schedule(scans.front());
 
   return _completion_handler->get_awaitable();

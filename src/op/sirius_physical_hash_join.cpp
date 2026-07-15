@@ -59,6 +59,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <format>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -391,18 +392,7 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
   D_ASSERT(build_child.is_sink());
   D_ASSERT(!build_child.children.empty());
   auto& build_meta = meta_pipeline.create_child_meta_pipeline(current, build_child);
-
-  // For the inner join of a RIGHT_DELIM_JOIN, the subtree below CONCAT_build is
-  // synthetic scaffolding: partition_join runs inline in the delim join's sink and
-  // the DUMMY_SCAN placeholder carries no runtime data. Skip the recursion; build_meta
-  // still finalizes to a [CONCAT_build] single-op pipeline.
-  bool is_delim_inner = false;
-  if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(&op)) {
-    is_delim_inner = hj->is_delim_join_inner();
-  } else if (auto* nlj = dynamic_cast<sirius_physical_nested_loop_join*>(&op)) {
-    is_delim_inner = nlj->is_delim_join_inner();
-  }
-  if (!is_delim_inner) { build_meta.build(*build_child.children[0]); }
+  build_meta.build(*build_child.children[0]);
 
   op.children[0]->build_pipelines(current, meta_pipeline);
 
@@ -585,19 +575,19 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     } else {
       SIRIUS_LOG_WARN(
         "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: expected to pop a "
-        "batch from the default port but got none in operator " +
-        std::to_string(this->get_operator_id()));
+        "batch from the default port but got none in operator {}",
+        this->get_operator_id());
     }
     // Subsequent probe-only tasks share the hash table built under the initial
     // SCHEDULING task. They MUST run on the same GPU — tag with operator_id.
     return std::make_unique<partitioned_operator_data>(std::move(input_batch),
                                                        this->get_operator_id());
   } else {
-    SIRIUS_LOG_WARN(fmt::format(
+    SIRIUS_LOG_WARN(
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: invalid hash table "
       "build state {} in operator {}",
       static_cast<int>(_hash_table_build_state),
-      this->get_operator_id()));
+      this->get_operator_id());
     return nullptr;
   }
 }
@@ -1110,7 +1100,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       }
 
     } else {
-      throw std::runtime_error(fmt::format(
+      throw std::runtime_error(std::format(
         "In sirius_physical_hash_join::execute: invalid hash table build state {} in BUILD_PROBE "
         "mode for operator id {}",
         static_cast<int>(_hash_table_build_state),

@@ -39,9 +39,9 @@
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
-#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
+#include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
@@ -213,6 +213,51 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   return info;
 }
 
+//! Build the GPU scan source leaf for a table scan, wrapping it in a `DYNAMIC_FILTER` operator
+//! when a producing join wired runtime dynamic filters into this scan.
+//!
+//! Shared by every scan format; `InfoT` is the concrete `ingestible_table_info` subtype. The
+//! template body relies on two per-format properties it resolves statically: `InfoT` exposes a
+//! `sirius_dynamic_filters` channel field, and a `make_ingestible` overload accepts
+//! `unique_ptr<InfoT>`.
+//!
+//! `mode` selects the wrapped operator's post-decode capability and is the scan format's only
+//! behavioral input here: a parquet scan already evaluated AST-capable filters (zone maps)
+//! through the reader's `set_filter`, so it wraps in `membership_masks_only`; a duckdb-native
+//! scan has no read-time dynamic path, so it wraps in `include_ast_row_masks` to also evaluate
+//! zone maps row-wise. Filters are elided when no producer ultimately registered — this runs
+//! after the whole tree is built, so `has_producers()` is settled.
+template <typename InfoT>
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
+  std::unique_ptr<InfoT> info,
+  const sirius::op::sirius_physical_table_scan& scan,
+  const sirius::operator_params& op_params,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto dynamic_filters = scan.sirius_dynamic_filters;
+  if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
+  info->sirius_dynamic_filters = dynamic_filters;
+
+  auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
+    duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
+      scan.types, scan.estimated_cardinality, std::move(ingestible));
+
+  if (dynamic_filters) {
+    // Under a PARTITION parent this emits the [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as
+    // sink); in inline contexts both join the current pipeline.
+    auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+      scan.types,
+      scan.estimated_cardinality,
+      std::move(dynamic_filters),
+      op_params.dynamic_filter_keep_threshold,
+      mode);
+    dynamic_filter_op->children.push_back(std::move(leaf));
+    leaf = std::move(dynamic_filter_op);
+  }
+  return leaf;
+}
+
 //! Rewrite a TABLE_SCAN for `seq_scan` / `parquet_scan` / `read_parquet` /
 //! `sirius_read_parquet` (the internal S3 rewrite target): REPLACE the slot with the GPU
 //! leaf so it inherits the TABLE_SCAN's tree position and stays the source-leaf of the
@@ -233,35 +278,21 @@ void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   bool replace_slot = false;
   if (fn == "seq_scan") {
-    auto info       = build_duckdb_native_table_info(scan, op_params, context);
-    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
-    leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types, scan.estimated_cardinality, std::move(ingestible));
+    // The duckdb-native scan has no read-time dynamic-filter path, so its wrapped DYNAMIC_FILTER
+    // also evaluates AST-capable filters (zone maps) row-wise, not membership masks alone.
+    leaf = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
+                              scan,
+                              op_params,
+                              sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
-    auto info = build_parquet_table_info(scan, op_params);
-    // Dynamic filters: the ingestible consumes them for read-time row-group pruning; the
-    // DYNAMIC_FILTER wrapped above applies them post-decode. Elide both when no producer was
-    // wired — the wrap runs after the whole tree is built, so has_producers() is settled here.
-    auto dynamic_filters = scan.sirius_dynamic_filters;
-    if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
-    info->sirius_dynamic_filters = dynamic_filters;
-
-    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
-    leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types, scan.estimated_cardinality, std::move(ingestible));
-    if (dynamic_filters) {
-      // Under a PARTITION parent this emits the legacy [GPU_SCAN, DYNAMIC_FILTER] pipeline
-      // (filter as sink); in inline contexts both join the current pipeline.
-      auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-        scan.types,
-        scan.estimated_cardinality,
-        std::move(dynamic_filters),
-        op_params.dynamic_filter_keep_threshold);
-      dynamic_filter_op->children.push_back(std::move(leaf));
-      leaf = std::move(dynamic_filter_op);
-    }
+    // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped
+    // DYNAMIC_FILTER applies membership masks only.
+    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
+                              scan,
+                              op_params,
+                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else {
@@ -275,33 +306,43 @@ void wrap_table_scan_source(
   }
 }
 
-//! Attach a leaf CPU_SOURCE as the only child of a COLUMN_DATA_SCAN, EMPTY_RESULT, or
-//! DUMMY_SCAN node. A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk
-//! scan (filled at runtime) — left as-is.
-void wrap_cpu_source(sirius::op::sirius_physical_operator& source_op)
+//! Replace a COLUMN_DATA_SCAN, EMPTY_RESULT, or DUMMY_SCAN slot in place with a GPU_VALUES
+//! source. Unlike the scan-companion wraps, no leaf child and no extra pipeline is created:
+//! GPU_VALUES is a first-class in-pipeline source driven by the normal task creation
+//! loop, exactly like GPU_SCAN (same shape as wrap_table_scan_source's replace path).
+//! A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan (filled
+//! at runtime) — left as-is. The viability gates run BEFORE the collection is moved out so an
+//! unsupported type or oversized single-task source falls back to DuckDB CPU with its data intact.
+void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
+                             std::size_t max_source_bytes)
 {
-  if (!source_op.children.empty()) { return; }
+  if (!slot->children.empty()) { return; }
 
-  duckdb::unique_ptr<sirius::op::sirius_physical_cpu_source> leaf;
-  switch (source_op.type) {
+  duckdb::unique_ptr<sirius::op::sirius_physical_gpu_values> gpu_values;
+  switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN: {
-      auto& col_scan = source_op.Cast<sirius::op::sirius_physical_column_data_scan>();
+      auto& col_scan = slot->Cast<sirius::op::sirius_physical_column_data_scan>();
       if (!col_scan.collection) { return; }  // LEFT_DELIM_JOIN cached chunk scan — skip
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, std::move(col_scan.collection));
+      sirius::op::sirius_physical_gpu_values::throw_if_unsupported_types(slot->types);
+      sirius::op::sirius_physical_gpu_values::throw_if_collection_too_large(*col_scan.collection,
+                                                                            max_source_bytes);
+      gpu_values = duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
+        slot->types, slot->estimated_cardinality, std::move(col_scan.collection));
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN:
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, /*produce_single_row=*/true);
+      sirius::op::sirius_physical_gpu_values::throw_if_unsupported_types(slot->types);
+      gpu_values = duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
+        slot->types, slot->estimated_cardinality, /*produce_single_row=*/true);
       break;
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
-      leaf = duckdb::make_uniq<sirius::op::sirius_physical_cpu_source>(
-        source_op.types, source_op.estimated_cardinality, /*produce_single_row=*/false);
+      sirius::op::sirius_physical_gpu_values::throw_if_unsupported_types(slot->types);
+      gpu_values = duckdb::make_uniq<sirius::op::sirius_physical_gpu_values>(
+        slot->types, slot->estimated_cardinality, /*produce_single_row=*/false);
       break;
     default: return;
   }
-  source_op.children.push_back(std::move(leaf));
+  slot = std::move(gpu_values);
 }
 
 //! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
@@ -472,7 +513,7 @@ void insert_gpu_pipeline_operators_recursive(
 
 //! Replace a DELIM JOIN's `distinct_root` (the bare DISTINCT) with `DISTINCT_MERGE ->
 //! PARTITION_DISTINCT -> original DISTINCT`. The non-owning `delim_base.distinct` borrow stays
-//! valid — moving a unique_ptr never relocates the object — and the inline sink path uses it.
+//! valid — moving a unique_ptr never relocates the object — and the fan-out wiring uses it.
 void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
                          const sirius::operator_params& op_params)
 {
@@ -527,10 +568,6 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
   if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& right_delim = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
 
-    // Tag the bare DISTINCT so its `build_pipelines` is a no-op: the delim-join sink runs
-    // `distinct->execute`/`sink` inline, so it contributes nothing to any pipeline.
-    if (right_delim.distinct) { right_delim.distinct->set_owned_by_delim_join(true); }
-
     auto* internal_join = delim_base.join.get();
     if (internal_join && internal_join->children.size() >= 2) {
       auto* build_child = internal_join->children[1].get();
@@ -544,13 +581,6 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
         }
       }
     }
-  } else if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-    auto& left_delim = slot->Cast<sirius::op::sirius_physical_left_delim_join>();
-
-    // Same DISTINCT tagging as the RIGHT branch. The cached chunk scan
-    // (`left_delim.column_data_scan`) was already recorded in LEFT_DELIM_JOIN's constructor;
-    // it can't be recovered here — wrap_join already buried it under a CONCAT/PARTITION chain.
-    if (left_delim.distinct) { left_delim.distinct->set_owned_by_delim_join(true); }
   }
 }
 
@@ -574,12 +604,23 @@ void insert_gpu_pipeline_operators_recursive(
       wrap_table_scan_source(slot, op_params, context);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
-    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT: wrap_cpu_source(*slot); break;
+    case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
+      replace_with_gpu_values(slot,
+                              op_params.scan_task_batch_size == 0
+                                ? sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE
+                                : op_params.scan_task_batch_size);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
-      // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data flow, so a
-      // CPU_SOURCE leaf would only materialize a phantom pipeline; real DUMMY_SCANs keep it.
+      // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data (the delim join
+      // fans its input directly to PARTITION_build), so a GPU_VALUES replacement would only
+      // materialize a phantom source; real DUMMY_SCANs are replaced.
       auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
-      if (!dummy.is_delim_join_placeholder()) { wrap_cpu_source(*slot); }
+      if (!dummy.is_delim_join_placeholder()) {
+        replace_with_gpu_values(slot,
+                                op_params.scan_task_batch_size == 0
+                                  ? sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE
+                                  : op_params.scan_task_batch_size);
+      }
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:

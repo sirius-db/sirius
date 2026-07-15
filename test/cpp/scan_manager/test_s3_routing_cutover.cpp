@@ -646,11 +646,11 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
   auto q = make_empty_query();
   // The query intentionally has no scan operators: routed caches must still
   // advance once per query, matching the default ioctx's query-wide refresh.
-  manager.prepare_for_query(q);
+  manager.prepare_for_query(q, true);
   REQUIRE(routed_cache->query_epoch() == 1);
   REQUIRE(default_cache->query_epoch() == 1);
 
-  manager.prepare_for_query(q);
+  manager.prepare_for_query(q, true);
   REQUIRE(routed_cache->query_epoch() == 2);
   REQUIRE(default_cache->query_epoch() == 2);
 }
@@ -670,7 +670,7 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
   REQUIRE(datasource->io_ctx()->cache() == nullptr);
 
   auto q = make_empty_query();
-  REQUIRE_NOTHROW(manager.prepare_for_query(q));
+  REQUIRE_NOTHROW(manager.prepare_for_query(q, true));
 }
 
 TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][perf]")

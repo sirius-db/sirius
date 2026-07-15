@@ -90,6 +90,8 @@ Scripts are in `test/tpch_performance/`.
 
 ## Workflow H-A: Generate TPC-H Data
 
+**Generation gate — ALWAYS ask before generating.** Before generating anything (via `/dataset-manager` or the script below), ask the user whether the dataset already exists and where. A missing path is not proof the dataset doesn't exist — datasets are typically shared across worktrees (e.g. the main checkout's `test_datasets/`, not the current worktree's) or kept elsewhere on disk, so the user may already have it at a location you haven't checked. Generate only after the user explicitly confirms no existing dataset is available.
+
 Data generation is owned by the **`/dataset-manager`** skill — the single source of truth for both formats. Prefer delegating to it rather than calling the script directly. It produces:
 
 - **parquet** → `test_datasets/tpch_parquet_sf<SF>/` (a directory; built via `tpchgen-rs`)
@@ -182,7 +184,7 @@ Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). 
 
 **Round 1 — data & engine**
 1. **Data source** (`--data-source`) — `parquet` or `duckdb`.
-2. **Dataset** (`--input`) — the parquet **directory** or `.duckdb` **file** path. Confirm it exists; if it does not, ask whether to generate it via the `/dataset-manager` skill first (generation can take significant time and disk at large scale factors — **never auto-generate without asking**). For duckdb, clarify plain vs `--cluster` (sorted) if generating.
+2. **Dataset** (`--input`) — the parquet **directory** or `.duckdb` **file** path. ALWAYS ask the user where the dataset lives — never assume a path, and never treat a missing path as "needs generating": the dataset may already exist at a different location (see the generation gate in Workflow H-A). If the given path doesn't exist, report that and ask for the correct location; offer generation via `/dataset-manager` only after the user confirms no existing dataset is available (generation can take significant time and disk at large scale factors — **never auto-generate**). For duckdb, clarify plain vs `--cluster` (sorted) if generating.
 3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — which Sirius config YAML to use (required for any GPU engine). Do not guess the path; confirm it.
 4. **Engine** (`--engine`) — `gpu`, `cpu`, or `both` (default `both`).
 

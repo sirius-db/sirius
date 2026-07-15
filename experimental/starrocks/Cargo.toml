@@ -33,7 +33,7 @@ syn = { version = "2", features = ["full", "parsing"] }
 substrait = "0.63.0"
 substrait-explain = "0.7.0"
 thiserror = "2"
-thrift = "0.23"
+thrift = "0.24"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }

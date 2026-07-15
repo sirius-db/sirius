@@ -11,7 +11,7 @@ The GPU scan path is a single unified source operator, `sirius_gpu_scan_operator
 | Parquet (local or object-store) | `parquet_gpu_ingestible` | `parquet_ingestible_table_info` | `cudf::io::read_parquet` over row-group slices |
 | DuckDB-native `.duckdb` tables | `duckdb_native_gpu_ingestible` | `duckdb_native_ingestible_table_info` | GPU decode of per-row-group storage segments |
 
-The pipeline converter rewrites a DuckDB table scan into a `GPU_SCAN` source: it lowers the bind data into the appropriate `ingestible_table_info`, calls the free `make_ingestible(...)` factory to build the `gpu_ingestible`, constructs the operator carrying it, and inserts it at `operators[0]` of the pipeline. No separate metadata pipeline is created.
+The pipeline converter rewrites a DuckDB table scan into a `GPU_SCAN` source: it lowers the bind data into the appropriate `ingestible_table_info`, calls the free `make_ingestible(...)` factory to build the `gpu_ingestible`, constructs the operator carrying it, and inserts it at `operators[0]` of the pipeline. When a dynamic-filter channel is wired to the scan, a `DYNAMIC_FILTER` operator sits directly above it (see [Dynamic Filters](dynamic-filters.md)). No separate metadata pipeline is created.
 
 Before a query runs, `sirius_scan_manager::prepare_for_query` walks the plan's `GPU_SCAN` operators. For each it either (a) matches a pinned-table cache entry and serves the scan from cached batches, or (b) builds a `split_provider` over the operator's ingestible. A single per-query sequencer (`load_balancing_scan_batch_coalescer`) drives metadata production, coalesces the output into right-sized data batches, balances each batch onto a GPU, and pushes the resulting splits onto each operator's `split_connector`.
 
@@ -39,7 +39,7 @@ The operator handles two split shapes transparently, both delivered as `scan_ope
 
 `no_history_peak_memory_estimate()` returns the input size for resident (cached) inputs. For fresh reads it reserves 8x the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint.
 
-> The `DUCKDB_SCAN` and `PARQUET_SCAN` physical operator types and the `sirius_physical_table_scan` / `sirius_physical_duckdb_scan` / `sirius_physical_parquet_scan` wrappers still exist for the CPU / DuckDB-source path, but the GPU read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
+> `sirius_physical_table_scan` (`TABLE_SCAN`) remains only as the plan-time carrier that `wrap_table_scan_source` consumes; the read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
 
 ## gpu_ingestible
 
@@ -183,7 +183,7 @@ A lock-protected queue of pre-built splits. The producer (sequencer) enqueues vi
 
 ## Pinned Tables
 
-**Files:** `src/include/pin_table.hpp`, `src/pin_table.cpp`; pinned-entry storage + cache matching in `src/include/scan_manager/sirius_scan_manager.hpp` and `src/scan_manager/sirius_scan_manager.cpp`.
+**Files:** `src/include/pin_table.hpp`, `src/pin_table.cpp`; pinned-entry storage + cache matching in `src/include/scan_manager/sirius_scan_manager.hpp` and `src/scan_manager/sirius_scan_manager.cpp`; zone-map capture and pruning in `src/include/scan_manager/pinned_chunk_stats.hpp` and `src/scan_manager/pinned_chunk_stats.cpp`.
 
 The `pin_table` table function pre-loads a table's columns into memory so subsequent scans of the same source bypass file I/O entirely. It supports both source formats and two memory tiers.
 
@@ -214,7 +214,7 @@ Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_bat
 
 ### Storage and matching
 
-Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a `cache_entry_info` (the cache identity + column layout) plus the cached batches: `data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one `host_data_representation` per batch, sliced by column at scan time) for the HOST tier.
+Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a `cache_entry_info` (the cache identity + column layout) plus the cached batches: `data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one `host_data_representation` per batch, sliced by column at scan time) for the HOST tier. It also carries a `pinned_zone_maps` sidecar — the pin-time per-column, per-chunk min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
 
 `cache_entry_info` captures format identity — the resolved parquet **file set**, or the duckdb **catalog.schema.table** — plus the cached columns (by storage index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same format, same identity, and a **column superset** of the scan's request. A parquet pin never serves a duckdb scan or vice-versa.
 
@@ -223,6 +223,35 @@ During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` 
 ### Re-pin semantics
 
 For the GPU tier, `insert_pinned_entry` merges into an existing entry when the row count matches (adding only columns not already cached; per-chunk memory-space placement must match) and replaces it otherwise. The HOST tier always replaces, since each host chunk already holds every column.
+
+### Zone maps
+
+With `enable_pinned_zone_map_pruning` enabled (the default), `pin_table` captures per-chunk
+min/max statistics and cached scans use them to skip chunks that cannot match a pushed-down
+filter. The option is available through DuckDB `SET` and YAML under `sirius.operator_params`.
+
+**Capture and types.** Both pin tiers run one `cudf::minmax` reduction per supported column and
+chunk before the data is stored on the GPU or converted to HOST memory. Supported types are
+signed and unsigned integers through 64 bits, `DATE` decoded as days, and `TIMESTAMP` decoded as
+microseconds. Other or physically mismatched types, empty or all-null column chunks, and
+results without valid bounds have no usable statistics and are never pruned. CUDA failures
+abort the pin.
+
+**Pruning.** During query preparation, static pushed-down table filters are checked against the
+statistics with DuckDB's `CheckStatistics`. Supported filters include typed comparisons, `IN`,
+`IS NULL`, `IS NOT NULL`, and safe `AND`/`OR` combinations. Missing statistics, unsupported
+filters, type mismatches, and runtime dynamic filters keep the chunk. Surviving chunks still pass
+through the normal GPU filter; pruning a HOST-tier chunk also avoids its H2D copy.
+
+**Sentinel chunk.** If every chunk is proven empty, chunk 0 is still served so the scan can signal
+pipeline completion; the normal GPU filter then removes its rows.
+
+**Statless entries and re-pinning.** Disabling the option before pinning skips the extra GPU work
+and creates an entry without zone maps. Turning the option on later does not retrofit statistics.
+A HOST re-pin replaces the entry. For an in-place GPU merge, the re-pin must cover every cached
+column and pass the normal merge-alignment checks; a strict subset cannot restore statistics.
+Unpinning and then re-pinning all required columns is the safest recovery. Merging a new GPU
+column while capture is disabled also drops the entry's existing zone maps.
 
 ## Batch Coalescing
 
@@ -287,7 +316,7 @@ Stats-pruned row groups are skipped before any segment metadata is requested. Th
 
 ## Row Group Pruning
 
-Both GPU scan formats drop row groups that a pushed-down filter proves cannot contain a matching row, before those row groups are read or decoded.
+Both GPU scan formats drop row groups that a pushed-down filter proves cannot contain a matching row, before those row groups are read or decoded. Pinned tables get the same treatment at chunk granularity — see [Zone maps](#zone-maps).
 
 ### Parquet path
 
@@ -307,7 +336,7 @@ The DuckDB-native scan prunes row groups using DuckDB's own statistics machinery
 
 This runs entirely from `PartitionRowGroup` statistics — no segment metadata is needed — so a pruned row group is skipped **before its segments are walked, staged, copied to the GPU, or decoded**. If every row group is pruned, the native path refuses up front and the query falls back to DuckDB CPU before the async scan starts.
 
-Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native metadata walk. DuckDB `DYNAMIC_FILTER` entries are excluded because Sirius runtime dynamic filters use a separate `sirius_dynamic_filter_set` channel and the parquet reader/post-decode consumer paths described in [Dynamic Filters](dynamic-filters.md); they are not translated through this static `TableFilterSet` path. This metadata separation does not imply one universal execution order: the producing join's immediate probe scan starts after build-port publication, while a base scan reached transitively through an intervening join may materialize early splits before publication and samples the channel at its per-split checkpoints. See [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing). The payoff from the static statistics walk is data-clustering-dependent — it costs almost nothing when statistics cannot help and is multiplicative when the table is ordered such that a filter eliminates most row groups.
+Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native metadata walk. DuckDB `DYNAMIC_FILTER` entries are excluded because Sirius runtime dynamic filters use a separate `sirius_dynamic_filter_set` channel and their own scan-consumer paths — the parquet reader's `set_filter` and the post-decode `DYNAMIC_FILTER` operator (the duckdb-native scan consumes post-decode only) — described in [Dynamic Filters](dynamic-filters.md); they are not translated through this static `TableFilterSet` path. This metadata separation does not imply one universal execution order: the producing join's immediate probe scan starts after build-port publication, while a base scan reached transitively through an intervening join may materialize early splits before publication and samples the channel at its per-split checkpoints. See [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing). The payoff from the static statistics walk is data-clustering-dependent — it costs almost nothing when statistics cannot help and is multiplicative when the table is ordered such that a filter eliminates most row groups.
 
 ## Sirius IO Subsystem
 
@@ -460,7 +489,8 @@ The converter builds a `gpu_ingestible` and parks it on the `GPU_SCAN` operator.
 | `src/include/scan_manager/balancing_strategy.hpp` | Device-placement policy interface |
 | `src/include/scan_manager/round_robin_strategy.hpp` / `.cpp` | Round-robin GPU placement |
 | `src/include/scan_manager/config.hpp` | `scan_manager_config` |
+| `src/include/scan_manager/pinned_chunk_stats.hpp` / `.cpp` | Pin-time per-chunk min/max capture, filter-safety check + prune probe |
 | `src/include/pin_table.hpp` / `src/pin_table.cpp` | `pin_table` / `unpin_table` + pin materialization |
 | `src/include/op/scan/cached_ranges.hpp` / `src/op/scan/cached_ranges.cpp` | Sorted byte-range coalescing/lookup |
-| `src/include/op/scan/cpu_source_task.hpp` / `src/op/scan/cpu_source_task.cpp` | CPU-source scan task (ColumnDataCollection / empty / dummy) |
+| `src/include/op/sirius_physical_gpu_values.hpp` / `src/op/sirius_physical_gpu_values.cpp` | `GPU_VALUES` source for `ColumnDataCollection`, empty-result, and dummy-scan inputs |
 | `src/op/scan/scan_utils.cpp` | Row group pruning, filter expression conversion |

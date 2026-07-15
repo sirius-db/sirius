@@ -299,12 +299,9 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   //     scan_cached_operator_data emitted per chunk by cached_split_provider
   //     drives a pipeline_task on the chunk's home GPU, so this is the
   //     correct emission for the cached-pin routing gate.
-  //   - duckdb_scan_executor.cpp:264 emits "scan_batch assigned to GPU N
-  //     batch_id=K" — fires ONLY for the DuckDB-attach scan path
-  //     (cpu_source_task / duckdb_scan_task). The pinned-parquet path goes
-  //     through sirius_gpu_parquet_scan_operator + pipeline_task, NOT
-  //     through duckdb_scan_executor, so scan_ids is empty under this
-  //     fixture by design.
+  //   - duckdb_scan_executor's "scan_batch assigned to GPU N batch_id=K"
+  //     emission no longer exists (that executor was deleted), so scan_ids
+  //     is empty under this fixture by design.
   //
   // The plan-spec grep gate ("scan_ids" pattern) is documentation drift —
   // the audit emission shape was discovered at runtime to be pipeline_ids
