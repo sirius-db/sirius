@@ -317,7 +317,15 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             resource_tree,
             unique_operator_names,
             quantity_specs: [
-                ("capacity_bytes".into(), QuantitySpec::bytes()),
+                // SI decimal prefixes (kB/MB/GB) rather than the IEC default:
+                // rounder numbers read better on the DAG bars and tooltips.
+                (
+                    "capacity_bytes".into(),
+                    QuantitySpec {
+                        occupancy_prefix: quent_ui::quantity::PrefixSystem::Si,
+                        ..QuantitySpec::bytes()
+                    },
+                ),
                 ("capacity_entries".into(), QuantitySpec::unit()),
                 ("unit".into(), QuantitySpec::unit()),
             ]
