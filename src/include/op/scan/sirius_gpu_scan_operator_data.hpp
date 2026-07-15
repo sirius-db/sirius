@@ -141,6 +141,11 @@ class scan_operator_input : public op::operator_data {
   /// resident branch. Self-contained: the mask's owning words pointer keeps
   /// the storage alive for the split's lifetime.
   scan_manager::mvcc_chunk_mask mvcc_keep_mask;
+  /// True when the op's ingestible will run a row-filter expression against
+  /// this split's materialized table (post_filter_and_project filters by
+  /// copy). Stamped by drain_cached_provider on resident splits; scan_info
+  /// splits fold filter costs into their own estimates instead.
+  bool row_filter_pending{false};
 };
 
 }  // namespace sirius::op::scan

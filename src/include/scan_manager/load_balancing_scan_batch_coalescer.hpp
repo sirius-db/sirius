@@ -110,6 +110,10 @@ class load_balancing_scan_batch_coalescer {
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
     std::unique_ptr<databatch_provider> batch_provider;
+    /// Whether the op's ingestible applies a row-filter expression to cached
+    /// batches; stamped onto each drained split so its working-set estimate
+    /// covers the filter-by-copy peak.
+    bool row_filter_pending{false};
   };
 
   load_balancing_scan_batch_coalescer()                                           = default;
@@ -132,16 +136,17 @@ class load_balancing_scan_batch_coalescer {
 
   /// Drain @p provider into @p connector: pull batches until the provider is
   /// exhausted (or @p stop fires), wrapping each as a resident
-  /// scan_operator_input. Always closes the connector on exit — with the
-  /// pending exception when the provider throws, so the consumer's
-  /// get_next_split() rethrows a clean query error instead of blocking
-  /// forever (the dispatcher swallows task exceptions, so an unclosed
-  /// connector is a silent query hang). Static and public so the drain
-  /// behavior is unit-testable against a fake provider; production use is
-  /// the sequencer's cached-slot path.
+  /// scan_operator_input with @p row_filter_pending stamped on. Always closes
+  /// the connector on exit — with the pending exception when the provider
+  /// throws, so the consumer's get_next_split() rethrows a clean query error
+  /// instead of blocking forever (the dispatcher swallows task exceptions, so
+  /// an unclosed connector is a silent query hang). Static and public so the
+  /// drain behavior is unit-testable against a fake provider; production use
+  /// is the sequencer's cached-slot path.
   static void drain_cached_provider(databatch_provider& provider,
                                     split_connector& connector,
-                                    std::stop_token const& stop);
+                                    std::stop_token const& stop,
+                                    bool row_filter_pending);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when

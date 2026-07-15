@@ -237,7 +237,8 @@ TEST_CASE("drain_cached_provider forwards every batch then closes",
 
   split_connector connector;
   std::stop_source stop;
-  load_balancing_scan_batch_coalescer::drain_cached_provider(provider, connector, stop.get_token());
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), /*row_filter_pending=*/false);
 
   for (int i = 0; i < 3; ++i) {
     auto split = connector.get_next_split();
@@ -245,6 +246,7 @@ TEST_CASE("drain_cached_provider forwards every batch then closes",
     auto* input = dynamic_cast<sirius::op::scan::scan_operator_input*>(split->get());
     REQUIRE(input != nullptr);
     REQUIRE(input->is_resident());
+    REQUIRE_FALSE(input->row_filter_pending);  // filter-less op: nothing stamped
   }
   REQUIRE_FALSE(connector.get_next_split().has_value());  // closed and drained
 }
@@ -262,7 +264,7 @@ TEST_CASE("drain_cached_provider surfaces a provider exception instead of hangin
   // Must not propagate: the dispatcher would swallow it and leave the
   // connector open forever (the old silent-hang bug).
   REQUIRE_NOTHROW(load_balancing_scan_batch_coalescer::drain_cached_provider(
-    provider, connector, stop.get_token()));
+    provider, connector, stop.get_token(), /*row_filter_pending=*/false));
 
   // The stored error takes precedence over queued splits: every consumer
   // pull now rethrows the producer failure (instead of a partial stream
@@ -271,7 +273,7 @@ TEST_CASE("drain_cached_provider surfaces a provider exception instead of hangin
   REQUIRE_THROWS_AS(connector.get_next_split(), std::runtime_error);
 }
 
-TEST_CASE("drain_cached_provider forwards the mvcc keep-mask onto each split",
+TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag onto each split",
           "[cached_serving][scan_manager]")
 {
   auto& e    = env();
@@ -282,7 +284,8 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask onto each split",
 
   split_connector connector;
   std::stop_source stop;
-  load_balancing_scan_batch_coalescer::drain_cached_provider(provider, connector, stop.get_token());
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), /*row_filter_pending=*/true);
 
   auto first = connector.get_next_split();
   REQUIRE(first.has_value());
@@ -291,12 +294,14 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask onto each split",
   // Same word storage, same extent: the words were forwarded, not rebuilt.
   REQUIRE(in0->mvcc_keep_mask.words == mask0.words);
   REQUIRE(in0->mvcc_keep_mask.row_count == mask0.row_count);
+  REQUIRE(in0->row_filter_pending);
 
   auto second = connector.get_next_split();
   REQUIRE(second.has_value());
   auto* in1 = dynamic_cast<sirius::op::scan::scan_operator_input*>(second->get());
   REQUIRE(in1 != nullptr);
   REQUIRE_FALSE(in1->mvcc_keep_mask.has_mask());
+  REQUIRE(in1->row_filter_pending);  // per-op flag: stamped on every split
 
   REQUIRE_FALSE(connector.get_next_split().has_value());
 }
@@ -348,16 +353,16 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
   }
 }
 
-TEST_CASE("masked resident splits report the filter-copy working-set peak",
+TEST_CASE("masked and filtered resident splits report the filter-copy working-set peak",
           "[cached_serving][scan_manager]")
 {
   auto& e    = env();
   auto batch = make_test_batch(e, 64);
 
-  // Unmasked resident chunks serve a zero-copy view: working set == data.
-  sirius::op::scan::scan_operator_input unmasked(batch);
-  REQUIRE(unmasked.get_estimated_working_set_size_in_bytes() ==
-          unmasked.get_estimated_size_in_bytes());
+  // Unmasked, unfiltered resident chunks serve a zero-copy view: working set
+  // == data.
+  sirius::op::scan::scan_operator_input plain(batch);
+  REQUIRE(plain.get_estimated_working_set_size_in_bytes() == plain.get_estimated_size_in_bytes());
 
   // Masked chunks are filtered by copy: input + output coexist at peak, plus
   // the BOOL8 expansion (1 B/row) and the uploaded bitmask words.
@@ -365,8 +370,18 @@ TEST_CASE("masked resident splits report the filter-copy working-set peak",
   masked.mvcc_keep_mask  = make_test_mask(64);
   auto const batch_bytes = masked.get_estimated_size_in_bytes();
   REQUIRE(batch_bytes > 0);
-  REQUIRE(masked.get_estimated_working_set_size_in_bytes() ==
-          2 * batch_bytes + 64 + masked.mvcc_keep_mask.view().size_bytes());
+  auto const masked_peak = 2 * batch_bytes + 64 + masked.mvcc_keep_mask.view().size_bytes();
+  REQUIRE(masked.get_estimated_working_set_size_in_bytes() == masked_peak);
+
+  // A pending row filter is also a filter-by-copy: input + compacted output.
+  sirius::op::scan::scan_operator_input filtered(batch);
+  filtered.row_filter_pending = true;
+  REQUIRE(filtered.get_estimated_working_set_size_in_bytes() == 2 * batch_bytes);
+
+  // Masked + filtered runs its phases sequentially and stays inside the
+  // masked envelope.
+  masked.row_filter_pending = true;
+  REQUIRE(masked.get_estimated_working_set_size_in_bytes() == masked_peak);
 }
 
 TEST_CASE("drain_cached_provider honors a pre-stopped token", "[cached_serving][scan_manager]")
@@ -378,7 +393,8 @@ TEST_CASE("drain_cached_provider honors a pre-stopped token", "[cached_serving][
   split_connector connector;
   std::stop_source stop;
   stop.request_stop();
-  load_balancing_scan_batch_coalescer::drain_cached_provider(provider, connector, stop.get_token());
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), /*row_filter_pending=*/false);
 
   REQUIRE(provider.served == 0);                          // nothing pulled after stop
   REQUIRE_FALSE(connector.get_next_split().has_value());  // still closed: consumer unblocked

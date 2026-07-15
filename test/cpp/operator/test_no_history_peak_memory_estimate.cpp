@@ -196,6 +196,10 @@ TEST_CASE("GPU scan adds filter-only decode bytes to its no-history estimate",
         1400);
   CHECK(scan.no_history_peak_memory_estimate({1, 0, operator_data_type::GPU_SCAN, false, 600}) ==
         600);
+  // Resident chunks skip the 8x fresh-read heuristic but still cover their
+  // mask/filter copy peak, which flows in through the working-set estimate.
   CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, true, 700}) ==
-        100);
+        700);
+  CHECK(scan.no_history_peak_memory_estimate({1, 800, operator_data_type::GPU_SCAN, true, 700}) ==
+        800);
 }

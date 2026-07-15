@@ -556,7 +556,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
   const bool input_resident = ls._input_data && ls._input_data->is_resident();
   auto working_set_bytes    = input_basis;
-  if (input_type == op::operator_data_type::GPU_SCAN && !input_resident && ls._input_data) {
+  // Resident (cached) scan inputs report mask/filter copy peaks through their
+  // working-set estimate too — it seeds the cold-start guess below via
+  // input_stats, so do not gate this on residency.
+  if (input_type == op::operator_data_type::GPU_SCAN && ls._input_data) {
     working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
@@ -567,6 +570,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
 
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
+    // Non-resident scans keep the per-split decode floor even with history;
+    // resident (cached) scans trust the learned peak — their mask/filter
+    // model only seeds the cold start, and a warm undershoot is repaired by
+    // record_on_failure + retry.
     if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }
