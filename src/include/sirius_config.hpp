@@ -31,6 +31,9 @@ namespace sirius {
 
 namespace config {
 
+// Default values — these are the fallbacks used when adaptive GPU tuning
+// is not available (e.g. before the GPU is initialized). The actual runtime
+// values are computed by operator_params::init_adaptive() based on VRAM.
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
@@ -116,6 +119,23 @@ struct operator_params {
   /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
   /// [0, 1]; 1.0 keeps filtering always on.
   double dynamic_filter_keep_threshold = 0.9;
+
+  /// Initialize tuning parameters adaptively based on the current GPU's VRAM.
+  /// Called once at engine startup. On ROCm, queries hipMemGetInfo; on NVIDIA,
+  /// queries cudaMemGetInfo. All values can still be overridden by the .yaml
+  /// config or DuckDB SET commands after this call.
+  ///
+  /// Scaling rules (for a GPU with V bytes of VRAM):
+  ///   scan_task_batch_size   = clamp(V * 0.10, 128MB, 4GB)
+  ///   hash_partition_bytes   = clamp(V * 0.08, 128MB, 2GB)
+  ///   concat_batch_bytes     = clamp(V * 0.10, 128MB, 4GB)
+  ///   sort_sample_bytes      = clamp(V * 0.05, 64MB, 1GB)
+  ///   max_build_hash_table   = clamp(V * 0.08, 128MB, 2GB)
+  ///   max_sort_partition_fraction = 0.33 (unchanged — already a fraction)
+  ///
+  /// On an 8GB GPU: batch=800MB, hash_part=640MB, build=640MB
+  /// On a 192GB GPU: batch=4GB (capped), hash_part=2GB (capped), build=2GB (capped)
+  void init_adaptive();
 };
 
 struct telemetry_config {

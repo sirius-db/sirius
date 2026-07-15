@@ -261,6 +261,27 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
       uint64_t{1},
       total_bytes / s_partition_size + static_cast<uint64_t>(total_bytes % s_partition_size != 0)));
   }
+
+  // VRAM-aware partition cap: if the total data exceeds 40% of available VRAM,
+  // increase partition count so each partition fits in ~30% of VRAM. This
+  // prevents OOM on small-VRAM GPUs (e.g. 8GB consumer cards running TPC-H
+  // Q21 with a 3-table join). On large-VRAM GPUs (MI300), the data typically
+  // fits in 40% of VRAM, so this doesn't trigger and partitions stay at 1.
+  {
+    size_t free_vram = 0, total_vram = 0;
+    if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && total_vram > 0) {
+      size_t const vram_40pct = total_vram * 2 / 5;  // 40% of total VRAM
+      if (total_bytes > vram_40pct) {
+        size_t const per_partition_budget = std::max(total_vram * 3 / 10, size_t{128 * 1024 * 1024});
+        int vram_partitions = static_cast<int>(
+          (total_bytes + per_partition_budget - 1) / per_partition_budget);
+        num_partitions = std::max(num_partitions, vram_partitions);
+        // Cap at 32 partitions (safety)
+        num_partitions = std::min(num_partitions, 32);
+      }
+    }
+  }
+
   // Multi-GPU floor: if the input is big enough to justify using the second
   // GPU, force at least num_gpus partitions so partition-based operators
   // (hash_join, merge_group_by) get work on every GPU. Below the small-table
