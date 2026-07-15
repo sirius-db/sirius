@@ -500,6 +500,13 @@ std::unique_ptr<duckdb::MaterializedQueryResult> require_query_ok(duckdb::Connec
     static_cast<duckdb::MaterializedQueryResult*>(result.release()));
 }
 
+void query_or_throw_on_error(duckdb::Connection& con, std::string const& sql)
+{
+  auto result = con.Query(sql);
+  if (!result) { throw std::runtime_error("DuckDB returned a null query result"); }
+  if (result->HasError()) { result->ThrowError(); }
+}
+
 std::string gpu_execution_sql(std::string const& inner_sql)
 {
   std::string escaped;
@@ -711,6 +718,19 @@ sirius::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std::s
   auto* rest_ctx = dynamic_cast<sirius::io::rest::rest_ioctx*>(datasource->io_ctx().get());
   REQUIRE(rest_ctx != nullptr);
   return *rest_ctx;
+}
+
+void require_s3_keys_listed(s3_sql_fixture& fixture,
+                            s3_test_env const& env,
+                            std::vector<std::string_view> const& expected_keys)
+{
+  auto& rest  = require_rest_ioctx(fixture, s3_uri(env.bucket, "parquet/nation.parquet"));
+  auto listed = rest.list_objects(env.bucket, "glob-enc/");
+  for (auto const expected : expected_keys) {
+    INFO("expected LIST key=" << expected);
+    REQUIRE(std::any_of(
+      listed.begin(), listed.end(), [&](auto const& entry) { return entry.key == expected; }));
+  }
 }
 
 std::uint64_t rest_chunk_get_count(s3_sql_fixture& fixture, std::string const& uri)
@@ -2486,6 +2506,93 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
 }
 
+TEST_CASE("transparent S3 glob rejects a matched percent-encoded key instead of opening its decoy",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/a%2Fb.parquet", "glob-enc/a/b.parquet"});
+
+  auto const s3_query = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/a*.parquet");
+
+  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, s3_query),
+                    Catch::Contains("percent-encoded"));
+}
+
+TEST_CASE("transparent S3 glob opens keys containing URI fragment and query delimiters",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/x#1.parquet", "glob-enc/y?v.parquet"});
+
+  for (auto const pattern :
+       {std::string_view{"glob-enc/x*.parquet"}, std::string_view{"glob-enc/y*.parquet"}}) {
+    DYNAMIC_SECTION("pattern=" << pattern)
+    {
+      auto const s3_query    = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, pattern);
+      auto const local_query = "SELECT count(*) FROM " + local_parquet_glob_scan(*env, pattern);
+      compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+    }
+  }
+}
+
+TEST_CASE("transparent S3 glob opens a key containing a literal percent byte",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/100%.parquet"});
+
+  auto const s3_query =
+    "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/100*.parquet");
+  auto const local_query =
+    "SELECT count(*) FROM " + local_parquet_glob_scan(*env, "glob-enc/100*.parquet");
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob rejects a matched Hive-style percent-encoded key",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/t/col=a%20b/p0.parquet"});
+
+  auto const s3_query =
+    "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/t/*/*.parquet");
+
+  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, s3_query),
+                    Catch::Contains("percent-encoded"));
+}
+
+TEST_CASE("transparent S3 glob ignores percent-encoded keys outside the match",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/a%2Fb.parquet", "glob-enc/y?v.parquet"});
+
+  auto const pattern     = std::string_view{"glob-enc/y*.parquet"};
+  auto const s3_query    = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, pattern);
+  auto const local_query = "SELECT count(*) FROM " + local_parquet_glob_scan(*env, pattern);
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
 TEST_CASE("transparent S3 glob preserves hive partition columns",
           "[s3][integration][sql][gpu_execution][transparent][glob]")
 {
@@ -2552,7 +2659,7 @@ TEST_CASE("transparent S3 glob remains correct with a straddled footer-probe win
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
 }
 
-TEST_CASE("transparent S3 glob warm scan skips native footer reads",
+TEST_CASE("transparent S3 glob warm scan skips blocking host reads",
           "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
 {
   auto env = load_s3_test_env();

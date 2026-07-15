@@ -9,6 +9,7 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/uri_parser.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
@@ -288,6 +289,34 @@ class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
 };
 
 }  // namespace
+
+TEST_CASE("S3 LIST keys survive the URI embedding escape seam", "[s3][filesystem][glob]")
+{
+  for (auto const key : {std::string_view{"a%2Fb.p"},
+                         std::string_view{"x#1.p"},
+                         std::string_view{"y?v.p"},
+                         std::string_view{"100%.p"},
+                         std::string_view{"col=a%20b/p0.p"}}) {
+    DYNAMIC_SECTION("key=" << key)
+    {
+      auto const escaped = sirius::io::s3::escape_s3_key_for_uri(key);
+      auto const parsed  = sirius::io::parse("s3://bkt/" + escaped);
+
+      CHECK(parsed.host == "bkt");
+      CHECK(parsed.path == key);
+    }
+  }
+}
+
+TEST_CASE("S3 LIST key URI escaping preserves ordinary keys byte for byte",
+          "[s3][filesystem][glob]")
+{
+  for (auto const key : {std::string_view{"plain.parquet"},
+                         std::string_view{"year=2026/part 0.parquet"},
+                         std::string_view{"nested/path/file.parquet"}}) {
+    DYNAMIC_SECTION("key=" << key) { CHECK(sirius::io::s3::escape_s3_key_for_uri(key) == key); }
+  }
+}
 
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
 {

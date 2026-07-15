@@ -332,6 +332,44 @@ duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path
   return expand_glob(path, sirius_ctx->get_scan_manager());
 }
 
+namespace {
+
+// True when @p key contains '%' followed by two hex digits. Such keys cannot
+// be represented faithfully today: DuckDB URL-decodes hive partition values
+// (and only those) from the path exactly once, so the escaped path text this
+// file emits would make bind-time pruning, the GPU-projected value, and the
+// local-FS oracle all disagree — silent wrong results. expand_glob fails
+// loudly on them instead; '#', '?' and bare-'%' keys round-trip exactly and
+// stay supported. Full support is a tracked follow-up (a path/URI contract
+// change), at which point this guard is removed.
+bool key_has_percent_encoded_sequence(std::string_view key)
+{
+  auto const is_hex = [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+  };
+  for (std::size_t i = 0; i + 2 < key.size(); ++i) {
+    if (key[i] == '%' && is_hex(key[i + 1]) && is_hex(key[i + 2])) { return true; }
+  }
+  return false;
+}
+
+}  // namespace
+
+std::string escape_s3_key_for_uri(std::string_view key)
+{
+  std::string out;
+  out.reserve(key.size());
+  for (char const c : key) {
+    switch (c) {
+      case '%': out += "%25"; break;
+      case '#': out += "%23"; break;
+      case '?': out += "%3F"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
 duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::string const& pattern,
   sirius::scan_manager::sirius_scan_manager& scan_manager,
@@ -389,12 +427,24 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
           matched = match_glob_no_crawl(key_segments, pattern_segments);
         }
         if (!matched) { continue; }
+        // Match-scoped fail-loud guard (see key_has_percent_encoded_sequence):
+        // unmatched keys under the same prefix stay harmless.
+        if (key_has_percent_encoded_sequence(entry.key)) {
+          throw duckdb::IOException(
+            "[sirius_httpfs] glob '" + pattern + "' matched S3 key '" + entry.key +
+            "' containing a percent-encoded sequence; hive/filename semantics for such keys are "
+            "not preserved over s3:// yet — rename the object or exclude it from the glob");
+        }
         if (matches.size() >= match_cap) {
           throw duckdb::IOException("[sirius_httpfs] glob '" + pattern + "' matched more than " +
                                     std::to_string(match_cap) +
                                     " objects — narrow the glob prefix");
         }
-        duckdb::OpenFileInfo info("s3://" + std::string{bucket} + "/" + entry.key);
+        // Matching runs on the literal key bytes above; only the URI embedding
+        // escapes them, so the later parse() of this path restores the exact
+        // key (see escape_s3_key_for_uri).
+        duckdb::OpenFileInfo info("s3://" + std::string{bucket} + "/" +
+                                  escape_s3_key_for_uri(entry.key));
         if (entry.size <= static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max())) {
           info.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
           info.extended_info->options["file_size"] =

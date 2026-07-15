@@ -72,10 +72,15 @@ class sirius_httpfs : public duckdb::FileSystem {
 
   /// Extended open: when @p file carries a @c "file_size" option (a
   /// non-negative BIGINT — the LIST-provided size @ref Glob attaches), the
-  /// datasource is opened through the known-size seam with ZERO network (no
-  /// HEAD). A missing / wrong-typed / negative option silently falls back to
-  /// the plain open path — third-party-populated @c OpenFileInfo must not
-  /// break the open.
+  /// datasource is opened through the parquet-footer-probe seam: ONE
+  /// suffix-range GET resolves the size from Content-Range (no HEAD) and
+  /// stashes the trailing bytes for the binder's footer reads. The size value
+  /// itself only discriminates this extended open from the plain fallback —
+  /// the probe re-derives the authoritative size from the response. A missing /
+  /// wrong-typed / negative option silently falls back to the plain open path
+  /// (HEAD, then ranged GETs) — third-party-populated @c OpenFileInfo must not
+  /// break the open. Non-parquet files opened this way still read correctly;
+  /// they just pay for a stashed tail that no footer read consumes.
   duckdb::unique_ptr<duckdb::FileHandle> OpenFileExtended(
     const duckdb::OpenFileInfo& file,
     duckdb::FileOpenFlags flags,
@@ -96,8 +101,16 @@ class sirius_httpfs : public duckdb::FileSystem {
   /// OpenFile: requires a resolvable @c ClientContext, @c gpu_execution
   /// enabled, and no active CPU-fallback replay. Each match carries its
   /// LIST-provided size in the extended info so the subsequent open needs no
-  /// HEAD. Zero matches yield an empty vector (DuckDB raises its standard
-  /// no-files error).
+  /// HEAD (one suffix-range GET instead — see @ref OpenFileExtended). Match
+  /// paths embed the literal LIST key via @ref escape_s3_key_for_uri: keys
+  /// containing @c #, @c ? or a bare @c % show the escaped form in the path
+  /// text (and in the @c filename virtual column) but open the exact object.
+  /// A matched key containing a percent-encoded sequence (@c % followed by
+  /// two hex digits) throws instead — DuckDB URL-decodes hive partition
+  /// values from the path once, so no single path text can serve both the
+  /// open and hive semantics for such keys; full support is a tracked
+  /// follow-up. Zero matches yield an empty vector (DuckDB raises its
+  /// standard no-files error).
   duckdb::vector<duckdb::OpenFileInfo> Glob(const std::string& path,
                                             duckdb::FileOpener* opener = nullptr) override;
 
@@ -111,6 +124,17 @@ class sirius_httpfs : public duckdb::FileSystem {
  protected:
   bool SupportsOpenFileExtended() const override { return true; }
 };
+
+/// Escape a literal S3 object key for embedding into an @c s3:// URI so the
+/// later @c sirius::io::parse() of that URI restores the exact key bytes.
+/// LIST returns keys as literal bytes, but the open path treats the produced
+/// string as a URI — @c '#' starts a fragment, @c '?' starts a query, and
+/// @c %xx percent-decodes — so exactly those three bytes are escaped
+/// (@c '%'→"%25" first, then @c '#'→"%23", @c '?'→"%3F"). Every other byte,
+/// including @c '/', @c '=' and space, stays literal: hive-partition path
+/// text (@c col=a b/) must survive unchanged. Identity for keys without
+/// @c %/#/?, i.e. every plain key round-trips byte-identically.
+std::string escape_s3_key_for_uri(std::string_view key);
 
 /// Expand an @c s3:// glob @p pattern into concrete object URIs via one
 /// paginated ListObjectsV2 sweep, streamed page-by-page (peak memory = one

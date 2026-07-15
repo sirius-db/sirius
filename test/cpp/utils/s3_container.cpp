@@ -65,6 +65,7 @@ extern "C" {
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace sirius::test {
@@ -214,6 +215,30 @@ fs::path generate_fixtures(fs::path const& out_dir)
     {"python3", script.string(), "--out", out_dir.string(), "--parquet-source", parquet_src});
   if (rc != 0) throw std::runtime_error("generate_fixtures.py failed");
   return out_dir;
+}
+
+void create_special_key_fixtures(fs::path const& fixture_dir)
+{
+  auto const nation = fixture_dir / "parquet" / "nation.parquet";
+  auto const region = fixture_dir / "parquet" / "region.parquet";
+  if (!fs::is_regular_file(nation) || !fs::is_regular_file(region)) {
+    throw std::runtime_error("special-key glob fixtures require nation.parquet and region.parquet");
+  }
+
+  auto const root = fixture_dir / "glob-enc";
+  fs::remove_all(root);
+  std::array<std::pair<fs::path, fs::path>, 6> const fixtures{{
+    {nation, root / "a%2Fb.parquet"},
+    {region, root / "a" / "b.parquet"},
+    {nation, root / "x#1.parquet"},
+    {nation, root / "y?v.parquet"},
+    {nation, root / "100%.parquet"},
+    {nation, root / "t" / "col=a%20b" / "p0.parquet"},
+  }};
+  for (auto const& [source, destination] : fixtures) {
+    fs::create_directories(destination.parent_path());
+    fs::copy_file(source, destination, fs::copy_options::overwrite_existing);
+  }
 }
 
 // ---- host-side SigV4 + libcurl upload --------------------------------------
@@ -555,6 +580,7 @@ bool bring_up()
 
   fs::path ca_bundle = generate_self_signed_cert(certs_dir);
   generate_fixtures(fixture_dir);
+  create_special_key_fixtures(fixture_dir);
 
   // HTTP instance: testcontainers' HTTP wait makes it ready before run returns.
   int http_req = make_minio_request();
