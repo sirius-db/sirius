@@ -78,7 +78,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
     virtual_columns(std::move(virtual_columns_p)),
-    gen_row_id_column(column_ids.back().IsRowIdColumn())
+    gen_row_id_column(!column_ids.empty() && column_ids.back().IsRowIdColumn())
 {
   // Sort projection_ids so that DuckDB's ReferenceColumns() outputs columns in
   // ascending column_ids order. This matches the parquet scan convention (where

@@ -196,7 +196,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   try {
     size_t total_sample_bytes = 0;
     for (auto const& batch : valid_batches) {
-      total_sample_bytes += batch.get_data()->get_size_in_bytes();
+      auto* data = batch.get_data();
+      if (!data) { continue; }
+      total_sample_bytes += data->get_size_in_bytes();
     }
 
     // 2. Build cudf order vectors from BoundOrderByNode
@@ -284,9 +286,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       std::vector<int32_t> boundary_indices_host;
       boundary_indices_host.reserve(num_boundaries);
       for (size_t i = 1; i <= num_boundaries; i++) {
-        auto idx = static_cast<int32_t>((i * total_rows) / num_parts);
-        if (idx >= static_cast<int32_t>(total_rows)) { idx = static_cast<int32_t>(total_rows) - 1; }
-        boundary_indices_host.push_back(idx);
+        int64_t idx = (static_cast<int64_t>(i) * total_rows) / num_parts;
+        if (idx >= static_cast<int64_t>(total_rows)) { idx = static_cast<int64_t>(total_rows) - 1; }
+        boundary_indices_host.push_back(static_cast<int32_t>(idx));
       }
 
       // Create a device column with the boundary indices

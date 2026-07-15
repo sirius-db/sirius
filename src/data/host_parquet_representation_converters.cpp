@@ -173,7 +173,13 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
   auto& host_src       = source.cast<host_parquet_representation>();
   auto const data_size = host_src.get_size_in_bytes();
 
-  assert(source.get_device_id() != target_memory_space->get_device_id());
+  if (target_memory_space == nullptr) {
+    throw std::runtime_error("target_memory_space is null");
+  }
+  if (source.get_device_id() == target_memory_space->get_device_id()) {
+    throw std::runtime_error(
+      "convert_host_parquet_to_host_parquet: source and target device ids must differ");
+  }
   auto* mr = target_memory_space
                ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   if (mr == nullptr) {

@@ -46,6 +46,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -531,7 +532,9 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
         size_t const overread    = chunk_bytes - (need_hi - need_lo);
         bool const worth_caching = overread * 4 < chunk_bytes;  // over-read < 25% of chunk
         if (worth_caching && c != nullptr && c->state.mark_loading()) {
-          assert(c->data != nullptr);
+          if (c->data == nullptr) {
+            throw std::runtime_error("prefetching_cache: null data in io_segments");
+          }
           io_chunks.push_back(c);  // (2) host-to-device load into the cache buffer
           io_segments.emplace_back(off, chunk_bytes, c->data);
           h2d++;
@@ -712,14 +715,15 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
       if (c->state.mark_queued()) {
         auto* buffer = buffers.back();
         buffers.pop_back();
-        c->data      = reinterpret_cast<uint8_t*>(buffer);
-        c->numa_node = numa_allocated;
         if (!c->state.mark_allocated()) {
           buffers.push_back(buffer);  // return the buffer to the pool
           spdlog::error(
             "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
             "allocated",
             c->offset);
+        } else {
+          c->data      = reinterpret_cast<uint8_t*>(buffer);
+          c->numa_node = numa_allocated;
         }
       }
     }
@@ -761,6 +765,10 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
                                           allocated_chunks.end(),
                                           [&](cached_chunk* c) {
                                             if (c->state.mark_loading()) {
+                                              if (c->data == nullptr) {
+                                                std::ignore = c->state.mark_load_failed();
+                                                return true;  // remove: no host buffer to load into
+                                              }
                                               segments.emplace_back(
                                                 c->offset, _chunk_size, c->data);
                                               return false;
