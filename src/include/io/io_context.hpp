@@ -257,10 +257,10 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint);
 
   /// Known-size variant.  The base implementation ignores @p known_size and
-  /// delegates to the required @c create_io_object(path) (local backends learn
-  /// the size for free from the fd); a backend whose size discovery costs a
-  /// round-trip (rest_ioctx's HEAD) overrides this to build the io_object with
-  /// zero network.  Same distinct-virtual rationale as the hint variant above.
+  /// delegates to the required @c create_io_object(path); a backend whose size
+  /// discovery would otherwise cost a round-trip overrides this to build the
+  /// io_object without one.  Same distinct-virtual rationale as the hint
+  /// variant above.
   virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path,
                                                              std::uint64_t known_size);
 

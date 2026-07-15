@@ -1544,14 +1544,9 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - req.t_submit)
                                          .count());
-          // chunk_get_count keeps its established meaning — every completed
-          // ranged GET, blocking host_reads included (the #1087 s3-bench
-          // bind_chunk_get and the routing-perf tests depend on that).  The
-          // blocking_host_get_* counters are an ADDITIONAL view: a blocking
-          // single host_read (e.g. the native parquet binder's footer /
-          // metadata fetch, or any other synchronous read) bumps both, so the
-          // blocking-read phase stays readable without changing chunk_get's
-          // semantics.
+          // Every completed ranged GET bumps chunk_get_*, blocking host_reads
+          // included. A blocking single host_read additionally bumps
+          // blocking_host_get_* — the two are additive, not disjoint.
           _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
           _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
           atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);

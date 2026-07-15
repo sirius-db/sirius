@@ -406,15 +406,6 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   return io_ctx->open_datasource(file_path, hint);
 }
 
-std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path, std::uint64_t known_size)
-{
-  auto file_path = normalize_path(std::string(path));
-  auto io_ctx    = ioctx_for_path(file_path);
-  if (!io_ctx) { return nullptr; }
-  return io_ctx->open_datasource(file_path, known_size);
-}
-
 void sirius_scan_manager::list_objects_paged(
   std::string const& s3_prefix_uri,
   std::size_t page_size,

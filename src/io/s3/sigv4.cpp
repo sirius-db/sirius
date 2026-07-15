@@ -402,14 +402,10 @@ std::string presign_url(std::string_view method,
 
   // ---- 8. Assemble the final URL.  S3 accepts the query params in any order
   //         (only the canonical query fed into the signature must be sorted,
-  //         and X-Amz-Signature is never part of it), so the placement of the
-  //         signature is presentation-only.  Two shapes:
-  //         - pure X-Amz query (no extra params): append the signature LAST —
-  //           byte-for-byte the layout of AWS's published query-auth vector,
-  //           which a golden test pins.
-  //         - merged query (extra request params present): insert the
-  //           signature in sorted position, so the final URL mirrors the
-  //           canonical order end to end. ----
+  //         and X-Amz-Signature is never part of it), so signature placement is
+  //         presentation-only.  Preserve the existing object-request layout —
+  //         a pure X-Amz query appends the signature last; merged LIST queries
+  //         insert it in sorted position for a fully canonical-ordered URL. ----
   std::string final_query;
   if (extra_canonical_query.empty()) {
     final_query = canonical_query;

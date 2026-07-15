@@ -123,12 +123,12 @@ std::uint64_t parse_size(std::string_view raw)
 
 list_objects_v2_page parse_list_objects_v2(std::string_view xml)
 {
+  // Fail closed: a malformed body must never parse as a silently-incomplete
+  // listing (dropped objects), nor let elements outside the root steer paging.
   constexpr std::string_view k_root_open  = "<ListBucketResult";
   constexpr std::string_view k_root_close = "</ListBucketResult>";
-  // The root open tag must be exactly <ListBucketResult, terminated by '>' or
-  // XML whitespace (attributes follow) — a prefix match alone would accept a
-  // bogus root like <ListBucketResultBogus> and parse its content as a real
-  // listing.
+  // Reject root-name prefix matches: <ListBucketResult must end at '>' or XML
+  // whitespace, else <ListBucketResultBogus> would parse as a real listing.
   auto const is_xml_space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
   std::size_t root_open   = std::string_view::npos;
   for (auto cand = xml.find(k_root_open); cand != std::string_view::npos;
@@ -143,10 +143,7 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
     throw std::runtime_error(
       "parse_list_objects_v2: not a ListObjectsV2 response (no <ListBucketResult>)");
   }
-  // Only whitespace and one optional <?xml ...?> prologue may precede the
-  // root: any other leading content (a wrapper element, a comment, a second
-  // document) marks a body this parser does not understand — fail closed
-  // rather than silently skipping it.
+  // Only an optional XML declaration may precede the root.
   auto const pre = trim(xml.substr(0, root_open));
   if (!pre.empty()) {
     bool prologue_only = false;
@@ -159,24 +156,15 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
         "parse_list_objects_v2: unexpected content before <ListBucketResult>");
     }
   }
-  // Window every scan below to the root element's CONTENT. Elements placed
-  // outside the root (a <Contents>, <IsTruncated> or continuation token after
-  // the close tag) must never be honored as results — an injected token could
-  // even steer the pagination loop. The window starts after the open tag's '>'
-  // (tolerating the xmlns attribute and any prologue before the root), and the
-  // close is searched AFTER the open, so a close-before-open body is rejected
-  // as truncated for free.
+  // Restrict all field lookup below to the root element's content. The window
+  // starts after the open tag's '>'; the close is searched after the open, so a
+  // close-before-open (or absent close) body is rejected as truncated.
   auto const root_open_end = xml.find('>', root_open + k_root_open.size());
   if (root_open_end == std::string_view::npos) {
     throw std::runtime_error(
       "parse_list_objects_v2: truncated ListObjectsV2 response (unterminated <ListBucketResult> "
       "open tag)");
   }
-  // Require the root close tag: a body truncated before it (a malformed /
-  // partial 200 from an S3-compatible gateway) would otherwise parse as a
-  // "valid" page with is_truncated defaulting to false — the paged loop would
-  // believe the listing is complete and a glob would silently drop every object
-  // past the cut. Real S3/MinIO always close the root.
   auto const root_close = xml.find(k_root_close, root_open_end + 1);
   if (root_close == std::string_view::npos) {
     throw std::runtime_error(
@@ -186,16 +174,10 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
 
   list_objects_v2_page page;
 
-  // Object entries: the <Key>/<Size> inside each <Contents> block. Scoping to
-  // <Contents> (rather than scanning every <Key> in the document) keeps a stray
-  // <Key> that an S3-compatible service might place elsewhere — or a future
-  // response extension — from being mistaken for an object key. <CommonPrefixes>
-  // rollups use <Prefix>, so they are excluded for free. A <Contents> without a
-  // present, closed, non-empty <Key> or without a parseable <Size> throws: AWS
-  // documents both as always present, so their absence means a mangled body —
-  // silently skipping the entry would make a glob drop the object with no
-  // error, and downstream opens rely on the LIST-provided size to skip their
-  // size-discovery round-trip, so a silent zero would corrupt reads.
+  // Parse Key and Size only from complete <Contents> elements; scoping to the
+  // block excludes stray <Key>s and <CommonPrefixes> rollups. A missing Key or
+  // Size means a mangled body (both are always present), so throw rather than
+  // drop the entry or open with a zero size.
   constexpr std::string_view k_contents_open  = "<Contents>";
   constexpr std::string_view k_contents_close = "</Contents>";
   for (std::size_t pos = 0;;) {
@@ -229,10 +211,8 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
     pos = ce + k_contents_close.size();
   }
 
-  // <IsTruncated> is mandatory and strictly boolean. AWS documents it as always
-  // present; a page missing it (or carrying anything but true/false) is a
-  // mangled body, and defaulting to "not truncated" would end the paged loop
-  // early — a glob would silently treat a partial listing as complete.
+  // IsTruncated is required and strictly boolean; defaulting a missing/garbage
+  // value to "not truncated" would end the paged loop on a partial listing.
   auto const truncated = element_text(body, "IsTruncated");
   if (!truncated.has_value()) {
     throw std::runtime_error(
@@ -251,19 +231,15 @@ list_objects_v2_page parse_list_objects_v2(std::string_view xml)
   if (auto const token = element_text(body, "NextContinuationToken"); token.has_value()) {
     page.next_continuation_token = xml_unescape(trim(*token));
   } else if (page.is_truncated) {
-    // A truncated page must carry the token that fetches the next page; without
-    // it the listing cannot be completed and must not be treated as complete.
-    // (An empty <NextContinuationToken></NextContinuationToken> passes here and
-    // is rejected by the paged caller — the parser validates body shape only.)
+    // A truncated page must carry the token for the next page. (An empty token
+    // element passes here and is rejected by the paged caller.)
     throw std::runtime_error(
       "parse_list_objects_v2: truncated ListObjectsV2 page without a continuation token "
       "(<NextContinuationToken> missing)");
   }
 
-  // Reject non-whitespace content after the root close. Checked LAST so a
-  // malformed window (missing <IsTruncated>, token-less truncated page) reports
-  // its own, more specific error first; nothing here was honored either way —
-  // every scan above is window-scoped.
+  // Reject non-whitespace content after the root close. Checked last so a
+  // malformed window reports its own, more specific error first.
   if (!trim(xml.substr(root_close + k_root_close.size())).empty()) {
     throw std::runtime_error("parse_list_objects_v2: unexpected content after </ListBucketResult>");
   }

@@ -96,12 +96,7 @@ struct rest_chunked_rx_request {
   // take the event-synchronized recycle path (see needs_event_for_synchronization).
   bool staged_through_bounce{false};
 
-  // perf_instrumentation attribution: set on the blocking single host_read path
-  // (rest_reactor::host_read → prep_host_rx_request) — every synchronous host
-  // GET that reaches the network, e.g. DuckDB's native parquet binder footer
-  // reads, but equally any other blocking read.  finish() then bumps
-  // blocking_host_get_* IN ADDITION to the chunk_get_* counters (additive, not
-  // disjoint).  Stash-served reads issue no GET and count in neither.
+  // Marks synchronous network reads for blocking_host_get_* attribution.
   bool perf_blocking_host_get{false};
 
   // perf (set only when the reactor's perf_instrumentation is on): t_enqueue at

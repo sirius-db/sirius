@@ -109,11 +109,10 @@ std::string_view method_to_str(s3_request_method method)
   return "GET";  // unreachable; all enumerators handled
 }
 
-// A LIST canonical query must never carry auth params: a caller-supplied
-// X-Amz-* key would be merged into the signed set (presigned mode) or signed
-// verbatim (header mode), silently duplicating or overriding the authorizer's
-// own signing parameters. Case-insensitive — S3 treats query keys as sent, but
-// rejecting both spellings closes the smuggling door entirely.
+// Reject X-Amz-* parameters case-insensitively to prevent signing-parameter
+// injection: a caller-supplied X-Amz-* key would otherwise be merged into the
+// signed set (presigned mode) or signed verbatim (header mode), duplicating or
+// overriding the authorizer's own signing parameters.
 void reject_amz_query_params(std::string_view canonical_query)
 {
   constexpr std::string_view k_amz = "x-amz-";

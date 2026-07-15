@@ -157,8 +157,7 @@ void split_segments(std::string_view s, std::vector<std::string_view>& out)
 /// '/'-segment (duckdb::Glob, the same matcher LocalFileSystem applies per
 /// directory entry); `**` matches zero or more whole segments (the crawl).
 /// Memoized on `(ki, pi)` — plain backtracking is exponential in the number of
-/// `**` segments, and the pattern is user-supplied on an external SQL surface.
-/// @p memo is a reused scratch buffer sized `(keys.size()+1)*(pats.size()+1)`,
+/// `**` segments. @p memo is a reused scratch buffer sized `(keys.size()+1)*(pats.size()+1)`,
 /// values -1 (unknown) / 0 (false) / 1 (true).
 bool match_glob_segments(std::vector<std::string_view> const& keys,
                          std::size_t ki,
@@ -334,14 +333,10 @@ duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path
 
 namespace {
 
-// True when @p key contains '%' followed by two hex digits. Such keys cannot
-// be represented faithfully today: DuckDB URL-decodes hive partition values
-// (and only those) from the path exactly once, so the escaped path text this
-// file emits would make bind-time pruning, the GPU-projected value, and the
-// local-FS oracle all disagree — silent wrong results. expand_glob fails
-// loudly on them instead; '#', '?' and bare-'%' keys round-trip exactly and
-// stay supported. Full support is a tracked follow-up (a path/URI contract
-// change), at which point this guard is removed.
+// True when @p key contains '%' followed by two hex digits. DuckDB decodes hive
+// partition values from the path, so a literal %HH key cannot currently preserve
+// both object identity and partition values; expand_glob rejects it. ('#', '?'
+// and bare-'%' keys round-trip exactly and stay supported.)
 bool key_has_percent_encoded_sequence(std::string_view key)
 {
   auto const is_hex = [](char c) {

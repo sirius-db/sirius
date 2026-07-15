@@ -108,14 +108,9 @@ void rest_ioctx::list_objects_paged(
         "s3://" +
         std::string(bucket) + "/" + std::string(prefix));
     }
-    // Loop-termination guards: the scanned cap above only advances with the
-    // entry count, so a non-conformant backend that keeps answering truncated
-    // pages that add no entries (same token, alternating tokens, or empty
-    // pages) would otherwise spin this loop forever. We never send a
-    // delimiter, so a conformant non-final page always carries entries; and a
-    // token that does not advance can only refetch the same page. Every
-    // accepted page therefore advances `scanned` by at least one, keeping the
-    // total page count bounded by the scanned cap.
+    // A truncated page must contain entries and advance the token. Together
+    // with scanned_cap these bound pagination for non-conforming backends that
+    // would otherwise loop on empty or non-advancing pages.
     if (page.is_truncated && page.entries.empty()) {
       throw std::runtime_error(
         "rest_ioctx::list_objects: truncated ListObjectsV2 page with no entries for s3://" +

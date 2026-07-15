@@ -382,15 +382,6 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
 
-  /// \brief Known-size open: the object's size is already known (e.g. from an
-  ///        S3 ListObjectsV2 response), so a backend whose size discovery costs
-  ///        a round-trip builds the datasource with zero network. No production
-  ///        caller today — parquet opens prefer the footer-probe hint (one
-  ///        suffix GET replaces HEAD + footer reads); reserved for the
-  ///        exact-range known-size open of non-footer consumers.
-  [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path, std::uint64_t known_size);
-
   /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
   ///        to @p sink, one call per page; @p sink returns false to stop early.
   ///        Routes via @ref ioctx_for_path to the object-store backend (throws a

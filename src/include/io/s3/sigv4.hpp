@@ -106,8 +106,9 @@ sigv4_signed_request sign_request(
  * @param ttl           Validity window. Becomes the @c X-Amz-Expires query
  *                      parameter (in seconds).
  * @param extra_canonical_query  Additional request query parameters, already
- *                      RFC3986-encoded and `&`-joined (e.g.
- *                      @c "list-type=2&prefix=p%2F&max-keys=1000" for a
+ *                      RFC3986-encoded, `&`-joined, and in SigV4 canonical
+ *                      (byte-sorted) order (e.g.
+ *                      @c "list-type=2&max-keys=1000&prefix=p%2F" for a
  *                      ListObjectsV2 request). Empty for plain object GET/HEAD.
  *                      These are merged with the @c X-Amz-* parameters and the
  *                      whole set is re-sorted before signing, so they

@@ -30,8 +30,8 @@ namespace sirius::io::s3 {
 inline constexpr std::size_t default_max_list_objects = 100'000;
 
 /// Default cap on the total number of entries a paged listing will scan across
-/// all pages (≤ 1000 LIST round-trips at the maximum page size). Bounds time
-/// and request count on a prefix whose population dwarfs the matches.
+/// all pages. Bounds the scanned-object count and request cost on a prefix
+/// whose population dwarfs the matches.
 inline constexpr std::size_t default_max_scanned_objects = 1'000'000;
 
 /// One object from a ListObjectsV2 page: full key + object size in bytes.
@@ -54,35 +54,14 @@ struct list_objects_v2_page {
 };
 
 /**
- * @brief Parse one ListObjectsV2 XML response body.
+ * @brief Parse one complete ListObjectsV2 response.
  *
- * Hand-rolled (no XML dependency): the S3 ListObjectsV2 schema is small and
- * fixed. Tolerant of the `xmlns` attribute on `<ListBucketResult>` and leading /
- * trailing whitespace. XML entities (`&amp; &lt; &gt; &quot; &apos;`) in key /
- * token text are unescaped.
+ * Hand-rolled (no XML dependency). Accepts an optional XML declaration and root
+ * attributes, and unescapes the five predefined XML entities. Fails closed so a
+ * malformed body never parses as a silently-incomplete listing.
  *
- * The body must be a COMPLETE, well-formed response — a truncated / partial
- * (but transport-complete) body must not parse as a silently-incomplete
- * listing, so the root close tag and every `<Contents>` block are required to
- * close, and the fields AWS documents as always present are mandatory: a
- * malformed body fails closed instead of silently dropping entries or ending
- * the paged sweep early.
- *
- * @throw std::runtime_error when @p xml is not a recognizable, complete
- *        ListObjectsV2 response: no `<ListBucketResult>` open tag (e.g. an S3
- *        `<Error>` body or an empty string), a missing `</ListBucketResult>`
- *        close tag, or a `<Contents>` opened without a `</Contents>` close (both
- *        signal a truncated body); a `<Contents>` whose `<Key>` is missing /
- *        unclosed / empty (a silently-skipped entry would make a glob drop the
- *        object with no error); a `<Contents>` whose `<Size>` is missing /
- *        non-numeric / overflows `uint64_t` (a silently-zeroed or wrapped size
- *        would defeat the no-HEAD open path downstream — `<Size>0</Size>` is
- *        legal, S3 allows zero-byte objects); a missing / unclosed
- *        `<IsTruncated>` or a value other than exactly `true` / `false` after
- *        trimming (defaulting would end the paged loop on a partial listing);
- *        or `<IsTruncated>true</IsTruncated>` without a `<NextContinuationToken>`
- *        element (the listing could not be completed). An empty-but-present
- *        token element is accepted here and rejected by the paged caller.
+ * @throws std::runtime_error for malformed roots, entries, sizes, or paging
+ *         fields.
  */
 list_objects_v2_page parse_list_objects_v2(std::string_view xml);
 

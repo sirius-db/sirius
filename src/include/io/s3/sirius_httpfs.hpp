@@ -70,17 +70,10 @@ class sirius_httpfs : public duckdb::FileSystem {
     duckdb::FileOpenFlags flags,
     duckdb::optional_ptr<duckdb::FileOpener> opener = nullptr) override;
 
-  /// Extended open: when @p file carries a @c "file_size" option (a
-  /// non-negative BIGINT — the LIST-provided size @ref Glob attaches), the
-  /// datasource is opened through the parquet-footer-probe seam: ONE
-  /// suffix-range GET resolves the size from Content-Range (no HEAD) and
-  /// stashes the trailing bytes for the binder's footer reads. The size value
-  /// itself only discriminates this extended open from the plain fallback —
-  /// the probe re-derives the authoritative size from the response. A missing /
-  /// wrong-typed / negative option silently falls back to the plain open path
-  /// (HEAD, then ranged GETs) — third-party-populated @c OpenFileInfo must not
-  /// break the open. Non-parquet files opened this way still read correctly;
-  /// they just pay for a stashed tail that no footer read consumes.
+  /// A valid LIST-provided @c "file_size" option (the non-negative BIGINT
+  /// @ref Glob attaches) selects the parquet footer probe, which resolves size
+  /// and stashes the suffix in one GET. Invalid metadata falls back to the
+  /// regular HEAD-based open.
   duckdb::unique_ptr<duckdb::FileHandle> OpenFileExtended(
     const duckdb::OpenFileInfo& file,
     duckdb::FileOpenFlags flags,
@@ -95,22 +88,13 @@ class sirius_httpfs : public duckdb::FileSystem {
   int64_t GetFileSize(duckdb::FileHandle& handle) override;
   duckdb::timestamp_t GetLastModifiedTime(duckdb::FileHandle& handle) override;
 
-  /// Exact key: returns @c {path} when @ref CanHandleFile, else empty. A
-  /// glob/wildcard pattern expands via one paginated S3 LIST (through the
-  /// connection's scan_manager — see @ref expand_glob), gated like @ref
-  /// OpenFile: requires a resolvable @c ClientContext, @c gpu_execution
-  /// enabled, and no active CPU-fallback replay. Each match carries its
-  /// LIST-provided size in the extended info so the subsequent open needs no
-  /// HEAD (one suffix-range GET instead — see @ref OpenFileExtended). Match
-  /// paths embed the literal LIST key via @ref escape_s3_key_for_uri: keys
-  /// containing @c #, @c ? or a bare @c % show the escaped form in the path
-  /// text (and in the @c filename virtual column) but open the exact object.
-  /// A matched key containing a percent-encoded sequence (@c % followed by
-  /// two hex digits) throws instead — DuckDB URL-decodes hive partition
-  /// values from the path once, so no single path text can serve both the
-  /// open and hive semantics for such keys; full support is a tracked
-  /// follow-up. Zero matches yield an empty vector (DuckDB raises its
-  /// standard no-files error).
+  /// Exact key: returns @c {path} when @ref CanHandleFile. A glob pattern
+  /// expands via one paginated S3 LIST (see @ref expand_glob) under four
+  /// contracts: it is gated like @ref OpenFile (resolvable @c ClientContext,
+  /// @c gpu_execution on, no CPU-fallback replay); each match carries its
+  /// LIST-provided size so the open needs no HEAD; a matched key containing a
+  /// percent-encoded sequence (@c % + two hex digits) throws; and zero matches
+  /// yield an empty vector.
   duckdb::vector<duckdb::OpenFileInfo> Glob(const std::string& path,
                                             duckdb::FileOpener* opener = nullptr) override;
 

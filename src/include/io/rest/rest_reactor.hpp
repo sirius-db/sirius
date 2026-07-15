@@ -151,14 +151,9 @@ struct rest_perf_snapshot {
   // over every completed curl attempt incl. retries / partial / failed bodies.
   // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
   std::uint64_t payload_bytes_read_total{0};
-  // perf_instrumentation-gated: an ADDITIONAL view of every blocking host_read
-  // GET that hits the network (the native parquet binder reads footers this
-  // way, but so does any other synchronous read — e.g. CPU-fallback data reads;
-  // column data goes through the async chunk path).  These GETs are ALSO
-  // counted in chunk_get_count above — blocking_host_get_* does not remove
-  // them, it isolates the blocking-read phase.  Stash-served host_reads issue
-  // no GET and are counted by neither; the one-shot footer-probe suffix GET at
-  // open counts only as a chunk GET.
+  // perf_instrumentation-gated. Blocking host GETs remain part of chunk_get_*
+  // and are also attributed to blocking_host_get_*. Stash hits issue no GET and
+  // increment neither.
   std::uint64_t blocking_host_get_count{0};
   std::uint64_t blocking_host_get_wall_ns_total{0};
   std::uint64_t blocking_host_get_wall_ns_max{0};
