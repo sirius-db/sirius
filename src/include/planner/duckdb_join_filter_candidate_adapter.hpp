@@ -107,11 +107,11 @@ class duckdb_probe_target_candidate final {
     duckdb::LogicalType storage_type{};
   };
 
-  ~duckdb_probe_target_candidate() = default;
-  duckdb_probe_target_candidate(duckdb_probe_target_candidate const&) = default;
+  ~duckdb_probe_target_candidate()                                               = default;
+  duckdb_probe_target_candidate(duckdb_probe_target_candidate const&)            = default;
   duckdb_probe_target_candidate& operator=(duckdb_probe_target_candidate const&) = default;
-  duckdb_probe_target_candidate(duckdb_probe_target_candidate&&)            = delete;
-  duckdb_probe_target_candidate& operator=(duckdb_probe_target_candidate&&) = delete;
+  duckdb_probe_target_candidate(duckdb_probe_target_candidate&&)                 = delete;
+  duckdb_probe_target_candidate& operator=(duckdb_probe_target_candidate&&)      = delete;
 
   [[nodiscard]] duckdb_dynamic_filter_channel const& channel_identity() const& noexcept;
   [[nodiscard]] duckdb_dynamic_filter_channel const& channel_identity() const&& = delete;
@@ -147,7 +147,7 @@ class duckdb_probe_target_candidate final {
  */
 class duckdb_join_filter_candidate final {
  public:
-  ~duckdb_join_filter_candidate() = default;
+  ~duckdb_join_filter_candidate()                                   = default;
   duckdb_join_filter_candidate(duckdb_join_filter_candidate const&) = default;
   duckdb_join_filter_candidate& operator=(duckdb_join_filter_candidate const& other);
   duckdb_join_filter_candidate(duckdb_join_filter_candidate&& other) noexcept;
@@ -157,8 +157,7 @@ class duckdb_join_filter_candidate final {
   [[nodiscard]] bool build_subtree_has_filter_hint() const noexcept;
   [[nodiscard]] std::vector<std::size_t> const& condition_indexes() const& noexcept;
   [[nodiscard]] std::vector<std::size_t> const& condition_indexes() const&& = delete;
-  [[nodiscard]] std::vector<duckdb::ExpressionType> const& condition_comparisons()
-    const& noexcept;
+  [[nodiscard]] std::vector<duckdb::ExpressionType> const& condition_comparisons() const& noexcept;
   [[nodiscard]] std::vector<duckdb::ExpressionType> const& condition_comparisons() const&& = delete;
   [[nodiscard]] std::vector<duckdb_probe_target_candidate> const& targets() const& noexcept;
   [[nodiscard]] std::vector<duckdb_probe_target_candidate> const& targets() const&& = delete;

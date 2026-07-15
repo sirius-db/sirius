@@ -152,29 +152,33 @@ TEST_CASE("extract classifies statistics_only when probe_info is empty",
 
 TEST_CASE("extract rejects anomalous targetless metadata", "[dynamic_filter][adapter]")
 {
-  SECTION("empty condition ordinals") {
+  SECTION("empty condition ordinals")
+  {
     auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
     join->filter_pushdown = make_pushdown_info({}, false);
 
     require_malformed_carries_only_kind(extract(*join));
   }
 
-  SECTION("out-of-range condition ordinal") {
+  SECTION("out-of-range condition ordinal")
+  {
     auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
     join->filter_pushdown = make_pushdown_info({1}, false);
 
     require_malformed_carries_only_kind(extract(*join));
   }
 
-  SECTION("duplicate condition ordinals") {
-    auto join = make_join(
-      {duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_EQUAL});
+  SECTION("duplicate condition ordinals")
+  {
+    auto join =
+      make_join({duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_EQUAL});
     join->filter_pushdown = make_pushdown_info({0, 0}, false);
 
     require_malformed_carries_only_kind(extract(*join));
   }
 
-  SECTION("build-side filter hint without a probe target") {
+  SECTION("build-side filter hint without a probe target")
+  {
     auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
     join->filter_pushdown = make_pushdown_info({0}, true);
 

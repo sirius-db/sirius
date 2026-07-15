@@ -48,11 +48,15 @@ duckdb_probe_target_candidate::duckdb_probe_target_candidate(
 
 duckdb_dynamic_filter_channel const& duckdb_probe_target_candidate::channel_identity()
   const& noexcept
-{ return _channel_identity; }
+{
+  return _channel_identity;
+}
 
 std::vector<duckdb_probe_target_candidate::probe_column> const&
 duckdb_probe_target_candidate::columns() const& noexcept
-{ return _columns; }
+{
+  return _columns;
+}
 
 duckdb_join_filter_candidate::duckdb_join_filter_candidate(
   duckdb_candidate_kind kind,
@@ -75,7 +79,9 @@ duckdb_join_filter_candidate::duckdb_join_filter_candidate(
     _condition_indexes(std::move(other._condition_indexes)),
     _condition_comparisons(std::move(other._condition_comparisons)),
     _targets(std::move(other._targets))
-{ other.reset_to_absent(); }
+{
+  other.reset_to_absent();
+}
 
 duckdb_join_filter_candidate& duckdb_join_filter_candidate::operator=(
   duckdb_join_filter_candidate const& other)
@@ -99,13 +105,19 @@ duckdb_join_filter_candidate& duckdb_join_filter_candidate::operator=(
 }
 
 duckdb_join_filter_candidate duckdb_join_filter_candidate::absent()
-{ return duckdb_join_filter_candidate{duckdb_candidate_kind::absent, false, {}, {}, {}}; }
+{
+  return duckdb_join_filter_candidate{duckdb_candidate_kind::absent, false, {}, {}, {}};
+}
 
 duckdb_join_filter_candidate duckdb_join_filter_candidate::statistics_only()
-{ return duckdb_join_filter_candidate{duckdb_candidate_kind::statistics_only, false, {}, {}, {}}; }
+{
+  return duckdb_join_filter_candidate{duckdb_candidate_kind::statistics_only, false, {}, {}, {}};
+}
 
 duckdb_join_filter_candidate duckdb_join_filter_candidate::malformed()
-{ return duckdb_join_filter_candidate{duckdb_candidate_kind::malformed, false, {}, {}, {}}; }
+{
+  return duckdb_join_filter_candidate{duckdb_candidate_kind::malformed, false, {}, {}, {}};
+}
 
 duckdb_join_filter_candidate duckdb_join_filter_candidate::admitted(
   bool build_subtree_has_filter_hint,
@@ -152,18 +164,26 @@ duckdb_join_filter_candidate duckdb_join_filter_candidate::admitted(
 duckdb_candidate_kind duckdb_join_filter_candidate::kind() const noexcept { return _kind; }
 
 bool duckdb_join_filter_candidate::build_subtree_has_filter_hint() const noexcept
-{ return _build_subtree_has_filter_hint; }
+{
+  return _build_subtree_has_filter_hint;
+}
 
 std::vector<std::size_t> const& duckdb_join_filter_candidate::condition_indexes() const& noexcept
-{ return _condition_indexes; }
+{
+  return _condition_indexes;
+}
 
 std::vector<duckdb::ExpressionType> const& duckdb_join_filter_candidate::condition_comparisons()
   const& noexcept
-{ return _condition_comparisons; }
+{
+  return _condition_comparisons;
+}
 
 std::vector<duckdb_probe_target_candidate> const& duckdb_join_filter_candidate::targets()
   const& noexcept
-{ return _targets; }
+{
+  return _targets;
+}
 
 void duckdb_join_filter_candidate::reset_to_absent() noexcept
 {
@@ -189,13 +209,19 @@ class candidate_builder final {
   }
 
   [[nodiscard]] static duckdb_join_filter_candidate absent()
-  { return duckdb_join_filter_candidate::absent(); }
+  {
+    return duckdb_join_filter_candidate::absent();
+  }
 
   [[nodiscard]] static duckdb_join_filter_candidate statistics_only()
-  { return duckdb_join_filter_candidate::statistics_only(); }
+  {
+    return duckdb_join_filter_candidate::statistics_only();
+  }
 
   [[nodiscard]] static duckdb_join_filter_candidate malformed()
-  { return duckdb_join_filter_candidate::malformed(); }
+  {
+    return duckdb_join_filter_candidate::malformed();
+  }
 
   [[nodiscard]] static duckdb_join_filter_candidate admitted(
     bool build_subtree_has_filter_hint,
@@ -325,7 +351,9 @@ duckdb_join_filter_candidate extract(duckdb::LogicalComparisonJoin const& op)
 }
 
 duckdb_dynamic_filter_channel scan_channel_identity(duckdb::LogicalGet const& get)
-{ return get.dynamic_filters; }
+{
+  return get.dynamic_filters;
+}
 
 }  // namespace duckdb_join_filter_candidate_adapter
 
