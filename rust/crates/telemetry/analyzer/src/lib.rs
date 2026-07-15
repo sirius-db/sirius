@@ -69,6 +69,11 @@ pub mod view;
 const TASK_TYPE_NAME: &str = "task";
 const DATA_BATCH_TYPE_NAME: &str = "data_batch";
 const BATCH_TYPE_NAME: &str = "batch";
+/// The Batch FSM's entry state. It is instantaneous bookkeeping (identity
+/// attributes ride the create event; queued/packaged follow microseconds
+/// later), so the analyzer omits it from every aggregated series — it would
+/// only ever render as noise slivers at extreme zoom.
+const BATCH_REGISTERED_STATE: &str = "batch_registered";
 /// Data-flow measure counting batches residing in each (state, tier) cell.
 const MEASURE_COUNT: &str = "count";
 /// Data-flow measure summing batch bytes held in each (state, tier) cell.
@@ -441,6 +446,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                         .any(|usage| usage.resource_id() == req.resource_id)
                                 }),
                                 |id| id == req.resource_id,
+                                None,
                             )?;
                         }
                         Some(DATA_BATCH_TYPE_NAME) => {
@@ -457,6 +463,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                     db.usages().any(|u| u.resource_id() == req.resource_id)
                                 }),
                                 |id| id == req.resource_id,
+                                None,
                             )?;
                         }
                         Some(BATCH_TYPE_NAME) => {
@@ -475,6 +482,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                         .any(|usage| usage.resource_id() == req.resource_id)
                                 }),
                                 |id| id == req.resource_id,
+                                Some(BATCH_REGISTERED_STATE),
                             )?;
                         }
                         other => {
@@ -570,6 +578,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                         .any(|usage| resource_ids.contains(&usage.resource_id()))
                                 }),
                                 |id| resource_ids.contains(&id),
+                                None,
                             )?;
                         }
                         Some(DATA_BATCH_TYPE_NAME) => {
@@ -587,6 +596,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                         .any(|usage| resource_ids.contains(&usage.resource_id()))
                                 }),
                                 |id| resource_ids.contains(&id),
+                                None,
                             )?;
                         }
                         Some(BATCH_TYPE_NAME) => {
@@ -605,6 +615,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                         .any(|usage| resource_ids.contains(&usage.resource_id()))
                                 }),
                                 |id| resource_ids.contains(&id),
+                                Some(BATCH_REGISTERED_STATE),
                             )?;
                         }
                         other => {
@@ -843,6 +854,9 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             }
 
             for (state_name, usage) in batch.usages_with_state_names() {
+                if state_name == BATCH_REGISTERED_STATE {
+                    continue;
+                }
                 let resource_id = usage.resource_id();
                 if let Some(builder_indices) = per_state_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
@@ -1041,6 +1055,9 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 }
             }
             for (state_name, usage) in batch.usages_with_state_names() {
+                if state_name == BATCH_REGISTERED_STATE {
+                    continue;
+                }
                 let resource_id = usage.resource_id();
                 if let Some(builder_indices) = per_state_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
@@ -1162,6 +1179,9 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     continue;
                 };
                 let state = from.name();
+                if state == BATCH_REGISTERED_STATE {
+                    continue;
+                }
                 // States without a tier usage (terminal batch_consumed) hold no
                 // residency and contribute to no dimension key.
                 let Some(tier_usage) = from
@@ -1398,12 +1418,16 @@ impl SiriusUiAnalyzer {
         builder: &mut ResourceTimelineByKeyBuilder<'a, &'a str>,
         fsms: impl Iterator<Item = &'a F>,
         resource_filter: impl Fn(Uuid) -> bool,
+        skip_state: Option<&str>,
     ) -> AnalyzerResult<()>
     where
         F: FsmUsages<'a> + 'a,
     {
         for fsm in fsms {
             for (state_name, usage) in fsm.usages_with_state_names() {
+                if skip_state.is_some_and(|skip| skip == state_name) {
+                    continue;
+                }
                 if resource_filter(usage.resource_id()) {
                     builder.try_push(state_name, &usage)?;
                 }

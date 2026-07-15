@@ -96,8 +96,9 @@ fn memory_tier_events(id: Uuid, parent: Uuid, name: &str, bytes: u64) -> Vec<Eve
 ///
 /// Batch A (pipeline op1, batch_id 7, 1000 bytes), timestamps relative to the
 /// query epoch:
-/// - t=0    registered on GPU
-/// - t=0    queued on GPU
+/// - t=0    registered on GPU (100ns span: pins the analyzer's explicit
+///          omission of the bookkeeping entry state from aggregates)
+/// - t=100  queued on GPU
 /// - t=300  queued on HOST (tier-change self-transition: spill)
 /// - t=500  packaged (task 1) on HOST
 /// - t=800  processing (task 1) on GPU
@@ -220,7 +221,7 @@ fn fixture(with_batches: bool) -> Fixture {
             ),
             batch_event(
                 batch_a_id,
-                EPOCH,
+                EPOCH + 100,
                 1,
                 BatchTransition::BatchQueued(BatchQueued {
                     tier: tier_usage(gpu_id, 1000),
@@ -402,7 +403,7 @@ fn data_flow_timeline_bins() {
     let count = &series.values["count"];
     assert_eq!(
         count["batch_queued"]["GPU"],
-        [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     );
     assert_eq!(
         count["batch_queued"]["HOST"],
@@ -416,15 +417,16 @@ fn data_flow_timeline_bins() {
         count["batch_processing"]["GPU"],
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
     );
-    // batch_registered is instantaneous (zero-duration span), so its all-zero
-    // series is dropped; batch_consumed holds no tier residency.
+    // batch_registered spans a real 100ns in this fixture but is explicitly
+    // omitted by the analyzer (bookkeeping entry state); batch_consumed holds
+    // no tier residency.
     assert!(!count.contains_key("batch_registered"));
     assert!(!count.contains_key("batch_consumed"));
 
     let bytes = &series.values["bytes"];
     assert_eq!(
         bytes["batch_queued"]["GPU"],
-        [1000.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        [0.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     );
     assert_eq!(
         bytes["batch_processing"]["GPU"],
@@ -513,8 +515,11 @@ fn batch_keyed_timeline_over_memory_tier_resource() {
     let states = &by_state.capacities_states_values["capacity_bytes"];
     assert_eq!(
         states["batch_queued"],
-        [1000.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        [0.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     );
+    // The registered entry state occupies GPU for bin 0 but is explicitly
+    // omitted from aggregated lanes.
+    assert!(!states.contains_key("batch_registered"));
     assert_eq!(
         states["batch_processing"],
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0]
