@@ -23,16 +23,19 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
+#include "planner/query.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -47,7 +50,7 @@ task_scheduler::task_scheduler(
   : _task_queue(task_queue_ordering), _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
-    *_telemetry_context, "task-scheduler-gpu-queue");
+    *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
 
   // Self-publisher: schedule() uses this to wake management_eventloop when a
   // new task is pushed, so the loop can re-run the matcher against any device
@@ -174,6 +177,12 @@ std::future<void> task_scheduler::start_query()
   std::scoped_lock lock(_query_mutex);
   const auto& scans = _query->get_scan_operators();
 
+  // A query with no schedulable scan can never complete. Plan generation should have
+  // rejected it, so fail loudly instead of dereferencing an empty vector.
+  if (scans.empty()) {
+    throw std::runtime_error("task_scheduler: query has no schedulable scan sources");
+  }
+
   _task_creator->schedule(scans.front());
 
   return _completion_handler->get_awaitable();
@@ -183,11 +192,6 @@ void task_scheduler::terminate_query(std::exception_ptr error)
 {
   _completion_handler->report_error(std::move(error));
   stop();
-}
-
-void task_scheduler::signal_query_complete()
-{
-  if (_completion_handler) { _completion_handler->mark_completed(); }
 }
 
 void task_scheduler::drain_after_error()
@@ -281,8 +285,8 @@ void task_scheduler::wait_for_completion()
 
 void task_scheduler::management_eventloop()
 {
-  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{*_telemetry_context,
-                                                                         "task-scheduler-thread"};
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
+    *_telemetry_context, "task-scheduler-thread", _telemetry_context->shared_group_id()};
 
   // Pull-signal scheduler. The loop blocks on _task_request_channel for two
   // event kinds:
@@ -323,8 +327,10 @@ void task_scheduler::management_eventloop()
     // binding to guarantee correctness.
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
-      // First try exact preference match.
-      auto task = _task_queue.pop_if(
+      std::unique_ptr<sirius::parallel::itask> task;
+
+      // Exact preference match.
+      task = _task_queue.pop_if(
         [device_id](const sirius::parallel::itask& t) -> bool {
           const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
           if (!gpu_task) { return false; }

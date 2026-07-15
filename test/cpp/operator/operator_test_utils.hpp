@@ -175,6 +175,23 @@ inline std::vector<T> copy_column_to_host(const cudf::column_view& col)
   }
 }
 
+/// @brief Copy a column's per-row validity to host (true == valid). All-true if no null mask.
+inline std::vector<bool> copy_validity_to_host(const cudf::column_view& col)
+{
+  std::vector<bool> host(col.size(), true);
+  if (col.size() == 0 || col.null_mask() == nullptr) { return host; }
+  auto const total_bits = col.offset() + col.size();
+  auto const num_words  = static_cast<std::size_t>((total_bits + 31) / 32);
+  std::vector<cudf::bitmask_type> words(num_words);
+  cudaMemcpy(
+    words.data(), col.null_mask(), num_words * sizeof(cudf::bitmask_type), cudaMemcpyDeviceToHost);
+  for (cudf::size_type i = 0; i < col.size(); ++i) {
+    auto const bit = i + col.offset();
+    host[i]        = (words[bit / 32] >> (bit % 32)) & 1u;
+  }
+  return host;
+}
+
 template <typename T>
 inline std::shared_ptr<cucascade::data_batch> make_numeric_batch(
   cucascade::memory::memory_space& space, const std::vector<T>& values, cudf::type_id type_id)
@@ -195,6 +212,47 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch(
                sizeof(int8_t) * tmp.size(),
                cudaMemcpyHostToDevice);
   } else {
+    cudaMemcpy(col->mutable_view().data<T>(),
+               values.data(),
+               sizeof(T) * values.size(),
+               cudaMemcpyHostToDevice);
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
+  auto batch_id = ::sirius::get_next_batch_id();
+  return cucascade::data_batch::make(batch_id, std::move(gpu_repr));
+}
+
+/// @brief Single numeric column batch where @p valids[i]==false makes row i NULL.
+template <typename T>
+inline std::shared_ptr<cucascade::data_batch> make_numeric_batch_with_nulls(
+  cucascade::memory::memory_space& space,
+  const std::vector<T>& values,
+  const std::vector<bool>& valids,
+  cudf::type_id type_id)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = default_stream();
+  auto size   = static_cast<cudf::size_type>(values.size());
+
+  auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
+  auto* mask_ptr = static_cast<cudf::bitmask_type*>(null_mask.data());
+  cudf::size_type null_count = 0;
+  for (cudf::size_type i = 0; i < size; ++i) {
+    if (!valids[i]) {
+      cudf::set_null_mask(mask_ptr, i, i + 1, false, stream);
+      ++null_count;
+    }
+  }
+
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{type_id}, size, std::move(null_mask), null_count, stream, mr);
+  if (size > 0) {
     cudaMemcpy(col->mutable_view().data<T>(),
                values.data(),
                sizeof(T) * values.size(),

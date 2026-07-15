@@ -12,9 +12,21 @@ use starrocks_plan_translator::TranslatedPlan;
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
 #[derive(Clone, Debug)]
-pub(crate) struct FragmentResult {
+pub struct FragmentResult {
     /// Result batches in fragment output order. Empty for a fragment with no output columns.
     pub(crate) batches: Vec<RecordBatch>,
+}
+
+impl FragmentResult {
+    /// Builds a result from its output batches (in fragment output order).
+    pub fn new(batches: Vec<RecordBatch>) -> Self {
+        Self { batches }
+    }
+
+    /// The result batches in fragment output order.
+    pub fn batches(&self) -> &[RecordBatch] {
+        &self.batches
+    }
 }
 
 /// Runs a translated fragment and returns its result batches.
@@ -28,14 +40,14 @@ pub(crate) struct FragmentResult {
 /// startup, the executor pushes Arrow batches (e.g. via an Arrow C stream) into a bounded channel
 /// the `ResultStore` drains, and execution is cancellable from `cancel_plan_fragment`. Large/slow
 /// result queries then stream through `fetch_data` instead of risking dispatch-time timeout/OOM.
-pub(crate) trait FragmentExecutor: std::fmt::Debug + Send + Sync {
+pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     /// Executes `translated` and returns its Arrow result batches.
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String>;
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct StubExecutor;
+pub struct StubExecutor;
 
 impl FragmentExecutor for StubExecutor {
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {

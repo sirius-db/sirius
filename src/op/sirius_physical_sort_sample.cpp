@@ -224,9 +224,14 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     if (valid_batches.size() == 1) {
       merged_sample_view = get_cudf_table_view(valid_batches[0]);
     } else {
-      merged_sample_batch = gpu_merge_impl::merge_order_by(
-        valid_batches, order_key_idx, column_order, null_precedence, stream, *space);
-      merged_sample_view = get_cudf_table_view(merged_sample_batch->to_read_only());
+      merged_sample_batch = gpu_merge_impl::merge_order_by(valid_batches,
+                                                           order_key_idx,
+                                                           column_order,
+                                                           null_precedence,
+                                                           stream,
+                                                           *space,
+                                                           batch_telemetry());
+      merged_sample_view  = get_cudf_table_view(merged_sample_batch->to_read_only());
     }
 
     // 4. Compute number of partitions

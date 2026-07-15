@@ -111,12 +111,14 @@ class convertible_data_provider {
   /**
    * @brief Get all convertible data units matching the given memory space.
    *
-   * @param space           The memory space to filter by.
-   * @param front_to_back   Iteration direction: true = front-to-back, false = back-to-front.
+   * @param space             The memory space to filter by.
+   * @param front_to_back     Iteration direction: true = front-to-back, false = back-to-front.
+   * @param ignore_subscribed When true (default), skip batches that have been subscribed to by a
+   * task.
    * @return A vector of convertible_data instances (may be empty).
    */
   virtual std::vector<std::unique_ptr<convertible_data>> get_all_convertible(
-    cucascade::memory::memory_space* space, bool front_to_back) = 0;
+    cucascade::memory::memory_space* space, bool front_to_back, bool ignore_subscribed = true) = 0;
 };
 
 }  // namespace sirius

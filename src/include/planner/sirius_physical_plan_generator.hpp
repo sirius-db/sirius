@@ -22,10 +22,19 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+namespace sirius::op {
+class sirius_physical_table_scan;
+}  // namespace sirius::op
+
 namespace duckdb {
 class ClientContext;
 class GPUContext;
 class ColumnDataCollection;
+class DynamicTableFilterSet;
 class LogicalOperator;
 class LogicalAggregate;
 class LogicalColumnDataGet;
@@ -43,6 +52,10 @@ class LogicalProjection;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
 }  // namespace duckdb
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}
 
 namespace sirius::planner {
 
@@ -69,7 +82,19 @@ class sirius_physical_plan_generator {
   // duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::GPUIntermediateRelation>>
   // gpu_recursive_cte_tables;
 
+  /// @brief Map from duckdb::DynamicTableFilterSet pointers to sirius_dynamic_filter_set channels.
+  /// DuckDB pairs a producer (join) and a consumer (scan) by planting the same
+  /// DynamicTableFilterSet pointer on both sides, so we key the channels by these pointers.
+  std::unordered_map<duckdb::DynamicTableFilterSet const*,
+                     std::shared_ptr<sirius::op::sirius_dynamic_filter_set>>
+    dynamic_filter_channels;
+
  public:
+  /// @brief Look up or create the dynamic filter channel keyed by @p key. Returns nullptr if @p key
+  /// is null. Same pointer in repeated calls returns the same channel.
+  [[nodiscard]] std::shared_ptr<sirius::op::sirius_dynamic_filter_set>
+  get_or_create_dynamic_filter_channel(duckdb::DynamicTableFilterSet const* key);
+
   //! Creates a plan from the logical operator. This involves resolving column bindings and
   //! generating physical operator nodes.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -174,5 +199,21 @@ class sirius_physical_plan_generator {
  public:
   duckdb::ClientContext& context;
   // duckdb::GPUContext& gpu_context;
+
+ public:
+  //! Recursive post-pass that derives each operator's `_parent_op` from the final tree's
+  //! `children[]`, run after all tree rewrites have settled so the pointer cannot drift.
+  //! Public so the engine can re-run it after the RESULT_COLLECTOR wrap is added around the
+  //! plan post-generation — otherwise the wrapped child's `_parent_op` would stay null and
+  //! break the tree-parent-driven wiring.
+  static void set_parent_ops(sirius::op::sirius_physical_operator& op,
+                             sirius::op::sirius_physical_operator* parent);
+
+ private:
+  //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
+  //! merge operators, scan companions, GPU_VALUES) so the tree carries the full execution
+  //! structure before the pipeline converter runs.
+  void insert_gpu_pipeline_operators(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
 };
 }  // namespace sirius::planner

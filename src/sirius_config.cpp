@@ -115,6 +115,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
   r.optional("honor_retry_after", opt.honor_retry_after);
   r.optional("perf_instrumentation", opt.perf_instrumentation);
+  r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.reject_unknown();
 }
 
@@ -171,6 +172,12 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
+  r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
+  r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
+  r.optional("dynamic_filter_domain_coverage_threshold",
+             opt.dynamic_filter_domain_coverage_threshold);
+  r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
+  r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.reject_unknown();
 }
 
@@ -189,7 +196,7 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("monitor_period_ms", opt.monitor_period_ms);
+  r.optional("monitor_period", opt.monitor_period);
   r.reject_unknown();
 }
 

@@ -1,5 +1,10 @@
 use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType};
+use substrait::proto::read_rel::local_files::FileOrFiles;
+use substrait::proto::read_rel::local_files::file_or_files::{
+    FileFormat, ParquetReadOptions, PathType,
+};
+use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
     Expression, FilterRel, ProjectRel, ReadRel, Rel, RelCommon, rel, rel_common,
 };
@@ -7,6 +12,7 @@ use substrait::proto::{
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
+use crate::scan_paths::ScanFilePaths;
 use crate::{ExtensionRegistry, URN_BOOLEAN};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
@@ -34,14 +40,26 @@ pub(crate) struct TranslatedRel {
 struct PlanContext<'a> {
     /// Descriptor lookups for row layouts, tables, and scan schemas.
     desc: &'a DescriptorTable,
+    /// Parquet file paths for each scan node, collected from the fragment's broker
+    /// scan ranges. Scans with paths emit a `local_files` read; path-less scans
+    /// fall back to a named-table read.
+    scan_paths: &'a ScanFilePaths,
     /// Substrait extension registry shared across the whole plan.
     registry: &'a mut ExtensionRegistry,
 }
 
 impl<'a> PlanContext<'a> {
     /// Creates a plan translation context.
-    fn new(desc: &'a DescriptorTable, registry: &'a mut ExtensionRegistry) -> Self {
-        Self { desc, registry }
+    fn new(
+        desc: &'a DescriptorTable,
+        scan_paths: &'a ScanFilePaths,
+        registry: &'a mut ExtensionRegistry,
+    ) -> Self {
+        Self {
+            desc,
+            scan_paths,
+            registry,
+        }
     }
 
     /// Creates an expression context for an expression over `row_tuples`.
@@ -186,8 +204,9 @@ fn translate_scan(
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
     expect_children(node, &children, 0)?;
+    let file_paths = ctx.scan_paths.for_node(node.node_id);
     let input = TranslatedRel {
-        rel: scan_rel(ctx.desc, tuple_id)?,
+        rel: scan_rel(ctx.desc, tuple_id, file_paths)?,
         row_tuples: vec![tuple_id],
         output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
     };
@@ -226,23 +245,43 @@ fn translate_project(
 pub(crate) fn translate_plan(
     plan: &TPlan,
     desc: &DescriptorTable,
+    scan_paths: &ScanFilePaths,
     registry: &mut ExtensionRegistry,
 ) -> Result<TranslatedRel> {
-    let mut ctx = PlanContext::new(desc, registry);
+    let mut ctx = PlanContext::new(desc, scan_paths, registry);
     plan.translate(&mut ctx)
 }
 
-/// Builds a Substrait named-table read for a StarRocks scan tuple.
-fn scan_rel(desc: &DescriptorTable, tuple_id: i32) -> Result<Rel> {
+/// Builds a Substrait read for a StarRocks scan tuple.
+///
+/// With `file_paths` present (FILE_SCAN broker ranges) it emits a `local_files`
+/// parquet read so DuckDB's Substrait reader resolves the scan to
+/// `parquet_scan(<paths>)`. v1 assumes parquet files whose column order matches
+/// the scan tuple's slot order, which holds for `FILES()` `SELECT *`. Without
+/// paths (e.g. HDFS scans) it falls back to a named-table read.
+fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Result<Rel> {
+    let read_type = if file_paths.is_empty() {
+        ReadType::NamedTable(NamedTable {
+            names: desc.table_names_for_tuple(tuple_id)?,
+            ..Default::default()
+        })
+    } else {
+        ReadType::LocalFiles(LocalFiles {
+            items: file_paths
+                .iter()
+                .map(|path| FileOrFiles {
+                    path_type: Some(PathType::UriFile(path.clone())),
+                    file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    };
     Ok(Rel {
         rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
             base_schema: Some(desc.named_struct(tuple_id)?),
-            read_type: Some(substrait::proto::read_rel::ReadType::NamedTable(
-                substrait::proto::read_rel::NamedTable {
-                    names: desc.table_names_for_tuple(tuple_id)?,
-                    ..Default::default()
-                },
-            )),
+            read_type: Some(read_type),
             ..Default::default()
         }))),
     })
@@ -302,7 +341,10 @@ pub(crate) fn project_exprs(
     desc: &DescriptorTable,
     registry: &mut ExtensionRegistry,
 ) -> Result<TranslatedRel> {
-    let mut ctx = PlanContext::new(desc, registry);
+    // Root projections evaluate over already-translated inputs, so there are no
+    // scan nodes to resolve file paths for.
+    let scan_paths = ScanFilePaths::default();
+    let mut ctx = PlanContext::new(desc, &scan_paths, registry);
     project_exprs_with_context(input, exprs, &mut ctx)
 }
 

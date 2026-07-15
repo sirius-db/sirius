@@ -1,0 +1,399 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * See the LICENSE file at the repo root for the full text.
+ */
+
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <optional>
+#include <string_view>
+
+namespace sirius::test {
+
+struct tpch_query_spec {
+  std::size_t number;
+  std::string_view sql;
+  std::optional<float> float_tolerance;
+  bool retry_once;
+};
+
+inline constexpr char kTpchQ1[] =
+  "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, "
+  "sum(l_extendedprice) as sum_base_price, "
+  "sum(l_extendedprice * (1 - l_discount)) as sum_disc_price, "
+  "sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge, "
+  "avg(l_quantity) as avg_qty, avg(l_extendedprice) as avg_price, "
+  "avg(l_discount) as avg_disc, count(*) as count_order "
+  "from lineitem "
+  "where l_shipdate <= date '1995-08-19' "
+  "group by l_returnflag, l_linestatus "
+  "order by l_returnflag, l_linestatus;";
+
+inline constexpr char kTpchQ2[] =
+  "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, "
+  "s.s_address, s.s_phone, s.s_comment "
+  "from part p, supplier s, partsupp ps, nation n, region r "
+  "where p.p_partkey = ps.ps_partkey and s.s_suppkey = ps.ps_suppkey "
+  "and p.p_size = 41 and p.p_type like '%NICKEL' "
+  "and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
+  "and r.r_name = 'EUROPE' "
+  "and ps.ps_supplycost = ("
+  "  select min(ps.ps_supplycost) "
+  "  from partsupp ps, supplier s, nation n, region r "
+  "  where p.p_partkey = ps.ps_partkey and s.s_suppkey = ps.ps_suppkey "
+  "  and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
+  "  and r.r_name = 'EUROPE'"
+  ") "
+  "order by s.s_acctbal desc, n.n_name, s.s_name, p.p_partkey "
+  "limit 100;";
+
+inline constexpr char kTpchQ3[] =
+  "select l.l_orderkey, "
+  "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
+  "o.o_orderdate, o.o_shippriority "
+  "from customer c, orders o, lineitem l "
+  "where c.c_mktsegment = 'HOUSEHOLD' and c.c_custkey = o.o_custkey "
+  "and l.l_orderkey = o.o_orderkey "
+  "and o.o_orderdate < date '1995-03-25' "
+  "and l.l_shipdate > date '1995-03-25' "
+  "group by l.l_orderkey, o.o_orderdate, o.o_shippriority "
+  "order by revenue desc, o.o_orderdate "
+  "limit 10;";
+
+inline constexpr char kTpchQ4[] =
+  "select o.o_orderpriority, count(*) as order_count "
+  "from orders o "
+  "where o.o_orderdate >= date '1996-10-01' "
+  "and o.o_orderdate < date '1997-01-01' "
+  "and exists ("
+  "  select * from lineitem l "
+  "  where l.l_orderkey = o.o_orderkey "
+  "  and l.l_commitdate < l.l_receiptdate"
+  ") "
+  "group by o.o_orderpriority "
+  "order by o.o_orderpriority;";
+
+inline constexpr char kTpchQ5[] =
+  "select n.n_name, "
+  "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue "
+  "from orders o, lineitem l, supplier s, nation n, region r, customer c "
+  "where c.c_custkey = o.o_custkey and l.l_orderkey = o.o_orderkey "
+  "and l.l_suppkey = s.s_suppkey and c.c_nationkey = s.s_nationkey "
+  "and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
+  "and r.r_name = 'EUROPE' "
+  "and o.o_orderdate >= date '1997-01-01' "
+  "and o.o_orderdate < date '1998-01-01' "
+  "group by n.n_name "
+  "order by revenue desc;";
+
+inline constexpr char kTpchQ6[] =
+  "select sum(l_extendedprice * l_discount) as revenue "
+  "from lineitem "
+  "where l_shipdate >= date '1997-01-01' "
+  "and l_shipdate < date '1998-01-01' "
+  "and l_discount between 0.03 - 0.01 and 0.03 + 0.01 "
+  "and l_quantity < 24;";
+
+inline constexpr char kTpchQ7[] =
+  "select supp_nation, cust_nation, l_year, sum(volume) as revenue "
+  "from ("
+  "  select n1.n_name as supp_nation, n2.n_name as cust_nation, "
+  "  extract(year from l.l_shipdate) as l_year, "
+  "  l.l_extendedprice * (1 - l.l_discount) as volume "
+  "  from supplier s, lineitem l, orders o, customer c, nation n1, nation n2 "
+  "  where s.s_suppkey = l.l_suppkey and o.o_orderkey = l.l_orderkey "
+  "  and c.c_custkey = o.o_custkey and s.s_nationkey = n1.n_nationkey "
+  "  and c.c_nationkey = n2.n_nationkey "
+  "  and ((n1.n_name = 'EGYPT' and n2.n_name = 'UNITED STATES') "
+  "    or (n1.n_name = 'UNITED STATES' and n2.n_name = 'EGYPT')) "
+  "  and l.l_shipdate between date '1995-01-01' and date '1996-12-31'"
+  ") as shipping "
+  "group by supp_nation, cust_nation, l_year "
+  "order by supp_nation, cust_nation, l_year;";
+
+inline constexpr char kTpchQ8[] =
+  "select o_year, "
+  "sum(case when nation = 'EGYPT' then volume else 0 end) / sum(volume) as mkt_share "
+  "from ("
+  "  select extract(year from o.o_orderdate) as o_year, "
+  "  l.l_extendedprice * (1 - l.l_discount) as volume, "
+  "  n2.n_name as nation "
+  "  from lineitem l, part p, supplier s, orders o, customer c, "
+  "  nation n1, nation n2, region r "
+  "  where p.p_partkey = l.l_partkey and s.s_suppkey = l.l_suppkey "
+  "  and l.l_orderkey = o.o_orderkey and o.o_custkey = c.c_custkey "
+  "  and c.c_nationkey = n1.n_nationkey and n1.n_regionkey = r.r_regionkey "
+  "  and r.r_name = 'MIDDLE EAST' and s.s_nationkey = n2.n_nationkey "
+  "  and o.o_orderdate between date '1995-01-01' and date '1996-12-31' "
+  "  and p.p_type = 'PROMO BRUSHED COPPER'"
+  ") as all_nations "
+  "group by o_year "
+  "order by o_year;";
+
+inline constexpr char kTpchQ9[] =
+  "select nation, o_year, sum(amount) as sum_profit "
+  "from ("
+  "  select n.n_name as nation, "
+  "  extract(year from o.o_orderdate) as o_year, "
+  "  l.l_extendedprice * (1 - l.l_discount) - ps.ps_supplycost * l.l_quantity as amount "
+  "  from part p, supplier s, lineitem l, partsupp ps, orders o, nation n "
+  "  where s.s_suppkey = l.l_suppkey and ps.ps_suppkey = l.l_suppkey "
+  "  and ps.ps_partkey = l.l_partkey and p.p_partkey = l.l_partkey "
+  "  and o.o_orderkey = l.l_orderkey and s.s_nationkey = n.n_nationkey "
+  "  and p.p_name like '%yellow%'"
+  ") as profit "
+  "group by nation, o_year "
+  "order by nation, o_year desc;";
+
+inline constexpr char kTpchQ10[] =
+  "select c.c_custkey, c.c_name, "
+  "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
+  "c.c_acctbal, n.n_name, c.c_address, c.c_phone, c.c_comment "
+  "from customer c, orders o, lineitem l, nation n "
+  "where c.c_custkey = o.o_custkey and l.l_orderkey = o.o_orderkey "
+  "and o.o_orderdate >= date '1994-03-01' "
+  "and o.o_orderdate < date '1994-06-01' "
+  "and l.l_returnflag = 'R' "
+  "and c.c_nationkey = n.n_nationkey "
+  "group by c.c_custkey, c.c_name, c.c_acctbal, c.c_phone, "
+  "n.n_name, c.c_address, c.c_comment "
+  "order by revenue desc "
+  "limit 20;";
+
+inline constexpr char kTpchQ11[] =
+  "select ps.ps_partkey, "
+  "sum(ps.ps_supplycost * ps.ps_availqty) as value "
+  "from partsupp ps, supplier s, nation n "
+  "where ps.ps_suppkey = s.s_suppkey "
+  "and s.s_nationkey = n.n_nationkey "
+  "and n.n_name = 'JAPAN' "
+  "group by ps.ps_partkey "
+  "having sum(ps.ps_supplycost * ps.ps_availqty) > ("
+  "  select sum(ps.ps_supplycost * ps.ps_availqty) * 0.0001000000 "
+  "  from partsupp ps, supplier s, nation n "
+  "  where ps.ps_suppkey = s.s_suppkey "
+  "  and s.s_nationkey = n.n_nationkey "
+  "  and n.n_name = 'JAPAN'"
+  ") "
+  "order by value desc;";
+
+inline constexpr char kTpchQ12[] =
+  "select l.l_shipmode, "
+  "sum(case when o.o_orderpriority = '1-URGENT' "
+  "  or o.o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, "
+  "sum(case when o.o_orderpriority <> '1-URGENT' "
+  "  and o.o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count "
+  "from orders o, lineitem l "
+  "where o.o_orderkey = l.l_orderkey "
+  "and l.l_shipmode in ('TRUCK', 'REG AIR') "
+  "and l.l_commitdate < l.l_receiptdate "
+  "and l.l_shipdate < l.l_commitdate "
+  "and l.l_receiptdate >= date '1994-01-01' "
+  "and l.l_receiptdate < date '1995-01-01' "
+  "group by l.l_shipmode "
+  "order by l.l_shipmode;";
+
+inline constexpr char kTpchQ13[] =
+  "select c_count, count(*) as custdist "
+  "from ("
+  "  select c.c_custkey, count(o.o_orderkey) "
+  "  from customer c "
+  "  left outer join orders o "
+  "    on c.c_custkey = o.o_custkey "
+  "    and o.o_comment not like '%special%requests%' "
+  "  group by c.c_custkey"
+  ") as orders (c_custkey, c_count) "
+  "group by c_count "
+  "order by custdist desc, c_count desc;";
+
+inline constexpr char kTpchQ14[] =
+  "select 100.00 * sum(case when p.p_type like 'PROMO%' "
+  "  then l.l_extendedprice * (1 - l.l_discount) else 0 end) "
+  "  / sum(l.l_extendedprice * (1 - l.l_discount)) as promo_revenue "
+  "from lineitem l, part p "
+  "where l.l_partkey = p.p_partkey "
+  "and l.l_shipdate >= date '1994-08-01' "
+  "and l.l_shipdate < date '1994-09-01';";
+
+inline constexpr char kTpchQ15[] =
+  "with revenue_view as ("
+  "  select l_suppkey as supplier_no, "
+  "  sum(l_extendedprice * (1 - l_discount)) as total_revenue "
+  "  from lineitem "
+  "  where l_shipdate >= date '1993-05-01' "
+  "  and l_shipdate < date '1993-08-01' "
+  "  group by l_suppkey"
+  ") "
+  "select s.s_suppkey, s.s_name, s.s_address, s.s_phone, r.total_revenue "
+  "from supplier s, revenue_view r "
+  "where s.s_suppkey = r.supplier_no "
+  "and r.total_revenue = ("
+  "  select max(total_revenue) from revenue_view"
+  ") "
+  "order by s.s_suppkey;";
+
+inline constexpr char kTpchQ16[] =
+  "select p.p_brand, p.p_type, p.p_size, "
+  "count(distinct ps.ps_suppkey) as supplier_cnt "
+  "from partsupp ps, part p "
+  "where p.p_partkey = ps.ps_partkey "
+  "and p.p_brand <> 'Brand#21' "
+  "and p.p_type not like 'MEDIUM PLATED%' "
+  "and p.p_size in (38, 2, 8, 31, 44, 5, 14, 24) "
+  "and ps.ps_suppkey not in ("
+  "  select s.s_suppkey from supplier s "
+  "  where s.s_comment like '%Customer%Complaints%'"
+  ") "
+  "group by p.p_brand, p.p_type, p.p_size "
+  "order by supplier_cnt desc, p.p_brand, p.p_type, p.p_size;";
+
+inline constexpr char kTpchQ17[] =
+  "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
+  "from lineitem l, part p "
+  "where p.p_partkey = l.l_partkey "
+  "and p.p_brand = 'Brand#13' "
+  "and p.p_container = 'JUMBO CAN' "
+  "and l.l_quantity < ("
+  "  select 0.2 * avg(l2.l_quantity) "
+  "  from lineitem l2 "
+  "  where l2.l_partkey = p.p_partkey"
+  ");";
+
+inline constexpr char kTpchQ18[] =
+  "select c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, "
+  "o.o_totalprice, sum(l.l_quantity) "
+  "from customer c, orders o, lineitem l "
+  "where o.o_orderkey in ("
+  "  select l_orderkey from lineitem "
+  "  group by l_orderkey having sum(l_quantity) > 300"
+  ") "
+  "and c.c_custkey = o.o_custkey "
+  "and o.o_orderkey = l.l_orderkey "
+  "group by c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, o.o_totalprice "
+  "order by o.o_totalprice desc, o.o_orderdate "
+  "limit 100;";
+
+inline constexpr char kTpchQ19[] =
+  "select sum(l.l_extendedprice* (1 - l.l_discount)) as revenue "
+  "from lineitem l, part p "
+  "where ("
+  "  p.p_partkey = l.l_partkey "
+  "  and p.p_brand = 'Brand#41' "
+  "  and p.p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') "
+  "  and l.l_quantity >= 2 and l.l_quantity <= 2 + 10 "
+  "  and p.p_size between 1 and 5 "
+  "  and l.l_shipmode in ('AIR', 'AIR REG') "
+  "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
+  ") or ("
+  "  p.p_partkey = l.l_partkey "
+  "  and p.p_brand = 'Brand#13' "
+  "  and p.p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') "
+  "  and l.l_quantity >= 14 and l.l_quantity <= 14 + 10 "
+  "  and p.p_size between 1 and 10 "
+  "  and l.l_shipmode in ('AIR', 'AIR REG') "
+  "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
+  ") or ("
+  "  p.p_partkey = l.l_partkey "
+  "  and p.p_brand = 'Brand#55' "
+  "  and p.p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') "
+  "  and l.l_quantity >= 23 and l.l_quantity <= 23 + 10 "
+  "  and p.p_size between 1 and 15 "
+  "  and l.l_shipmode in ('AIR', 'AIR REG') "
+  "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
+  ");";
+
+inline constexpr char kTpchQ20[] =
+  "select s.s_name, s.s_address "
+  "from supplier s, nation n "
+  "where s.s_suppkey in ("
+  "  select ps.ps_suppkey from partsupp ps "
+  "  where ps.ps_partkey in ("
+  "    select p.p_partkey from part p where p.p_name like 'antique%'"
+  "  ) "
+  "  and ps.ps_availqty > ("
+  "    select 0.5 * sum(l.l_quantity) "
+  "    from lineitem l "
+  "    where l.l_partkey = ps.ps_partkey "
+  "    and l.l_suppkey = ps.ps_suppkey "
+  "    and l.l_shipdate >= date '1993-01-01' "
+  "    and l.l_shipdate < date '1994-01-01'"
+  "  )"
+  ") "
+  "and s.s_nationkey = n.n_nationkey "
+  "and n.n_name = 'KENYA' "
+  "order by s.s_name;";
+
+inline constexpr char kTpchQ21[] =
+  "select s.s_name, count(*) as numwait "
+  "from supplier s, lineitem l1, orders o, nation n "
+  "where s.s_suppkey = l1.l_suppkey "
+  "and o.o_orderkey = l1.l_orderkey "
+  "and o.o_orderstatus = 'F' "
+  "and l1.l_receiptdate > l1.l_commitdate "
+  "and exists ("
+  "  select * from lineitem l2 "
+  "  where l2.l_orderkey = l1.l_orderkey "
+  "  and l2.l_suppkey <> l1.l_suppkey"
+  ") "
+  "and not exists ("
+  "  select * from lineitem l3 "
+  "  where l3.l_orderkey = l1.l_orderkey "
+  "  and l3.l_suppkey <> l1.l_suppkey "
+  "  and l3.l_receiptdate > l3.l_commitdate"
+  ") "
+  "and s.s_nationkey = n.n_nationkey "
+  "and n.n_name = 'BRAZIL' "
+  "group by s.s_name "
+  "order by numwait desc, s.s_name "
+  "limit 100;";
+
+inline constexpr char kTpchQ22[] =
+  "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal "
+  "from ("
+  "  select substring(c_phone from 1 for 2) as cntrycode, c_acctbal "
+  "  from customer c "
+  "  where substring(c_phone from 1 for 2) in "
+  "    ('24', '31', '11', '16', '21', '20', '34') "
+  "  and c_acctbal > ("
+  "    select avg(c_acctbal) from customer "
+  "    where c_acctbal > 0.00 "
+  "    and substring(c_phone from 1 for 2) in "
+  "      ('24', '31', '11', '16', '21', '20', '34')"
+  "  ) "
+  "  and not exists ("
+  "    select * from orders o where o.o_custkey = c.c_custkey"
+  "  )"
+  ") as custsale "
+  "group by cntrycode "
+  "order by cntrycode;";
+
+inline constexpr std::array<tpch_query_spec, 22> kTpchQueries{{
+  tpch_query_spec{1, kTpchQ1, 0.00001f, false},
+  tpch_query_spec{2, kTpchQ2, std::nullopt, false},
+  tpch_query_spec{3, kTpchQ3, std::nullopt, false},
+  tpch_query_spec{4, kTpchQ4, std::nullopt, true},
+  tpch_query_spec{5, kTpchQ5, std::nullopt, false},
+  tpch_query_spec{6, kTpchQ6, std::nullopt, false},
+  tpch_query_spec{7, kTpchQ7, std::nullopt, false},
+  tpch_query_spec{8, kTpchQ8, std::nullopt, false},
+  tpch_query_spec{9, kTpchQ9, std::nullopt, false},
+  tpch_query_spec{10, kTpchQ10, std::nullopt, false},
+  tpch_query_spec{11, kTpchQ11, std::nullopt, false},
+  tpch_query_spec{12, kTpchQ12, std::nullopt, false},
+  tpch_query_spec{13, kTpchQ13, std::nullopt, false},
+  tpch_query_spec{14, kTpchQ14, std::nullopt, false},
+  tpch_query_spec{15, kTpchQ15, std::nullopt, false},
+  tpch_query_spec{16, kTpchQ16, std::nullopt, false},
+  tpch_query_spec{17, kTpchQ17, std::nullopt, false},
+  tpch_query_spec{18, kTpchQ18, std::nullopt, false},
+  tpch_query_spec{19, kTpchQ19, std::nullopt, false},
+  tpch_query_spec{20, kTpchQ20, std::nullopt, false},
+  tpch_query_spec{21, kTpchQ21, std::nullopt, false},
+  tpch_query_spec{22, kTpchQ22, std::nullopt, false},
+}};
+
+}  // namespace sirius::test

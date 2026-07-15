@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
+#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
@@ -87,7 +88,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregate_idx,
                                                               cudf_aggregate_struct_col_indices,
                                                               stream,
-                                                              *space);
+                                                              *space,
+                                                              batch_telemetry());
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

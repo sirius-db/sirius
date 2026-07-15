@@ -24,11 +24,13 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <op/sirius_dynamic_filter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
@@ -53,10 +55,12 @@
 #include <io/uring/uring_reactor.hpp>
 
 // standard library
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -98,6 +102,20 @@ class parquet_batch_coalescer : public batch_coalescer {
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
     if (file == nullptr) { return emitted; }
 
+    // Remember the first fully-pruned file. If the WHOLE source coalesces to
+    // nothing, flush() emits one empty split built from it — zero splits mean
+    // zero tasks, and the pipeline-completion accounting only fires from task
+    // completion, hanging sirius_engine::execute().
+    if (file->row_groups.empty() && !_empty_split_fallback) {
+      _empty_split_fallback = fallback_file{
+        file->file_metadata,
+        file->file_path,
+        file->datasource ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
+                         : std::shared_ptr<io::sirius_datasource>{},
+        file->partition_values,
+        file->disable_filter_pushdown};
+    }
+
     if (!_slices.empty() && (_partition_values != file->partition_values ||
                              _disable_pushdown != file->disable_filter_pushdown)) {
       emitted.push_back(emit_current());
@@ -106,30 +124,34 @@ class parquet_batch_coalescer : public batch_coalescer {
     _disable_pushdown = file->disable_filter_pushdown;
 
     std::vector<cudf::size_type> cur_rgs;
-    std::size_t cur_unc  = 0;
-    std::size_t cur_comp = 0;
-    int64_t cur_rows     = 0;
-    auto seal_file       = [&]() {
+    std::size_t cur_output  = 0;
+    std::size_t cur_working = 0;
+    std::size_t cur_comp    = 0;
+    int64_t cur_rows        = 0;
+    auto seal_file          = [&]() {
       if (cur_rgs.empty()) { return; }
       // A file's row groups can span multiple splits, each sealed into its own
       // slice. fadvise stores a per-scan prefetch handle on the datasource, so
       // each slice gets its own datasource (sharing the io_object) — otherwise
       // a later split's fadvise would stomp an earlier one's handle.
       auto slice_ds = file->datasource
-                              ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                              : std::shared_ptr<io::sirius_datasource>{};
+                                 ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
+                                 : std::shared_ptr<io::sirius_datasource>{};
       _slices.emplace_back(file->file_metadata,
                            file->file_path,
                            std::move(cur_rgs),
-                           cur_unc,
+                           cur_output,
+                           cur_working,
                            cur_comp,
                            std::move(slice_ds));
-      _acc_bytes += cur_unc;
+      _produced_any = true;
+      _acc_working_bytes += cur_working;
       _acc_rows += cur_rows;
       cur_rgs.clear();
-      cur_unc  = 0;
-      cur_comp = 0;
-      cur_rows = 0;
+      cur_output  = 0;
+      cur_working = 0;
+      cur_comp    = 0;
+      cur_rows    = 0;
     };
 
     // cuDF tables are limited to cudf::size_type (int32_t) rows per call.
@@ -137,14 +159,15 @@ class parquet_batch_coalescer : public batch_coalescer {
 
     for (auto const& rg : file->row_groups) {
       bool const byte_cap_hit = (!_slices.empty() || !cur_rgs.empty()) && _cap > 0 &&
-                                _acc_bytes + cur_unc + rg.uncompressed_bytes > _cap;
+                                _acc_working_bytes + cur_working + rg.decode_working_bytes > _cap;
       bool const row_cap_hit = (!_slices.empty() || !cur_rgs.empty()) &&
                                _acc_rows + cur_rows + rg.num_rows > cudf_max_rows;
       if (byte_cap_hit || row_cap_hit) {
         seal_file();
         emitted.push_back(emit_current());
       }
-      cur_unc += rg.uncompressed_bytes;
+      cur_output += rg.output_bytes;
+      cur_working += rg.decode_working_bytes;
       cur_comp += rg.compressed_bytes;
       cur_rgs.push_back(rg.index);
       cur_rows += rg.num_rows;
@@ -157,6 +180,25 @@ class parquet_batch_coalescer : public batch_coalescer {
   {
     std::vector<std::unique_ptr<scan_info>> out;
     if (!_slices.empty()) { out.push_back(emit_current()); }
+    // Every file was stats-pruned to zero row groups: emit exactly one split
+    // with a single zero-row-group slice so the scan still creates one task
+    // (materialize_metadata_to_table short-circuits it to a schema-correct
+    // empty table). Partial prunes never reach here — any surviving slice sets
+    // _produced_any. Zero splits would mean zero tasks, and pipeline-completion
+    // accounting only fires from task completion, hanging the query.
+    if (!_produced_any && _empty_split_fallback) {
+      _slices.emplace_back(_empty_split_fallback->file_metadata,
+                           _empty_split_fallback->file_path,
+                           std::vector<cudf::size_type>{},
+                           /*estimated_output_bytes=*/0,
+                           /*estimated_decode_working_bytes=*/0,
+                           /*reserved_compressed_bytes=*/0,
+                           _empty_split_fallback->datasource);
+      _partition_values = _empty_split_fallback->partition_values;
+      _disable_pushdown = _empty_split_fallback->disable_filter_pushdown;
+      _produced_any     = true;
+      out.push_back(emit_current());
+    }
     return out;
   }
 
@@ -170,15 +212,17 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
-    SIRIUS_LOG_INFO(
-      "[coalesce-debug] parquet_batch_coalescer emit #{}: {} slice(s), acc_bytes={}, cap={}",
+    SIRIUS_LOG_DEBUG(
+      "[coalesce-debug] parquet_batch_coalescer emit #{}: {} slice(s), output_bytes={}, "
+      "decode_working_bytes={}, cap={}",
       ++_emit_count,
       split->rg_slices.size(),
-      _acc_bytes,
+      split->estimated_bytes(),
+      split->estimated_working_set_bytes(),
       _cap);
     _slices.clear();
-    _acc_bytes = 0;
-    _acc_rows  = 0;
+    _acc_working_bytes = 0;
+    _acc_rows          = 0;
     return split;
   }
 
@@ -188,11 +232,23 @@ class parquet_batch_coalescer : public batch_coalescer {
   const bool _needs_assembly;
 
   std::vector<row_group_slice> _slices;
-  std::size_t _acc_bytes  = 0;
-  int64_t _acc_rows       = 0;
-  std::size_t _emit_count = 0;  // [coalesce-debug] running count of emitted batches
+  std::size_t _acc_working_bytes = 0;
+  int64_t _acc_rows              = 0;
+  std::size_t _emit_count        = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
+
+  /// First fully-pruned file, kept as the source for flush()'s empty-split
+  /// fallback when the whole scan produced no slice.
+  struct fallback_file {
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+    std::string file_path;
+    std::shared_ptr<io::sirius_datasource> datasource;
+    std::vector<std::string> partition_values;
+    bool disable_filter_pushdown;
+  };
+  std::optional<fallback_file> _empty_split_fallback;
+  bool _produced_any = false;
 };
 
 /// Column-chunk byte ranges a read fetches for @p row_group_indices, honoring
@@ -308,7 +364,32 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // materialize_table on a copy of these options.
   _reader_options = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
-  if (_plan->is_projected()) { _reader_options->set_column_names(_plan->data_column_names()); }
+  // Never hand cuDF an empty column list — a zero-column read over live row groups
+  // hangs. is_projected() already excludes it; this pins the invariant here.
+  if (_plan->is_projected() && !_plan->data_columns.empty()) {
+    _reader_options->set_column_names(_plan->data_column_names());
+  }
+
+  _sirius_dynamic_filters = bind.sirius_dynamic_filters;
+
+  // Producers reference probe columns in DuckDB's column_ids space; the AST merge and the
+  // post-decode apply both key by output-column position. Install the translation so push_filter
+  // remaps before storing. Wiring-time setup, before the producing build publishes.
+  if (_sirius_dynamic_filters) {
+    _sirius_dynamic_filters->set_consumer_column_remap(_plan->output_position_by_column_id);
+  }
+
+  // Hive-partition columns are path-derived constants, not decoded parquet columns, so they must
+  // not receive post-decode dynamic filters.
+  if (_sirius_dynamic_filters && _plan->has_partitions()) {
+    std::vector<std::size_t> partition_cols;
+    for (std::size_t i = 0; i < _plan->output_layout.size(); ++i) {
+      if (_plan->output_layout[i].source == scan_plan::output_entry::PARTITION) {
+        partition_cols.push_back(i);
+      }
+    }
+    _sirius_dynamic_filters->ignore_columns(partition_cols);
+  }
 
   _file_paths = bind.resolved_file_paths;
 }
@@ -437,7 +518,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   hybrid_scan_reader reader(metadata, opts);
 
   // Per-file leaf-column selection for byte accounting. Pure-filter columns are
-  // read for filter evaluation but excluded from the uncompressed accounting.
+  // part of the decode working set but not the projected-column estimate.
 
   // DuckDB schema types (P-space), indexed by scan_plan::data_column::primary_idx.
   // Used below to estimate the decoded (GPU-resident) byte size of each projected
@@ -452,6 +533,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   std::unordered_set<std::size_t> pure_filter_chunk_indices;
   if (_plan->is_projected()) {
     auto const pure_filter_positions = _plan->pure_filter_batch_positions();
+    bool has_data_output             = false;
+    for (auto const& output : _plan->output_layout) {
+      if (output.source == scan_plan::output_entry::DATA) {
+        has_data_output = true;
+        break;
+      }
+    }
     selected_chunk_indices.reserve(data_column_names.size());
     selected_chunk_decoded_width.reserve(data_column_names.size());
     for (std::size_t k = 0; k < data_column_names.size(); ++k) {
@@ -476,7 +564,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
           }
         }
       }
-      bool const is_pure_filter = pure_filter_positions.count(k);
+      // When no data column is projected, use the decoded columns as a nonzero
+      // history basis. This covers count-style and partition-only outputs.
+      bool const is_pure_filter = has_data_output && pure_filter_positions.count(k);
       for (auto const leaf : leaves) {
         selected_chunk_indices.push_back(leaf);
         selected_chunk_decoded_width.push_back(decoded_width);
@@ -495,37 +585,42 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
                      row_group_indices.size());
   }
 
-  // Estimate the DECODED (GPU-resident) byte size of a row group's projected
-  // columns
+  struct row_group_size_estimate {
+    std::size_t output_bytes         = 0;
+    std::size_t decode_working_bytes = 0;
+    std::size_t compressed_bytes     = 0;
+  };
+
+  // Estimate the decoded output and full decode working set for one row group.
   auto rg_contribution = [&](cudf::io::parquet::RowGroup const& row_group) {
-    std::size_t rg_decoded    = 0;
-    std::size_t rg_compressed = 0;
-    auto const row_count      = static_cast<std::size_t>(row_group.num_rows);
-    auto add_chunk            = [&](cudf::io::parquet::ColumnChunk const& chunk,
+    row_group_size_estimate estimate;
+    auto const row_count = static_cast<std::size_t>(row_group.num_rows);
+    auto add_chunk       = [&](cudf::io::parquet::ColumnChunk const& chunk,
                          bool is_pure_filter,
                          std::size_t decoded_width) {
       auto const& column_metadata = chunk.meta_data;
-      if (!is_pure_filter) {
-        if (decoded_width > 0) {
-          // Fixed-width column: row_count x decoded width, plus a validity mask.
-          rg_decoded += row_count * decoded_width + row_count / 8;
-        } else {
-          // VARCHAR / nested / unknown. Dictionary/RLE encoding can make the
-          // encoded chunk many times smaller than its decoded char buffer, so
-          // prefer SizeStatistics::unencoded_byte_array_data_bytes (the exact
-          // decoded BYTE_ARRAY size) when the writer recorded it, else fall back
-          // to the encoded-uncompressed size (under-counts dictionary data).
-          std::size_t const char_bytes =
-            (column_metadata.size_statistics &&
-             column_metadata.size_statistics->unencoded_byte_array_data_bytes)
-                         ? static_cast<std::size_t>(
-                  *column_metadata.size_statistics->unencoded_byte_array_data_bytes)
-                         : static_cast<std::size_t>(column_metadata.total_uncompressed_size);
-          // Plus the cuDF string column's offsets (one int32 per row) and validity.
-          rg_decoded += char_bytes + row_count * sizeof(std::uint32_t) + row_count / 8;
-        }
+      std::size_t decoded_bytes   = 0;
+      if (decoded_width > 0) {
+        // Fixed-width column: row_count x decoded width, plus a validity mask.
+        decoded_bytes = row_count * decoded_width + row_count / 8;
+      } else {
+        // VARCHAR / nested / unknown. Dictionary/RLE encoding can make the
+        // encoded chunk many times smaller than its decoded char buffer, so
+        // prefer SizeStatistics::unencoded_byte_array_data_bytes (the exact
+        // decoded BYTE_ARRAY size) when the writer recorded it, else fall back
+        // to the encoded-uncompressed size (under-counts dictionary data).
+        std::size_t const char_bytes =
+          (column_metadata.size_statistics &&
+           column_metadata.size_statistics->unencoded_byte_array_data_bytes)
+                  ? static_cast<std::size_t>(
+                *column_metadata.size_statistics->unencoded_byte_array_data_bytes)
+                  : static_cast<std::size_t>(column_metadata.total_uncompressed_size);
+        // Plus the cuDF string column's offsets (one int32 per row) and validity.
+        decoded_bytes = char_bytes + row_count * sizeof(std::uint32_t) + row_count / 8;
       }
-      rg_compressed += static_cast<std::size_t>(column_metadata.total_compressed_size);
+      estimate.decode_working_bytes += decoded_bytes;
+      if (!is_pure_filter) { estimate.output_bytes += decoded_bytes; }
+      estimate.compressed_bytes += static_cast<std::size_t>(column_metadata.total_compressed_size);
     };
     if (_plan->is_projected()) {
       for (std::size_t i = 0; i < selected_chunk_indices.size(); ++i) {
@@ -552,11 +647,14 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       // Column count does not match returned_types (cannot safely align types to
       // chunks): keep the original parquet encoded-uncompressed sizing.
       for (auto const& chunk : row_group.columns) {
-        rg_decoded += static_cast<std::size_t>(chunk.meta_data.total_uncompressed_size);
-        rg_compressed += static_cast<std::size_t>(chunk.meta_data.total_compressed_size);
+        auto const uncompressed = static_cast<std::size_t>(chunk.meta_data.total_uncompressed_size);
+        estimate.output_bytes += uncompressed;
+        estimate.decode_working_bytes += uncompressed;
+        estimate.compressed_bytes +=
+          static_cast<std::size_t>(chunk.meta_data.total_compressed_size);
       }
     }
-    return std::pair{rg_decoded, rg_compressed};
+    return estimate;
   };
 
   auto out                     = std::make_unique<parquet_file_scan_info>();
@@ -567,8 +665,12 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->disable_filter_pushdown = disable_filter_pushdown;
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
-    auto const [rg_unc, rg_comp] = rg_contribution(metadata.row_groups[rg_idx]);
-    out->row_groups.push_back({rg_idx, rg_unc, rg_comp, metadata.row_groups[rg_idx].num_rows});
+    auto const estimate = rg_contribution(metadata.row_groups[rg_idx]);
+    out->row_groups.push_back({rg_idx,
+                               estimate.output_bytes,
+                               estimate.decode_working_bytes,
+                               estimate.compressed_bytes,
+                               metadata.row_groups[rg_idx].num_rows});
   }
 
   // Hive partition values for this file, in scan_plan::partition_columns order.
@@ -610,26 +712,70 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     metadatas.push_back(*slice.file_metadata);
     rg_per_src.push_back(slice.row_group_indices);
   }
+  // All-pruned fallback split (parquet_batch_coalescer::flush): every slice
+  // carries zero row groups.
+  // Don't express that via set_row_groups — the meaning of an empty per-source
+  // vector has flipped between cudf versions ("all row groups" vs "none").
+  // Instead bound the read to zero rows against the footer metadata alone:
+  // cudf builds the schema-correct empty table without touching data pages,
+  // and it flows through the normal filter / partition / projection assembly
+  // below.
+  bool const all_slices_pruned =
+    !split.rg_slices.empty() &&
+    std::all_of(split.rg_slices.begin(), split.rg_slices.end(), [](row_group_slice const& s) {
+      return s.row_group_indices.empty();
+    });
   auto opts = *split.reader_options;
-  opts.set_row_groups(std::move(rg_per_src));
+  if (all_slices_pruned) {
+    opts.set_num_rows(0);
+  } else {
+    opts.set_row_groups(std::move(rg_per_src));
+  }
 
   // Per-task AST translation for reader-side row-group + row pushdown. set_filter
   // is gated on translation success AND on the per-batch disable_filter_pushdown
   // flag (set when the FLBA-decimal probe failed). When pushdown does not engage
-  // — disabled, or translation fails — the row filter is left for
+  // — disabled, translation fails, or the split is the all-pruned zero-row
+  // fallback (zero rows need no reader filter; skipping keeps GPU AST
+  // translation off that path) — the row filter is left for
   // post_filter_and_project to apply post-decode. The translated cuDF AST
   // (`ast_expression`) must outlive read_parquet; the borrowed Sirius AST and
   // the translator are only needed during translation.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  if (_duckdb_filter_expression && !split.disable_filter_pushdown) {
+  std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
+    std::nullopt;
+  cudf::ast::expression const* reader_filter_root = nullptr;
+
+  if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
     auto name_resolver     = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
     ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
-    if (ast_expression) { opts.set_filter(ast_expression->back()); }
+    if (ast_expression) { reader_filter_root = &ast_expression->back(); }
   }
+
+  if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
+      _sirius_dynamic_filters->has_filters()) {
+    if (ast_expression) {
+      reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
+                                                          reader_filter_root,
+                                                          *_sirius_dynamic_filters,
+                                                          *split.plan,
+                                                          mem_space.get_device_id());
+    } else {
+      dynamic_ast_expression.emplace();
+      reader_filter_root = merge_dynamic_filters_into_ast(dynamic_ast_expression->tree,
+                                                          /*existing_root=*/nullptr,
+                                                          *_sirius_dynamic_filters,
+                                                          *split.plan,
+                                                          mem_space.get_device_id());
+      if (!reader_filter_root) { dynamic_ast_expression.reset(); }
+    }
+  }
+
+  if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   auto [table, _] =

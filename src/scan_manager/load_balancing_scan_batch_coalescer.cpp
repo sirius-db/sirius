@@ -93,9 +93,9 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
     auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
     auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
-    SIRIUS_LOG_INFO("[coalesce-debug] load_balancer emit pipeline={} -> preferred GPU {}",
-                    state.pipeline_id,
-                    dev_id.has_value() ? dev_id.value() : -1);
+    SIRIUS_LOG_DEBUG("[coalesce-debug] load_balancer emit pipeline={} -> preferred GPU {}",
+                     state.pipeline_id,
+                     dev_id.has_value() ? dev_id.value() : -1);
     if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
 
     auto fadvise_hints = op_data->get_fadvise_hints();
@@ -161,20 +161,29 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
   state.connector->close();
 }
 
-void load_balancing_scan_batch_coalescer::process_cached_entries(
-  metadata_processing_state& state, [[maybe_unused]] std::stop_token const& stop)
+void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
+                                                                 std::stop_token const& stop)
 {
-  auto& batch_queue = state.queue;
-  bool is_closed    = false;
-  while (!is_closed) {
-    auto databatch = state.batch_provider->get_next_batch();
-    is_closed      = databatch == nullptr;
-    if (!is_closed) {
-      auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(databatch));
-      state.connector->push_split(std::move(op_data));
+  drain_cached_provider(*state.batch_provider, *state.connector, stop);
+}
+
+void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
+                                                                split_connector& connector,
+                                                                std::stop_token const& stop)
+{
+  try {
+    while (!stop.stop_requested()) {
+      auto databatch = provider.get_next_batch();
+      if (!databatch) { break; }
+      connector.push_split(std::make_unique<op::scan::scan_operator_input>(std::move(databatch)));
     }
+    connector.close();
+  } catch (...) {
+    // Surface the provider failure to the consumer: get_next_split() rethrows
+    // once the queue drains. Without this close the connector never closes —
+    // the dispatcher swallows task exceptions — and the query hangs silently.
+    connector.close(std::current_exception());
   }
-  state.connector->close();
 }
 
 }  // namespace sirius::scan_manager
