@@ -4,11 +4,14 @@
 //! text-protocol resultset rows: each column value is a length-encoded string, NULL is the single
 //! byte `0xFB`. The FE forwards those row bodies straight to the MySQL client.
 
+use arrow_array::temporal_conversions::{as_date, as_datetime};
+use arrow_array::types::{Date32Type, TimestampMicrosecondType};
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray, TimestampMicrosecondArray,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use starrocks_thrift::data::TResultBatch;
 use thrift::protocol::{TBinaryOutputProtocol, TSerializable};
 
@@ -79,8 +82,39 @@ impl MysqlResultEncoder {
             DataType::Int64 => render_primitive!(Int64Array),
             DataType::Float32 => render_primitive!(Float32Array),
             DataType::Float64 => render_primitive!(Float64Array),
-            // TODO(starrocks-execute): cover the remaining types the translator maps (decimal, date,
-            // datetime, binary) as the real executor lands.
+            DataType::LargeUtf8 => {
+                let typed = Self::downcast::<LargeStringArray>(array)?;
+                Ok(Some(typed.value(row).as_bytes().to_vec()))
+            }
+            DataType::Utf8View => {
+                let typed = Self::downcast::<StringViewArray>(array)?;
+                Ok(Some(typed.value(row).as_bytes().to_vec()))
+            }
+            DataType::Decimal128(_, _) => {
+                let typed = Self::downcast::<Decimal128Array>(array)?;
+                Ok(Some(typed.value_as_string(row).into_bytes()))
+            }
+            DataType::Date32 => {
+                let typed = Self::downcast::<Date32Array>(array)?;
+                let date = as_date::<Date32Type>(i64::from(typed.value(row)))
+                    .ok_or_else(|| format!("date32 value {} out of range", typed.value(row)))?;
+                Ok(Some(date.format("%Y-%m-%d").to_string().into_bytes()))
+            }
+            // StarRocks DATETIME is timezone-naive wall-clock; a tz-aware timestamp would need
+            // offset handling we don't implement, so let `Some(tz)` fall through to the error arm.
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                let typed = Self::downcast::<TimestampMicrosecondArray>(array)?;
+                let value = typed.value(row);
+                let datetime = as_datetime::<TimestampMicrosecondType>(value)
+                    .ok_or_else(|| format!("timestamp value {value} out of range"))?;
+                // MySQL text format; StarRocks omits the fractional part when it is zero.
+                let format = if value % 1_000_000 == 0 {
+                    "%Y-%m-%d %H:%M:%S"
+                } else {
+                    "%Y-%m-%d %H:%M:%S%.6f"
+                };
+                Ok(Some(datetime.format(format).to_string().into_bytes()))
+            }
             other => Err(format!(
                 "result encoding for arrow type {other:?} is not implemented yet"
             )),
@@ -182,6 +216,60 @@ mod tests {
         assert_eq!(result.rows[0], vec![0x02, b'4', b'2', 0x02, b'h', b'i']);
         // Row 1: NULL int (0xFB) then "x" (len 1).
         assert_eq!(result.rows[1], vec![0xFB, 0x01, b'x']);
+    }
+
+    #[test]
+    fn encodes_decimal_date_and_timestamp_as_text() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Decimal128(15, 2), true),
+            Field::new("day", DataType::Date32, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ]));
+        let decimals: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(-123456), None, None])
+                .with_precision_and_scale(15, 2)
+                .unwrap(),
+        );
+        // 10471 days = 1998-09-02.
+        let days: ArrayRef = Arc::new(Date32Array::from(vec![Some(10471), Some(0), Some(0)]));
+        let stamps: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(904_694_400_000_000),
+            Some(1_500_000),
+            // Sub-millisecond fractional part exercises %.6f leading-zero padding.
+            Some(1_500),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![decimals, days, stamps]).unwrap();
+
+        let result = MysqlResultEncoder::encode(&[batch], 0).unwrap();
+
+        let cells = |row: &[u8]| -> Vec<String> {
+            // All test values are short, so every cell is a one-byte length prefix.
+            let mut cells = Vec::new();
+            let mut idx = 0;
+            while idx < row.len() {
+                if row[idx] == 0xFB {
+                    cells.push("NULL".to_string());
+                    idx += 1;
+                } else {
+                    let len = row[idx] as usize;
+                    cells.push(String::from_utf8(row[idx + 1..idx + 1 + len].to_vec()).unwrap());
+                    idx += 1 + len;
+                }
+            }
+            cells
+        };
+        assert_eq!(
+            cells(&result.rows[0]),
+            vec!["-1234.56", "1998-09-02", "1998-09-02 00:00:00"]
+        );
+        assert_eq!(
+            cells(&result.rows[1]),
+            vec!["NULL", "1970-01-01", "1970-01-01 00:00:01.500000"]
+        );
+        assert_eq!(
+            cells(&result.rows[2]),
+            vec!["NULL", "1970-01-01", "1970-01-01 00:00:00.001500"]
+        );
     }
 
     #[test]
