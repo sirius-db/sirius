@@ -23,6 +23,7 @@
 // cudf
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -38,8 +39,12 @@
 
 namespace {
 
+using sirius::vss::build_ivf_flat_index_from_chunks;
+using sirius::vss::search_ivf_flat_index;
+using Metric = cuvs::distance::DistanceType;
+
 // Build a Sirius-style ARRAY<FLOAT>[dim] column (cudf LIST with a contiguous,
-// uniform FLOAT32 values child); i.e., the shape build_ivf_flat_index expects.
+// uniform FLOAT32 values child); i.e., the shape the builder wraps per chunk.
 std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> const& values,
                                                          cudf::size_type n_rows,
                                                          cudf::size_type dim)
@@ -66,7 +71,7 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
     n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
 }
 
-// Upload a host query vector to the device (search wants a device pointer).
+// Upload a host query vector to the device (search requires a device pointer)
 rmm::device_buffer upload(std::vector<float> const& v, rmm::cuda_stream_view stream)
 {
   rmm::device_buffer buf(v.size() * sizeof(float), stream);
@@ -92,20 +97,23 @@ std::vector<float> to_host_f(cudf::column_view const& col)
 
 }  // namespace
 
-// The metric string is the CREATE INDEX surface; these mappings must stay in
-// lockstep with the recognizer (vss_pattern.cpp::metric_for_function) or a pinned
-// index would never match a query's derived metric during auto-routing.
 TEST_CASE("ann_distance_type_from_metric maps the supported metrics", "[vss]")
 {
-  REQUIRE(sirius::vss::ann_distance_type_from_metric("l2sq") ==
-          cuvs::distance::DistanceType::L2SqrtExpanded);
-  REQUIRE(sirius::vss::ann_distance_type_from_metric("cosine") ==
-          cuvs::distance::DistanceType::CosineExpanded);
+  REQUIRE(sirius::vss::ann_distance_type_from_metric("l2sq") == Metric::L2SqrtExpanded);
+  REQUIRE(sirius::vss::ann_distance_type_from_metric("cosine") == Metric::CosineExpanded);
   REQUIRE_THROWS_AS(sirius::vss::ann_distance_type_from_metric("dot"), std::invalid_argument);
   REQUIRE_THROWS_AS(sirius::vss::ann_distance_type_from_metric(""), std::invalid_argument);
 }
 
-TEST_CASE("build_ivf_flat_index + search finds exact nearest neighbours", "[vss]")
+TEST_CASE("enn_distance_type_from_metric maps l2sq to the unexpanded form", "[vss]")
+{
+  REQUIRE(sirius::vss::enn_distance_type_from_metric("l2sq") == Metric::L2SqrtUnexpanded);
+  REQUIRE(sirius::vss::enn_distance_type_from_metric("cosine") == Metric::CosineExpanded);
+  REQUIRE_THROWS_AS(sirius::vss::enn_distance_type_from_metric("dot"), std::invalid_argument);
+  REQUIRE_THROWS_AS(sirius::vss::enn_distance_type_from_metric(""), std::invalid_argument);
+}
+
+TEST_CASE("build_ivf_flat_index_from_chunks + search finds exact nearest neighbours", "[vss]")
 {
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
@@ -132,13 +140,13 @@ TEST_CASE("build_ivf_flat_index + search finds exact nearest neighbours", "[vss]
   // is exact; the ANN approximation only kicks in when fewer lists are probed.
   constexpr std::uint32_t n_lists  = 2;
   constexpr std::uint32_t n_probes = n_lists;
-  auto index                       = sirius::vss::build_ivf_flat_index(
-    dataset_col->view(), dim, n_lists, cuvs::distance::DistanceType::L2SqrtExpanded, mr);
+  auto index                       = build_ivf_flat_index_from_chunks(
+    {dataset_col->view()}, dim, n_lists, Metric::L2SqrtExpanded, mr);
 
   SECTION("query in the origin cluster returns row 0")
   {
     auto q      = upload({0.1f, 0.1f}, stream);
-    auto result = sirius::vss::search_ivf_flat_index(
+    auto result = search_ivf_flat_index(
       *index, static_cast<const float*>(q.data()), dim, /*k=*/1, n_probes, stream, mr);
 
     REQUIRE(result.neighbors->size() == 1);
@@ -149,7 +157,7 @@ TEST_CASE("build_ivf_flat_index + search finds exact nearest neighbours", "[vss]
   SECTION("query in the far cluster returns row 3")
   {
     auto q      = upload({10.1f, 10.1f}, stream);
-    auto result = sirius::vss::search_ivf_flat_index(
+    auto result = search_ivf_flat_index(
       *index, static_cast<const float*>(q.data()), dim, /*k=*/1, n_probes, stream, mr);
 
     REQUIRE(to_host_i64(result.neighbors->view())[0] == 3);
@@ -158,7 +166,7 @@ TEST_CASE("build_ivf_flat_index + search finds exact nearest neighbours", "[vss]
   SECTION("k = 3 for an origin query stays within the origin cluster, ordered")
   {
     auto q      = upload({0.1f, 0.1f}, stream);
-    auto result = sirius::vss::search_ivf_flat_index(
+    auto result = search_ivf_flat_index(
       *index, static_cast<const float*>(q.data()), dim, /*k=*/3, n_probes, stream, mr);
 
     auto neighbors = to_host_i64(result.neighbors->view());
@@ -169,6 +177,78 @@ TEST_CASE("build_ivf_flat_index + search finds exact nearest neighbours", "[vss]
     REQUIRE(distances[0] <= distances[1]);
     REQUIRE(distances[1] <= distances[2]);
   }
+}
+
+// The chunked builder populates the index chunk by chunk via ivf_flat::extend,
+// tagging each vector with its GLOBAL row id (offset by the rows already added)
+// so search returns dataset-global indices in chunk order. A per-chunk-local id
+// regression would return 0-based ids from the far chunk and this test would catch it.
+TEST_CASE("build_ivf_flat_index_from_chunks tags global ids across chunks", "[vss]")
+{
+  constexpr cudf::size_type dim = 2;
+  auto const stream             = cudf::get_default_stream();
+  auto const mr                 = cudf::get_current_device_resource_ref();
+
+  // Chunk A -> global rows 0,1,2 near the origin.
+  auto chunk_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f}, 3, dim);
+  // Chunk B -> global rows 3,4,5 near (10,10).
+  auto chunk_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f, 10.0f, 11.0f}, 3, dim);
+
+  constexpr std::uint32_t n_lists  = 2;
+  constexpr std::uint32_t n_probes = n_lists;  // exact
+  auto index                       = build_ivf_flat_index_from_chunks(
+    {chunk_a->view(), chunk_b->view()}, dim, n_lists, Metric::L2SqrtExpanded, mr);
+
+  SECTION("a query in chunk B returns its global id 3, not a chunk-local 0")
+  {
+    auto q      = upload({10.1f, 10.1f}, stream);
+    auto result = search_ivf_flat_index(
+      *index, static_cast<const float*>(q.data()), dim, /*k=*/3, n_probes, stream, mr);
+    auto neighbors = to_host_i64(result.neighbors->view());
+    REQUIRE(neighbors[0] == 3);
+    for (auto id : neighbors) {
+      REQUIRE(id >= 3);  // every near neighbour lives in the far chunk
+    }
+  }
+
+  SECTION("a query in chunk A still returns global id 0")
+  {
+    auto q      = upload({0.1f, 0.1f}, stream);
+    auto result = search_ivf_flat_index(
+      *index, static_cast<const float*>(q.data()), dim, /*k=*/3, n_probes, stream, mr);
+    auto neighbors = to_host_i64(result.neighbors->view());
+    REQUIRE(neighbors[0] == 0);
+    for (auto id : neighbors) {
+      REQUIRE(id < 3);  // every near neighbour lives in the origin chunk
+    }
+  }
+}
+
+// An empty leading chunk must be skipped without shifting the global ids: the
+// first non-empty chunk still occupies [0, rows), so a subsequent chunk's ids are
+// offset only by real rows.
+TEST_CASE("build_ivf_flat_index_from_chunks skips empty chunks without shifting ids", "[vss]")
+{
+  constexpr cudf::size_type dim = 2;
+  auto const stream             = cudf::get_default_stream();
+  auto const mr                 = cudf::get_current_device_resource_ref();
+
+  auto empty   = make_fixed_size_float_list({}, 0, dim);
+  auto chunk_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f}, 2, dim);      // ids 0,1
+  auto chunk_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f}, 2, dim);  // ids 2,3
+
+  auto index = build_ivf_flat_index_from_chunks(
+    {empty->view(), chunk_a->view(), empty->view(), chunk_b->view()},
+    dim,
+    /*n_lists=*/2,
+    Metric::L2SqrtExpanded,
+    mr);
+
+  auto q      = upload({10.1f, 10.1f}, stream);
+  auto result = search_ivf_flat_index(
+    *index, static_cast<const float*>(q.data()), dim, /*k=*/1, /*n_probes=*/2, stream, mr);
+  // Chunk B follows exactly 2 real rows, so its first vector is global id 2.
+  REQUIRE(to_host_i64(result.neighbors->view())[0] == 2);
 }
 
 // Pin the distance magnitude: L2SqrtExpanded must yield Euclidean (rooted)
@@ -194,11 +274,11 @@ TEST_CASE("search_ivf_flat_index returns Euclidean distances for L2SqrtExpanded"
   auto dataset_col = make_fixed_size_float_list(dataset_vals, 4, dim);
 
   // Single list so every point is in it; probing it is a full (exact) scan.
-  auto index = sirius::vss::build_ivf_flat_index(
-    dataset_col->view(), dim, /*n_lists=*/1, cuvs::distance::DistanceType::L2SqrtExpanded, mr);
+  auto index = build_ivf_flat_index_from_chunks(
+    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr);
 
   auto q      = upload({0.0f, 0.0f}, stream);
-  auto result = sirius::vss::search_ivf_flat_index(
+  auto result = search_ivf_flat_index(
     *index, static_cast<const float*>(q.data()), dim, /*k=*/4, /*n_probes=*/1, stream, mr);
 
   auto neighbors = to_host_i64(result.neighbors->view());
@@ -218,11 +298,11 @@ TEST_CASE("search_ivf_flat_index handles k == n_rows", "[vss]")
 
   std::vector<float> dataset_vals = {1.0f, 5.0f, 2.0f};  // distances to 0: 1, 5, 2
   auto dataset_col                = make_fixed_size_float_list(dataset_vals, 3, dim);
-  auto index                      = sirius::vss::build_ivf_flat_index(
-    dataset_col->view(), dim, /*n_lists=*/1, cuvs::distance::DistanceType::L2SqrtExpanded, mr);
+  auto index                      = build_ivf_flat_index_from_chunks(
+    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr);
 
   auto q      = upload({0.0f}, stream);
-  auto result = sirius::vss::search_ivf_flat_index(
+  auto result = search_ivf_flat_index(
     *index, static_cast<const float*>(q.data()), dim, /*k=*/3, /*n_probes=*/1, stream, mr);
 
   auto neighbors = to_host_i64(result.neighbors->view());
@@ -255,11 +335,11 @@ TEST_CASE("build/search IVF-Flat ranks by direction for CosineExpanded", "[vss]"
     1.0f,  // row 3 -> 135 deg
   };
   auto dataset_col = make_fixed_size_float_list(dataset_vals, 4, dim);
-  auto index       = sirius::vss::build_ivf_flat_index(
-    dataset_col->view(), dim, /*n_lists=*/1, cuvs::distance::DistanceType::CosineExpanded, mr);
+  auto index       = build_ivf_flat_index_from_chunks(
+    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::CosineExpanded, mr);
 
   auto q      = upload({1.0f, 0.0f}, stream);
-  auto result = sirius::vss::search_ivf_flat_index(
+  auto result = search_ivf_flat_index(
     *index, static_cast<const float*>(q.data()), dim, /*k=*/4, /*n_probes=*/1, stream, mr);
 
   auto neighbors = to_host_i64(result.neighbors->view());
@@ -270,7 +350,8 @@ TEST_CASE("build/search IVF-Flat ranks by direction for CosineExpanded", "[vss]"
   REQUIRE(distances[2] <= distances[3]);
 }
 
-TEST_CASE("build_ivf_flat_index rejects a dim that mismatches the column width", "[vss]")
+TEST_CASE("build_ivf_flat_index_from_chunks rejects a dim that mismatches the column width",
+          "[vss]")
 {
   constexpr cudf::size_type dim = 2;
   auto const mr                 = cudf::get_current_device_resource_ref();
@@ -279,8 +360,30 @@ TEST_CASE("build_ivf_flat_index rejects a dim that mismatches the column width",
 
   // Column rows are width 2; asking the builder to read them as width 3 must be
   // rejected by the dataset-view validation, not silently misinterpreted.
-  REQUIRE_THROWS(sirius::vss::build_ivf_flat_index(
-    col->view(), /*dim=*/3, /*n_lists=*/1, cuvs::distance::DistanceType::L2SqrtExpanded, mr));
+  REQUIRE_THROWS(build_ivf_flat_index_from_chunks(
+    {col->view()}, /*dim=*/3, /*n_lists=*/1, Metric::L2SqrtExpanded, mr));
+}
+
+TEST_CASE("build_ivf_flat_index_from_chunks rejects empty chunk sets", "[vss]")
+{
+  constexpr cudf::size_type dim = 2;
+  auto const mr                 = cudf::get_current_device_resource_ref();
+
+  SECTION("no chunks at all throws")
+  {
+    std::vector<cudf::column_view> none;
+    REQUIRE_THROWS_AS(
+      build_ivf_flat_index_from_chunks(none, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr),
+      std::invalid_argument);
+  }
+
+  SECTION("all-empty chunks throw")
+  {
+    auto empty = make_fixed_size_float_list({}, 0, dim);
+    REQUIRE_THROWS_AS(build_ivf_flat_index_from_chunks(
+                        {empty->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr),
+                      std::invalid_argument);
+  }
 }
 
 TEST_CASE("search_ivf_flat_index rejects an index that is not IVF-Flat", "[vss]")
@@ -292,12 +395,12 @@ TEST_CASE("search_ivf_flat_index rejects an index that is not IVF-Flat", "[vss]"
   // back to the IVF-Flat index must fail loudly rather than reinterpret memory.
   auto not_ivf_flat = sirius::vss::make_cuvs_index(int{7});
   auto q            = upload({0.0f}, stream);
-  REQUIRE_THROWS_AS(sirius::vss::search_ivf_flat_index(*not_ivf_flat,
-                                                       static_cast<const float*>(q.data()),
-                                                       /*dim=*/1,
-                                                       /*k=*/1,
-                                                       /*n_probes=*/1,
-                                                       stream,
-                                                       mr),
+  REQUIRE_THROWS_AS(search_ivf_flat_index(*not_ivf_flat,
+                                          static_cast<const float*>(q.data()),
+                                          /*dim=*/1,
+                                          /*k=*/1,
+                                          /*n_probes=*/1,
+                                          stream,
+                                          mr),
                     std::invalid_argument);
 }

@@ -21,6 +21,8 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <raft/core/device_resources.hpp>
+
 #include <memory>
 
 namespace sirius::vss {
@@ -34,9 +36,14 @@ namespace sirius::vss {
  * query under `c.req.metric` and returns them as `[out0, ..., outN-1, distance]`,
  * ordered nearest-first where the per-chunk candidate set is handed to @ref
  * merge_enn_top_k. Returns the empty output schema when `c.k == 0` or @p input is empty.
+ *
+ * @p res is caller-owned and reused across every chunk so the RAFT handle setup
+ * is paid once; the per-chunk search runs async on its stream (see @ref
+ * brute_force_knn) and is synchronized once by the caller before the host read.
  */
 std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
-                                               cudf::table_view input);
+                                               cudf::table_view input,
+                                               raft::device_resources const& res);
 
 /**
  * @brief Consolidate per-chunk ENN candidates into the global nearest rows.

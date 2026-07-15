@@ -57,7 +57,8 @@ std::unique_ptr<cudf::table> make_empty_enn_output(cudf::table_view const& input
 }  // namespace
 
 std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
-                                               cudf::table_view input)
+                                               cudf::table_view input,
+                                               raft::device_resources const& res)
 {
   auto const stream = c.stream;
   auto const mr     = c.mr;
@@ -88,7 +89,7 @@ std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
     c.query_device, int64_t{1}, c.req.dim);
 
   auto knn = brute_force_knn(
-    dataset_view, query_view, keep, enn_distance_type_from_metric(c.req.metric), stream, mr);
+    res, dataset_view, query_view, keep, enn_distance_type_from_metric(c.req.metric), mr);
 
   auto gathered =
     cudf::gather(input, knn.neighbors->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);

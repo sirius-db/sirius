@@ -702,8 +702,11 @@ set(TEST_SOURCES
     test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/vss/test_brute_force_search.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp
-    test/cpp/vss/test_ivf_flat_index.cpp
     test/cpp/vss/test_cuvs_index_cache.cpp
+    test/cpp/vss/test_enn_top_k.cpp
+    test/cpp/vss/test_ivf_flat_index.cpp
+    test/cpp/vss/test_pinned_column.cpp
+    test/cpp/vss/test_vector_search.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp

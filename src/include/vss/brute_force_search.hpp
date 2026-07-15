@@ -19,10 +19,10 @@
 #include "vss/cudf_raft_interop.hpp"
 
 #include <cudf/column/column.hpp>
-#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <raft/core/device_resources.hpp>
+
 #include <rmm/resource_ref.hpp>
 
 #include <cuvs/distance/distance.hpp>
@@ -60,31 +60,26 @@ struct knn_result {
  * resource (not @p mr), which Sirius installs as the cucascade allocator, so it
  * is still reserved, just against the ambient current space rather than @p mr.
  *
- * @warning NON-OWNING inputs: @p dataset and @p queries borrow device memory
- *          that must remain alive AND resident on-device for the duration of the
- *          call — a free or a tiering spill (D2H) of either would be a
- *          use-after-free the compiler cannot catch. In Sirius, hold a
- *          `cucascade::read_only_data_batch` (shared lock) on the batch backing
- *          @p dataset across this call: its shared lock blocks the exclusive
- *          lock a spill would need (see @ref list_column_as_dataset_view). The
- *          call being synchronous bounds exactly how long that lock must be held.
+ * The search is enqueued on @p res's stream and is not synchronized before returning.
+ * Results are only valid to read on the host after the caller syncs that stream. The
+ * returned columns, the borrowed inputs, and the caller's downstream work therefore all
+ * order on @p res's stream. Pass one @p res reused across chunks so the handle's
+ * workspace setup is paid once rather than per call.
  *
- * The call is synchronous: the work stream is synchronized before returning.
- *
- * @param dataset Row-major `[n_rows, dim]` dataset to search.
- * @param queries Row-major `[n_queries, dim]` query vectors.
- * @param k       Number of neighbors per query (`1 <= k <= n_rows`).
- * @param metric  Distance metric (default: Euclidean L2, unexpanded).
- * @param stream  Stream the search and output allocations run on.
+ * @param res     Caller-owned RAFT resources; the search runs on its stream.
+ * @param dataset Row-major dataset to search.
+ * @param queries Row-major query vectors.
+ * @param k       Number of neighbors per query.
+ * @param metric  Distance metric.
  * @param mr      Device resource for the output columns (default: cudf's current).
- * @return Flattened neighbour-index and distance columns, plus `n_queries`/`k`.
+ * @return Flattened neighbor-index and distance columns, plus `n_queries`/`k`.
  */
 knn_result brute_force_knn(
+  raft::device_resources const& res,
   dataset_matrix_view dataset,
   dataset_matrix_view queries,
   int64_t k,
   cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2SqrtUnexpanded,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr   = cudf::get_current_device_resource_ref());
 
 }  // namespace sirius::vss

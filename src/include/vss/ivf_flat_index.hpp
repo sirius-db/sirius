@@ -76,7 +76,7 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
 
 /// Flattened k-NN result from an ANN search: both columns have length @c k,
 /// ordered nearest-first.
-struct ann_search_result {
+struct ann_result {
   std::unique_ptr<cudf::column> neighbors;  ///< INT64 row indices into the indexed dataset.
   std::unique_ptr<cudf::column> distances;  ///< FLOAT32 distances to those rows.
 };
@@ -93,12 +93,12 @@ struct ann_search_result {
 /// \param dim          Vector dimensionality (must equal the index's).
 /// \param k            Neighbors to return (1 <= k <= n_rows).
 /// \param n_probes     IVF lists to probe (accuracy/speed knob; <= n_lists).
-ann_search_result search_ivf_flat_index(any_cuvs_index const& index,
-                                        const float* query_device,
-                                        std::int64_t dim,
-                                        std::int64_t k,
-                                        std::uint32_t n_probes,
-                                        rmm::cuda_stream_view stream,
-                                        rmm::device_async_resource_ref mr);
+ann_result search_ivf_flat_index(any_cuvs_index const& index,
+                                 const float* query_device,
+                                 std::int64_t dim,
+                                 std::int64_t k,
+                                 std::uint32_t n_probes,
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::vss

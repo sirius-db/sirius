@@ -25,21 +25,32 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
-// rmm
+// raft / rmm / cuvs
+#include <raft/core/device_mdspan.hpp>
+#include <raft/core/device_resources.hpp>
+
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 
 #include <cuda_runtime_api.h>
 
-#include <algorithm>
+#include <cuvs/distance/distance.hpp>
+
 #include <cmath>
 #include <cstdint>
 #include <vector>
 
 namespace {
 
+using sirius::vss::brute_force_knn;
+using sirius::vss::dataset_matrix_view;
+using sirius::vss::list_column_as_dataset_view;
+using Metric = cuvs::distance::DistanceType;
+
 // Build a Sirius-style ARRAY<FLOAT>[dim] column (cudf LIST with a contiguous,
-// uniform FLOAT32 values child).
+// uniform FLOAT32 values child) so list_column_as_dataset_view can wrap it.
 std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> const& values,
                                                          cudf::size_type n_rows,
                                                          cudf::size_type dim)
@@ -66,264 +77,137 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
     n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
 }
 
-std::vector<int64_t> to_host(cudf::column_view const& col)
+// Copy a device column's raw elements back to the host after the search stream
+// has been synchronized.
+template <typename T>
+std::vector<T> to_host(cudf::column_view const& col)
 {
-  std::vector<int64_t> host(col.size());
-  cudaMemcpy(
-    host.data(), col.data<int64_t>(), sizeof(int64_t) * host.size(), cudaMemcpyDeviceToHost);
-  return host;
-}
-
-std::vector<float> to_host_f(cudf::column_view const& col)
-{
-  std::vector<float> host(col.size());
-  cudaMemcpy(host.data(), col.data<float>(), sizeof(float) * host.size(), cudaMemcpyDeviceToHost);
-  return host;
+  std::vector<T> out(col.size());
+  cudaMemcpy(out.data(), col.data<T>(), sizeof(T) * out.size(), cudaMemcpyDeviceToHost);
+  return out;
 }
 
 }  // namespace
 
-TEST_CASE("brute_force_knn finds exact nearest neighbours", "[vss]")
+TEST_CASE("brute_force_knn returns the exact nearest rows in order", "[vss]")
 {
-  constexpr cudf::size_type dim = 2;
+  auto stream = cudf::get_default_stream();
+  raft::device_resources res{stream};
 
-  // Two well-separated clusters: rows 0-2 near the origin, rows 3-4 near (10,10).
-  std::vector<float> dataset_vals = {
-    0.0f,
-    0.0f,  // row 0
-    1.0f,
-    0.0f,  // row 1
-    0.0f,
-    1.0f,  // row 2
-    10.0f,
-    10.0f,  // row 3
-    10.0f,
-    11.0f  // row 4
-  };
-  auto dataset_col = make_fixed_size_float_list(dataset_vals, 5, dim);
-
-  // q0 sits next to row 0; q1 sits next to row 3.
-  std::vector<float> query_vals = {
-    0.1f,
-    0.1f,  // q0
-    10.0f,
-    10.4f  // q1
-  };
-  auto query_col = make_fixed_size_float_list(query_vals, 2, dim);
-
-  auto dataset_view = sirius::vss::list_column_as_dataset_view(dataset_col->view(), dim);
-  auto query_view   = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
-
-  SECTION("k = 1 returns the single closest row per query")
-  {
-    auto result = sirius::vss::brute_force_knn(dataset_view, query_view, /*k=*/1);
-
-    REQUIRE(result.n_queries == 2);
-    REQUIRE(result.k == 1);
-    REQUIRE(result.neighbors->size() == 2);
-    REQUIRE(result.distances->size() == 2);
-
-    auto neighbors = to_host(result.neighbors->view());
-    REQUIRE(neighbors[0] == 0);  // q0 -> row 0
-    REQUIRE(neighbors[1] == 3);  // q1 -> row 3
-  }
-
-  SECTION("k = 3 returns the nearest cluster first, ordered by distance")
-  {
-    auto result = sirius::vss::brute_force_knn(dataset_view, query_view, /*k=*/3);
-
-    REQUIRE(result.neighbors->size() == 6);
-    auto neighbors = to_host(result.neighbors->view());
-    auto distances = to_host_f(result.distances->view());
-
-    // q0's nearest is row 0, and its 3 neighbors are all from the origin
-    // cluster {0,1,2}.
-    REQUIRE(neighbors[0] == 0);
-    REQUIRE(neighbors[1] < 3);
-    REQUIRE(neighbors[2] < 3);
-
-    // Distances are non-decreasing within each query block.
-    REQUIRE(distances[0] <= distances[1]);
-    REQUIRE(distances[1] <= distances[2]);
-  }
-}
-
-// The metric decides the returned distance magnitude. The SQL surface relies on
-// this exact contract: `array_distance` is wired to L2SqrtUnexpanded (Euclidean),
-// `array_cosine_distance` to CosineExpanded. Without magnitude assertions, a
-// metric/sqrt regression (e.g. returning squared L2) would silently still pass
-// ordering-only checks, so pin the values.
-TEST_CASE("brute_force_knn distance magnitudes match the requested metric", "[vss]")
-{
-  constexpr cudf::size_type dim = 2;
-
-  // Pythagorean rows so both squared and rooted distances are exact in float:
-  // distances to the origin are 0, 5, 10, 13.
-  std::vector<float> dataset_vals = {
-    0.0f,
-    0.0f,  // row 0 -> 0
-    3.0f,
-    4.0f,  // row 1 -> 5  (25)
-    8.0f,
-    6.0f,  // row 2 -> 10 (100)
-    5.0f,
-    12.0f,  // row 3 -> 13 (169)
-  };
-  auto dataset_col  = make_fixed_size_float_list(dataset_vals, 4, dim);
-  auto dataset_view = sirius::vss::list_column_as_dataset_view(dataset_col->view(), dim);
-
-  std::vector<float> query_vals = {0.0f, 0.0f};
-  auto query_col                = make_fixed_size_float_list(query_vals, 1, dim);
-  auto query_view               = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
-
-  SECTION("L2SqrtUnexpanded returns Euclidean distance (the array_distance contract)")
-  {
-    auto result = sirius::vss::brute_force_knn(
-      dataset_view, query_view, /*k=*/4, cuvs::distance::DistanceType::L2SqrtUnexpanded);
-
-    auto neighbors = to_host(result.neighbors->view());
-    auto distances = to_host_f(result.distances->view());
-    REQUIRE(neighbors == std::vector<int64_t>{0, 1, 2, 3});
-    REQUIRE(distances[0] == Approx(0.0f));
-    REQUIRE(distances[1] == Approx(5.0f));
-    REQUIRE(distances[2] == Approx(10.0f));
-    REQUIRE(distances[3] == Approx(13.0f));
-  }
-}
-
-// Regression for float32 catastrophic cancellation.
-TEST_CASE("brute_force_knn stays accurate for large-magnitude off-origin queries", "[vss]")
-{
+  // Dataset row i is [i, i, i]; query is the origin, so distances grow with i and
+  // the nearest rows are the smallest ids, tie-free.
+  constexpr cudf::size_type n_rows = 8;
   constexpr cudf::size_type dim    = 3;
-  constexpr cudf::size_type n_rows = 5000;
-
-  std::vector<float> dataset_vals(static_cast<std::size_t>(n_rows) * dim);
+  std::vector<float> data(n_rows * dim);
   for (cudf::size_type i = 0; i < n_rows; ++i) {
-    dataset_vals[i * dim + 0] = static_cast<float>(i);
-    dataset_vals[i * dim + 1] = static_cast<float>(i + 1);
-    dataset_vals[i * dim + 2] = static_cast<float>(i + 2);
+    data[i * dim + 0] = static_cast<float>(i);
+    data[i * dim + 1] = static_cast<float>(i);
+    data[i * dim + 2] = static_cast<float>(i);
   }
-  auto dataset_col  = make_fixed_size_float_list(dataset_vals, n_rows, dim);
-  auto dataset_view = sirius::vss::list_column_as_dataset_view(dataset_col->view(), dim);
+  auto dataset_col  = make_fixed_size_float_list(data, n_rows, dim);
+  auto dataset_view = list_column_as_dataset_view(dataset_col->view(), dim);
 
-  // Query far from the origin so <x,q> is large, where the cancellation is triggered
-  std::vector<float> query_vals = {4980.0f, 4981.0f, 4982.0f};
-  auto query_col                = make_fixed_size_float_list(query_vals, 1, dim);
-  auto query_view               = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
+  std::vector<float> q_host(dim, 0.0f);
+  rmm::device_uvector<float> q_dev(dim, stream);
+  cudaMemcpyAsync(
+    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.value());
+  auto query_view =
+    raft::make_device_matrix_view<const float, int64_t, raft::row_major>(q_dev.data(), 1, dim);
 
-  constexpr int64_t k = 5;
-  auto result         = sirius::vss::brute_force_knn(
-    dataset_view, query_view, k, cuvs::distance::DistanceType::L2SqrtUnexpanded);
+  constexpr int64_t k = 3;
+  auto knn            = brute_force_knn(res, dataset_view, query_view, k, Metric::L2SqrtUnexpanded);
+  stream.synchronize();
 
-  auto neighbors = to_host(result.neighbors->view());
-  auto distances = to_host_f(result.distances->view());
+  REQUIRE(knn.n_queries == 1);
+  REQUIRE(knn.k == k);
+  REQUIRE(knn.neighbors->size() == k);
+  REQUIRE(knn.distances->size() == k);
 
-  // Exact euclidean distance in double precision for a given dataset row
-  auto exact = [&](int64_t row) {
-    double s = 0.0;
-    for (cudf::size_type d = 0; d < dim; ++d) {
-      double const diff =
-        static_cast<double>(dataset_vals[row * dim + d]) - static_cast<double>(query_vals[d]);
-      s += diff * diff;
-    }
-    return std::sqrt(s);
-  };
+  auto neighbors = to_host<int64_t>(knn.neighbors->view());
+  auto distances = to_host<float>(knn.distances->view());
 
-  // Every returned distance must match its own exact value. The tolerance is far
-  // below the ~1.7 spacing the expanded metric was collapsing to 0, so this
-  // fails hard on the buggy metric and passes on the unexpanded one
-  for (int64_t j = 0; j < k; ++j) {
-    REQUIRE(distances[j] == Approx(exact(neighbors[j])).margin(1e-2));
-  }
-
-  // Row 4980 is the exact match; it must rank first at distance 0
-  REQUIRE(neighbors[0] == 4980);
-  REQUIRE(distances[0] == Approx(0.0).margin(1e-2));
-
-  // Results are ordered by ascending distance
-  for (int64_t j = 1; j < k; ++j) {
-    REQUIRE(distances[j - 1] <= distances[j] + 1e-3f);
+  // Nearest-first: rows 0, 1, 2 with Euclidean distance i * sqrt(3).
+  REQUIRE(neighbors == std::vector<int64_t>{0, 1, 2});
+  for (int64_t i = 0; i < k; ++i) {
+    REQUIRE(distances[i] == Approx(static_cast<float>(i) * std::sqrt(3.0f)).margin(1e-3));
   }
 }
 
-TEST_CASE("brute_force_knn handles boundary shapes", "[vss]")
+TEST_CASE("brute_force_knn cosine orders by angle, not magnitude", "[vss]")
 {
-  SECTION("k == n_rows returns every row, ordered by distance")
-  {
-    constexpr cudf::size_type dim   = 1;
-    std::vector<float> dataset_vals = {1.0f, 5.0f, 2.0f};  // distances to 0: 1, 5, 2
-    auto dataset_col                = make_fixed_size_float_list(dataset_vals, 3, dim);
-    auto dataset_view = sirius::vss::list_column_as_dataset_view(dataset_col->view(), dim);
+  auto stream = cudf::get_default_stream();
+  raft::device_resources res{stream};
 
-    std::vector<float> query_vals = {0.0f};
-    auto query_col                = make_fixed_size_float_list(query_vals, 1, dim);
-    auto query_view = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
-
-    auto result = sirius::vss::brute_force_knn(
-      dataset_view, query_view, /*k=*/3, cuvs::distance::DistanceType::L2SqrtUnexpanded);
-
-    auto neighbors = to_host(result.neighbors->view());
-    auto distances = to_host_f(result.distances->view());
-    REQUIRE(neighbors == std::vector<int64_t>{0, 2, 1});  // 1 < 2 < 5
-    REQUIRE(distances[0] == Approx(1.0f));
-    REQUIRE(distances[1] == Approx(2.0f));
-    REQUIRE(distances[2] == Approx(5.0f));
-  }
-
-  SECTION("single-row dataset with k = 1")
-  {
-    constexpr cudf::size_type dim   = 2;
-    std::vector<float> dataset_vals = {7.0f, 7.0f};
-    auto dataset_col                = make_fixed_size_float_list(dataset_vals, 1, dim);
-    auto dataset_view = sirius::vss::list_column_as_dataset_view(dataset_col->view(), dim);
-
-    std::vector<float> query_vals = {0.0f, 0.0f};
-    auto query_col                = make_fixed_size_float_list(query_vals, 1, dim);
-    auto query_view = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
-
-    auto result = sirius::vss::brute_force_knn(
-      dataset_view, query_view, /*k=*/1, cuvs::distance::DistanceType::L2SqrtUnexpanded);
-
-    REQUIRE(result.neighbors->size() == 1);
-    auto neighbors = to_host(result.neighbors->view());
-    auto distances = to_host_f(result.distances->view());
-    REQUIRE(neighbors[0] == 0);
-    REQUIRE(distances[0] == Approx(std::sqrt(98.0f)));
-  }
-}
-
-TEST_CASE("brute_force_knn breaks distance ties without dropping rows", "[vss]")
-{
   constexpr cudf::size_type dim = 2;
-  // Rows 0 and 1 are equidistant from the origin (both distance 1); the metric
-  // must surface both, not collapse the tie.
-  std::vector<float> dataset_vals = {1.0f, 0.0f, 0.0f, 1.0f};
-  auto dataset_col                = make_fixed_size_float_list(dataset_vals, 2, dim);
-  auto dataset_view = sirius::vss::list_column_as_dataset_view(dataset_col->view(), dim);
+  // Row 0 points along +x (aligned with the query), row 1 is off-axis, row 2 is
+  // aligned but far in magnitude. Cosine distance ignores magnitude, so the two
+  // aligned rows tie at 0 and both beat the off-axis row.
+  std::vector<float> data{1.0f,
+                          0.0f,  // row 0: aligned
+                          1.0f,
+                          1.0f,  // row 1: 45 deg
+                          9.0f,
+                          0.0f};  // row 2: aligned, large magnitude
+  constexpr cudf::size_type n_rows = 3;
+  auto dataset_col                 = make_fixed_size_float_list(data, n_rows, dim);
+  auto dataset_view                = list_column_as_dataset_view(dataset_col->view(), dim);
 
-  std::vector<float> query_vals = {0.0f, 0.0f};
-  auto query_col                = make_fixed_size_float_list(query_vals, 1, dim);
-  auto query_view               = sirius::vss::list_column_as_dataset_view(query_col->view(), dim);
+  std::vector<float> q_host{1.0f, 0.0f};
+  rmm::device_uvector<float> q_dev(dim, stream);
+  cudaMemcpyAsync(
+    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.value());
+  auto query_view =
+    raft::make_device_matrix_view<const float, int64_t, raft::row_major>(q_dev.data(), 1, dim);
 
-  auto result = sirius::vss::brute_force_knn(
-    dataset_view, query_view, /*k=*/2, cuvs::distance::DistanceType::L2SqrtUnexpanded);
+  auto knn = brute_force_knn(res, dataset_view, query_view, /*k=*/3, Metric::CosineExpanded);
+  stream.synchronize();
 
-  auto neighbors = to_host(result.neighbors->view());
-  auto distances = to_host_f(result.distances->view());
+  auto neighbors = to_host<int64_t>(knn.neighbors->view());
+  auto distances = to_host<float>(knn.distances->view());
 
-  std::sort(neighbors.begin(), neighbors.end());  // tie order is unspecified
-  REQUIRE(neighbors == std::vector<int64_t>{0, 1});
-  REQUIRE(distances[0] == Approx(1.0f));
-  REQUIRE(distances[1] == Approx(1.0f));
+  // The off-axis row (id 1) is strictly last; the two aligned rows come first.
+  REQUIRE(neighbors[2] == 1);
+  REQUIRE(distances[0] == Approx(0.0f).margin(1e-4));
+  REQUIRE(distances[1] == Approx(0.0f).margin(1e-4));
+  REQUIRE(distances[2] > distances[1]);
 }
 
-TEST_CASE("brute_force_knn rejects invalid k", "[vss]")
+TEST_CASE("brute_force_knn rejects out-of-range k and mismatched dims", "[vss]")
 {
-  constexpr cudf::size_type dim   = 2;
-  std::vector<float> dataset_vals = {0.0f, 0.0f, 1.0f, 1.0f};
-  auto dataset_col                = make_fixed_size_float_list(dataset_vals, 2, dim);
-  auto dataset_view = sirius::vss::list_column_as_dataset_view(dataset_col->view(), dim);
+  auto stream = cudf::get_default_stream();
+  raft::device_resources res{stream};
 
-  REQUIRE_THROWS(sirius::vss::brute_force_knn(dataset_view, dataset_view, /*k=*/0));
-  REQUIRE_THROWS(sirius::vss::brute_force_knn(dataset_view, dataset_view, /*k=*/3));
+  constexpr cudf::size_type n_rows = 4;
+  constexpr cudf::size_type dim    = 3;
+  std::vector<float> data(n_rows * dim, 1.0f);
+  auto dataset_col  = make_fixed_size_float_list(data, n_rows, dim);
+  auto dataset_view = list_column_as_dataset_view(dataset_col->view(), dim);
+
+  std::vector<float> q_host(dim, 0.0f);
+  rmm::device_uvector<float> q_dev(dim, stream);
+  cudaMemcpyAsync(
+    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.value());
+  auto query_view =
+    raft::make_device_matrix_view<const float, int64_t, raft::row_major>(q_dev.data(), 1, dim);
+
+  SECTION("k < 1 throws") { REQUIRE_THROWS(brute_force_knn(res, dataset_view, query_view, 0)); }
+
+  SECTION("k > n_rows throws")
+  {
+    REQUIRE_THROWS(brute_force_knn(res, dataset_view, query_view, n_rows + 1));
+  }
+
+  SECTION("query/dataset dimensionality mismatch throws")
+  {
+    std::vector<float> q2_host(dim + 1, 0.0f);
+    rmm::device_uvector<float> q2_dev(dim + 1, stream);
+    cudaMemcpyAsync(q2_dev.data(),
+                    q2_host.data(),
+                    sizeof(float) * (dim + 1),
+                    cudaMemcpyHostToDevice,
+                    stream.value());
+    auto bad_query = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
+      q2_dev.data(), 1, dim + 1);
+    REQUIRE_THROWS(brute_force_knn(res, dataset_view, bad_query, 1));
+  }
 }

@@ -1494,36 +1494,15 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   auto& scan_mgr  = sirius_ctx->get_scan_manager();
   const auto* pin = scan_mgr.find_pinned_entry(entry.name);
+  if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
+    throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
+                                "' must be pinned on the GPU tier before building an index");
+  }
 
   // Collect the vector column's GPU chunks as views:
   // a full coalesce of a large dataset overflows cudf's 2^31-element per-column limit
   // in the LIST child. The chunked builder feeds cuVS one chunk at a time via ivf_flat::extend.
-  std::vector<cudf::column_view> chunk_views;
-  sirius::materialized_pin mat;  // keep-alive for the non-pinned path
-  if (pin != nullptr && pin->tier == cucascade::memory::Tier::GPU) {
-    chunk_views = sirius::vss::pinned_column_chunk_views(*pin, data.column_name, *target_space);
-  } else {
-    std::size_t const batch_size =
-      sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
-    std::optional<std::vector<std::string>> const cols_opt{
-      std::vector<std::string>{data.column_name}};
-    auto info =
-      build_duckdb_pin_info(context, data.table_name, data.schema_name, cols_opt, batch_size);
-    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
-
-    std::vector<cucascade::memory::memory_space*> single_space{target_space};
-    mat = sirius::materialize_all_batches(*ingestible, single_space, *scan_mgr.io_ctx());
-    if (mat.tables.empty()) {
-      throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
-                                  "' produced no rows to index");
-    }
-    // Materialized on the default stream; sync before the raft-stream build reads them.
-    cudf::get_default_stream().synchronize();
-    chunk_views.reserve(mat.tables.size());
-    for (auto const& tbl : mat.tables) {
-      chunk_views.push_back(tbl->view().column(0));
-    }
-  }
+  auto chunk_views = sirius::vss::pinned_column_chunk_views(*pin, data.column_name, *target_space);
 
   int64_t n_rows = 0;
   for (auto const& v : chunk_views) {
@@ -1650,6 +1629,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
     }
   }
   if (req.k <= 0) { throw BinderException("sirius_vector_search: k must be >= 1"); }
+  if (req.n_probes < 0) { throw BinderException("sirius_vector_search: n_probes must be >= 0"); }
   if (req.metric != "l2sq" && req.metric != "cosine") {
     throw BinderException("sirius_vector_search: metric must be one of 'l2sq', 'cosine', got '" +
                           req.metric + "'");

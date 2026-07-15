@@ -24,6 +24,8 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <raft/core/device_resources.hpp>
+
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -52,6 +54,11 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
     out_chunks.push_back(std::move(views));
   }
 
+  // One RAFT handle for every chunk: bound to c.stream and reused across the
+  // loop so its workspace setup is paid once, not per chunk. Each per-chunk
+  // search runs async on c.stream; res must outlive (until vss_result_to_host syncs).
+  raft::device_resources res{c.stream};
+
   // Brute-force top-k per chunk. The per-chunk input table is laid out as
   // [vector, out0, out1, ...]; compute_enn_top_k returns [out0, ..., distance],
   // matching the table function's [output_columns..., distance] schema.
@@ -64,7 +71,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
     for (auto const& oc : out_chunks) {
       cols.push_back(oc[ci]);
     }
-    auto cand = compute_enn_top_k(c, cudf::table_view(cols));
+    auto cand = compute_enn_top_k(c, cudf::table_view(cols), res);
     if (cand->num_rows() > 0) { candidates.push_back(std::move(cand)); }
   }
 

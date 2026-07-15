@@ -161,13 +161,13 @@ namespace {
 using ivf_flat_index_t = cuvs::neighbors::ivf_flat::index<float, int64_t>;
 }  // namespace
 
-ann_search_result search_ivf_flat_index(any_cuvs_index const& index,
-                                        const float* query_device,
-                                        std::int64_t dim,
-                                        std::int64_t k,
-                                        std::uint32_t n_probes,
-                                        rmm::cuda_stream_view stream,
-                                        rmm::device_async_resource_ref mr)
+ann_result search_ivf_flat_index(any_cuvs_index const& index,
+                                 const float* query_device,
+                                 std::int64_t dim,
+                                 std::int64_t k,
+                                 std::uint32_t n_probes,
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
 {
   auto const* holder = dynamic_cast<cuvs_index_holder<ivf_flat_index_t> const*>(&index);
   if (holder == nullptr) {
@@ -197,7 +197,7 @@ ann_search_result search_ivf_flat_index(any_cuvs_index const& index,
     res, search_params, idx, query_view, neighbors_view, distances_view);
   raft::resource::sync_stream(res);
 
-  return ann_search_result{std::move(neighbors_col), std::move(distances_col)};
+  return ann_result{std::move(neighbors_col), std::move(distances_col)};
 }
 
 }  // namespace sirius::vss

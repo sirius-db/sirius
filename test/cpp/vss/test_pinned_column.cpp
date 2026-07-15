@@ -21,17 +21,16 @@
 
 // sirius
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <sirius/exception.hpp>
 #include <vss/pinned_column.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime_api.h>
-
-#include <cucascade/memory/memory_space.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -39,76 +38,91 @@
 
 namespace {
 
-std::shared_ptr<cudf::column> make_int_col(std::vector<int32_t> const& v)
+namespace ou = sirius::test::operator_utils;
+using sirius::vss::pinned_column_chunk_views;
+
+std::shared_ptr<cudf::column> make_int32_chunk(std::vector<int32_t> const& values)
 {
   auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                       static_cast<cudf::size_type>(v.size()),
+                                       static_cast<cudf::size_type>(values.size()),
                                        cudf::mask_state::UNALLOCATED);
   cudaMemcpy(col->mutable_view().data<int32_t>(),
-             v.data(),
-             sizeof(int32_t) * v.size(),
+             values.data(),
+             sizeof(int32_t) * values.size(),
              cudaMemcpyHostToDevice);
-  return col;
-}
-
-std::vector<int32_t> to_host_i32(cudf::column_view const& col)
-{
-  std::vector<int32_t> host(col.size());
-  cudaMemcpy(
-    host.data(), col.data<int32_t>(), sizeof(int32_t) * host.size(), cudaMemcpyDeviceToHost);
-  return host;
+  return std::shared_ptr<cudf::column>(std::move(col));
 }
 
 }  // namespace
 
-TEST_CASE("concat_pinned_column returns a single chunk's values", "[vss]")
+TEST_CASE("pinned_column_chunk_views returns borrowed chunks in pin order", "[vss]")
 {
-  auto& space = *sirius::test::operator_utils::get_default_gpu_space();
-  auto stream = cudf::get_default_stream();
+  auto* space = ou::get_default_gpu_space();
+
+  auto c0 = make_int32_chunk({0, 1, 2});
+  auto c1 = make_int32_chunk({3, 4});
 
   sirius::scan_manager::pinned_entry pin;
-  pin.tier                        = cucascade::memory::Tier::GPU;
-  pin.data_batches_by_column["v"] = {make_int_col({10, 20, 30})};
-  pin.num_rows                    = 3;
+  pin.data_batches_by_column["vec"] = {c0, c1};
+  pin.chunk_memory_spaces           = {space, space};
 
-  auto out = sirius::vss::concat_pinned_column(pin, "v", space, stream);
-  stream.synchronize();
+  auto views = pinned_column_chunk_views(pin, "vec", *space);
 
-  REQUIRE(out->size() == 3);
-  REQUIRE(to_host_i32(out->view()) == std::vector<int32_t>{10, 20, 30});
+  REQUIRE(views.size() == 2);
+  // Views borrow the pinned chunks (no copy): same device pointer and length, in
+  // the order they were pinned.
+  REQUIRE(views[0].size() == 3);
+  REQUIRE(views[1].size() == 2);
+  REQUIRE(views[0].data<int32_t>() == c0->view().data<int32_t>());
+  REQUIRE(views[1].data<int32_t>() == c1->view().data<int32_t>());
 }
 
-TEST_CASE("concat_pinned_column concatenates chunks in pin order", "[vss]")
+TEST_CASE("pinned_column_chunk_views rejects a missing or empty column", "[vss]")
 {
-  auto& space = *sirius::test::operator_utils::get_default_gpu_space();
-  auto stream = cudf::get_default_stream();
-
-  // The pin/index-build order must be preserved: the ANN search gathers rows by
-  // index into exactly this dataset, so a reordered concat would corrupt results.
-  sirius::scan_manager::pinned_entry pin;
-  pin.tier                        = cucascade::memory::Tier::GPU;
-  pin.data_batches_by_column["v"] = {make_int_col({1, 2, 3}), make_int_col({4, 5})};
-  pin.num_rows                    = 5;
-
-  auto out = sirius::vss::concat_pinned_column(pin, "v", space, stream);
-  stream.synchronize();
-
-  REQUIRE(out->size() == 5);
-  REQUIRE(to_host_i32(out->view()) == std::vector<int32_t>{1, 2, 3, 4, 5});
-}
-
-TEST_CASE("concat_pinned_column throws when the column is absent", "[vss]")
-{
-  auto& space = *sirius::test::operator_utils::get_default_gpu_space();
-  auto stream = cudf::get_default_stream();
+  auto* space = ou::get_default_gpu_space();
 
   sirius::scan_manager::pinned_entry pin;
-  pin.tier                        = cucascade::memory::Tier::GPU;
-  pin.data_batches_by_column["v"] = {make_int_col({1, 2, 3})};
+  pin.data_batches_by_column["vec"]   = {make_int32_chunk({1, 2, 3})};
+  pin.data_batches_by_column["empty"] = {};
+  pin.chunk_memory_spaces             = {space};
 
-  REQUIRE_THROWS(sirius::vss::concat_pinned_column(pin, "missing", space, stream));
+  SECTION("absent column name throws")
+  {
+    REQUIRE_THROWS_AS(pinned_column_chunk_views(pin, "nope", *space), sirius::internal_exception);
+  }
+
+  SECTION("present but chunkless column throws")
+  {
+    REQUIRE_THROWS_AS(pinned_column_chunk_views(pin, "empty", *space), sirius::internal_exception);
+  }
 }
 
-// NOTE: the multi-GPU rejection branch (a chunk resident on a different device
-// than `space`) needs a two-GPU fixture and is covered alongside the multi-GPU
-// pin-table integration tests, not here.
+TEST_CASE("pinned_column_chunk_views rejects chunks on a different GPU", "[vss]")
+{
+  auto* space = ou::get_default_gpu_space();
+
+  // The multi-GPU guard compares device ids, so it needs a second space on a
+  // different device. Skip cleanly on single-GPU hosts rather than fail.
+  cucascade::memory::memory_space* other = nullptr;
+  try {
+    static auto mgr2 = ou::initialize_memory_manager(/*n_gpus=*/2);
+    auto* candidate  = const_cast<cucascade::memory::memory_space*>(
+      mgr2->get_memory_space(cucascade::memory::Tier::GPU, 1));
+    if (candidate != nullptr && candidate->get_device_id() != space->get_device_id()) {
+      other = candidate;
+    }
+  } catch (...) {
+    other = nullptr;
+  }
+
+  if (other == nullptr) {
+    SUCCEED("single-GPU host: multi-GPU rejection path not exercised");
+    return;
+  }
+
+  sirius::scan_manager::pinned_entry pin;
+  pin.data_batches_by_column["vec"] = {make_int32_chunk({1, 2, 3})};
+  pin.chunk_memory_spaces           = {other};  // chunk on a different device than space
+
+  REQUIRE_THROWS_AS(pinned_column_chunk_views(pin, "vec", *space), sirius::internal_exception);
+}

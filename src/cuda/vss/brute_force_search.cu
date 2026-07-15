@@ -29,11 +29,11 @@
 
 namespace sirius::vss {
 
-knn_result brute_force_knn(dataset_matrix_view dataset,
+knn_result brute_force_knn(raft::device_resources const& res,
+                           dataset_matrix_view dataset,
                            dataset_matrix_view queries,
                            int64_t k,
                            cuvs::distance::DistanceType metric,
-                           rmm::cuda_stream_view stream,
                            rmm::device_async_resource_ref mr)
 {
   namespace bf = cuvs::neighbors::brute_force;
@@ -45,10 +45,10 @@ knn_result brute_force_knn(dataset_matrix_view dataset,
                "VSS dataset and query dimensionality must match");
   CUDF_EXPECTS(k >= 1 && k <= n_rows, "VSS k must satisfy 1 <= k <= n_rows");
 
-  // Run cuVS on the caller's stream so the search, the output allocations, and
-  // the caller's downstream work all order on a single stream.
-  // Note: could reuse resource handle across batches instead of constructing per call
-  raft::device_resources res{stream};
+  // Everything runs on res's stream so the search, the output allocations, and
+  // the caller's downstream work all order on that single stream. res is
+  // caller-owned and reused across chunks, so its handle setup is paid once.
+  auto const stream = raft::resource::get_cuda_stream(res);
 
   // Build the brute-force index. With the non-owning dataset view this stores a
   // reference to Sirius-owned memory and precomputes norms.
@@ -72,11 +72,7 @@ knn_result brute_force_knn(dataset_matrix_view dataset,
   bf::search_params search_params;
   bf::search(res, search_params, index, queries, neighbors_view, distances_view);
 
-  // Synchronous contract: sync the stream so the results are ready on return AND
-  // every non-owning read of the dataset has completed before the caller can
-  // release residency on the borrowed input.
-  raft::resource::sync_stream(res);
-
+  // The search runs async on res's stream.
   return knn_result{std::move(neighbors_col), std::move(distances_col), n_queries, k};
 }
 
