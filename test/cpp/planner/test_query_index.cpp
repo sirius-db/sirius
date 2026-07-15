@@ -20,101 +20,182 @@
 #include "planner/query_index.hpp"
 
 #include <algorithm>
+#include <deque>
+#include <memory>
+#include <span>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
+using sirius::op::MemoryBarrierType;
+using sirius::op::sirius_physical_operator;
+using sirius::op::SiriusPhysicalOperatorType;
 using sirius::pipeline::pipeline_build_context;
 using sirius::pipeline::sirius_pipeline;
+using sirius::pipeline::sirius_pipeline_build_state;
+using sirius::planner::barrier_order;
+using sirius::planner::build_index_options;
+using sirius::planner::pipeline_order;
 using sirius::planner::query_index;
 
 namespace {
 
-// Wire a producer -> consumer data-flow edge. add_dependency(producer) records `producer` as an
-// upstream dependency of `consumer` and `consumer` as a downstream parent of `producer`.
-void connect(duckdb::shared_ptr<sirius_pipeline>& producer,
-             duckdb::shared_ptr<sirius_pipeline>& consumer)
+// Minimal concrete operator: a pass-through node used purely to carry ports/next-ports so that
+// query_index can read the pipeline DAG. Uses PROJECTION so get_next_ports_after_sink() takes the
+// plain (non-delim-join) path.
+struct test_operator : sirius_physical_operator {
+  test_operator() : sirius_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0) {}
+};
+
+// Builds a pipeline DAG out of one operator per pipeline (acting as both source and sink) wired
+// together through barrier-tagged ports, mirroring how the planner wires real pipelines.
+class dag_builder {
+ public:
+  // Add a pipeline labelled `id`; each pipeline gets a single source+sink operator.
+  duckdb::shared_ptr<sirius_pipeline> add(int id)
+  {
+    auto pipeline = duckdb::make_shared_ptr<sirius_pipeline>(_ctx);
+    auto op       = std::make_unique<test_operator>();
+    op->set_pipeline(pipeline);
+    _bs.set_pipeline_source(*pipeline, *op);
+    _bs.set_pipeline_sink(*pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()), 0);
+    _ids[pipeline.get()] = id;
+    _ops.push_back(std::move(op));
+    _pipelines.push_back(pipeline);
+    return pipeline;
+  }
+
+  // Wire a data-flow edge from -> to carrying `barrier`.
+  void connect(const duckdb::shared_ptr<sirius_pipeline>& from,
+               const duckdb::shared_ptr<sirius_pipeline>& to,
+               MemoryBarrierType barrier)
+  {
+    auto* consumer_op = to->get_source().get();
+    auto* producer_op = from->get_sink().get();
+
+    _names.push_back("e" + std::to_string(_names.size()));
+    std::string_view name = _names.back();
+
+    auto port           = std::make_unique<sirius_physical_operator::port>();
+    port->type          = barrier;
+    port->repo          = nullptr;
+    port->src_pipeline  = from;
+    port->dest_pipeline = to;
+    consumer_op->add_port(name, std::move(port));
+
+    producer_op->add_next_port_after_sink(
+      sirius_physical_operator::next_port_info{consumer_op, name, uuid::now_v7()});
+  }
+
+  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines() const
+  {
+    return _pipelines;
+  }
+
+  // Convert branch spans to id vectors for readable assertions.
+  std::vector<std::vector<int>> label(std::span<const query_index::branch> branches) const
+  {
+    std::vector<std::vector<int>> out;
+    for (const auto& br : branches) {
+      std::vector<int> ids;
+      for (auto* p : br) {
+        ids.push_back(_ids.at(p));
+      }
+      out.push_back(std::move(ids));
+    }
+    return out;
+  }
+
+ private:
+  pipeline_build_context _ctx{true};
+  sirius_pipeline_build_state _bs;
+  std::vector<std::unique_ptr<test_operator>> _ops;
+  std::deque<std::string> _names;  // stable storage backing the port-name string_views
+  std::unordered_map<sirius_pipeline*, int> _ids;
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> _pipelines;
+};
+
+bool contains(const std::vector<std::vector<int>>& all, const std::vector<int>& one)
 {
-  consumer->add_dependency(producer);
+  return std::find(all.begin(), all.end(), one) != all.end();
 }
 
-std::vector<sirius_pipeline*> branch_to_vec(query_index::branch b)
+// The example DAG from the spec:
+//   1 -> 2 -> 3 --[FULL]--> 4 ;  5 -> 6 --[PIPELINE]--> 4 ;  4 -> 7 -> 8
+// Pipeline 4 is the multiport (fan-in) consumer.
+dag_builder make_example()
 {
-  return std::vector<sirius_pipeline*>(b.begin(), b.end());
+  dag_builder b;
+  auto p1 = b.add(1);
+  auto p2 = b.add(2);
+  auto p3 = b.add(3);
+  auto p4 = b.add(4);
+  auto p5 = b.add(5);
+  auto p6 = b.add(6);
+  auto p7 = b.add(7);
+  auto p8 = b.add(8);
+
+  b.connect(p1, p2, MemoryBarrierType::PIPELINE);
+  b.connect(p2, p3, MemoryBarrierType::PIPELINE);
+  b.connect(p3, p4, MemoryBarrierType::FULL);
+  b.connect(p5, p6, MemoryBarrierType::PIPELINE);
+  b.connect(p6, p4, MemoryBarrierType::PIPELINE);
+  b.connect(p4, p7, MemoryBarrierType::PIPELINE);
+  b.connect(p7, p8, MemoryBarrierType::PIPELINE);
+  return b;
 }
 
 }  // namespace
 
-TEST_CASE("query_index partitions a DAG into boundary-inclusive branches", "[query_index]")
+TEST_CASE("query_index pipeline_order cuts every branch at the multiport consumer", "[query_index]")
 {
-  pipeline_build_context ctx{true};
-  auto make = [&] { return duckdb::make_shared_ptr<sirius_pipeline>(ctx); };
+  auto b     = make_example();
+  auto index = query_index::build_index(b.pipelines(), build_index_options{pipeline_order{}});
+  auto got   = b.label(index->get_branches());
 
-  // Data flow:
-  //   scanA -> mid1 -> joinX
-  //   scanB --------> joinX
-  //   joinX -> mid2 -> result
-  // joinX is a fan-in branch point (2 producers); mid1/mid2 are pass-through; result is terminal.
-  auto scanA  = make();
-  auto scanB  = make();
-  auto mid1   = make();
-  auto mid2   = make();
-  auto joinX  = make();
-  auto result = make();
-
-  connect(scanA, mid1);
-  connect(mid1, joinX);
-  connect(scanB, joinX);
-  connect(joinX, mid2);
-  connect(mid2, result);
-
-  // Execution order (scans first) determines branch/plan order.
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipelines{
-    scanA, scanB, mid1, mid2, joinX, result};
-
-  auto index    = query_index::build_index(pipelines);
-  auto branches = index->get_branches();
-
-  REQUIRE(branches.size() == 3);
-  // Branch order follows the head pipeline's plan position: scanA, then scanB, then joinX.
-  REQUIRE(branch_to_vec(branches[0]) ==
-          std::vector<sirius_pipeline*>{scanA.get(), mid1.get(), joinX.get()});
-  REQUIRE(branch_to_vec(branches[1]) == std::vector<sirius_pipeline*>{scanB.get(), joinX.get()});
-  REQUIRE(branch_to_vec(branches[2]) ==
-          std::vector<sirius_pipeline*>{joinX.get(), mid2.get(), result.get()});
-
-  // joinX is a shared endpoint appearing in all three branches.
-  auto appears_in = [&](sirius_pipeline* p) {
-    int count = 0;
-    for (auto& br : branches) {
-      if (std::find(br.begin(), br.end(), p) != br.end()) { ++count; }
-    }
-    return count;
-  };
-  REQUIRE(appears_in(joinX.get()) == 3);
-  REQUIRE(appears_in(mid1.get()) == 1);
+  REQUIRE(got.size() == 3);
+  REQUIRE(contains(got, {1, 2, 3}));
+  REQUIRE(contains(got, {5, 6}));
+  REQUIRE(contains(got, {4, 7, 8}));
+  // The first-added scan heads the highest-priority (first) branch.
+  REQUIRE(got.front() == std::vector<int>{1, 2, 3});
 }
 
-TEST_CASE("query_index splits at a fan-out branch point", "[query_index]")
+TEST_CASE("query_index barrier_order extends through pipeline/partial barriers", "[query_index]")
 {
-  pipeline_build_context ctx{true};
-  auto make = [&] { return duckdb::make_shared_ptr<sirius_pipeline>(ctx); };
+  auto b     = make_example();
+  auto index = query_index::build_index(b.pipelines(), build_index_options{barrier_order{}});
+  auto got   = b.label(index->get_branches());
 
-  // scan -> fork ; fork -> a ; fork -> b   (fork feeds two consumers => fan-out branch point)
-  auto scan = make();
-  auto fork = make();
-  auto a    = make();
-  auto b    = make();
+  // The FULL edge (3->4) still cuts, but the PIPELINE edge (6->4) extends 5,6 through 4,7,8.
+  REQUIRE(got.size() == 2);
+  REQUIRE(contains(got, {1, 2, 3}));
+  REQUIRE(contains(got, {5, 6, 4, 7, 8}));
+}
 
-  connect(scan, fork);
-  connect(fork, a);
-  connect(fork, b);
+TEST_CASE("query_index default options use pipeline_order", "[query_index]")
+{
+  auto b     = make_example();
+  auto index = query_index::build_index(b.pipelines());  // default options
+  REQUIRE(index->get_branches().size() == 3);
+}
 
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipelines{scan, fork, a, b};
-  auto index    = query_index::build_index(pipelines);
-  auto branches = index->get_branches();
+TEST_CASE("query_index barrier_order with a partial barrier also extends", "[query_index]")
+{
+  dag_builder b;
+  auto scan = b.add(1);
+  auto mid  = b.add(2);
+  auto join = b.add(3);  // multiport
+  auto tail = b.add(4);
 
-  // scan -> [scan, fork]; fork fans out into two single-pipeline branches [fork,a] and [fork,b].
-  REQUIRE(branches.size() == 3);
-  REQUIRE(branch_to_vec(branches[0]) == std::vector<sirius_pipeline*>{scan.get(), fork.get()});
-  REQUIRE(branch_to_vec(branches[1]) == std::vector<sirius_pipeline*>{fork.get(), a.get()});
-  REQUIRE(branch_to_vec(branches[2]) == std::vector<sirius_pipeline*>{fork.get(), b.get()});
+  b.connect(scan, join, MemoryBarrierType::FULL);    // full edge into the multiport join
+  b.connect(mid, join, MemoryBarrierType::PARTIAL);  // partial edge extends
+  b.connect(join, tail, MemoryBarrierType::PIPELINE);
+
+  auto index = query_index::build_index(b.pipelines(), build_index_options{barrier_order{}});
+  auto got   = b.label(index->get_branches());
+
+  REQUIRE(got.size() == 2);
+  REQUIRE(contains(got, {1}));        // scan branch cut by its FULL edge
+  REQUIRE(contains(got, {2, 3, 4}));  // partial edge extends mid through join, tail
 }

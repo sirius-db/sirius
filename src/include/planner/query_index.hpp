@@ -23,30 +23,42 @@
 #include <memory>
 #include <span>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace sirius::planner {
 
 class query;
 
-/// Options for query_index::build_index. Reserved for future tuning; empty for now.
-struct build_index_options {};
+/// Branch-formation strategy: cut a branch at every multiport (fan-in) consumer operator. The
+/// multiport pipeline starts the next branch; branches are disjoint. This is the default.
+struct pipeline_order {};
+
+/// Branch-formation strategy: like pipeline_order, but a branch that reaches a multiport consumer
+/// through a PIPELINE- or PARTIAL-barrier port extends past that operator into the downstream
+/// pipeline. Only FULL-barrier edges cut a branch, so pipelinable work stays in one branch.
+struct barrier_order {};
+
+/// Options for query_index::build_index.
+struct build_index_options {
+  /// How branches are formed from the pipeline DAG. Defaults to pipeline_order.
+  std::variant<pipeline_order, barrier_order> branch_order{pipeline_order{}};
+};
 
 /**
  * @brief Precomputed structural index over a query's pipeline DAG.
  *
- * The index partitions the pipeline DAG into linear "branches". A branch is a maximal chain of
- * pipelines that runs from one branch point to the next, following consumer (downstream) edges.
- * A pipeline is a branch point when it is not a simple 1-producer / 1-consumer pass-through:
- * scans (0 producers), joins / merges (>1 producer, "fan-in"), forks (>1 consumer, "fan-out"),
- * and terminal result pipelines (0 consumers) are all branch points. Both endpoints of a branch
- * are branch points, so adjacent branches share their boundary pipeline.
+ * The index partitions the pipeline DAG into linear "branches" following consumer (downstream)
+ * edges. A branch is cut at a multiport consumer operator (fan-in, e.g. a join/merge whose source
+ * operator has more than one input port); the multiport pipeline starts a *new* branch, so
+ * pipeline_order branches are disjoint. barrier_order relaxes this: a branch reaching a multiport
+ * consumer through a PIPELINE/PARTIAL-barrier port is extended past the operator into the
+ * downstream pipeline (only FULL barriers cut). The chosen strategy is set via build_index_options.
  *
- * Example (numbers are pipelines; 3, 7, 10 are joins/forks):
- *   1 -> 2 -> 3        4 -> 5 -> 3       3 -> 6 -> 7      8 -> 9 -> 10 -> 7
- *   11 -> 10           3 -> 12
- * yields the branches [1,2,3], [4,5,3], [3,6,7], [3,12], [8,9,10,7], [11,10], ... with pipeline 3
- * appearing (as a shared endpoint) in several branches.
+ * Example (numbers are pipelines; the operator merging into 4 is multiport):
+ *   1 -> 2 -> 3 --[FULL]-->  4        5 -> 6 --[PIPELINE]--> 4        4 -> 7 -> 8
+ * pipeline_order branches: [1,2,3], [5,6], [4,7,8].
+ * barrier_order  branches: [1,2,3], [5,6,4,7,8]   (the PIPELINE edge extends 5,6 through 4,7,8).
  *
  * Branches are stored in plan order (by the head pipeline's position in the query's execution
  * order), so earlier branches sit closer to the scans. Callers use this order to assign
@@ -55,8 +67,7 @@ struct build_index_options {};
 class query_index {
  public:
   using pipeline_ptr = pipeline::sirius_pipeline*;
-  /// A branch: a chain of pipelines from one branch point to the next (both endpoints included),
-  /// head first (closest to the scans).
+  /// A branch: the chain of pipelines forming one branch, head first (closest to the scans).
   using branch = std::span<pipeline_ptr const>;
 
   /**
