@@ -142,12 +142,24 @@ void sirius_physical_streaming_sink::sink(const operator_data& output_data,
   const auto& batches = pod.get_data_batches();
 
   for (const auto& batch : batches) {
-    // Read size via a shared (read-only) lock — pure metadata access, no data copy or GPU work.
-    // The lock is released before add_data_batch so the repo receives the batch in idle state.
+    // Registration-time size snapshot, read under the batch's shared lock (excludes concurrent
+    // spill). The channel adds and subtracts this same stored value, so a later spill only makes
+    // the byte bound conservative, never unbalanced.
     std::size_t size_bytes = 0;
     {
       auto ro = batch->to_read_only();
       if (const auto* d = ro.get_data()) { size_bytes = d->get_size_in_bytes(); }
+    }
+
+    // One lock hold per batch keeps the _closing check, registration, and push atomic and FIFO.
+    std::lock_guard<std::mutex> lk(_pending_lock);
+
+    // A sink() after finalize is a pipeline-contract violation; fail before add_data_batch so
+    // the batch is neither orphaned in the repo nor stranded behind the closed channel.
+    if (_closing) {
+      throw sirius::internal_exception(
+        "sirius_physical_streaming_sink::sink() called after finalize — a task was still in "
+        "flight when the pipeline was declared finished");
     }
 
     // Register first: the repo becomes the owner of record and the batch is spill-visible
@@ -157,8 +169,7 @@ void sirius_physical_streaming_sink::sink(const operator_data& output_data,
     exec::exchange_batch_handle handle{batch->get_batch_id(), size_bytes};
 
     // Drain the backlog first, then push the new handle — or park it if anything is still
-    // queued or the channel is full. One lock hold keeps FIFO order intact and never blocks.
-    std::lock_guard<std::mutex> lk(_pending_lock);
+    // queued or the channel is full. Never blocks a worker.
     flush_pending_locked();
     if (!_pending.empty() || !_output_channel->try_push(handle)) { _pending.push_back(handle); }
   }
@@ -175,7 +186,10 @@ void sirius_physical_streaming_sink::on_finalize_operator()
 {
   // Hold the lock across flush + close decision so they are atomic: close now if the backlog
   // drained, otherwise defer the close to whichever try_flush_pending() delivers the last handle.
+  // _closing is set under the same lock: a concurrent sink() either completes before the close
+  // decision or rejects its batch.
   std::lock_guard<std::mutex> lk(_pending_lock);
+  _closing = true;
   flush_pending_locked();
   if (_pending.empty()) {
     _output_channel->close();

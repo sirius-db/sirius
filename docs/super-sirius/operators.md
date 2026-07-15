@@ -115,12 +115,18 @@ Key design invariants:
 - **Backpressure as admission control**: if the channel is full or `_pending` is non-empty,
   `get_next_task_hint()` and `get_next_task_input_data()` return `WAITING{nullptr}` / `nullptr`
   respectively, preventing new tasks from being created. Worker threads never block.
-- **FIFO `_pending` queue**: when `try_push` fails (channel full), the handle is appended to
-  `_pending`. Subsequent calls to `get_next_task_hint()` or `sink()` call `try_flush_pending()`
-  first, draining `_pending` in order before any new handles are attempted.
+- **FIFO `_pending` overflow buffer (bounded)**: when `try_push` fails (channel full), the handle
+  is appended to `_pending`. Subsequent calls to `get_next_task_hint()` or `sink()` call
+  `try_flush_pending()` first, draining `_pending` in order before any new handles are attempted.
+  `_pending` is not a second unbounded queue: because admission control refuses new sink tasks
+  while `_pending` is non-empty, its depth is bounded by the operator's in-flight task concurrency,
+  never by the input size.
 - **Flush-then-close EOS**: `on_finalize_operator()` flushes what fits; if `_pending` is empty
   it closes the channel immediately; otherwise it sets `_close_when_flushed` and defers the
-  close to the `try_flush_pending()` call triggered by the next consumer pop.
+  close to the `try_flush_pending()` call triggered by the next consumer pop. Finalize sets a
+  `_closing` flag under `_pending_lock`; a `sink()` that observes it (a batch arriving after
+  finalize — which the pipeline never does) throws rather than stranding the handle behind the
+  closed channel.
 - **Locking discipline**: whenever `_pending_lock` and the channel's internal mutex are both
   needed, `_pending_lock` is always acquired first (consistent ordering prevents deadlock);
   the base-class `lock` guards `ports` and is never held simultaneously with `_pending_lock`.

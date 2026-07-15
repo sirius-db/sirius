@@ -594,6 +594,29 @@ TEST_CASE("streaming_sink lifecycle: empty stream finalized closes channel with 
   REQUIRE_FALSE(h.has_value());
 }
 
+TEST_CASE("streaming_sink lifecycle: sink() after finalize throws and leaves no orphan",
+          "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto stream                 = default_stream();
+  auto [op, out_ch, out_repo] = make_sink();
+  auto in_repo                = wire_input_port(*op);
+
+  op->finalize_operator();  // nothing pending → sets _closing and closes the channel
+  REQUIRE(out_ch->closed());
+
+  // A late sink() must throw instead of stranding the handle behind the closed channel.
+  auto late = make_numeric_batch<int32_t>(*gpu_space, {42}, cudf::type_id::INT32);
+  REQUIRE_THROWS_AS(sink_batch(*op, late, stream), sirius::internal_exception);
+
+  // The rejected batch is not orphaned in the repo and nothing entered the channel.
+  REQUIRE(out_repo->total_size() == 0);
+  REQUIRE(out_ch->drained());
+}
+
 TEST_CASE("streaming_sink lifecycle: conservation across randomized run", "[streaming_sink]")
 {
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
