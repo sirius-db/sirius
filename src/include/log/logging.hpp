@@ -16,90 +16,64 @@
 
 #pragma once
 
-#ifdef __CUDACC__
-// nvcc cannot compile spdlog/fmt chrono headers — provide no-op macros
-#define SIRIUS_LOG_TRACE(...)
-#define SIRIUS_LOG_DEBUG(...)
-#define SIRIUS_LOG_INFO(...)
-#define SIRIUS_LOG_WARN(...)
-#define SIRIUS_LOG_ERROR(...)
-#define SIRIUS_LOG_FATAL(...)
-#else  // !__CUDACC__
+#include "log/level.hpp"
+#include "log/sink.hpp"
 
-// Compile in every log level by default. This must be set before spdlog is
-// first included in a translation unit, so this header is the single entry
-// point for spdlog: include <log/logging.hpp> rather than <spdlog/...> so the
-// level is set here first. If spdlog is pulled in earlier, it defaults the
-// level to INFO and silently drops TRACE/DEBUG statements — the post-include
-// check below catches that case.
-#ifndef SPDLOG_ACTIVE_LEVEL
-#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
+#include <format>
+#include <source_location>
+#include <utility>
+
+namespace sirius::log::detail {
+
+/// Format and log a message, but skip formatting if the level is disabled.
+template <typename... Args>
+void format_and_log(level level,
+                    const std::source_location& location,
+                    std::format_string<Args...> format_string,
+                    Args&&... format_args)
+{
+  if (auto s = get_sink(); s->should_log(level)) {
+    s->log(level, location, std::format(format_string, std::forward<Args>(format_args)...));
+  }
+}
+
+}  // namespace sirius::log::detail
+
+#define SIRIUS_LOG_IMPL(lvl, ...) \
+  ::sirius::log::detail::format_and_log(lvl, std::source_location::current(), __VA_ARGS__)
+
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_TRACE
+#define SIRIUS_LOG_TRACE(...) SIRIUS_LOG_IMPL(::sirius::log::level::trace, __VA_ARGS__)
+#else
+#define SIRIUS_LOG_TRACE(...) ((void)0)
 #endif
 
-#include <spdlog/sinks/daily_file_sink.h>
-#include <spdlog/spdlog.h>
-
-// Warn only if the level was actually raised above TRACE, which compiles out
-// lower-level log statements (e.g. because spdlog was included before this
-// header). SPDLOG_LEVEL_* is defined by the headers above.
-#if SPDLOG_ACTIVE_LEVEL > SPDLOG_LEVEL_TRACE
-#warning "SPDLOG_ACTIVE_LEVEL is above TRACE; lower-level log output is compiled out"
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_DEBUG
+#define SIRIUS_LOG_DEBUG(...) SIRIUS_LOG_IMPL(::sirius::log::level::debug, __VA_ARGS__)
+#else
+#define SIRIUS_LOG_DEBUG(...) ((void)0)
 #endif
 
-#include <string>
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_INFO
+#define SIRIUS_LOG_INFO(...) SIRIUS_LOG_IMPL(::sirius::log::level::info, __VA_ARGS__)
+#else
+#define SIRIUS_LOG_INFO(...) ((void)0)
+#endif
 
-#define SIRIUS_LOG_TRACE(...) SPDLOG_LOGGER_TRACE(spdlog::default_logger_raw(), __VA_ARGS__)
-#define SIRIUS_LOG_DEBUG(...) SPDLOG_LOGGER_DEBUG(spdlog::default_logger_raw(), __VA_ARGS__)
-#define SIRIUS_LOG_INFO(...)  SPDLOG_LOGGER_INFO(spdlog::default_logger_raw(), __VA_ARGS__)
-#define SIRIUS_LOG_WARN(...)  SPDLOG_LOGGER_WARN(spdlog::default_logger_raw(), __VA_ARGS__)
-#define SIRIUS_LOG_ERROR(...) SPDLOG_LOGGER_ERROR(spdlog::default_logger_raw(), __VA_ARGS__)
-#define SIRIUS_LOG_FATAL(...) SPDLOG_LOGGER_CRITICAL(spdlog::default_logger_raw(), __VA_ARGS__)
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_WARN
+#define SIRIUS_LOG_WARN(...) SIRIUS_LOG_IMPL(::sirius::log::level::warn, __VA_ARGS__)
+#else
+#define SIRIUS_LOG_WARN(...) ((void)0)
+#endif
 
-#endif  // __CUDACC__
-#ifndef __CUDACC__
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_ERROR
+#define SIRIUS_LOG_ERROR(...) SIRIUS_LOG_IMPL(::sirius::log::level::error, __VA_ARGS__)
+#else
+#define SIRIUS_LOG_ERROR(...) ((void)0)
+#endif
 
-namespace duckdb {
-
-inline spdlog::level::level_enum ParseLogLevel(const std::string& level_str)
-{
-  if (level_str == "trace") return spdlog::level::trace;
-  if (level_str == "debug") return spdlog::level::debug;
-  if (level_str == "info") return spdlog::level::info;
-  if (level_str == "warn") return spdlog::level::warn;
-  if (level_str == "error") return spdlog::level::err;
-  if (level_str == "critical") return spdlog::level::critical;
-  if (level_str == "off") return spdlog::level::off;
-  return spdlog::level::info;
-}
-
-inline void InitGlobalLogger(const std::string& log_level_str,
-                             const std::string& log_dir,
-                             int flush_seconds)
-{
-  auto log_file  = log_dir + "/sirius.log";
-  auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
-  file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
-
-  auto log_level = ParseLogLevel(log_level_str);
-  auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
-  logger->set_level(log_level);
-  spdlog::set_default_logger(logger);
-  spdlog::set_level(log_level);
-  spdlog::flush_every(std::chrono::seconds(flush_seconds));
-}
-
-inline void SetGlobalLogFlush(int flush_seconds)
-{
-  spdlog::flush_every(std::chrono::seconds(flush_seconds));
-}
-
-inline void SetGlobalLogLevel(const std::string& log_level_str)
-{
-  auto log_level = ParseLogLevel(log_level_str);
-  spdlog::set_level(log_level);
-  if (auto logger = spdlog::default_logger()) { logger->set_level(log_level); }
-}
-
-}  // namespace duckdb
-
-#endif  // !__CUDACC__
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_CRITICAL
+#define SIRIUS_LOG_FATAL(...) SIRIUS_LOG_IMPL(::sirius::log::level::critical, __VA_ARGS__)
+#else
+#define SIRIUS_LOG_FATAL(...) ((void)0)
+#endif

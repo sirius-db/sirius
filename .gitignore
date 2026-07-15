@@ -44,7 +44,7 @@ AGENTS.override.md
 CLAUDE.local.md
 newplan.md
 telemetry_data/
-log/
+/log/
 .ai-helper/
 
 .planning/
@@ -61,3 +61,4 @@ log/
 /doc/s3support/perf-baseline-*.json
 /doc/s3support/perf-history-*.jsonl
 *.local.md
+test/tpch_performance/__pycache__/

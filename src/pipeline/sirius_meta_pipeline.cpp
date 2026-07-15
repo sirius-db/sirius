@@ -16,6 +16,8 @@
 
 #include "pipeline/sirius_meta_pipeline.hpp"
 
+#include "config.hpp"
+
 namespace sirius {
 namespace pipeline {
 
@@ -135,6 +137,11 @@ sirius_pipeline& sirius_meta_pipeline::create_pipeline()
 {
   pipelines.emplace_back(duckdb::make_shared_ptr<sirius_pipeline>(build_ctx));
   state.set_pipeline_sink(*pipelines.back(), sink, next_batch_index++);
+  if (sink) {
+    // Pre-populate operators with [sink] so it lands at operators.back() after `is_ready`
+    // reverses; intermediates/sources are appended as build_pipelines recurses.
+    state.add_pipeline_operator(*pipelines.back(), *sink);
+  }
   return *pipelines.back();
 }
 

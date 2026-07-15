@@ -58,19 +58,11 @@ struct task_creation_hint {
 
 ```
 function get_operator_for_next_task(node):
-    // Special case: PARQUET_SCAN checks partition availability
-    if node is PARQUET_SCAN:
-        if parquet_global_state->has_more_partitions(): return node
-        else: return nullptr
-
     hint = node->get_next_task_hint()
     if hint is READY:
         return hint.producer  // create task from this operator
     if hint is WAITING_FOR_INPUT_DATA:
         producer = hint.producer
-        // Special case: DUCKDB_SCAN already drained
-        if producer is DUCKDB_SCAN and (drained or !can_create_more_tasks):
-            return nullptr
         return get_operator_for_next_task(producer)  // recurse upstream
     if no hint:
         return nullptr  // nothing to do
@@ -108,18 +100,6 @@ Returns `nullptr` if no batches are available.
 
 The core of the task creator's behavior comes from operator-specific overrides:
 
-### DUCKDB_SCAN / PARQUET_SCAN
-
-| Method | Behavior |
-|--------|----------|
-| `get_next_task_hint()` | Returns `READY` if scan is not exhausted (atomic flag) |
-| `get_next_task_input_data()` | N/A — task creator creates scan tasks directly |
-| Why custom | Sources don't have ports; the task creator handles them specially |
-
-For PARQUET_SCAN, the task creator loops through `parquet_global_state->acquire_next_rg_partition_index()` to create one task per row group partition.
-
-For DUCKDB_SCAN, one task is created per invocation. The scan task self-schedules its continuation internally.
-
 ### HASH_JOIN (BUILD_PROBE mode)
 
 | Method | Behavior |
@@ -143,9 +123,9 @@ Uses base class for both `get_next_task_hint()` and `get_next_task_input_data()`
 
 | Method | Behavior |
 |--------|----------|
-| `get_next_task_hint()` | If probe-side with no `_num_partitions` and has sibling: delegates to build sibling's hint. Otherwise: base class. |
-| `get_next_task_input_data()` | Mutex-locked with sibling to atomically determine partition count on first call via `determine_num_partitions()`. Notifies hash join of partition count. Then delegates to base class. |
-| Why custom | Sibling pair coordination: probe must wait for build to determine partition count |
+| `get_next_task_hint()` | If the non-driving side has no `_num_partitions`, delegates to the sizing sibling's hint. Otherwise: base class. |
+| `get_next_task_input_data()` | Mutex-locked with sibling to atomically determine partition count from the designated sizing side on first call. Notifies the hash join when build-side sizing can select an execution mode. Then delegates to base class. |
+| Why custom | Sibling pair coordination: build normally sizes both sides; RIGHT-family joins other than `RIGHT_DELIM_JOIN` size both from the retained probe side. |
 
 Deadlock prevention: both this and sibling partition locks are acquired in a fixed order using `std::scoped_lock`.
 
@@ -192,11 +172,9 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 
 | Operator | `get_next_task_hint()` | `get_next_task_input_data()` | Why Custom |
 |----------|------------------------|------------------------------|------------|
-| DUCKDB_SCAN | READY if not exhausted | N/A (task creator handles) | Source, no ports |
-| PARQUET_SCAN | READY if partitions remain | N/A (task creator handles) | Source, no ports |
 | HASH_JOIN (BUILD_PROBE) | Build state machine | Build+probe or probe only | Build/probe asymmetry |
 | HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
-| PARTITION | Delegates to build sibling | Mutex-locked count determination | Sibling coordination |
+| PARTITION | Delegates to sizing sibling | Mutex-locked count determination | Sibling coordination |
 | CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
 | SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
 | MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |

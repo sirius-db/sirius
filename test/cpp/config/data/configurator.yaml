@@ -24,7 +24,7 @@ sirius:
     downgrade:
       num_threads: 1
       thread_name_prefix: "sirius_downgrade_executor"
-      monitor_period_ms: 10
+      monitor_period: 10ms
   telemetry:
     enable_quent: false
     output_directory: "/tmp/sirius_telemetry_config_test"

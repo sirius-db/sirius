@@ -24,6 +24,7 @@
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_hash_join.hpp>
+#include <op/sirius_physical_partition.hpp>
 
 #include <atomic>
 #include <mutex>
@@ -614,6 +615,86 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
         false),
       std::runtime_error);
   }
+}
+
+TEST_CASE("sirius_physical_hash_join identifies right-family joins", "[physical_concat]")
+{
+  for (auto join_type :
+       {duckdb::JoinType::RIGHT, duckdb::JoinType::RIGHT_ANTI, duckdb::JoinType::RIGHT_SEMI}) {
+    INFO("join_type=" << duckdb::JoinTypeToString(join_type));
+    auto fixture = create_test_hash_join(join_type, {duckdb::LogicalType::INTEGER});
+    REQUIRE(fixture.hash_join->is_right_family());
+  }
+
+  for (auto join_type : {duckdb::JoinType::INNER,
+                         duckdb::JoinType::LEFT,
+                         duckdb::JoinType::SEMI,
+                         duckdb::JoinType::ANTI,
+                         duckdb::JoinType::MARK,
+                         duckdb::JoinType::OUTER}) {
+    INFO("join_type=" << duckdb::JoinTypeToString(join_type));
+    auto fixture = create_test_hash_join(join_type, {duckdb::LogicalType::INTEGER});
+    REQUIRE_FALSE(fixture.hash_join->is_right_family());
+  }
+}
+
+TEST_CASE("right-family sibling partitions round up from the probe input", "[physical_partition]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  auto build_batch =
+    make_numeric_batch<int32_t>(*space, std::vector<int32_t>(4, 1), cudf::type_id::INT32);
+  auto probe_batch =
+    make_numeric_batch<int32_t>(*space, std::vector<int32_t>(9, 1), cudf::type_id::INT32);
+  auto const build_bytes = build_batch->to_read_only().get_data()->get_size_in_bytes();
+  auto const probe_bytes = probe_batch->to_read_only().get_data()->get_size_in_bytes();
+  REQUIRE(probe_bytes > build_bytes);
+  auto const partition_size = probe_bytes - 1;
+
+  auto fixture    = create_test_hash_join(duckdb::JoinType::RIGHT, {duckdb::LogicalType::INTEGER});
+  auto make_types = [] {
+    return sirius::from_duckdb_vec(
+      duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  };
+  sirius_physical_partition build_partition(
+    make_types(), 4, fixture.hash_join.get(), true, partition_size);
+  sirius_physical_partition probe_partition(
+    make_types(), 9, fixture.hash_join.get(), false, partition_size);
+  build_partition.set_sibling_partition_op(&probe_partition);
+  probe_partition.set_sibling_partition_op(&build_partition);
+  build_partition.set_drives_partition_count(false);
+  probe_partition.set_drives_partition_count(true);
+
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  build_repo->add_data_batch(std::move(build_batch), 0);
+  probe_repo->add_data_batch(std::move(probe_batch), 0);
+
+  auto attach_port = [](sirius_physical_partition& partition,
+                        cucascade::shared_data_repository& repo) {
+    auto port           = std::make_unique<sirius_physical_operator::port>();
+    port->type          = MemoryBarrierType::FULL;
+    port->repo          = &repo;
+    port->src_pipeline  = nullptr;
+    port->dest_pipeline = nullptr;
+    partition.add_port("default", std::move(port));
+  };
+  attach_port(build_partition, *build_repo);
+  attach_port(probe_partition, *probe_repo);
+
+  // Enter through the non-driving build side first. It must still size both siblings from probe.
+  auto build_input = build_partition.get_next_task_input_data();
+  REQUIRE(build_input != nullptr);
+  auto build_output = build_partition.execute(*build_input, default_stream());
+  REQUIRE(
+    dynamic_cast<const pipelineable_operator_data&>(*build_output).get_data_batches().size() == 2);
+
+  auto probe_input = probe_partition.get_next_task_input_data();
+  REQUIRE(probe_input != nullptr);
+  auto probe_output = probe_partition.execute(*probe_input, default_stream());
+  REQUIRE(
+    dynamic_cast<const pipelineable_operator_data&>(*probe_output).get_data_batches().size() == 2);
 }
 
 //===----------------------------------------------------------------------===//

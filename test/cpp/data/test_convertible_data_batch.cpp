@@ -181,6 +181,46 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle 
   REQUIRE(all.size() == 2);
 }
 
+TEST_CASE("convertible_data_batch_provider get_all_convertible skips subscribed batches",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  cucascade::shared_data_repository repo;
+
+  auto batch1 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2}, cudf::type_id::INT32);
+  auto batch2 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{3, 4, 5}, cudf::type_id::INT32);
+  auto batch3 = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{6, 7, 8, 9}, cudf::type_id::INT32);
+
+  // batch2 is subscribed: a task has declared interest in it and it must not be downgraded.
+  batch2->subscribe();
+
+  repo.add_data_batch(batch1);
+  repo.add_data_batch(batch2);
+  repo.add_data_batch(batch3);
+
+  sirius::convertible_data_batch_provider provider(&repo);
+
+  SECTION("ignore_subscribed=true (default) skips the subscribed batch")
+  {
+    auto all = provider.get_all_convertible(e.gpu_space, false, /*ignore_subscribed=*/true);
+    // batch2 is subscribed -> excluded; batch1 and batch3 remain.
+    REQUIRE(all.size() == 2);
+  }
+
+  SECTION("ignore_subscribed=false includes the subscribed batch")
+  {
+    auto all = provider.get_all_convertible(e.gpu_space, false, /*ignore_subscribed=*/false);
+    // Subscription is ignored -> all three idle batches are returned.
+    REQUIRE(all.size() == 3);
+  }
+
+  batch2->unsubscribe();
+}
+
 TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-first",
           "[convertible_data_batch]")
 {

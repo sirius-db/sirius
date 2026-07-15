@@ -62,7 +62,7 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -220,13 +220,13 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   // Construct scoped_log_dir BEFORE scoped_mgpu_env so SIRIUS_LOG_DIR /
   // SIRIUS_LOG_LEVEL are in place when the extension callback creates the
   // SiriusContext (mgpu_test_utils.hpp:298 — "Construct BEFORE
-  // scoped_mgpu_env"). spdlog's file sink is flushed when shared_test_env
+  // scoped_mgpu_env"). the log file sink is flushed when shared_test_env
   // is destroyed (SiriusContext::shutdown drops the sinks).
   scoped_log_dir logs(tmp / "log");
   // env is held in unique_ptr so we can DESTROY it BEFORE parse_audit_log
   // runs. test_gpu_execution_tpch_mgpu_audit.cpp uses env->pause() for the
   // same effect; scoped_mgpu_env doesn't expose pause/resume so we
-  // explicitly reset() to flush spdlog. Mirrors the canonical pattern at
+  // explicitly reset() to flush the log. Mirrors the canonical pattern at
   // test_gpu_execution_tpch_mgpu_audit.cpp:166-235.
   auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
 
@@ -264,12 +264,12 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
     REQUIRE_FALSE(unpin->HasError());
   }
 
-  // Force-flush spdlog's file sink BEFORE tearing down the env. The default
+  // Force-flush the log file sink BEFORE tearing down the env. The default
   // log flush is every 3s (Config::LOG_FLUSH_SECONDS) and the SF1 query
   // completes well under that, so without an explicit flush the [mgpu-audit]
-  // emissions in src/pipeline/task_scheduler.cpp:275 stay in spdlog's
+  // emissions in src/pipeline/task_scheduler.cpp:275 stay in the sink's
   // buffer and never reach disk before parse_audit_log() reads it.
-  if (auto logger = spdlog::default_logger()) { logger->flush(); }
+  sirius::log::get_sink()->flush();
 
   // Tear down the SiriusContext + DuckDB. Verbatim equivalent of
   // env->pause() in test_gpu_execution_tpch_mgpu_audit.cpp:233 —
@@ -299,12 +299,9 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   //     scan_cached_operator_data emitted per chunk by cached_split_provider
   //     drives a pipeline_task on the chunk's home GPU, so this is the
   //     correct emission for the cached-pin routing gate.
-  //   - duckdb_scan_executor.cpp:264 emits "scan_batch assigned to GPU N
-  //     batch_id=K" — fires ONLY for the DuckDB-attach scan path
-  //     (cpu_source_task / duckdb_scan_task). The pinned-parquet path goes
-  //     through sirius_gpu_parquet_scan_operator + pipeline_task, NOT
-  //     through duckdb_scan_executor, so scan_ids is empty under this
-  //     fixture by design.
+  //   - duckdb_scan_executor's "scan_batch assigned to GPU N batch_id=K"
+  //     emission no longer exists (that executor was deleted), so scan_ids
+  //     is empty under this fixture by design.
   //
   // The plan-spec grep gate ("scan_ids" pattern) is documentation drift —
   // the audit emission shape was discovered at runtime to be pipeline_ids
@@ -646,7 +643,7 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
 
   // Construct scoped_log_dir BEFORE the env so SIRIUS_LOG_DIR is in place when
   // the SiriusContext initializes. env is held in a unique_ptr so we can reset()
-  // it (flushing spdlog's file sink) before parse_audit_log reads the file.
+  // it (flushing the log file sink) before parse_audit_log reads the file.
   scoped_log_dir logs(tmp / "log");
   auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
 
@@ -677,9 +674,9 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
     REQUIRE_FALSE(unpin->HasError());
   }
 
-  // Flush spdlog and tear down the env so the audit file is complete on disk
+  // Flush the log and tear down the env so the audit file is complete on disk
   // before parse_audit_log reads it.
-  if (auto logger = spdlog::default_logger()) { logger->flush(); }
+  sirius::log::get_sink()->flush();
   env.reset();
 
   auto counts      = parse_audit_log(logs.path());

@@ -16,22 +16,56 @@
 
 #pragma once
 
-namespace sirius::pipeline {
+#include <memory>
+#include <utility>
 
-//! Lightweight context for plan-time pipeline construction.
+namespace sirius {
+
+namespace telemetry {
+class telemetry_context;
+}  // namespace telemetry
+
+namespace pipeline {
+
+//! Context for plan-time pipeline construction.
 //! Replaces the sirius_engine& dependency so that pipelines can be built
 //! without an engine instance (e.g. at optimizer/bind time).
-struct pipeline_build_context {
-  //! Whether query results must preserve insertion order
-  //! (from DuckDB's PreserveInsertionOrderSetting)
-  bool preserve_insertion_order = true;
+class pipeline_build_context {
+ public:
+  //! @param telemetry_context SiriusContext-wide telemetry context; may be null
+  //!        when pipelines are built without an engine (tests, optimizer/bind).
+  //!        Carried into each sirius_pipeline so operators can build data_batch
+  //!        probes.
+  //! @param preserve_insertion_order Whether query results must preserve
+  //!        insertion order (from DuckDB's PreserveInsertionOrderSetting).
+  //! @param num_gpus Number of GPUs available for partition-floor heuristics.
+  //!        Enables sirius_pipeline_converter::configure_partition_min_partitions
+  //!        to ensure big partition-consuming operators (hash_join,
+  //!        merge_group_by) get at least num_gpus partitions to spread work.
+  explicit pipeline_build_context(
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+    bool preserve_insertion_order = true,
+    int num_gpus                  = 1)
+    : _telemetry_context(std::move(telemetry_context)),
+      _preserve_insertion_order(preserve_insertion_order),
+      _num_gpus(num_gpus)
+  {
+  }
 
-  //! Number of GPUs available for partition-floor heuristics. Defaults to 1
-  //! (single-GPU). Set from sirius_engine's hardware topology at convert time;
-  //! enables sirius_pipeline_converter::configure_partition_min_partitions to
-  //! ensure big partition-consuming operators (hash_join, merge_group_by) get
-  //! at least num_gpus partitions to spread work across devices.
-  int num_gpus = 1;
+  [[nodiscard]] bool preserve_insertion_order() const { return _preserve_insertion_order; }
+
+  [[nodiscard]] int num_gpus() const { return _num_gpus; }
+
+  [[nodiscard]] const std::shared_ptr<const telemetry::telemetry_context>& telemetry_context() const
+  {
+    return _telemetry_context;
+  }
+
+ private:
+  std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
+  bool _preserve_insertion_order = true;
+  int _num_gpus                  = 1;
 };
 
-}  // namespace sirius::pipeline
+}  // namespace pipeline
+}  // namespace sirius

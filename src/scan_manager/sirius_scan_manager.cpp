@@ -65,30 +65,25 @@ namespace sirius::scan_manager {
 namespace {
 
 struct cached_databatch_provider : public databatch_provider {
-  explicit cached_databatch_provider(pinned_entry const& entry, std::span<size_t> selected_columns)
-    : _entry(entry)
+  cached_databatch_provider(pinned_entry const& entry,
+                            std::span<size_t> selected_columns,
+                            cached_scan_plan plan,
+                            const telemetry::batch_telemetry_info& telemetry_info)
+    : _plan(std::move(plan)), _entry(entry), _telemetry_info(telemetry_info)
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
       _column_names.emplace_back(entry_column_names[idx]);
       _column_indices.push_back(idx);
     });
-
-    if (_entry.tier == cucascade::memory::Tier::GPU) {
-      if (_entry.data_batches_by_column.empty()) {
-        _n_chunks = 0;
-      } else {
-        _n_chunks = _entry.data_batches_by_column.begin()->second.size();
-      }
-    } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      _n_chunks = _entry.host_chunks.size();
-    }
   }
 
   std::shared_ptr<cucascade::data_batch> get_next_batch() override
   {
-    auto index = _index.fetch_add(1);
-    if (index >= _n_chunks) { return nullptr; }
+    // The atomic cursor walks survivor positions, each mapping to a chunk index.
+    auto const cursor = _index.fetch_add(1);
+    if (cursor >= _plan.survivor_chunk_indices.size()) { return nullptr; }
+    auto const index = _plan.survivor_chunk_indices[cursor];
     if (_entry.tier == cucascade::memory::Tier::GPU) {
       return get_device_databatch(index);
     } else if (_entry.tier == cucascade::memory::Tier::HOST) {
@@ -103,8 +98,12 @@ struct cached_databatch_provider : public databatch_provider {
     if (index >= _entry.host_chunks.size()) { return nullptr; }
     const auto& chunk = _entry.host_chunks.at(index);
     if (!chunk) { return nullptr; }
-    auto data_rep = chunk->slice(_column_indices);
-    return cucascade::data_batch::make(get_next_batch_id(), std::move(data_rep));
+    auto data_rep       = chunk->slice(_column_indices);
+    const auto batch_id = get_next_batch_id();
+    return cucascade::data_batch::make(
+      batch_id,
+      std::move(data_rep),
+      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
   std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
@@ -125,20 +124,47 @@ struct cached_databatch_provider : public databatch_provider {
                                                             : _entry.memory_space;
     auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
       view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-    return ::cucascade::data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
+    const auto batch_id = ::sirius::get_next_batch_id();
+    return ::cucascade::data_batch::make(
+      batch_id,
+      std::move(gpu_repr),
+      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
-  std::size_t _n_chunks;
+  cached_scan_plan _plan;
   std::vector<std::string> _column_names;
   std::vector<size_t> _column_indices;
   const pinned_entry& _entry;
+  telemetry::batch_telemetry_info _telemetry_info;
   std::atomic<std::size_t> _index{0};
 };
 
-std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry, std::span<size_t> selected_columns)
+/// Filter view extracted from the scan's ingestible info: the pushed-down TableFilterSet plus the
+/// scan's column_ids its keys index into.
+struct scan_filter_view {
+  duckdb::TableFilterSet const* table_filters{nullptr};
+  duckdb::vector<duckdb::ColumnIndex> const* column_ids{nullptr};
+};
+
+scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& info)
 {
-  return std::make_unique<cached_databatch_provider>(entry, selected_columns);
+  if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+    return {p->table_filters.get(), &p->column_ids};
+  } else if (auto const* p =
+               dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
+    return {p->table_filters.get(), &p->column_ids};
+  }
+  return {};
+}
+
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry,
+  std::span<size_t> selected_columns,
+  cached_scan_plan plan,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  return std::make_unique<cached_databatch_provider>(
+    entry, selected_columns, std::move(plan), telemetry_info);
 }
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
@@ -246,7 +272,16 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  auto datasource = create_datasource(uri);
+  // Footer-probe only when we will actually read + parse the footer.  On a warm
+  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
+  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
+  auto const cache_key     = normalize_path(uri);
+  auto const io_ctx        = ioctx_for_path(uri);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+  auto const hint =
+    footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
+
+  auto datasource = create_datasource(uri, hint);
   if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
@@ -286,8 +321,10 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   return result;
 }
 
-void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
+void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
+                                            bool enable_pinned_zone_map_pruning)
 {
+  _pruning_enabled = enable_pinned_zone_map_pruning;
   reset();
 
   if (_io_ctx && _io_ctx->cache()) {
@@ -339,7 +376,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   }
 
   if (_scan_op_order.empty()) {
-    spdlog::warn("[sirius_scan_manager::prepare_for_query] no GPU scan operators found in query");
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::prepare_for_query] no GPU scan operators found in query");
     return;
   }
 
@@ -357,14 +395,14 @@ void sirius_scan_manager::start_metadata_processing()
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path)
+  std::string_view path, sirius::io::open_hint hint)
 {
   auto file_path = normalize_path(std::string(path));
   auto io_ctx    = ioctx_for_path(file_path);
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
-  return io_ctx->open_datasource(file_path);
+  return io_ctx->open_datasource(file_path, hint);
 }
 
 std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
@@ -531,7 +569,9 @@ void sirius_scan_manager::insert_pinned_entry(
   const std::string& name,
   cache_entry_info cache_info,
   std::vector<std::unique_ptr<cudf::table>> data_tables,
-  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces)
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
+  duckdb::vector<duckdb::LogicalType> column_types,
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per
@@ -567,6 +607,19 @@ void sirius_scan_manager::insert_pinned_entry(
       std::to_string(column_names.size()) + ")");
   }
 
+  // Normalize the optional zone-map capture.
+  bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
+  auto pin_zone_maps        = pinned_zone_maps::from_capture(std::move(column_types),
+                                                      std::move(chunk_stats),
+                                                      cache_info.column_ids.size(),
+                                                      data_tables.size());
+  if (stats_supplied && !pin_zone_maps.has_stats()) {
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::insert_pinned_entry] zone-map capture failure; pinning '{}' without "
+      "statistics",
+      name);
+  }
+
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
     // Same-row-count merge only applies when the completeness contracts match.
@@ -596,6 +649,33 @@ void sirius_scan_manager::insert_pinned_entry(
             "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
             "chunk_memory_spaces[" +
             std::to_string(i) + "] differs between existing and new entry");
+        }
+      }
+      // Per-chunk ROW counts must match too: the byte-budget coalescer can slice
+      // the same table at different row-group boundaries for a different column
+      // set (varchar byte budgets are data-dependent), which still yields equal
+      // chunk counts and — because round-robin placement is a function of chunk
+      // index alone — identical memory_spaces. Merging such chunks would corrupt
+      // the entry positionally (columns disagreeing on chunk boundaries) and
+      // silently invalidate the per-chunk MVCC row-count map a duckdb pin stamps
+      // via attach_mvcc_metadata. Reject loudly instead.
+      if (!entry.data_batches_by_column.empty()) {
+        auto const& existing_chunks = entry.data_batches_by_column.begin()->second;
+        if (existing_chunks.size() != data_tables.size()) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — existing entry has " +
+            std::to_string(existing_chunks.size()) + " chunks but the new materialization has " +
+            std::to_string(data_tables.size()));
+        }
+        for (std::size_t i = 0; i < data_tables.size(); ++i) {
+          if (!data_tables[i]) { continue; }
+          if (existing_chunks[i]->size() != data_tables[i]->num_rows()) {
+            throw std::runtime_error(
+              "[sirius_scan_manager::insert_pinned_entry] merge mismatch — chunk " +
+              std::to_string(i) + " has " + std::to_string(existing_chunks[i]->size()) +
+              " rows in the existing entry but " + std::to_string(data_tables[i]->num_rows()) +
+              " in the new materialization (same total, different chunk boundaries)");
+          }
         }
       }
       // Same row count → merge unique columns into the existing entry.
@@ -633,11 +713,42 @@ void sirius_scan_manager::insert_pinned_entry(
       // not list a column with no backing chunks in data_batches_by_column).
       // column_ids and names grow together and we only append, so the projection
       // positions already handed out for existing columns stay valid.
+      bool const entry_had_stats = entry.zone_maps.has_stats();
       for (std::size_t i = 0; i < is_new_col.size(); ++i) {
         if (!is_new_col[i]) { continue; }
         if (!entry.data_batches_by_column.contains(column_names[i])) { continue; }
         entry.cache_info.column_ids.push_back(cache_info.column_ids[i]);
         entry.cache_info.names.push_back(column_names[i]);
+        entry.zone_maps.append_column_from(pin_zone_maps, i);
+      }
+      if (entry_had_stats && !entry.zone_maps.has_stats()) {
+        // append_from_column() cleared the sidecar stats because the new column's zone-map shape
+        // disagreed with the existing entry's shape. Warn but still pin the entry.
+        SIRIUS_LOG_WARN(
+          "[sirius_scan_manager::insert_pinned_entry] merge appended columns without "
+          "statistics; dropping zone-map statistics for entry '{}'",
+          name);
+      }
+      // A statless entry adopts the incoming capture when it covers every entry column (by
+      // primary index) — the re-pin recovery path for entries pinned while capture was off.
+      // Safe because the merge guards above proved identical chunk boundaries.
+      if (!entry.zone_maps.has_stats() && pin_zone_maps.has_stats()) {
+        std::unordered_map<duckdb::idx_t, std::size_t> incoming_pos_by_primary;
+        incoming_pos_by_primary.reserve(cache_info.column_ids.size());
+        for (std::size_t i = 0; i < cache_info.column_ids.size(); ++i) {
+          incoming_pos_by_primary.emplace(cache_info.column_ids[i].GetPrimaryIndex(), i);
+        }
+        std::vector<std::size_t> incoming_pos_by_entry_pos;
+        incoming_pos_by_entry_pos.reserve(entry.cache_info.column_ids.size());
+        for (auto const& col : entry.cache_info.column_ids) {
+          auto it = incoming_pos_by_primary.find(col.GetPrimaryIndex());
+          if (it == incoming_pos_by_primary.end()) { break; }
+          incoming_pos_by_entry_pos.push_back(it->second);
+        }
+        if (incoming_pos_by_entry_pos.size() == entry.cache_info.column_ids.size()) {
+          entry.zone_maps =
+            pinned_zone_maps::remap(std::move(pin_zone_maps), incoming_pos_by_entry_pos);
+        }
       }
       return;
     }
@@ -650,6 +761,7 @@ void sirius_scan_manager::insert_pinned_entry(
   entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
   entry.tier                = cucascade::memory::Tier::GPU;
   entry.num_rows            = new_num_rows;
+  entry.zone_maps           = std::move(pin_zone_maps);
 
   for (auto& table : data_tables) {
     if (!table) { continue; }
@@ -671,7 +783,9 @@ void sirius_scan_manager::insert_pinned_entry_host(
   const std::string& name,
   cache_entry_info cache_info,
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  duckdb::vector<duckdb::LogicalType> column_types,
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column. Re-insert always replaces — there is no per-column merge analog
@@ -685,14 +799,40 @@ void sirius_scan_manager::insert_pinned_entry_host(
     }
   }
 
+  // Normalize the optional zone-map capture
+  bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
+  auto pin_zone_maps        = pinned_zone_maps::from_capture(std::move(column_types),
+                                                      std::move(chunk_stats),
+                                                      cache_info.column_ids.size(),
+                                                      host_chunks.size());
+  if (stats_supplied && !pin_zone_maps.has_stats()) {
+    // Only reason stats failed to append is a shape mismatch between the captured stats and the
+    // pinned entry; warn but still pin the entry.
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::insert_pinned_entry_host] zone-map capture shape mismatch; "
+      "pinning '{}' without statistics",
+      name);
+  }
+
   pinned_entry entry;
   entry.cache_info   = std::move(cache_info);
   entry.tier         = cucascade::memory::Tier::HOST;
   entry.memory_space = &memory_space;
   entry.num_rows     = new_num_rows;
   entry.host_chunks  = std::move(host_chunks);
+  entry.zone_maps    = std::move(pin_zone_maps);
 
   _pinned_entries[name] = std::move(entry);
+}
+
+void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
+                                               duckdb_mvcc_metadata metadata)
+{
+  auto it = _pinned_entries.find(name);
+  if (it == _pinned_entries.end()) {
+    throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
+  }
+  it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
 }
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
@@ -706,6 +846,125 @@ void sirius_scan_manager::visit_pinned_entries(
   for (auto const& [name, entry] : _pinned_entries) {
     if (!visitor(name, entry)) { break; }
   }
+}
+
+void validate_pinned_entry_for_serving(pinned_entry const& entry,
+                                       std::span<std::size_t const> selected_columns)
+{
+  auto const& entry_column_names = entry.cache_info.column_names();
+
+  if (entry.tier == cucascade::memory::Tier::GPU) {
+    if (entry.data_batches_by_column.empty()) { return; }  // legitimate zero-chunk entry
+    auto const n_chunks = entry.data_batches_by_column.begin()->second.size();
+    if (entry.chunk_memory_spaces.size() != n_chunks) {
+      throw std::runtime_error(
+        "pinned entry's chunk_memory_spaces does not cover every chunk of the entry");
+    }
+    for (auto const* space : entry.chunk_memory_spaces) {
+      if (!space) { throw std::runtime_error("pinned entry has a null chunk memory_space"); }
+    }
+    for (auto idx : selected_columns) {
+      auto const& name = entry_column_names.at(idx);
+      auto it          = entry.data_batches_by_column.find(name);
+      if (it == entry.data_batches_by_column.end() || it->second.size() != n_chunks) {
+        throw std::runtime_error("pinned column '" + name +
+                                 "' does not cover every chunk of the entry");
+      }
+      for (auto const& chunk : it->second) {
+        if (!chunk) { throw std::runtime_error("pinned column '" + name + "' has a null chunk"); }
+      }
+    }
+    return;
+  }
+
+  if (entry.tier == cucascade::memory::Tier::HOST) {
+    for (auto const& chunk : entry.host_chunks) {
+      if (!chunk) { throw std::runtime_error("pinned entry has a null host chunk"); }
+    }
+    return;
+  }
+
+  throw std::runtime_error("pinned entry has an unsupported tier");
+}
+
+cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
+                                        duckdb::TableFilterSet const* table_filters,
+                                        duckdb::vector<duckdb::ColumnIndex> const* column_ids)
+{
+  std::size_t n_chunks = 0;
+  if (entry.tier == cucascade::memory::Tier::GPU) {
+    n_chunks = entry.data_batches_by_column.empty()
+                 ? 0
+                 : entry.data_batches_by_column.begin()->second.size();
+  } else if (entry.tier == cucascade::memory::Tier::HOST) {
+    n_chunks = entry.host_chunks.size();
+  }
+
+  // Identity plan (serve everything) until proven otherwise.
+  cached_scan_plan plan;
+  plan.survivor_chunk_indices.reserve(n_chunks);
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    plan.survivor_chunk_indices.push_back(c);
+  }
+  if (n_chunks == 0 || !entry.zone_maps.has_stats() || table_filters == nullptr ||
+      table_filters->filters.empty() || column_ids == nullptr) {
+    return plan;
+  }
+
+  // Filter keys are positions into the QUERY's column_ids (remapped at plan time by
+  // create_table_filter_set); map each to its primary/storage index, then to the entry's positional
+  // column.
+  std::unordered_map<duckdb::idx_t, std::size_t> entry_pos_by_primary;
+  entry_pos_by_primary.reserve(entry.cache_info.column_ids.size());
+  for (std::size_t i = 0; i < entry.cache_info.column_ids.size(); ++i) {
+    entry_pos_by_primary.emplace(entry.cache_info.column_ids[i].GetPrimaryIndex(), i);
+  }
+
+  struct usable_filter {
+    duckdb::TableFilter const* filter;
+    std::size_t entry_pos;
+  };
+  std::vector<usable_filter> usable;
+  for (auto const& [col_idx, filter] : table_filters->filters) {
+    if (!filter) { continue; }
+    if (col_idx >= column_ids->size()) { continue; }  // defensive
+    auto const& column_id = (*column_ids)[col_idx];
+    // rowid / empty / virtual sentinels have no storage stats.
+    if (!column_id.HasPrimaryIndex() || column_id.IsRowIdColumn() || column_id.IsEmptyColumn() ||
+        column_id.IsVirtualColumn()) {
+      continue;
+    }
+    auto it = entry_pos_by_primary.find(column_id.GetPrimaryIndex());
+    if (it == entry_pos_by_primary.end()) { continue; }
+    auto const pos = it->second;
+    if (pos >= entry.zone_maps.column_count()) { continue; }  // absent for this column
+    if (!filter_safe_for_stats(*filter, entry.zone_maps.column_type(pos))) { continue; }
+    usable.push_back({filter.get(), pos});
+  }
+  if (usable.empty()) { return plan; }
+
+  plan.survivor_chunk_indices.clear();
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    bool pruned = false;
+    for (auto const& uf : usable) {
+      auto const* cell = entry.zone_maps.cell(uf.entry_pos, c);
+      if (cell != nullptr && chunk_provably_empty(*uf.filter, *cell)) {
+        pruned = true;
+        break;
+      }
+    }
+    if (!pruned) { plan.survivor_chunk_indices.push_back(c); }
+  }
+  plan.pruned = n_chunks - plan.survivor_chunk_indices.size();
+
+  // Sentinel chunk: an all-pruned scan must not become a zero-batch scan (zero
+  // splits => zero tasks => pipeline completion never fires — the hazard both
+  // disk paths guard against). Keep chunk 0; the GPU filter empties it.
+  if (plan.survivor_chunk_indices.empty()) {
+    plan.survivor_chunk_indices.push_back(0);
+    plan.pruned = n_chunks - 1;
+  }
+  return plan;
 }
 
 bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
@@ -723,15 +982,48 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
       auto cols = gather_by_primary_index(entry.cache_info.column_ids,
                                           op->get_ingestible().materialized_column_order());
       if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
-      auto provider = make_provider_for_pinned_entry(entry, cols);
+      // Serve-time defense: a malformed entry would end the cached batch stream
+      // early (nullptr mid-stream reads as end-of-stream) and silently truncate
+      // the scan; validate up front so it throws here and the catch below falls
+      // back to the disk read instead.
+      validate_pinned_entry_for_serving(entry, cols);
+      // Zone-map survivor plan
+      auto const filter_view =
+        _pruning_enabled ? extract_scan_filters(table_info) : scan_filter_view{};
+      auto plan = build_cached_scan_plan(entry, filter_view.table_filters, filter_view.column_ids);
+      auto const total_chunks = plan.survivor_chunk_indices.size() + plan.pruned;
+      if (plan.pruned > 0) {
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] zone-map pruning for pinned entry '{}' ({} tier): {}/{} chunks "
+          "pruned, serving {}",
+          pinned_name,
+          entry.tier == cucascade::memory::Tier::GPU ? "GPU" : "HOST",
+          plan.pruned,
+          total_chunks,
+          plan.survivor_chunk_indices.size());
+      } else {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager] zone-map pruning for pinned entry '{}': nothing pruned ({} "
+          "chunks served)",
+          pinned_name,
+          total_chunks);
+      }
+      auto provider =
+        make_provider_for_pinned_entry(entry, cols, std::move(plan), op->batch_telemetry());
       _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
-      spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
-                   pinned_name,
-                   op->get_operator_id());
+      SIRIUS_LOG_INFO("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
+                      pinned_name,
+                      op->get_operator_id());
       return true;
     }
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_ERROR(
+      "[sirius_scan_manager] error while trying to assign cached entries to "
+      "operator '{}': {}",
+      op->get_operator_id(),
+      e.what());
   } catch (...) {
-    spdlog::error(
+    SIRIUS_LOG_ERROR(
       "[sirius_scan_manager] error while trying to assign cached entries to "
       "operator '{}'",
       op->get_operator_id());

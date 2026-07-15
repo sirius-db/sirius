@@ -21,6 +21,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -30,7 +31,9 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
+#include "expression/ast/reference.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
@@ -39,6 +42,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>
@@ -354,6 +358,110 @@ std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalCompariso
 }  // namespace
 //===----------------------------------------------------------------------===//
 
+/// A join equality-condition side that is a plain column reference (BOUND_REF) or a cast of one
+/// (BOUND_CAST(BOUND_REF)) is already handled directly by the hash-join key extraction and by the
+/// PARTITION operator's cast-alignment logic, so it needs no materialization.
+static bool is_trivial_key_side(const duckdb::Expression& expr)
+{
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) { return true; }
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
+    return expr.Cast<duckdb::BoundCastExpression>().child->GetExpressionClass() ==
+           duckdb::ExpressionClass::BOUND_REF;
+  }
+  return false;
+}
+
+/// Materialize complex expressions appearing in equality join conditions into real columns.
+///
+/// Sirius always feeds a hash join through a PARTITION -> CONCAT chain, and the PARTITION operator
+/// - the first consumer of the join key - hashes columns by index and cannot evaluate expressions.
+/// To support keys like `n_nationkey * 10`, we push a projection below the join that appends the
+/// expression as a new column on that side's child, then rewrite the condition side to a plain
+/// BoundReferenceExpression pointing at the appended column. PARTITION, CONCAT, and the hash join
+/// then all see an ordinary column reference; the partitioning invariant (both sides hash the
+/// identical materialized value) holds because DuckDB binds both sides of a comparison to a common
+/// type, so the materialized column matches the type the other side hashes.
+///
+/// Only genuinely complex sides of equality (or IS-NOT-DISTINCT-FROM) conditions are materialized;
+/// plain/cast-of-reference sides keep the existing fast path, and inequality-condition sides are
+/// left untouched (they are evaluated inline as the mixed-join predicate). A side whose expression
+/// cannot be translated to a Sirius AST node is left unchanged, preserving the existing
+/// "unsupported join condition expression" behavior downstream.
+static void materialize_expression_join_keys(
+  duckdb::LogicalComparisonJoin& op,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& left,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& right)
+{
+  auto materialize_side = [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator>& child,
+                              duckdb::vector<duckdb::idx_t>& projection_map,
+                              bool is_left) {
+    const std::size_t old_width = child->types.size();
+
+    // Gather the complex, translatable sides on this child across all equality conditions.
+    std::vector<std::size_t> cond_indices;
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> key_exprs;
+    duckdb::vector<sirius::logical_type> key_types;
+    for (std::size_t i = 0; i < op.conditions.size(); i++) {
+      auto& cond = op.conditions[i];
+      if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+          cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        continue;  // inequality sides are evaluated inline as the mixed-join predicate
+      }
+      auto& side_expr = is_left ? cond.left : cond.right;
+      if (is_trivial_key_side(*side_expr)) { continue; }
+      auto node = sirius::ast::from_duckdb(*side_expr);
+      if (!node) { continue; }  // untranslatable: leave for the existing downstream throw
+      cond_indices.push_back(i);
+      key_exprs.push_back(std::move(node));
+      key_types.push_back(sirius::from_duckdb(side_expr->return_type));
+    }
+
+    if (cond_indices.empty()) { return; }
+
+    // Build the projection: identity passthrough of all original columns + the key expressions.
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+    duckdb::vector<sirius::logical_type> out_types;
+    select_list.reserve(old_width + key_exprs.size());
+    out_types.reserve(old_width + key_exprs.size());
+    for (std::size_t c = 0; c < old_width; c++) {
+      select_list.push_back(std::make_unique<sirius::ast::node>(
+        sirius::ast::reference{static_cast<uint32_t>(c), child->types[c]}));
+      out_types.push_back(child->types[c]);
+    }
+    for (std::size_t k = 0; k < key_exprs.size(); k++) {
+      select_list.push_back(std::move(key_exprs[k]));
+      out_types.push_back(key_types[k]);
+    }
+
+    const std::size_t cardinality = child->estimated_cardinality;
+    child =
+      push_projection(std::move(child), std::move(out_types), std::move(select_list), cardinality);
+
+    // Rewrite each materialized condition side to reference its appended column.
+    for (std::size_t k = 0; k < cond_indices.size(); k++) {
+      const std::size_t new_index = old_width + k;
+      auto& side_expr =
+        is_left ? op.conditions[cond_indices[k]].left : op.conditions[cond_indices[k]].right;
+      side_expr =
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(side_expr->return_type, new_index);
+    }
+
+    // Exclude the synthetic key column(s) from the join output. An empty projection map means
+    // "all columns"; make it explicit over just the original columns so the appended key does
+    // not leak into the join result or shift downstream column indices. A non-empty map already
+    // lists only original indices (< old_width) and needs no change.
+    if (projection_map.empty()) {
+      projection_map.reserve(old_width);
+      for (std::size_t c = 0; c < old_width; c++) {
+        projection_map.push_back(static_cast<duckdb::idx_t>(c));
+      }
+    }
+  };
+
+  materialize_side(left, op.left_projection_map, /*is_left=*/true);
+  materialize_side(right, op.right_projection_map, /*is_left=*/false);
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
 {
@@ -380,10 +488,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // return Make<PhysicalCrossProduct>(op.types, left, right, op.estimated_cardinality);
   }
 
-  std::size_t has_range = 0;
-  bool has_equality     = op.HasEquality(has_range);
-  bool can_merge        = has_range > 0;
-  bool can_iejoin       = has_range >= 2 && recursive_cte_tables.empty();
+  // Materialize any complex expressions in equality conditions into real columns below the join,
+  // rewriting those condition sides to plain references. This must run before the conditions are
+  // inspected/wrapped below so all downstream analysis sees plain column references.
+  materialize_expression_join_keys(op, left, right);
+
+  std::size_t has_range              = 0;
+  [[maybe_unused]] bool has_equality = op.HasEquality(has_range);
+  bool can_merge                     = has_range > 0;
+  bool can_iejoin                    = has_range >= 2 && recursive_cte_tables.empty();
   switch (op.join_type) {
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:

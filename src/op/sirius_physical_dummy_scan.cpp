@@ -16,22 +16,20 @@
 
 #include "op/sirius_physical_dummy_scan.hpp"
 
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+
 namespace sirius {
 namespace op {
 
-std::unique_ptr<operator_data> sirius_physical_dummy_scan::execute(const operator_data& input_data,
-                                                                   rmm::cuda_stream_view /*stream*/)
+void sirius_physical_dummy_scan::build_pipelines(pipeline::sirius_pipeline& current,
+                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  /// DUMMY_SCAN is the source of its pipeline. The upstream CPU_SOURCE produces
-  /// a single 1-row sentinel batch into this operator's input port; execute()
-  /// must forward that batch unchanged so downstream operators (e.g. a
-  /// PROJECTION of constant expressions) see one input row and produce one
-  /// output row. The base execute() returns an empty batch, which would drop
-  /// the row and yield zero output rows.
-
-  // Forward the upstream CPU_SOURCE's single 1-row sentinel batch unchanged.
-  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+  // The RIGHT_DELIM_JOIN build placeholder carries no runtime data — the delim join fans its
+  // input directly to PARTITION_build — so it contributes no pipeline operator. Real DUMMY_SCANs
+  // (constant-row subqueries) fall back to the base source-leaf behavior.
+  if (is_delim_join_placeholder()) { return; }
+  sirius_physical_operator::build_pipelines(current, meta_pipeline);
 }
 
 }  // namespace op

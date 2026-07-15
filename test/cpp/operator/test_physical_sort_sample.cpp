@@ -65,7 +65,8 @@ class mock_gpu_pipeline : public sirius::pipeline::sirius_pipeline {
   bool _finished;
 };
 
-sirius_physical_sort_sample make_sort_sample(uint64_t sort_sample_bytes)
+sirius_physical_sort_sample make_sort_sample(uint64_t sort_sample_bytes,
+                                             uint64_t max_partition_bytes = 0)
 {
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::LogicalType::INTEGER));
@@ -74,7 +75,8 @@ sirius_physical_sort_sample make_sort_sample(uint64_t sort_sample_bytes)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     std::move(orders),
     1000,
-    sort_sample_bytes);
+    sort_sample_bytes,
+    max_partition_bytes);
 }
 
 void add_int_batches(cucascade::shared_data_repository& repo,
@@ -164,7 +166,7 @@ TEST_CASE("sirius_physical_sort_sample get_next_task_hint waits for sample bytes
   auto sample_op = make_sort_sample(threshold);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
 
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(false);
 
@@ -197,7 +199,7 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
   auto sample_op = make_sort_sample(100000);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
 
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(true);
   attach_port(sample_op, *repo, src_pipeline);
@@ -246,7 +248,7 @@ TEST_CASE(
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
   add_int_batches(*repo, *space, num_batches, rows_per_batch);
 
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(true);
   attach_port(sample_op, *repo, src_pipeline);
@@ -302,4 +304,93 @@ TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition b
   const auto boundary_key =
     read_int32_column(sample_op.get_partition_boundaries().view().column(0), 0);
   REQUIRE(boundary_key == 50);
+}
+
+TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual bytes",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  constexpr std::size_t rows_per_batch = 30;
+  std::vector<int32_t> values(rows_per_batch);
+  std::iota(values.begin(), values.end(), 0);
+  auto batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+  std::size_t batch_bytes;
+  {
+    auto read_only = batch->to_read_only();
+    batch_bytes    = read_only.get_data()->get_size_in_bytes();
+  }
+
+  auto sample_op = make_sort_sample(/*sort_sample_bytes=*/batch_bytes,
+                                    /*max_partition_bytes=*/batch_bytes - 1);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  repo->add_data_batch(std::move(batch), 0);
+
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(true);
+  attach_port(sample_op, *repo, src_pipeline);
+
+  REQUIRE(sample_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  REQUIRE(repo->all_empty());
+
+  (void)sample_op.execute(*input, cudf::get_default_stream());
+  CHECK(sample_op.get_num_partitions() == 2);
+  CHECK(sample_op.get_partition_boundaries().num_rows() == 1);
+}
+
+TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplicate boundaries",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  constexpr std::size_t rows_per_batch = 30;
+  bool upstream_finished               = false;
+  int num_batches                      = 1;
+  bool expect_repo_empty               = true;
+  SECTION("upstream is unfinished")
+  {
+    upstream_finished = false;
+    num_batches       = 1;
+    expect_repo_empty = true;
+  }
+  SECTION("upstream is finished with an unsampled batch")
+  {
+    upstream_finished = true;
+    num_batches       = 2;
+    expect_repo_empty = false;
+  }
+
+  std::vector<int32_t> values(rows_per_batch);
+  std::iota(values.begin(), values.end(), 0);
+  auto first_batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+  std::size_t batch_bytes;
+  {
+    auto read_only = first_batch->to_read_only();
+    batch_bytes    = read_only.get_data()->get_size_in_bytes();
+  }
+
+  auto sample_op = make_sort_sample(/*sort_sample_bytes=*/batch_bytes,
+                                    /*max_partition_bytes=*/batch_bytes - 1);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  repo->add_data_batch(std::move(first_batch), 0);
+  if (num_batches > 1) { add_int_batches(*repo, *space, num_batches - 1, rows_per_batch); }
+
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(upstream_finished);
+  attach_port(sample_op, *repo, src_pipeline);
+
+  REQUIRE(sample_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  REQUIRE(repo->all_empty() == expect_repo_empty);
+
+  (void)sample_op.execute(*input, cudf::get_default_stream());
+  CHECK(sample_op.get_num_partitions() == rows_per_batch);
+  CHECK(sample_op.get_partition_boundaries().num_rows() == rows_per_batch - 1);
 }

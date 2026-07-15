@@ -24,8 +24,8 @@
 //      SiriusContextExtensionCallback reads these env vars in its constructor
 //      (src/sirius_context.cpp:569-571)
 //   4. run the TPC-H query via compare_gpu_vs_cpu (fallback disabled)
-//   5. pause() the env again — this destroys the DuckDB instance and flushes
-//      spdlog's file sink
+//   5. get_sink()->flush() + pause() the env — the explicit best-effort flush
+//      completes the log file before it is parsed
 //   6. open the log file (${SIRIUS_LOG_DIR}/sirius.log, daily-rotated), regex
 //      the emission payload 08-03 landed:
 //         [mgpu-audit] pipeline_task dispatched to GPU N task_id=K
@@ -42,6 +42,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <log/logging.hpp>
 #include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 
@@ -114,10 +115,7 @@ constexpr auto kTpchQ1 =
   "order by l_returnflag, l_linestatus;";
 
 // ATTACH the DuckDB-format integration database on the fresh connection so
-// TPC-H Q1 runs through the DuckDB->cpu_source_task scan path closed by
-// FIX-01 in Plan 08-01. This path does NOT route through
-// host_parquet_representation_converters.cpp (the distinct 08-06 fix-site),
-// so the audit assertion is decoupled from that known-open bug.
+// TPC-H Q1 runs through the DuckDB-native scan path.
 void attach_integration_duckdb(duckdb::Connection& con)
 {
   fs::path db_path;
@@ -212,10 +210,8 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   {
     auto con = std::make_unique<duckdb::Connection>(env->make_connection());
     // Use the DuckDB-format integration database (same path as
-    // GPUExecutionDuckDBFixture) so Q1 flows through the FIX-01-covered
-    // cpu_source_task path rather than host_parquet_representation (the open
-    // 08-06 fix-site). This decouples the AUDIT assertion from the known-open
-    // parquet converter bug.
+    // GPUExecutionDuckDBFixture) so Q1 flows through the DuckDB-native scan
+    // path.
     attach_integration_duckdb(*con);
 
     auto disable_fallback = con->Query("SET enable_duckdb_fallback = false;");
@@ -236,7 +232,8 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
     // the [tpch] TEST_CASEs).
   }
 
-  // pause() destroys the DuckDB instance and flushes spdlog's file sink.
+  // Complete the log file before parsing it; pause() tears down the instance.
+  sirius::log::get_sink()->flush();
   env->pause();
 
   auto counts = parse_audit_log(tmp_log_dir);

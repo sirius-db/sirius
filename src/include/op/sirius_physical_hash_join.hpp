@@ -128,8 +128,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
-                                   sirius_physical_operator& op,
-                                   bool build_rhs = true);
+                                   sirius_physical_operator& op);
 
   /**
    * @brief Returns true if the given join conditions can be handled by this operator.
@@ -140,6 +139,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * conditional table columns.
    */
   static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions);
+
+  [[nodiscard]] bool is_right_family() const
+  {
+    return join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI ||
+           join_type == duckdb::JoinType::RIGHT_ANTI;
+  }
+
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
@@ -162,12 +168,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();
-
-  /// @brief True when plan construction wired at least one dynamic-filter consumer.
-  [[nodiscard]] bool publishes_dynamic_filters() const noexcept
-  {
-    return _dynamic_filter_plan.enabled();
-  }
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
@@ -200,6 +200,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
   std::unique_ptr<cudf::filtered_join>
     _filtered_table;  // reusable build-on-right semi-join object for MARK joins in BUILD_PROBE mode
+  bool _build_has_null = false;  // whether the build/right side has a NULL in any join key column;
+                                 // needed for MARK three-valued logic in BUILD_PROBE mode
   std::optional<::cucascade::read_only_data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
   std::vector<std::unique_ptr<cudf::column>>
@@ -275,10 +277,25 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    std::size_t partition_idx) override;
 
  public:
+  //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN (set in its
+  //! constructor). The delim join owns its execution: `is_sink()` returns false and
+  //! `build_join_pipelines` skips build-side externalization.
+  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
+  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
+
   // Sink Interface
-  bool is_sink() const override { return true; }
+  //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule
+  //! applies (sink iff parent is PARTITION or RIGHT_DELIM_JOIN).
+  bool is_sink() const override
+  {
+    if (_is_delim_join_inner) { return false; }
+    return sirius_physical_operator::is_sink();
+  }
 
   void on_finalize_operator() override;
+
+ protected:
+  bool _is_delim_join_inner = false;
 };
 
 }  // namespace op

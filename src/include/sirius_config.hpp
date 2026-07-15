@@ -116,6 +116,12 @@ struct operator_params {
   /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
   /// [0, 1]; 1.0 keeps filtering always on.
   double dynamic_filter_keep_threshold = 0.9;
+
+  /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
+  /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
+  /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
+  /// off carries no zone maps and cannot prune until re-pinned with the flag on.
+  bool enable_pinned_zone_map_pruning = true;
 };
 
 struct telemetry_config {

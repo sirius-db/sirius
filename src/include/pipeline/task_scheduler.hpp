@@ -32,7 +32,6 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace sirius::parallel {
 class downgrade_executor;
@@ -136,13 +135,12 @@ class task_scheduler {
   }
 
   /**
-   * @brief Set the priority scan operators
+   * @brief Prepare scheduler state for a query.
    *
-   * Sets the scan operators that should be executed with priority.
-   * First element in vector will be first out of the queue.
-   * Also prepares the scan executor cache for these operators.
+   * Drains tasks left by the previous query, installs the new query and completion handler,
+   * and resets per-query scheduler state.
    *
-   * @param scans Vector of scan operators (first in vector = first out of queue)
+   * @param query Query whose tasks will be scheduled
    */
   void prepare_for_query(duckdb::shared_ptr<planner::query> query);
 
@@ -163,18 +161,6 @@ class task_scheduler {
    * @param error The error to report.
    */
   void terminate_query(std::exception_ptr error);
-
-  /**
-   * @brief Signal successful query completion from a task_creator pool thread.
-   *
-   * Called by the cpu_source_task lambda when a terminal CPU-only pipeline
-   * completes without dispatching any downstream GPU tasks (e.g. EMPTY_RESULT,
-   * DUMMY_SCAN → RESULT_COLLECTOR with no intermediate operators). Unlike
-   * gpu_pipeline_executor::mark_completed(), this must NOT call
-   * drain_pending_tasks() — doing so from within a bounded_pool lambda
-   * deadlocks on wait_all(). wait_for_completion() drains the queues anyway.
-   */
-  void signal_query_complete();
 
   /**
    * @brief Drain all in-flight tasks after a query error.
@@ -220,12 +206,6 @@ class task_scheduler {
 
   std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
-
-  /// Pipelines that transitively feed a plan-wired dynamic-filter join's build input. The
-  /// management loop gives compatible queued tasks from these pipelines soft priority so later
-  /// splits of a transitive scan target are more likely to observe the filter. Immediate probes are
-  /// ordered independently by the join hint. Set once in prepare_for_query; read-only thereafter.
-  std::unordered_set<const sirius_pipeline*> _filter_build_pipelines;
 
   exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;
