@@ -220,7 +220,8 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
 
   auto table = sirius::create_cudf_table_with_random_data(
     num_rows, column_types, ranges, stream, gpu_space->get_default_allocator(), true);
-  auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
   expected_table_data expected;
   std::vector<std::string> expected_strings;
@@ -286,7 +287,8 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
 
   auto table = sirius::create_cudf_table_with_random_data(
     num_rows, column_types, ranges, stream, gpu_space->get_default_allocator(), false);
-  auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
   expected_table_data expected;
   {
@@ -382,7 +384,8 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
     cols.push_back(std::move(col1));
 
     auto table = std::make_unique<cudf::table>(std::move(cols));
-    auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
+    auto batch = sirius::make_data_batch(
+      std::move(table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
     convert_batch_to_host(sirius_ctx, batch, stream);
     batches.emplace_back(std::move(batch));
   }

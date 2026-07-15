@@ -28,7 +28,8 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   std::vector<cudf::null_order> const& null_precedence,
   const std::vector<int>& projections,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   if (order_key_idx.size() != column_order.size() ||
       order_key_idx.size() != null_precedence.size()) {
@@ -61,7 +62,7 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
                                    memory_space.get_default_allocator());
 
   // Create the output data batch
-  return make_data_batch(std::move(output_table), memory_space, stream);
+  return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
 }  // namespace op

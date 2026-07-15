@@ -26,6 +26,13 @@
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "sirius_config.hpp"
+
+#include <cstdint>
+
+namespace cudf {
+class table_view;
+}  // namespace cudf
 
 namespace sirius {
 
@@ -97,21 +104,33 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
  protected:
   // CachingOperator Interface
 
-  static void build_join_pipelines(pipeline::sirius_pipeline& current,
-                                   pipeline::sirius_meta_pipeline& meta_pipeline,
-                                   sirius_physical_operator& op,
-                                   bool build_rhs = true);
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
  public:
   // Source interface
-  bool is_source() const override { return duckdb::PropagatesBuildSide(join_type); }
+  //! Always a source: every join emits output.
+  bool is_source() const override { return true; }
 
  public:
-  // Sink Interface
-  bool is_sink() const override { return true; }
+  //! True when this NLJ is the internal `delim.join` of a RIGHT_DELIM_JOIN; see the
+  //! identical field on `sirius_physical_hash_join`.
+  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
+  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
 
+  // Sink Interface
+  //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule
+  //! applies. Mirrors HJ.
+  bool is_sink() const override
+  {
+    if (_is_delim_join_inner) { return false; }
+    return sirius_physical_operator::is_sink();
+  }
+
+ protected:
+  bool _is_delim_join_inner = false;
+
+ public:
   static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,
                            duckdb::JoinType join_type);
 
@@ -123,6 +142,21 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+  /// @brief Join-type-correct output when one input side has no rows. Invoked by the regular
+  /// execute path when it receives a real 0-row batch (e.g. an all-pruned scan under the
+  /// empty-split fallback): the preserved side's rows are padded, kept, or marked false per
+  /// join type; only the condition evaluation is skipped.
+  std::unique_ptr<operator_data> emit_one_side_empty_result(const cudf::table_view& left,
+                                                            const cudf::table_view& right,
+                                                            bool left_side_empty,
+                                                            cucascade::memory::memory_space& space,
+                                                            rmm::cuda_stream_view stream);
+
+  //! Left table restricted to left_output_col_idxs (the plan's left projection map). Applied
+  //! by the left-only output paths (SEMI/ANTI/MARK), whose result must match op.types;
+  //! selection drops columns only, so row indices from joins on the full table stay valid.
+  cudf::table_view select_left_output(const cudf::table_view& left) const;
 
  protected:
   std::mutex batches_to_processed_mutex;

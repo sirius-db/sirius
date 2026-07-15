@@ -301,35 +301,60 @@ If you cannot satisfy the contract — for example, your operator legitimately n
 
 **File:** `src/include/pipeline/task_scheduler.hpp`, `src/pipeline/task_scheduler.cpp`
 
-The `task_scheduler` is the top-level orchestrator that owns GPU and scan sub-executors.
+The `task_scheduler` is the top-level GPU-pipeline orchestrator. It owns the shared pipeline-task
+queue, one `gpu_pipeline_executor` per active GPU, and the management thread that matches queued
+tasks to ready devices. Scan execution is reached through `task_creator`; there is no scan
+sub-executor or scan-priority queue owned here.
 
 ### Key Methods
 
 | Method | Purpose |
 |--------|---------|
-| `start()` | Initializes scan executor, GPU executors, launches management thread |
-| `stop()` | Stops all sub-executors, joins threads |
-| `prepare_for_query(query)` | Drains leftover tasks, prepares scan cache, populates priority scan queue |
-| `start_query()` | Creates completion handler, distributes to executors, schedules initial scans, returns future |
+| `start()` | Starts every GPU executor, then launches the management thread |
+| `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
+| `prepare_for_query(query)` | Drains executor leftovers, installs query/completion state, and resets per-query scheduler state |
+| `start_query()` | Schedules `query.get_scan_operators().front()` through `task_creator` and returns the completion future |
 | `terminate_query(exception)` | Reports error to completion handler |
 | `drain_after_error()` | Multi-stage drain for clean shutdown |
 
 ### Management Event Loop
 
-`management_eventloop()` runs on a dedicated thread:
+`management_eventloop()` is a pull-signal matcher on a dedicated thread. GPU executors publish
+`device_ready` when a worker is available; `schedule()` publishes `task_available` after adding a
+task. Ready devices remain recorded until a compatible task arrives:
 
 ```
 while running:
-    1. task_request_channel.get()  -- block for GPU executor request
-    2. task_queue.pop()            -- dequeue a pipeline task
-    3. Route to GPU executor by device_id
+    1. Wait for device_ready or task_available; drain the current event burst
+    2. For each ready device, select a compatible queued task:
+       a. exact preferred-device match
+       b. unpreferred task (or one with a stale preference)
+    3. Dispatch the selected task to that device's GPU executor
 ```
 
-The event loop bridges task creation (which pushes to `_task_queue`) with GPU executors (which pull via task requests).
+Tasks stay in the top-level queue until a ready device can accept them, preserving visibility to
+the downgrade machinery. A live preferred device is binding because the task may reference
+device-local data.
 
 ### Initial Scan Scheduling
 
-`schedule_next_scan_tasks()` pops scan operators from `_priority_scans` and calls `task_creator->schedule(scan_op)` for each. This kicks off the first wave of scan tasks.
+`start_query()` schedules exactly the first operator in `query.get_scan_operators()`. Subsequent
+work is exposed by task hints and completion-driven downstream scheduling; there is no
+`schedule_next_scan_tasks()` or `_priority_scans` walk.
+
+### Dynamic-filter independence
+
+The scheduler is filter-agnostic: it does not inspect hash joins or reorder queued work to advance
+dynamic-filter publication. Immediate probes remain strictly ordered by synchronous build-CONCAT
+publication in the join pipeline. A scan reached transitively through an intervening join has no
+such edge and samples whatever complete filters are visible at its reader and post-decode
+checkpoints.
+
+Issue [#1124](https://github.com/sirius-db/sirius/issues/1124) measured the former build-subtree
+preference at SF300. It provided no coverage benefit; disabling it cut wall time by 9–25% and
+substantially reduced run-to-run variance, so it was removed. See
+[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing)
+for the consumer semantics.
 
 ## GPU Pipeline Executor
 

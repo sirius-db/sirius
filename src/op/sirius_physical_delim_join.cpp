@@ -16,10 +16,12 @@
 
 #include "op/sirius_physical_delim_join.hpp"
 
+#include "config.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
@@ -27,19 +29,6 @@
 
 namespace sirius {
 namespace op {
-
-class sirius_left_delim_join_local_state : public duckdb::LocalSinkState {
- public:
-  duckdb::unique_ptr<duckdb::LocalSinkState> distinct_state;
-  // duckdb::shared_ptr<GPUIntermediateRelation> lhs_data;
-  duckdb::ColumnDataAppendState append_state;
-};
-
-class sirius_right_delim_join_local_state : public duckdb::LocalSinkState {
- public:
-  duckdb::unique_ptr<duckdb::LocalSinkState> join_state;
-  duckdb::unique_ptr<duckdb::LocalSinkState> distinct_state;
-};
 
 sirius_physical_delim_join::sirius_physical_delim_join(
   SiriusPhysicalOperatorType type,
@@ -70,10 +59,25 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
                                delim_idx)
 {
   D_ASSERT(join->children.size() == 2);
+
+  // The inner join is the source of the delim join's output pipeline (built via
+  // build_join_pipelines), not a standalone pipeline sink — tag it so is_sink() returns false.
+  // RIGHT_DELIM_JOIN only: LEFT's inner join feeds a real build subtree.
+  if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(join.get())) {
+    hj->set_delim_join_inner(true);
+  } else if (auto* nlj = dynamic_cast<sirius_physical_nested_loop_join*>(join.get())) {
+    nlj->set_delim_join_inner(true);
+  }
+
   children.push_back(std::move(join->children[1]));
 
-  join->children[1] =
+  // Mark the placeholder so replace_with_gpu_values skips it: it carries no runtime data
+  // (the delim join fans its input directly to PARTITION_build), so a GPU_VALUES replacement
+  // would only materialize a phantom source.
+  auto dummy_placeholder =
     duckdb::make_uniq<sirius_physical_dummy_scan>(children[0]->get_types(), estimated_cardinality);
+  dummy_placeholder->set_delim_join_placeholder(true);
+  join->children[1] = std::move(dummy_placeholder);
 }
 
 sirius_physical_left_delim_join::sirius_physical_left_delim_join(
@@ -98,6 +102,12 @@ sirius_physical_left_delim_join::sirius_physical_left_delim_join(
     estimated_cardinality,
     nullptr);
   if (delim_idx.IsValid()) { cached_chunk_scan->cte_index = delim_idx.GetIndex(); }
+
+  // Record the cached chunk scan now — after wrap_join, internal_join->children[0] becomes a
+  // CONCAT and the reference is unrecoverable. It becomes a first-class source pipeline fed by
+  // the delim join's fan-out sink.
+  column_data_scan = cached_chunk_scan.get();
+
   join->children[0] = std::move(cached_chunk_scan);
 }
 
@@ -122,6 +132,17 @@ void sirius_physical_left_delim_join::build_pipelines(pipeline::sirius_pipeline&
       duckdb::reference<pipeline::sirius_pipeline>(*child_meta_pipeline.get_base_pipeline())));
   }
   join->build_pipelines(current, meta_pipeline);
+
+  if (distinct_root) {
+    // Spawn a child meta rooted at the distinct chain
+    // (DISTINCT_MERGE -> PARTITION_DISTINCT -> DISTINCT); the standard walk produces its
+    // three pipelines, sequenced after child_meta_pipeline by the data dependency on the
+    // original DISTINCT's per-thread output. distinct_root is pre-populated as the meta's
+    // sink, so build from its child — re-building distinct_root would re-trigger its sink
+    // protocol and duplicate the MERGE_GROUP_BY pipeline.
+    auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);
+    if (!distinct_root->children.empty()) { distinct_meta.build(*distinct_root->children[0]); }
+  }
 }
 
 void sirius_physical_right_delim_join::build_pipelines(
@@ -142,7 +163,35 @@ void sirius_physical_right_delim_join::build_pipelines(
       duckdb::reference<pipeline::sirius_pipeline>(*child_meta_pipeline.get_base_pipeline())));
   }
 
-  sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *join, false);
+  // wrap_join already inserted CONCAT_build → PARTITION_build → original_build as the
+  // inner join's children[1]; build_join_pipelines consumes that chain via the plan tree.
+  //
+  // Nested RIGHT_DELIM_JOIN: `current` may already carry a barrier op (RDJ/PARTITION) as
+  // its pre-populated sink; routing *join through it would fuse the inner join into that
+  // pipeline. Split it into its own child meta instead — fusing with non-barrier ops
+  // (PROJECTION, FILTER, ...) is correct.
+  auto current_ops = current.get_operators();
+  const bool needs_split =
+    !current_ops.empty() &&
+    (current_ops.front().get().type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
+     current_ops.front().get().type == SiriusPhysicalOperatorType::PARTITION);
+
+  if (needs_split) {
+    auto& join_meta = meta_pipeline.create_child_meta_pipeline(current, *join);
+    auto& join_base = *join_meta.get_base_pipeline();
+    // Clear the pre-populated [join] so build_join_pipelines re-adds it within join_meta.
+    meta_pipeline.get_state().set_pipeline_operators(join_base, {});
+    sirius_physical_hash_join::build_join_pipelines(join_base, join_meta, *join);
+  } else {
+    sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *join);
+  }
+
+  if (distinct_root) {
+    // Spawn the distinct-chain child meta; see LEFT_DELIM_JOIN above for why we build
+    // from distinct_root's child rather than distinct_root itself.
+    auto& distinct_meta = meta_pipeline.create_child_meta_pipeline(current, *distinct_root);
+    if (!distinct_root->children.empty()) { distinct_meta.build(*distinct_root->children[0]); }
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
@@ -153,49 +202,12 @@ std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
     dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches(false));
 }
 
-void sirius_physical_right_delim_join::sink(const operator_data& input_data,
-                                            rmm::cuda_stream_view stream)
-{
-  nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::sink"};
-  // partition_join stays inline (still part of the delim join)
-  auto partition_join_output = partition_join->execute(input_data, stream);
-  // distinct stays inline (still part of the delim join)
-  auto distinct_output = distinct->execute(input_data, stream);
-
-  stream.synchronize();
-
-  partition_join->sink(*partition_join_output, stream);
-  // partition_distinct is external — push distinct output via distinct's next_port_after_sink
-  distinct->sink(*distinct_output, stream);
-}
-
-std::unique_ptr<operator_data> sirius_physical_right_delim_join::get_next_task_input_data()
-{
-  return partition_join->get_next_task_input_data();
-}
-
 std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::execute"};
   return std::make_unique<pipelineable_operator_data>(
     dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches(false));
-}
-
-void sirius_physical_left_delim_join::sink(const operator_data& input_data,
-                                           rmm::cuda_stream_view stream)
-{
-  nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::sink"};
-  // column_data_scan stays inline (still part of the delim join)
-  auto column_data_scan_output = column_data_scan->execute(input_data, stream);
-  // distinct stays inline (still part of the delim join)
-  auto distinct_output = distinct->execute(input_data, stream);
-
-  stream.synchronize();
-
-  column_data_scan->sink(*column_data_scan_output, stream);
-  // partition_distinct is external — push distinct output via distinct's next_port_after_sink
-  distinct->sink(*distinct_output, stream);
 }
 
 }  // namespace op

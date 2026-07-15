@@ -256,7 +256,7 @@ class test_fixture {
   duckdb::DuckDB db;
   duckdb::Connection con;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
-  pipeline::pipeline_build_context build_ctx{true};
+  pipeline::pipeline_build_context build_ctx{nullptr, true};
   task_scheduler pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
 };

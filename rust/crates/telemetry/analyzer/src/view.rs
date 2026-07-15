@@ -21,12 +21,13 @@ use quent_query_engine_analyzer::{
     view::InMemoryQueryEngineModelView,
     worker::Worker,
 };
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use quent_simulator_ui::EntityRef;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use uuid::Uuid;
 
 use crate::{
     batch::{Batch, BatchExt},
+    data_batch::{DataBatch, DataBatchExt},
     model::SiriusModel,
     task::{Task, TaskExt},
 };
@@ -43,6 +44,7 @@ pub(crate) struct SiriusModelQueryView<'a> {
     resources: HashMap<Uuid, &'a RtResource>,
     resource_groups: HashMap<Uuid, &'a RtResourceGroup>,
     tasks: HashMap<Uuid, &'a Task>,
+    data_batches: HashMap<Uuid, &'a DataBatch>,
     batches: HashMap<Uuid, &'a Batch>,
 }
 
@@ -87,6 +89,7 @@ impl<'a> SiriusModelQueryView<'a> {
             resource_groups,
             resources,
             tasks: HashMap::default(),
+            data_batches: HashMap::default(),
             batches: HashMap::default(),
         };
 
@@ -104,6 +107,18 @@ impl<'a> SiriusModelQueryView<'a> {
             })
             .map(|task| (task.id(), task))
             .collect();
+
+        result.data_batches = model
+            .data_batches
+            .values()
+            .filter(|data_batch| {
+                data_batch
+                    .producer_pipeline_uuid()
+                    .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
+            })
+            .map(|data_batch| (data_batch.id(), data_batch))
+            .collect();
+
         result.batches = model
             .batches
             .values()
@@ -156,6 +171,10 @@ impl<'a> SiriusModelQueryView<'a> {
 
     pub(crate) fn tasks(&self) -> impl Iterator<Item = &'a Task> + '_ {
         self.tasks.values().copied()
+    }
+
+    pub(crate) fn data_batches(&self) -> impl Iterator<Item = &'a DataBatch> + '_ {
+        self.data_batches.values().copied()
     }
 
     pub(crate) fn batches(&self) -> impl Iterator<Item = &'a Batch> + '_ {

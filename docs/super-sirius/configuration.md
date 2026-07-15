@@ -91,6 +91,11 @@ sirius:
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
+    enable_dynamic_filter_pushdown: true    # BUILD_PROBE IN-list / Bloom filters
+    enable_dynamic_zone_map_filter: false  # optional read-time min/max filter
+    dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
+    dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
+    enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -239,6 +244,11 @@ Four optional nested sub-configs tune the individual backends and caches:
 | `max_build_hash_table_bytes` | 500 MB | Max build-side size for BUILD_PROBE join mode |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
+| `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. An eligible `BUILD_PROBE` hash-join build publishes an IN-list or Bloom membership filter, chosen by L2-cache fit, for post-decode application by the probe scan. |
+| `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds for read-time row-group pruning. Requires `enable_dynamic_filter_pushdown`; intended for clustered-keyset workloads. |
+| `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
+| `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -359,11 +369,16 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 
 ### Expression Evaluation
 
+**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `use_cudf_expr` | true | Use cuDF-based expression evaluation |
-| `expression_executor_strategy` | `materialize` | Expression executor strategy |
+| `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
 | `use_custom_top_n` | false | Use custom top-N implementation |
+
+`expression_executor_strategy` remains registered as a deprecated compatibility alias for
+`expression_evaluator_strategy`; new configuration should use the evaluator name.
 
 ### Scan
 
@@ -388,6 +403,40 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | `max_build_hash_table_bytes` | 500 MB | Max build-side hash table bytes |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 
+### Dynamic Filters
+
+Both settings are also accepted in YAML under `sirius.operator_params`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. Wires eligible `BUILD_PROBE` hash-join-build membership filters into probe scans. |
+| `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds for read-time row-group pruning. Has no effect unless `enable_dynamic_filter_pushdown` is enabled. |
+| `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
+
+```sql
+SET enable_dynamic_filter_pushdown = true;
+SET enable_dynamic_zone_map_filter = false;
+```
+
+### Pinned Tables
+
+This setting is accepted both as a DuckDB `SET` variable and in YAML under
+`sirius.operator_params`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_pinned_zone_map_pruning` | true | Capture pinned-chunk zone maps at pin time and use them to prune cached scans. |
+
+Setting this to `false` before `pin_table` avoids the extra GPU reductions and creates a
+statless entry. Enabling it later does not add statistics to that entry; re-pin the table with
+the setting enabled. Disabling it only for a query leaves existing statistics intact. See
+[Pinned-table zone maps](scan.md#zone-maps) for supported types, pruning, and re-pin behavior.
+
+```sql
+SET enable_pinned_zone_map_pruning = false;
+```
+
 ### Transparent Execution
 
 | Variable | Default | Description |
@@ -400,7 +449,7 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 |----------|---------|-------------|
 | `print_gpu_table_max_rows` | - | Max rows to print in debug output |
 | `enable_fallback_check` | - | Enable fallback validation |
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU on Sirius errors. Matches the legacy `gpu_processing` path. Set to `false` to surface Sirius errors instead of silently falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 ## Legacy Config Flags

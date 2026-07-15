@@ -1,10 +1,8 @@
 use instrumentation_model::{Sirius, SiriusEvent};
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
-use quent_query_engine_analyzer::{
-    entities,
-    ui::{QuentViewer, UiAnalyzer, ViewerEventStream},
-};
+use quent_query_engine_analyzer::entities;
+use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
 use quent_query_engine_ui::{
     OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
     data_flow::{DataFlowTimelineBinned, DataFlowTimelineResponse},
@@ -35,7 +33,7 @@ use tracing::debug;
 
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, Span,
-    fsm::{FsmTypeDeclaration, FsmUsages, Transition},
+    fsm::{FsmTypeDeclaration, FsmUsages, Transition, collection::FsmCollection},
     resource::{
         ResourceGroup, ResourceTypeDecl, Usage, Using, collection::ResourceCollection,
         tree::ResourceTreeNode,
@@ -48,18 +46,20 @@ use quent_analyzer::{
         },
     },
 };
-use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanosecs, to_secs};
 use quent_simulator_ui::EntityRef;
+use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanosecs, to_secs};
 use uuid::Uuid;
 
 use crate::{
     batch::{Batch, BatchExt},
+    data_batch::{DataBatch, DataBatchExt},
     model::{MEMORY_TIER_TYPE_NAME, SiriusModel, SiriusModelBuilder},
     task::{Task, TaskExt},
     view::SiriusModelQueryView,
 };
 
 pub mod batch;
+pub mod data_batch;
 pub mod model;
 pub mod task;
 #[cfg(test)]
@@ -67,6 +67,7 @@ mod tests;
 pub mod view;
 
 const TASK_TYPE_NAME: &str = "task";
+const DATA_BATCH_TYPE_NAME: &str = "data_batch";
 const BATCH_TYPE_NAME: &str = "batch";
 /// Data-flow measure counting batches residing in each (state, tier) cell.
 const MEASURE_COUNT: &str = "count";
@@ -74,24 +75,6 @@ const MEASURE_COUNT: &str = "count";
 const MEASURE_BYTES: &str = "bytes";
 /// The memory tiers in stable stacking/legend order.
 const MEMORY_TIER_ORDER: [&str; 3] = ["GPU", "HOST", "DISK"];
-
-/// The FSM entity kinds this analyzer can slice timelines by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EntityKind {
-    Task,
-    Batch,
-}
-
-/// Resolve an entity type name from a request to an [`EntityKind`].
-fn try_entity_kind(entity_type_name: &str) -> AnalyzerResult<EntityKind> {
-    match entity_type_name {
-        TASK_TYPE_NAME => Ok(EntityKind::Task),
-        BATCH_TYPE_NAME => Ok(EntityKind::Batch),
-        other => Err(AnalyzerError::InvalidArgument(format!(
-            "{other} is not a known entity type in this model"
-        ))),
-    }
-}
 
 /// `quent-open` viewer entry: renders Sirius events with [`SiriusUiAnalyzer`].
 pub struct Viewer;
@@ -115,7 +98,7 @@ struct PlainBuilderSlot<'a> {
     config_idx: usize,
     builder: ResourceTimelineBuilder<'a>,
     resource_id_filter: Arc<HashSet<Uuid>>,
-    task_filter: OperatorFilter,
+    op_filter: OperatorFilter,
 }
 
 struct PerStateBuilderSlot<'a> {
@@ -123,8 +106,44 @@ struct PerStateBuilderSlot<'a> {
     config_idx: usize,
     builder: ResourceTimelineByKeyBuilder<'a, &'a str>,
     resource_id_filter: Arc<HashSet<Uuid>>,
-    task_filter: OperatorFilter,
-    entity_kind: EntityKind,
+    op_filter: OperatorFilter,
+    entity_type_name: String,
+}
+
+/// Adapts the model's task map to the [`FsmCollection`] contract that
+/// [`entities::list_entities`] ranks and pages over.
+struct TaskCollection<'a>(&'a HashMap<Uuid, Task>);
+
+impl FsmCollection for TaskCollection<'_> {
+    type Fsm = Task;
+
+    fn fsms(&self) -> impl Iterator<Item = &Task> {
+        self.0.values()
+    }
+}
+
+/// Adapts the model's data-batch map to the [`FsmCollection`] contract that
+/// [`entities::list_entities`] ranks and pages over.
+struct DataBatchCollection<'a>(&'a HashMap<Uuid, DataBatch>);
+
+impl FsmCollection for DataBatchCollection<'_> {
+    type Fsm = DataBatch;
+
+    fn fsms(&self) -> impl Iterator<Item = &DataBatch> {
+        self.0.values()
+    }
+}
+
+/// Adapts the model's batch-placement map to the [`FsmCollection`] contract
+/// that [`entities::list_entities`] ranks and pages over.
+struct BatchCollection<'a>(&'a HashMap<Uuid, Batch>);
+
+impl FsmCollection for BatchCollection<'_> {
+    type Fsm = Batch;
+
+    fn fsms(&self) -> impl Iterator<Item = &Batch> {
+        self.0.values()
+    }
 }
 
 impl UiAnalyzer for SiriusUiAnalyzer {
@@ -160,6 +179,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             resource_types = model.arbitrary_resources.resource_types.len(),
             resource_group_types = model.resource_group_types.len(),
             tasks = model.tasks.len(),
+            data_batches = model.data_batches.len(),
             batches = model.batches.len(),
         );
 
@@ -247,9 +267,11 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .collect();
 
         let task_decl = Task::fsm_type_declaration();
+        let data_batch_decl = DataBatch::fsm_type_declaration();
         let batch_decl = Batch::fsm_type_declaration();
         let fsm_types = [
             (task_decl.name.clone(), task_decl),
+            (data_batch_decl.name.clone(), data_batch_decl),
             (batch_decl.name.clone(), batch_decl),
         ]
         .into_iter()
@@ -290,8 +312,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             resource_tree,
             unique_operator_names,
             quantity_specs: [
-                ("capacity_entries".into(), QuantitySpec::unit()),
                 ("capacity_bytes".into(), QuantitySpec::bytes()),
+                ("capacity_entries".into(), QuantitySpec::unit()),
                 ("unit".into(), QuantitySpec::unit()),
             ]
             .into(),
@@ -318,12 +340,12 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .as_ref()
             .map(|s| s.resolve(&self.model))
             .transpose()?;
-        let operator_filter = entry.application.operator_id;
+        let operator_filter = entry.application;
 
-        // Restrict candidates to the requested query: a task belongs to a query
-        // iff its pipeline (== quent operator) is one of that query's
-        // operators. Without this, tasks from a different query sharing a
-        // resource and overlapping the window would leak in.
+        // Restrict candidates to the requested query: an entity belongs to a
+        // query iff its (producer) pipeline is one of that query's operators.
+        // Without this, entities from a different query sharing a resource and
+        // overlapping the window would leak in.
         let query_operators: HashSet<Uuid> = self
             .model
             .query_view(query_id)?
@@ -331,23 +353,49 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .map(|op| op.id())
             .collect();
 
-        entities::list_entities(
-            &self.model,
-            |task| {
-                task.pipeline_uuid().is_some_and(|pipeline_uuid| {
-                    query_operators.contains(&pipeline_uuid)
-                        && operator_filter.is_none_or(|filter| pipeline_uuid == filter)
-                })
-            },
-            entities::ListQuery {
-                scope: scope.as_ref(),
-                window,
-                filter: &entry.filter,
-                sort: entry.sort,
-                page: entry.page,
-                epoch,
-            },
-        )
+        let query = entities::ListQuery {
+            scope: scope.as_ref(),
+            window,
+            filter: &entry.filter,
+            sort: entry.sort,
+            page: entry.page,
+            epoch,
+        };
+
+        // The model holds two distinct FSM types (tasks and data batches), so
+        // dispatch on the requested entity type rather than a single collection.
+        // Absent an explicit type, default to tasks.
+        match entry.filter.entity_type_name.as_deref() {
+            Some(DATA_BATCH_TYPE_NAME) => entities::list_entities(
+                &DataBatchCollection(&self.model.data_batches),
+                |data_batch| {
+                    data_batch
+                        .producer_pipeline_uuid()
+                        .is_some_and(|op| query_operators.contains(&op))
+                        && data_batch.matches_filter(&operator_filter)
+                },
+                query,
+            ),
+            Some(BATCH_TYPE_NAME) => entities::list_entities(
+                &BatchCollection(&self.model.batches),
+                |batch| {
+                    batch
+                        .pipeline_uuid()
+                        .is_some_and(|op| query_operators.contains(&op))
+                        && batch.matches_filter(&operator_filter)
+                },
+                query,
+            ),
+            _ => entities::list_entities(
+                &TaskCollection(&self.model.tasks),
+                |task| {
+                    task.pipeline_uuid()
+                        .is_some_and(|op| query_operators.contains(&op))
+                        && task.matches_filter(&operator_filter)
+                },
+                query,
+            ),
+        }
     }
 
     // TODO(johanpel): consider reusing the bulk request API with a single entry for requests like this.
@@ -368,36 +416,73 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             TimelineRequest::Resource(req) => {
                 let resource_type = view.resource_type_of(req.resource_id)?;
                 let long_entities_threshold = req.long_entities_threshold_s.map(to_nanosecs);
-                let task_filter = req.application;
+                let fsm_filter = req.application;
 
-                if let Some(entity_type_name) = &req.entity_filter.entity_type_name {
+                if req.entity_filter.entity_type_name.is_some() {
                     let mut builder = ResourceTimelineByKeyBuilder::try_new(
                         resource_type,
                         config,
                         long_entities_threshold,
                     )?;
-                    match try_entity_kind(entity_type_name)? {
-                        EntityKind::Task => self.populate_keyed_builder(
-                            &mut builder,
-                            self.filtered_tasks(&view, &task_filter, config.span)?
+
+                    match req.entity_filter.entity_type_name.as_deref() {
+                        Some(TASK_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_tasks(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
                                 .into_iter()
                                 .filter(|task| {
                                     task.usages()
                                         .any(|usage| usage.resource_id() == req.resource_id)
                                 }),
-                            |id| id == req.resource_id,
-                        )?,
-                        EntityKind::Batch => self.populate_keyed_builder(
-                            &mut builder,
-                            self.filtered_batches(&view, &task_filter, config.span)?
+                                |id| id == req.resource_id,
+                            )?;
+                        }
+                        Some(DATA_BATCH_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_data_batches(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
+                                .into_iter()
+                                .filter(|db| {
+                                    db.usages().any(|u| u.resource_id() == req.resource_id)
+                                }),
+                                |id| id == req.resource_id,
+                            )?;
+                        }
+                        Some(BATCH_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_batches(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
                                 .into_iter()
                                 .filter(|batch| {
                                     batch
                                         .usages()
                                         .any(|usage| usage.resource_id() == req.resource_id)
                                 }),
-                            |id| id == req.resource_id,
-                        )?,
+                                |id| id == req.resource_id,
+                            )?;
+                        }
+                        other => {
+                            Err(AnalyzerError::InvalidArgument(format!(
+                                "{:?} is not a known entity type in this model",
+                                other
+                            )))?;
+                        }
                     }
                     Ok(SingleTimelineResponse {
                         config: config_secs,
@@ -411,13 +496,29 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     )?;
 
                     builder.try_extend(
-                        self.filtered_tasks(&view, &task_filter, config.span)?
-                            .into_iter()
-                            .flat_map(|task| task.usages())
-                            .filter(|usage| usage.resource_id() == req.resource_id),
+                        self.filtered_tasks(
+                            &view,
+                            req.entity_filter.clone(),
+                            &fsm_filter,
+                            config.span,
+                        )?
+                        .into_iter()
+                        .flat_map(|task| task.usages())
+                        .filter(|usage| usage.resource_id() == req.resource_id),
                     )?;
                     builder.try_extend(
-                        self.filtered_batches(&view, &task_filter, config.span)?
+                        self.filtered_data_batches(
+                            &view,
+                            req.entity_filter.clone(),
+                            &fsm_filter,
+                            config.span,
+                        )?
+                        .into_iter()
+                        .flat_map(|db| db.usages())
+                        .filter(|usage| usage.resource_id() == req.resource_id),
+                    )?;
+                    builder.try_extend(
+                        self.filtered_batches(&view, req.entity_filter, &fsm_filter, config.span)?
                             .into_iter()
                             .flat_map(|batch| batch.usages())
                             .filter(|usage| usage.resource_id() == req.resource_id),
@@ -431,7 +532,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             TimelineRequest::ResourceGroup(req) => {
                 let resource_type = view.resource_type(&req.resource_type_name)?;
                 let long_entities_threshold = req.long_entities_threshold_s.map(to_nanosecs);
-                let task_filter = req.app_params;
+                let fsm_filter = req.app_params;
 
                 // Build the resource tree for this group
                 let tree = ResourceTreeNode::try_new(&view, req.resource_group_id)?;
@@ -446,35 +547,74 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     })
                     .collect();
 
-                if let Some(entity_type_name) = &req.entity_filter.entity_type_name {
+                if req.entity_filter.entity_type_name.is_some() {
                     let mut builder = ResourceTimelineByKeyBuilder::try_new(
                         resource_type,
                         config,
                         long_entities_threshold,
                     )?;
-                    match try_entity_kind(entity_type_name)? {
-                        EntityKind::Task => self.populate_keyed_builder(
-                            &mut builder,
-                            self.filtered_tasks(&view, &task_filter, config.span)?
+
+                    match req.entity_filter.entity_type_name.as_deref() {
+                        Some(TASK_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_tasks(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
                                 .into_iter()
                                 .filter(|task| {
                                     task.usages()
                                         .any(|usage| resource_ids.contains(&usage.resource_id()))
                                 }),
-                            |id| resource_ids.contains(&id),
-                        )?,
-                        EntityKind::Batch => self.populate_keyed_builder(
-                            &mut builder,
-                            self.filtered_batches(&view, &task_filter, config.span)?
+                                |id| resource_ids.contains(&id),
+                            )?;
+                        }
+                        Some(DATA_BATCH_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_data_batches(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
+                                .into_iter()
+                                .filter(|db| {
+                                    db.usages()
+                                        .any(|usage| resource_ids.contains(&usage.resource_id()))
+                                }),
+                                |id| resource_ids.contains(&id),
+                            )?;
+                        }
+                        Some(BATCH_TYPE_NAME) => {
+                            self.populate_keyed_builder(
+                                &mut builder,
+                                self.filtered_batches(
+                                    &view,
+                                    req.entity_filter,
+                                    &fsm_filter,
+                                    config.span,
+                                )?
                                 .into_iter()
                                 .filter(|batch| {
                                     batch
                                         .usages()
                                         .any(|usage| resource_ids.contains(&usage.resource_id()))
                                 }),
-                            |id| resource_ids.contains(&id),
-                        )?,
+                                |id| resource_ids.contains(&id),
+                            )?;
+                        }
+                        other => {
+                            Err(AnalyzerError::InvalidArgument(format!(
+                                "{:?} is not a known entity type in this model",
+                                other
+                            )))?;
+                        }
                     }
+
                     Ok(SingleTimelineResponse {
                         config: config_secs,
                         data: self.timeline_to_ui_keyed(builder.build(), epoch)?,
@@ -486,13 +626,29 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         long_entities_threshold,
                     )?;
                     builder.try_extend(
-                        self.filtered_tasks(&view, &task_filter, config.span)?
-                            .into_iter()
-                            .flat_map(|task| task.usages())
-                            .filter(|usage| resource_ids.contains(&usage.resource_id())),
+                        self.filtered_tasks(
+                            &view,
+                            req.entity_filter.clone(),
+                            &fsm_filter,
+                            config.span,
+                        )?
+                        .into_iter()
+                        .flat_map(|task| task.usages())
+                        .filter(|usage| resource_ids.contains(&usage.resource_id())),
                     )?;
                     builder.try_extend(
-                        self.filtered_batches(&view, &task_filter, config.span)?
+                        self.filtered_data_batches(
+                            &view,
+                            req.entity_filter.clone(),
+                            &fsm_filter,
+                            config.span,
+                        )?
+                        .into_iter()
+                        .flat_map(|db| db.usages())
+                        .filter(|usage| resource_ids.contains(&usage.resource_id())),
+                    )?;
+                    builder.try_extend(
+                        self.filtered_batches(&view, req.entity_filter, &fsm_filter, config.span)?
                             .into_iter()
                             .flat_map(|batch| batch.usages())
                             .filter(|usage| resource_ids.contains(&usage.resource_id())),
@@ -525,8 +681,12 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         // each bulk entry. After populating this, we'll build a reverse index,
         // that maps a resource_id to a list of indices in these vecs, for which
         // that resource's usages are relevant.
-        let mut plain_builders: Vec<(String, ResourceTimelineBuilder, HashSet<Uuid>, OperatorFilter)> =
-            Vec::new();
+        let mut plain_builders: Vec<(
+            String,
+            ResourceTimelineBuilder,
+            HashSet<Uuid>,
+            OperatorFilter,
+        )> = Vec::new();
 
         // Prepare them also for keyed builders (building by state).
         let mut per_state_builders: Vec<(
@@ -534,7 +694,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             ResourceTimelineByKeyBuilder<&str>,
             HashSet<Uuid>,
             OperatorFilter,
-            EntityKind,
+            String, // entity_type_name this slot breaks down by ("task" | "data_batch", etc.)
         )> = Vec::new();
 
         for (entry_id, entry) in request.entries {
@@ -546,7 +706,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 task_filter,
                 long_entities_threshold,
             } = self.try_prepare_bulk_entry(&view, entry, &resource_tree)?;
-            if let Some(entity_type_name) = &entity_filter.entity_type_name {
+            if let Some(entity_type_name) = entity_filter.entity_type_name {
                 per_state_builders.push((
                     entry_id,
                     ResourceTimelineByKeyBuilder::try_new(
@@ -556,7 +716,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     )?,
                     resource_id_filter,
                     task_filter,
-                    try_entity_kind(entity_type_name)?,
+                    entity_type_name,
                 ));
             } else {
                 plain_builders.push((
@@ -613,7 +773,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             );
 
         // Iterate over all usages once and push any usages of resources in our
-        // lookup table to their respective builders.
+        // lookup table to their respective builders. For now we only have
+        // tasks.
         for task in view.tasks() {
             for usage in task.usages() {
                 let resource_id = usage.resource_id();
@@ -632,13 +793,42 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 if let Some(builder_indices) = per_state_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
                         let builder = &mut per_state_builders[builder_idx];
-                        if builder.4 == EntityKind::Task && task.matches_filter(&builder.3) {
+                        if builder.4 == TASK_TYPE_NAME && task.matches_filter(&builder.3) {
                             builder.1.try_push(state_name, &usage)?;
                         }
                     }
                 }
             }
         }
+
+        for data_batch in view.data_batches() {
+            for usage in data_batch.usages() {
+                let resource_id = usage.resource_id();
+                if let Some(builder_indices) = plain_index.get(&resource_id) {
+                    for &builder_idx in builder_indices {
+                        let builder = &mut plain_builders[builder_idx];
+                        if data_batch.matches_filter(&builder.3) {
+                            builder.1.try_push(&usage)?;
+                        }
+                    }
+                }
+            }
+
+            for (state_name, usage) in data_batch.usages_with_state_names() {
+                let resource_id = usage.resource_id();
+                if let Some(builder_indices) = per_state_index.get(&resource_id) {
+                    for &builder_idx in builder_indices {
+                        let builder = &mut per_state_builders[builder_idx];
+                        if builder.4 == DATA_BATCH_TYPE_NAME
+                            && data_batch.matches_filter(&builder.3)
+                        {
+                            builder.1.try_push(state_name, &usage)?;
+                        }
+                    }
+                }
+            }
+        }
+
         for batch in view.batches() {
             for usage in batch.usages() {
                 let resource_id = usage.resource_id();
@@ -657,7 +847,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 if let Some(builder_indices) = per_state_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
                         let builder = &mut per_state_builders[builder_idx];
-                        if builder.4 == EntityKind::Batch && batch.matches_filter(&builder.3) {
+                        if builder.4 == BATCH_TYPE_NAME && batch.matches_filter(&builder.3) {
                             builder.1.try_push(state_name, &usage)?;
                         }
                     }
@@ -724,15 +914,10 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
             // Wrap the filter once so per-config slots share one allocation.
             let resource_id_filter = Arc::new(resource_id_filter);
-            let entity_kind = entity_filter
-                .entity_type_name
-                .as_deref()
-                .map(try_entity_kind)
-                .transpose()?;
 
             for (config_idx, config) in request.configs.iter().enumerate() {
                 let entry_config = config.try_into_binned_span(epoch)?;
-                if let Some(entity_kind) = entity_kind {
+                if let Some(type_name) = entity_filter.entity_type_name.clone() {
                     per_state_builders.push(PerStateBuilderSlot {
                         entry_id: entry_id.clone(),
                         config_idx,
@@ -742,8 +927,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                             long_entities_threshold,
                         )?,
                         resource_id_filter: Arc::clone(&resource_id_filter),
-                        task_filter: task_filter.clone(),
-                        entity_kind,
+                        op_filter: task_filter.clone(),
+                        entity_type_name: type_name,
                     });
                 } else {
                     plain_builders.push(PlainBuilderSlot {
@@ -755,7 +940,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                             long_entities_threshold,
                         )?,
                         resource_id_filter: Arc::clone(&resource_id_filter),
-                        task_filter: task_filter.clone(),
+                        op_filter: task_filter.clone(),
                     });
                 }
             }
@@ -786,17 +971,16 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 acc
             });
 
-        // Single pass over all tasks/batches and their usages — the dominant
-        // cost — dispatched to every matching (entry, config) builder. Builders
-        // filter by their own span internally, so out-of-window usages are
-        // no-ops.
+        // Single pass over all tasks/usages — the dominant cost — dispatched to
+        // every matching (entry, config) builder. Builders filter by their own
+        // span internally, so out-of-window usages are no-ops.
         for task in view.tasks() {
             for usage in task.usages() {
                 let resource_id = usage.resource_id();
                 if let Some(builder_indices) = plain_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
                         let slot = &mut plain_builders[builder_idx];
-                        if task.matches_filter(&slot.task_filter) {
+                        if task.matches_filter(&slot.op_filter) {
                             slot.builder.try_push(&usage)?;
                         }
                     }
@@ -807,8 +991,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 if let Some(builder_indices) = per_state_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
                         let slot = &mut per_state_builders[builder_idx];
-                        if slot.entity_kind == EntityKind::Task
-                            && task.matches_filter(&slot.task_filter)
+                        if slot.entity_type_name == TASK_TYPE_NAME
+                            && task.matches_filter(&slot.op_filter)
                         {
                             slot.builder.try_push(state_name, &usage)?;
                         }
@@ -816,13 +1000,41 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 }
             }
         }
+
+        for data_batch in view.data_batches() {
+            for usage in data_batch.usages() {
+                let resource_id = usage.resource_id();
+                if let Some(builder_indices) = plain_index.get(&resource_id) {
+                    for &builder_idx in builder_indices {
+                        let slot = &mut plain_builders[builder_idx];
+                        if data_batch.matches_filter(&slot.op_filter) {
+                            slot.builder.try_push(&usage)?;
+                        }
+                    }
+                }
+            }
+            for (state_name, usage) in data_batch.usages_with_state_names() {
+                let resource_id = usage.resource_id();
+                if let Some(builder_indices) = per_state_index.get(&resource_id) {
+                    for &builder_idx in builder_indices {
+                        let slot = &mut per_state_builders[builder_idx];
+                        if slot.entity_type_name == DATA_BATCH_TYPE_NAME
+                            && data_batch.matches_filter(&slot.op_filter)
+                        {
+                            slot.builder.try_push(state_name, &usage)?;
+                        }
+                    }
+                }
+            }
+        }
+
         for batch in view.batches() {
             for usage in batch.usages() {
                 let resource_id = usage.resource_id();
                 if let Some(builder_indices) = plain_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
                         let slot = &mut plain_builders[builder_idx];
-                        if batch.matches_filter(&slot.task_filter) {
+                        if batch.matches_filter(&slot.op_filter) {
                             slot.builder.try_push(&usage)?;
                         }
                     }
@@ -833,8 +1045,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 if let Some(builder_indices) = per_state_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
                         let slot = &mut per_state_builders[builder_idx];
-                        if slot.entity_kind == EntityKind::Batch
-                            && batch.matches_filter(&slot.task_filter)
+                        if slot.entity_type_name == BATCH_TYPE_NAME
+                            && batch.matches_filter(&slot.op_filter)
                         {
                             slot.builder.try_push(state_name, &usage)?;
                         }
@@ -1069,13 +1281,22 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 }
 
 impl SiriusUiAnalyzer {
-    /// Return the query's tasks, filtered by time window and operator id.
+    /// Return an iterator over all tasks, filtered by time window and operator id.
     fn filtered_tasks<'a>(
         &self,
         view: &'a SiriusModelQueryView<'a>,
+        entity_filter: EntityFilter,
         task_filter: &OperatorFilter,
         time_window: SpanNanoSec,
     ) -> AnalyzerResult<Vec<&'a Task>> {
+        if let Some(entity_type_name) = entity_filter.entity_type_name
+            && entity_type_name != TASK_TYPE_NAME
+        {
+            return Err(AnalyzerError::InvalidArgument(format!(
+                "{entity_type_name} is not a known entity type in this model"
+            )));
+        }
+
         Ok(view
             .tasks()
             .filter(|task| task.span().is_ok_and(|s| s.intersects(&time_window)))
@@ -1083,17 +1304,47 @@ impl SiriusUiAnalyzer {
             .collect())
     }
 
-    /// Return the query's batches, filtered by time window and operator id.
+    fn filtered_data_batches<'a>(
+        &self,
+        view: &'a SiriusModelQueryView<'a>,
+        entity_filter: EntityFilter,
+        filter: &OperatorFilter,
+        time_window: SpanNanoSec,
+    ) -> AnalyzerResult<Vec<&'a DataBatch>> {
+        if let Some(entity_type_name) = entity_filter.entity_type_name
+            && entity_type_name != DATA_BATCH_TYPE_NAME
+        {
+            return Err(AnalyzerError::InvalidArgument(format!(
+                "{entity_type_name} is not a known entity type in this model"
+            )));
+        }
+        Ok(view
+            .data_batches()
+            .filter(|db| db.span().is_ok_and(|s| s.intersects(&time_window)))
+            .filter(|db| db.matches_filter(filter))
+            .collect())
+    }
+
+    /// Return the query's batch placements, filtered by time window and
+    /// operator id.
     fn filtered_batches<'a>(
         &self,
         view: &'a SiriusModelQueryView<'a>,
-        operator_filter: &OperatorFilter,
+        entity_filter: EntityFilter,
+        filter: &OperatorFilter,
         time_window: SpanNanoSec,
     ) -> AnalyzerResult<Vec<&'a Batch>> {
+        if let Some(entity_type_name) = entity_filter.entity_type_name
+            && entity_type_name != BATCH_TYPE_NAME
+        {
+            return Err(AnalyzerError::InvalidArgument(format!(
+                "{entity_type_name} is not a known entity type in this model"
+            )));
+        }
         Ok(view
             .batches()
             .filter(|batch| batch.span().is_ok_and(|s| s.intersects(&time_window)))
-            .filter(|batch| batch.matches_filter(operator_filter))
+            .filter(|batch| batch.matches_filter(filter))
             .collect())
     }
 
@@ -1141,19 +1392,18 @@ impl SiriusUiAnalyzer {
         })
     }
 
-    /// Populate a keyed resource timeline builder with any state-usage FSMs
-    /// (tasks or batches).
+    /// Populate a keyed resource timeline builder with tasks.
     fn populate_keyed_builder<'a, F>(
         &self,
         builder: &mut ResourceTimelineByKeyBuilder<'a, &'a str>,
-        entities: impl Iterator<Item = &'a F>,
+        fsms: impl Iterator<Item = &'a F>,
         resource_filter: impl Fn(Uuid) -> bool,
     ) -> AnalyzerResult<()>
     where
         F: FsmUsages<'a> + 'a,
     {
-        for entity in entities {
-            for (state_name, usage) in entity.usages_with_state_names() {
+        for fsm in fsms {
+            for (state_name, usage) in fsm.usages_with_state_names() {
                 if resource_filter(usage.resource_id()) {
                     builder.try_push(state_name, &usage)?;
                 }
@@ -1162,7 +1412,8 @@ impl SiriusUiAnalyzer {
         Ok(())
     }
 
-    /// Turn a list of entity ids (tasks or batches) into UI-compatible FSM data.
+    /// Turn a list of entity ids (tasks, data batches, or batch placements)
+    /// into UI-compatible FSM data.
     fn task_entities_to_ui_fsm(
         &self,
         entity_ids: &[Uuid],
@@ -1171,16 +1422,16 @@ impl SiriusUiAnalyzer {
         entity_ids
             .iter()
             .filter_map(|&id| {
-                self.model
-                    .tasks
-                    .get(&id)
-                    .map(|task| task.try_to_ui_fsm(epoch))
-                    .or_else(|| {
-                        self.model
-                            .batches
-                            .get(&id)
-                            .map(|batch| batch.try_to_ui_fsm(epoch))
-                    })
+                if let Some(task) = self.model.tasks.get(&id) {
+                    Some(task.try_to_ui_fsm(epoch))
+                } else if let Some(db) = self.model.data_batches.get(&id) {
+                    Some(db.try_to_ui_fsm(epoch))
+                } else {
+                    self.model
+                        .batches
+                        .get(&id)
+                        .map(|batch| batch.try_to_ui_fsm(epoch))
+                }
             })
             .collect()
     }

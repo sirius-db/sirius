@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use instrumentation_model::{SiriusEvent, batch, task};
+use instrumentation_model::{SiriusEvent, batch, channel, gpu_device, memory, task, thread_group};
 use quent_time::TimeUnixNanoSec;
 use rustc_hash::FxHashMap as HashMap;
 
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model,
-    fsm::collection::FsmCollection,
     resource::{
         CapacityDecl, CapacityValue, Resource, ResourceCapacities, ResourceGroup,
         ResourceGroupTypeDecl, ResourceTypeDecl, Usage, Using,
@@ -32,18 +31,26 @@ use quent_query_engine_analyzer::{
 };
 use quent_query_engine_model::QueryEngineEvent;
 use quent_simulator_ui::EntityRef;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     batch::{Batch, BatchBuilder},
+    data_batch::{DataBatch, DataBatchBuilder, DataBatchExt},
     task::{Task, TaskBuilder, TaskExt},
     view::SiriusModelQueryView,
 };
 
+const GPU_DEVICE_GROUP_TYPE_NAME: &str = "gpu_device";
+const THREAD_GROUP_TYPE_NAME: &str = "thread_group";
 const TASK_QUEUE_TYPE_NAME: &str = "task_queue";
 const TASK_MANAGER_LOOP_THREAD_TYPE_NAME: &str = "task_manager_loop_thread";
 const EXECUTOR_THREAD_TYPE_NAME: &str = "executor_thread";
 const QUEUE_ENTRIES_CAPACITY_NAME: &str = "capacity_entries";
+const MEMORY_TYPE_NAME: &str = "memory";
+const CHANNEL_TYPE_NAME: &str = "channel";
+const MEMORY_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
+const CHANNEL_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
 /// Type name of the MemoryTier resources as recorded by the model.
 pub(crate) const MEMORY_TIER_TYPE_NAME: &str = "memory_tier";
 /// Capacity name of the MemoryTier `bytes` capacity as recorded by the model.
@@ -59,7 +66,7 @@ fn validate_resource_type(actual: &str, expected: &str, id: Uuid) -> AnalyzerRes
     }
 }
 
-fn insert_task_resource_types(resources: &mut InMemoryResources) {
+fn insert_sirius_specific_resource_types(resources: &mut InMemoryResources) {
     resources.resource_types.insert(
         TASK_QUEUE_TYPE_NAME.to_string(),
         ResourceTypeDecl::new(
@@ -76,6 +83,20 @@ fn insert_task_resource_types(resources: &mut InMemoryResources) {
         ResourceTypeDecl::unit(EXECUTOR_THREAD_TYPE_NAME),
     );
     resources.resource_types.insert(
+        MEMORY_TYPE_NAME.to_string(),
+        ResourceTypeDecl::new(
+            MEMORY_TYPE_NAME,
+            [CapacityDecl::new_occupancy(MEMORY_BYTES_CAPACITY_NAME)],
+        ),
+    );
+    resources.resource_types.insert(
+        CHANNEL_TYPE_NAME.to_string(),
+        ResourceTypeDecl::new(
+            CHANNEL_TYPE_NAME,
+            [CapacityDecl::new_occupancy(CHANNEL_BYTES_CAPACITY_NAME)],
+        ),
+    );
+    resources.resource_types.insert(
         MEMORY_TIER_TYPE_NAME.to_string(),
         ResourceTypeDecl::new(
             MEMORY_TIER_TYPE_NAME,
@@ -89,6 +110,7 @@ pub struct SiriusModel {
     pub(crate) query_engine: InMemoryQueryEngineModel,
     pub(crate) arbitrary_resources: InMemoryResources,
     pub(crate) tasks: HashMap<Uuid, Task>,
+    pub(crate) data_batches: HashMap<Uuid, DataBatch>,
     pub(crate) batches: HashMap<Uuid, Batch>,
     pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
 }
@@ -179,14 +201,6 @@ impl SiriusModel {
     }
 }
 
-impl FsmCollection for SiriusModel {
-    type Fsm = Task;
-
-    fn fsms(&self) -> impl Iterator<Item = &Task> {
-        self.tasks.values()
-    }
-}
-
 impl ResourceCollection for SiriusModel {
     fn resources(&self) -> impl Iterator<Item = &dyn Resource> {
         self.arbitrary_resources
@@ -263,72 +277,11 @@ impl ResourceCollection for SiriusModel {
     }
 }
 
-/// A usage from either a Task or a Batch FSM. Unifies the two distinct opaque
-/// `impl Usage` types so [`SiriusModel::usages`] can chain them.
-enum EitherUsage<A, B> {
-    Task(A),
-    Batch(B),
-}
-
-enum EitherIter<A, B> {
-    Task(A),
-    Batch(B),
-}
-
-impl<I, A: Iterator<Item = I>, B: Iterator<Item = I>> Iterator for EitherIter<A, B> {
-    type Item = I;
-    fn next(&mut self) -> Option<I> {
-        match self {
-            EitherIter::Task(iter) => iter.next(),
-            EitherIter::Batch(iter) => iter.next(),
-        }
-    }
-}
-
-impl<'a, A: Usage<'a>, B: Usage<'a>> Usage<'a> for EitherUsage<A, B> {
-    fn entity_id(&self) -> Uuid {
-        match self {
-            EitherUsage::Task(usage) => usage.entity_id(),
-            EitherUsage::Batch(usage) => usage.entity_id(),
-        }
-    }
-    fn resource_id(&self) -> Uuid {
-        match self {
-            EitherUsage::Task(usage) => usage.resource_id(),
-            EitherUsage::Batch(usage) => usage.resource_id(),
-        }
-    }
-    fn capacities(&self) -> impl Iterator<Item = &'a CapacityValue> {
-        match self {
-            EitherUsage::Task(usage) => EitherIter::Task(usage.capacities()),
-            EitherUsage::Batch(usage) => EitherIter::Batch(usage.capacities()),
-        }
-    }
-    fn span(&self) -> quent_time::span::SpanUnixNanoSec {
-        match self {
-            EitherUsage::Task(usage) => usage.span(),
-            EitherUsage::Batch(usage) => usage.span(),
-        }
-    }
-}
-
-impl Using for SiriusModel {
-    fn usages(&self) -> impl Iterator<Item = impl Usage<'_>> {
-        self.tasks
-            .values()
-            .flat_map(|task| task.usages().map(EitherUsage::Task))
-            .chain(
-                self.batches
-                    .values()
-                    .flat_map(|batch| batch.usages().map(EitherUsage::Batch)),
-            )
-    }
-}
-
 pub struct SiriusModelBuilder {
     query_engine: InMemoryQueryEngineModelBuilder,
     arbitrary_resources: InMemoryResourcesBuilder,
     tasks: HashMap<Uuid, TaskBuilder>,
+    data_batches: HashMap<Uuid, DataBatchBuilder>,
     batches: HashMap<Uuid, BatchBuilder>,
 }
 
@@ -338,6 +291,7 @@ impl SiriusModelBuilder {
             query_engine: InMemoryQueryEngineModelBuilder::try_new(engine_id)?,
             arbitrary_resources: InMemoryResourcesBuilder::default(),
             tasks: HashMap::default(),
+            data_batches: HashMap::default(),
             batches: HashMap::default(),
         })
     }
@@ -386,11 +340,41 @@ impl SiriusModelBuilder {
                 self.query_engine
                     .try_push(Event::new(id, timestamp, QueryEngineEvent::Port(e)))
             }
+            SiriusEvent::GpuDevice(e) => {
+                let gpu_device::GpuDeviceEvent::Declaration(d) = e;
+                self.arbitrary_resources.push_group_raw(
+                    id,
+                    GPU_DEVICE_GROUP_TYPE_NAME,
+                    &d.instance_name,
+                    Some(d.parent_group_id),
+                );
+                Ok(())
+            }
+            SiriusEvent::ThreadGroup(e) => {
+                let thread_group::ThreadGroupEvent::Declaration(d) = e;
+                self.arbitrary_resources.push_group_raw(
+                    id,
+                    THREAD_GROUP_TYPE_NAME,
+                    &d.instance_name,
+                    Some(d.parent_group_id),
+                );
+                Ok(())
+            }
             SiriusEvent::TaskQueue(e) => self.push_task_queue(id, timestamp, e),
             SiriusEvent::TaskManagerLoopThread(e) => {
                 self.push_task_manager_loop_thread(id, timestamp, e)
             }
             SiriusEvent::ExecutorThread(e) => self.push_executor_thread(id, timestamp, e),
+            SiriusEvent::Memory(e) => self.push_memory(id, timestamp, e),
+            SiriusEvent::Channel(e) => self.push_channel(id, timestamp, e),
+            SiriusEvent::DataBatch(d) => {
+                let data_batch_builder = self
+                    .data_batches
+                    .entry(id)
+                    .or_insert_with(|| DataBatchBuilder::try_new(id).unwrap());
+                data_batch_builder.push(Event::new(id, timestamp, d));
+                Ok(())
+            }
             SiriusEvent::Batch(b) => {
                 let batch_builder = self
                     .batches
@@ -434,6 +418,82 @@ impl SiriusModelBuilder {
                 builder.push(RtResourceTransition::Finalizing(timestamp));
             }
             MemoryTierTransition::Exit => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Exit(timestamp));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_memory(
+        &mut self,
+        id: Uuid,
+        timestamp: TimeUnixNanoSec,
+        event: memory::MemoryEvent,
+    ) -> AnalyzerResult<()> {
+        use memory::MemoryTransition;
+        match event.state {
+            MemoryTransition::MemoryInitializing(init) => {
+                validate_resource_type(&init.resource_type_name, MEMORY_TYPE_NAME, id)?;
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Init(timestamp));
+                builder.set_type_name(init.resource_type_name);
+                builder.set_instance_name(Some(init.instance_name));
+                builder.set_parent_group_id(init.parent_group_id);
+            }
+            MemoryTransition::MemoryOperating(operating) => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Operating(
+                    timestamp,
+                    ResourceCapacities(vec![CapacityValue::new(
+                        MEMORY_BYTES_CAPACITY_NAME,
+                        operating.capacity_bytes.value.unwrap_or(0),
+                    )]),
+                ));
+            }
+            MemoryTransition::MemoryFinalizing(_) => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Finalizing(timestamp));
+            }
+            MemoryTransition::Exit => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Exit(timestamp));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_channel(
+        &mut self,
+        id: Uuid,
+        timestamp: TimeUnixNanoSec,
+        event: channel::ChannelEvent,
+    ) -> AnalyzerResult<()> {
+        use channel::ChannelTransition;
+        match event.state {
+            ChannelTransition::ChannelInitializing(init) => {
+                validate_resource_type(&init.resource_type_name, CHANNEL_TYPE_NAME, id)?;
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Init(timestamp));
+                builder.set_type_name(init.resource_type_name);
+                builder.set_instance_name(Some(init.instance_name));
+                builder.set_parent_group_id(init.parent_group_id);
+            }
+            ChannelTransition::ChannelOperating(operating) => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Operating(
+                    timestamp,
+                    ResourceCapacities(vec![CapacityValue::new(
+                        CHANNEL_BYTES_CAPACITY_NAME,
+                        operating.capacity_bytes.value.unwrap_or(0),
+                    )]),
+                ));
+            }
+            ChannelTransition::ChannelFinalizing(_) => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Finalizing(timestamp));
+            }
+            ChannelTransition::Exit => {
                 let builder = self.arbitrary_resources.try_builder(id)?;
                 builder.push(RtResourceTransition::Exit(timestamp));
             }
@@ -557,11 +617,11 @@ impl SiriusModelBuilder {
         // Build resources first. As we iterate over task builders and build all
         // tasks, we can populate the leaf resources used_by field.
         let mut resources = self.arbitrary_resources.try_build()?;
-        insert_task_resource_types(&mut resources);
+        insert_sirius_specific_resource_types(&mut resources);
 
         let mut query_engine = self.query_engine.try_build()?;
-        let mut tasks = HashMap::default();
 
+        let mut tasks = HashMap::default();
         for (task_id, task_builder) in self.tasks.into_iter() {
             let task = task_builder.try_build()?;
             for usage in task.usages() {
@@ -591,6 +651,40 @@ impl SiriusModelBuilder {
             tasks.insert(task_id, task);
         }
 
+        let mut data_batches = HashMap::default();
+        for (data_batch_id, data_batch_builder) in self.data_batches.into_iter() {
+            match data_batch_builder.try_build() {
+                Ok(data_batch) => {
+                    for usage in data_batch.usages() {
+                        let resource_type_name = resources
+                            .resource(usage.resource_id())?
+                            .type_name()
+                            .to_owned();
+                        let set = &mut resources
+                            .resource_types
+                            .get_mut(&resource_type_name)
+                            .unwrap()
+                            .used_by;
+                        if !set.contains(data_batch.type_name()) {
+                            set.insert(data_batch.type_name().to_owned());
+                        }
+                    }
+                    if let Some(operator_id) = data_batch.producer_pipeline_uuid() // Sirius Pipeline Uuid is Quent Operator Id
+                        && let Some(data_batch_span) = data_batch.active_span()
+                        && let Some(operator) = query_engine.operators.get_mut(&operator_id)
+                    {
+                        operator.active_span = Some(match operator.active_span() {
+                            None => data_batch_span,
+                            Some(existing) => existing.extend(&data_batch_span),
+                        });
+                    }
+
+                    data_batches.insert(data_batch_id, data_batch);
+                }
+                Err(e) => warn!("Invalid data_batch encountered {e}"),
+            }
+        }
+
         let mut batches = HashMap::default();
         for (batch_id, batch_builder) in self.batches.into_iter() {
             let batch = batch_builder.try_build()?;
@@ -617,6 +711,7 @@ impl SiriusModelBuilder {
             query_engine,
             arbitrary_resources: resources,
             tasks,
+            data_batches,
             batches,
             resource_group_types: HashMap::default(),
         };
@@ -641,6 +736,7 @@ impl SiriusModelBuilder {
             query_engine: temp_model.query_engine,
             arbitrary_resources: temp_model.arbitrary_resources,
             tasks: temp_model.tasks,
+            data_batches: temp_model.data_batches,
             batches: temp_model.batches,
             resource_group_types,
         })

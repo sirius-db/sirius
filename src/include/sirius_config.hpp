@@ -94,6 +94,34 @@ struct operator_params {
   /// L4 in the issue #510 microbenchmark, defaulted higher to stay conservative). Set to 0 to
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
+  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a
+  /// runtime membership filter (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan,
+  /// which applies it post-decode to drop non-matching rows before the join. On by default; the
+  /// master switch for the feature.
+  bool enable_dynamic_filter_pushdown = true;
+
+  /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
+  /// for READ-time row-group pruning at the probe scan. Off by default and requires
+  /// enable_dynamic_filter_pushdown: on TPC-H-shaped joins DuckDB's static transitive-predicate
+  /// pushdown already prunes range-derivable builds, and scattered keys prune nothing, so the
+  /// zone-map only pays off on clustered-keyset joins whose narrow key range is runtime-determined.
+  bool enable_dynamic_zone_map_filter = false;
+
+  /// Skip publishing a key's dynamic filters when the build covers at least this fraction of the
+  /// key's domain (rows gate and zone-map range gate). Values >= 1.0 effectively disable the gate.
+  double dynamic_filter_domain_coverage_threshold = 0.9;
+
+  /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split
+  /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
+  /// [0, 1]; 1.0 keeps filtering always on.
+  double dynamic_filter_keep_threshold = 0.9;
+
+  /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
+  /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
+  /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
+  /// off carries no zone maps and cannot prune until re-pinned with the flag on.
+  bool enable_pinned_zone_map_pruning = true;
 };
 
 struct telemetry_config {

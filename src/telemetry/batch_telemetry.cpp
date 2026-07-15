@@ -24,7 +24,7 @@
 
 #include <cucascade/data/data_batch.hpp>
 
-#include <fmt/format.h>
+#include <format>
 
 #include <array>
 #include <atomic>
@@ -265,7 +265,7 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
   std::lock_guard lock(shard.mutex);
   auto handle = quent::batch::create(impl_->context->context(),
                                      {
-                                       .instance_name = fmt::format("batch-{}", snap->batch_id),
+                                       .instance_name = std::format("batch-{}", snap->batch_id),
                                        .batch_id      = snap->batch_id,
                                        .pipeline_uuid = port.pipeline_uuid,
                                        .port_uuid     = port.port_uuid,
@@ -325,7 +325,7 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
     // packaged.
     auto handle = quent::batch::create(impl_->context->context(),
                                        {
-                                         .instance_name = fmt::format("batch-{}", snap->batch_id),
+                                         .instance_name = std::format("batch-{}", snap->batch_id),
                                          .batch_id      = snap->batch_id,
                                          .pipeline_uuid = consumer_pipeline_uuid,
                                          .port_uuid     = uuid::new_nil(),

@@ -31,9 +31,9 @@ proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "parsing"] }
 substrait = "0.63.0"
-substrait-explain = "0.6.0"
+substrait-explain = "0.7.0"
 thiserror = "2"
-thrift = "0.23"
+thrift = "0.24"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
@@ -79,3 +79,8 @@ proc-macro2.workspace = true
 prost-build.workspace = true
 quote.workspace = true
 syn.workspace = true
+
+[dev-dependencies]
+# The engine integration test builds a local_files Substrait plan + a parquet fixture.
+substrait.workspace = true
+tempfile = "3"

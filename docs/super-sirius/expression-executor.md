@@ -1,29 +1,29 @@
-# Expression Executor
+# Expression Evaluator
 
-This document covers the GPU expression execution subsystem used by FILTER and PROJECTION operators.
+This document covers the GPU expression-evaluation subsystem used by FILTER and PROJECTION operators.
 
 ## Overview
 
-**File:** `src/include/expression_executor/gpu_expression_executor.hpp`
+**File:** `src/include/expression_evaluator/expression_evaluator.hpp`
 
-`gpu_expression_executor` evaluates expressions on the GPU using the Sirius AST type hierarchy (see [Sirius AST Type Hierarchy](#sirius-ast-type-hierarchy)). It provides two execution modes:
+`expression_evaluator` evaluates expressions on the GPU using the Sirius AST type hierarchy (see [Sirius AST Type Hierarchy](#sirius-ast-type-hierarchy)). It provides two public table operations:
 
-> **API boundary:** `sirius::ast::node` is the single expression currency at every operator, planner, and executor boundary. Operators own their expressions directly as `std::unique_ptr<sirius::ast::node>` (e.g. a projection's `select_list`, a table scan's `filter_expr`), and `sirius::join_condition` holds its `left`/`right` sides as `std::unique_ptr<sirius::ast::node>`. DuckDB expressions are translated to Sirius AST once, at the planner/scan boundary, via `sirius::ast::from_duckdb(duckdb::Expression const&)`. There is no wrapper type between DuckDB and Sirius's expression IR, so neither `duckdb/planner/expression/...` nor an opaque handle appears on the operator surface — only `sirius::ast::node`.
+> **API boundary:** `sirius::ast::node` is the single expression currency at every operator, planner, and evaluator boundary. Operators own their expressions directly as `std::unique_ptr<sirius::ast::node>` (e.g. a projection's `select_list`, a table scan's `filter_expr`), and `sirius::join_condition` holds its `left`/`right` sides as `std::unique_ptr<sirius::ast::node>`. DuckDB expressions are translated to Sirius AST once, at the planner/scan boundary, via `sirius::ast::from_duckdb(duckdb::Expression const&)`. There is no wrapper type between DuckDB and Sirius's expression IR, so neither `duckdb/planner/expression/...` nor an opaque handle appears on the operator surface — only `sirius::ast::node`.
 
 | Method | Purpose | Used By |
 |--------|---------|---------|
-| `execute(input)` | Projects: evaluates expressions and returns result columns with all rows | PROJECTION |
+| `evaluate(input)` | Projects: evaluates expressions and returns result columns with all rows | PROJECTION |
 | `select(input)` | Filters: evaluates a boolean expression and returns only rows that pass | FILTER |
 
 Both methods accept a `cudf::table_view` and return a new `cudf::table` with the result. The `rmm::cuda_stream_view` and memory resource are passed to the constructor and stored as members — they are not per-call arguments.
 
-The executor can be constructed from a `duckdb::vector<std::unique_ptr<sirius::ast::node>>` (the full operator expression list), from a single `sirius::ast::node`, from a non-owning `sirius::ast::node const*`, or from a non-owning `std::vector<sirius::ast::node const*>`. The PROJECTION operator uses the non-owning vector form to pass only the entries that actually need evaluation, after pulling out pure BOUND_REF passthroughs that it exposes as zero-copy views (see [operators](operators.md)). `execute()` returns one output column per supplied expression, in order. If a slot is ever null (an unsupported expression that `from_duckdb` could not translate), the executor throws `InternalException` rather than dereferencing it.
+The evaluator can be constructed from a `duckdb::vector<std::unique_ptr<sirius::ast::node>>` (the full operator expression list), from a single `sirius::ast::node`, from a non-owning `sirius::ast::node const*`, or from a non-owning `std::vector<sirius::ast::node const*>`. The PROJECTION operator uses the non-owning vector form to pass only the entries that actually need evaluation, after pulling out pure BOUND_REF passthroughs that it exposes as zero-copy views (see [operators](operators.md)). `evaluate()` returns one output column per supplied expression, in order. If a slot is ever null (an unsupported expression that `from_duckdb` could not translate), the evaluator throws `InternalException` rather than dereferencing it.
 
 ## Sirius AST Type Hierarchy
 
 **Files:** `src/include/expression/ast/node.hpp`, `src/include/expression/ast/*.hpp`
 
-`sirius::ast::node` is a `std::variant`-based sum type over all Sirius expression node kinds. It is the sole expression representation passed across operator, planner, and executor boundaries, and the type the executor dispatches on via `std::visit`.
+`sirius::ast::node` is a `std::variant`-based sum type over all Sirius expression node kinds. It is the sole expression representation passed across operator, planner, and evaluator boundaries, and the type the evaluator dispatches on via `std::visit`.
 
 ```cpp
 struct node {
@@ -76,9 +76,9 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 
 ## Execution Strategies
 
-**File:** `src/include/expression_executor/expression_executor_strategy.hpp`
+**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
 
-The executor supports three strategies, selected via the `strategy` constructor parameter (default from `duckdb::Config::EXPRESSION_EXECUTOR_STRATEGY`):
+The evaluator supports three strategies, selected via the `strategy` constructor parameter (default from `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`):
 
 | Strategy | How it executes | cuDF API |
 |----------|-----------------|----------|
@@ -88,26 +88,26 @@ The executor supports three strategies, selected via the `strategy` constructor 
 
 ### Tree of AST Trees
 
-Not every DuckDB expression has a cuDF AST equivalent — these are called **AST breakers** (e.g. `CASE`, `LIKE`, `SUBSTRING`, unsupported `CAST` types). For AST strategies, the executor walks the DuckDB expression and greedily builds AST subtrees up to each breaker. When it hits a breaker, it materializes that subtree as a `cudf::column`, stashes it internally, and references it from the enclosing AST subtree via a `cudf::ast::column_reference`.
+Not every DuckDB expression has a cuDF AST equivalent — these are called **AST breakers** (e.g. `CASE`, `LIKE`, `SUBSTRING`, unsupported `CAST` types). For AST strategies, the evaluator walks the DuckDB expression and greedily builds AST subtrees up to each breaker. When it hits a breaker, it materializes that subtree as a `cudf::column`, stashes it internally, and references it from the enclosing AST subtree via a `cudf::ast::column_reference`.
 
-The result is a tree of AST trees whose edges are AST breakers. Each AST tree is evaluated by `cudf::compute_column` (or `compute_column_jit`) in `execute_ast()`.
+The result is a tree of AST trees whose edges are AST breakers. Each AST tree is evaluated by `cudf::compute_column` (or `compute_column_jit`) in `evaluate_ast()`.
 
 ### `min_ast_size` — per-subtree mode selection
 
-An AST subtree with only one operator gains little from AST execution and would pay the launch overhead of `compute_column`. The `min_ast_size` constructor parameter (default `2`) sets the threshold: before adding a subtree to the AST tree, the executor calls `count_ast_ops()` on it; if the count is below `min_ast_size`, the subtree is evaluated operator-by-operator in MATERIALIZE mode instead.
+An AST subtree with only one operator gains little from AST execution and would pay the launch overhead of `compute_column`. The `min_ast_size` constructor parameter (default `2`) sets the threshold: before adding a subtree to the AST tree, the evaluator calls `cudf_ast_op_count()` on it; if the count is below `min_ast_size`, the subtree is evaluated operator-by-operator in MATERIALIZE mode instead.
 
 This means `MATERIALIZE` strategy is effectively `AST_INTERPRET` with `min_ast_size = ∞`.
 
-### `execution_mode` (internal)
+### `evaluation_mode` (internal)
 
-Internal to the executor, each node is evaluated with either `execution_mode::AST` or `execution_mode::MATERIALIZE`. This is a **hint** — if a node tagged AST turns out to be a breaker, it is evaluated in MATERIALIZE mode anyway (and wrapped via `materialize_as_ast_column()` so the parent still sees an AST reference).
+Internal to the evaluator, each node is evaluated with either `evaluation_mode::AST` or `evaluation_mode::MATERIALIZE`. This is a **hint** — if a node tagged AST turns out to be a breaker, it is evaluated in MATERIALIZE mode anyway (and wrapped via `materialize_as_ast_column()` so the parent still sees an AST reference).
 
 ### Setting the strategy
 
 The strategy is a DuckDB SET variable registered in `src/sirius_extension.cpp`:
 
 ```sql
-SET expression_executor_strategy = 'ast_jit';   -- or 'ast_interpret', 'materialize'
+SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materialize'
 ```
 
 ## Supported Expression Types
@@ -133,9 +133,9 @@ SET expression_executor_strategy = 'ast_jit';   -- or 'ast_interpret', 'material
 
 ### String concatenation
 
-String concatenation — both the `||` operator (`col || ' suffix'`) and the `concat(a, b, …)` function — resolves to `function_id::concat` (DuckDB lowers `||` to a function named `"||"`, which maps to the same id as `"concat"`). It is dispatched as a materialize-only function in `gpu_execute_function.cpp`: every argument is materialized, any scalar argument is broadcast to a full-length column via `cudf::make_column_from_scalar`, and the columns are joined with `cudf::strings::concatenate` using an empty separator. The narep scalar is invalid (null), giving standard SQL null propagation — any NULL input produces a NULL output.
+String concatenation — both the `||` operator (`col || ' suffix'`) and the `concat(a, b, …)` function — resolves to `function_id::concat` (DuckDB lowers `||` to a function named `"||"`, which maps to the same id as `"concat"`). It is dispatched as a materialize-only function in `src/expression_evaluator/specializations/function.cpp`: every argument is materialized, any scalar argument is broadcast to a full-length column via `cudf::make_column_from_scalar`, and the columns are joined with `cudf::strings::concatenate` using an empty separator. The narep scalar is invalid (null), giving standard SQL null propagation — any NULL input produces a NULL output.
 
-Per-expression-type dispatch lives in `src/expression_executor/specializations/` (one file per Sirius AST alternative: `gpu_execute_comparison.cpp`, `gpu_execute_case.cpp`, etc.). Each specialization decides how to emit cuDF AST nodes, materialize, or fall back based on the effective execution mode.
+Per-expression-type dispatch lives in `src/expression_evaluator/specializations/` (one file per Sirius AST alternative: `comparison.cpp`, `case.cpp`, etc.). Each specialization decides how to emit cuDF AST nodes, materialize, or fall back based on the effective evaluation mode.
 
 ### AST-Eligible Operations
 
@@ -153,9 +153,9 @@ Anything outside this set is an AST breaker and forces materialization at that n
 
 ## GPU Expression Translator
 
-**File:** `src/include/expression_executor/gpu_expression_translator_internal.hpp`
+**File:** `src/include/expression_evaluator/gpu_expression_translator_internal.hpp`
 
-`gpu_expression_translator` is a **separate** utility that converts Sirius AST expressions into standalone cuDF AST trees for operators that need compiled expression evaluation outside the executor — primarily mixed joins and parquet filter pushdown.
+`gpu_expression_translator` is a **separate** utility that converts Sirius AST expressions into standalone cuDF AST trees for operators that need compiled expression evaluation outside the evaluator — primarily mixed joins and parquet filter pushdown.
 
 ```cpp
 struct translated_expression {
@@ -196,13 +196,13 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass inequalit
 
 | File | Purpose |
 |------|---------|
-| `src/include/expression_executor/gpu_expression_executor.hpp` | Main executor class |
-| `src/expression_executor/gpu_expression_executor.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
-| `src/expression_executor/specializations/gpu_execute_*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
-| `src/include/expression_executor/expression_executor_strategy.hpp` | `expression_executor_strategy` enum + string conversions |
-| `src/include/expression_executor/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
-| `src/include/expression_executor/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |
-| `src/expression_executor/gpu_expression_translator.cpp` | Translator implementation |
+| `src/include/expression_evaluator/expression_evaluator.hpp` | Main evaluator class |
+| `src/expression_evaluator/expression_evaluator.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
+| `src/expression_evaluator/specializations/*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
+| `src/include/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
+| `src/include/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
+| `src/include/expression_evaluator/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |
+| `src/expression_evaluator/gpu_expression_translator.cpp` | Translator implementation |
 | `src/include/expression/ast/node.hpp` | `sirius::ast::node` variant; per-alternative headers included from here |
 | `src/include/expression/ast/from_duckdb.hpp` | `sirius::ast::from_duckdb` — DuckDB → Sirius AST translation |
 | `src/include/expression/ast/utils.hpp` | AST tree utilities — `visit_references`, `clone`, `substitute_references` |

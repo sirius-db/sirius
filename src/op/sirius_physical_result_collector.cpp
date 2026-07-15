@@ -18,6 +18,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <config.hpp>
+#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
@@ -79,9 +81,11 @@ void sirius_physical_result_collector::build_pipelines(
   // operator is a sink, build a pipeline
   D_ASSERT(children.empty());
 
-  // single operator: the operator becomes the data source of the current pipeline
+  // RESULT_COLLECTOR is both the root of `current` (appended here, operators[0]
+  // post-reverse) and the sink of its own child_meta (pre-populated by
+  // create_child_meta_pipeline).
   auto& state = meta_pipeline.get_state();
-  state.set_pipeline_source(current, *this);
+  state.add_pipeline_operator(current, *this);
 
   // we create a new pipeline starting from the child
   auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -91,9 +95,9 @@ void sirius_physical_result_collector::build_pipelines(
 sirius_physical_materialized_collector::sirius_physical_materialized_collector(
   ::sirius::sirius_prepared_statement_data& data, duckdb::ClientContext& client_ctx)
   : sirius_physical_result_collector(data),
-    _client_ctx(client_ctx),
     result_collection(
-      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, sirius::to_duckdb_vec(types)))
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, sirius::to_duckdb_vec(types))),
+    _client_ctx(client_ctx)
 {
 }
 
@@ -159,9 +163,32 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
 
+      auto host_reservation =
+        const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(
+          data->get_size_in_bytes());
+
       // clone_to: creates new batch with data converted to host_data_representation
-      auto result_batch = ro.clone_to<cucascade::host_data_representation>(
-        registry, next_batch_id, mem_space, stream);
+      if (host_reservation == nullptr) {
+        SIRIUS_LOG_WARN(
+          "sirius_physical_materialized_collector: host reservation failed for batch {} ({} "
+          "bytes) — proceeding without reservation, converter may OOM",
+          ro.get_batch_id(),
+          data->get_size_in_bytes());
+      }
+      auto result_batch =
+        host_reservation != nullptr
+          ? ro.clone_to<cucascade::host_data_representation>(
+              registry,
+              next_batch_id,
+              *host_reservation,
+              stream,
+              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id))
+          : ro.clone_to<cucascade::host_data_representation>(
+              registry,
+              next_batch_id,
+              mem_space,
+              stream,
+              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.

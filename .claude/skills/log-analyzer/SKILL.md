@@ -42,7 +42,8 @@ python3 tools/log_analyzer/parse_logs.py <log_file> [--out <dir>]
 <out>/
 ├── _index.csv                  # one row per analytical query kept (select/with only)
 ├── _summary.json               # counts + complete_queries / incomplete_queries lists + format warnings
-├── _pipeline_aggregates.csv    # one row per (query, pipeline_id) — the workhorse table
+├── _pipeline_aggregates.csv    # one row per (query, pipeline_id) — pipeline window, operator_types, output/timing sums, all memory metrics
+├── _operator_aggregates.csv    # one row per (query, pipeline_id, operator_id) — per-operator input/output/timing sums, ordered by run order within each pipeline
 └── <ts>/                       # one folder per query, e.g. 2026-05-20_14-41-37.879
     ├── query.sql               # Full SQL text from the log
     ├── query_meta.json         # begin/end ts, duration, status (complete | incomplete)
@@ -84,7 +85,7 @@ Ask the user which query if it's not obvious, or surface the slowest / failed ca
 
 See `references/single_query.md` for the full playbook. Quick summary of the analyses worth running on every query:
 
-1. **Operator time attribution** — which operators dominate? Use `_pipeline_aggregates.csv` (`sum_execution_time_ms`, `max_execution_time_ms`) joined to the pipeline plan to attribute time per operator type.
+1. **Operator time attribution** — which operators dominate? Use `_operator_aggregates.csv` (`sum_execution_time_ms`, `max_execution_time_ms` per `operator_id`/`operator_type`) — it gives per-operator timing directly, no join to the plan needed. `_pipeline_aggregates.csv` has the pipeline-wide roll-up.
 2. **Pipeline gap analysis** — for each pipeline, the gap from the previous pipeline's `pipeline_end` to this one's `pipeline_begin`. Large gaps point at pipeline breakers (`barrier: FULL` in the plan) or scheduler stalls.
 3. **Memory pressure** — read `memory_reservations.csv` over time; `memory_available` dropping toward zero (and `total_reserved` approaching `max_pool`) means we got close to OOM and are likely thrashing.
 4. **Downgrade detection** — read `downgrades.csv` directly. Each row is one satisfied downgrade request and carries the source tier (`GPU:N`, `HOST:-1`, etc.), `total_bytes`, `duration_ms`, throughput, and the `to_host` / `to_disk` split. Sum `total_bytes` by `source_tier` to answer "how much was evicted from GPUs vs from host." A handful is normal under pressure; a lot — especially `HOST→DISK` rows — is a red flag, downgrade is expensive.
@@ -192,11 +193,12 @@ After you've localized the issue, recommend the right next step:
 | Which queries are in this log? | `_index.csv`, `_summary.json` |
 | What operators does query X have? | `<folder>/pipeline_plan.json -> counts.operator_types` |
 | Which pipeline does operator id=N live in? | `<folder>/pipeline_plan.json -> operator_index` |
-| Per-operator execution time | `<folder>/task_outputs.csv` (per-task) or `_pipeline_aggregates.csv` (per-pipeline) |
+| Per-operator execution time | `_operator_aggregates.csv` (per-operator, aggregated) or `<folder>/task_outputs.csv` (per-task) |
 | Memory low-water mark | `<folder>/memory_reservations.csv -> memory_available` |
 | Downgrade events (bytes evicted, source tier, where it went) | `<folder>/downgrades.csv` |
 | Re-materialized inputs after a downgrade (per-task view) | `<folder>/memory_history.csv -> peak_bytes_to_materialize_input > 0` |
 | Per-pipeline summary across one query | filter `_pipeline_aggregates.csv` by `query_begin_ts` |
+| Per-operator summary across one query | filter `_operator_aggregates.csv` by `query_begin_ts` |
 | How well work was balanced across GPUs (multi-GPU runs) | group `task_outputs.csv` by `gpu_id` (per pipeline or per operator type); see `references/single_query.md` § "GPU balance" |
 | Host (pinned) pool memory at query start/end | `<folder>/query_meta.json -> pool_stats.host` |
 | GPU device memory pool at query start/end (per GPU) | `<folder>/query_meta.json -> pool_stats.gpu[]` |

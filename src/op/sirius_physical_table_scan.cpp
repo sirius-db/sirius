@@ -111,10 +111,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   auto& input                  = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& ro_input_batches = input.get_read_only_batches();
 
-  // For parquet scan pipelines, filter and projection are already applied in
-  // parquet_scan_task and the host_parquet_representation converters.
-  // Also, only parquet file tails are small due to the partitioning logic, so batch concatenation
-  // is not needed.
+  // Passthrough inputs arrive with filter and projection already applied upstream, in
+  // batches small enough that concatenation is not needed.
   if (passthrough) {
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
@@ -143,7 +141,11 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       auto concatenated = cudf::concatenate(table_views, stream, space->get_default_allocator());
       auto concat_rep   = std::make_unique<cucascade::gpu_table_representation>(
         std::move(concatenated), *space, stream);
-      single_batch = cucascade::data_batch::make(0, std::move(concat_rep));
+      size_t const batch_id = get_next_batch_id();
+      single_batch          = cucascade::data_batch::make(
+        batch_id,
+        std::move(concat_rep),
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
     }
   }
 
@@ -167,8 +169,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       *local_filter_expr, cudf::get_current_device_resource_ref(), stream);
     auto filtered_table = evaluator.select(
       batch_ref.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
-    output_batch =
-      sirius::make_data_batch(std::move(filtered_table), *batch_ref.get_memory_space(), stream);
+    output_batch = sirius::make_data_batch(
+      std::move(filtered_table), *batch_ref.get_memory_space(), stream, batch_telemetry());
   } else {
     output_batch = ::cucascade::data_batch::to_idle(std::move(batch_ref));
   }
@@ -237,7 +239,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     std::size_t const referenced_bytes = sirius::estimate_referenced_column_bytes(
       input_view, referenced_indices, output_ro.get_data()->get_size_in_bytes());
     output_batch = sirius::make_data_batch_from_view(
-      projected_view, std::move(output_ro), referenced_bytes, *space, stream);
+      projected_view, std::move(output_ro), referenced_bytes, *space, stream, batch_telemetry());
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;

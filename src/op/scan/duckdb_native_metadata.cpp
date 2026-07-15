@@ -28,6 +28,7 @@
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/block_manager.hpp>
+#include <duckdb/storage/segment/uncompressed.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 #include <duckdb/storage/storage_manager.hpp>
@@ -296,6 +297,15 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
                std::to_string(rg_idx) + ": Max String Length stat absent from segment stats";
       }
       desc.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+      // Stats-drift guard: a marker-bearing segment must never reach the GPU string
+      // decoder. Mirrors the refusal in prepare_duckdb_native_walk (see rationale there).
+      if (*desc.max_string_length >=
+          duckdb::StringUncompressed::GetStringBlockLimit(segment.GetBlockSize())) {
+        return "varchar segment on column " + std::to_string(column_id) + " row group " +
+               std::to_string(rg_idx) +
+               ": max string length reaches the overflow-block limit; overflow strings are not "
+               "GPU-decodable";
+      }
     }
     col_md.data_segments.push_back(std::move(desc));
   }
@@ -350,9 +360,10 @@ void compute_segment_bytes_size(std::vector<duckdb_row_group_metadata>& row_grou
 
 /// @brief Check if the filter can be applied to row-group pruning.
 ///
-/// The only filter type we must exclude from statistics pruning is DYNAMIC_FILTER:
-/// its bounds come from a runtime source (e.g. a hash-join build) and are not
-/// currently populated at metadata-walk time.
+/// This DuckDB-native statistics walker only consumes the static payloads represented directly by
+/// DuckDB @c TableFilter nodes. @c DYNAMIC_FILTER is a routing placeholder, while Sirius runtime
+/// join filters use their own publication channel and scan-consumer paths, so it is not translated
+/// by this walker.
 bool filter_is_prunable(duckdb::TableFilterType t)
 {
   return t != duckdb::TableFilterType::DYNAMIC_FILTER;
@@ -557,9 +568,49 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
       plan.pruned_row_groups,
       plan.pruned_decoded_bytes);
   }
+  // A fully-pruned table (every row group removed by filter stats) is viable: the
+  // ranges walk yields empty row-group lists, and the coalescer's empty-batch
+  // fallback emits one schema-correct 0-row split so the scan still creates a task
+  // and the pipeline completes (mirrors the parquet all-pruned path). Refusing here
+  // instead throws "duckdb-native scan rejected query" and hangs the query.
   if (plan.n_row_groups > 0 && plan.pruned_row_groups == plan.n_row_groups) {
-    refuse("no row groups in table (empty or fully pruned)");
-    return plan;
+    SIRIUS_LOG_DEBUG(
+      "[duckdb_native_metadata] all {} row groups stats-pruned; scan yields an "
+      "empty result via the coalescer fallback",
+      plan.n_row_groups);
+  }
+
+  // Overflow (big-string) refusal. The UNCOMPRESSED codec stores any single string
+  // at/over StringUncompressed::GetStringBlockLimit in an overflow block, leaving a
+  // BIG_STRING_MARKER the GPU string decoder would silently emit as string content.
+  // The stat is a per-string max, so stat < limit proves a row group marker-free.
+  // Conservative for DICT_FSST, which inlines strings up to 16 KiB
+  // (DictFSSTCompression::STRING_SIZE_LIMIT) without markers — codecs are invisible
+  // in row-group stats, so its limit..16 KiB row groups are refused unnecessarily
+  // (rare in practice).
+  auto const overflow_limit = duckdb::StringUncompressed::GetStringBlockLimit(plan.block_size);
+  for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+    if (projected_cols[ci].is_rowid || !projected_types[ci].is_varchar()) { continue; }
+    auto const& storage_idx = projected_cols[ci].storage_idx;
+    for (std::size_t rg = 0; rg < plan.n_row_groups; ++rg) {
+      if (plan.row_group_pruned_by_stats[rg]) { continue; }  // pruned -> never decoded
+      if (rg >= plan.partition_row_groups.size() || !plan.partition_row_groups[rg]) { continue; }
+      auto stats = plan.partition_row_groups[rg]->GetColumnStatistics(storage_idx);
+      if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats)) {
+        refuse("row group " + std::to_string(rg) + " varchar column " +
+               std::to_string(storage_idx.GetPrimaryIndex()) +
+               ": max-string-length stat absent; cannot rule out overflow strings");
+        return plan;
+      }
+      auto const max_len = duckdb::StringStats::MaxStringLength(*stats);
+      if (max_len >= overflow_limit) {
+        refuse("row group " + std::to_string(rg) + " varchar column " +
+               std::to_string(storage_idx.GetPrimaryIndex()) + ": max string length " +
+               std::to_string(max_len) + " reaches the overflow-block limit (" +
+               std::to_string(overflow_limit) + "); overflow strings are not GPU-decodable");
+        return plan;
+      }
+    }
   }
 
   plan.viable = true;

@@ -14,39 +14,38 @@
  * limitations under the License.
  */
 
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 
 #include <exception>
+#include <format>
 #include <source_location>
 #include <string>
 #include <string_view>
 
 inline void log_exception_helper(const std::source_location& loc)
 {
-  spdlog::source_loc spd_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
+  auto sink = sirius::log::get_sink();
   try {
     throw;
   } catch (const std::exception& e) {
-    spdlog::log(spd_loc, spdlog::level::err, "Exception caught: {}", e.what());
+    sink->log(sirius::log::level::error, loc, std::format("Exception caught: {}", e.what()));
   } catch (...) {
-    spdlog::log(spd_loc, spdlog::level::err, "UNKNOWN exception caught");
+    sink->log(sirius::log::level::error, loc, "UNKNOWN exception caught");
   }
 }
 
 template <typename... Args>
 void log_exception_helper(const std::source_location& loc, std::string_view fmt_str, Args&&... args)
 {
-  spdlog::source_loc spd_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
-
-  // Formats your string cleanly using v1.8.5 syntax
-  std::string user_msg = fmt::vformat(fmt_str, fmt::make_format_args(args...));
+  auto sink            = sirius::log::get_sink();
+  std::string user_msg = std::vformat(fmt_str, std::make_format_args(args...));
 
   try {
     throw;
   } catch (const std::exception& e) {
-    spdlog::log(spd_loc, spdlog::level::err, "{}: {}", user_msg, e.what());
+    sink->log(sirius::log::level::error, loc, std::format("{}: {}", user_msg, e.what()));
   } catch (...) {
-    spdlog::log(spd_loc, spdlog::level::err, "{}: UNKNOWN exception", user_msg);
+    sink->log(sirius::log::level::error, loc, std::format("{}: UNKNOWN exception", user_msg));
   }
 }
 

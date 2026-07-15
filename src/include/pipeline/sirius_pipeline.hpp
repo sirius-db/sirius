@@ -38,6 +38,10 @@ namespace creator {
 class task_creator;
 }  // namespace creator
 
+namespace telemetry {
+class telemetry_context;
+}  // namespace telemetry
+
 namespace pipeline {
 
 class sirius_pipeline;
@@ -57,6 +61,12 @@ class sirius_pipeline_build_state {
   sirius::reference_map_t<const op::sirius_physical_operator,
                           std::reference_wrapper<sirius_pipeline>>
     cte_dependencies;
+  //! CTE_SCAN → consumer pipeline, populated by
+  //! `sirius_physical_column_data_scan::build_pipelines`. CTE_SCAN never lands in any pipeline's
+  //! `operators[]`, so tree-based wiring resolves consumers through this map, not `dest_for_op`.
+  sirius::reference_map_t<const op::sirius_physical_operator,
+                          std::reference_wrapper<sirius_pipeline>>
+    cte_scan_consumers;
 
  public:
   void set_pipeline_source(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
@@ -182,6 +192,14 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   [[nodiscard]] std::unique_lock<std::mutex> get_task_creation_lock();
 
   [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
+
+  //! The SiriusContext-wide telemetry context carried in this pipeline's build
+  //! context (set at convert time in sirius_engine). Operators read it via
+  //! sirius_physical_operator::get_telemetry_context() to build data_batch probes.
+  [[nodiscard]] const telemetry::telemetry_context* get_telemetry_context() const
+  {
+    return build_ctx_.telemetry_context().get();
+  }
 
  private:
   //! Whether or not the pipeline has been readied

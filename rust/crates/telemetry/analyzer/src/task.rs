@@ -15,9 +15,9 @@ use quent_analyzer::{
         events::{FsmEvents, FsmEventsBuilder},
     },
 };
+use quent_query_engine_ui::OperatorFilter;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
-use quent_query_engine_ui::OperatorFilter;
 use uuid::Uuid;
 
 /// The reconstructed Task FSM.
@@ -65,6 +65,12 @@ impl TaskExt for Task {
         SpanUnixNanoSec::try_new(start, end).ok()
     }
 
+    // NOTE(merge): upstream (#1112) surfaced per-transition attributes and
+    // derived attributes (bytes_per_sec, pipeline name) here, but the quent
+    // revision this branch builds against ([patch] to the local quent
+    // worktree) has no `attributes`/`derived_attributes` fields on
+    // `FsmTransition` yet. Restore the attribute surfacing when quent grows
+    // those fields.
     fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine> {
         let transitions = self
             .transitions()

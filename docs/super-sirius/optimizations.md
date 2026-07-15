@@ -11,7 +11,7 @@ This document catalogs Super Sirius performance optimizations by category. Each 
 **Mechanism:** `determine_num_partitions()` computes partition count from actual input data size:
 ```
 total_bytes = sum of all batch sizes from input repository
-num_partitions = max(1, total_bytes / hash_partition_bytes)
+num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 ```
 
 **Code path:** `src/op/sirius_physical_partition.cpp` — `determine_num_partitions()`
@@ -36,7 +36,7 @@ num_partitions = max(1, total_bytes / hash_partition_bytes)
 3. **MERGE_SORT**: Multi-way merge of pre-sorted partitions via `cudf::merge_order_by()`
 
 **Code path:**
-- `src/pipeline/sirius_pipeline_converter.cpp` — `split_order_by_sink()` (pipeline splitting)
+- `src/planner/sirius_physical_plan_generator.cpp` — `wrap_order_by()` (plan-time sort chain insertion)
 - `src/op/sirius_physical_sort_sample.cpp` — boundary computation
 - `src/op/sirius_physical_sort_partition.cpp` — range partitioning
 - `src/op/sirius_physical_merge_sort.cpp` — multi-way merge
@@ -47,9 +47,9 @@ num_partitions = max(1, total_bytes / hash_partition_bytes)
 
 **Motivation:** Multi-partition sorting samples batches to compute partition boundaries. A fixed sample batch count does not scale with variable batch sizes, single-batch task input contradicted the multi-batch sample the hint waited for, and concatenating + fully re-sorting the sample wasted work because upstream ORDER_BY already emits locally sorted batches. Scheduling boundary computation with a CAS election also let losing tasks waste GPU work.
 
-**Mechanism:** `sirius_physical_sort_sample` overrides `get_next_task_input_data()` so the boundary task receives the full multi-batch sample the hint waited for. Sampling is byte-based: it pulls batches until `sort_sample_bytes` is reached (or upstream finishes), then merges the already-sorted sample batches with `gpu_merge_impl::merge_order_by` and computes boundaries from the merged run — no concatenate-and-full-sort. Boundary scheduling uses an explicit `NOT_DONE -> SCHEDULED -> DONE` state machine: `get_next_task_input_data()` claims the sample and moves to `SCHEDULED`, `get_next_task_hint()` returns `nullopt` while `SCHEDULED` so no duplicate boundary task is created, `execute()` moves to `DONE`, and OOM resets to `NOT_DONE` for retry. After boundaries are computed the operator falls back to single-batch passthrough.
+**Mechanism:** `sirius_physical_sort_sample` overrides `get_next_task_input_data()` so the boundary task receives the full multi-batch sample the hint waited for. Sampling is byte-based: it pulls batches until `sort_sample_bytes` is reached (or upstream finishes), then merges the already-sorted sample batches with `gpu_merge_impl::merge_order_by` and computes boundaries from the merged run — no concatenate-and-full-sort. When the sample contains the complete upstream input, its actual bytes determine the partition count; partial samples still extrapolate from estimated cardinality. Boundary scheduling uses an explicit `NOT_DONE -> SCHEDULED -> DONE` state machine: `get_next_task_input_data()` claims the sample and moves to `SCHEDULED`, `get_next_task_hint()` returns `nullopt` while `SCHEDULED` so no duplicate boundary task is created, `execute()` moves to `DONE`, and OOM resets to `NOT_DONE` for retry. After boundaries are computed the operator falls back to single-batch passthrough.
 
-**Code path:** `src/op/sirius_physical_sort_sample.cpp` — `get_next_task_input_data()`, `get_next_task_hint()`, `execute()`; `src/pipeline/sirius_pipeline_converter.cpp` — wiring `sort_sample_bytes` into SORT_SAMPLE
+**Code path:** `src/op/sirius_physical_sort_sample.cpp` — `get_next_task_input_data()`, `get_next_task_hint()`, `execute()`; `src/planner/sirius_physical_plan_generator.cpp` — wiring `sort_sample_bytes` into SORT_SAMPLE
 
 **Config:** `sort_sample_bytes` (default: 512 MB), settable via YAML and the `sort_sample_bytes` SET option
 
@@ -106,16 +106,16 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 ### Zero-Copy Projection Passthrough (PR #991)
 
-**Motivation:** A projection that simply re-references input columns (`SELECT a, c, a`) previously deep-copied every output column on device via the expression executor's BOUND_REF path, even though the data already lived on the GPU.
+**Motivation:** A projection that simply re-references input columns (`SELECT a, c, a`) previously deep-copied every output column on device via the expression evaluator's BOUND_REF path, even though the data already lived on the GPU.
 
 **Mechanism:** `sirius_physical_projection::execute()` classifies each `select_list` entry as a pure passthrough (`sirius::ast::reference`) or an expression to evaluate, then takes one of three paths per batch:
 1. **All evaluated:** owned `cudf::table` (unchanged).
 2. **All passthrough:** output is a `cudf::table_view` over the input columns, wrapped as a view-backed batch whose owner is the input's `read_only_data_batch` lock — **zero device copies**.
 3. **Mixed:** only the non-passthrough entries are evaluated; the output view mixes evaluated columns with input columns, jointly owned by the evaluated table (`shared_ptr<cudf::table>`) and the input lock.
 
-Only the entries needing evaluation are handed to the executor (its `std::vector<sirius::ast::node const*>` constructor), so passthrough columns are never materialized.
+Only the entries needing evaluation are handed to the evaluator (its `std::vector<sirius::ast::node const*>` constructor), so passthrough columns are never materialized.
 
-**Code path:** `src/op/sirius_physical_projection.cpp` — `execute()`; `src/include/data/data_batch_utils.hpp` — `make_data_batch_from_view()`; `src/include/expression_executor/gpu_expression_executor.hpp` — subset constructor.
+**Code path:** `src/op/sirius_physical_projection.cpp` — `execute()`; `src/include/data/data_batch_utils.hpp` — `make_data_batch_from_view()`; `src/include/expression_evaluator/expression_evaluator.hpp` — subset constructor.
 
 ### Adaptive MARK Join Build Side (PR #924)
 
@@ -133,7 +133,7 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 
 ### Projection Folding (PR #909)
 
-**Motivation:** Building a Sirius physical plan from DuckDB's logical plan inserts PROJECTION operators that DuckDB's optimizer never sees — for filter `projection_map` reordering, hoisted aggregate child/filter expressions, table-scan filter columns, and the user's SELECT list. Each PROJECTION is a full GPU pipeline stage that runs `gpu_expression_executor` over every batch and materializes an intermediate batch, so stacked projections evaluate expressions more than once.
+**Motivation:** Building a Sirius physical plan from DuckDB's logical plan inserts PROJECTION operators that DuckDB's optimizer never sees — for filter `projection_map` reordering, hoisted aggregate child/filter expressions, table-scan filter columns, and the user's SELECT list. Each PROJECTION is a full GPU pipeline stage that runs `expression_evaluator` over every batch and materializes an intermediate batch, so stacked projections evaluate expressions more than once.
 
 **Mechanism:** All planner projection creation goes through `push_projection()`, and a single `fold_adjacent_projections()` pass over the finished plan tree collapses any `PROJECTION -> PROJECTION` chain into one projection. Folding composes the two select lists with the AST helpers `visit_references()` (find which child outputs the outer list reads) and `substitute_references()` (rewrite outer references in terms of the inner projection's expressions), so the merged projection produces the same columns in one expression-evaluation stage.
 
@@ -223,7 +223,7 @@ Data is moved from GPU to HOST tier via converter registry.
 2. The AST is set on `parquet_reader_options` via `set_filter()`, pushing filtering into the cuDF reader
 3. `TABLE_SCAN` is set to passthrough (no GPU expression evaluation needed)
 
-If translation fails, filtering falls back to `gpu_expression_executor` on the decoded batch.
+If translation fails, filtering falls back to `expression_evaluator` on the decoded batch.
 
 **Code path:**
 - `src/op/scan/scan_utils.cpp` — `convert_table_filters_to_expression()`, `filter_row_groups_with_stats()`
@@ -346,3 +346,27 @@ If translation fails, filtering falls back to `gpu_expression_executor` on the d
 - `src/include/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
 
 **Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and reactor counts
+
+### Zone-Map Pruning on Pinned Chunks (PR #1154)
+
+**Motivation:** Warm scans previously replayed every pinned chunk, including chunks that a filter
+could not match. HOST-pinned chunks also paid an unnecessary H2D copy before being filtered out.
+
+**Mechanism:** At pin time, Sirius runs one min/max reduction for each supported column in every
+decoded chunk and stores the results with the pinned entry. This happens before GPU storage or
+HOST conversion, so both tiers use the same capture path.
+
+At cache-serve time, static pushed-down filters are checked with DuckDB's `CheckStatistics`.
+Chunks proven unable to match are omitted from the cached scan plan; on the HOST tier this also
+avoids their H2D copies. Runtime dynamic filters do not participate in this chunk-level pruning.
+
+Unsupported types or filters and missing statistics keep the chunk. If all chunks are pruned,
+chunk 0 is retained as a sentinel and emptied by the GPU filter so the pipeline still completes.
+
+**Code path:** `src/pin_table.cpp` captures the statistics;
+`src/scan_manager/pinned_chunk_stats.cpp` owns the statistics and safety checks; and
+`src/scan_manager/sirius_scan_manager.cpp` builds and serves the survivor plan.
+
+**Config:** `enable_pinned_zone_map_pruning` (default: `true`) is available through YAML and
+DuckDB `SET`. It gates both capture and pruning; entries pinned while it is disabled remain
+statless until re-pinned. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
