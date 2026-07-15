@@ -75,6 +75,33 @@ def copy_parquet_fixtures(source_dir: Path, out_dir: Path) -> list[Path]:
     return paths
 
 
+def copy_glob_parquet_fixtures(source_dir: Path, out_dir: Path) -> list[Path]:
+    """Create deterministic multi-file and hive-style parquet layouts for S3 glob tests."""
+    nation = source_dir / "nation.parquet"
+    region = source_dir / "region.parquet"
+    if not nation.is_file() or not region.is_file():
+        raise FileNotFoundError(
+            "nation.parquet and region.parquet are required for glob fixtures"
+        )
+
+    layout = [
+        (nation, out_dir / "glob" / "multi" / "nation_a.parquet"),
+        (nation, out_dir / "glob" / "multi" / "nation_b.parquet"),
+        (region, out_dir / "glob" / "multi" / "region.parquet"),
+        (nation, out_dir / "glob" / "hive" / "year=2024" / "nation.parquet"),
+        (nation, out_dir / "glob" / "hive" / "year=2025" / "nation.parquet"),
+        (nation, out_dir / "root_a.parquet"),
+        (nation, out_dir / "root_b.parquet"),
+    ]
+
+    paths: list[Path] = []
+    for src, dst in layout:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        paths.append(dst)
+    return paths
+
+
 def sha256_of(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -113,10 +140,16 @@ def main() -> int:
         "medium.bin",
         "small.parquet",
         "MANIFEST.sha256",
+        "root_glob.parquet",
+        "root_a.parquet",
+        "root_b.parquet",
     ):
         stale_path = out_dir / stale
         if stale_path.exists():
             stale_path.unlink()
+    stale_glob_dir = out_dir / "glob"
+    if stale_glob_dir.exists():
+        shutil.rmtree(stale_glob_dir)
 
     paths = [
         write_hello(out_dir),
@@ -124,6 +157,7 @@ def main() -> int:
         write_deterministic_bytes(out_dir / "medium.bin", MEDIUM_SIZE, MEDIUM_SEED),
     ]
     paths.extend(copy_parquet_fixtures(args.parquet_source, out_dir))
+    paths.extend(copy_glob_parquet_fixtures(args.parquet_source, out_dir))
 
     manifest_path = args.manifest or (out_dir / "MANIFEST.sha256")
     with manifest_path.open("w") as f:

@@ -16,11 +16,19 @@
 
 #pragma once
 
+#include "io/s3/s3_list_parser.hpp"
+
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
+
+namespace sirius::scan_manager {
+class sirius_scan_manager;
+}  // namespace sirius::scan_manager
 
 namespace sirius::io::s3 {
 
@@ -62,6 +70,15 @@ class sirius_httpfs : public duckdb::FileSystem {
     duckdb::FileOpenFlags flags,
     duckdb::optional_ptr<duckdb::FileOpener> opener = nullptr) override;
 
+  /// A valid LIST-provided @c "file_size" option (the non-negative BIGINT
+  /// @ref Glob attaches) selects the parquet footer probe, which resolves size
+  /// and stashes the suffix in one GET. Invalid metadata falls back to the
+  /// regular HEAD-based open.
+  duckdb::unique_ptr<duckdb::FileHandle> OpenFileExtended(
+    const duckdb::OpenFileInfo& file,
+    duckdb::FileOpenFlags flags,
+    duckdb::optional_ptr<duckdb::FileOpener> opener) override;
+
   void Read(duckdb::FileHandle& handle,
             void* buffer,
             int64_t nr_bytes,
@@ -71,8 +88,13 @@ class sirius_httpfs : public duckdb::FileSystem {
   int64_t GetFileSize(duckdb::FileHandle& handle) override;
   duckdb::timestamp_t GetLastModifiedTime(duckdb::FileHandle& handle) override;
 
-  /// Concrete-object only: returns @c {path} when @ref CanHandleFile, else empty.
-  /// Rejects glob/wildcard patterns (no S3 LIST) with a clear error.
+  /// Exact key: returns @c {path} when @ref CanHandleFile. A glob pattern
+  /// expands via one paginated S3 LIST (see @ref expand_glob) under four
+  /// contracts: it is gated like @ref OpenFile (resolvable @c ClientContext,
+  /// @c gpu_execution on, no CPU-fallback replay); each match carries its
+  /// LIST-provided size so the open needs no HEAD; a matched key containing a
+  /// percent-encoded sequence (@c % + two hex digits) throws; and zero matches
+  /// yield an empty vector.
   duckdb::vector<duckdb::OpenFileInfo> Glob(const std::string& path,
                                             duckdb::FileOpener* opener = nullptr) override;
 
@@ -82,6 +104,35 @@ class sirius_httpfs : public duckdb::FileSystem {
   bool OnDiskFile(duckdb::FileHandle& /*handle*/) override { return false; }
 
   std::string GetName() const override { return "SiriusHttpFS"; }
+
+ protected:
+  bool SupportsOpenFileExtended() const override { return true; }
 };
+
+/// Escape a literal S3 object key for embedding into an @c s3:// URI so the
+/// later @c sirius::io::parse() of that URI restores the exact key bytes.
+/// LIST returns keys as literal bytes, but the open path treats the produced
+/// string as a URI — @c '#' starts a fragment, @c '?' starts a query, and
+/// @c %xx percent-decodes — so exactly those three bytes are escaped
+/// (@c '%'→"%25" first, then @c '#'→"%23", @c '?'→"%3F"). Every other byte,
+/// including @c '/', @c '=' and space, stays literal: hive-partition path
+/// text (@c col=a b/) must survive unchanged. Identity for keys without
+/// @c %/#/?, i.e. every plain key round-trips byte-identically.
+std::string escape_s3_key_for_uri(std::string_view key);
+
+/// Expand an @c s3:// glob @p pattern into concrete object URIs via one
+/// paginated ListObjectsV2 sweep, streamed page-by-page (peak memory = one
+/// page + the matches). The LIST prefix is everything up to the last '/'
+/// before the first wildcard, so the sweep is server-side-narrowed to the
+/// table's prefix. Matching follows DuckDB's glob semantics per '/'-segment
+/// (@c *, @c ?, @c […] never cross a segment; @c ** crosses). Matches carry
+/// their LIST size in @c extended_info->options["file_size"]. Throws (never
+/// truncates) once more than @p max_matches keys match — "narrow the glob
+/// prefix"; wildcards in the bucket segment are rejected. @p max_matches unset
+/// → the backend's configured cap (@c rest.list_max_matches).
+duckdb::vector<duckdb::OpenFileInfo> expand_glob(
+  std::string const& pattern,
+  sirius::scan_manager::sirius_scan_manager& scan_manager,
+  std::optional<std::size_t> max_matches = std::nullopt);
 
 }  // namespace sirius::io::s3
