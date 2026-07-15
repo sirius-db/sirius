@@ -24,12 +24,9 @@ namespace sirius::ast {
 struct node;
 
 /**
- * @brief Render an expression tree as compact, single-line SQL-ish text.
- *
- * Column references render as `#<input-column-index>` (names are not available at this
- * level). Intended for display only (operator params_to_string / telemetry / debug
- * printing) — the output is not parseable SQL and must never feed back into planning.
- * Never throws: unrepresentable literals render as `?`.
+ * @brief Render an expression tree as compact single-line SQL-ish text (references as
+ * `#<column-index>`). Display only — not parseable SQL. Never throws: unrepresentable
+ * literals and null children render as `?`.
  */
 [[nodiscard]] std::string to_string(node const& n);
 

@@ -57,10 +57,8 @@ class ingestible_table_info {
    */
   [[nodiscard]] virtual std::span<std::string const> file_paths() const = 0;
 
-  /**
-   * @brief One-line source (table / file) + pushed-down-filter description, consumed by
-   *        sirius_gpu_scan_operator::params_to_string for telemetry / debug display.
-   */
+  /// One-line source + pushed-down-filter description for the scan operator's
+  /// params_to_string (telemetry display).
   [[nodiscard]] virtual std::string params_to_string() const { return ""; }
 
  protected:

@@ -65,8 +65,6 @@ impl TaskExt for Task {
     }
 
     fn matches_filter(&self, filter: &OperatorFilter) -> bool {
-        // Operator entities are declared per physical operator, so an operator filter matches
-        // any task that computed that operator (`Computing.operator_uuid`).
         filter
             .operator_id
             .is_none_or(|operator_uuid| self.computed_operator_uuids().any(|u| u == operator_uuid))
@@ -87,9 +85,7 @@ impl TaskExt for Task {
                 let ModelTaskTransition::Computing(data) = &transition.data else {
                     return None;
                 };
-                // The operator ran from this Computing transition until the task's next
-                // transition (another Computing, or Finalizing). A trailing Computing with no
-                // successor contributes no measurable span.
+                // Runs until the next transition; a trailing Computing has no span.
                 let next = transitions.get(i + 1)?;
                 let span =
                     SpanUnixNanoSec::try_new(transition.timestamp(), next.timestamp()).ok()?;

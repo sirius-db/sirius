@@ -34,8 +34,7 @@ inline duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
   return result;
 }
 
-//! One-line rendering of the sort keys ("#0 ASC, #1 DESC"), shared by the
-//! order-by / merge-sort / top-n params_to_string overrides.
+//! Render sort keys as one line ("#0 ASC, #1 DESC") for params_to_string.
 inline std::string orders_to_string(const duckdb::vector<duckdb::BoundOrderByNode>& orders)
 {
   std::string result;
@@ -72,8 +71,6 @@ class sirius_physical_order : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
-
-  //! One-line sort-key description for telemetry / debug display.
   std::string params_to_string() const override { return orders_to_string(orders); }
 };
 

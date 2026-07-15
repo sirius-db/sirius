@@ -109,8 +109,6 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
-
-  //! One-line keys + aggregates description for telemetry / debug display.
   std::string params_to_string() const override;
 };
 

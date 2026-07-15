@@ -90,9 +90,8 @@ impl<'a> SiriusModelQueryView<'a> {
             data_batches: HashMap::default(),
         };
 
-        // Operator entities are declared per physical operator, so a task belongs to this query's
-        // view iff it computed one of the query's operators, and a data batch iff it was produced
-        // by one of them.
+        // A task belongs to this query's view iff it computed one of the query's operators,
+        // and a data batch iff it was produced by one of them.
         let operator_ids = result
             .operators()
             .map(|operator| operator.id())

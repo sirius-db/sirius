@@ -45,8 +45,6 @@ impl DataBatchExt for DataBatch {
     }
 
     fn matches_filter(&self, filter: &OperatorFilter) -> bool {
-        // Operator entities are declared per physical operator, so an operator filter matches
-        // the batch produced by that specific operator.
         filter
             .operator_id
             .is_none_or(|operator_uuid| self.producer_operator_uuid() == Some(operator_uuid))

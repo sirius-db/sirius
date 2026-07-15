@@ -576,10 +576,8 @@ impl SiriusModelBuilder {
                     set.insert(task.type_name().to_owned());
                 }
             }
-            // Attribute activity to each physical operator the task computed. A task runs its
-            // operators sequentially and emits one `Computing` event per operator, so its span is
-            // split per operator (keyed by the operator's stable UUID) rather than folded into a
-            // single pipeline-level bar.
+            // A task computes its operators sequentially, so its span splits into one
+            // activity span per operator (keyed by the operator's stable UUID).
             for (operator_uuid, span) in task.operator_active_spans() {
                 if let Some(operator) = query_engine.operators.get_mut(&operator_uuid) {
                     operator.active_span = Some(match operator.active_span() {
@@ -610,10 +608,8 @@ impl SiriusModelBuilder {
                             set.insert(data_batch.type_name().to_owned());
                         }
                     }
-                    // Operator activity is attributed per-operator from task `Computing` spans
-                    // above (keyed by operator UUID). The data_batch's `producer_pipeline_uuid` is
-                    // a pipeline id, not an operator entity id, so it is intentionally not folded
-                    // into operator activity here.
+                    // `producer_pipeline_uuid` is a pipeline id, not an operator entity id, so
+                    // batches are intentionally not folded into operator activity here.
                     data_batches.insert(data_batch_id, data_batch);
                 }
                 Err(e) => warn!("Invalid data_batch encountered {e}"),

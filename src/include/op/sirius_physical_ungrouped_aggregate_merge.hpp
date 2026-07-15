@@ -57,8 +57,6 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
 
  public:
   bool is_sink() const override { return true; }
-
-  //! One-line list of the merged aggregates for telemetry / debug display.
   std::string params_to_string() const override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,

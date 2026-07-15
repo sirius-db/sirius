@@ -94,12 +94,9 @@ translate_duckdb_expression_with_names(
   gpu_expression_translator::column_name_resolver_fxn resolver);
 
 /**
- * @brief One-line rendering of pushed-down table filters
- *        ("l_shipdate<='1998-09-02' AND l_quantity>5"), for scan operator
- *        params_to_string / telemetry display.
- *
- * Filter keys index into @p column_ids; a column whose name cannot be resolved renders
- * as `#<primary index>`. Returns "" when @p filters is empty.
+ * @brief Render pushed-down table filters as one line ("l_shipdate<='1998-09-02' AND ...")
+ * for params_to_string. Filter keys index into @p column_ids; unresolvable names render
+ * as `#<primary index>`.
  */
 std::string table_filters_to_string(const duckdb::TableFilterSet& filters,
                                     const duckdb::vector<duckdb::ColumnIndex>& column_ids,

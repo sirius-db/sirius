@@ -305,11 +305,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .transpose()?;
         let operator_filter = entry.application;
 
-        // Restrict candidates to the requested query: a task belongs to a query
-        // iff it computed one of that query's operators, and a data batch iff
-        // it was produced by one of them. Without this, entities from a
-        // different query sharing a resource and overlapping the window would
-        // leak in.
+        // Restrict candidates to the requested query's operators; otherwise entities from
+        // another query sharing a resource and overlapping the window would leak in.
         let query_operators: HashSet<Uuid> = self
             .model
             .query_view(query_id)?
@@ -1080,9 +1077,8 @@ impl SiriusUiAnalyzer {
             .iter()
             .filter_map(|&id| {
                 if let Some(task) = self.model.tasks.get(&id) {
-                    // Label the task with the chain of operators it computed. (Operator
-                    // entities are per physical operator; the task's pipeline_uuid is no
-                    // longer an entity id, so the label is rebuilt from Computing events.)
+                    // The task's pipeline_uuid is no longer an entity id, so its label is
+                    // rebuilt from the chain of operators it computed.
                     let mut names: Vec<&str> = vec![];
                     for operator_uuid in task.computed_operator_uuids() {
                         if let Some(operator) =

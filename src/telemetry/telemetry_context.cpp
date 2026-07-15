@@ -193,18 +193,15 @@ void emit_plan_telemetry(
   // Collect edges while iterating
   rust::Vec<quent::plan::Edges> edges;
 
-  // A physical operator can appear in more than one pipeline (e.g. a join whose build side is a
-  // pipeline sink and whose probe side is the next pipeline's source is the same operator object).
-  // Its `operator_uuid` is the quent entity id, so declare each operator at most once.
+  // An operator can appear in more than one pipeline (a join is one pipeline's sink and the
+  // next one's source); declare each operator_uuid at most once.
   std::unordered_set<uuid::UUID, uuid_hash> declared_operators;
 
   for (const auto& pipeline : pipelines) {
     const auto operators = pipeline->get_operators();
 
-    // Declare each physical operator as its own quent Operator so it renders as an individual
-    // activity bar in the "Operator timeline" lane (instead of one bar per pipeline). Parent
-    // links are left empty (matching the quent demo); the operator DAG is conveyed via the plan
-    // edges below, and the activity bars only require an id + type_name.
+    // One quent Operator per physical operator (one timeline bar each); the operator DAG is
+    // conveyed via the plan edges below, so parent_operator_ids stays empty.
     for (const auto& op_ref : operators) {
       const auto& op = op_ref.get();
       if (!declared_operators.insert(op.get_operator_uuid()).second) { continue; }
@@ -218,8 +215,6 @@ void emit_plan_telemetry(
           .custom_attributes   = {},
         });
 
-      // Operator metadata, shown in the viewer's operator info panel. `params` carries the
-      // operator-specific description (join conditions, projected expressions, ...).
       quent::CustomAttributes stats{};
       stats.i64_attrs.push_back(
         quent::I64Attr{.key = "operator_id", .value = static_cast<int64_t>(op.get_operator_id())});

@@ -96,8 +96,6 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
     if (db_path.empty()) { return {}; }
     return std::span<std::string const>(&db_path, 1);
   }
-
-  //! One-line table + pushed-down-filter description for telemetry / debug display.
   [[nodiscard]] std::string params_to_string() const override;
 };
 

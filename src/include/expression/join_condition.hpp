@@ -86,17 +86,11 @@ comparison_type from_duckdb(duckdb::ExpressionType t);
  */
 duckdb::ExpressionType to_duckdb(comparison_type c);
 
-/**
- * @brief SQL spelling of a comparison operator ("=", "<=", "IS DISTINCT FROM", ...),
- *        for display in operator params / telemetry.
- */
+/// SQL spelling of a comparison operator ("=", "<=", "IS DISTINCT FROM", ...).
 std::string_view to_string(comparison_type c);
 
-/**
- * @brief One-line rendering of a condition list ("#0 = #1 AND #2 < #3"), for display in
- *        operator params / telemetry. Left sides reference probe-side columns, right
- *        sides build-side columns.
- */
+/// Render a condition list as one line ("#0 = #1 AND #2 < #3"); left sides are
+/// probe-side column references, right sides build-side.
 std::string to_string(const duckdb::vector<join_condition>& conditions);
 
 /**
