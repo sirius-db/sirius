@@ -19,9 +19,9 @@
 #include "log/sink.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <optional>
-#include <string>
 
 namespace sirius::log {
 
@@ -33,7 +33,7 @@ namespace sirius::log {
 /// Construction settings of the owning spdlog sink.
 struct spdlog_owning_config {
   /// Directory the daily log file `sirius.log` is written to.
-  std::string log_dir;
+  std::filesystem::path log_dir;
   /// Interval between scheduled best-effort flushes; nullopt schedules none.
   std::optional<std::chrono::milliseconds> flush_interval;
 };

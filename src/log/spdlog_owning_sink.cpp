@@ -20,9 +20,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
-#include <format>
 #include <memory>
-#include <string>
 
 namespace sirius::log {
 
@@ -51,7 +49,7 @@ class spdlog_owning_sink final : public sink {
  public:
   explicit spdlog_owning_sink(const spdlog_owning_config& config)
   {
-    auto log_file  = std::format("{}/sirius.log", config.log_dir);
+    auto log_file  = (config.log_dir / "sirius.log").string();
     auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
     file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
@@ -75,6 +73,8 @@ class spdlog_owning_sink final : public sink {
   // set_default_logger replaces it.
 
   // The level lives in the spdlog logger itself — the single source of truth.
+  // spdlog's logger holds its level in an atomic, so this is safe to call
+  // concurrently with log()/should_log().
   void set_level(level lvl) override { _logger->set_level(to_spdlog_level(lvl)); }
 
   [[nodiscard]] bool should_log(level lvl) const override

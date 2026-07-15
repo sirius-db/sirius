@@ -36,12 +36,10 @@ using scoped_recording_sink = sirius::test::scoped_recording_log_sink;
 
 TEST_CASE("Unknown level names are rejected and leave the default", "[log]")
 {
-  // The config layer relies on this: it seeds `info` and keeps it on a bad name.
-  level lvl = level::info;
-  CHECK_FALSE(string_to_enum("verbose", lvl));
-  CHECK(lvl == level::info);
-  CHECK(string_to_enum("warn", lvl));
-  CHECK(lvl == level::warn);
+  // The config layer relies on this: an unknown name yields nullopt, and the
+  // caller falls back to info.
+  CHECK_FALSE(string_to_enum("verbose").has_value());
+  CHECK(string_to_enum("warn") == level::warn);
 }
 
 // test cases using SIRIUS_LOG_* only make sense when logging is compiled in.

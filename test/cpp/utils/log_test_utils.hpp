@@ -99,17 +99,14 @@ class scoped_recording_log_sink {
   explicit scoped_recording_log_sink(std::string_view level = "trace")
     : _sink(std::make_shared<recording_log_sink>())
   {
-    sirius::log::level lvl = sirius::log::level::info;
-    sirius::log::string_to_enum(level, lvl);
-    _sink->set_level(lvl);
+    _sink->set_level(sirius::log::string_to_enum(level).value_or(sirius::log::level::info));
     sirius::log::set_sink(_sink);
   }
 
   ~scoped_recording_log_sink()
   {
     using duckdb::Config;
-    sirius::log::level lvl = sirius::log::level::info;
-    sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
+    auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
     auto flush =
       Config::LOG_FLUSH_SECONDS <= 0
         ? std::nullopt

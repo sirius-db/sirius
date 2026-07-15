@@ -1610,8 +1610,7 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
 // Rebuilds the global sink from the current logging config.
 static void ReinstallLogSink()
 {
-  sirius::log::level lvl = sirius::log::level::info;
-  sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
+  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
   auto flush =
     Config::LOG_FLUSH_SECONDS <= 0
       ? std::nullopt
@@ -1625,8 +1624,7 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
   // A level change only re-targets the current sink; no need to rebuild it.
-  sirius::log::level lvl = sirius::log::level::info;
-  sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
+  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
   sirius::log::get_sink()->set_level(lvl);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }

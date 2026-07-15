@@ -105,10 +105,9 @@ int main(int argc, char* argv[])
   sirius::util::install_segfault_backtrace_handler();
 
   // Initialize the logger
-  std::string log_dir    = SIRIUS_UNITTEST_LOG_DIR;
-  Config::LOG_DIR        = log_dir;
-  sirius::log::level lvl = sirius::log::level::info;
-  sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
+  std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
+  Config::LOG_DIR     = log_dir;
+  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
   auto flush =
     Config::LOG_FLUSH_SECONDS <= 0
       ? std::nullopt

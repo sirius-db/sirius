@@ -18,26 +18,16 @@
 
 namespace sirius::log {
 
-bool string_to_enum(std::string_view name, level& lvl)
+std::optional<level> string_to_enum(std::string_view name)
 {
-  if (name == "trace") {
-    lvl = level::trace;
-  } else if (name == "debug") {
-    lvl = level::debug;
-  } else if (name == "info") {
-    lvl = level::info;
-  } else if (name == "warn") {
-    lvl = level::warn;
-  } else if (name == "error") {
-    lvl = level::error;
-  } else if (name == "critical") {
-    lvl = level::critical;
-  } else if (name == "off") {
-    lvl = level::off;
-  } else {
-    return false;
-  }
-  return true;
+  if (name == "trace") { return level::trace; }
+  if (name == "debug") { return level::debug; }
+  if (name == "info") { return level::info; }
+  if (name == "warn") { return level::warn; }
+  if (name == "error") { return level::error; }
+  if (name == "critical") { return level::critical; }
+  if (name == "off") { return level::off; }
+  return std::nullopt;
 }
 
 }  // namespace sirius::log

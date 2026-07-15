@@ -999,8 +999,7 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
-  sirius::log::level lvl = sirius::log::level::info;
-  sirius::log::string_to_enum(Config::LOG_LEVEL, lvl);
+  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
   auto flush =
     Config::LOG_FLUSH_SECONDS <= 0
       ? std::nullopt

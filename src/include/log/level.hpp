@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace sirius::log {
@@ -58,10 +59,7 @@ enum class level : uint8_t {
   off = SIRIUS_LOG_LEVEL_OFF,
 };
 
-/// Parses a level name into a level.
-///
-/// Returns false
-/// (leaving `lvl` unchanged) for an unrecognized name.
-bool string_to_enum(std::string_view name, level& lvl);
+/// Parses a level name into a level, or nullopt for an unrecognized name.
+std::optional<level> string_to_enum(std::string_view name);
 
 }  // namespace sirius::log
