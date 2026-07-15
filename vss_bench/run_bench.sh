@@ -108,9 +108,9 @@ f="$WORK/sirius_enn.sql"
   echo ".mode list"; echo ".headers off"; echo ".timer on"
 } > "$f"
 battery "$f" "@@Q|sirius_enn|ps_image_embedding|$K|na" \
-  "SELECT id FROM sirius_vector_search('partsupp_laion', 'ps_image_embedding', $IMG_Q, k => $K, output_columns => ['id'], use_index => false);"
+  "SELECT id FROM sirius_knn_search('partsupp_laion', 'ps_image_embedding', $IMG_Q, k => $K, output_columns => ['id'], use_index => false);"
 battery "$f" "@@Q|sirius_enn|ps_text_embedding|$K|na" \
-  "SELECT id FROM sirius_vector_search('partsupp_laion', 'ps_text_embedding', $TXT_Q, k => $K, output_columns => ['id'], use_index => false);"
+  "SELECT id FROM sirius_knn_search('partsupp_laion', 'ps_text_embedding', $TXT_Q, k => $K, output_columns => ['id'], use_index => false);"
 run_engine sirius_enn "$f"
 
 # ===== duckdb_enn: DuckDB VSS brute force (CPU) =====
@@ -159,9 +159,9 @@ f="$WORK/sirius_ann.sql"
 # sweep n_probes (same list as lance_ann); index is built once, only the search varies
 for np in $NPROBES_LIST; do
   battery "$f" "@@Q|sirius_ann|ps_image_embedding|$K|$np" \
-    "SELECT id FROM sirius_vector_search('partsupp_laion', 'ps_image_embedding', $IMG_Q, k => $K, output_columns => ['id'], n_probes => $np);"
+    "SELECT id FROM sirius_knn_search('partsupp_laion', 'ps_image_embedding', $IMG_Q, k => $K, output_columns => ['id'], n_probes => $np);"
   battery "$f" "@@Q|sirius_ann|ps_text_embedding|$K|$np" \
-    "SELECT id FROM sirius_vector_search('partsupp_laion', 'ps_text_embedding', $TXT_Q, k => $K, output_columns => ['id'], n_probes => $np);"
+    "SELECT id FROM sirius_knn_search('partsupp_laion', 'ps_text_embedding', $TXT_Q, k => $K, output_columns => ['id'], n_probes => $np);"
 done
 run_engine sirius_ann "$f"
 

@@ -109,7 +109,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
     c.ctx.get_cuvs_index_cache().find_by_column(req.table_name, req.column_name, metric);
   if (index_entry == nullptr || !index_entry->index) {
     throw duckdb::InvalidInputException(
-      "sirius_vector_search: no ANN index for '" + req.table_name + "." + req.column_name +
+      "sirius_knn_search: no ANN index for '" + req.table_name + "." + req.column_name +
       "' under the requested metric; create one with sirius_create_ann_index or pass "
       "use_index => false");
   }
@@ -159,7 +159,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
     auto views = pinned_column_chunk_views(c.pin, name, c.space);
     if (views.size() != n_chunks) {
       throw duckdb::InvalidInputException(
-        "sirius_vector_search: pinned table columns have inconsistent chunk counts");
+        "sirius_knn_search: pinned table columns have inconsistent chunk counts");
     }
     out_chunks.push_back(std::move(views));
   }

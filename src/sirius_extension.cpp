@@ -29,14 +29,14 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -1569,13 +1569,13 @@ static std::vector<float> vector_search_query_floats(const Value& query)
     children = &ListValue::GetChildren(query);
   } else {
     throw BinderException(
-      "sirius_vector_search: query (3rd argument) must be a FLOAT array, e.g. [..]::FLOAT[N]");
+      "sirius_knn_search: query (3rd argument) must be a FLOAT array, e.g. [..]::FLOAT[N]");
   }
   std::vector<float> out;
   out.reserve(children->size());
   for (auto const& child : *children) {
     if (child.IsNull()) {
-      throw BinderException("sirius_vector_search: query vector must not contain NULLs");
+      throw BinderException("sirius_knn_search: query vector must not contain NULLs");
     }
     out.push_back(child.GetValue<float>());
   }
@@ -1594,7 +1594,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   if (input.inputs.size() < 3 || input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
       input.inputs[2].IsNull()) {
     throw BinderException(
-      "sirius_vector_search requires three non-NULL positional arguments: table, column, query");
+      "sirius_knn_search requires three non-NULL positional arguments: table, column, query");
   }
   req.table_name  = input.inputs[0].ToString();
   req.column_name = input.inputs[1].ToString();
@@ -1609,8 +1609,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first);
     if (kv.second.IsNull()) {
-      throw BinderException("sirius_vector_search: named parameter '" + kv.first +
-                            "' cannot be NULL");
+      throw BinderException("sirius_knn_search: named parameter '" + kv.first + "' cannot be NULL");
     }
     if (key == "k") {
       req.k = kv.second.GetValue<int64_t>();
@@ -1628,10 +1627,10 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
       }
     }
   }
-  if (req.k <= 0) { throw BinderException("sirius_vector_search: k must be >= 1"); }
-  if (req.n_probes < 0) { throw BinderException("sirius_vector_search: n_probes must be >= 0"); }
+  if (req.k <= 0) { throw BinderException("sirius_knn_search: k must be >= 1"); }
+  if (req.n_probes < 0) { throw BinderException("sirius_knn_search: n_probes must be >= 0"); }
   if (req.metric != "l2sq" && req.metric != "cosine") {
-    throw BinderException("sirius_vector_search: metric must be one of 'l2sq', 'cosine', got '" +
+    throw BinderException("sirius_knn_search: metric must be one of 'l2sq', 'cosine', got '" +
                           req.metric + "'");
   }
 
@@ -1657,19 +1656,19 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
     for (std::size_t i = 0; i < schema_names.size(); ++i) {
       if (schema_names[i] == col) { return schema_types[i]; }
     }
-    throw BinderException("sirius_vector_search: column '" + col + "' not found in table '" +
+    throw BinderException("sirius_knn_search: column '" + col + "' not found in table '" +
                           req.table_name + "'");
   };
 
   auto const& vec_type = type_of(req.column_name);
   if (vec_type.id() != LogicalTypeId::ARRAY ||
       ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
-    throw BinderException("sirius_vector_search: column '" + req.column_name +
+    throw BinderException("sirius_knn_search: column '" + req.column_name +
                           "' must be a FLOAT[N] array column");
   }
   req.dim = static_cast<int64_t>(ArrayType::GetSize(vec_type));
   if (static_cast<int64_t>(req.query.size()) != req.dim) {
-    throw BinderException("sirius_vector_search: query has " + std::to_string(req.query.size()) +
+    throw BinderException("sirius_knn_search: query has " + std::to_string(req.query.size()) +
                           " elements but column '" + req.column_name + "' is FLOAT[" +
                           std::to_string(req.dim) + "]");
   }
@@ -1693,8 +1692,7 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
-    throw InvalidInputException(
-      "sirius_vector_search requires the Sirius context to be initialized");
+    throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
   }
 
   auto state       = make_uniq<SiriusVectorSearchGlobalState>();
@@ -1809,9 +1807,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo create_ann_index_info(create_ann_index);
   catalog.CreateTableFunction(transaction, create_ann_index_info);
 
-  // sirius_vector_search(table, column, query, k =>, output_columns =>, metric =>,
+  // sirius_knn_search(table, column, query, k =>, output_columns =>, metric =>,
   // use_index =>, n_probes =>, schema_name =>)
-  TableFunction vector_search("sirius_vector_search",
+  TableFunction vector_search("sirius_knn_search",
                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
                               SiriusVectorSearchFunction,
                               SiriusVectorSearchBind,

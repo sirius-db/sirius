@@ -606,14 +606,12 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
-    test/cpp/integration/test_gpu_execution_vss_enn.cpp
-    test/cpp/integration/test_gpu_execution_vss_ann.cpp
-    test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/io/s3/test_sigv4.cpp

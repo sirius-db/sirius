@@ -49,7 +49,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
     auto views = pinned_column_chunk_views(c.pin, name, c.space);
     if (views.size() != n_chunks) {
       throw duckdb::InvalidInputException(
-        "sirius_vector_search: pinned table columns have inconsistent chunk counts");
+        "sirius_knn_search: pinned table columns have inconsistent chunk counts");
     }
     out_chunks.push_back(std::move(views));
   }

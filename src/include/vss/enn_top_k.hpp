@@ -28,7 +28,7 @@
 namespace sirius::vss {
 
 /**
- * @brief Per-chunk ENN top-k for the sirius_vector_search table function.
+ * @brief Per-chunk ENN top-k for the sirius_knn_search table function.
  *
  * @p input is one pinned chunk laid out as `[vector, out0, out1, ...]`: column 0
  * is the FLOAT[dim] vector column searched against `c.query_device`, columns

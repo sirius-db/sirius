@@ -52,7 +52,7 @@ std::unique_ptr<cudf::table> make_empty_vss_output(const scan_manager::pinned_en
     auto it = pin.data_batches_by_column.find(name);
     if (it == pin.data_batches_by_column.end() || it->second.empty()) {
       throw duckdb::InvalidInputException(
-        "sirius_vector_search: pinned table missing output column '" + name + "'");
+        "sirius_knn_search: pinned table missing output column '" + name + "'");
     }
     cols.push_back(cudf::empty_like(it->second.front()->view()));
   }
@@ -76,7 +76,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   auto& memory_manager = ctx.get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
-    throw duckdb::InvalidInputException("sirius_vector_search: no GPU memory space available");
+    throw duckdb::InvalidInputException("sirius_knn_search: no GPU memory space available");
   }
   auto* space          = const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
   int const target_gpu = space->get_device_id();
@@ -91,13 +91,13 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   // output columns straight from GPU-resident chunks (same order the index built in).
   const auto* pin = ctx.get_scan_manager().find_pinned_entry(req.table_name);
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
-    throw duckdb::InvalidInputException("sirius_vector_search: table '" + req.table_name +
+    throw duckdb::InvalidInputException("sirius_knn_search: table '" + req.table_name +
                                         "' must be pinned on the GPU tier");
   }
 
   auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
   if (host_spaces.empty()) {
-    throw duckdb::InvalidInputException("sirius_vector_search: no HOST memory space available");
+    throw duckdb::InvalidInputException("sirius_knn_search: no HOST memory space available");
   }
   const auto* host_space = host_spaces.front();
 
