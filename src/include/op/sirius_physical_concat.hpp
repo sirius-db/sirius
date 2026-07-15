@@ -73,9 +73,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     const op::input_stats& stats) const override;
 
  private:
-  bool _is_build;
-  bool _concat_all;
-  uint64_t _concat_batch_bytes;
+  bool _is_build = false;
+  bool _concat_all = false;
+  uint64_t _concat_batch_bytes{};
   //! Non-owning. Captured at construction from the `downstream_join` ctor argument.
   sirius_physical_operator* _downstream_join = nullptr;
 };

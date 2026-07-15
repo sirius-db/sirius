@@ -86,7 +86,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   duckdb::unsafe_vector<std::size_t> non_distinct_filter;
   duckdb::unsafe_vector<std::size_t> distinct_filter;
 
-  sirius_physical_operator* child_op;
+  sirius_physical_operator* child_op = nullptr;
   sirius_physical_operator* get_child_op() const { return child_op; }
 
   // Grouped aggregatge definitions for cudf compute

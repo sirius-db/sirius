@@ -109,6 +109,9 @@ static const char* signal_name(int sig)
 
 static void segfault_handler(int sig)
 {
+  // Arm watchdog FIRST — subsequent calls are not async-signal-safe and may deadlock
+  signal(SIGALRM, SIG_DFL);  // ensure default (terminate) disposition
+  alarm(3);                  // hard deadline for the entire handler
   std::array<void*, kBacktraceMaxFrames> frames{};
   int n = backtrace(frames.data(), kBacktraceMaxFrames);
   if (n <= 0) {

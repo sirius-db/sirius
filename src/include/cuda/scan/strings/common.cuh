@@ -31,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -151,15 +152,15 @@ inline uint32_t get_target_ctas()
 {
   int device = 0;
   RMM_CUDA_TRY(cudaGetDevice(&device));
-  static int cached_device = -1;
-  static uint32_t cached   = 0;
-  if (cached_device == device) return cached;
+  static std::atomic<int> cached_device{-1};
+  static std::atomic<uint32_t> cached{0};
+  if (cached_device.load() == device) return cached.load();
   cudaDeviceProp prop;
   RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
   int occupancy_blocks = prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM;
-  cached_device        = device;
-  cached               = static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
-  return cached;
+  cached_device.store(device);
+  cached.store(static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2));
+  return cached.load();
 }
 
 //! @brief Expand segment descriptors into smaller chunks.

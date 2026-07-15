@@ -21,6 +21,8 @@
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
 
@@ -28,7 +30,9 @@
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -76,6 +80,21 @@ std::unique_ptr<cudf::column> fixup_list_offsets(std::unique_ptr<cudf::column> c
   child = fixup_list_offsets(std::move(child), stream, mr);
 
   if (offsets->type().id() == cudf::type_id::INT64) {
+    // cudf::cast silently truncates INT64 offsets to INT32; reject the scan
+    // up-front when the stored offsets would overflow cudf::size_type rather
+    // than emit corrupt list offsets. Offsets are structural (non-null), but
+    // guard with has_nulls()/is_valid() so a malformed column surfaces as an
+    // exception instead of a silent truncation.
+    if (!offsets->has_nulls()) {
+      auto const [min_s, max_s] = cudf::minmax(offsets->view(), stream, mr);
+      if (max_s->is_valid(stream)) {
+        auto const max_val =
+          static_cast<cudf::numeric_scalar<int64_t> const&>(*max_s).value(stream);
+        if (max_val > std::numeric_limits<int32_t>::max()) {
+          throw std::runtime_error("list offset exceeds INT32_MAX — cannot narrow to INT32");
+        }
+      }
+    }
     offsets = cudf::cast(offsets->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
   }
 

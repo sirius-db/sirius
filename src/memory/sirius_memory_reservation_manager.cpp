@@ -18,6 +18,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include "cucascade/memory/common.hpp"
+#include "log/logging.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -64,7 +65,12 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
   // device. The cost is a single device sync per managed GPU at teardown.
   for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
-    cudaDeviceSynchronize();
+    if (auto const err = cudaDeviceSynchronize(); err != cudaSuccess) {
+      SIRIUS_LOG_ERROR(
+        "sirius_memory_reservation_manager destructor: cudaDeviceSynchronize failed on device {}: {}",
+        gpu_spaces[i]->get_device_id(),
+        cudaGetErrorString(err));
+    }
     cudf::set_current_device_resource(std::move(prev_device_mrs_[i]));
   }
 }

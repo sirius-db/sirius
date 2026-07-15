@@ -27,9 +27,21 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <log/logging.hpp>
 
+#include <mutex>
+
 namespace sirius::transparent {
 
 namespace {
+
+/// Guards the shared DBConfig::options.disabled_optimizers container against
+/// concurrent read-modify-write by sirius_pre_optimizer_hook and
+/// restore_transparent_disabled_optimizers. Both functions mutate the same
+/// shared container; without this lock, concurrent queries race and one
+/// query's changes can clobber another's (lost update).
+std::mutex& optimizer_mutex() {
+  static std::mutex m;
+  return m;
+}
 
 bool gpu_execution_enabled(const duckdb::ClientContext& context)
 {
@@ -111,6 +123,10 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx || !ctx->is_initialized() || ctx->is_internal_query_active()) { return; }
 
+  // The disabled_optimizers set lives on the shared DBConfig and is accessed
+  // by concurrent queries. Lock to prevent lost updates.
+  std::lock_guard<std::mutex> lk(optimizer_mutex());
+
   auto disabled = duckdb::DBConfig::GetConfig(context).options.disabled_optimizers;
   ctx->set_transparent_original_disabled_optimizers(disabled);
 
@@ -147,8 +163,13 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx || !ctx->is_initialized() || ctx->is_internal_query_active()) { return; }
 
   // Restore the original connection setting so transparent execution does not
-  // leak optimizer changes into later CPU queries.
-  ctx->restore_transparent_disabled_optimizers(context);
+  // leak optimizer changes into later CPU queries. Lock the same mutex as
+  // sirius_pre_optimizer_hook to prevent a concurrent query from racing on
+  // the shared disabled_optimizers container.
+  {
+    std::lock_guard<std::mutex> lk(optimizer_mutex());
+    ctx->restore_transparent_disabled_optimizers(context);
+  }
 
   // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this
   // copy — that's the single source of truth for GPU support. If the plan contains

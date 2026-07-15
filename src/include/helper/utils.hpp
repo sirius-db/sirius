@@ -25,7 +25,8 @@ template <typename T>
 inline constexpr T ceil_div(T a, T b)
 {
   static_assert(std::is_integral<T>::value, "ceil_div requires an integral type");
-  return (a + b - 1) / b;
+  // Overflow-safe: (a + b - 1) / b overflows when a is near SIZE_MAX.
+  return a / b + (a % b != 0 ? 1 : 0);
 }
 
 template <typename T>
@@ -33,7 +34,8 @@ inline constexpr T ceil_div_8(T a)
 {
   static_assert(std::is_integral<T>::value, "ceil_div_8 requires an integral type");
   static_assert(std::is_unsigned<T>::value, "ceil_div_8 requires an unsigned type");
-  return (a + 7) >> 3;
+  // Overflow-safe: (a + 7) overflows when a is near SIZE_MAX.
+  return (a >> 3) + ((a & 7) != 0 ? 1 : 0);
 }
 
 template <typename T>
@@ -67,6 +69,8 @@ inline constexpr S make_mask(T num_bits)
   static_assert(std::is_unsigned<T>::value, "make_mask requires an unsigned type for num_bits");
   static_assert(std::is_integral<S>::value, "make_mask requires an integral type for return");
   static_assert(std::is_unsigned<S>::value, "make_mask requires an unsigned type for return");
+  // Guard against UB: shifting by >= type width is undefined behavior.
+  if (num_bits >= sizeof(S) * 8) return static_cast<S>(-1);  // all bits set
   return static_cast<S>((static_cast<S>(1) << num_bits) - 1);
 }
 

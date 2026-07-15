@@ -304,8 +304,9 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
 
 std::unique_ptr<operator_data> sirius_physical_top_n_merge::get_next_task_input_data()
 {
-  // we need to lock, then pull all the batches from one partition and return them, and increment
-  // the partition index
+  // Drain every batch currently available in this operator's single input repo.
+  // top_n_merge has one input port, so all buffered batches belong to the same
+  // logical stream; no per-partition indexing is required.
   std::lock_guard<std::mutex> lg(lock);
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   bool found_batch = true;

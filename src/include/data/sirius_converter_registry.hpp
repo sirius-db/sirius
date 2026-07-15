@@ -65,6 +65,9 @@ class converter_registry {
    */
   static registry_type& get()
   {
+    // Must hold mutex_ — a concurrent shutdown() can reset instance_ while
+    // we dereference it. Use the same lock as initialize()/shutdown().
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!instance_) { throw std::runtime_error("converter_registry not initialized"); }
     return *instance_;
   }

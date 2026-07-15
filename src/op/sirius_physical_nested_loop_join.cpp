@@ -46,7 +46,6 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <cstdio>
 #include <span>
 
 namespace sirius {
@@ -345,11 +344,14 @@ cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
 }
 
 /// @brief Left-associative LOGICAL_AND over @p terms; @p chain owns the AND nodes and must be
-/// pre-reserved to terms.size()-1.
+/// pre-reserved to terms.size()-1. Caller must ensure @p terms is non-empty.
 const cudf::ast::expression& fold_logical_and(
   std::span<const std::reference_wrapper<const cudf::ast::expression>> terms,
   std::vector<cudf::ast::operation>& chain)
 {
+  if (terms.empty()) {
+    throw std::runtime_error("sirius_physical_nested_loop_join: fold_logical_and called with no terms");
+  }
   for (size_t i = 1; i < terms.size(); i++) {
     const cudf::ast::expression& lhs = (i == 1) ? terms[0].get() : chain.back();
     chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND, lhs, terms[i].get());
@@ -646,7 +648,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
     std::vector<cudf::column_view> left_col_views, right_col_views;
     std::vector<std::unique_ptr<cudf::column>> intermediates_scope_holder;
-    std::vector<std::unique_ptr<cudf::table>> expression_res_scope_hodler;
+    std::vector<std::unique_ptr<cudf::table>> expression_res_scope_holder;
     left_col_views.reserve(left.num_columns());
     right_col_views.reserve(right.num_columns());
 
@@ -680,7 +682,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
             side + " table");
         }
         col_views.push_back(expr_view.column(0));
-        expression_res_scope_hodler.push_back(std::move(expr_result_table));
+        expression_res_scope_holder.push_back(std::move(expr_result_table));
       } else {
         auto target_type = duckdb::GetCudfType(expr.return_type);
 

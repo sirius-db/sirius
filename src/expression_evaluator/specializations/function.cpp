@@ -24,6 +24,9 @@
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
 
+// standard
+#include <limits>
+
 // duckdb
 #include <duckdb/common/assert.hpp>
 
@@ -168,6 +171,19 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     // to cudf::size_type (int32_t) here because cudf::strings::slice_strings
     // only accepts int32 bounds — the narrowing is a cudf API constraint,
     // not a SUBSTRING semantic limit.
+    //
+    // start_raw == INT32_MIN would underflow after subtracting 1; likewise
+    // start_raw + len_raw - 1 must fit in int32_t. Reject anything outside the
+    // safe range before casting.
+    auto const i32_min = static_cast<int64_t>(std::numeric_limits<cudf::size_type>::min());
+    auto const i32_max = static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max());
+    if (start_raw <= i32_min || start_raw > i32_max ||
+        len_raw < 0 || len_raw > i32_max ||
+        start_raw + len_raw - 1 < i32_min ||
+        start_raw + len_raw - 1 > i32_max) {
+      throw invalid_input_exception(
+        "SUBSTRING start/length arguments are outside the range supported by the GPU engine");
+    }
     auto const start_val = static_cast<cudf::size_type>(start_raw) - 1;
     auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
 

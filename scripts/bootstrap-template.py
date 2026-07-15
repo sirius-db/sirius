@@ -48,7 +48,7 @@ def replace(file_name, to_find, to_replace):
 
 
 files_to_search = []
-files_to_search.extend(Path("./.github").rglob("./**/*.yml"))
+files_to_search.extend(Path("./.github").rglob("*.yml"))
 files_to_search.extend(Path("./test").rglob("./**/*.test"))
 files_to_search.extend(Path("./src").rglob("./**/*.hpp"))
 files_to_search.extend(Path("./src").rglob("./**/*.cpp"))

@@ -48,7 +48,7 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
   //! The aggregates that have to be computed
   duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
 
-  sirius_physical_operator* child_op;
+  sirius_physical_operator* child_op = nullptr;
   sirius_physical_operator* get_child_op() const { return child_op; }
 
   bool is_source() const override { return true; }

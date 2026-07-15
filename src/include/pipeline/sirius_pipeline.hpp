@@ -203,7 +203,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
  private:
   //! Whether or not the pipeline has been readied
-  bool ready;
+  std::atomic<bool> ready{false};
   //! Whether or not the pipeline has been initialized
   std::atomic<bool> initialized;
   //! The source of this pipeline
