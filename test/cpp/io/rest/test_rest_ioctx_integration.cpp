@@ -874,15 +874,90 @@ TEST_CASE("rest_ioctx lists S3 objects with sizes and follows encoded continuati
   CHECK(server.head_count() == 0);
 }
 
-TEST_CASE("rest perf snapshot attributes native footer reads separately from chunk reads",
+TEST_CASE("rest LIST loop watchdog child runner", "[.][rest][list][watchdog_child]")
+{
+  auto const* endpoint = std::getenv("SIRIUS_TEST_REST_LIST_WATCHDOG_ENDPOINT");
+  if (endpoint == nullptr) { return; }
+
+  auto ctx = make_direct_rest_ioctx(endpoint);
+  std::string error;
+  try {
+    (void)ctx->list_objects("bucket", "loop/", /*page_size=*/1);
+  } catch (std::exception const& e) {
+    error = e.what();
+  }
+
+  INFO(error);
+  CHECK((error.find("continuation token did not advance") != std::string::npos ||
+         (error.find("truncated") != std::string::npos &&
+          error.find("no entries") != std::string::npos)));
+}
+
+TEST_CASE("rest_ioctx terminates a repeated-token empty LIST loop", "[s3][integration][rest][list]")
+{
+  range_fault_policy fault;
+  fault.response_delay = 100ms;
+  range_http_server server(
+    deterministic_payload(16), fault, {}, scripted_list_mode::repeated_empty_token);
+
+  auto const result = run_list_watchdog(server, 10s, 1s);
+  INFO("LIST requests=" << server.list_count());
+  CHECK_FALSE(result.timed_out);
+  CHECK(result.exited_normally);
+  CHECK(result.exit_code == 0);
+  CHECK(server.list_count() <= 3);
+}
+
+TEST_CASE("rest_ioctx terminates an alternating-token empty LIST loop",
+          "[s3][integration][rest][list]")
+{
+  range_fault_policy fault;
+  fault.response_delay = 100ms;
+  range_http_server server(
+    deterministic_payload(16), fault, {}, scripted_list_mode::alternating_empty_tokens);
+
+  auto const result = run_list_watchdog(server, 10s, 1s);
+  INFO("LIST requests=" << server.list_count());
+  CHECK_FALSE(result.timed_out);
+  CHECK(result.exited_normally);
+  CHECK(result.exit_code == 0);
+  CHECK(server.list_count() <= 3);
+}
+
+TEST_CASE("rest_ioctx accepts an empty final LIST page and rejects an empty continuation token",
+          "[s3][integration][rest][list]")
+{
+  SECTION("empty final page")
+  {
+    range_http_server server(deterministic_payload(16));
+    auto ctx    = make_direct_rest_ioctx(server.endpoint());
+    auto listed = ctx->list_objects("bucket", "empty/", /*page_size=*/1);
+
+    CHECK(listed.empty());
+    CHECK(server.list_count() == 1);
+  }
+
+  SECTION("truncated page without a continuation token")
+  {
+    range_http_server server(
+      deterministic_payload(16), {}, {}, scripted_list_mode::truncated_empty_without_token);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    CHECK_THROWS_WITH(ctx->list_objects("bucket", "empty/", /*page_size=*/1),
+                      Catch::Contains("without") && Catch::Contains("continuation token"));
+    CHECK(server.list_count() == 1);
+  }
+}
+
+TEST_CASE("rest perf snapshot attributes blocking host reads separately from chunk reads",
           "[s3][integration][rest][perf]")
 {
-  SECTION("native footer counters exist and default to zero")
+  SECTION("blocking host counters exist and default to zero")
   {
     sirius::io::rest::rest_perf_snapshot snapshot{};
-    CHECK(snapshot.native_footer_get_count == 0);
-    CHECK(snapshot.native_footer_wall_ns_total == 0);
-    CHECK(snapshot.native_footer_wall_ns_max == 0);
+    CHECK(snapshot.blocking_host_get_count == 0);
+    CHECK(snapshot.blocking_host_get_wall_ns_total == 0);
+    CHECK(snapshot.blocking_host_get_wall_ns_max == 0);
   }
 
   SECTION("blocking host_read network GETs are counted and pool-aggregated")
@@ -909,14 +984,14 @@ TEST_CASE("rest perf snapshot attributes native footer reads separately from chu
                         std::span<std::uint8_t const>(payload.data() + 4096, second.size()));
 
     auto const after = ioctx->perf_snapshot();
-    CHECK(after.native_footer_get_count == before.native_footer_get_count + readers);
-    CHECK(after.native_footer_wall_ns_total > before.native_footer_wall_ns_total);
-    CHECK(after.native_footer_wall_ns_max > 0);
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count + readers);
+    CHECK(after.blocking_host_get_wall_ns_total > before.blocking_host_get_wall_ns_total);
+    CHECK(after.blocking_host_get_wall_ns_max > 0);
     CHECK(after.chunk_get_count == before.chunk_get_count + readers);
     CHECK(server.get_count() == readers);
   }
 
-  SECTION("stash-served parquet footer reads are not counted as native network footer reads")
+  SECTION("stash-served parquet footer reads are not counted as blocking host reads")
   {
     auto const parquet    = read_binary_file(committed_parquet_fixture("nation.parquet"));
     auto const footer_len = static_cast<std::size_t>(parquet_footer_len(parquet));
@@ -943,13 +1018,56 @@ TEST_CASE("rest perf snapshot attributes native footer reads separately from chu
                         std::span<std::uint8_t const>(parquet.data() + footer_off, footer_len));
 
     auto const after = ioctx->perf_snapshot();
-    CHECK(after.native_footer_get_count == before.native_footer_get_count);
-    CHECK(after.native_footer_wall_ns_total == before.native_footer_wall_ns_total);
-    CHECK(after.native_footer_wall_ns_max == before.native_footer_wall_ns_max);
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
+    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
+    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
     CHECK(server.get_count() == 1);
   }
 
-  SECTION("async chunk reads bump chunk counters without touching native footer counters")
+  SECTION("a blocking read outside the footer stash is counted as a blocking network read")
+  {
+    auto payload = deterministic_payload(16 * 1024);
+    range_http_server server(payload);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = true;
+    cfg.footer_probe_bytes   = 8;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource          = ioctx->open_datasource("s3://footer-bucket/outside-stash.bin",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    auto const before        = ioctx->perf_snapshot();
+
+    std::array<std::uint8_t, 32> out{};
+    REQUIRE(datasource->host_read(0, out.size(), out.data()) == out.size());
+    require_bytes_equal(out, std::span<std::uint8_t const>(payload.data(), out.size()));
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count + 1);
+    CHECK(after.chunk_get_count == before.chunk_get_count + 1);
+    CHECK(server.get_count() == 2);
+  }
+
+  SECTION("the one-shot footer probe GET bypasses native counters but remains a chunk GET")
+  {
+    auto payload = deterministic_payload(16 * 1024);
+    range_http_server server(payload);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = true;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto const before        = ioctx->perf_snapshot();
+
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/probe-only.bin",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
+    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
+    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
+    CHECK(after.chunk_get_count == before.chunk_get_count + 1);
+    CHECK(server.get_count() == 1);
+  }
+
+  SECTION("async chunk reads bump chunk counters without touching blocking host counters")
   {
     auto payload = deterministic_payload(64 * 1024);
     range_http_server server(payload);
@@ -974,12 +1092,12 @@ TEST_CASE("rest perf snapshot attributes native footer reads separately from chu
     require_bytes_equal(a, std::span<std::uint8_t const>(payload.data() + 17, a.size()));
     require_bytes_equal(b, std::span<std::uint8_t const>(payload.data() + 4096, b.size()));
     CHECK(after.chunk_get_count > before.chunk_get_count);
-    CHECK(after.native_footer_get_count == before.native_footer_get_count);
-    CHECK(after.native_footer_wall_ns_total == before.native_footer_wall_ns_total);
-    CHECK(after.native_footer_wall_ns_max == before.native_footer_wall_ns_max);
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
+    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
+    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
   }
 
-  SECTION("native footer counters are gated off when perf instrumentation is disabled")
+  SECTION("blocking host counters are gated off when perf instrumentation is disabled")
   {
     auto payload = deterministic_payload(4096);
     range_http_server server(payload);
@@ -994,9 +1112,9 @@ TEST_CASE("rest perf snapshot attributes native footer reads separately from chu
     require_bytes_equal(out, std::span<std::uint8_t const>(payload.data() + 99, out.size()));
 
     auto const after = ioctx->perf_snapshot();
-    CHECK(after.native_footer_get_count == 0);
-    CHECK(after.native_footer_wall_ns_total == 0);
-    CHECK(after.native_footer_wall_ns_max == 0);
+    CHECK(after.blocking_host_get_count == 0);
+    CHECK(after.blocking_host_get_wall_ns_total == 0);
+    CHECK(after.blocking_host_get_wall_ns_max == 0);
     CHECK(server.get_count() == 1);
   }
 }

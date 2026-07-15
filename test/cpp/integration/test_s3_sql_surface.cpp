@@ -849,11 +849,11 @@ sirius::io::rest::rest_perf_snapshot delta_snapshot(
     sat_sub(after.device_stream_sync_total, before.device_stream_sync_total);
   out.payload_bytes_read_total =
     sat_sub(after.payload_bytes_read_total, before.payload_bytes_read_total);
-  out.native_footer_get_count =
-    sat_sub(after.native_footer_get_count, before.native_footer_get_count);
-  out.native_footer_wall_ns_total =
-    sat_sub(after.native_footer_wall_ns_total, before.native_footer_wall_ns_total);
-  out.native_footer_wall_ns_max = after.native_footer_wall_ns_max;
+  out.blocking_host_get_count =
+    sat_sub(after.blocking_host_get_count, before.blocking_host_get_count);
+  out.blocking_host_get_wall_ns_total =
+    sat_sub(after.blocking_host_get_wall_ns_total, before.blocking_host_get_wall_ns_total);
+  out.blocking_host_get_wall_ns_max = after.blocking_host_get_wall_ns_max;
   return out;
 }
 
@@ -2637,7 +2637,7 @@ TEST_CASE("transparent S3 glob scans use parquet footer probes",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   auto const delta = delta_snapshot(rest.perf_snapshot(), before);
 
-  CHECK(delta.native_footer_get_count == 0);
+  CHECK(delta.blocking_host_get_count == 0);
 }
 
 TEST_CASE("transparent S3 glob remains correct with a straddled footer-probe window",
@@ -2681,7 +2681,7 @@ TEST_CASE("transparent S3 glob warm scan skips blocking host reads",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   auto const warm_delta = delta_snapshot(rest.perf_snapshot(), before_warm);
 
-  CHECK(warm_delta.native_footer_get_count == 0);
+  CHECK(warm_delta.blocking_host_get_count == 0);
 }
 
 TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
