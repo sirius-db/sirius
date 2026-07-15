@@ -327,7 +327,7 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
   repo->add_data_batch(std::move(batch), 0);
 
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(true);
   attach_port(sample_op, *repo, src_pipeline);
@@ -380,7 +380,7 @@ TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplic
   repo->add_data_batch(std::move(first_batch), 0);
   if (num_batches > 1) { add_int_batches(*repo, *space, num_batches - 1, rows_per_batch); }
 
-  const sirius::pipeline::pipeline_build_context build_ctx{true};
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   auto src_pipeline = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
   src_pipeline->set_finished(upstream_finished);
   attach_port(sample_op, *repo, src_pipeline);
