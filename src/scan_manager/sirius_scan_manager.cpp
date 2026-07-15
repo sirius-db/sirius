@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -70,7 +71,7 @@ struct cached_databatch_provider : public databatch_provider {
                             std::span<std::size_t const> selected_columns,
                             cached_scan_plan plan,
                             const telemetry::batch_telemetry_info& telemetry_info,
-                            std::shared_ptr<mvcc_chunk_mask_set const> mvcc_masks)
+                            mvcc_chunk_mask_set mvcc_masks)
     : _plan(std::move(plan)),
       _entry(entry),
       _telemetry_info(telemetry_info),
@@ -96,7 +97,7 @@ struct cached_databatch_provider : public databatch_provider {
       data = get_host_databatch(index);
     }
     if (!data) { return {}; }
-    auto mask = (_mvcc_masks && index < _mvcc_masks->size()) ? (*_mvcc_masks)[index] : nullptr;
+    auto mask = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
     return {std::move(data), std::move(mask)};
   }
 
@@ -144,7 +145,9 @@ struct cached_databatch_provider : public databatch_provider {
   std::vector<size_t> _column_indices;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
-  std::shared_ptr<mvcc_chunk_mask_set const> _mvcc_masks;
+  /// This provider's own copy of the entry's per-chunk keep-masks (empty for
+  /// parquet pins); word storage is shared through each mask's owning pointer.
+  mvcc_chunk_mask_set _mvcc_masks;
   std::atomic<std::size_t> _index{0};
 };
 
@@ -164,17 +167,6 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
     return {p->table_filters.get(), &p->column_ids};
   }
   return {};
-}
-
-std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry,
-  std::span<std::size_t const> selected_columns,
-  cached_scan_plan plan,
-  const telemetry::batch_telemetry_info& telemetry_info,
-  std::shared_ptr<mvcc_chunk_mask_set const> mvcc_masks)
-{
-  return std::make_unique<cached_databatch_provider>(
-    entry, selected_columns, std::move(plan), telemetry_info, std::move(mvcc_masks));
 }
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
@@ -359,15 +351,19 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
+  std::vector<cached_assignment> cached_assignments;
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
     _metadata_processor->register_pipeline(op, round_robin);
-    // On a pinned-cache hit the coalescer serves this operator from the cached
+    // On a pinned-cache hit the coalescer serves this operator from a cached
     // batch_provider (process_cached_entries); skip the disk-reading
-    // split_provider entirely so no read is issued for the cached scan.
-    if (try_assign_cached_entries(op)) {
+    // split_provider entirely so no read is issued for the cached scan. The
+    // provider itself is built after the mask jobs run (below), so it can
+    // take a copy of the entry's finished mask set.
+    if (auto assignment = try_match_cached_entry(op)) {
+      cached_assignments.push_back(std::move(*assignment));
       _scan_op_order.push_back(op);
       continue;
     }
@@ -400,8 +396,36 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   if (!_pending_mvcc_mask_jobs.empty()) {
     run_mvcc_mask_jobs(
       _pending_mvcc_mask_jobs, *_dispatcher, _reservation_manager, *_topology_index);
-    _pending_mvcc_mask_jobs.clear();
   }
+
+  // Provider handoff, deferred to behind the mask run so ownership is a
+  // sequential handoff instead of sharing: each matched op's provider takes
+  // its own copy of its entry's completed set (slot-sized — word storage is
+  // shared through the masks' owning pointers), then the requests release
+  // theirs. The sequencer only spawns in start_metadata_processing, so
+  // serving still starts with finished masks.
+  for (auto& assignment : cached_assignments) {
+    mvcc_chunk_mask_set masks;  // stays empty for parquet pins
+    if (assignment.entry->mvcc != nullptr) {
+      auto request = std::ranges::find_if(
+        _pending_mvcc_mask_jobs,
+        [&](mvcc_mask_job_request const& r) { return r.entry_name == assignment.entry_name; });
+      if (request == _pending_mvcc_mask_jobs.end()) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::prepare_for_query] no mask job was queued for mvcc-pinned "
+          "entry '" +
+          assignment.entry_name + "'");
+      }
+      masks = request->masks;
+    }
+    auto provider = make_provider_for_pinned_entry(*assignment.entry,
+                                                   assignment.columns,
+                                                   std::move(assignment.plan),
+                                                   assignment.op->batch_telemetry(),
+                                                   std::move(masks));
+    _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
+  }
+  _pending_mvcc_mask_jobs.clear();
 
   start_metadata_processing();
 }
@@ -1002,6 +1026,17 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   throw std::runtime_error("pinned entry has an unsupported tier");
 }
 
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  cached_scan_plan plan,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  mvcc_chunk_mask_set mvcc_masks)
+{
+  return std::make_unique<cached_databatch_provider>(
+    entry, selected_columns, std::move(plan), telemetry_info, std::move(mvcc_masks));
+}
+
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
                                         duckdb::TableFilterSet const* table_filters,
                                         duckdb::vector<duckdb::ColumnIndex> const* column_ids)
@@ -1082,7 +1117,8 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
   return plan;
 }
 
-bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
+std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_match_cached_entry(
+  op::scan::sirius_gpu_scan_operator* op)
 {
   const auto& table_info = op->get_ingestible().table_info();
 
@@ -1132,7 +1168,6 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
           total_chunks);
       }
 
-      std::shared_ptr<mvcc_chunk_mask_set const> provider_masks;  // stays null for parquet pins
       if (entry.mvcc) {
         auto const* duckdb_info =
           dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info);
@@ -1154,28 +1189,37 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
                                    " chunk(s) but the entry stores " +
                                    std::to_string(stored_chunks));
         }
-        auto masks     = std::make_shared<mvcc_chunk_mask_set>(n_chunks);
-        provider_masks = masks;
-        mvcc_mask_job_request request;
-        request.masks    = std::move(masks);
-        request.metadata = *entry.mvcc;
-        request.storage  = duckdb_info->storage;
-        request.context  = duckdb_info->context;
-        request.chunk_spaces =
-          entry.tier == cucascade::memory::Tier::GPU
-            ? entry.chunk_memory_spaces
-            : std::vector<cucascade::memory::memory_space*>(n_chunks, entry.memory_space);
-        request.entry_name = pinned_name;
-        _pending_mvcc_mask_jobs.push_back(std::move(request));
+        // One mask job per entry per query: a second scan op over the same
+        // entry (e.g. a self-join) shares the pending job's completed set at
+        // handoff instead of re-running the capture+fill walk.
+        auto const already_pending = std::ranges::any_of(
+          _pending_mvcc_mask_jobs,
+          [&](mvcc_mask_job_request const& r) { return r.entry_name == pinned_name; });
+        if (already_pending) {
+          SIRIUS_LOG_INFO(
+            "[sirius_scan_manager] operator '{}' shares pinned entry '{}''s pending mvcc mask "
+            "job",
+            op->get_operator_id(),
+            pinned_name);
+        } else {
+          mvcc_mask_job_request request;
+          request.masks    = mvcc_chunk_mask_set(n_chunks);
+          request.metadata = *entry.mvcc;
+          request.storage  = duckdb_info->storage;
+          request.context  = duckdb_info->context;
+          request.chunk_spaces =
+            entry.tier == cucascade::memory::Tier::GPU
+              ? entry.chunk_memory_spaces
+              : std::vector<cucascade::memory::memory_space*>(n_chunks, entry.memory_space);
+          request.entry_name = pinned_name;
+          _pending_mvcc_mask_jobs.push_back(std::move(request));
+        }
       }
 
-      auto provider = make_provider_for_pinned_entry(
-        entry, cols, std::move(plan), op->batch_telemetry(), std::move(provider_masks));
-      _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
       SIRIUS_LOG_INFO("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
                       pinned_name,
                       op->get_operator_id());
-      return true;
+      return cached_assignment{op, &entry, std::move(cols), pinned_name, std::move(plan)};
     } catch (std::exception const& e) {
       if (mvcc_strict) {
         throw std::runtime_error("[sirius_scan_manager] mvcc-pinned entry '" + pinned_name +
@@ -1187,17 +1231,17 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
         "operator '{}': {}",
         op->get_operator_id(),
         e.what());
-      return false;
+      return std::nullopt;
     } catch (...) {
       if (mvcc_strict) { throw; }
       SIRIUS_LOG_ERROR(
         "[sirius_scan_manager] error while trying to assign cached entries to "
         "operator '{}'",
         op->get_operator_id());
-      return false;
+      return std::nullopt;
     }
   }
-  return false;
+  return std::nullopt;
 }
 
 }  // namespace sirius::scan_manager

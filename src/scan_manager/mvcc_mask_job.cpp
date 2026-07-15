@@ -118,80 +118,77 @@ std::size_t numa_node_for(ccm::memory_space const& space,
   return numa < 0 ? 0 : static_cast<std::size_t>(numa);
 }
 
-/// One dirty chunk's fill state; stable-address (tasks hold pointers).
-struct chunk_work {
-  mvcc_chunk_mask_set* masks{nullptr};
-  std::size_t chunk_index{0};
-  std::span<std::uint32_t> words;
-  std::size_t row_count{0};
-  std::shared_ptr<void> retention;
-  std::span<op::scan::mvcc_row_group_slice const> slices;
-  duckdb::TransactionData transaction{duckdb::TransactionData::Committed()};
-  std::atomic<bool> any_deleted{false};
-};
-
 }  // namespace
 
-void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
-                        exec::scoped_dispatcher& dispatcher,
-                        cucascade::memory::memory_reservation_manager& reservation_manager,
-                        sirius::memory::topology_index const& topology)
+mvcc_mask_workset prepare_mvcc_mask_tasks(
+  std::span<mvcc_mask_job_request> requests,
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  sirius::memory::topology_index const& topology)
 {
-  if (requests.empty()) { return; }
+  mvcc_mask_workset workset;
+  if (requests.empty()) { return workset; }
 
-  // Phase 1 — SERIAL captures (prepare thread; ClientContext discipline).
-  struct captured_job {
-    mvcc_mask_job_request* request;
-    op::scan::mvcc_visibility_plan plan;
-  };
-  std::vector<captured_job> jobs;
-  jobs.reserve(requests.size());
+  // Stage 1 — SERIAL captures (prepare thread; ClientContext discipline).
+  // Plans land in the workset (they own the row-group slices the works
+  // reference); plan_requests[i] pairs workset.plans[i] with its request.
+  workset.plans.reserve(requests.size());
+  std::vector<mvcc_mask_job_request*> plan_requests;
+  plan_requests.reserve(requests.size());
   bool any_dirty = false;
   for (auto& request : requests) {
-    if (!request.masks || !request.storage || !request.context) {
-      throw std::runtime_error("[run_mvcc_mask_jobs] malformed mask request for pinned entry '" +
-                               request.entry_name + "'");
+    if (!request.storage || !request.context) {
+      throw std::runtime_error(
+        "[prepare_mvcc_mask_tasks] malformed mask request for pinned entry '" + request.entry_name +
+        "'");
     }
     op::scan::mvcc_visibility_plan plan = [&] {
       try {
         return op::scan::capture_mvcc_visibility_plan(
           *request.storage, *request.context, request.metadata);
       } catch (std::exception const& e) {
-        throw std::runtime_error("[run_mvcc_mask_jobs] pinned entry '" + request.entry_name +
+        throw std::runtime_error("[prepare_mvcc_mask_tasks] pinned entry '" + request.entry_name +
                                  "': " + e.what());
       }
     }();
-    if (plan.mvcc_row_groups.size() != request.masks->size() ||
+    if (plan.mvcc_row_groups.size() != request.masks.size() ||
         plan.mvcc_row_groups.size() != request.chunk_spaces.size()) {
-      throw std::runtime_error("[run_mvcc_mask_jobs] pinned entry '" + request.entry_name +
+      throw std::runtime_error("[prepare_mvcc_mask_tasks] pinned entry '" + request.entry_name +
                                "': chunk count mismatch between the visibility plan (" +
                                std::to_string(plan.mvcc_row_groups.size()) + "), the mask set (" +
-                               std::to_string(request.masks->size()) + ") and chunk_spaces (" +
+                               std::to_string(request.masks.size()) + ") and chunk_spaces (" +
                                std::to_string(request.chunk_spaces.size()) + ")");
     }
     any_dirty = any_dirty || plan.any_version_state();
-    jobs.push_back({&request, std::move(plan)});
+    workset.plans.push_back(std::move(plan));
+    plan_requests.push_back(&request);
   }
-  if (!any_dirty) { return; }  // every mask slot stays null — the unmasked fast path
+  if (!any_dirty) {
+    // Every mask slot stays default — the unmasked fast path.
+    workset.plans.clear();
+    return workset;
+  }
 
-  // Phase 2 — pinned mask storage, reservation-first (the decoder's staging
+  // Stage 2 — pinned mask storage, reservation-first (the decoder's staging
   // pattern). Lay dirty chunks out per NUMA node first (block size is uniform
   // across the per-NUMA host spaces — one host config), then make ONE
-  // consolidated reservation + multi-block allocation per node.
+  // consolidated reservation + multi-block allocation per node. Each dirty
+  // chunk's carved mask is installed into its request's set right here — the
+  // aliasing words pointer IS the storage owner — with the bits uninitialized
+  // until the fill tasks run.
   auto host_spaces = reservation_manager.get_memory_spaces_for_tier(ccm::Tier::HOST);
   if (host_spaces.empty()) {
-    throw std::runtime_error("[run_mvcc_mask_jobs] no HOST-tier memory space registered");
+    throw std::runtime_error("[prepare_mvcc_mask_tasks] no HOST-tier memory space registered");
   }
   auto const* probe_fsmr =
     host_spaces.front()->get_memory_resource_as<ccm::fixed_size_host_memory_resource>();
   if (probe_fsmr == nullptr) {
     throw std::runtime_error(
-      "[run_mvcc_mask_jobs] host memory space is not a fixed_size_host_memory_resource");
+      "[prepare_mvcc_mask_tasks] host memory space is not a fixed_size_host_memory_resource");
   }
   auto const block_size = probe_fsmr->get_block_size();
 
   struct mask_slot {
-    std::size_t job;
+    std::size_t plan;
     std::size_t chunk;
     std::size_t block;
     std::size_t offset;
@@ -205,26 +202,24 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
   };
   constexpr std::size_t kMaskAlign = 64;  // cache-line-aligned carve within blocks
   std::map<std::size_t, node_layout> nodes;
-  std::vector<std::unique_ptr<chunk_work>> works;
 
-  auto make_work = [&jobs](std::size_t j, std::size_t c, std::size_t rows) {
-    auto& job         = jobs[j];
-    auto work         = std::make_unique<chunk_work>();
-    work->masks       = job.request->masks.get();
+  auto make_work = [&workset, &plan_requests](std::size_t p, std::size_t c) {
+    auto& plan        = workset.plans[p];
+    auto work         = std::make_unique<mvcc_mask_work>();
+    work->masks       = &plan_requests[p]->masks;
     work->chunk_index = c;
-    work->row_count   = rows;
-    work->slices      = std::span<op::scan::mvcc_row_group_slice const>(
-      job.plan.mvcc_row_groups[c].data(), job.plan.mvcc_row_groups[c].size());
-    work->transaction = job.plan.transaction;
+    work->slices = std::span<op::scan::mvcc_row_group_slice const>(plan.mvcc_row_groups[c].data(),
+                                                                   plan.mvcc_row_groups[c].size());
+    work->transaction = plan.transaction;
     return work;
   };
 
-  for (std::size_t j = 0; j < jobs.size(); ++j) {
-    auto& job = jobs[j];
-    for (std::size_t c = 0; c < job.plan.mvcc_row_groups.size(); ++c) {
-      if (!job.plan.chunk_has_version_state[c] || job.plan.mvcc_row_groups[c].empty()) { continue; }
+  for (std::size_t p = 0; p < workset.plans.size(); ++p) {
+    auto& plan = workset.plans[p];
+    for (std::size_t c = 0; c < plan.mvcc_row_groups.size(); ++c) {
+      if (!plan.chunk_has_version_state[c] || plan.mvcc_row_groups[c].empty()) { continue; }
       std::size_t rows = 0;
-      for (auto const& slice : job.plan.mvcc_row_groups[c]) {
+      for (auto const& slice : plan.mvcc_row_groups[c]) {
         rows += slice.row_count;
       }
       auto const n_words = (rows + 31) / 32;
@@ -237,23 +232,23 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
         // returning, so only the true-async-DMA benefit is lost, and only
         // for these oversized chunks.
         SIRIUS_LOG_INFO(
-          "[run_mvcc_mask_jobs] pinned entry '{}': chunk {} mask ({} bytes) exceeds one "
+          "[prepare_mvcc_mask_tasks] pinned entry '{}': chunk {} mask ({} bytes) exceeds one "
           "staging block ({} bytes); using pageable host memory for it",
-          job.request->entry_name,
+          plan_requests[p]->entry_name,
           c,
           bytes,
           block_size);
-        auto storage    = std::make_shared<std::vector<std::uint32_t>>(n_words);
-        auto work       = make_work(j, c, rows);
-        work->words     = std::span<std::uint32_t>(storage->data(), storage->size());
-        work->retention = std::move(storage);
-        works.push_back(std::move(work));
+        auto storage = std::make_shared<std::vector<std::uint32_t>>(n_words);
+        plan_requests[p]->masks[c] =
+          mvcc_chunk_mask{std::shared_ptr<std::uint32_t[]>(storage, storage->data()), rows};
+        workset.works.push_back(make_work(p, c));
         continue;
       }
-      auto* space = job.request->chunk_spaces[c];
+      auto* space = plan_requests[p]->chunk_spaces[c];
       if (space == nullptr) {
-        throw std::runtime_error("[run_mvcc_mask_jobs] pinned entry '" + job.request->entry_name +
-                                 "': chunk " + std::to_string(c) + " has no memory space");
+        throw std::runtime_error("[prepare_mvcc_mask_tasks] pinned entry '" +
+                                 plan_requests[p]->entry_name + "': chunk " + std::to_string(c) +
+                                 " has no memory space");
       }
       auto& node      = nodes[numa_node_for(*space, topology)];
       node.cur_offset = (node.cur_offset + kMaskAlign - 1) / kMaskAlign * kMaskAlign;
@@ -261,7 +256,7 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
         ++node.blocks_used;
         node.cur_offset = 0;
       }
-      node.slots.push_back({j, c, node.blocks_used - 1, node.cur_offset, bytes, rows});
+      node.slots.push_back({p, c, node.blocks_used - 1, node.cur_offset, bytes, rows});
       node.cur_offset += bytes;
     }
   }
@@ -271,7 +266,7 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
     ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST, numa_node);
     auto reservation = reservation_manager.request_reservation(host_req, total_bytes);
     if (!reservation) {
-      throw std::runtime_error("[run_mvcc_mask_jobs] failed to reserve " +
+      throw std::runtime_error("[prepare_mvcc_mask_tasks] failed to reserve " +
                                std::to_string(total_bytes) +
                                " bytes of pinned host memory for MVCC keep-masks (NUMA node " +
                                std::to_string(numa_node) + ")");
@@ -282,7 +277,7 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
       // The strategy may fall back to another host space; the layout above
       // assumed one uniform block size, so a mismatch would mis-carve.
       throw std::runtime_error(
-        "[run_mvcc_mask_jobs] reserved host space is not a fixed_size_host_memory_resource "
+        "[prepare_mvcc_mask_tasks] reserved host space is not a fixed_size_host_memory_resource "
         "with the expected block size");
     }
     auto bundle         = std::make_shared<pinned_mask_bundle>();
@@ -290,51 +285,66 @@ void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
     bundle->blocks      = fsmr->allocate_multiple_blocks(total_bytes, bundle->reservation.get());
 
     for (auto const& slot : layout.slots) {
-      auto* base  = reinterpret_cast<std::uint8_t*>(bundle->blocks->at(slot.block).data());
-      auto work   = make_work(slot.job, slot.chunk, slot.rows);
-      work->words = std::span<std::uint32_t>(reinterpret_cast<std::uint32_t*>(base + slot.offset),
-                                             slot.bytes / sizeof(std::uint32_t));
-      work->retention = bundle;
-      works.push_back(std::move(work));
+      auto* base = reinterpret_cast<std::uint8_t*>(bundle->blocks->at(slot.block).data());
+      plan_requests[slot.plan]->masks[slot.chunk] =
+        mvcc_chunk_mask{std::shared_ptr<std::uint32_t[]>(
+                          bundle, reinterpret_cast<std::uint32_t*>(base + slot.offset)),
+                        slot.rows};
+      workset.works.push_back(make_work(slot.plan, slot.chunk));
     }
   }
 
-  // Phase 3 — fan out one task per <= metadata_parse_chunk() row groups (a
+  // Stage 3 — build one fill task per <= metadata_parse_chunk() row groups (a
   // task never spans chunks: slices are word-disjoint across tasks only
   // because they cut on 32-row-aligned row-group boundaries within one
-  // chunk's mask), then block until every task ran.
+  // chunk's mask). Tasks write through their chunk's installed mask slot —
+  // request sets are sized once at request creation and never resized, and
+  // the workset's unique_ptrs keep the work addresses stable.
   auto const parse_chunk = op::scan::metadata_parse_chunk();
-  std::vector<absl::AnyInvocable<void()>> tasks;
-  for (auto& work_ptr : works) {
+  for (auto& work_ptr : workset.works) {
     auto* work = work_ptr.get();
     for (std::size_t begin = 0; begin < work->slices.size(); begin += parse_chunk) {
       auto const count = std::min(parse_chunk, work->slices.size() - begin);
-      tasks.push_back([work, begin, count] {
+      workset.fill_tasks.push_back([work, begin, count] {
+        auto const& mask = (*work->masks)[work->chunk_index];
+        std::span<std::uint32_t> words{mask.words.get(), (mask.row_count + 31) / 32};
         if (op::scan::fill_keep_mask_for_row_groups(
-              work->slices.subspan(begin, count), work->transaction, work->words)) {
+              work->slices.subspan(begin, count), work->transaction, words)) {
           work->any_deleted.store(true, std::memory_order_relaxed);
         }
       });
     }
   }
-  SIRIUS_LOG_DEBUG("[run_mvcc_mask_jobs] {} dirty chunk(s), {} fill task(s) across {} request(s)",
-                   works.size(),
-                   tasks.size(),
-                   requests.size());
-  fan_out_and_join(dispatcher, std::move(tasks), "mvcc keep-mask fill");
+  return workset;
+}
 
-  // Phase 4 — publish. Chunks that dropped nothing keep a null slot (served
-  // unmasked); their carved span is simply unused, and the node bundle frees
-  // once the last published mask releases (or right here when none did).
-  for (auto& work_ptr : works) {
+void finalize_mvcc_masks(mvcc_mask_workset& workset)
+{
+  // Masks whose fill dropped rows are already in place (prepare installed the
+  // words, the fill tasks wrote the bits). Chunks that dropped nothing reset
+  // to the default slot (served unmasked: no upload, no kernel), releasing
+  // their storage ref — the node bundle frees once the last kept mask
+  // releases, or right here when none survives.
+  for (auto& work_ptr : workset.works) {
     auto& work = *work_ptr;
-    if (!work.any_deleted.load(std::memory_order_relaxed)) { continue; }
-    auto mask                       = std::make_shared<mvcc_chunk_mask>();
-    mask->words                     = work.words;
-    mask->row_count                 = work.row_count;
-    mask->retention                 = work.retention;
-    (*work.masks)[work.chunk_index] = std::move(mask);
+    if (work.any_deleted.load(std::memory_order_relaxed)) { continue; }
+    (*work.masks)[work.chunk_index] = mvcc_chunk_mask{};
   }
+}
+
+void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
+                        exec::scoped_dispatcher& dispatcher,
+                        cucascade::memory::memory_reservation_manager& reservation_manager,
+                        sirius::memory::topology_index const& topology)
+{
+  auto workset = prepare_mvcc_mask_tasks(requests, reservation_manager, topology);
+  if (workset.fill_tasks.empty()) { return; }
+  SIRIUS_LOG_DEBUG("[run_mvcc_mask_jobs] {} dirty chunk(s), {} fill task(s) across {} request(s)",
+                   workset.works.size(),
+                   workset.fill_tasks.size(),
+                   requests.size());
+  fan_out_and_join(dispatcher, std::move(workset.fill_tasks), "mvcc keep-mask fill");
+  finalize_mvcc_masks(workset);
 }
 
 }  // namespace sirius::scan_manager

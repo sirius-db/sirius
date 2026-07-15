@@ -30,7 +30,7 @@
 // (forward-then-close; provider throw -> close(exception) -> consumer
 // rethrows; pre-stopped token -> close without draining) and
 // validate_pinned_entry_for_serving (malformed entries throw so
-// try_assign_cached_entries falls back to the disk read; well-formed and
+// try_match_cached_entry falls back to the disk read; well-formed and
 // zero-chunk entries pass).
 
 #include "operator/operator_test_utils.hpp"
@@ -61,7 +61,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -193,16 +192,13 @@ std::shared_ptr<cucascade::data_batch> make_test_batch(test_env& e, std::size_t 
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr));
 }
 
-/// All-ones keep-mask over @p rows rows, retained by a plain vector — the
-/// unit-test stand-in for the mask job's pinned {reservation, blocks} bundle.
-std::shared_ptr<sirius::scan_manager::mvcc_chunk_mask const> make_test_mask(std::size_t rows)
+/// All-ones keep-mask over @p rows rows, its words aliasing a plain vector —
+/// the unit-test stand-in for the mask job's pinned {reservation, blocks}
+/// bundle.
+sirius::scan_manager::mvcc_chunk_mask make_test_mask(std::size_t rows)
 {
-  auto storage    = std::make_shared<std::vector<std::uint32_t>>((rows + 31) / 32, 0xFFFFFFFFu);
-  auto mask       = std::make_shared<sirius::scan_manager::mvcc_chunk_mask>();
-  mask->words     = std::span<std::uint32_t>(storage->data(), storage->size());
-  mask->row_count = rows;
-  mask->retention = storage;
-  return mask;
+  auto storage = std::make_shared<std::vector<std::uint32_t>>((rows + 31) / 32, 0xFFFFFFFFu);
+  return {std::shared_ptr<std::uint32_t[]>(storage, storage->data()), rows};
 }
 
 /// Serves its scripted batches (each optionally paired with a keep-mask) in
@@ -210,7 +206,7 @@ std::shared_ptr<sirius::scan_manager::mvcc_chunk_mask const> make_test_mask(std:
 /// drain must handle.
 struct scripted_provider final : databatch_provider {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-  std::vector<std::shared_ptr<sirius::scan_manager::mvcc_chunk_mask const>> masks;
+  std::vector<sirius::scan_manager::mvcc_chunk_mask> masks;
   std::size_t served{0};
   bool throw_when_exhausted{false};
 
@@ -218,7 +214,8 @@ struct scripted_provider final : databatch_provider {
   {
     if (served < batches.size()) {
       auto idx = served++;
-      return {batches[idx], idx < masks.size() ? masks[idx] : nullptr};
+      return {batches[idx],
+              idx < masks.size() ? masks[idx] : sirius::scan_manager::mvcc_chunk_mask{}};
     }
     if (throw_when_exhausted) { throw std::runtime_error("provider blew up mid-stream"); }
     return {};
@@ -291,13 +288,15 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask onto each split",
   REQUIRE(first.has_value());
   auto* in0 = dynamic_cast<sirius::op::scan::scan_operator_input*>(first->get());
   REQUIRE(in0 != nullptr);
-  REQUIRE(in0->mvcc_keep_mask == mask0);  // pointer identity: no copy, no reorder
+  // Same word storage, same extent: the words were forwarded, not rebuilt.
+  REQUIRE(in0->mvcc_keep_mask.words == mask0.words);
+  REQUIRE(in0->mvcc_keep_mask.row_count == mask0.row_count);
 
   auto second = connector.get_next_split();
   REQUIRE(second.has_value());
   auto* in1 = dynamic_cast<sirius::op::scan::scan_operator_input*>(second->get());
   REQUIRE(in1 != nullptr);
-  REQUIRE(in1->mvcc_keep_mask == nullptr);
+  REQUIRE_FALSE(in1->mvcc_keep_mask.has_mask());
 
   REQUIRE_FALSE(connector.get_next_split().has_value());
 }
@@ -310,35 +309,40 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
 
   SECTION("with a mask set")
   {
-    auto m0  = make_test_mask(4);
-    auto m2  = make_test_mask(4);
-    auto set = std::make_shared<sirius::scan_manager::mvcc_chunk_mask_set>();
-    set->push_back(m0);
-    set->push_back(nullptr);  // all-visible chunk: served unmasked
-    set->push_back(m2);
+    auto m0 = make_test_mask(4);
+    auto m2 = make_test_mask(4);
+    sirius::scan_manager::mvcc_chunk_mask_set set;
+    set.push_back(m0);
+    set.push_back({});  // all-visible chunk: served unmasked
+    set.push_back(m2);
 
+    // The provider takes its own copy of the set (the post-mask-run handoff
+    // shape); the words themselves are shared, never duplicated. Identity
+    // plan: all three chunks survive.
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry, cols, sirius::telemetry::batch_telemetry_info{}, set);
+      entry, cols, std::move(plan), sirius::telemetry::batch_telemetry_info{}, set);
     auto b0 = provider->get_next_batch();
     REQUIRE(b0.data);
-    REQUIRE(b0.mvcc_keep_mask == m0);
+    REQUIRE(b0.mvcc_keep_mask.words == m0.words);
     auto b1 = provider->get_next_batch();
     REQUIRE(b1.data);
-    REQUIRE(b1.mvcc_keep_mask == nullptr);
+    REQUIRE_FALSE(b1.mvcc_keep_mask.has_mask());
     auto b2 = provider->get_next_batch();
     REQUIRE(b2.data);
-    REQUIRE(b2.mvcc_keep_mask == m2);
+    REQUIRE(b2.mvcc_keep_mask.words == m2.words);
     REQUIRE_FALSE(provider->get_next_batch().data);  // end of stream
   }
 
   SECTION("without a mask set every chunk serves unmasked")
   {
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry, cols, sirius::telemetry::batch_telemetry_info{});
+      entry, cols, std::move(plan), sirius::telemetry::batch_telemetry_info{});
     for (int i = 0; i < 3; ++i) {
       auto b = provider->get_next_batch();
       REQUIRE(b.data);
-      REQUIRE(b.mvcc_keep_mask == nullptr);
+      REQUIRE_FALSE(b.mvcc_keep_mask.has_mask());
     }
     REQUIRE_FALSE(provider->get_next_batch().data);
   }
@@ -362,7 +366,7 @@ TEST_CASE("masked resident splits report the filter-copy working-set peak",
   auto const batch_bytes = masked.get_estimated_size_in_bytes();
   REQUIRE(batch_bytes > 0);
   REQUIRE(masked.get_estimated_working_set_size_in_bytes() ==
-          2 * batch_bytes + 64 + masked.mvcc_keep_mask->words.size() * sizeof(std::uint32_t));
+          2 * batch_bytes + 64 + masked.mvcc_keep_mask.view().size_bytes());
 }
 
 TEST_CASE("drain_cached_provider honors a pre-stopped token", "[cached_serving][scan_manager]")

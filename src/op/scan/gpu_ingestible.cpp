@@ -38,8 +38,8 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     auto batch  = split.get_cached_batch();
     auto rbatch = batch->to_read_only();
     auto view   = get_cudf_table_view(rbatch);
-    if (split.mvcc_keep_mask) {
-      auto const& mask = *split.mvcc_keep_mask;
+    if (split.mvcc_keep_mask.has_mask()) {
+      auto const& mask = split.mvcc_keep_mask;
       if (mask.row_count != static_cast<std::size_t>(view.num_rows())) {
         throw std::runtime_error("[gpu_ingestible::materialize_table] mvcc keep-mask covers " +
                                  std::to_string(mask.row_count) +
@@ -47,7 +47,7 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
                                  std::to_string(view.num_rows()));
       }
       auto masked = apply_host_keep_bitmask(
-        view, mask.words, mask.row_count, stream, mem_space->get_default_allocator());
+        view, mask.view(), mask.row_count, stream, mem_space->get_default_allocator());
       // The pinned mask words feed a true-async H2D DMA, and for a HOST-tier
       // chunk `rbatch` owns the staged device copy the filter kernel reads —
       // neither release is ordered against the stream once this branch

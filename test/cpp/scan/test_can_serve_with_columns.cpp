@@ -15,7 +15,7 @@
  */
 
 // Unit tests for cache_entry_info::can_serve_with_columns — the pinned-cache match
-// used by sirius_scan_manager::try_assign_cached_entries. A pinned entry can serve
+// used by sirius_scan_manager::try_match_cached_entry. A pinned entry can serve
 // an incoming scan iff it has the same identity (parquet file set OR duckdb
 // catalog.schema.table) AND reads a superset of the requested columns; the result
 // is the gather projection (positions into the pinned entry's column layout) that

@@ -41,7 +41,7 @@ struct databatch_provider {
   /// A default-constructed batch (null @ref data) means end-of-stream.
   struct batch {
     std::shared_ptr<cucascade::data_batch> data;
-    std::shared_ptr<mvcc_chunk_mask const> mvcc_keep_mask;  ///< null = all rows visible
+    mvcc_chunk_mask mvcc_keep_mask;  ///< default = all rows visible
   };
 
   virtual ~databatch_provider()  = default;

@@ -97,7 +97,7 @@ namespace sirius::scan_manager {
 /// Captures only what serving needs — the table's identity (parquet file set OR
 /// duckdb catalog/schema/table name), the cached columns (by primary/storage
 /// index), and their names (aligned with @c column_ids) for the GPU gather — and
-/// owns the match logic that @ref sirius_scan_manager::try_assign_cached_entries consults.
+/// owns the match logic that @ref sirius_scan_manager::try_match_cached_entry consults.
 class cache_entry_info {
  public:
   std::vector<std::string> resolved_file_paths;    ///< parquet identity (file set)
@@ -198,23 +198,10 @@ struct pinned_entry {
 /// Serve-time defense against malformed entries: the cached serving loop reads
 /// a nullptr batch as end-of-stream, so a column with fewer chunks (or a null
 /// chunk) would silently end the scan early — fewer rows than requested, no
-/// error. @ref sirius_scan_manager::try_assign_cached_entries calls this before
-/// attaching the provider and converts a throw into a disk-read fallback.
+/// error. @ref sirius_scan_manager::try_match_cached_entry calls this before
+/// recording the assignment and converts a throw into a disk-read fallback.
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
-
-/// Build the cached-serving databatch_provider for @p entry over
-/// @p selected_columns (positions into @c entry.cache_info.column_ids, in the
-/// scan's materialized order). @p mvcc_masks, when non-null, is the per-chunk
-/// MVCC keep-mask set the provider pairs with each chunk it yields (slot i
-/// masks chunk i; a null slot serves that chunk unmasked). Declared
-/// here so the chunk↔mask pairing is unit-testable; the provider type itself
-/// stays internal to the scan manager.
-std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry,
-  std::span<std::size_t const> selected_columns,
-  const telemetry::batch_telemetry_info& telemetry_info,
-  std::shared_ptr<mvcc_chunk_mask_set const> mvcc_masks = nullptr);
 
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
@@ -223,6 +210,22 @@ struct cached_scan_plan {
   std::vector<std::size_t> survivor_chunk_indices;  ///< indices of chunks that survived pruning
   std::size_t pruned{0};
 };
+
+/// Build the cached-serving databatch_provider for @p entry over
+/// @p selected_columns (positions into @c entry.cache_info.column_ids, in the
+/// scan's materialized order). @p plan lists the zone-map survivor chunks the
+/// provider serves (the identity plan when nothing was pruned). @p mvcc_masks
+/// is the provider's own copy of the per-chunk MVCC keep-mask set, paired with
+/// each chunk it yields (slot i masks chunk i; a default slot — or an empty
+/// set, the parquet-pin case — serves the chunk unmasked). Declared here so
+/// the chunk↔mask pairing is unit-testable; the provider type itself stays
+/// internal to the scan manager.
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  cached_scan_plan plan,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  mvcc_chunk_mask_set mvcc_masks = {});
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -445,10 +448,27 @@ class sirius_scan_manager {
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
-  /// \brief Attach a cached batch_provider to @p op if a pinned entry can serve
-  ///        it. Returns true when a cache hit was assigned (the caller then skips
-  ///        the disk-reading split_provider for this operator).
-  bool try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op);
+  /// One matched (scan op ← pinned entry) pairing from the cache-match pass.
+  /// Provider construction is deferred to after run_mvcc_mask_jobs so each
+  /// provider takes its own copy of the entry's completed mask set; the entry
+  /// pointer stays valid for the whole prepare (pin/unpin is
+  /// query-lifecycle-serialized).
+  struct cached_assignment {
+    op::scan::sirius_gpu_scan_operator* op{nullptr};
+    pinned_entry const* entry{nullptr};
+    std::vector<std::size_t> columns;  ///< selected columns, materialized order
+    std::string entry_name;            ///< handoff key into _pending_mvcc_mask_jobs
+    cached_scan_plan plan;             ///< zone-map survivor plan, moved into the provider
+  };
+
+  /// \brief Match @p op against the pinned entries. On a hit, validates the
+  ///        entry for serving, queues the entry's MVCC mask job unless one is
+  ///        already pending (a self-join queues ONE job per entry), and
+  ///        returns the assignment for the post-mask-run provider handoff.
+  ///        Returns nullopt on a miss (the caller then builds the
+  ///        disk-reading split_provider for this operator).
+  [[nodiscard]] std::optional<cached_assignment> try_match_cached_entry(
+    op::scan::sirius_gpu_scan_operator* op);
 
   /// Resolve the ioctx that should serve @p path (normalized internally, so callers
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
@@ -481,9 +501,11 @@ class sirius_scan_manager {
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   bool _pruning_enabled{true};
 
-  /// Mask computations recorded by try_assign_cached_entries for this query's
-  /// duckdb+mvcc cache hits; executed block-in-prepare by run_mvcc_mask_jobs
-  /// before start_metadata_processing, cleared in reset().
+  /// One mask computation per distinct pinned entry matched this query
+  /// (recorded by try_match_cached_entry, deduped by entry name); executed
+  /// block-in-prepare by run_mvcc_mask_jobs, after which the provider handoff
+  /// copies each completed set out and the vector is cleared (also cleared in
+  /// reset() for the prepare-threw case).
   std::vector<mvcc_mask_job_request> _pending_mvcc_mask_jobs;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh

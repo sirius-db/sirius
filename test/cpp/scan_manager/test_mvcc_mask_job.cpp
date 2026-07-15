@@ -18,8 +18,9 @@
 // assemble concurrent disjoint writes exactly once, rethrow the first task
 // error, and turn silently-dropped tasks (a stopping dispatcher) into a loud
 // error instead of a deadlock or a partial result; run_mvcc_mask_jobs must
-// publish pinned, reservation-backed masks only for chunks that actually
-// dropped rows, and do nothing at all for version-state-free tables.
+// leave pinned, reservation-backed masks only for chunks that actually
+// dropped rows (finalize resets carved-but-clean slots), and do nothing at
+// all for version-state-free tables.
 
 #include "operator/operator_test_utils.hpp"
 
@@ -49,8 +50,10 @@
 #include <vector>
 
 using sirius::scan_manager::fan_out_and_join;
+using sirius::scan_manager::finalize_mvcc_masks;
 using sirius::scan_manager::mvcc_chunk_mask_set;
 using sirius::scan_manager::mvcc_mask_job_request;
+using sirius::scan_manager::prepare_mvcc_mask_tasks;
 using sirius::scan_manager::run_mvcc_mask_jobs;
 
 namespace {
@@ -212,7 +215,7 @@ TEST_CASE("fan_out_and_join with zero tasks returns immediately", "[mvcc_mask_jo
   REQUIRE_NOTHROW(fan_out_and_join(dispatcher, {}, "empty test"));
 }
 
-TEST_CASE("run_mvcc_mask_jobs publishes pinned masks for dirty chunks only",
+TEST_CASE("run_mvcc_mask_jobs keeps pinned masks for dirty chunks only",
           "[mvcc_mask_job][scan_manager]")
 {
   auto& e = env();
@@ -231,7 +234,7 @@ TEST_CASE("run_mvcc_mask_jobs publishes pinned masks for dirty chunks only",
   REQUIRE(host_space != nullptr);
 
   mvcc_mask_job_request request;
-  request.masks        = std::make_shared<mvcc_chunk_mask_set>(2);
+  request.masks        = mvcc_chunk_mask_set(2);
   request.metadata     = metadata;
   request.storage      = &storage;
   request.context      = tdb.con->context.get();
@@ -244,25 +247,25 @@ TEST_CASE("run_mvcc_mask_jobs publishes pinned masks for dirty chunks only",
   sirius::exec::scoped_dispatcher dispatcher(pool, 4);
   run_mvcc_mask_jobs(requests, dispatcher, *e.mgr, e.topology);
 
-  auto const& masks = *requests[0].masks;
-  REQUIRE(masks[0] != nullptr);  // chunk with deletes: published
-  REQUIRE(masks[1] == nullptr);  // untouched chunk: unmasked fast path
+  auto const& masks = requests[0].masks;
+  REQUIRE(masks[0].has_mask());        // chunk with deletes: mask kept
+  REQUIRE_FALSE(masks[1].has_mask());  // untouched chunk: unmasked fast path
 
-  auto const& mask = *masks[0];
+  auto const& mask = masks[0];
   REQUIRE(mask.row_count == metadata.base_row_count_per_chunk[0]);
-  REQUIRE(mask.words.size() == (mask.row_count + 31) / 32);
+  REQUIRE(mask.view().size() == (mask.row_count + 31) / 32);
   for (std::size_t r = 0; r < mask.row_count; ++r) {
     bool const deleted = (r == 0 || r == 31 || r == 32 || r == 2048 || r == 100000);
-    if (bit_at(mask.words, r) != !deleted) {
+    if (bit_at(mask.view(), r) != !deleted) {
       INFO("row " << r);
-      REQUIRE(bit_at(mask.words, r) == !deleted);
+      REQUIRE(bit_at(mask.view(), r) == !deleted);
     }
   }
 
   // The published words live in registered (pinned) host memory carved from
   // the reservation-backed staging blocks.
   cudaPointerAttributes attrs{};
-  REQUIRE(cudaPointerGetAttributes(&attrs, mask.words.data()) == cudaSuccess);
+  REQUIRE(cudaPointerGetAttributes(&attrs, mask.words.get()) == cudaSuccess);
   REQUIRE(attrs.type == cudaMemoryTypeHost);
 
   exec_ok(*tdb.con, "ROLLBACK");
@@ -288,7 +291,7 @@ TEST_CASE("run_mvcc_mask_jobs is a no-op for version-state-free tables",
 
   auto* host_space = e.mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
   mvcc_mask_job_request request;
-  request.masks        = std::make_shared<mvcc_chunk_mask_set>(1);
+  request.masks        = mvcc_chunk_mask_set(1);
   request.metadata     = metadata;
   request.storage      = &storage;
   request.context      = tdb.con->context.get();
@@ -301,7 +304,136 @@ TEST_CASE("run_mvcc_mask_jobs is a no-op for version-state-free tables",
   sirius::exec::scoped_dispatcher dispatcher(pool, 2);
   run_mvcc_mask_jobs(requests, dispatcher, *e.mgr, e.topology);
 
-  REQUIRE((*requests[0].masks)[0] == nullptr);
+  REQUIRE_FALSE(requests[0].masks[0].has_mask());
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("prepare_mvcc_mask_tasks stages dispatch-free work that fills and finalizes by hand",
+          "[mvcc_mask_job][scan_manager]")
+{
+  auto& e = env();
+  job_test_db tdb;
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(60000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  exec_ok(*tdb.con, "DELETE FROM t WHERE rowid < 10");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  auto metadata = make_metadata(*tdb.con, storage);
+
+  auto* host_space = e.mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  mvcc_mask_job_request request;
+  request.masks        = mvcc_chunk_mask_set(1);
+  request.metadata     = metadata;
+  request.storage      = &storage;
+  request.context      = tdb.con->context.get();
+  request.chunk_spaces = {host_space};
+  request.entry_name   = "t";
+  std::vector<mvcc_mask_job_request> requests;
+  requests.push_back(std::move(request));
+
+  // Stage without a dispatcher: layout is observable before any fill runs.
+  auto workset = prepare_mvcc_mask_tasks(requests, *e.mgr, e.topology);
+  REQUIRE(workset.works.size() == 1);  // one dirty chunk
+  REQUIRE_FALSE(workset.fill_tasks.empty());
+  // Prepare installed the carved (still-unfilled) mask straight into the set.
+  auto const& staged = requests[0].masks[0];
+  REQUIRE(staged.has_mask());
+  REQUIRE(staged.row_count == metadata.base_row_count_per_chunk[0]);
+  REQUIRE(staged.view().size() == (staged.row_count + 31) / 32);
+  // Cache-line-aligned carve within the staging block.
+  REQUIRE(reinterpret_cast<std::uintptr_t>(staged.words.get()) % 64 == 0);
+
+  // Run the fill inline — no dispatcher — then finalize and check the set.
+  for (auto& task : workset.fill_tasks) {
+    task();
+  }
+  finalize_mvcc_masks(workset);
+  REQUIRE(requests[0].masks[0].has_mask());
+  for (std::size_t r = 0; r < 32; ++r) {
+    REQUIRE(bit_at(requests[0].masks[0].view(), r) == (r >= 10));
+  }
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("finalize_mvcc_masks resets carved chunks whose fill dropped no rows",
+          "[mvcc_mask_job][scan_manager]")
+{
+  auto& e = env();
+  job_test_db tdb;
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(60000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+
+  // A second connection's uncommitted DELETE: the chunk carries row version
+  // state (dirty -> carved), but the delete is invisible to the scan
+  // transaction, so the fill drops nothing and finalize must reset the slot
+  // back to the unmasked fast path.
+  duckdb::Connection writer(*tdb.db);
+  exec_ok(writer, "BEGIN TRANSACTION");
+  exec_ok(writer, "DELETE FROM t WHERE rowid < 10");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  auto metadata = make_metadata(*tdb.con, storage);
+
+  auto* host_space = e.mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  mvcc_mask_job_request request;
+  request.masks        = mvcc_chunk_mask_set(1);
+  request.metadata     = metadata;
+  request.storage      = &storage;
+  request.context      = tdb.con->context.get();
+  request.chunk_spaces = {host_space};
+  request.entry_name   = "t";
+  std::vector<mvcc_mask_job_request> requests;
+  requests.push_back(std::move(request));
+
+  // Drive the stages by hand to observe the carve -> reset transition.
+  auto workset = prepare_mvcc_mask_tasks(requests, *e.mgr, e.topology);
+  REQUIRE(workset.works.size() == 1);        // version state -> carved
+  REQUIRE(requests[0].masks[0].has_mask());  // installed, not yet filled
+  for (auto& task : workset.fill_tasks) {
+    task();
+  }
+  finalize_mvcc_masks(workset);
+  REQUIRE_FALSE(requests[0].masks[0].has_mask());  // nothing dropped -> reset
+
+  exec_ok(*tdb.con, "ROLLBACK");
+  exec_ok(writer, "ROLLBACK");
+}
+
+TEST_CASE("prepare_mvcc_mask_tasks stages nothing for version-state-free tables",
+          "[mvcc_mask_job][scan_manager]")
+{
+  auto& e = env();
+  job_test_db tdb;
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  // Reopen so the session-written version managers unload (the provably-clean
+  // shape, same as the run-level no-op test).
+  tdb.con.reset();
+  tdb.db.reset();
+  tdb.db  = std::make_unique<duckdb::DuckDB>(tdb.path);
+  tdb.con = std::make_unique<duckdb::Connection>(*tdb.db);
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  auto metadata = make_metadata(*tdb.con, storage);
+
+  auto* host_space = e.mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  mvcc_mask_job_request request;
+  request.masks        = mvcc_chunk_mask_set(1);
+  request.metadata     = metadata;
+  request.storage      = &storage;
+  request.context      = tdb.con->context.get();
+  request.chunk_spaces = {host_space};
+  request.entry_name   = "t";
+  std::vector<mvcc_mask_job_request> requests;
+  requests.push_back(std::move(request));
+
+  auto workset = prepare_mvcc_mask_tasks(requests, *e.mgr, e.topology);
+  REQUIRE(workset.works.empty());
+  REQUIRE(workset.fill_tasks.empty());
+  REQUIRE_FALSE(requests[0].masks[0].has_mask());
   exec_ok(*tdb.con, "ROLLBACK");
 }
 
@@ -320,14 +452,16 @@ TEST_CASE("run_mvcc_mask_jobs handles two requests over the same table",
 
   auto* host_space = e.mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
   std::vector<mvcc_mask_job_request> requests;
-  for (int i = 0; i < 2; ++i) {  // self-join analog: one request per scan op
+  // Two requests over one table = two pinned entries pinned over the same
+  // storage (a self-join of ONE entry dedups upstream to a single request).
+  for (int i = 0; i < 2; ++i) {
     mvcc_mask_job_request request;
-    request.masks        = std::make_shared<mvcc_chunk_mask_set>(1);
+    request.masks        = mvcc_chunk_mask_set(1);
     request.metadata     = metadata;
     request.storage      = &storage;
     request.context      = tdb.con->context.get();
     request.chunk_spaces = {host_space};
-    request.entry_name   = "t";
+    request.entry_name   = "t" + std::to_string(i);
     requests.push_back(std::move(request));
   }
 
@@ -336,10 +470,10 @@ TEST_CASE("run_mvcc_mask_jobs handles two requests over the same table",
   run_mvcc_mask_jobs(requests, dispatcher, *e.mgr, e.topology);
 
   for (auto const& request : requests) {
-    auto const& mask = (*request.masks)[0];
-    REQUIRE(mask != nullptr);
+    auto const& mask = request.masks[0];
+    REQUIRE(mask.has_mask());
     for (std::size_t r = 0; r < 32; ++r) {
-      REQUIRE(bit_at(mask->words, r) == (r >= 10));
+      REQUIRE(bit_at(mask.view(), r) == (r >= 10));
     }
   }
   exec_ok(*tdb.con, "ROLLBACK");

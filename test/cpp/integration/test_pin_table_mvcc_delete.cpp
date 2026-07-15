@@ -35,7 +35,6 @@
 
 #include <memory>
 #include <string>
-#include <vector>
 
 using PinMvccDeleteFixture = sirius::test::GpuExecutionFixture;
 
@@ -358,5 +357,25 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("DELETE FROM t WHERE k % 3 = 0;");
 
   compare_gpu_vs_cpu("SELECT u.g, count(*) FROM t JOIN u ON t.k = u.k GROUP BY u.g ORDER BY u.g;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccDeleteFixture,
+                 "mvcc delete: a self-join of a masked pinned table masks both sides",
+                 "[integration][gpu_execution][pin_table_mvcc_delete]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, (range % 100)::INTEGER AS g "
+    "FROM range(100000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  run_ok("DELETE FROM t WHERE k % 3 = 0 OR k IN (31, 32, 2048);");
+
+  // Two GPU scan operators hit the same pinned entry: the mask job runs once
+  // (deduped by entry name) and each scan's provider serves its own copy of
+  // the completed set. The offset join predicate pairs each row with its
+  // neighbor, so a mask leak on either side changes the counts.
+  compare_gpu_vs_cpu(
+    "SELECT a.g, count(*) FROM t a JOIN t b ON a.k = b.k + 1 GROUP BY a.g ORDER BY a.g;");
   run_ok("CALL unpin_table('t');");
 }
