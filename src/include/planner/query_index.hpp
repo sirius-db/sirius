@@ -39,10 +39,16 @@ struct pipeline_order {};
 /// pipeline. Only FULL-barrier edges cut a branch, so pipelinable work stays in one branch.
 struct barrier_order {};
 
+/// Branch-formation strategy: exactly like barrier_order, except that an edge feeding the probe
+/// side of a HASH_JOIN consumer is always treated as a PIPELINE barrier (regardless of its actual
+/// barrier). This keeps the probe pipeline flowing through the join into the downstream branch,
+/// while the build side still cuts on its own (typically FULL) barrier.
+struct build_probe {};
+
 /// Options for query_index::build_index.
 struct build_index_options {
   /// How branches are formed from the pipeline DAG. Defaults to pipeline_order.
-  std::variant<pipeline_order, barrier_order> branch_order{pipeline_order{}};
+  std::variant<pipeline_order, barrier_order, build_probe> branch_order{pipeline_order{}};
 };
 
 /**

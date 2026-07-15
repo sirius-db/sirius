@@ -35,27 +35,32 @@ using sirius::pipeline::sirius_pipeline;
 using sirius::pipeline::sirius_pipeline_build_state;
 using sirius::planner::barrier_order;
 using sirius::planner::build_index_options;
+using sirius::planner::build_probe;
 using sirius::planner::pipeline_order;
 using sirius::planner::query_index;
 
 namespace {
 
 // Minimal concrete operator: a pass-through node used purely to carry ports/next-ports so that
-// query_index can read the pipeline DAG. Uses PROJECTION so get_next_ports_after_sink() takes the
-// plain (non-delim-join) path.
+// query_index can read the pipeline DAG. Defaults to PROJECTION so get_next_ports_after_sink()
+// takes the plain (non-delim-join) path; a type can be supplied to model e.g. a HASH_JOIN consumer.
 struct test_operator : sirius_physical_operator {
-  test_operator() : sirius_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0) {}
+  explicit test_operator(SiriusPhysicalOperatorType type = SiriusPhysicalOperatorType::PROJECTION)
+    : sirius_physical_operator(type, {}, 0)
+  {
+  }
 };
 
 // Builds a pipeline DAG out of one operator per pipeline (acting as both source and sink) wired
 // together through barrier-tagged ports, mirroring how the planner wires real pipelines.
 class dag_builder {
  public:
-  // Add a pipeline labelled `id`; each pipeline gets a single source+sink operator.
-  duckdb::shared_ptr<sirius_pipeline> add(int id)
+  // Add a pipeline labelled `id`; each pipeline gets a single source+sink operator of `type`.
+  duckdb::shared_ptr<sirius_pipeline> add(
+    int id, SiriusPhysicalOperatorType type = SiriusPhysicalOperatorType::PROJECTION)
   {
     auto pipeline = duckdb::make_shared_ptr<sirius_pipeline>(_ctx);
-    auto op       = std::make_unique<test_operator>();
+    auto op       = std::make_unique<test_operator>(type);
     op->set_pipeline(pipeline);
     _bs.set_pipeline_source(*pipeline, *op);
     _bs.set_pipeline_sink(*pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()), 0);
@@ -65,15 +70,17 @@ class dag_builder {
     return pipeline;
   }
 
-  // Wire a data-flow edge from -> to carrying `barrier`.
+  // Wire a data-flow edge from -> to carrying `barrier`, pushed into port `port_name` on the
+  // consumer (auto-generated when empty; use "build"/"default" to model hash-join sides).
   void connect(const duckdb::shared_ptr<sirius_pipeline>& from,
                const duckdb::shared_ptr<sirius_pipeline>& to,
-               MemoryBarrierType barrier)
+               MemoryBarrierType barrier,
+               const std::string& port_name = "")
   {
     auto* consumer_op = to->get_source().get();
     auto* producer_op = from->get_sink().get();
 
-    _names.push_back("e" + std::to_string(_names.size()));
+    _names.push_back(port_name.empty() ? "e" + std::to_string(_names.size()) : port_name);
     std::string_view name = _names.back();
 
     auto port           = std::make_unique<sirius_physical_operator::port>();
@@ -198,4 +205,49 @@ TEST_CASE("query_index barrier_order with a partial barrier also extends", "[que
   REQUIRE(got.size() == 2);
   REQUIRE(contains(got, {1}));        // scan branch cut by its FULL edge
   REQUIRE(contains(got, {2, 3, 4}));  // partial edge extends mid through join, tail
+}
+
+// A hash join fed by a FULL-barrier probe side and a FULL-barrier build side:
+//   probe(1) --[FULL,"default"]--> join(2) ;  build(3) --[FULL,"build"]--> join(2) ;  join -> 4
+namespace {
+struct join_dag {
+  dag_builder b;
+  duckdb::shared_ptr<sirius_pipeline> probe, build, join, tail;
+  join_dag()
+  {
+    probe = b.add(1);
+    build = b.add(3);
+    join  = b.add(2, SiriusPhysicalOperatorType::HASH_JOIN);
+    tail  = b.add(4);
+    b.connect(probe, join, MemoryBarrierType::FULL, "default");  // probe side
+    b.connect(build, join, MemoryBarrierType::FULL, "build");    // build side
+    b.connect(join, tail, MemoryBarrierType::PIPELINE);
+  }
+};
+}  // namespace
+
+TEST_CASE("query_index build_probe pipelines the hash-join probe side through the join",
+          "[query_index]")
+{
+  join_dag d;
+  auto index = query_index::build_index(d.b.pipelines(), build_index_options{build_probe{}});
+  auto got   = d.b.label(index->get_branches());
+
+  // Probe (1) extends through the join (2) and its downstream (4); build side (3) still cuts.
+  REQUIRE(got.size() == 2);
+  REQUIRE(contains(got, {1, 2, 4}));
+  REQUIRE(contains(got, {3}));
+}
+
+TEST_CASE("query_index barrier_order does not pipeline the hash-join probe side", "[query_index]")
+{
+  join_dag d;
+  // Same DAG under barrier_order: both FULL edges cut, so the join heads its own branch.
+  auto index = query_index::build_index(d.b.pipelines(), build_index_options{barrier_order{}});
+  auto got   = d.b.label(index->get_branches());
+
+  REQUIRE(got.size() == 3);
+  REQUIRE(contains(got, {1}));
+  REQUIRE(contains(got, {3}));
+  REQUIRE(contains(got, {2, 4}));
 }
