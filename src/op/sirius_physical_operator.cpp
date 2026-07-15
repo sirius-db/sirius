@@ -134,7 +134,11 @@ std::string sirius_physical_operator::get_name() const
   return SiriusPhysicalOperatorToString(type);
 }
 
-std::string sirius_physical_operator::to_string() const { return get_name() + params_to_string(); }
+std::string sirius_physical_operator::to_string() const
+{
+  auto params = params_to_string();
+  return params.empty() ? get_name() : get_name() + " [" + params + "]";
+}
 
 void sirius_physical_operator::print() const { std::cout << to_string() << std::endl; }
 

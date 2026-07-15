@@ -193,6 +193,18 @@ void emit_plan_telemetry(
       return chain;
     }();
 
+    // One "<name>(<id>).params" string attribute per operator with a non-empty
+    // params_to_string(), so the viewer's operator info panel shows per-operator
+    // metadata (join conditions, predicates, sort keys, ...) for the pipeline chain.
+    quent::CustomAttributes custom_attributes{};
+    for (const auto& op : operators) {
+      if (auto params = op.get().params_to_string(); !params.empty()) {
+        custom_attributes.string_attrs.push_back(
+          quent::StringAttr{std::format("{}({}).params", op.get().get_name(), op.get().operator_id),
+                            std::move(params)});
+      }
+    }
+
     operator_obs->declaration(
       pipeline_uuid,
       quent::operator_::Declaration{
@@ -200,7 +212,7 @@ void emit_plan_telemetry(
         .parent_operator_ids = {},
         .instance_name       = operator_chain,
         .type_name           = std::format("Pipeline Id {}", pipeline->get_pipeline_id()),
-        .custom_attributes   = {},
+        .custom_attributes   = std::move(custom_attributes),
       });
 
     // Receiver ports on pipeline source operators.

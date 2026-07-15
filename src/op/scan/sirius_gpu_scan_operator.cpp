@@ -135,4 +135,9 @@ std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
   return stats.bytes * 8 + filter_only_bytes;
 }
 
+std::string sirius_gpu_scan_operator::params_to_string() const
+{
+  return _ingestible ? _ingestible->table_info().params_to_string() : "";
+}
+
 }  // namespace sirius::op::scan

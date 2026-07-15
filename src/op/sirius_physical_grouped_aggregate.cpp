@@ -105,5 +105,14 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   }
   return std::make_unique<pipelineable_operator_data>(results);
 }
+
+std::string sirius_physical_grouped_aggregate::params_to_string() const
+{
+  return cudf_aggregate_definitions_to_string(group_idx,
+                                              cudf_aggregates,
+                                              cudf_aggregate_idx,
+                                              cudf_aggregate_struct_col_indices,
+                                              aggregate_slots);
+}
 }  // namespace op
 }  // namespace sirius

@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -894,6 +895,11 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{
       make_data_batch(std::move(result_table), *space, stream, batch_telemetry())});
+}
+
+std::string sirius_physical_nested_loop_join::params_to_string() const
+{
+  return duckdb::JoinTypeToString(join_type) + ": " + sirius::to_string(conditions);
 }
 
 }  // namespace op

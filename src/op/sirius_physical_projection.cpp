@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/reference.hpp"
+#include "expression/ast/to_string.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
 #include "sirius/exception.hpp"
@@ -179,6 +180,16 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
       out_view, std::move(owner), referenced_bytes, mem, stream, batch_telemetry()));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
+}
+
+std::string sirius_physical_projection::params_to_string() const
+{
+  std::string result;
+  for (auto const& expr : select_list) {
+    if (!result.empty()) { result += ", "; }
+    result += expr ? sirius::ast::to_string(*expr) : "?";
+  }
+  return result;
 }
 
 }  // namespace op

@@ -212,6 +212,7 @@ set(EXTENSION_SOURCES
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
     src/expression/ast/node.cpp
+    src/expression/ast/to_string.cpp
     src/expression/ast/utils.cpp
     src/expression/from_duckdb.cpp
     src/expression/function_id.cpp
@@ -574,6 +575,7 @@ set(TEST_SOURCES
     test/cpp/expression/test_ast_from_duckdb.cpp
     test/cpp/expression/test_ast_scaffold.cpp
     test/cpp/expression/test_ast_to_duckdb.cpp
+    test/cpp/expression/test_ast_to_string.cpp
     test/cpp/expression/test_comparison_type_mapping.cpp
     test/cpp/expression/test_function_id.cpp
     test/cpp/expression/test_value.cpp

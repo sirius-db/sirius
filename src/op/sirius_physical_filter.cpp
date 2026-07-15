@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
+#include "expression/ast/to_string.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -85,6 +86,11 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
       std::move(filtered_table), *batch.get_memory_space(), stream, batch_telemetry()));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
+}
+
+std::string sirius_physical_filter::params_to_string() const
+{
+  return expression ? sirius::ast::to_string(*expression) : "";
 }
 
 }  // namespace op

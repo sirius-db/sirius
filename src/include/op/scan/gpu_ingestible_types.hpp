@@ -20,6 +20,7 @@
 
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #pragma once
@@ -55,6 +56,12 @@ class ingestible_table_info {
    * must remain valid for the lifetime of @c *this.
    */
   [[nodiscard]] virtual std::span<std::string const> file_paths() const = 0;
+
+  /**
+   * @brief One-line source (table / file) + pushed-down-filter description, consumed by
+   *        sirius_gpu_scan_operator::params_to_string for telemetry / debug display.
+   */
+  [[nodiscard]] virtual std::string params_to_string() const { return ""; }
 
  protected:
   ingestible_table_info() = default;

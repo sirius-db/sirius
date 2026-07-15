@@ -16,6 +16,7 @@
 
 // sirius
 #include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/to_string.hpp>
 #include <expression/join_condition.hpp>
 
 // duckdb
@@ -61,6 +62,35 @@ duckdb::ExpressionType to_duckdb(comparison_type c)
   }
   throw std::runtime_error("sirius::to_duckdb: unrecognized comparison_type " +
                            std::to_string(static_cast<int>(c)));
+}
+
+std::string_view to_string(comparison_type c)
+{
+  switch (c) {
+    case comparison_type::equal: return "=";
+    case comparison_type::not_equal: return "!=";
+    case comparison_type::lt: return "<";
+    case comparison_type::le: return "<=";
+    case comparison_type::gt: return ">";
+    case comparison_type::ge: return ">=";
+    case comparison_type::distinct_from: return "IS DISTINCT FROM";
+    case comparison_type::not_distinct_from: return "IS NOT DISTINCT FROM";
+  }
+  return "?";
+}
+
+std::string to_string(const duckdb::vector<join_condition>& conditions)
+{
+  std::string result;
+  for (const auto& cond : conditions) {
+    if (!result.empty()) { result += " AND "; }
+    result += cond.left ? sirius::ast::to_string(*cond.left) : std::string{"?"};
+    result += " ";
+    result += to_string(cond.comparison);
+    result += " ";
+    result += cond.right ? sirius::ast::to_string(*cond.right) : std::string{"?"};
+  }
+  return result;
 }
 
 namespace {

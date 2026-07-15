@@ -430,4 +430,15 @@ std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(
   return std::make_shared<duckdb_native_gpu_ingestible>(std::move(info));
 }
 
+std::string duckdb_native_ingestible_table_info::params_to_string() const
+{
+  std::string result = table_name.empty() ? "duckdb" : table_name;
+  if (table_filters && !table_filters->filters.empty()) {
+    auto filters = table_filters_to_string(
+      *table_filters, column_ids, std::span<const std::string>(names.data(), names.size()));
+    if (!filters.empty()) { result += ", filters: " + filters; }
+  }
+  return result;
+}
+
 }  // namespace sirius::op::scan
