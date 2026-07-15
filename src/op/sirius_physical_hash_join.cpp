@@ -392,18 +392,7 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
   D_ASSERT(build_child.is_sink());
   D_ASSERT(!build_child.children.empty());
   auto& build_meta = meta_pipeline.create_child_meta_pipeline(current, build_child);
-
-  // For the inner join of a RIGHT_DELIM_JOIN, the subtree below CONCAT_build is
-  // synthetic scaffolding: partition_join runs inline in the delim join's sink and
-  // the DUMMY_SCAN placeholder carries no runtime data. Skip the recursion; build_meta
-  // still finalizes to a [CONCAT_build] single-op pipeline.
-  bool is_delim_inner = false;
-  if (auto* hj = dynamic_cast<sirius_physical_hash_join*>(&op)) {
-    is_delim_inner = hj->is_delim_join_inner();
-  } else if (auto* nlj = dynamic_cast<sirius_physical_nested_loop_join*>(&op)) {
-    is_delim_inner = nlj->is_delim_join_inner();
-  }
-  if (!is_delim_inner) { build_meta.build(*build_child.children[0]); }
+  build_meta.build(*build_child.children[0]);
 
   op.children[0]->build_pipelines(current, meta_pipeline);
 

@@ -93,6 +93,7 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 
 # --- cuCollections (cuco) --- #
 
@@ -252,7 +253,10 @@ set(EXTENSION_SOURCES
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
+    src/log/level.cpp
     src/log/logging.cpp
+    src/log/noop_sink.cpp
+    src/log/spdlog_owning_sink.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -362,6 +366,7 @@ set(EXTENSION_SOURCES
 
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
+    src/op/partition/crc32_partition_hash.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
@@ -597,6 +602,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
+    test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
@@ -605,6 +611,7 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_pin_table_duckdb_native_cache.cpp
@@ -621,6 +628,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
+    test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
@@ -700,7 +708,8 @@ if(SIRIUS_BUILD_S3_TESTS)
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
-    test/cpp/integration/test_s3_sql_surface.cpp)
+    test/cpp/integration/test_s3_sql_surface.cpp
+    test/cpp/integration/test_s3_tpch.cpp)
 endif()
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
@@ -742,7 +751,7 @@ target_include_directories(
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
-target_link_libraries(sirius_unittest sirius_extension duckdb_static)
+target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
 link_extension_libraries(sirius_unittest "")
 
 # S3 container harness: the testcontainers-native bridge plus libcurl for
