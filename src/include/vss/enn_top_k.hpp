@@ -24,6 +24,7 @@
 #include <raft/core/device_resources.hpp>
 
 #include <memory>
+#include <vector>
 
 namespace sirius::vss {
 
@@ -48,12 +49,12 @@ std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
 /**
  * @brief Consolidate per-chunk ENN candidates into the global nearest rows.
  *
- * @p input is the concatenated per-chunk candidates `[out0, ..., outN-1,
- * distance]`; the trailing distance column already carries each row's cuVS
- * distance, so this is a top-k (ascending) on it, returning `min(num_rows, c.k)`
- * rows sorted nearest-first.
+ * @p candidates is the per-chunk top-k tables, each `[out0, ..., outN-1, distance]`
+ * and already sorted ascending by the trailing distance column (cuVS select_k returns sorted).
+ * K-way merges them into one globally sorted table and slices the nearest `min(num_rows, c.k)`
+ * rows. @p candidates must be non-empty and share the same schema.
  */
 std::unique_ptr<cudf::table> merge_enn_top_k(const vector_search_context& c,
-                                             cudf::table_view input);
+                                             std::vector<cudf::table_view> const& candidates);
 
 }  // namespace sirius::vss

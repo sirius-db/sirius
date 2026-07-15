@@ -268,17 +268,24 @@ TEST_CASE("merge_enn_top_k keeps the globally nearest rows sorted by distance", 
 {
   EnnHarness h(/*dim=*/3, "l2sq", std::vector<float>(3, 0.0f));
 
-  // Candidate rows [id, distance] with distances out of order.
-  std::vector<int32_t> ids{0, 1, 2, 3};
-  std::vector<float> dist{3.0f, 1.0f, 2.0f, 0.0f};
+  // Two per-chunk candidate tables [id, distance], each already sorted ascending
+  // by distance (as cuVS select_k returns them). Global order across both chunks:
+  // id 3 (0.0), id 1 (1.0), id 2 (2.0), id 0 (3.0).
+  std::vector<int32_t> ids_a{3, 2};
+  std::vector<float> dist_a{0.0f, 2.0f};
+  std::vector<int32_t> ids_b{1, 0};
+  std::vector<float> dist_b{1.0f, 3.0f};
+
+  auto id_a = make_int32_column(ids_a);
+  auto d_a  = make_float_column(dist_a);
+  auto id_b = make_int32_column(ids_b);
+  auto d_b  = make_float_column(dist_b);
+  std::vector<cudf::table_view> candidates{cudf::table_view({id_a->view(), d_a->view()}),
+                                           cudf::table_view({id_b->view(), d_b->view()})};
 
   SECTION("top-k by ascending distance, sorted nearest-first")
   {
-    auto id_col   = make_int32_column(ids);
-    auto dist_col = make_float_column(dist);
-    cudf::table_view input({id_col->view(), dist_col->view()});
-
-    auto out = merge_enn_top_k(h.context(/*k=*/2), input);
+    auto out = merge_enn_top_k(h.context(/*k=*/2), candidates);
     h.stream.synchronize();
 
     REQUIRE(out->num_rows() == 2);
@@ -291,11 +298,7 @@ TEST_CASE("merge_enn_top_k keeps the globally nearest rows sorted by distance", 
 
   SECTION("k beyond the row count returns every row, still sorted")
   {
-    auto id_col   = make_int32_column(ids);
-    auto dist_col = make_float_column(dist);
-    cudf::table_view input({id_col->view(), dist_col->view()});
-
-    auto out = merge_enn_top_k(h.context(/*k=*/100), input);
+    auto out = merge_enn_top_k(h.context(/*k=*/100), candidates);
     h.stream.synchronize();
 
     auto got_ids = to_host<int32_t>(out->get_column(0).view());
@@ -304,11 +307,7 @@ TEST_CASE("merge_enn_top_k keeps the globally nearest rows sorted by distance", 
 
   SECTION("k == 0 returns an empty table")
   {
-    auto id_col   = make_int32_column(ids);
-    auto dist_col = make_float_column(dist);
-    cudf::table_view input({id_col->view(), dist_col->view()});
-
-    auto out = merge_enn_top_k(h.context(/*k=*/0), input);
+    auto out = merge_enn_top_k(h.context(/*k=*/0), candidates);
     REQUIRE(out->num_rows() == 0);
   }
 }

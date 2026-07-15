@@ -20,7 +20,6 @@
 #include "vss/vector_search_internal.hpp"
 
 #include <cudf/column/column_view.hpp>
-#include <cudf/concatenate.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -79,20 +78,14 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
     return vss_result_to_host(c, make_empty_vss_output(c.pin, req.output_columns));
   }
 
-  // Merge per-chunk candidates into the global top-k (sort by distance).
-  std::unique_ptr<cudf::table> combined;
-  if (candidates.size() == 1) {
-    combined = std::move(candidates.front());
-  } else {
-    std::vector<cudf::table_view> views;
-    views.reserve(candidates.size());
-    for (auto const& t : candidates) {
-      views.push_back(t->view());
-    }
-    combined = cudf::concatenate(views, c.stream, c.mr);
+  // K-way merge the per-chunk top-k lists into the global top-k, sorted by distance
+  std::vector<cudf::table_view> views;
+  views.reserve(candidates.size());
+  for (auto const& t : candidates) {
+    views.push_back(t->view());
   }
 
-  auto merged = merge_enn_top_k(c, combined->view());
+  auto merged = merge_enn_top_k(c, views);
   return vss_result_to_host(c, std::move(merged));
 }
 

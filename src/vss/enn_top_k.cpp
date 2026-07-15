@@ -24,7 +24,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
-#include <cudf/sorting.hpp>
+#include <cudf/merge.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
@@ -107,32 +107,31 @@ std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
   return std::make_unique<cudf::table>(std::move(out_cols));
 }
 
-std::unique_ptr<cudf::table> merge_enn_top_k(const vector_search_context& c, cudf::table_view input)
+std::unique_ptr<cudf::table> merge_enn_top_k(const vector_search_context& c,
+                                             std::vector<cudf::table_view> const& candidates)
 {
   auto const stream = c.stream;
   auto const mr     = c.mr;
   auto const limit  = static_cast<std::size_t>(c.k);
 
-  if (limit == 0 || input.num_rows() == 0) { return duckdb::make_empty_like(input); }
+  // Distance is the trailing column of every [out0, ..., distance] candidate.
+  auto const distance_index = candidates.front().num_columns() - 1;
+
+  if (limit == 0) { return duckdb::make_empty_like(candidates.front()); }
+
+  // Each candidate is already sorted ascending by distance (cuVS select_k), so a
+  // k-way merge on the distance column yields one globally sorted table without
+  // concatenating first.
+  auto merged = cudf::merge(
+    candidates, {distance_index}, {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream, mr);
 
   auto const keep =
-    std::min<cudf::size_type>(input.num_rows(), static_cast<cudf::size_type>(limit));
-  if (keep == 0) { return duckdb::make_empty_like(input); }
+    std::min<cudf::size_type>(merged->num_rows(), static_cast<cudf::size_type>(limit));
+  if (keep == merged->num_rows()) { return merged; }
 
-  // Distance is the trailing column of the [out0, ..., distance] candidate rows.
-  auto const distance_index = input.num_columns() - 1;
-
-  auto indices =
-    cudf::top_k_order(input.column(distance_index), keep, cudf::order::ASCENDING, stream, mr);
-  auto gathered =
-    cudf::gather(input, indices->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
-  // top_k_order keeps the k nearest but does not guarantee sorted output.
-  return cudf::sort_by_key(gathered->view(),
-                           cudf::table_view({gathered->view().column(distance_index)}),
-                           {cudf::order::ASCENDING},
-                           {cudf::null_order::AFTER},
-                           stream,
-                           mr);
+  // Zero-copy view of the nearest `keep`; deep-copy into an owning table.
+  auto head = cudf::slice(merged->view(), {0, keep}).front();
+  return std::make_unique<cudf::table>(head, stream, mr);
 }
 
 }  // namespace sirius::vss
