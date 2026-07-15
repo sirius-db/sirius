@@ -761,3 +761,4 @@ TEST_CASE("mock_request_authorizer can force credential errors", "[s3][authorize
 
 #include "../rdma/rdma_real_client_tests.hpp"
 #include "../rdma/rdma_retries_metrics_tests.hpp"
+#include "../rdma/rdma_slot_lifetime_tests.hpp"

@@ -17,12 +17,14 @@
 #include "io/rdma/cuobj_rdma_reactor.hpp"
 
 #include "io/uri_parser.hpp"
+#include "log/logging.hpp"
 
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -66,14 +68,84 @@ cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg)
   return cfg;
 }
 
+/// Sticky context errors: the wait ended AND the CUDA context is dead — all
+/// in-flight and future work on it is terminated, so nothing can write the
+/// caller's dst anymore.  Per the CUDA contract these leave the process state
+/// inconsistent; restart is the recovery (fail-stop is containment).
+bool is_context_fatal(cudaError_t rc)
+{
+  switch (rc) {
+    case cudaErrorIllegalAddress:
+    case cudaErrorMisalignedAddress:
+    case cudaErrorIllegalInstruction:
+    case cudaErrorInvalidAddressSpace:
+    case cudaErrorInvalidPc:
+    case cudaErrorHardwareStackError:
+    case cudaErrorLaunchFailure: return true;
+    default: return false;
+  }
+}
+
+/// Codes meaning the sync call cannot have performed the wait at all — the
+/// counterexamples to "an error return is a deferred report after the wait".
+bool cannot_have_waited(cudaError_t rc)
+{
+  return rc == cudaErrorInvalidResourceHandle || rc == cudaErrorStreamCaptureUnsupported;
+}
+
+/// RAII owner of the delivery completion event (F01): destroy runs only when
+/// create succeeded, and a destroy failure is logged without ever overriding
+/// the delivery result.
+struct event_guard {
+  const cuda_delivery_ops& ops;
+  cudaEvent_t handle{};
+  bool created{false};
+
+  explicit event_guard(const cuda_delivery_ops& delivery_ops) : ops(delivery_ops) {}
+  event_guard(const event_guard&)            = delete;
+  event_guard& operator=(const event_guard&) = delete;
+
+  ~event_guard()
+  {
+    if (!created) { return; }
+    cudaError_t rc = cudaSuccess;
+    try {
+      rc = ops.event_destroy(handle);
+    } catch (...) {
+      rc = cudaErrorUnknown;
+    }
+    if (rc != cudaSuccess) {
+      SIRIUS_LOG_WARN(
+        "cuobj_rdma_reactor: completion event destroy failed ({}); delivery result "
+        "preserved",
+        cudaGetErrorString(rc));
+    }
+  }
+};
+
 }  // namespace
+
+void validate(const cuda_delivery_ops& ops)
+{
+  const bool complete = ops.event_create && ops.event_record && ops.event_synchronize &&
+                        ops.event_destroy && ops.memcpy_async && ops.stream_synchronize &&
+                        ops.device_synchronize;
+  if (!complete) {
+    throw std::invalid_argument(
+      "cuda_delivery_ops: every delivery op must be callable (the defaults are the real CUDA "
+      "runtime entry points; partial injections must keep the rest real)");
+  }
+}
 
 cuobj_rdma_reactor::arena::~arena()
 {
-  if (base != nullptr) {
-    if (registrar) { registrar->deregister_memory(base); }
-    (void)cudaFree(base);
-  }
+  if (base == nullptr) { return; }
+  if (leaked) {
+    return;
+  }  // F01: deliberately leaked — deregistering/freeing
+     // under an un-quiesced device is the use-after-free
+  if (registrar) { registrar->deregister_memory(base); }
+  (void)cudaFree(base);
 }
 
 cuobj_rdma_reactor::cuobj_rdma_reactor(std::shared_ptr<reactor_context> ctx)
@@ -92,8 +164,8 @@ cuobj_rdma_reactor::~cuobj_rdma_reactor()
 void cuobj_rdma_reactor::start()
 {
   std::lock_guard lk{_mtx};
-  if (_started || _joined) { return; }
-  _started = true;
+  if (_state != reactor_state::created) { return; }
+  _state = reactor_state::running;
   _workers.reserve(_config.max_inflight);
   for (size_t i = 0; i < _config.max_inflight; ++i) {
     _workers.emplace_back([this] { worker_loop(); });
@@ -104,17 +176,46 @@ void cuobj_rdma_reactor::shutdown()
 {
   {
     std::unique_lock lk{_mtx};
-    if (_joined) { return; }
-    _stopping = true;
+    if (_state == reactor_state::joined) { return; }
+    _state = reactor_state::stopping;
     _cv.notify_all();
     _drained_cv.wait(lk, [&] { return _queue.empty() && _active == 0; });
-    _joined = true;
+    _state = reactor_state::joined;
     _cv.notify_all();
   }
   for (auto& worker : _workers) {
     if (worker.joinable()) { worker.join(); }
   }
   _workers.clear();
+
+  // F01 fail-stop teardown probe: after a fatal delivery state the arenas may
+  // still be the target of un-quiesced NIC/copy work.  Prove device
+  // quiescence per arena or LEAK it — freeing under an un-quiesced device is
+  // the use-after-free; leaking is safe.  (_first_fatal is stable here: its
+  // only writers are the worker threads, all joined above.)
+  if (_first_fatal) {
+    std::lock_guard alk{_arena_mtx};
+    for (auto& [device_id, ar] : _arenas) {
+      if (!ar || ar->base == nullptr || ar->leaked) { continue; }
+      cudaError_t rc = cudaSuccess;
+      try {
+        rmm::cuda_set_device_raii device_scope{rmm::cuda_device_id{device_id}};
+        rc = _ctx->delivery_ops().device_synchronize();
+      } catch (...) {
+        rc = cudaErrorUnknown;
+      }
+      if (rc != cudaSuccess) {
+        ar->leaked = true;
+        _arena_leak_total.fetch_add(1, std::memory_order_relaxed);
+        SIRIUS_LOG_ERROR(
+          "cuobj_rdma_reactor: leaking the device {} landing arena at teardown — device "
+          "quiescence could not be established after a fatal delivery state ({}); a fatal CUDA "
+          "error is process-level: restart is the recovery",
+          device_id,
+          cudaGetErrorString(rc));
+      }
+    }
+  }
 }
 
 void cuobj_rdma_reactor::interrupt() { _cv.notify_all(); }
@@ -122,20 +223,106 @@ void cuobj_rdma_reactor::interrupt() { _cv.notify_all(); }
 bool cuobj_rdma_reactor::stopping()
 {
   std::lock_guard lk{_mtx};
-  return _stopping;
+  return _state == reactor_state::failing || _state == reactor_state::failed ||
+         _state == reactor_state::stopping || _state == reactor_state::joined;
+}
+
+bool cuobj_rdma_reactor::delivery_fatal()
+{
+  std::lock_guard lk{_mtx};
+  return _first_fatal != nullptr;
+}
+
+std::string cuobj_rdma_reactor::first_fatal_message()
+{
+  std::lock_guard lk{_mtx};
+  return _first_fatal_message;
+}
+
+void cuobj_rdma_reactor::enter_failed(std::exception_ptr fatal, std::string message)
+{
+  std::deque<std::unique_ptr<cuobj_chunked_rx_request>> drained;
+  {
+    std::lock_guard lk{_mtx};
+    if (_state != reactor_state::running) { return; }  // exactly-once; shutdown keeps its own path
+    _state               = reactor_state::failing;
+    _first_fatal         = fatal;
+    _first_fatal_message = std::move(message);
+    drained.swap(_queue);
+    _delivery_fatal_total.fetch_add(1, std::memory_order_relaxed);
+    _cv.notify_all();
+    _drained_cv.notify_all();
+  }
+  SIRIUS_LOG_ERROR(
+    "cuobj_rdma_reactor: FATAL delivery state — {}; intake stopped, {} queued "
+    "chunk(s) drained by error; a fatal CUDA error is process-level: restart is "
+    "the recovery",
+    _first_fatal_message,
+    drained.size());
+  for (auto& chunk : drained) {
+    if (chunk && chunk->manager) { chunk->manager->report_error(fatal); }
+  }
+  {
+    std::lock_guard lk{_mtx};
+    if (_state == reactor_state::failing) { _state = reactor_state::failed; }
+  }
+}
+
+void cuobj_rdma_reactor::quiesce_or_fail_stop(const cuobj_chunked_rx_request& chunk)
+{
+  _fallback_stream_sync_total.fetch_add(1, std::memory_order_relaxed);
+  const auto& ops = _ctx->delivery_ops();
+
+  // Stream rung.  An error return normally means the wait COMPLETED and a
+  // deferred async error is being reported — that is still proof of
+  // quiescence; only the cannot-have-waited codes leave it unproved.
+  cudaError_t rc = cudaSuccess;
+  bool waited    = true;
+  try {
+    rc     = ops.stream_synchronize(chunk.stream.value());
+    waited = !cannot_have_waited(rc);
+  } catch (...) {
+    rc     = cudaErrorUnknown;
+    waited = false;  // a throwing callable proves nothing
+  }
+  if (waited && !is_context_fatal(rc)) { return; }  // quiesced_recoverable
+  if (waited) {                                     // quiesced_context_fatal
+    enter_failed(std::make_exception_ptr(std::runtime_error(
+                   std::string("cuobj_rdma_reactor: fatal delivery state (stream sync: ") +
+                   cudaGetErrorString(rc) + ")")),
+                 std::string("stream sync: ") + cudaGetErrorString(rc));
+    return;
+  }
+
+  // Device rung: success proves quiescence device-wide; any error here means
+  // dead-or-unknowable — there is no safe "report and continue" fourth path
+  // under the bare-dst contract (F01 contract v3 §2).
+  try {
+    rc = ops.device_synchronize();
+  } catch (...) {
+    rc = cudaErrorUnknown;
+  }
+  if (rc == cudaSuccess) { return; }  // quiesced_recoverable via the device rung
+  enter_failed(std::make_exception_ptr(std::runtime_error(
+                 std::string("cuobj_rdma_reactor: fatal delivery state (device sync: ") +
+                 cudaGetErrorString(rc) + ")")),
+               std::string("device sync: ") + cudaGetErrorString(rc));
 }
 
 rdma_perf_snapshot cuobj_rdma_reactor::perf_snapshot() const noexcept
 {
   rdma_perf_snapshot s;
-  s.bytes_total      = _bytes_total.load(std::memory_order_relaxed);
-  s.requests_total   = _requests_total.load(std::memory_order_relaxed);
-  s.retries_total    = _retries_total.load(std::memory_order_relaxed);
-  s.short_read_total = _short_read_total.load(std::memory_order_relaxed);
-  s.error_total      = _error_total.load(std::memory_order_relaxed);
-  s.slot_wait_total  = _slot_wait_total.load(std::memory_order_relaxed);
-  s.flush_total      = _flush_total.load(std::memory_order_relaxed);
-  s.inflight_peak    = _inflight_peak.load(std::memory_order_relaxed);
+  s.bytes_total                = _bytes_total.load(std::memory_order_relaxed);
+  s.requests_total             = _requests_total.load(std::memory_order_relaxed);
+  s.retries_total              = _retries_total.load(std::memory_order_relaxed);
+  s.short_read_total           = _short_read_total.load(std::memory_order_relaxed);
+  s.error_total                = _error_total.load(std::memory_order_relaxed);
+  s.slot_wait_total            = _slot_wait_total.load(std::memory_order_relaxed);
+  s.flush_total                = _flush_total.load(std::memory_order_relaxed);
+  s.inflight_peak              = _inflight_peak.load(std::memory_order_relaxed);
+  s.fallback_stream_sync_total = _fallback_stream_sync_total.load(std::memory_order_relaxed);
+  s.delivery_fatal_total       = _delivery_fatal_total.load(std::memory_order_relaxed);
+  s.arena_leak_total           = _arena_leak_total.load(std::memory_order_relaxed);
   return s;
 }
 
@@ -170,9 +357,12 @@ void cuobj_rdma_reactor::worker_loop()
     std::unique_ptr<cuobj_chunked_rx_request> chunk;
     {
       std::unique_lock lk{_mtx};
-      _cv.wait(lk, [&] { return _stopping || !_queue.empty(); });
+      _cv.wait(lk, [&] {
+        return _state == reactor_state::stopping || _state == reactor_state::joined ||
+               !_queue.empty();
+      });
       if (_queue.empty()) {
-        if (_stopping) { return; }
+        if (_state == reactor_state::stopping || _state == reactor_state::joined) { return; }
         continue;
       }
       chunk = std::move(_queue.front());
@@ -220,6 +410,16 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
     uint8_t* slot_ptr = ar.base + static_cast<size_t>(slot) * _config.arena_slot_size;
     const size_t n    = get_with_retry(chunk.bucket, chunk.key, chunk.offset, chunk.size, slot_ptr);
 
+    // Owner-worker convergence (F01): after a fatal transition never start new
+    // CUDA work on the dead context.  The owner resolves its own chunk here,
+    // pre-enqueue — nothing is in flight on the slot, so the plain RAII
+    // release below is safe.
+    if (delivery_fatal()) {
+      throw std::runtime_error("cuobj_rdma_reactor: chunk aborted after a fatal delivery state (" +
+                               first_fatal_message() + ")");
+    }
+
+    const auto& ops = _ctx->delivery_ops();
     if (_ctx->flush_before_copy()) {
       throw_on_cuda_error(
         cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
@@ -227,19 +427,55 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
         "GPUDirect writes flush failed");
       _flush_total.fetch_add(1, std::memory_order_relaxed);
     }
+
+#ifndef NDEBUG
+    {
+      // Precondition (F01 contract v3 §2): RDMA device reads do not support
+      // captured streams — a capturing stream makes the quiescence ladder's
+      // sync calls unable to wait.
+      cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+      if (cudaStreamIsCapturing(chunk.stream.value(), &capture) == cudaSuccess) {
+        assert(capture == cudaStreamCaptureStatusNone &&
+               "RDMA device reads do not support captured streams");
+      }
+    }
+#endif
+
+    // F01 discipline: the completion event exists BEFORE the enqueue, so a
+    // create failure unwinds with nothing in flight (safe release,
+    // recoverable).  Inline completion wait: the D2D of one slot is
+    // microseconds against the blocking GET that preceded it — no parked-copy
+    // machinery.
+    event_guard event{ops};
+    throw_on_cuda_error(ops.event_create(&event.handle, cudaEventDisableTiming),
+                        "completion event create failed");
+    event.created = true;
     throw_on_cuda_error(
-      cudaMemcpyAsync(chunk.dst, slot_ptr, n, cudaMemcpyDeviceToDevice, chunk.stream.value()),
+      ops.memcpy_async(chunk.dst, slot_ptr, n, cudaMemcpyDeviceToDevice, chunk.stream.value()),
       "D2D copy enqueue failed");
-    // Inline completion wait: the D2D of one slot is microseconds against the
-    // blocking GET that preceded it, so the worker waits for its own copy and
-    // recycles the slot immediately — no parked-copy machinery.
-    cudaEvent_t event{};
-    throw_on_cuda_error(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
-                        "event create failed");
-    auto record_err = cudaEventRecord(event, chunk.stream.value());
-    auto sync_err   = record_err == cudaSuccess ? cudaEventSynchronize(event) : record_err;
-    (void)cudaEventDestroy(event);
-    throw_on_cuda_error(sync_err, "D2D completion wait failed");
+
+    // Post-enqueue: from here the slot belongs to the stream and the caller's
+    // future must stay unresolved until quiescence is proved — any failure
+    // goes through the quiescence ladder before this frame unwinds (source
+    // slot AND destination RMM UAF guards, F01).
+    cudaError_t delivery_rc = cudaSuccess;
+    std::string delivery_stage;
+    try {
+      delivery_rc    = ops.event_record(event.handle, chunk.stream.value());
+      delivery_stage = "completion event record failed";
+      if (delivery_rc == cudaSuccess) {
+        delivery_rc    = ops.event_synchronize(event.handle);
+        delivery_stage = "completion event wait failed";
+      }
+    } catch (...) {
+      delivery_rc    = cudaErrorUnknown;
+      delivery_stage = "completion event operation threw";
+    }
+    if (delivery_rc != cudaSuccess) {
+      quiesce_or_fail_stop(chunk);
+      throw std::runtime_error("cuobj_rdma_reactor: " + delivery_stage + ": " +
+                               cudaGetErrorString(delivery_rc));
+    }
 
     _bytes_total.fetch_add(n, std::memory_order_relaxed);
     chunk.manager->chunk_complete(n);
@@ -332,10 +568,16 @@ void cuobj_rdma_reactor::enqueue(request_type_ptr req)
     std::lock_guard lk{_mtx};
     if (!_ctx->client()) {
       failure = std::make_exception_ptr(not_implemented("enqueue"));
-    } else if (_stopping || _joined) {
+    } else if (_state == reactor_state::failing || _state == reactor_state::failed) {
+      // F01 fail-fast point: static prep_* cannot see reactor state, so a
+      // fatal delivery state surfaces here, naming the first fatal error.
+      failure = std::make_exception_ptr(
+        std::runtime_error("cuobj_rdma_reactor::enqueue: reactor entered a fatal delivery state (" +
+                           _first_fatal_message + ")"));
+    } else if (_state == reactor_state::stopping || _state == reactor_state::joined) {
       failure = std::make_exception_ptr(
         std::runtime_error("cuobj_rdma_reactor::enqueue: reactor is shut down"));
-    } else if (!_started) {
+    } else if (_state != reactor_state::running) {
       failure = std::make_exception_ptr(
         std::runtime_error("cuobj_rdma_reactor::enqueue: reactor is not started"));
     } else {

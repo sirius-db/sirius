@@ -41,11 +41,13 @@ rdma::cuobj_rdma_reactor::config reactor_config_from(const object_store_config& 
 
 }  // namespace
 
-s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg, std::shared_ptr<rdma::rdma_client> client)
+s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg,
+                             std::shared_ptr<rdma::rdma_client> client,
+                             rdma::cuda_delivery_ops delivery)
   : templated_ioctx<rdma::cuobj_rdma_reactor>(
       1,
-      [ctx = std::make_shared<rdma::cuobj_rdma_reactor::reactor_context>(reactor_config_from(cfg),
-                                                                         client)] {
+      [ctx = std::make_shared<rdma::cuobj_rdma_reactor::reactor_context>(
+         reactor_config_from(cfg), client, std::move(delivery))] {
         return std::make_unique<rdma::cuobj_rdma_reactor>(ctx);
       }),
     _client(std::move(client))
@@ -65,6 +67,9 @@ rdma::rdma_perf_snapshot s3_rdma_ioctx::perf_snapshot() const noexcept
     total.slot_wait_total += s.slot_wait_total;
     total.flush_total += s.flush_total;
     total.inflight_peak = std::max(total.inflight_peak, s.inflight_peak);
+    total.fallback_stream_sync_total += s.fallback_stream_sync_total;
+    total.delivery_fatal_total += s.delivery_fatal_total;
+    total.arena_leak_total += s.arena_leak_total;
   }
   return total;
 }

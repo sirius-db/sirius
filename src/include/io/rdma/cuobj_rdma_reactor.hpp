@@ -24,11 +24,15 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -51,6 +55,40 @@ namespace sirius::io::rdma {
   return writes_ordering < k_all_devices_ordered;
 }
 
+/// CUDA delivery seam (F01): every CUDA call on the device-chunk delivery path
+/// goes through these, so tests can inject failures without faking CUDA side
+/// effects.  Defaults are the real CUDA runtime entry points; the indirection
+/// is one std::function call per op against a 100+ µs blocking GET.  Injected
+/// at CONSTRUCTION only (via the @c s3_rdma_ioctx constructor) — there is no
+/// runtime setter, so workers never race a swap.
+struct cuda_delivery_ops {
+  // Lambdas rather than &function: several runtime entry points carry C++
+  // overload sets in cuda_runtime.h, so a bare address is ambiguous.
+  std::function<cudaError_t(cudaEvent_t*, unsigned int)> event_create =
+    [](cudaEvent_t* event, unsigned int flags) { return cudaEventCreateWithFlags(event, flags); };
+  std::function<cudaError_t(cudaEvent_t, cudaStream_t)> event_record =
+    [](cudaEvent_t event, cudaStream_t stream) { return cudaEventRecord(event, stream); };
+  std::function<cudaError_t(cudaEvent_t)> event_synchronize = [](cudaEvent_t event) {
+    return cudaEventSynchronize(event);
+  };
+  std::function<cudaError_t(cudaEvent_t)> event_destroy = [](cudaEvent_t event) {
+    return cudaEventDestroy(event);
+  };
+  std::function<cudaError_t(void*, const void*, size_t, cudaMemcpyKind, cudaStream_t)>
+    memcpy_async =
+      [](void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
+        return cudaMemcpyAsync(dst, src, count, kind, stream);
+      };
+  std::function<cudaError_t(cudaStream_t)> stream_synchronize = [](cudaStream_t stream) {
+    return cudaStreamSynchronize(stream);
+  };
+  std::function<cudaError_t()> device_synchronize = [] { return cudaDeviceSynchronize(); };
+};
+
+/// Throws std::invalid_argument when any member is null — every op must stay
+/// callable (the defaults above; partial injections keep the rest real).
+void validate(const cuda_delivery_ops& ops);
+
 /// Pull-based transfer counters, snapshotted lock-free from the reactor's
 /// atomics (the REST backend's perf-snapshot pattern).  Values accumulate for
 /// the reactor's lifetime and are never reset.
@@ -64,6 +102,11 @@ struct rdma_perf_snapshot {
                                  ///< while slots == workers; kept for staged-completion shapes)
   uint64_t flush_total{0};       ///< GPUDirect write flushes performed (0 while flushing is off)
   uint64_t inflight_peak{0};     ///< max chunks concurrently being processed by the worker pool
+  uint64_t fallback_stream_sync_total{0};  ///< F01 quiescence-ladder runs after a post-enqueue
+                                           ///< delivery failure (stream rung invoked)
+  uint64_t delivery_fatal_total{0};        ///< fail-stop transitions (exactly-once per reactor)
+  uint64_t arena_leak_total{0};  ///< arenas deliberately leaked at teardown because device
+                                 ///< quiescence could not be established after a fatal state
 };
 
 /// s3://bucket/key object handle resolved by @c s3_rdma_ioctx::create_io_object
@@ -132,16 +175,21 @@ class cuobj_rdma_reactor {
   };
 
   /// Shared per-pool state: the effective config + the transfer client (may be
-  /// null until the real data path is configured).
+  /// null until the real data path is configured) + the CUDA delivery seam
+  /// (immutable after construction — F01).
   class reactor_context {
    public:
-    reactor_context(config cfg, std::shared_ptr<rdma_client> client)
-      : _config(cfg), _client(std::move(client))
+    reactor_context(config cfg,
+                    std::shared_ptr<rdma_client> client,
+                    cuda_delivery_ops delivery = {})
+      : _config(cfg), _client(std::move(client)), _delivery(std::move(delivery))
     {
+      validate(_delivery);
     }
 
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
     [[nodiscard]] const std::shared_ptr<rdma_client>& client() const noexcept { return _client; }
+    [[nodiscard]] const cuda_delivery_ops& delivery_ops() const noexcept { return _delivery; }
 
     /// Flush GPUDirect writes before the consuming D2D copy.  Off by default;
     /// set at init from the device's writes-ordering attribute
@@ -152,6 +200,7 @@ class cuobj_rdma_reactor {
    private:
     config _config;
     std::shared_ptr<rdma_client> _client;
+    cuda_delivery_ops _delivery;
     bool _flush_before_copy{false};
   };
 
@@ -208,16 +257,46 @@ class cuobj_rdma_reactor {
     uint8_t* base{nullptr};
     std::unique_ptr<slot_pool> pool;
     std::shared_ptr<rdma_client> registrar;  // deregisters base on teardown
+    bool leaked{false};                      // F01: set at the fail-stop teardown probe — the
+                                             // destructor then skips deregister + cudaFree
+                                             // (freeing under an un-quiesced device is the UAF;
+                                             // leaking is safe)
     ~arena();
   };
+
+  /// Reactor lifecycle (single state machine — F01).  FAILING/FAILED are the
+  /// fail-stop terminal states entered exactly once by @c enter_failed after
+  /// an unrecoverable delivery failure: intake stops (enqueue fails fast
+  /// naming the first fatal error), queued chunks are drained by error, and
+  /// every ACTIVE chunk converges through its OWNER worker's own quiescence
+  /// ladder — never resolved cross-worker.  STOPPING/JOINED are ordinary
+  /// shutdown.  A failed reactor cannot restart; a fatal CUDA error is a
+  /// process-level event (restart is the recovery) — fail-stop is containment.
+  enum class reactor_state : uint8_t { created, running, failing, failed, stopping, joined };
 
   void worker_loop();
   void process_chunk(cuobj_chunked_rx_request& chunk);
   arena& arena_for_device(int device_id);
   [[nodiscard]] bool stopping();
+  [[nodiscard]] bool delivery_fatal();
+  [[nodiscard]] std::string first_fatal_message();
+  /// Exactly-once fail-stop transition: latches the first fatal error, swaps
+  /// out the queue (its chunks are error-reported OUTSIDE the lock), notifies,
+  /// and bumps delivery_fatal_total.  Later callers return with no effect.
+  void enter_failed(std::exception_ptr fatal, std::string message);
+  /// F01 quiescence ladder for post-enqueue delivery failures.  Runs the real
+  /// stream sync — per the CUDA contract an error return is a deferred report
+  /// delivered AFTER the wait, i.e. still proof of quiescence; only the
+  /// cannot-have-waited codes (invalid handle / stream capture) escalate to
+  /// the device rung.  quiesced_recoverable ⇒ returns (slot release + error
+  /// resolution are now safe); quiesced_context_fatal / cannot_establish ⇒
+  /// enters the failed state (then returns; the caller reports the original
+  /// error).  Never resolves anything itself.
+  void quiesce_or_fail_stop(const cuobj_chunked_rx_request& chunk);
   /// Bounded-retry transfer into @p dst: up to max_get_attempts client gets
-  /// (+ the short-read check), backoff between attempts, abort when stopping.
-  /// Counts retries/short reads; throws the last error on exhaustion.
+  /// (+ the short-read check), backoff between attempts, abort when stopping
+  /// or after a fatal transition.  Counts retries/short reads; throws the
+  /// last error on exhaustion.
   size_t get_with_retry(
     std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst);
 
@@ -229,9 +308,9 @@ class cuobj_rdma_reactor {
   std::condition_variable _drained_cv;
   std::deque<std::unique_ptr<cuobj_chunked_rx_request>> _queue;
   size_t _active{0};
-  bool _started{false};
-  bool _stopping{false};
-  bool _joined{false};
+  reactor_state _state{reactor_state::created};
+  std::exception_ptr _first_fatal;   // set once by enter_failed
+  std::string _first_fatal_message;  // its message, for fail-fast errors
   std::vector<std::thread> _workers;
 
   std::mutex _arena_mtx;
@@ -245,6 +324,9 @@ class cuobj_rdma_reactor {
   std::atomic<uint64_t> _slot_wait_total{0};
   std::atomic<uint64_t> _flush_total{0};
   std::atomic<uint64_t> _inflight_peak{0};
+  std::atomic<uint64_t> _fallback_stream_sync_total{0};
+  std::atomic<uint64_t> _delivery_fatal_total{0};
+  std::atomic<uint64_t> _arena_leak_total{0};
 };
 
 }  // namespace sirius::io::rdma

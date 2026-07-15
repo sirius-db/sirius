@@ -41,8 +41,12 @@ namespace sirius::io::s3 {
  */
 class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
  public:
+  /// @p delivery is the CUDA delivery seam (F01) — construction-time only, no
+  /// setter; defaults to the real CUDA runtime.  Throws std::invalid_argument
+  /// when a member was nulled out.
   explicit s3_rdma_ioctx(object_store_config cfg,
-                         std::shared_ptr<rdma::rdma_client> client = nullptr);
+                         std::shared_ptr<rdma::rdma_client> client = nullptr,
+                         rdma::cuda_delivery_ops delivery          = {});
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::rdma; }
 
