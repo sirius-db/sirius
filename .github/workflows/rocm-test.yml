@@ -24,6 +24,8 @@ on:
   pull_request:
     paths:
       - 'cmake/**'
+      - 'src/**'
+      - 'CMakeLists.txt'
       - 'scripts/build_rocm_deps.sh'
       - 'scripts/hipdf_26.06_api_patch.sh'
       - '.github/workflows/rocm-test.yml'

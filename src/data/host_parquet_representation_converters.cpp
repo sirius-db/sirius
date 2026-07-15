@@ -76,20 +76,90 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   cucascade::memory::memory_space const* target_memory_space,
   rmm::cuda_stream_view stream)
 {
-  // STRUCTURAL GAP (io rebase): sirius::op::scan::prefetched_data_source — the
-  // in-memory cudf::io::datasource adapter that wrapped a cache_ranges and fed
-  // cudf::io::read_parquet from prefetched host blocks — was removed
-  // (prefetched_data_source.cpp deleted, the type is no longer declared) with no
-  // replacement. The cached-host-parquet -> GPU conversion below cannot be
-  // reconstructed until that adapter is reimplemented, so this path is stubbed
-  // to throw and the dependent body is disabled.
-  (void)source;
-  (void)target_memory_space;
-  (void)stream;
-  throw std::runtime_error(
-    "convert_host_parquet_to_gpu_with_prefetched_data_source: prefetched_data_source "
-    "adapter was removed in the io rebase; cached-host-parquet GPU conversion is "
-    "unavailable until it is reimplemented.");
+  // Convert host_parquet_representation to gpu_table_representation.
+  // The prior implementation used a deleted prefetched_data_source adapter.
+  // Reimplemented: use cudf::io::read_parquet directly from the host buffer
+  // via a host_span datasource, then copy the result to the target GPU device.
+  auto& host_src       = source.cast<host_parquet_representation>();
+  auto const data_size = host_src.get_size_in_bytes();
+
+  // Get the target GPU device and set context
+  int target_device_id = target_memory_space ? target_memory_space->get_device_id() : 0;
+  rmm::cuda_set_device_raii target_device_raii{rmm::cuda_device_id{target_device_id}};
+
+  // Sync caller's stream so any upstream work is flushed
+  stream.synchronize();
+
+  // Get the target memory resource for allocation
+  auto* mr = target_memory_space
+               ? target_memory_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>()
+               : nullptr;
+  rmm::device_async_resource_ref alloc = mr ? static_cast<rmm::device_async_resource_ref>(*mr)
+                                            : rmm::mr::get_current_device_resource();
+
+  // Get the host buffer as a span and create a datasource
+  auto const& host_allocation = host_src.get_column_chunks();
+  // Use cudf::io::datasource::from_host_span if available, otherwise from_pointer
+  // The host_allocation contains the raw Parquet bytes in pinned host memory
+  auto const& blocks = host_allocation->get_blocks();
+  if (blocks.empty()) {
+    throw std::runtime_error("convert_host_parquet_to_gpu: empty host allocation");
+  }
+
+  // Create a contiguous host buffer from the blocks (they may be non-contiguous)
+  std::vector<uint8_t> contiguous_host(data_size);
+  size_t copied = 0;
+  for (auto const& block : blocks) {
+    if (copied >= data_size) break;
+    size_t to_copy = std::min(static_cast<size_t>(block.size()), data_size - copied);
+    std::memcpy(contiguous_host.data() + copied, block.data(), to_copy);
+    copied += to_copy;
+  }
+
+  // Create a datasource from the contiguous host buffer
+  auto datasource = cudf::io::datasource::from_host_span(
+    cudf::host_span<uint8_t const>{contiguous_host.data(), data_size});
+
+  // Read the Parquet data from the host buffer into a GPU table
+  auto reader_options = host_src.get_reader_options();
+  reader_options.set_source(datasource.get());
+
+  // Use the target-bound stream for the read
+  auto target_stream = target_memory_space ? target_memory_space->acquire_stream() : stream;
+
+  auto result = cudf::io::read_parquet(reader_options, target_stream, alloc);
+
+  // read_parquet does not throw on all CUDA errors; check for a sticky error
+  // and fail loudly rather than constructing a table from a partially-failed read.
+  auto const read_err = cudaGetLastError();
+  if (read_err != cudaSuccess) {
+    throw std::runtime_error(
+      std::string("convert_host_parquet_to_gpu: read_parquet failed: ") +
+      cudaGetErrorString(read_err));
+  }
+
+  auto gpu_table = std::make_unique<cudf::table>(std::move(result.tbl));
+  // gpu_table_representation binds a non-const memory_space reference for later
+  // stream/memory-resource acquisition. The source space is not mutated through
+  // it; the const_cast bridges cuCascade's non-const API to this converter's
+  // const-qualified input contract.
+  auto dst = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(gpu_table),
+    const_cast<cucascade::memory::memory_space&>(*target_memory_space),
+    target_stream);
+
+  // Partition injection: the host source may carry a partition-inject function
+  // that must be preserved across the host→GPU boundary. The GPU table
+  // representation does not currently carry partition metadata, so fail loudly
+  // rather than silently dropping partitions.
+  if (host_src.has_partition_inject_fn()) {
+    throw std::runtime_error(
+      "convert_host_parquet_to_gpu: source has a partition-inject function but "
+      "gpu_table_representation does not carry partition metadata; partitioned "
+      "cached-host-parquet GPU conversion is not supported");
+  }
+
+  return dst;
 }
 
 /**

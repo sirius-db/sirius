@@ -58,7 +58,15 @@ if(ENABLE_ROCM)
     FetchContent_Populate(cuda2rocm)
   endif()
   set(SIRIUS_ROCM_COMPAT_DIR "${cuda2rocm_SOURCE_DIR}/cuda-compat-shims/include")
+  # cucascade-rocm provides the <cucascade/...> stub headers that 133 sirius
+  # source/header files include. Without this on the include path, every one of
+  # those files fails with 'cucascade/... file not found' under ENABLE_ROCM.
+  # The real cuCascade submodule (cucascade/) is only built when
+  # SIRIUS_ENABLE_CUCASCADE=ON; the stubs provide compile-only fallbacks for
+  # the default ROCm config (gates OFF) so the rest of the engine compiles.
+  set(SIRIUS_ROCM_CUCASCADE_DIR "${cuda2rocm_SOURCE_DIR}/cucascade-rocm/include")
   message(STATUS "cuda2rocm shims: ${SIRIUS_ROCM_COMPAT_DIR}")
+  message(STATUS "cuda2rocm cucascade stubs: ${SIRIUS_ROCM_CUCASCADE_DIR}")
 endif()
 
 if(ENABLE_ROCM)
@@ -184,6 +192,11 @@ if(ENABLE_ROCM)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
 endif()
 find_package(cudf REQUIRED CONFIG)
+# On NVIDIA, cuDF's cmake config calls find_dependency(rmm) so rmm::rmm is
+# available transitively. On ROCm, hipDF's config may NOT export this
+# transitive dependency (it depends on how hipDF was built — CPM vs install).
+# Explicitly find rmm so rmm::rmm always exists when Sirius links it.
+find_package(rmm REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
@@ -193,7 +206,8 @@ find_package(OpenSSL REQUIRED)
 # ROCm: roctx (nvtx3-equivalent profiling-range API). The library is libroctx64,
 # shipped in the roctracer / rocprofiler-developer-tools package. Resolved with
 # find_library (matching rocBLAS) so a non-default ROCm install path is honored.
-# The header is <roctracer/roctx.h>, consumed by cmake/rocm_compat/nvtx3/nvtx3.hpp.
+# The header is <roctracer/roctx.h>, consumed by the cuda2rocm nvtx3 shim
+# (cuda-compat-shims/include/nvtx3/nvtx3.hpp, via FetchContent).
 # ROCTX_PATH is an optional user override pointing at the ROCm install root.
 if(ENABLE_ROCM)
   find_path(ROCTX_INCLUDE_DIR NAMES roctracer/roctx.h
@@ -257,8 +271,8 @@ pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 # expands to CUCASCADE_BUILD_CUDF=ON once hipDF+hipMM are installed.
 #
 # When SIRIUS_ENABLE_CUCASCADE is OFF: the submodule is not built; the stub
-# types in cmake/rocm_compat/cucascade/ provide compile-only fallbacks
-# (throw at runtime → DuckDB CPU execution).
+# types in cuda2rocm's cucascade-rocm/include/cucascade/ (via FetchContent)
+# provide compile-only fallbacks (throw at runtime → DuckDB CPU execution).
 if(SIRIUS_ENABLE_CUCASCADE)
 set(BUILD_TESTS
     OFF
@@ -667,7 +681,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # of the shim.
   if(ENABLE_ROCM)
     target_include_directories(${_target} BEFORE PRIVATE
-      ${SIRIUS_ROCM_COMPAT_DIR})
+      ${SIRIUS_ROCM_COMPAT_DIR} ${SIRIUS_ROCM_CUCASCADE_DIR})
   endif()
 
   # Substrait->DuckDB reader headers (from_substrait.hpp) and its bundled
@@ -713,7 +727,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   endif()
 
   # ROCm: link roctx (the nvtx3-equivalent profiling-range API backed by the
-  # cmake/rocm_compat/nvtx3 shim) and expose the SIRIUS_ROCM define to source.
+  # cuda2rocm nvtx3 shim, via FetchContent) and expose the SIRIUS_ROCM define to source.
   if(ENABLE_ROCM)
     target_link_libraries(${_target} PRIVATE ${ROCTX_LIBRARY})
     target_include_directories(${_target} PRIVATE ${ROCTX_INCLUDE_DIR})
@@ -989,7 +1003,7 @@ target_include_directories(
 
 if(ENABLE_ROCM)
   target_include_directories(sirius_unittest BEFORE PRIVATE
-    ${SIRIUS_ROCM_COMPAT_DIR})
+    ${SIRIUS_ROCM_COMPAT_DIR} ${SIRIUS_ROCM_CUCASCADE_DIR})
 endif()
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static)
@@ -1052,7 +1066,7 @@ target_include_directories(
 
 if(ENABLE_ROCM)
   target_include_directories(parquet_benchmark BEFORE PRIVATE
-    ${SIRIUS_ROCM_COMPAT_DIR})
+    ${SIRIUS_ROCM_COMPAT_DIR} ${SIRIUS_ROCM_CUCASCADE_DIR})
 endif()
 
 target_link_libraries(
@@ -1069,9 +1083,9 @@ if(SIRIUS_ENABLE_CUCASCADE)
                         cuCascade::cucascade cuCascade::cucascade_cudf)
 endif()
 # When SIRIUS_ENABLE_CUCASCADE is OFF, parquet_benchmark.cpp's <cucascade/...>
-# includes resolve to the cmake/rocm_compat/cucascade/ stub (on ROCm) or are
-# absent (on CUDA without cuCascade — an unusual config). The stub types make
-# it compile; runtime calls throw.
+# includes resolve to the cuda2rocm cucascade-rocm stub (on ROCm, via
+# FetchContent) or are absent (on CUDA without cuCascade — an unusual config).
+# The stub types make it compile; runtime calls throw.
 link_extension_libraries(parquet_benchmark "")
 
 # ROCm: same roctx include/link as sirius_unittest (nvtx3 shim → roctx.h).
