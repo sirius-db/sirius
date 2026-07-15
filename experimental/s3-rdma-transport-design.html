@@ -34,9 +34,11 @@
 Read large Parquet column data from S3 **straight into GPU memory over RDMA**,
 removing today's pinned-host staging + PCIe H2D copy. A cuObject gateway
 `RDMA_WRITE`s into a small pre-registered GPU **arena**; a GPU-local copy then
-moves it to the final RMM buffer. `s3://` URIs, SigV4 auth, and the Parquet
-scanner are unchanged — the new code is one reactor plus a thin ioctx under the
-existing `templated_ioctx`, the same way the REST backend is built. The
+moves it to the final RMM buffer. `s3://` URIs, the SigV4 credential machinery,
+and the Parquet scanner are unchanged — the new code is one reactor plus a thin
+ioctx under the existing `templated_ioctx`, the same way the REST backend is
+built. (One auth-surface extension is required: the RDMA token and `Range`
+must be **inside** the SigV4 signature — D8.) The
 benchmark already proves the cuObject RDMA data path at line rate. What remains
 Sirius-specific is the arena+D2D **visibility discipline**, validated in
 rollout phase P3 (§4). And a strict **delivery-failure discipline** (§2)
@@ -76,7 +78,9 @@ engine behind it, defined by which read **builders** it provides.)*
 The **control plane** (HTTP) carries only the RDMA descriptor token; the **data
 plane** (RDMA) writes object bytes straight into the GPU arena. Versus the REST
 backend (GET → pinned host bounce → PCIe H2D), this swaps host staging for a
-small GPU arena and the H2D copy for a GPU-local D2D (<1% overhead). Host reads
+small GPU arena and the H2D copy for a GPU-local D2D (~3 µs per 4 MiB slot —
+under 1% of the transfer at the 100G reference point; a larger share at higher
+line rates, so re-measure before extrapolating). Host reads
 (footers / HEAD) still go over HTTP, reusing `curl_handle` and the SigV4
 `s3_request_authorizer`.
 
@@ -87,13 +91,15 @@ chunk D2D-copied to its offset in the full-size RMM destination buffer. A 128 Mi
 
 Both sizing knobs are **config** (`s3_rdma_max_inflight`,
 `s3_rdma_arena_slot_size`). The default — **8 workers × 4 MiB slots = 32 MiB per
-device** — is calibrated on the benchmark's CX-6 **100G** rig, which is the
-*floor* for this transport (line rate at 8 × 4 MiB; 8 × 1 MiB leaves ~12% idle).
-Faster NICs scale the same two knobs, not the design: keep the bytes in flight
-(`workers × slot_size`) growing roughly linearly with line rate — e.g.
-~16 × 16 MiB or 64 × 4 MiB ≈ 256 MiB/device for 800G-class NICs — and re-derive
-the knee empirically on the target rig (a P4/P5 sweep). The arena stays trivial
-next to GPU memory at any of these points.
+device** — comes from the benchmark's CX-6 **100G reference configuration**
+(line rate at 8 × 4 MiB; 8 × 1 MiB leaves ~12% idle; measured with warm page
+cache and the server's 2 MiB chunking, so other topologies must re-measure).
+Faster NICs scale the same two knobs, not the design: the bytes in flight
+(`workers × slot_size`) must grow with line rate, and the knee has to be
+re-derived empirically on the target NIC (a P4/P5 sweep) — the 100G numbers do
+not transfer. Arena memory cost is exact:
+`workers × slot_size × active GPUs` per Sirius context (32 MiB per device at
+the reference defaults).
 
 ## 2. How one read works
 
@@ -118,16 +124,19 @@ sequenceDiagram
 `cuObjGet` blocks until the RDMA completes, so the **worker pool is the
 concurrency bound** — and because there is exactly one arena slot per worker, a
 worker always finds a free slot: admission pressure lives in the reactor's
-queue, never in the arena (the queue is currently uncapped; bounding and
-observing queued work is a tracked follow-up). Completion uses the framework's
+queue, which is **capped per ioctx** with blocking admission and depth/wait
+counters (see the config appendix). Completion uses the framework's
 `exec::semi_future` + `request_manager`: each chunk reports `chunk_complete` or
 `report_error` exactly once and then releases its manager reference — the
 future resolves when the last chunk does. Nothing runs on a CUDA callback
-thread. The worker waits on its own copy **inline** (parking the worker to
-dodge a ~3 µs wait — right after a ~350 µs network GET — buys nothing); the
-REST backend's event-poll shape remains the documented fallback if
-shared-stream measurements on the rig ever show the inline wait stalling
-workers.
+thread. The worker waits on its own copy **inline**: at the measured 100G
+reference point the D2D is ~3 µs against a ~350 µs network GET, so parking the
+worker is not expected to improve throughput. Two caveats keep this a
+hypothesis rather than a settled fact: the event wait covers **all prior work
+on the caller's stream**, not just our D2D, and the ratio shifts at higher
+line rates — a realistic shared-stream saturation test is an explicit
+activation gate, and the REST backend's event-poll shape is the documented
+fallback if it fails.
 
 **When delivery fails.** Once the D2D is enqueued, two buffers are at stake:
 the arena slot (its next user would corrupt an in-flight copy) and the caller's
@@ -135,10 +144,16 @@ destination (the caller frees it as soon as its future resolves — while the
 copy may still be writing it). The rule is therefore absolute: **neither the
 slot is recycled nor the future resolved until the stream is proven quiet.**
 
-- The completion event is created **before** the copy is enqueued — if even
-  that fails, nothing is in flight and the error is plainly recoverable.
-- On any CUDA failure after the enqueue, the worker proves quiescence with a
-  real stream sync. A sync call can return an error produced by *earlier*
+- The completion event is created **before** the copy is enqueued — if event
+  creation fails, no D2D has been submitted, so releasing the slot and
+  reporting the error is safe.
+- A non-success return from `cudaMemcpyAsync` itself does **not** prove the
+  copy was rejected: async CUDA calls may return errors produced by *earlier*
+  async work, so the enqueue state is unknown. Any non-success here is treated
+  exactly like a post-enqueue failure and goes through the quiescence proof
+  below.
+- On any CUDA failure at or after the enqueue, the worker proves quiescence
+  with a real stream sync. A sync call can return an error produced by earlier
   async work — the call itself still waited, so the stream is still proven
   quiet. The only exception is an error meaning the call never ran at all
   (e.g. an invalid stream handle); then the worker escalates to a device-wide
@@ -147,8 +162,15 @@ slot is recycled nor the future resolved until the stream is proven quiet.**
   support them.)
 - The verdict is three-way. *Quiet + healthy*: release the slot, report the
   original error, keep serving. *Quiet + context-fatal* (sticky errors such as
-  an illegal memory access): the CUDA context is dead and nothing can touch the
-  destination anymore — report and **fail-stop**. *Unprovable*: fail-stop.
+  an illegal memory access): the CUDA context is dead — no engine can write
+  the destination anymore, so reporting the error is safe — and the reactor
+  **fail-stops**. *Unprovable* (the device-wide sync also failed with a
+  non-sticky code, or could not run): the request is **never handed back** —
+  its future deliberately does not resolve, because a resolved future licenses
+  the caller to free a destination that may still be written. The reactor
+  fail-stops and escalates to **process-fatal**: the process must be restarted
+  (watchdog territory). A wedged request is the deliberate lesser evil against
+  a silent use-after-free.
 - **Fail-stop** happens exactly once. New reads fail fast, naming the first
   fatal error. Queued chunks are completed with that error. Chunks already in
   flight finish on their own workers — never resolved on another worker's
@@ -171,11 +193,11 @@ ordinary tests without faking CUDA semantics.
 | D1 | Keep `s3://`; select the backend once, at `io_context_registry` construction: `s3_transport=RDMA` registers the rdma backend for the s3 slot instead of restful (`AUTO`→HTTP) | `s3_transport` already exists in config (parsed, currently unused); exactly one s3 backend per context keeps path routing unambiguous, and the scan side (`ioctx_for_path` / split providers) is untouched |
 | D2 | Build RDMA as **one new transport engine under the existing IO framework** — a `cuobj_rdma_reactor` wrapped by a thin `s3_rdma_ioctx`; the per-device **arena map is reactor state**, while the shared context carries only config, the transfer client, and the flush policy *(identifiers: `templated_ioctx`, `prep_host_rx` / `prep_device_rx` builders, `enqueue`)* | Same shape as `rest_ioctx`; chunking, pooling, completion, the `slot_pool`, and the registry factory are all reused. Keeping arenas on the reactor (not the shared context) keeps ownership with the worker pool that fills them |
 | D3 | One hybrid ioctx: host reads → HTTP, device reads → RDMA; the REST backend is not instantiated in RDMA mode | Backends are mutually exclusive per context; callers see identical semantics |
-| **D4** | **Landing arena + GPU-local D2D**, not direct RDMA into RMM buffers | Sirius RMM is `cuda_async_memory_resource` — not registrable for GPUDirect and stream-ordered, so the NIC can't target it. Arena = `cudaMalloc`, registered once; D2D is <1% overhead, zero host bounce |
-| D5 | Completion via `semi_future` + `request_manager`: a chunk completes exactly once, on its own worker, after an **inline wait** on its CUDA event — and never before delivery is settled per the **§2 quiescence / fail-stop discipline** | Closes both use-after-free sides at once — a reused slot under an in-flight copy, and a freed destination still being written. A fatal CUDA error is process-level, so the reactor contains it and defers recovery to a restart instead of pretending to continue |
+| **D4** | **Landing arena + GPU-local D2D**, not direct RDMA into RMM buffers | Sirius RMM is `cuda_async_memory_resource` — not registrable for GPUDirect and stream-ordered, so the NIC can't target it. Arena = `cudaMalloc`, registered once; the D2D costs ~3 µs per 4 MiB slot (under 1% at the 100G reference point), with zero host bounce |
+| D5 | Completion via `semi_future` + `request_manager`: a chunk completes exactly once, on its own worker, after an **inline wait** on its CUDA event — and never before delivery is settled per the **§2 quiescence / fail-stop discipline** | Closes both use-after-free sides at once — a reused slot under an in-flight copy, and a freed destination still being written. A fatal CUDA error is process-level, so the reactor contains it and defers recovery to a process restart |
 | D6 | v1: explicit `RDMA` opt-in, fail loudly, no HTTP fallback; all device reads go RDMA | Fallbacks and premature thresholds mask misconfiguration exactly where RDMA is deliberately deployed |
 | D7 | Optional build feature `SIRIUS_ENABLE_S3_RDMA` (conda `libcuobjclient` or `CUOBJ_SDK_ROOT`); never vendor NVIDIA SDKs | Default-off builds unchanged. Note: conda ships cuObject 1.2.x while the benchmark validated 1.0.0 — version reconciliation is a real task, not a drop-in add |
-| D8 | Dev rig = benchmark server (unsigned, isolated net); production gateways must SigV4-validate before honoring RDMA headers | The client always signs; RDMA headers must never bypass auth |
+| D8 | Dev rig = benchmark server (unsigned, isolated net); production gateways must SigV4-validate before honoring RDMA headers. **The `x-amz-rdma-token` and `Range` headers are signed** — the authorizer's request surface is extended so headers added for RDMA are part of the SigV4 canonical request, and the RDMA control plane requires header-signing mode (a presigned URL cannot bind headers added after signing) | Standard SigV4 requires `x-amz-*` headers in the signature; an unsigned token is not bound to the request, so a gateway could not distinguish a tampered descriptor from a legitimate one. Signing token + range binds object, byte range, and destination capability into one authorized request |
 | **D9** | **Prefetch cache off, structurally**: the reactor defines *only* the host-read and device-read builders and omits the two staged-read ones — the framework then derives "no cache for this backend" on its own | Capabilities are derived from which builders a reactor defines (there is no flag to set); the cache activates only if a backend has a staged-read path. kvikio — Sirius's official fallback backend — already ships this exact minimal profile |
 
 Why D9 works, in one picture:
@@ -184,12 +206,13 @@ Why D9 works, in one picture:
 flowchart LR
   A["reactor defines ONLY<br/>host-read + device-read builders"] --> B["framework derives:<br/>no vector read, no staged H2D"]
   B --> C["prefetch cache is never built<br/>for this backend"]
-  C --> D["no host staging can sneak in;<br/>the cache's staged-read crash path<br/>is unreachable"]
+  C --> D["the omitted builders make host staging<br/>and the cache's staged-read crash path<br/>unreachable for this backend"]
 ```
 
 This is not just hygiene: the armed cache currently **over-reads 2–7× on sparse
 column projections** (issue #1078, a foreground/background allocation race) —
-this backend is structurally immune to that too, the same way kvikio is.
+the omitted builders make that path unreachable for this backend too, the
+same way it is for kvikio.
 
 `max_inflight` = worker count = **global** in-flight ceiling (one blocking
 `cuObjGet` per worker); "per-device" applies only to arena placement
@@ -215,7 +238,7 @@ axes:
   are always same-device (never a cross-device copy). A per-GPU reactor would
   instead make concurrency `GPUs × max_inflight` (e.g. 4×8 = 32 concurrent
   `cuObjGet`), breaking the global ceiling and risking gateway/NIC overload.
-- **NIC count** is the one thing that eventually justifies more reactors:
+- **NIC count** is what eventually justifies more reactors:
   per-GPU / per-NIC **reactor sharding** — tighter NIC↔GPU affinity at the cost
   of global rate-limit complexity — is the deferred evolution for explicit
   multi-NIC/NUMA topologies, not v1.
@@ -241,14 +264,14 @@ change.
 | **P0a ✅ wire migration landed** | Standard wire protocol merged into `s3RDMA-benchmarktool` (drop 4 non-standard headers; server decodes the address from the token; `x-amz-rdma-reply`) | — |
 | **P0b ⏳ gateway hardening open** | Strict descriptor parsing, `buf_size` enforcement, exact-completion check (itemized in the appendix). **Also the precondition for trusting short-write detection on the client** | — |
 | **P1 — unblocked** (#1042 merged) | Add the rdma backend type + factory; the `io_context_registry` constructor picks rdma-vs-rest for the s3 slot by `s3_transport` (`AUTO`→HTTP); routing tests extend the existing cutover suite | — |
-| P2 | `cuobj_rdma_reactor` against a **mock** client; hardware-free matrix incl. compile-time checks that the two staged-read capabilities stay off, plus the **delivery-failure fault-injection matrix** (§2: quiescence proof, fail-stop, teardown leak) | — |
-| P3 | Real cuObject path, single GPU; arena + D2D + flush + a visibility stress test. **Activation gates:** exact-write authority (jointly with P0b), the session-ownership decision (§5 Q6), per-device visibility policy (§5 Q2) | CX-6 |
+| P2 | `cuobj_rdma_reactor` against a **mock** client; RDMA-rig-free matrix (the delivery tests still need a CUDA GPU) incl. compile-time checks that the two staged-read capabilities stay off, plus the **delivery-failure fault-injection matrix** (§2: quiescence proof, fail-stop, teardown leak) | — |
+| P3 | Real cuObject path, single GPU; arena + D2D + flush + a visibility stress test. **Activation gates:** exact-write authority incl. mandatory reply validation (jointly with P0b), the session-ownership decision (§5 Q6), per-device visibility policy (§5 Q2), the ambiguous-failure fencing answer (§5 Q7), and the shared-stream inline-wait saturation test (§2) | CX-6 |
 | P4 | Multi-GPU (per-device arenas, NIC↔GPU affinity), retries, metrics, tuning | CX-6 |
 | P5 | Range coalescing; direct-into-RMM spike; small-read threshold go/no-go (incl. control-plane connection reuse); vs-HTTP benchmark | CX-6 |
 
 ## 5. Open questions for team review
 
-1. **Sizing defaults** — ship the fixed 100G-floor default from §1's sizing
+1. **Sizing defaults** — ship the fixed 100G-reference default from §1's sizing
    rule, or should the default self-scale from a detected/configured link
    speed? (Faster NICs also grow the blocking-GET worker pool — §6.)
 2. **Visibility policy validation** — CUDA exposes a per-device
@@ -278,6 +301,13 @@ change.
    same arena) or shareable? The answer is SDK-version-dependent (conda 1.2.x
    vs the validated 1.0.0) and shapes the client-wrapper API; it must be
    decided on the rig, before activation.
+7. **Ambiguous-failure fencing** — after a control-plane timeout or reset, the
+   gateway may still hold a descriptor for the slot and keep writing it; the
+   protocol defines what a success response means, but not what silence means.
+   Does the cuObject SDK or the gateway offer a fencing / cancellation
+   primitive (deregister-and-confirm, descriptor revocation)? Without one, the
+   retry contract (appendix) must quarantine the slot and fail the read on any
+   ambiguous failure — a question for NVIDIA as much as for this team.
 
 ## 6. Risks
 
@@ -312,14 +342,16 @@ Standard cuObject protocol (spec §1.3.2 / §1.3.3): two custom tags + `Range`.
 | Header | Direction | Meaning |
 |---|---|---|
 | `x-amz-rdma-token` | client → gateway | base64 cuObject descriptor; **encodes the remote slot address** (and the slot size) |
-| `x-amz-rdma-reply` | gateway → client | RDMA status tag. Completion is observed as `cuObjGet`'s returned `n == expected` — but that count is only **authoritative once the gateway enforces exact completion** (accepts no short or overlong RDMA piece): the P0b hardening (see below) is therefore a precondition for trusting short-write detection on the real path |
+| `x-amz-rdma-reply` | gateway → client | RDMA status tag. Completion is observed as `cuObjGet`'s returned `n == expected`, and that count is authoritative only when **both** halves hold: the gateway enforces exact completion (accepts no short or overlong RDMA piece), **and** the client requires a valid reply tag before it reports the requested size — an HTTP 200/206 without a legitimate reply must be treated as failure, and the reply payload is never interpreted as a byte count. Both halves are P0b items (see below) and a precondition for trusting short-write detection on the real path |
 
 The benchmark's four extra headers (`x-cuobj-remote-addr`, `x-cuobj-size`,
 `x-cuobj-chunk-size`, `x-amz-rdma-bytes-transferred`) are **dropped**: the
 address rides in the token, capacity is the `cuObjGet` `size` arg, and the
 reply tag supersedes the byte-count header. The server chunks transfers
 server-side (its own config, default 2 MiB) — nothing is negotiated on the wire.
-Production gateways SigV4-validate the control request before honoring the token.
+Production gateways SigV4-validate the control request before honoring the
+token, and the token + `Range` are part of that signature (D8): the client
+signs them, the gateway verifies them — an unsigned token is rejected.
 
 ### Config (under `object_store_config`)
 
@@ -332,17 +364,42 @@ s3_rdma_max_inflight              # worker count = global in-flight ceiling (def
 s3_rdma_arena_slot_size           # per-chunk arena slot (default 4 MiB — see §1 sizing)
 ```
 
-The control plane reuses the shared object-store endpoint carried by the
-authorizer; a distinct RDMA-gateway endpoint knob is added only if activation
-shows the gateway host must differ from the S3 endpoint. There is deliberately
-**no client chunk-size knob**: the transfer granularity is the arena slot size,
-and the server chunks independently. Auth/TLS reuse the existing fields
-(`s3_signing_mode`, `ca_bundle_path`, `tls_verify`).
+**Endpoint topology (decided for v1):** the configured S3 endpoint **is** the
+cuObject gateway — one host serves both the ordinary HEAD / range-GET traffic
+and the RDMA control requests, under one set of credentials and one signing
+host. A split topology (RDMA gateway separate from the S3 origin) is out of
+scope for v1: it needs two endpoints, two signing hosts, and an explicit
+credential boundary, and is only worth designing if a deployment actually
+requires it. There is deliberately **no client chunk-size knob**: the transfer
+granularity is the arena slot size, and the server chunks independently.
+Auth/TLS reuse the existing fields (`s3_signing_mode` — header mode required
+for RDMA, D8 — `ca_bundle_path`, `tls_verify`).
 
-**Retry contract** — deliberately independent of the REST policy: retries are
-chunk-level; only client transport failures and short reads retry; CUDA work
-never retries; exhaustion surfaces the last error — and per D6, never a
-transport switch.
+**Admission bound (v1):** the reactor's request queue is **capped per ioctx**
+(a small configurable multiple of the worker count); admission blocks once the
+cap is reached. Queue depth and queue-wait counters expose the pressure. The
+process-wide budget is contexts × workers — a deployment running several
+Sirius contexts must size the gateway budget for the sum.
+
+**Retry contract** — deliberately independent of the REST policy, and split by
+plane, because the two planes fail differently:
+
+- **Host/HTTP reads** (footers, metadata): retryable on transport failures and
+  short reads. The client owns the write loop into the destination buffer, and
+  a closed connection means no further writes — re-issuing into the same
+  buffer is safe.
+- **RDMA device reads**: retryability is decided by the **commit point**. A
+  failure that provably precedes the control request leaving the client
+  (connection setup, before the token is sent) is retryable. Once the token
+  may have reached the gateway, a timeout or reset without an authoritative
+  reply is **ambiguous**: the gateway holds a descriptor for the slot and may
+  still be writing it — the protocol defines "success response ⇒ transfer
+  complete", but not "no response ⇒ gateway stopped". An ambiguous failure is
+  therefore **not retried in place**: the read fails terminally and the slot
+  is withheld from reuse (quarantined), unless the gateway/SDK provides a
+  fencing or cancellation primitive (§5 Q7 — open question to NVIDIA).
+- Everywhere: CUDA work never retries; exhaustion surfaces the last error —
+  and per D6, never a transport switch.
 
 Counters follow the REST-reactor instrumentation shape: `s3_rdma_bytes_total`,
 `…_requests_total`, `…_retries_total`, `…_short_read_total`, `…_error_total`,
@@ -361,8 +418,10 @@ strict address validator — today's parse takes the first hex field with no
 length/field validation (and wrongly rejects a legitimate address 0); the token's
 `buf_size` field is transmitted but never read server-side (a capacity check the
 server could perform for free but currently skips); the client reports success on
-any 200/206 without an `n == expected` short-write check; optional SigV4 in the
-dev server.
+any 200/206 without an `n == expected` short-write check **and without requiring
+a valid `x-amz-rdma-reply` tag** (mandatory client-side reply validation is part
+of P0b — only after it may the callback report the requested size); optional
+SigV4 in the dev server.
 
 > Detailed gateway-hardening notes (file:line specifics) are tracked in the
 > `s3RDMA-benchmarktool` repo.
