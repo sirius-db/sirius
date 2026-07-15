@@ -1624,8 +1624,11 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
   // A level change only re-targets the current sink; no need to rebuild it.
-  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
-  sirius::log::get_sink()->set_level(lvl);
+  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
+  sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
+  if (!parsed_level) {
+    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
