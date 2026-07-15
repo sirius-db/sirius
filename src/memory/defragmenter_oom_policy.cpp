@@ -18,6 +18,7 @@
 #include "memory/defragmenter_oom_policy.hpp"
 
 #include "cuda_runtime_api.h"
+#include "log/logging.hpp"
 
 #include <cuda_runtime.h>
 
@@ -89,7 +90,11 @@ void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
   // Release all free, fragmented blocks back to the driver so it can reassemble
   // them into larger contiguous regions for the retry.
   cudaMemPoolTrimTo(oom_ex->pool_handle, /*minBytesToKeep=*/0);
-  cudaDeviceSynchronize();  // Ensure that the trim operation is complete before retrying.
+  if (auto const err = cudaDeviceSynchronize(); err != cudaSuccess) {
+    SIRIUS_LOG_ERROR("defragmenter_oom_policy: cudaDeviceSynchronize failed after trim: {}",
+                     cudaGetErrorString(err));
+    std::rethrow_exception(eptr);
+  }
 
   try {
     return retry_function(bytes, stream);

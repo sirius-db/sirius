@@ -11,7 +11,7 @@
 # <copy_to_latest>      : Set this as the latest version ("true" / "false", default: "false")
 # <copy_to_versioned>   : Set this as a versioned version that will prevent its deletion
 
-set -e
+set -euo pipefail
 
 if [[ $4 == wasm* ]]; then
   ext="/tmp/extension/$1.duckdb_extension.wasm"

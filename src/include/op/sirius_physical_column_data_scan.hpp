@@ -50,7 +50,7 @@ class sirius_physical_column_data_scan : public sirius_physical_operator {
   //! (optionally owned) column data collection to scan
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection;
 
-  std::size_t cte_index;
+  std::size_t cte_index{};
 
   duckdb::optional_idx delim_index;
 

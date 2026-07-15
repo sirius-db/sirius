@@ -80,8 +80,11 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
  * @param batch The idle data batch to extract the table view from.
  * @return cudf::table_view The underlying cudf table view.
  */
+// CRITICAL: The returned table_view references GPU memory owned by `batch`. The caller MUST ensure
+// `batch` outlives the returned view — no concurrent downgrade/mutation is safe while the view is
+// in use.
 // NOLINTNEXTLINE(readability-non-const-parameter) -- to_read_only() is non-const
-inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
+[[nodiscard]] inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
 {
   auto ro    = batch.to_read_only();
   auto* data = ro.get_data();

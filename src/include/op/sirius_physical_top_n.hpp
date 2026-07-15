@@ -46,8 +46,8 @@ class sirius_physical_top_n : public sirius_physical_operator {
   ~sirius_physical_top_n() override;
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  std::size_t limit;
-  std::size_t offset;
+  std::size_t limit{};
+  std::size_t offset{};
   //! Dynamic table filter (if any)
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter;
 

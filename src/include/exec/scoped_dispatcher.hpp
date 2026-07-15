@@ -69,7 +69,15 @@ class scoped_dispatcher {
     if (inflight_ < max_inflight_) {
       ++inflight_;
       lk.unlock();
-      pool_.schedule(std::move(task));
+      try {
+        pool_.schedule(std::move(task));
+      } catch (...) {
+        std::lock_guard lk2(mu_);
+        --inflight_;
+        cv_slot_.notify_one();
+        if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
+        throw;
+      }
     } else {
       pending_.push_back(std::move(task));
     }
@@ -88,7 +96,15 @@ class scoped_dispatcher {
 
     ++inflight_;
     lk.unlock();
-    pool_.schedule(std::move(task));
+    try {
+      pool_.schedule(std::move(task));
+    } catch (...) {
+      std::lock_guard lk2(mu_);
+      --inflight_;
+      cv_slot_.notify_one();
+      if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
+      throw;
+    }
     return true;
   }
 
@@ -165,7 +181,20 @@ class scoped_dispatcher {
         if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
       }
     }
-    if (have_next) pool_.schedule(std::move(next));
+    if (have_next) {
+      try {
+        pool_.schedule(std::move(next));
+      } catch (...) {
+        // If schedule throws, the task is lost but we must release the
+        // inflight slot that was retained for it — otherwise wait_for_all()
+        // deadlocks.
+        std::lock_guard lk2(mu_);
+        --inflight_;
+        cv_slot_.notify_one();
+        if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
+        throw;
+      }
+    }
   }
 
   static_thread_pool& pool_;

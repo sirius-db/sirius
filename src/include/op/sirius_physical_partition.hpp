@@ -126,11 +126,11 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// two join sides have different physical column types for the same logical key.
   std::vector<cudf::data_type> _partition_key_cast_types;
   std::optional<int> _num_partitions;
-  bool _is_build;
+  bool _is_build = false;
   bool _drives_partition_count{false};
-  bool _has_sibling_partition_op;
-  PartitionType _partition_type;
-  uint64_t s_partition_size;
+  bool _has_sibling_partition_op = false;
+  PartitionType _partition_type = {};
+  uint64_t s_partition_size{};
   int _min_num_partitions{1};
   uint64_t _small_table_bytes{0};
 };

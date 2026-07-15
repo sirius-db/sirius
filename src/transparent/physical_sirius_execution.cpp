@@ -121,10 +121,21 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         // LogicalGet::dynamic_filters survive the serialize/deserialize round-trip — they are
         // not in DuckDB's serialization schema and would otherwise be null on the fresh plan,
         // making downstream Sirius wiring silently miss runtime-computed dynamic filters.
-        fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
+        //
+        // DuckDB reuses the same prepared physical operator across EXECUTE calls
+        // (comment above). Concurrent executions race on the mutable logical_plan_
+        // unique_ptr — a reset during another thread's copy_logical_plan is
+        // use-after-free. Lock to serialize the read+reset.
+        static std::mutex logical_plan_mutex;
+        std::lock_guard<std::mutex> lp_lock(logical_plan_mutex);
+        if (logical_plan_) {
+          fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
+        }
       } catch (duckdb::NotImplementedException&) {
         // Drop logical_plan_ — we know it can't be copied, so future executes
         // will skip straight to the replan path.
+        static std::mutex logical_plan_mutex;
+        std::lock_guard<std::mutex> lp_lock(logical_plan_mutex);
         logical_plan_.reset();
       }
     }

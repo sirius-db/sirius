@@ -44,12 +44,12 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
                               std::size_t estimated_cardinality);
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  std::size_t limit;
-  std::size_t offset;
+  std::size_t limit{};
+  std::size_t offset{};
   //! Dynamic table filter (if any)
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter;
 
-  sirius_physical_operator* child_op;
+  sirius_physical_operator* child_op = nullptr;
   sirius_physical_operator* get_child_op() const { return child_op; }
 
  public:

@@ -391,7 +391,10 @@ struct alignas(64) chunk_lifecycle {
       // Clamp: never read more than we promised.
       if (cur_reads >= cur_inserts) return;
 
-      uint64_t next = (cur & ~READ_MASK) | (uint64_t(cur_reads + 1) << READ_SHIFT);
+      // Saturate at uint16 max to avoid wrap (matches the on_request inserts
+      // saturation pattern).
+      uint16_t new_reads = cur_reads == 0xFFFFu ? 0xFFFFu : cur_reads + 1;
+      uint64_t next      = (cur & ~READ_MASK) | (uint64_t(new_reads) << READ_SHIFT);
 
       if (packed.compare_exchange_weak(
             cur, next, std::memory_order_acq_rel, std::memory_order_relaxed))
@@ -480,6 +483,7 @@ find_entry(const Chunks& chunks,
   using chunk_ptr_t =
     decltype(std::to_address(std::declval<const std::ranges::range_value_t<Chunks>&>()));
   if (size == 0) return {};
+  if (chunk_size == 0) return {};
 
   auto const first        = std::ranges::begin(chunks);
   auto const last         = std::ranges::end(chunks);

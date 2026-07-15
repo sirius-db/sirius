@@ -75,7 +75,7 @@ class completion_handler {
     if (_completed.compare_exchange_strong(expected, true)) {
       try {
         _has_error.store(true);
-        _promise.set_exception(std::make_exception_ptr(std::runtime_error(error.data())));
+        _promise.set_exception(std::make_exception_ptr(std::runtime_error(std::string(error))));
       } catch (...) {
         // Promise already satisfied or other error - ignore
       }

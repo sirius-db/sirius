@@ -58,7 +58,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -252,7 +251,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       if (col_idx < lhs_input_types.size()) {
         lhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(col_idx));
       } else {
-        printf("WARNING:In sirius_physical_hash_join: left_projection_map index out of range");
+        SIRIUS_LOG_WARN("sirius_physical_hash_join: left_projection_map index {} out of range {}",
+                        col_idx,
+                        lhs_input_types.size());
       }
     }
   }
@@ -275,7 +276,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       if (col_idx < rhs_input_types.size()) {
         rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(col_idx));
       } else {
-        printf("WARNING:In sirius_physical_hash_join: right_projection_map index out of range");
+        SIRIUS_LOG_WARN("sirius_physical_hash_join: right_projection_map index {} out of range {}",
+                        col_idx,
+                        rhs_input_types.size());
       }
     }
   }

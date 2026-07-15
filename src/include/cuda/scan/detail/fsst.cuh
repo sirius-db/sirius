@@ -73,12 +73,13 @@ _CCCL_DEVICE _CCCL_FORCEINLINE bool device_fsst_import(uint8_t const* buf,
   out->len[0]    = 1;
   out->symbol[0] = 0;
   uint32_t code  = zero_term;
-  if (zero_term) length_histo[0]--;
+  if (zero_term && length_histo[0] > 0) --length_histo[0];
 
   for (uint32_t l = 1; l <= 8u; ++l) {
     uint32_t hist_idx = l & 7u;         // 1,2,3,4,5,6,7,0
     uint32_t sym_len  = (l & 7u) + 1u;  // 2,3,4,5,6,7,8,1
     for (uint32_t i = 0; i < length_histo[hist_idx]; ++i, ++code) {
+      if (code >= 255) break;
       out->len[code] = static_cast<uint8_t>(sym_len);
       uint64_t sym   = 0;
       for (uint32_t j = 0; j < sym_len; ++j) {

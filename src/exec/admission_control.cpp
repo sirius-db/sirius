@@ -27,15 +27,16 @@ admission_control::slot admission_control::acquire(size_t size, std::stop_token 
   // Wait until either the request fits within the remaining budget, or we
   // are the only one in line (deadlock-avoidance branch — no slots will
   // release to free up space).
+  // Use subtraction to avoid overflow: _in_use + size can wrap for huge sizes.
   bool fits =
-    _cv.wait(lk, stop, [&] { return (_in_use + size <= _budget) || (_active_slots == 0); });
+    _cv.wait(lk, stop, [&] { return (size <= _budget - _in_use) || (_active_slots == 0); });
   if (!fits) {
     // Stop requested and predicate still not satisfied.
     return {};
   }
 
   size_t reserved;
-  if (_in_use + size <= _budget) {
+  if (size <= _budget - _in_use) {
     reserved = size;
   } else {
     // _active_slots == 0 here, so _in_use == 0.  Reserve the full budget

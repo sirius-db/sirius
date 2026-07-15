@@ -59,6 +59,9 @@ inline std::size_t duckdb_block_payload_offset(duckdb::SingleFileBlockManager co
   }
   const std::size_t alloc =
     static_cast<std::size_t>(bm.GetBlockSize()) + static_cast<std::size_t>(bm.GetBlockHeaderSize());
+  if (alloc != 0 && static_cast<uint64_t>(block_id) > SIZE_MAX / alloc) {
+    throw std::overflow_error("block payload offset overflow");
+  }
   return DUCKDB_BLOCK_START + static_cast<std::size_t>(block_id) * alloc +
          static_cast<std::size_t>(bm.GetBlockHeaderSize());
 }

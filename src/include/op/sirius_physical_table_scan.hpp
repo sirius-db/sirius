@@ -105,15 +105,15 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;
 
-  duckdb::PhysicalTableScan* physical_table_scan;
+  duckdb::PhysicalTableScan* physical_table_scan = nullptr;
 
   duckdb::unique_ptr<duckdb::ColumnDataCollection> collection;
 
-  uint64_t* column_size;
+  uint64_t* column_size = nullptr;
 
-  uint64_t* mask_size;
+  uint64_t* mask_size = nullptr;
 
-  bool* already_cached;
+  bool* already_cached = nullptr;
 
   duckdb::vector<sirius::logical_type> scanned_types;
 
@@ -122,7 +122,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   duckdb::unique_ptr<duckdb::TableFilterSet> fake_table_filters;
 
   //! Whether it's required to generate a separate row id column (e.g., in some select *)
-  bool gen_row_id_column;
+  bool gen_row_id_column = false;
 
   //! Only used in optimized table scan
   bool exhausted = false;

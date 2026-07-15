@@ -907,7 +907,16 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
                                          int si         = token.slot_index();
                                          auto& s        = slots[si];
                                          auto ev_status = s.event->query();
-                                         return !(ev_status == query_status::in_progress);
+                                         if (ev_status != query_status::in_progress) {
+                                           // H2D copy completed — credit the chunk now that the
+                                           // device memory is fully written. Deferred from
+                                           // reap_cqes so the chunk is not credited before the
+                                           // async copy finishes (which would let the caller
+                                           // read uninitialized device memory).
+                                           s.on_complete(s.bytes_read);
+                                           return true;
+                                         }
+                                         return false;
                                        }),
                         copying_slots.end());
   };
@@ -1011,6 +1020,11 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         continue;
       } else if (hint == io_slot::h2d_sync_hint::h2d_event_based) {
         copying_slots.push_back(s.release_slot());
+        // The H2D copy is in-flight and is synchronized via the slot's event.
+        // on_complete is deferred until poll_copy_completions observes the
+        // event — crediting the chunk here would let the caller read device
+        // memory before the copy finishes.
+        continue;
       }
       s.on_complete(s.bytes_read);
     }
@@ -1057,6 +1071,10 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
                                      "uring_reactor: failed to synchronize copy event for slot {}",
                                      si);
       }
+      // The synchronize above waited for the H2D copy to finish, so the device
+      // memory is now valid — credit the chunk whose completion was deferred
+      // from reap_cqes (poll_copy_completions is not called during shutdown).
+      slot.on_complete(slot.bytes_read);
     });
 
     // Mark all pending requests as canceled so their managers don't wait indefinitely for

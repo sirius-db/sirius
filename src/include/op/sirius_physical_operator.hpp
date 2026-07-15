@@ -355,7 +355,7 @@ class sirius_physical_operator {
   //! The types returned by this physical operator
   duckdb::vector<sirius::logical_type> types;
   //! The estimated cardinality of this physical operator
-  std::size_t estimated_cardinality;
+  std::size_t estimated_cardinality{};
   //! The unique ID of this operator (auto-incremented at creation)
   size_t operator_id;
 
@@ -494,8 +494,11 @@ class sirius_physical_operator {
   template <class TARGET>
   TARGET& Cast()
   {
-    // TODO(amin) this is buggy code
-    if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+    if (TARGET::TYPE == SiriusPhysicalOperatorType::INVALID) {
+      throw internal_exception(
+        "Cast<TARGET>(): TARGET type is INVALID — cannot cast to an invalid operator type");
+    }
+    if (type != TARGET::TYPE) {
       throw internal_exception(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }
@@ -505,7 +508,11 @@ class sirius_physical_operator {
   template <class TARGET>
   const TARGET& Cast() const
   {
-    if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+    if (TARGET::TYPE == SiriusPhysicalOperatorType::INVALID) {
+      throw internal_exception(
+        "Cast<TARGET>(): TARGET type is INVALID — cannot cast to an invalid operator type");
+    }
+    if (type != TARGET::TYPE) {
       throw internal_exception(
         "Failed to cast physical operator to type - physical operator type mismatch");
     }

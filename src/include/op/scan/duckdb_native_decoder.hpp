@@ -35,6 +35,7 @@
 
 // standard library
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -83,6 +84,9 @@ inline std::optional<uint32_t> checked_array_child_advance(uint32_t cursor,
                                                            uint64_t row_count,
                                                            uint64_t array_size)
 {
+  if (array_size != 0 && row_count > UINT64_MAX / array_size) {
+    throw std::overflow_error("array child advance: row_count * array_size overflow");
+  }
   uint64_t const next = static_cast<uint64_t>(cursor) + row_count * array_size;
   if (next > static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max())) {
     return std::nullopt;

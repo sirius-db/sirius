@@ -468,9 +468,11 @@ class templated_ioctx : public sirius_ioctx {
   bool _started{false};
 
  private:
-  static const io_object_type& as_typed(const sirius_io_object& obj) noexcept
+  static const io_object_type& as_typed(const sirius_io_object& obj)
   {
-    return static_cast<const io_object_type&>(obj);
+    auto* p = dynamic_cast<const io_object_type*>(&obj);
+    if (!p) { throw std::runtime_error("as_typed: type mismatch"); }
+    return *p;
   }
 };
 
