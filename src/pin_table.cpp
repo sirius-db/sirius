@@ -306,8 +306,19 @@ materialized_host_pin materialize_pin_to_host(
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
       cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
-      auto host_repr =
-        registry.convert<cucascade::host_data_representation>(gpu_repr, target_host_space, stream);
+      auto host_reservation =
+        target_host_space->make_reservation_or_null(gpu_repr.get_size_in_bytes());
+      if (host_reservation == nullptr) {
+        SIRIUS_LOG_WARN(
+          "materialize_pin_to_host: host reservation failed ({} bytes) — proceeding without "
+          "reservation, converter may OOM",
+          gpu_repr.get_size_in_bytes());
+      }
+      auto host_repr = host_reservation != nullptr
+                         ? registry.convert<cucascade::host_data_representation>(
+                             gpu_repr, *host_reservation, stream)
+                         : registry.convert<cucascade::host_data_representation>(
+                             gpu_repr, target_host_space, stream);
       stream.synchronize();
       out.host_chunks.emplace_back(std::move(host_repr));
     });

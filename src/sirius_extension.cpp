@@ -76,6 +76,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "log/spdlog_owning_sink.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -118,22 +119,6 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
-
-// Read the per-session `enable_duckdb_fallback` setting (default true).  Mirrors
-// how `gpu_execution` is read via ClientContext::TryGetCurrentSetting, so a
-// `SET enable_duckdb_fallback = false` stays scoped to the connection that
-// issued it instead of leaking through a process-global to every other
-// connection (and, across a test binary, to every later test case).  The
-// AddExtensionOption registration already stores the value per-context; only the
-// read had been going through the global static.
-bool duckdb_fallback_enabled(ClientContext& context)
-{
-  Value setting;
-  if (context.TryGetCurrentSetting("enable_duckdb_fallback", setting) && !setting.IsNull()) {
-    return setting.GetValue<bool>();
-  }
-  return true;
-}
 
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
@@ -664,9 +649,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   if (!data.res) {
     auto start = std::chrono::high_resolution_clock::now();
     if (data.plan_error) {
-      printf(
-        "=============================================\nError in SiriusExecuteQuery, fallback to "
-        "DuckDB\n=============================================\n");
+      print_cpu_fallback_banner();
       data.res = run_internal_cpu_fallback_query(
         context, *data.conn, data.cpu_fallback_query, data.plan_error_message);
     } else {
@@ -675,9 +658,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       if (data.res->HasError()) {
         if (duckdb_fallback_enabled(context)) {
           SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
-          printf(
-            "=============================================\nError in SiriusExecuteQuery, fallback "
-            "to DuckDB\n=============================================\n");
+          print_cpu_fallback_banner();
           data.res = run_internal_cpu_fallback_query(
             context, *data.conn, data.cpu_fallback_query, data.res->GetError());
         } else {
@@ -1649,24 +1630,43 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
 }
 
+// Rebuilds the global sink from the current logging config.
+static void ReinstallLogSink()
+{
+  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
+  auto flush =
+    Config::LOG_FLUSH_SECONDS <= 0
+      ? std::nullopt
+      : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
+  auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+  sink->set_level(lvl);
+  sirius::log::set_sink(std::move(sink));
+}
+
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
-  sirius::SetGlobalLogLevel(Config::LOG_LEVEL);
+  // A level change only re-targets the current sink; no need to rebuild it.
+  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
+  sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
+  if (!parsed_level) {
+    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  ReinstallLogSink();
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
-  sirius::SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
+  // The flush interval is fixed at sink construction, so rebuild the sink.
+  ReinstallLogSink();
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
@@ -1840,6 +1840,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                            // prior connection's SET may have mutated (that leaked the
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
+
+  // TEST ONLY: when non-empty, transparent GPU execution fails at runtime with that
+  // message after plan generation succeeds, to exercise the CPU fallback path. No
+  // setter — the value is read via TryGetCurrentSetting in PhysicalSiriusExecution.
+  config.AddExtensionOption(
+    "sirius_test_inject_transparent_gpu_error",
+    "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
+    LogicalType::VARCHAR,
+    Value(""));
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(

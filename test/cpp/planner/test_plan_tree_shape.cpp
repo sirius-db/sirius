@@ -267,10 +267,9 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   auto* hgb = partition->children[0].get();
   REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
 
-  // `distinct` always borrows the subtree bottom; the delim sink runs it inline.
+  // `distinct` always borrows the subtree bottom (the bare DISTINCT).
   REQUIRE(delim.distinct != nullptr);
   CHECK(static_cast<sirius_physical_operator*>(delim.distinct) == hgb);
-  CHECK(delim.distinct->is_owned_by_delim_join());
 
   REQUIRE(delim.join);
   REQUIRE(delim.join->children.size() == 2);
@@ -490,11 +489,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto& delim = node->Cast<sirius::op::sirius_physical_left_delim_join>();
     require_delim_join_common(delim);
 
-    // The cached chunk scan (filled at runtime by the delim sink) is buried under the
-    // internal join's probe-side CONCAT/PARTITION chain and is tagged so its
-    // build_pipelines is a no-op.
+    // The cached chunk scan (filled at runtime by the delim join's fan-out) is buried under
+    // the internal join's probe-side CONCAT/PARTITION chain.
     REQUIRE(delim.column_data_scan != nullptr);
-    CHECK(delim.column_data_scan->is_owned_by_delim_join());
     CHECK(contains(delim.join->children[0].get(), delim.column_data_scan));
   }
 }

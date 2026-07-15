@@ -151,8 +151,21 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
       // Same non-atomic-upgrade race as the GPU arm: skip if already in the target space.
       if (mut_accessor.get_memory_space() == nullptr ||
           mut_accessor.get_memory_space()->get_id() != target_space->get_id()) {
-        mut_accessor.convert_to<cucascade::host_data_representation>(
-          registry, target_space, stream);
+        auto host_reservation =
+          const_cast<cucascade::memory::memory_space*>(target_space)
+            ->make_reservation_or_null(mut_accessor.get_data()->get_size_in_bytes());
+        if (host_reservation != nullptr) {
+          mut_accessor.convert_to<cucascade::host_data_representation>(
+            registry, *host_reservation, stream);
+        } else {
+          SIRIUS_LOG_WARN(
+            "lock_or_prepare_batch: host reservation failed for batch {} ({} bytes) — "
+            "proceeding without reservation, converter may OOM",
+            mut_accessor.get_batch_id(),
+            mut_accessor.get_data()->get_size_in_bytes());
+          mut_accessor.convert_to<cucascade::host_data_representation>(
+            registry, target_space, stream);
+        }
       }
       return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
     }
