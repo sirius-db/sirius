@@ -17,7 +17,6 @@
 #include "sirius_context.hpp"
 
 #include "config.hpp"
-#include "ctrack.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
@@ -690,11 +689,6 @@ void SiriusContext::create_query(
   task_creator_->prepare_for_query(*query_);
   scan_manager_->prepare_for_query(*query_,
                                    config_.get_operator_params().enable_pinned_zone_map_pruning);
-  {
-    std::ostringstream oss;
-    ctrack::calc_stats_and_clear().get_summary_table(oss, /*use_color=*/false);
-    SIRIUS_LOG_INFO("ctrack timing:\n{}", oss.str());
-  }
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

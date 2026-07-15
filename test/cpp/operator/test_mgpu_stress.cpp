@@ -140,7 +140,7 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
   if (!require_two_gpus()) return;
 
   // Single tmp root holds every per-query parquet surface. Cleaned up at exit.
-  auto root    = make_tmp_dir("root");
+  auto root = make_tmp_dir("root");
 
   // --- [0] order surface: 4 files x 50k rows ~ 0.6 MiB. Forces multi-
   //         partition sort with hash_partition_bytes = 1 MiB.

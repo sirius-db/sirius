@@ -251,13 +251,13 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
     REQUIRE(unpin);
     REQUIRE_FALSE(unpin->HasError());
     auto& scheduler = env->get_task_scheduler(con);
-    scheduler.visit_executors([&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
-      tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
-    });
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
   env.reset();
-
 
   INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
   REQUIRE(tasks_per_gpu.count(0));
@@ -609,13 +609,13 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
     REQUIRE(unpin);
     REQUIRE_FALSE(unpin->HasError());
     auto& scheduler = env->get_task_scheduler(con);
-    scheduler.visit_executors([&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
-      tasks_per_gpu2[device_id] = exec.get_metrics().tasks_executed;
-    });
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu2[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
   env.reset();
-
 
   INFO("gpu0 tasks=" << tasks_per_gpu2[0] << " gpu1 tasks=" << tasks_per_gpu2[1]);
   REQUIRE(tasks_per_gpu2.count(0));

@@ -17,7 +17,6 @@
 #include "pipeline/task_scheduler.hpp"
 
 #include "creator/task_creator.hpp"
-#include "ctrack.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
@@ -151,7 +150,6 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
 
 void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
-  CTRACK;
   // Drain leftover tasks from previous query
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_leftover_tasks();
@@ -318,11 +316,7 @@ void task_scheduler::management_eventloop()
       }
     }
 
-    if (_task_queue.is_empty()) {
-      CTRACK_NAME("waiting_for_task");
-      _task_creator->schedule_lookahead(*_ready_devices.begin());
-      _task_queue.wait();
-    }
+    if (_task_queue.is_empty()) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
 
     // Matcher: for each ready device, try to find a dispatchable task.
     // A task is dispatchable to device X if:

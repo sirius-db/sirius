@@ -30,7 +30,6 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <ctrack.hpp>
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
@@ -119,7 +118,6 @@ void gpu_pipeline_executor::manager_loop()
 
     std::unique_ptr<parallel::itask> pipeline_task = nullptr;
     {
-      CTRACK_NAME("request_rtt");
       if (!_task_request_publisher.send(std::move(ready))) {
         SIRIUS_LOG_INFO(
           "GPU Pipeline Executor: task_request channel closed, stopping manager loop");
@@ -309,6 +307,7 @@ void gpu_pipeline_executor::manager_loop()
        pipeline]() mutable {
         try {
           task->execute(exc_stream);
+          _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (oom_reschedule_exception& oom) {
           if (_completion_handler && _completion_handler->has_error()) {
             // If the completion handler is already in an error state, then we can just return and
@@ -483,6 +482,11 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
 }
 
 bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }
+
+executor_metrics gpu_pipeline_executor::get_metrics() const noexcept
+{
+  return {_tasks_executed.load(std::memory_order_relaxed)};
+}
 
 void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
 {

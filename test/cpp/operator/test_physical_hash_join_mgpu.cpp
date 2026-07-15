@@ -160,9 +160,10 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
     auto con = env.make_connection();
     require_gpu_matches_cpu(con, inner_query);
     auto& scheduler = env.get_task_scheduler(con);
-    scheduler.visit_executors([&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
-      tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
-    });
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
   // Both GPUs saw SOME pipeline work.
@@ -229,9 +230,10 @@ TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes parti
     auto con = env.make_connection();
     require_gpu_matches_cpu(con, inner_query);
     auto& scheduler = env.get_task_scheduler(con);
-    scheduler.visit_executors([&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
-      tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
-    });
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
   // MIXED_JOIN with >=2 partitions must schedule pipeline work on BOTH GPUs.
@@ -617,9 +619,10 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
       require_gpu_matches_cpu(con, inner_query);
     }
     auto& scheduler = env.get_task_scheduler(con);
-    scheduler.visit_executors([&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
-      tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
-    });
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
   INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);

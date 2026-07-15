@@ -16,7 +16,6 @@
 
 #include "creator/task_creator.hpp"
 
-#include "ctrack.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -97,32 +96,28 @@ void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_sch
 
 void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
-  CTRACK;
-  {
-    std::lock_guard<std::mutex> lock(_global_state_mutex);
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
 
-    _gpu_operator_global_state_map.clear();
+  _gpu_operator_global_state_map.clear();
 
-    const auto& pipelines = query.get_pipelines();
+  const auto& pipelines = query.get_pipelines();
 
-    auto* sirius_ctx =
-      _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
-    std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
-      sirius_ctx->get_telemetry_context();
+  auto* sirius_ctx =
+    _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
+    sirius_ctx->get_telemetry_context();
 
-    for (const auto& pipeline : pipelines) {
-      pipeline->set_task_creator(this);
-      auto source_operator = pipeline->get_source();
-      if (source_operator == nullptr) {
-        SIRIUS_LOG_WARN(
-          "Pipeline has no source operator; skipping task creation for this pipeline.");
-        continue;
-      }
-      size_t operator_id = source_operator->get_operator_id();
-      auto gs =
-        std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
-      _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
+  for (const auto& pipeline : pipelines) {
+    pipeline->set_task_creator(this);
+    auto source_operator = pipeline->get_source();
+    if (source_operator == nullptr) {
+      SIRIUS_LOG_WARN("Pipeline has no source operator; skipping task creation for this pipeline.");
+      continue;
     }
+    size_t operator_id = source_operator->get_operator_id();
+    auto gs =
+      std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
   }
 
   std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);

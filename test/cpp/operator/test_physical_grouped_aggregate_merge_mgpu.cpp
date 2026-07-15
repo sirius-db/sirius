@@ -82,8 +82,8 @@ TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes 
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("highcard");
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("highcard");
+  auto yaml = tmp / "mgpu.yaml";
 
   // Independent keys across files: range(0..500000) each — total ~4M rows
   // with ~500k distinct keys. At ~16 B/row that is ~64 MiB input; with
@@ -114,9 +114,10 @@ TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes 
     require_gpu_matches_cpu(*con, inner_query);
     auto& scheduler = env.get_task_scheduler(*con);
     con.reset();
-    scheduler.visit_executors([&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
-      tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
-    });
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
   INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
@@ -134,8 +135,8 @@ TEST_CASE("grouped_aggregate_merge - group by with single key forces single-GPU 
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("singlekey");
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("singlekey");
+  auto yaml = tmp / "mgpu.yaml";
 
   // Every row shares k=0 → aggregate result is a single group. Below the
   // small-table-bytes threshold where the num_gpus floor is skipped, so
@@ -174,8 +175,8 @@ TEST_CASE("grouped_aggregate_merge - count(*)-only aggregate across two GPUs",
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("countstar");
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("countstar");
+  auto yaml = tmp / "mgpu.yaml";
 
   // Same high-cardinality surface as test #1 so we hit the multi-partition
   // MGPU path, but the aggregate is COUNT(*) only — catches cudf
@@ -205,9 +206,10 @@ TEST_CASE("grouped_aggregate_merge - count(*)-only aggregate across two GPUs",
     require_gpu_matches_cpu(*con, inner_query);
     auto& scheduler = env.get_task_scheduler(*con);
     con.reset();
-    scheduler.visit_executors([&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
-      tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
-    });
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
   INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
