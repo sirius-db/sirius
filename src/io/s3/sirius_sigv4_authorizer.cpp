@@ -19,6 +19,7 @@
 #include "io/io_errors.hpp"
 #include "io/s3/sigv4.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <ctime>
 #include <stdexcept>
@@ -108,6 +109,37 @@ std::string_view method_to_str(s3_request_method method)
   return "GET";  // unreachable; all enumerators handled
 }
 
+// Reject X-Amz-* parameters case-insensitively to prevent signing-parameter
+// injection: a caller-supplied X-Amz-* key would otherwise be merged into the
+// signed set (presigned mode) or signed verbatim (header mode), duplicating or
+// overriding the authorizer's own signing parameters.
+void reject_amz_query_params(std::string_view canonical_query)
+{
+  constexpr std::string_view k_amz = "x-amz-";
+  for (std::size_t b = 0; b < canonical_query.size();) {
+    auto const amp     = canonical_query.find('&', b);
+    auto const len     = (amp == std::string::npos ? canonical_query.size() : amp) - b;
+    auto const key_end = std::min(std::string_view{canonical_query}.substr(b, len).find('='), len);
+    auto const key     = std::string_view{canonical_query}.substr(b, key_end);
+    if (key.size() >= k_amz.size()) {
+      bool amz = true;
+      for (std::size_t i = 0; i < k_amz.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(key[i])) != k_amz[i]) {
+          amz = false;
+          break;
+        }
+      }
+      if (amz) {
+        throw credential_error(
+          "sirius_sigv4_authorizer: X-Amz-* keys are not allowed in a LIST canonical query (got '" +
+          std::string{key} + "')");
+      }
+    }
+    if (amp == std::string::npos) { break; }
+    b = amp + 1;
+  }
+}
+
 }  // namespace
 
 sirius_sigv4_authorizer_base::sirius_sigv4_authorizer_base(static_credentials creds,
@@ -170,6 +202,34 @@ s3_authorized_request sirius_sigv4_presigned_authorizer::authorize(s3_object_ref
   }
 }
 
+s3_authorized_request sirius_sigv4_presigned_authorizer::authorize_list(
+  std::string_view bucket, std::string_view canonical_query, std::chrono::seconds timeout)
+{
+  if (bucket.empty()) { throw credential_error("sirius_sigv4_authorizer: empty bucket"); }
+  reject_amz_query_params(canonical_query);
+  std::string const canonical_uri = "/" + uri_encode(bucket, /*encode_slash=*/true);
+  auto const signer               = make_signer(_creds, _region);
+  auto const effective_ttl        = timeout.count() > 0 ? timeout : _ttl;
+
+  try {
+    // The list params are merged into the signed canonical query by presign_url,
+    // so the URL carries both them and the X-Amz-* auth params; headers empty.
+    return s3_authorized_request{presign_url(/*method=*/"GET",
+                                             _scheme,
+                                             _host,
+                                             canonical_uri,
+                                             signer,
+                                             std::time(nullptr),
+                                             effective_ttl,
+                                             canonical_query),
+                                 {}};
+  } catch (credential_error const&) {
+    throw;
+  } catch (std::exception const& e) {
+    throw credential_error(std::string("sirius_sigv4_presigned_authorizer: ") + e.what());
+  }
+}
+
 sirius_sigv4_header_authorizer::sirius_sigv4_header_authorizer(static_credentials creds,
                                                                std::string region,
                                                                std::string endpoint)
@@ -197,6 +257,38 @@ s3_authorized_request sirius_sigv4_header_authorizer::authorize(s3_object_ref co
                                    signer,
                                    std::time(nullptr));
     std::string url = _scheme + "://" + _host + canonical_uri;
+    return s3_authorized_request{std::move(url), std::move(signed_req.headers)};
+  } catch (credential_error const&) {
+    throw;
+  } catch (std::exception const& e) {
+    throw credential_error(std::string("sirius_sigv4_header_authorizer: ") + e.what());
+  }
+}
+
+s3_authorized_request sirius_sigv4_header_authorizer::authorize_list(
+  std::string_view bucket, std::string_view canonical_query, std::chrono::seconds /*timeout*/)
+{
+  if (bucket.empty()) { throw credential_error("sirius_sigv4_authorizer: empty bucket"); }
+  reject_amz_query_params(canonical_query);
+  std::string const canonical_uri = "/" + uri_encode(bucket, /*encode_slash=*/true);
+  auto const signer               = make_signer(_creds, _region);
+
+  try {
+    // sign_request already signs an arbitrary pre-sorted canonical query; the
+    // URL carries the same query verbatim, auth rides in the returned headers.
+    auto signed_req = sign_request(/*method=*/"GET",
+                                   _host,
+                                   canonical_uri,
+                                   canonical_query,
+                                   sha256_hex(""),
+                                   /*extra_headers=*/{},
+                                   signer,
+                                   std::time(nullptr));
+    std::string url = _scheme + "://" + _host + canonical_uri;
+    if (!canonical_query.empty()) {
+      url += '?';
+      url += canonical_query;
+    }
     return s3_authorized_request{std::move(url), std::move(signed_req.headers)};
   } catch (credential_error const&) {
     throw;

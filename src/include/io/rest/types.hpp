@@ -96,6 +96,9 @@ struct rest_chunked_rx_request {
   // take the event-synchronized recycle path (see needs_event_for_synchronization).
   bool staged_through_bounce{false};
 
+  // Marks synchronous network reads for blocking_host_get_* attribution.
+  bool perf_blocking_host_get{false};
+
   // perf (set only when the reactor's perf_instrumentation is on): t_enqueue at
   // queue insertion, t_submit at dequeue onto a connection; their delta is the
   // queue_wait sample (attempt 0 only), and t_submit anchors the chunk_get span.

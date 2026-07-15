@@ -20,6 +20,7 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
+#include "io/s3/s3_list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
@@ -45,8 +46,11 @@ namespace cucascade::memory {
 class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -377,6 +381,24 @@ class sirius_scan_manager {
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
+
+  /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
+  ///        to @p sink, one call per page; @p sink returns false to stop early.
+  ///        Routes via @ref ioctx_for_path to the object-store backend (throws a
+  ///        clear error when the path does not resolve to one). page_size /
+  ///        early-stop semantics are the backend's (@c rest_ioctx::list_objects_paged).
+  ///        @p max_scanned unset → the backend's configured cap
+  ///        (@c rest.list_max_scanned); a value overrides it.
+  void list_objects_paged(
+    std::string const& s3_prefix_uri,
+    std::size_t page_size,
+    std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+    std::optional<std::size_t> max_scanned = std::nullopt);
+
+  /// \brief The configured glob-match cap (@c rest.list_max_matches) for the
+  ///        backend @p s3_uri routes to — the glob layer bounds its match set
+  ///        with it. Throws a clear error for a non-object-store path.
+  [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.

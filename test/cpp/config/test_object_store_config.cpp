@@ -255,6 +255,8 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
 {
   CHECK_FALSE(sirius::io::rest::config{}.perf_instrumentation);
   CHECK(sirius::io::rest::config{}.footer_probe_bytes == 512UL * 1024);
+  CHECK(sirius::io::rest::config{}.list_max_matches == 100'000);
+  CHECK(sirius::io::rest::config{}.list_max_scanned == 1'000'000);
 
   auto const path =
     std::filesystem::temp_directory_path() / "sirius_rest_perf_instrumentation.yaml";
@@ -264,12 +266,16 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
              "    scan_manager:\n"
              "      rest:\n"
              "        perf_instrumentation: true\n"
-             "        footer_probe_bytes: 256KiB\n");
+             "        footer_probe_bytes: 256KiB\n"
+             "        list_max_matches: 5\n"
+             "        list_max_scanned: 50\n");
 
   sirius::sirius_config cfg;
   REQUIRE_NOTHROW(cfg.load_from_file(path));
   CHECK(cfg.get_scan_manager_config().rest.perf_instrumentation);
   CHECK(cfg.get_scan_manager_config().rest.footer_probe_bytes == 256UL * 1024);
+  CHECK(cfg.get_scan_manager_config().rest.list_max_matches == 5);
+  CHECK(cfg.get_scan_manager_config().rest.list_max_scanned == 50);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
