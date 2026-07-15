@@ -141,8 +141,6 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
 
   // Single tmp root holds every per-query parquet surface. Cleaned up at exit.
   auto root    = make_tmp_dir("root");
-  auto log_dir = root / "log";
-  scoped_log_dir logs(log_dir);
 
   // --- [0] order surface: 4 files x 50k rows ~ 0.6 MiB. Forces multi-
   //         partition sort with hash_partition_bytes = 1 MiB.
@@ -322,8 +320,7 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
     }
   }
 
-  // Cleanup tmp surface (log_dir is inside `root`, scoped_log_dir restores
-  // SIRIUS_LOG_DIR/SIRIUS_LOG_LEVEL on dtor).
+  // Cleanup tmp surface.
   std::error_code ec;
   fs::remove_all(root, ec);
 }
