@@ -308,10 +308,18 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
   T warp_inclusive;
   T warp_total;
   WarpScanT(warp_scan_temp[warp_id]).InclusiveSum(thread_agg, warp_inclusive, warp_total);
-  if (lane_id == 31) warp_aggregates[warp_id] = warp_total;
+  // The warp total lives on the last active lane of each warp. On NVIDIA
+  // (32-wide warp) that was hardcoded to lane 31; on AMD (64-wide wavefront)
+  // the carrier must be the last lane. For a full warp this is
+  // cub::detail::warp_threads - 1. cub::WarpScan already broadcast warp_total
+  // to every lane (that is what the third output parameter is), so writing on
+  // any active lane suffices; use the last lane for clarity and to match the
+  // original intent. NUM_WARPS is BITPACK_BLOCK_DIM / cub::detail::warp_threads
+  // (= 4 on AMD, 8 on NVIDIA) so this stays index-correct on both.
+  if (lane_id == cub::detail::warp_threads - 1) warp_aggregates[warp_id] = warp_total;
   __syncthreads();
 
-  // Stage 2 — serial scan of NUM_WARPS=8 warp totals by warp 0 lane 0.
+  // Stage 2 — serial scan of NUM_WARPS warp totals by warp 0 lane 0.
   if (warp_id == 0 && lane_id == 0) {
     T running = T(0);
 #pragma unroll

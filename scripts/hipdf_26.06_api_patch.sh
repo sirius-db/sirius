@@ -220,3 +220,40 @@ echo "existing filter_column_chunks_byte_ranges + payload_column_chunks_byte_ran
 echo "methods (which already exist in hipDF 25.10). This is functionally correct"
 echo "but may not be optimal — the upstream 26.06 impl uses a combined"
 echo "select_columns(ALL_COLUMNS) path. This can be optimized later."
+
+# -----------------------------------------------------------------------------
+# Patch 4: Patch get_rmm.cmake to use find_package(rmm) instead of CPM re-fetch
+# -----------------------------------------------------------------------------
+# hipDF's get_rmm.cmake calls rapids_cpm_rmm which in HIP mode calls
+# rapids_cpm_hipmm — this re-fetches rmm from source via CPM, which causes
+# "Unknown CMake command rapids_make_logger" because the CPM-fetched rmm
+# doesn't have the rapids_logger module that the system-installed hipMM has.
+# Fix: use find_package(rmm) to find the system-installed hipMM instead.
+
+RMM_CMAKE="$HIPDF_DIR/cpp/cmake/thirdparty/get_rmm.cmake"
+if [ -f "$RMM_CMAKE" ] && ! grep -q "find_package(rmm" "$RMM_CMAKE"; then
+  echo "Patching: get_rmm.cmake to use find_package(rmm) instead of CPM"
+  cat > "$RMM_CMAKE" << 'RMM_PATCH'
+# =============================================================================
+# Patched by build_rocm_deps.sh: use find_package(rmm) instead of CPM re-fetch.
+#
+# The original hipDF get_rmm.cmake calls rapids_cpm_rmm which re-fetches rmm
+# from source via CPM. This causes a "Unknown CMake command rapids_make_logger"
+# error because the CPM-fetched rmm doesn't have the rapids_logger module that
+# the system-installed hipMM (built by build_rocm_deps.sh Step 1) has.
+#
+# Using find_package(rmm) finds the hipMM install at /opt/rocm which has the
+# correct rapids_logger integration.
+# =============================================================================
+
+# This function finds rmm (hipMM) via find_package instead of CPM.
+function(find_and_configure_rmm)
+  find_package(rmm REQUIRED CONFIG)
+endfunction()
+
+find_and_configure_rmm()
+RMM_PATCH
+  echo "  Done"
+else
+  echo "Skip: get_rmm.cmake already patched (or file not found)"
+fi

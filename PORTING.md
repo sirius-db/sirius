@@ -11,7 +11,7 @@ maps/Bloom filters), and cuCascade (out-of-core memory reservation/repository).
 This port adds an opt-in AMD ROCm/HIP backend (`ENABLE_ROCM=ON`) that uses
 the ROCm-DS drop-in equivalents hipDF and hipMM, plus compatibility shims
 that eliminate per-file HIPIFY. The design goal is **zero source-file edits**
-for the 69 files containing `cuda*` runtime calls — achieved via a
+for the 57 files containing `cuda*` runtime calls — achieved via a
 `cuda_runtime.h` compatibility shim that macro-aliases `cuda*` to `hip*`.
 
 ### Component map
@@ -24,7 +24,7 @@ for the 69 files containing `cuda*` runtime calls — achieved via a
 │  SIRIUS_BUILD_TELEMETRY (gated)      ROCTX find_library             │
 ├─────────────────────────────────────────────────────────────────────┤
 │  cuda2rocm shims (via FetchContent)  ← BEFORE on include path, shadows NVIDIA hdrs  │
-│  ├── cuda_runtime.h      cuda*→hip* macro aliases (67 symbols)      │
+│  ├── cuda_runtime.h      cuda*→hip* macro aliases (68 macros + 6 type aliases) │
 │  ├── cuda_runtime_api.h   redirect                                   │
 │  ├── cuda.h               redirect                                   │
 │  ├── cub/cub.cuh          #include hipcub + namespace cub=hipcub     │
@@ -87,7 +87,7 @@ The `cub/cub.cuh` shim redirects to `<hipcub/hipcub.hpp>` and creates
 `cuco::bloom_filter` / `cuco::static_set` are excluded from `CUDA_SOURCES`.
 The PIMPL'd header (`sirius_dynamic_filter.hpp`) still compiles.
 
-### 3.5 cuCascade → stub (cuda2rocm shims (via FetchContent)cucascade/)
+### 3.5 cuCascade → stub (cuda2rocm cucascade-rocm/, via FetchContent)
 
 `SIRIUS_ENABLE_CUCASCADE` defaults OFF on ROCm. Instead of the real cuCascade
 submodule, 32 stub headers provide ~70 types so 63 `.cpp` files compile.
@@ -98,7 +98,7 @@ graceful degradation to DuckDB CPU execution.
 
 ### 4.1 cuda_runtime.h
 
-`#include <hip/hip_runtime.h>` then `#define cuda* hip*` for all 67 symbols
+`#include <hip/hip_runtime.h>` then `#define cuda* hip*` for 68 macros + 6 type aliases
 Sirius and its dependencies (RMM, cuDF, cuCascade) use. Key mappings:
 
 | Category | CUDA | HIP | Notes |
@@ -139,7 +139,7 @@ unmasked warps.
 
 ### 4.3 cuCascade Stub (32 headers)
 
-Provides ~70 types across 32 headers in `cuda2rocm shims (via FetchContent)cucascade/`.
+Provides ~70 types across 32 headers in `cuda2rocm/cucascade-rocm/include/cucascade/` (via FetchContent).
 Design principles:
 
 - **5 real virtual base classes** (Sirius subclasses them): `memory_reservation_manager`,
@@ -159,7 +159,7 @@ Design principles:
 
 `nvtx3::scoped_range` (the only nvtx3 type Sirius uses, 47 call sites) maps
 to `roctxRangeStartA`/`roctxRangeStop`. The shim is at
-`cuda2rocm shims (via FetchContent)nvtx3/nvtx3.hpp`. ROCm's roctx header is at
+`cuda2rocm/cuda-compat-shims/include/nvtx3/nvtx3.hpp` (via FetchContent). ROCm's roctx header is at
 `/opt/rocm/include/roctracer/roctx.h` (discovered via `find_path`).
 
 ### 4.5 Source Fix: __shfl_xor_sync
@@ -209,12 +209,100 @@ cmake --build build/rocm
 
 ## 7. Remaining Work
 
-1. **hipDF/hipMM installation**: The host needs hipDF + hipMM installed and
-   discoverable as `cudf::cudf` / `rmm::rmm`. No pixi/vcpkg ROCm env exists yet.
+1. **hipDF/hipMM installation**: `scripts/build_rocm_deps.sh` builds and
+   installs both from source. See §8 for the real-build fixes discovered on
+   gfx942/ROCm 7.2.1 hardware.
 2. **Runtime validation**: The stub makes code compile; runtime behavior needs
    testing on a host with hipDF installed. Stub methods throw → CPU fallback.
 3. **cuco port or replacement**: Needed for Bloom/in-list dynamic filters.
 4. **NVML → rocm-smi/hwloc**: For multi-GPU topology.
+
+## 8. Real-Build Fixes (discovered on gfx942 / ROCm 7.2.1)
+
+These fixes were discovered by actually building hipDF + hipMM on a real
+AMD MI300 (gfx942, ROCm 7.2.1, hipcc 7.2.53211). They are incorporated into
+`scripts/build_rocm_deps.sh` and `scripts/hipdf_26.06_api_patch.sh`.
+
+### 8.1 Compiler: hipcc as C/CXX (not g++)
+
+hipMM's `.cpp` sources (e.g. `rmm/src/cuda_device.cpp`) are compiled with
+`-x hip --offload-arch=gfx942` flags. Plain `g++` fails with:
+```
+c++: error: unrecognized command-line option '--offload-arch=gfx942'
+```
+**Fix:** Set `CMAKE_CXX_COMPILER=hipcc` and `CMAKE_C_COMPILER=hipcc`.
+hipcc is a wrapper around clang++ that understands HIP flags.
+
+### 8.2 Architecture: ROCM_AMDGPU_TARGETS env var
+
+`rapids_cmake`'s `rapids_hip_set_architectures` checks that
+`CMAKE_HIP_ARCHITECTURES` matches `AMDGPU_TARGETS`. A mismatch is fatal:
+```
+mismatch between CMAKE_HIP_ARCHITECTURES='gfx908;gfx90a;gfx942;gfx950',
+AMDGPU_TARGETS='gfx942'
+```
+**Fix:** Set `ROCM_AMDGPU_TARGETS=gfx942` and `GPU_TARGETS=gfx942` as
+environment variables (not cmake -D vars). The ROCm toolchain defaults
+`CMAKE_HIP_ARCHITECTURES` to `gfx908;gfx90a;gfx942;gfx950`; the env var
+overrides this to a single target.
+
+### 8.3 Network: git HTTP/1.1 (fixes flaky GitHub clones)
+
+DSW pods and some CI environments have flaky HTTP/2 connections to GitHub.
+git clone fails with:
+```
+GnuTLS recv error (-110): The TLS connection was non-properly terminated
+HTTP/2 stream 1 was not closed cleanly before end of the underlying stream
+```
+**Fix:** `git config --global http.version HTTP/1.1`
+
+### 8.4 Pre-clone all CPM dependencies
+
+hipDF has 16+ transitive dependencies fetched via CPM/FetchContent. Each
+fetch is a git clone from GitHub — any failure aborts the entire configure.
+**Fix:** `build_rocm_deps.sh` Step 0 pre-clones all deps into a cache
+directory and passes them as `FETCHCONTENT_SOURCE_DIR_<name>` overrides.
+Correct branch/tag names (from rapids-cmake `versions.json`):
+
+| Dependency | Branch/Tag |
+|------------|-----------|
+| rapids-cmake | branch-25.10 |
+| CCCL | v3.0.3 |
+| libhipcxx | release/rocmds-26.03 |
+| jitify | release/rocmds-26.03 |
+| hipcomp | release/rocmds-26.03 |
+| spdlog | v1.14.1 |
+| fmt | 11.0.2 |
+| rapids-logger | branch-0.1.0 |
+| flatbuffers | v24.3.25 |
+| CRoaring | v4.3.11 |
+| dlpack | v1.0 |
+| nanoarrow | apache-arrow-nanoarrow-0.6.0 |
+| thread-pool | v4.1.0 |
+| zstd | v1.5.6 |
+| kvikio | branch-25.10 |
+| NVTX | v3.2.0 |
+| arrow | apache-arrow-18.0.0 |
+
+### 8.5 get_rmm.cmake: find_package instead of CPM re-fetch
+
+hipDF's `get_rmm.cmake` calls `rapids_cpm_rmm` which in HIP mode calls
+`rapids_cpm_hipmm` — this re-fetches rmm from source via CPM, causing:
+```
+CMake Error: Unknown CMake command "rapids_make_logger"
+```
+The CPM-fetched rmm doesn't have the `rapids_logger` module that the
+system-installed hipMM has.
+**Fix:** `hipdf_26.06_api_patch.sh` patches `get_rmm.cmake` to use
+`find_package(rmm REQUIRED CONFIG)` instead.
+
+### 8.6 hipMM build verified
+
+hipMM was successfully built and installed on real gfx942/ROCm 7.2.1:
+- `librmm.so` → `/opt/rocm/lib/`
+- Headers → `/opt/rocm/include/rmm/`
+- CMake config → `/opt/rocm/lib/cmake/rmm/rmm-config.cmake`
+- `find_package(rmm CONFIG)` finds version 4.0.0
 
 ## Appendix A: Compile-Test Success Logs (gfx942, ROCm 7.2.1)
 
