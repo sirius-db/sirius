@@ -61,18 +61,28 @@ struct list_objects_v2_page {
  * trailing whitespace. XML entities (`&amp; &lt; &gt; &quot; &apos;`) in key /
  * token text are unescaped.
  *
- * The body must be a COMPLETE response — a truncated / partial (but
- * transport-complete) body must not parse as a silently-incomplete listing, so
- * both the root close tag and every `<Contents>` block are required to close.
+ * The body must be a COMPLETE, well-formed response — a truncated / partial
+ * (but transport-complete) body must not parse as a silently-incomplete
+ * listing, so the root close tag and every `<Contents>` block are required to
+ * close, and the fields AWS documents as always present are mandatory: a
+ * malformed body fails closed instead of silently dropping entries or ending
+ * the paged sweep early.
  *
  * @throw std::runtime_error when @p xml is not a recognizable, complete
  *        ListObjectsV2 response: no `<ListBucketResult>` open tag (e.g. an S3
  *        `<Error>` body or an empty string), a missing `</ListBucketResult>`
  *        close tag, or a `<Contents>` opened without a `</Contents>` close (both
- *        signal a truncated body); or a `<Contents>` whose `<Size>` is missing /
+ *        signal a truncated body); a `<Contents>` whose `<Key>` is missing /
+ *        unclosed / empty (a silently-skipped entry would make a glob drop the
+ *        object with no error); a `<Contents>` whose `<Size>` is missing /
  *        non-numeric / overflows `uint64_t` (a silently-zeroed or wrapped size
- *        would defeat the no-HEAD open path downstream). `<Size>0</Size>` is
- *        legal — S3 allows zero-byte objects.
+ *        would defeat the no-HEAD open path downstream — `<Size>0</Size>` is
+ *        legal, S3 allows zero-byte objects); a missing / unclosed
+ *        `<IsTruncated>` or a value other than exactly `true` / `false` after
+ *        trimming (defaulting would end the paged loop on a partial listing);
+ *        or `<IsTruncated>true</IsTruncated>` without a `<NextContinuationToken>`
+ *        element (the listing could not be completed). An empty-but-present
+ *        token element is accepted here and rejected by the paged caller.
  */
 list_objects_v2_page parse_list_objects_v2(std::string_view xml);
 

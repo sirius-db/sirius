@@ -216,9 +216,156 @@ TEST_CASE("ListObjectsV2 parser rejects non-list bodies and malformed sizes", "[
     std::runtime_error);
 
   auto max_size = parse_list_objects_v2(
-    R"(<ListBucketResult><Contents><Key>a</Key><Size>18446744073709551615</Size></Contents></ListBucketResult>)");
+    R"(<ListBucketResult><Contents><Key>a</Key><Size>18446744073709551615</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)");
   REQUIRE(max_size.entries.size() == 1);
   CHECK(max_size.entries[0].size == std::numeric_limits<std::uint64_t>::max());
+}
+
+TEST_CASE("ListObjectsV2 parser rejects Contents without a Key", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
+    Catch::Contains("<Contents> without <Key>"));
+}
+
+TEST_CASE("ListObjectsV2 parser rejects an unclosed Key", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Key>a<Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
+    Catch::Contains("<Contents> without <Key>"));
+}
+
+TEST_CASE("ListObjectsV2 parser rejects an empty Key", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Key></Key><Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
+    Catch::Contains("empty <Key>"));
+}
+
+TEST_CASE("ListObjectsV2 parser requires IsTruncated", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents></ListBucketResult>)"),
+    Catch::Contains("missing <IsTruncated>"));
+}
+
+TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list_parser]")
+{
+  for (auto const value : {"TRUE", "1", "garbage"}) {
+    DYNAMIC_SECTION("value=" << value)
+    {
+      auto const xml =
+        std::string{
+          "<ListBucketResult><Contents><Key>a</Key><Size>5</Size>"
+          "</Contents><IsTruncated>"} +
+        value + "</IsTruncated></ListBucketResult>";
+      CHECK_THROWS_WITH(sirius::io::s3::parse_list_objects_v2(xml),
+                        Catch::Contains("invalid <IsTruncated>"));
+    }
+  }
+
+  SECTION("unclosed element")
+  {
+    CHECK_THROWS_WITH(
+      sirius::io::s3::parse_list_objects_v2(
+        R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated>true</ListBucketResult>)"),
+      Catch::Contains("missing <IsTruncated>"));
+  }
+}
+
+TEST_CASE("ListObjectsV2 parser requires a token for a truncated page", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult>)"),
+    Catch::Contains("without") && Catch::Contains("ContinuationToken"));
+}
+
+TEST_CASE("ListObjectsV2 parser trims a valid IsTruncated value", "[s3][list_parser]")
+{
+  auto const page = sirius::io::s3::parse_list_objects_v2(
+    R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated> true </IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>)");
+
+  CHECK(page.is_truncated);
+  CHECK(page.next_continuation_token == "next");
+}
+
+TEST_CASE("ListObjectsV2 parser rejects object entries after the root element", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult><Contents><Key>outside</Key><Size>1</Size></Contents>)"),
+    Catch::Contains("after </ListBucketResult>"));
+}
+
+TEST_CASE("ListObjectsV2 parser does not read IsTruncated outside the root", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(sirius::io::s3::parse_list_objects_v2(
+                      R"(<ListBucketResult></ListBucketResult><IsTruncated>false</IsTruncated>)"),
+                    Catch::Contains("missing <IsTruncated>"));
+}
+
+TEST_CASE("ListObjectsV2 parser does not read a continuation token outside the root",
+          "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult><NextContinuationToken>outside</NextContinuationToken>)"),
+    Catch::Contains("without") && Catch::Contains("ContinuationToken"));
+}
+
+TEST_CASE("ListObjectsV2 parser rejects a root close before the root open", "[s3][list_parser]")
+{
+  CHECK_THROWS_AS(sirius::io::s3::parse_list_objects_v2(
+                    R"(</ListBucketResult><ListBucketResult><IsTruncated>false</IsTruncated>)"),
+                  std::runtime_error);
+}
+
+TEST_CASE("ListObjectsV2 parser accepts a prologue, root namespace, and trailing whitespace",
+          "[s3][list_parser]")
+{
+  auto const page = sirius::io::s3::parse_list_objects_v2(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+    "<Contents><Key>a</Key><Size>1</Size></Contents>"
+    "<IsTruncated>false</IsTruncated>"
+    "</ListBucketResult> \n\t");
+
+  REQUIRE(page.entries.size() == 1);
+  CHECK(page.entries[0].key == "a");
+  CHECK(page.entries[0].size == 1);
+  CHECK_FALSE(page.is_truncated);
+}
+
+TEST_CASE("ListObjectsV2 parser rejects a root-name prefix collision", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<ListBucketResultBogus><IsTruncated>false</IsTruncated></ListBucketResult>)"),
+    Catch::Contains("not a ListObjectsV2 response"));
+}
+
+TEST_CASE("ListObjectsV2 parser rejects content before the root element", "[s3][list_parser]")
+{
+  CHECK_THROWS_WITH(
+    sirius::io::s3::parse_list_objects_v2(
+      R"(<Foo/><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>)"),
+    Catch::Contains("before <ListBucketResult>"));
+}
+
+TEST_CASE("ListObjectsV2 parser accepts a prologue and newline before the root",
+          "[s3][list_parser]")
+{
+  auto const page = sirius::io::s3::parse_list_objects_v2(
+    "<?xml version=\"1.0\"?>\n "
+    "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>");
+
+  CHECK(page.entries.empty());
+  CHECK_FALSE(page.is_truncated);
 }
 
 TEST_CASE("s3_request_authorizer base rejects LIST until implementations opt in",

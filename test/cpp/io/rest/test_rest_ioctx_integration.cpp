@@ -24,6 +24,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/s3_container.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -37,6 +38,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <utils/log_test_utils.hpp>
 
@@ -46,6 +48,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -264,6 +267,13 @@ struct generated_listing {
   std::size_t total{0};
 };
 
+enum class scripted_list_mode {
+  normal,
+  repeated_empty_token,
+  alternating_empty_tokens,
+  truncated_empty_without_token
+};
+
 class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer {
  public:
   explicit fixed_url_authorizer(std::string endpoint) : _endpoint(std::move(endpoint)) {}
@@ -290,8 +300,9 @@ class range_http_server {
  public:
   explicit range_http_server(std::vector<std::uint8_t> object,
                              range_fault_policy fault          = {},
-                             std::vector<listed_object> listed = {})
-    : _object(std::move(object)), _fault(fault), _listed(std::move(listed))
+                             std::vector<listed_object> listed = {},
+                             scripted_list_mode list_mode      = scripted_list_mode::normal)
+    : _object(std::move(object)), _fault(fault), _listed(std::move(listed)), _list_mode(list_mode)
   {
     REQUIRE_FALSE(_object.empty());
 
@@ -570,6 +581,33 @@ class range_http_server {
       send_all(fd, response);
       return;
     }
+    if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
+
+    if (_list_mode != scripted_list_mode::normal) {
+      std::string token_out;
+      if (_list_mode == scripted_list_mode::repeated_empty_token) {
+        token_out = "repeat-token";
+      } else if (_list_mode == scripted_list_mode::alternating_empty_tokens) {
+        token_out = list_idx % 2 == 0 ? "token-A" : "token-B";
+      }
+
+      std::ostringstream xml;
+      xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+             "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+             "<IsTruncated>true</IsTruncated>";
+      if (!token_out.empty()) {
+        xml << "<NextContinuationToken>" << xml_escape(token_out) << "</NextContinuationToken>";
+      }
+      xml << "</ListBucketResult>";
+
+      auto body = xml.str();
+      std::string response =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+      send_all(fd, response);
+      send_all(fd, body);
+      return;
+    }
 
     auto prefix          = query_value(target, "prefix");
     auto token           = query_value(target, "continuation-token");
@@ -703,6 +741,7 @@ class range_http_server {
   std::vector<std::uint8_t> _object;
   range_fault_policy _fault;
   std::vector<listed_object> _listed;
+  scripted_list_mode _list_mode;
   std::optional<generated_listing> _generated_listing;
   std::atomic<bool> _stop{false};
   std::atomic<std::size_t> _head_count{0};
@@ -747,6 +786,67 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
 
 using capture_sink       = sirius::test::recording_log_sink;
 using scoped_log_capture = sirius::test::scoped_recording_log_sink;
+
+struct list_watchdog_result {
+  bool timed_out{false};
+  bool exited_normally{false};
+  int exit_code{-1};
+};
+
+list_watchdog_result run_list_watchdog(range_http_server const& server,
+                                       std::chrono::milliseconds startup_timeout,
+                                       std::chrono::milliseconds operation_timeout)
+{
+  if (sirius::test::g_integration_env != nullptr && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+
+  constexpr char k_endpoint_env[] = "SIRIUS_TEST_REST_LIST_WATCHDOG_ENDPOINT";
+  std::optional<std::string> old_endpoint;
+  if (auto const* current = std::getenv(k_endpoint_env); current != nullptr) {
+    old_endpoint = current;
+  }
+  auto const endpoint = server.endpoint();
+  REQUIRE(::setenv(k_endpoint_env, endpoint.c_str(), 1) == 0);
+
+  auto const pid = ::fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    ::execl("/proc/self/exe",
+            "sirius_unittest",
+            "rest LIST loop watchdog child runner",
+            static_cast<char*>(nullptr));
+    ::_exit(127);
+  }
+
+  if (old_endpoint.has_value()) {
+    REQUIRE(::setenv(k_endpoint_env, old_endpoint->c_str(), 1) == 0);
+  } else {
+    REQUIRE(::unsetenv(k_endpoint_env) == 0);
+  }
+
+  int status        = 0;
+  bool request_seen = false;
+  auto stop         = std::chrono::steady_clock::now() + startup_timeout;
+  while (std::chrono::steady_clock::now() < stop) {
+    if (!request_seen && server.list_count() > 0) {
+      request_seen = true;
+      stop         = std::chrono::steady_clock::now() + operation_timeout;
+    }
+    auto const waited = ::waitpid(pid, &status, WNOHANG);
+    if (waited == pid) {
+      return {.timed_out       = false,
+              .exited_normally = WIFEXITED(status),
+              .exit_code       = WIFEXITED(status) ? WEXITSTATUS(status) : -1};
+    }
+    if (waited < 0) { return {}; }
+    std::this_thread::sleep_for(20ms);
+  }
+
+  (void)::kill(pid, SIGKILL);
+  (void)::waitpid(pid, &status, 0);
+  return {.timed_out = true, .exited_normally = false, .exit_code = -1};
+}
 
 }  // namespace
 
@@ -1181,7 +1281,7 @@ TEST_CASE("rest LIST retries are observable and isolated from object-read byte c
     range_http_server server(deterministic_payload(16), fault, objects);
     auto ctx    = make_direct_rest_ioctx(server.endpoint(), cfg);
     auto before = ctx->perf_snapshot();
-    scoped_spdlog_capture logs;
+    scoped_log_capture logs;
 
     auto listed = ctx->list_objects("bucket", "data/", /*page_size=*/1000);
     auto after  = ctx->perf_snapshot();
@@ -1195,9 +1295,9 @@ TEST_CASE("rest LIST retries are observable and isolated from object-read byte c
 
     auto records = logs.records();
     CHECK(std::any_of(records.begin(), records.end(), [](capture_sink::record const& record) {
-      return record.level == spdlog::level::warn &&
-             record.payload.find("bucket") != std::string::npos &&
-             record.payload.find("data/") != std::string::npos;
+      return record.level == sirius::log::level::warn &&
+             record.message.find("bucket") != std::string::npos &&
+             record.message.find("data/") != std::string::npos;
     }));
   }
 
@@ -1206,7 +1306,7 @@ TEST_CASE("rest LIST retries are observable and isolated from object-read byte c
     range_http_server server(deterministic_payload(16), {}, objects);
     auto ctx    = make_direct_rest_ioctx(server.endpoint(), cfg);
     auto before = ctx->perf_snapshot();
-    scoped_spdlog_capture logs;
+    scoped_log_capture logs;
 
     auto listed = ctx->list_objects("bucket", "data/", /*page_size=*/1000);
     auto after  = ctx->perf_snapshot();
@@ -1219,7 +1319,7 @@ TEST_CASE("rest LIST retries are observable and isolated from object-read byte c
 
     auto records = logs.records();
     CHECK(std::none_of(records.begin(), records.end(), [](capture_sink::record const& record) {
-      return record.level >= spdlog::level::warn;
+      return record.level >= sirius::log::level::warn;
     }));
   }
 }
