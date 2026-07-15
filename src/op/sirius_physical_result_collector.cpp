@@ -168,6 +168,13 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           data->get_size_in_bytes());
 
       // clone_to: creates new batch with data converted to host_data_representation
+      if (host_reservation == nullptr) {
+        SIRIUS_LOG_WARN(
+          "sirius_physical_materialized_collector: host reservation failed for batch {} ({} "
+          "bytes) — proceeding without reservation, converter may OOM",
+          ro.get_batch_id(),
+          data->get_size_in_bytes());
+      }
       auto result_batch =
         host_reservation != nullptr
           ? ro.clone_to<cucascade::host_data_representation>(

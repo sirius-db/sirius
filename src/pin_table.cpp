@@ -308,6 +308,12 @@ materialized_host_pin materialize_pin_to_host(
       cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
       auto host_reservation =
         target_host_space->make_reservation_or_null(gpu_repr.get_size_in_bytes());
+      if (host_reservation == nullptr) {
+        SIRIUS_LOG_WARN(
+          "materialize_pin_to_host: host reservation failed ({} bytes) — proceeding without "
+          "reservation, converter may OOM",
+          gpu_repr.get_size_in_bytes());
+      }
       auto host_repr = host_reservation != nullptr
                          ? registry.convert<cucascade::host_data_representation>(
                              gpu_repr, *host_reservation, stream)

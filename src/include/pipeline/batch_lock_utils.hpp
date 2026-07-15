@@ -158,6 +158,11 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
           mut_accessor.convert_to<cucascade::host_data_representation>(
             registry, *host_reservation, stream);
         } else {
+          SIRIUS_LOG_WARN(
+            "lock_or_prepare_batch: host reservation failed for batch {} ({} bytes) — "
+            "proceeding without reservation, converter may OOM",
+            mut_accessor.get_batch_id(),
+            mut_accessor.get_data()->get_size_in_bytes());
           mut_accessor.convert_to<cucascade::host_data_representation>(
             registry, target_space, stream);
         }
