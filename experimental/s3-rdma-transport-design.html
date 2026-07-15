@@ -56,8 +56,9 @@ byte crosses host memory and PCIe **twice**. RDMA-direct removes both legs.
   SigV4 / `sirius_datasource` semantics; the REST backend stays the
   config-selectable default; no Parquet-scanner changes.
 - **Non-goals (v1):** no new URI scheme; no plain-AWS-S3 (needs a cuObject
-  gateway); no `AUTO` probe and no runtime HTTP fallback (RDMA failure = I/O
-  error); no AWS-CRT dependency.
+  gateway); no `AUTO` probe and no runtime HTTP fallback (failures surface loudly
+  per D6 and the §2 discipline — never a silent transport switch); no AWS-CRT
+  dependency.
 
 ## 1. Architecture
 
@@ -192,9 +193,10 @@ slot is recycled nor the future resolved until the stream is proven quiet.**
 - **Reactor fail-stop** is the containment shape for failures that do *not*
   corrupt the CUDA process — in v1 that is the ambiguous RDMA outcome in the
   retry contract (appendix). It happens exactly once: new reads fail fast,
-  naming the first fatal error; queued chunks are completed with that error;
-  chunks already in flight finish on their own workers — never resolved on
-  another worker's behalf; and any arena that cannot be proven quiet at
+  naming the first fail-stop error; queued envelopes — and the un-generated
+  chunks of partially-consumed ones — are error-completed with it; chunks
+  already in flight finish on their own workers — never resolved on another
+  worker's behalf; and any arena that cannot be proven quiet at
   teardown is deliberately **leaked rather than freed**, because freeing
   memory a NIC might still write is the very use-after-free this discipline
   exists to prevent. The process stays alive, but RDMA service on this
@@ -216,7 +218,7 @@ the absence of normal teardown.
 | D2 | Build RDMA as **one new transport engine under the existing IO framework** — a `cuobj_rdma_reactor` wrapped by a thin `s3_rdma_ioctx`; the per-device **arena map is reactor state**, while the shared context carries only config, the transfer client/session factory (per-worker sessions preferred — §5 Q6), and the flush policy *(identifiers: `templated_ioctx`, `prep_host_rx` / `prep_device_rx` builders, `enqueue`)* | Same shape as `rest_ioctx`; chunking, pooling, completion, the `slot_pool`, and the registry factory are all reused. Keeping arenas on the reactor (not the shared context) keeps ownership with the worker pool that fills them |
 | D3 | One hybrid ioctx: host reads → HTTP, device reads → RDMA; the REST backend is not instantiated in RDMA mode | Backends are mutually exclusive per context; callers see identical semantics |
 | **D4** | **Landing arena + GPU-local D2D**, not direct RDMA into RMM buffers | Sirius RMM is `cuda_async_memory_resource` — not registrable for GPUDirect and stream-ordered, so the NIC can't target it. Arena = `cudaMalloc`, registered once; the D2D costs ~3 µs per 4 MiB slot (under 1% at the 100G reference point), with zero host bounce |
-| D5 | Completion via `semi_future` + `request_manager`: a chunk completes exactly once, on its own worker, after an **inline wait** on its CUDA event — and never before delivery is settled per the **§2 quiescence / fail-stop discipline** | Closes both use-after-free sides at once — a reused slot under an in-flight copy, and a freed destination still being written. A fatal CUDA error is process-level, so the reactor contains it and defers recovery to a process restart |
+| D5 | Completion via `semi_future` + `request_manager`: a chunk completes exactly once, on its own worker, after an **inline wait** on its CUDA event — and never before delivery is settled per the **§2 quiescence / fail-stop discipline** | Closes both use-after-free sides at once — a reused slot under an in-flight copy, and a freed destination still being written. A fatal CUDA error is process-level: per §2 the process-fatal hook terminates the process (restart is the recovery); the reactor's fail-stop contains only non-corrupting failures (the ambiguous RDMA outcome) |
 | D6 | v1: explicit `RDMA` opt-in, fail loudly, no HTTP fallback; all device reads go RDMA | Fallbacks and premature thresholds mask misconfiguration exactly where RDMA is deliberately deployed |
 | D7 | Optional build feature `SIRIUS_ENABLE_S3_RDMA` (conda `libcuobjclient` or `CUOBJ_SDK_ROOT`); never vendor NVIDIA SDKs | Default-off builds unchanged. Note: conda ships cuObject 1.2.x while the benchmark validated 1.0.0 — version reconciliation is a real task, not a drop-in add |
 | D8 | Dev rig = benchmark server (unsigned, isolated net); production gateways must SigV4-validate before honoring RDMA headers. **The `x-amz-rdma-token` and `Range` headers are signed**, and v1 supports the RDMA control plane in **header-signing mode only** (RDMA init rejects `s3_signing_mode = presigned`) — surface mechanics in the appendix's "Auth surface extension" | Standard SigV4 requires `x-amz-*` headers in the signature; an unsigned token is not bound to the request, so a gateway could not distinguish a tampered descriptor from a legitimate one. Signing token + range binds object, byte range, and destination capability into one authorized request |
@@ -318,8 +320,8 @@ as the plan that closes the gap between the current tree and this design.
 4. **cucascade registrable IO sub-MR** — appetite for a `cudaMalloc`-backed,
    registrable allocation path for IO buffers? It unlocks direct-into-RMM
    (drops the <1% D2D) but touches cucascade's memory architecture.
-5. **Metrics** — counter set + naming vs the existing S3 counters. Note the #982
-   perf instrumentation was re-added for the REST reactor in #1042; the RDMA
+5. **Metrics** — counter set + naming vs the existing S3 counters. Note the REST reactor's
+   perf instrumentation was re-added in #1042; the RDMA
    counters should follow that shape rather than invent a parallel one (see
    the appendix for the proposed set, including the delivery-safety counters).
 6. **Session ownership** — the cuObject SDK documents no whole-client
@@ -350,10 +352,11 @@ as the plan that closes the gap between the current tree and this design.
   now narrowed (§5 Q2): OWNER is settled by the CUDA contract; the remaining
   exposure is NONE-ordering platforms, per-device wiring, and the P3 stress
   test.
-- **Fatal CUDA errors are process-level.** The reactor's fail-stop (§2)
-  contains one — it does not recover it. Operators should treat a delivery
-  fatal as "restart required", and the surrounding system must not assume
-  other GPU work on that context keeps functioning.
+- **Fatal CUDA errors are process-level.** The §2 process-fatal hook
+  terminates the process — supervisor restart is the recovery, so operators
+  need a relaunch policy. The reactor's fail-stop contains only the
+  non-corrupting ambiguous-RDMA case: there the process stays alive, but RDMA
+  service on the context requires a restart.
 - Needs a controlled cuObject gateway (not plain AWS S3). NIC↔GPU PCIe affinity
   can silently halve BW. The gateway slot budget must cover `max_inflight` per
   Sirius context (not × GPUs or × queries) — and a process running several
@@ -491,7 +494,7 @@ Counters follow the REST-reactor instrumentation shape: `s3_rdma_bytes_total`,
 `…_slot_wait_total`, `…_flush_total`, `…_inflight_peak`,
 `…_queue_depth_peak`, `…_queue_wait_total` — plus the
 delivery-safety set from §2: `…_fallback_stream_sync_total` (quiescence-ladder
-runs), `…_delivery_fatal_total` (fail-stop transitions), `…_arena_leak_total`
+runs), `…_fail_stop_total` (reactor fail-stop transitions — the ambiguous-RDMA containment; the process-terminating verdicts leave a fatal log line and an exit code, not a scrapeable counter), `…_arena_leak_total`
 (arenas leaked at teardown because a writer — device stream or remote gateway
 — could not be proven quiet).
 
