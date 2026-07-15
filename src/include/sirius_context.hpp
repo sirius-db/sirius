@@ -381,6 +381,18 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
 };
 
+/// Installs the log sink selected by `Config::LOG_BACKEND`, reading the level/dir
+/// from `Config::LOG_*`.
+///
+/// `db` backs the `duckdb` backend: when it is null (the callback ctor calls it
+/// this way, before a DatabaseInstance exists) the `duckdb` backend is left
+/// deferred — the facade keeps its no-op default until `LoadInternal` calls this
+/// again with the real `db`. The db-independent backends (`spdlog`, `noop`) are
+/// installed regardless, so startup diagnostics emitted during construction are
+/// captured. An unknown backend throws only when `db` is non-null, so the error
+/// surfaces from extension load / SET rather than from the ctor.
+void install_configured_log_sink(DatabaseInstance* db);
+
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions
 class SiriusContextExtensionCallback : public ExtensionCallback {
