@@ -177,6 +177,9 @@ std::future<void> task_scheduler::start_query()
   std::scoped_lock lock(_query_mutex);
   const auto& scans = _query->get_scan_operators();
 
+  if (scans.empty()) {
+    throw std::runtime_error("task_scheduler: no scan operators");
+  }
   _task_creator->schedule(scans.front());
 
   return _completion_handler->get_awaitable();

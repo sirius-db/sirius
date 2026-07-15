@@ -855,7 +855,10 @@ void fill_fixed_width_runs(std::vector<staged_segment> const& staged,
     }
     gpu_segment_desc seg{};
     seg.d_bytes    = device_base + s.device_offset;
-    seg.bytes_size = static_cast<uint32_t>(std::min<std::size_t>(s.bytes, UINT32_MAX));
+    if (s.bytes > UINT32_MAX) {
+      throw std::overflow_error("segment bytes exceed UINT32_MAX");
+    }
+    seg.bytes_size = static_cast<uint32_t>(s.bytes);
     seg.row_offset = s.row_offset;
     seg.row_count  = s.row_count;
     out_runs.back().segments.push_back(seg);
@@ -876,7 +879,10 @@ void fill_string_runs(std::vector<staged_segment> const& staged,
     }
     gpu_string_segment_desc seg{};
     seg.d_bytes           = device_base + s.device_offset;
-    seg.bytes_size        = static_cast<uint32_t>(std::min<std::size_t>(s.bytes, UINT32_MAX));
+    if (s.bytes > UINT32_MAX) {
+      throw std::overflow_error("segment bytes exceed UINT32_MAX");
+    }
+    seg.bytes_size        = static_cast<uint32_t>(s.bytes);
     seg.row_offset        = s.row_offset;
     seg.row_count         = s.row_count;
     seg.seg_row_start     = 0;
@@ -1081,6 +1087,9 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     auto const& staged = staged_cols[ci];
     if (staged.is_varchar) {
       gpu_string_column_decode_input input;
+      if (staged.total_rows > INT32_MAX) {
+        throw std::overflow_error("total_rows exceeds INT32_MAX");
+      }
       input.total_rows = static_cast<uint32_t>(staged.total_rows);
       input.has_nulls  = staged.has_nulls;
       fill_string_runs(staged.data, device_buf, input.data);
@@ -1091,6 +1100,9 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
       // Decode the child data as a fixed-width column
       gpu_column_decode_input child_input;
       child_input.out_type   = sirius_to_cudf_type(scan_info.projected_types[ci].array_child());
+      if (staged.total_child_rows > INT32_MAX) {
+        throw std::overflow_error("total_child_rows exceeds INT32_MAX");
+      }
       child_input.total_rows = static_cast<uint32_t>(staged.total_child_rows);
       child_input.has_nulls  = staged.child_has_nulls;
       fill_fixed_width_runs(staged.array_child_data, device_buf, child_input.data);
@@ -1100,6 +1112,9 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     } else {
       gpu_column_decode_input input;
       input.out_type   = sirius_to_cudf_type(scan_info.projected_types[ci]);
+      if (staged.total_rows > INT32_MAX) {
+        throw std::overflow_error("total_rows exceeds INT32_MAX");
+      }
       input.total_rows = static_cast<uint32_t>(staged.total_rows);
       input.has_nulls  = staged.has_nulls;
       fill_fixed_width_runs(staged.data, device_buf, input.data);
@@ -1143,6 +1158,11 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
       // Filling stride offsets
       auto init_scalar = cudf::numeric_scalar<cudf::size_type>(0, true, stream, mr_ref);
       auto step_scalar = cudf::numeric_scalar<cudf::size_type>(array_size, true, stream, mr_ref);
+      // total_rows + 1 would overflow cudf::size_type when total_rows == INT32_MAX;
+      // an offsets column of INT32_MAX+1 entries is not representable, so reject it.
+      if (total_rows >= INT32_MAX) {
+        throw std::overflow_error(std::string(kTag) + " ARRAY offsets count exceeds cudf::size_type max");
+      }
       auto offsets     = cudf::sequence(total_rows + 1, init_scalar, step_scalar, stream, mr_ref);
 
       // Decode array-level validity from staged.validity segments

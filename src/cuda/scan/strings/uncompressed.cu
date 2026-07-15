@@ -80,9 +80,9 @@ __global__ void kernel_compute_lengths_uncomp(string_chunk_desc const* __restric
     auto const seg_i                     = desc.seg_row_start + i;
     auto const cur                       = duck_offset(off_bytes, seg_i);
     auto const prev                      = (seg_i > 0) ? duck_offset(off_bytes, seg_i - 1) : 0;
-    auto const abs_cur                   = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
-    auto const abs_prev                  = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
-    d_lengths[desc.global_row_start + i] = abs_cur - abs_prev;
+    auto const abs_cur                   = static_cast<uint32_t>(cur >= 0 ? cur : ~static_cast<uint32_t>(cur) + 1u);
+    auto const abs_prev                  = static_cast<uint32_t>(prev >= 0 ? prev : ~static_cast<uint32_t>(prev) + 1u);
+    d_lengths[desc.global_row_start + i] = abs_cur > abs_prev ? abs_cur - abs_prev : 0u;
   }
 }
 
@@ -118,9 +118,9 @@ __global__ void kernel_gather_uncomp(string_chunk_desc const* __restrict__ descs
     auto const seg_i    = desc.seg_row_start + i;
     auto const cur      = duck_offset(off_bytes, seg_i);
     auto const prev     = (seg_i > 0) ? duck_offset(off_bytes, seg_i - 1) : 0;
-    auto const abs_cur  = static_cast<uint32_t>(cur >= 0 ? cur : -cur);
-    auto const abs_prev = static_cast<uint32_t>(prev >= 0 ? prev : -prev);
-    auto const str_len  = abs_cur - abs_prev;
+    auto const abs_cur  = static_cast<uint32_t>(cur >= 0 ? cur : ~static_cast<uint32_t>(cur) + 1u);
+    auto const abs_prev = static_cast<uint32_t>(prev >= 0 ? prev : ~static_cast<uint32_t>(prev) + 1u);
+    auto const str_len  = abs_cur > abs_prev ? abs_cur - abs_prev : 0u;
 
     auto const out_pos = d_offsets[desc.global_row_start + i];
     auto const* src    = dict_end - abs_cur;

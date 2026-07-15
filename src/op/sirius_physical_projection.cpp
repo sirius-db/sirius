@@ -109,7 +109,9 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
   for (auto& input_ro : input_batches) {
     auto input_view = sirius::get_cudf_table_view(input_ro);
-    auto& mem = *input_ro.get_memory_space();  // owned by the memory manager (outlives input_ro)
+    auto* space = input_ro.get_memory_space();
+    if (!space) { continue; }
+    auto& mem = *space;  // owned by the memory manager (outlives input_ro)
 
     // ---- Path 1: every output column is an evaluated expression ----
     if (all_evaluated) {

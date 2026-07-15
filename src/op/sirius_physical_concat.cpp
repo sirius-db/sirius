@@ -205,6 +205,9 @@ void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_st
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
+  if (partitioned_output_data == nullptr) {
+    throw std::runtime_error("concat sink: expected partitioned data");
+  }
   auto partition_idx           = partitioned_output_data->get_partition_idx();
   for (auto& batch : partitioned_output_data->get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {

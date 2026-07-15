@@ -75,14 +75,15 @@ size_t write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
   // GET spills from one buffer into the next as each fills.
   while (remaining > 0 && sink->active < sink->buffers.size()) {
     iovec& b = sink->buffers[sink->active];
-    if (b.iov_base == nullptr) { break; }
+    void* base = b.iov_base;
+    if (base == nullptr) { break; }
     if (sink->cursor >= b.iov_len) {
       ++sink->active;
       sink->cursor = 0;
       continue;
     }
     size_t const n = std::min(b.iov_len - sink->cursor, remaining);
-    std::memcpy(static_cast<uint8_t*>(b.iov_base) + sink->cursor, src, n);
+    std::memcpy(static_cast<uint8_t*>(base) + sink->cursor, src, n);
     sink->cursor += n;
     sink->written += n;
     src += n;
@@ -1110,6 +1111,7 @@ int rest_socket_cb(CURL* /*easy*/, curl_socket_t s, int what, void* userp, void*
 int rest_timer_cb(CURLM* /*multi*/, long timeout_ms, void* userp)
 {
   auto* ws = static_cast<worker_state*>(userp);
+  if (!ws) { return 0; }
   itimerspec its{};  // all-zero => disarm
   if (timeout_ms == 0) {
     its.it_value.tv_nsec = 1;  // fire essentially immediately
