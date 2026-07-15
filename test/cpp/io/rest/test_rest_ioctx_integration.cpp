@@ -545,8 +545,8 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
   return make_direct_rest_ioctx(std::move(endpoint), direct_rest_test_config());
 }
 
-using capture_backend    = sirius::test::recording_log_backend;
-using scoped_log_capture = sirius::test::scoped_recording_log_backend;
+using capture_sink       = sirius::test::recording_log_sink;
+using scoped_log_capture = sirius::test::scoped_recording_log_sink;
 
 }  // namespace
 

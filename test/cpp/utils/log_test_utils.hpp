@@ -30,8 +30,8 @@
 
 namespace sirius::test {
 
-/// In-memory log_backend recording every message at or above its level.
-class recording_log_backend final : public sirius::log::sink {
+/// In-memory log sink recording every message at or above its level.
+class recording_log_sink final : public sirius::log::sink {
  public:
   struct record {
     sirius::log::level level;
@@ -91,21 +91,21 @@ class recording_log_backend final : public sirius::log::sink {
   int _flush_count = 0;
 };
 
-/// Swaps the global logging backend for a recording one for the scope of a
+/// Swaps the global logging sink for a recording one for the scope of a
 /// test and restores the configured logger (initialized in unittest.cpp's
 /// main from the Config:: values) on exit.
-class scoped_recording_log_backend {
+class scoped_recording_log_sink {
  public:
-  explicit scoped_recording_log_backend(std::string_view level = "trace")
-    : _backend(std::make_shared<recording_log_backend>())
+  explicit scoped_recording_log_sink(std::string_view level = "trace")
+    : _sink(std::make_shared<recording_log_sink>())
   {
     sirius::log::level lvl = sirius::log::level::info;
     sirius::log::string_to_enum(level, lvl);
-    _backend->set_level(lvl);
-    sirius::log::set_sink(_backend);
+    _sink->set_level(lvl);
+    sirius::log::set_sink(_sink);
   }
 
-  ~scoped_recording_log_backend()
+  ~scoped_recording_log_sink()
   {
     using duckdb::Config;
     sirius::log::level lvl = sirius::log::level::info;
@@ -119,18 +119,15 @@ class scoped_recording_log_backend {
     sirius::log::set_sink(std::move(sink));
   }
 
-  scoped_recording_log_backend(const scoped_recording_log_backend&)            = delete;
-  scoped_recording_log_backend& operator=(const scoped_recording_log_backend&) = delete;
+  scoped_recording_log_sink(const scoped_recording_log_sink&)            = delete;
+  scoped_recording_log_sink& operator=(const scoped_recording_log_sink&) = delete;
 
-  [[nodiscard]] recording_log_backend& backend() { return *_backend; }
-  [[nodiscard]] std::shared_ptr<recording_log_backend> backend_ptr() { return _backend; }
-  [[nodiscard]] std::vector<recording_log_backend::record> records() const
-  {
-    return _backend->records();
-  }
+  [[nodiscard]] recording_log_sink& sink() { return *_sink; }
+  [[nodiscard]] std::shared_ptr<recording_log_sink> sink_ptr() { return _sink; }
+  [[nodiscard]] std::vector<recording_log_sink::record> records() const { return _sink->records(); }
 
  private:
-  std::shared_ptr<recording_log_backend> _backend;
+  std::shared_ptr<recording_log_sink> _sink;
 };
 
 }  // namespace sirius::test

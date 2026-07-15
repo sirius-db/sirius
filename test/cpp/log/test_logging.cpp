@@ -16,20 +16,23 @@
 
 #include "catch.hpp"
 #include "log/logging.hpp"
-#include "log/noop_sink.hpp"
 #include "utils/log_test_utils.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <latch>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
-using namespace sirius::log;
+using sirius::log::get_sink;
+using sirius::log::level;
+using sirius::log::set_sink;
+using sirius::log::string_to_enum;
 
-using recording_backend        = sirius::test::recording_log_backend;
-using scoped_recording_backend = sirius::test::scoped_recording_log_backend;
+using recording_sink        = sirius::test::recording_log_sink;
+using scoped_recording_sink = sirius::test::scoped_recording_log_sink;
 
 TEST_CASE("Unknown level names are rejected and leave the default", "[log]")
 {
@@ -41,55 +44,53 @@ TEST_CASE("Unknown level names are rejected and leave the default", "[log]")
   CHECK(lvl == level::warn);
 }
 
+// test cases using SIRIUS_LOG_* only make sense when logging is compiled in.
+#if SIRIUS_ACTIVE_LOG_LEVEL != SIRIUS_LOG_LEVEL_OFF
+
 TEST_CASE("SIRIUS_LOG macros format and attribute the call site", "[log]")
 {
-  scoped_recording_backend scoped;
+  scoped_recording_sink scoped;
 
-  SIRIUS_LOG_INFO("x={}", 42);
+  SIRIUS_LOG_FATAL("x={}", 42);
   const uint32_t expected_line = __LINE__ - 1;
 
-  auto messages = scoped.backend().records();
+  auto messages = scoped.sink().records();
   REQUIRE(messages.size() == 1);
-  CHECK(messages[0].level == level::info);
+  CHECK(messages[0].level == level::critical);
   CHECK(messages[0].message == "x=42");
   CHECK(messages[0].file.ends_with("test_logging.cpp"));
   CHECK(messages[0].line == expected_line);
 }
 
-TEST_CASE("set_sink(nullptr) installs a discarding backend", "[log]")
+TEST_CASE("Concurrent logging survives sink swaps", "[log]")
 {
-  scoped_recording_backend scoped;
-
-  set_sink(nullptr);  // swaps in a noop, detaching the recorder
-  SIRIUS_LOG_ERROR("dropped {}", 1);
-  get_sink()->log(level::critical, std::source_location::current(), "dropped");
-  CHECK(get_sink()->flush());  // the noop flush is vacuously reliable
-  CHECK(scoped.backend().count() == 0);
-}
-
-TEST_CASE("Concurrent logging survives backend swaps", "[log]")
-{
-  scoped_recording_backend scoped;
-  auto backend_a = scoped.backend_ptr();
-  auto backend_b = std::make_shared<recording_backend>();
-  backend_a->set_level(level::trace);
-  backend_b->set_level(level::trace);
+  scoped_recording_sink scoped;
+  auto sink_a = scoped.sink_ptr();
+  auto sink_b = std::make_shared<recording_sink>();
+  sink_a->set_level(level::trace);
+  sink_b->set_level(level::trace);
 
   std::atomic<bool> stop{false};
+  std::latch ready{4};
   std::vector<std::thread> loggers;
   loggers.reserve(4);
   for (int t = 0; t < 4; t++) {
-    loggers.emplace_back([&stop, t] {
+    loggers.emplace_back([&stop, &ready, t] {
+      ready.count_down();
       while (!stop.load(std::memory_order_relaxed)) {
-        SIRIUS_LOG_INFO("thread {} says hi", t);
+        SIRIUS_LOG_FATAL("thread {} says hi", t);
       }
     });
   }
 
+  // Wait until every logger thread is up so the swaps below race with concurrent
+  // logging rather than with thread startup.
+  ready.wait();
+
   auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   bool use_a    = false;
   while (std::chrono::steady_clock::now() < deadline) {
-    set_sink(use_a ? backend_a : backend_b);
+    set_sink(use_a ? sink_a : sink_b);
     use_a = !use_a;
   }
   stop.store(true, std::memory_order_relaxed);
@@ -97,18 +98,18 @@ TEST_CASE("Concurrent logging survives backend swaps", "[log]")
     t.join();
   }
 
-  CHECK(backend_a->count() + backend_b->count() > 0);
+  CHECK(sink_a->count() + sink_b->count() > 0);
 }
 
-TEST_CASE("The noop sink accepts and discards everything", "[log]")
-{
-  auto noop = make_noop_sink();
-  REQUIRE(noop != nullptr);
-  noop->log(level::critical, std::source_location::current(), "into the void");
-  CHECK(noop->flush());
+#endif
 
-  scoped_recording_backend scoped;
-  set_sink(noop);
-  SIRIUS_LOG_ERROR("also into the void");
-  CHECK(scoped.backend().count() == 0);
+TEST_CASE("set_sink(nullptr) installs a discarding sink", "[log]")
+{
+  scoped_recording_sink scoped;
+
+  set_sink(nullptr);  // swaps in a noop, detaching the recorder
+  SIRIUS_LOG_ERROR("dropped {}", 1);
+  get_sink()->log(level::critical, std::source_location::current(), "dropped");
+  CHECK(get_sink()->flush());  // the noop flush is vacuously reliable
+  CHECK(scoped.sink().count() == 0);
 }
