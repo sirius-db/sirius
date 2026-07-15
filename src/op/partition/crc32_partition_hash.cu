@@ -144,8 +144,23 @@ __global__ void fold_all(col_desc const* __restrict__ cols,
 cudf::size_type grid_for(cudf::size_type n)
 {
   // Widen before the ceiling division: `n` can be near INT32_MAX, which cuDF permits.
-  auto const blocks = (static_cast<int64_t>(n) + kBlock - 1) / kBlock;
-  return static_cast<cudf::size_type>(std::min<int64_t>(blocks, 65535));
+  int64_t const blocks = (static_cast<int64_t>(n) + kBlock - 1) / kBlock;
+
+  // `fold_all` is a grid-stride loop, so any positive grid is correct. Size it to the device's
+  // resident-block capacity (SMs × max active blocks/SM) rather than one block per kBlock rows:
+  // for large inputs the latter launches far more blocks than the GPU can run at once, and there
+  // is no legacy grid-X ceiling to work around on the CUDA 12+ hardware we target. Fall back to the
+  // full ceiling if the device queries fail.
+  int device = 0, sm_count = 0, blocks_per_sm = 0;
+  if (cudaGetDevice(&device) == cudaSuccess &&
+      cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, fold_all, kBlock, 0) ==
+        cudaSuccess &&
+      sm_count > 0 && blocks_per_sm > 0) {
+    int64_t const resident = static_cast<int64_t>(sm_count) * blocks_per_sm;
+    return static_cast<cudf::size_type>(std::min(blocks, resident));
+  }
+  return static_cast<cudf::size_type>(blocks);
 }
 
 // Fixed-width byte count for a supported non-string type id.
