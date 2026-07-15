@@ -42,11 +42,13 @@ inline void require_transparent_execution_delta(
   const duckdb::SiriusContext::transparent_execution_stats& after,
   uint64_t expected_rebind_delta,
   uint64_t expected_fallback_delta,
-  uint64_t expected_execution_delta)
+  uint64_t expected_execution_delta,
+  uint64_t expected_runtime_fallback_delta = 0)
 {
   REQUIRE(after.successful_rebinds == before.successful_rebinds + expected_rebind_delta);
   REQUIRE(after.fallbacks == before.fallbacks + expected_fallback_delta);
   REQUIRE(after.executions == before.executions + expected_execution_delta);
+  REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks + expected_runtime_fallback_delta);
 }
 
 }  // namespace sirius::test

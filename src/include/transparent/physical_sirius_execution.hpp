@@ -22,6 +22,10 @@
 #include <duckdb/execution/physical_operator.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+namespace duckdb {
+class PreparedStatementData;
+}  // namespace duckdb
+
 namespace sirius::transparent {
 
 /// \brief A DuckDB PhysicalOperator that transparently wraps Sirius GPU execution.
@@ -41,6 +45,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
                           std::string query_sql,
                           duckdb::vector<duckdb::LogicalType> types,
                           duckdb::vector<std::string> names,
+                          duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
+                          bool cpu_plan_reads_s3,
                           duckdb::idx_t estimated_cardinality);
 
   // Source operator interface
@@ -76,6 +82,18 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
 
   /// Output column names (needed for result construction).
   duckdb::vector<std::string> result_names_;
+
+  /// DuckDB's CPU physical plan, wrapped in a minimal PreparedStatementData and
+  /// stashed at OnFinalizePrepare before this operator replaced it. On a GPU
+  /// execution failure, GetDataInternal runs it on a private duckdb::Executor bound
+  /// to the same ClientContext (same transaction/MVCC snapshot). shared_ptr so the
+  /// const source state can keep it alive across the nested run.
+  duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared_;
+
+  /// Whether the CPU fallback plan reads s3:// data. S3 is GPU-only (DuckDB's CPU
+  /// read_parquet cannot serve Sirius-owned s3://), so a runtime GPU failure on an
+  /// s3 query surfaces a clear error instead of falling back to CPU.
+  bool cpu_plan_reads_s3_ = false;
 };
 
 }  // namespace sirius::transparent
