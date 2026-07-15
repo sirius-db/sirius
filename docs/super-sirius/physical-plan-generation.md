@@ -325,17 +325,15 @@ MERGE_TOP_N merges local top-N results.
 
 ### DELIM_JOIN
 
-Complex splitting for correlated subqueries. Both LEFT and RIGHT variants contain two internal operators:
-- `join` — the actual HASH_JOIN (one child replaced with a scan of cached data)
-- `distinct` — a HASH_GROUP_BY that produces deduplicated data for DELIM_SCAN operators in the correlated subquery
+Decorrelated correlated-subquery join. Both variants hold two internal operators:
+- `join` — the HASH_JOIN doing the join-back (one child replaced by a cached-data scan)
+- `distinct_root` — the `MERGE_GROUP_BY → PARTITION_DISTINCT → DISTINCT` chain that dedups the correlated key for the subquery's DELIM_SCANs (`distinct` is a non-owning borrow of the bottom DISTINCT)
 
-When the delim join's `sink()` is called, it pushes data to both internal operators simultaneously. The distinct output is then partitioned and merged externally. Additionally, the internal HASH_JOIN undergoes standard probe-side and build-side splitting (documented in the [HASH_JOIN](#hash_join-probe-side) sections above).
+The delim join is a **fan-out sink that performs no data transformation**: `execute()` is a pass-through, and its base `sink()` forwards each input batch unchanged to two branch pipelines — the DISTINCT branch and the join-feeding branch (`partition_join` for RIGHT, `column_data_scan` for LEFT). It owns the fan-out (two `next_port_after_sink` edges) and anchors the construct (the `distinct` / `join` / `column_data_scan` / `delim_scans` pointers and the DELIM_SCAN dependency); the dedup and the join happen in the sub-operators.
 
 #### RIGHT_DELIM_JOIN
 
-In the constructor, RIGHT_DELIM_JOIN extracts the RHS child from the internal join and replaces it with a `dummy_scan`. The extracted RHS becomes `children[0]` of the delim join, built via a child meta-pipeline. A `partition_join` (PARTITION, is_build=true) is created during `initialize_internal()` to partition data for the actual join's build side.
-
-When `operators.size() > 0` (intermediate operators before the delim join), a pipeline breaker is inserted:
+Ctor: extract the RHS from the internal join, replace it with a `dummy_scan` placeholder; the RHS becomes `children[0]`. `wrap_join` wraps the build side as `CONCAT_build → PARTITION_build → DUMMY_SCAN`, and `partition_join` points at that PARTITION_build. With intermediate operators before the delim join (`operators.size() > 0`), a pipeline breaker is inserted:
 
 ```mermaid
 graph LR
@@ -347,17 +345,14 @@ graph LR
     MR -->|"FULL"| DS["Downstream<br/>(DELIM_SCAN pipelines)"]
 ```
 
-Dashed edges indicate internal pushes from `RIGHT_DELIM_JOIN.sink()` to `partition_join` and `distinct`.
+With no intermediate operators, no breaker is needed — RIGHT_DELIM_JOIN is the current pipeline's sink directly.
 
-When `operators.size() == 0` (no intermediate operators), no pipeline breaker is needed — the current pipeline keeps RIGHT_DELIM_JOIN as its sink directly.
-
-- The CONCAT is a build concat (`is_build=true`); it connects to the internal HASH_JOIN's `"build"` port in the probe pipeline
-- The probe and build `partition_join` operators are linked as siblings for partition count coordination
-- `partition_join` also receives a `FULL` barrier port on the same repository as the delim join (line 88–94 in `insert_repository`)
+- `partition_join` (PARTITION_build) is a single-op pipeline fed by the fan-out; its build CONCAT feeds the HASH_JOIN `"build"` port.
+- Probe and build partitions are linked as siblings; the inner join is identified via its tree parent (`link_join_partition_siblings`) so the build (distinct) side drives the partition count.
 
 #### LEFT_DELIM_JOIN
 
-In the constructor, LEFT_DELIM_JOIN extracts the LHS child from the internal join and replaces it with a `column_data_scan`. The extracted LHS becomes `children[0]`, built via a child meta-pipeline. Unlike RIGHT_DELIM_JOIN, **no pipeline breaker** is created and **no partition_join/concat pair** is needed — the `column_data_scan` directly feeds downstream pipelines.
+Ctor: extract the LHS from the internal join, replace it with a `column_data_scan`; the LHS becomes `children[0]`. No breaker and no partition_join/concat pair.
 
 ```mermaid
 graph LR
@@ -367,11 +362,8 @@ graph LR
     MR -->|"FULL"| DS["Downstream<br/>(DELIM_SCAN pipelines)"]
 ```
 
-Dashed edges indicate internal pushes from `LEFT_DELIM_JOIN.sink()` to `column_data_scan` and `distinct`.
-
-- `column_data_scan` caches the input data so the internal HASH_JOIN's probe side can scan it
-- The internal HASH_JOIN is built into the probe pipeline via `join->build_pipelines()`, so its build side (the correlated subquery) gets a normal child meta-pipeline with standard HASH_JOIN handling
-- `build_join_pipelines` adds the internal HASH_JOIN as an operator in the probe pipeline, with `column_data_scan` as its source: `[column_data_scan, HASH_JOIN, ..., outer_sink]`
+- `column_data_scan` is the source of the join's probe pipeline (`[column_data_scan, HASH_JOIN, ..., outer_sink]`), fed by the fan-out.
+- The internal HASH_JOIN's build side (the subquery) gets standard build splitting via `join->build_pipelines()`.
 
 #### Key Differences
 
@@ -381,7 +373,7 @@ Dashed edges indicate internal pushes from `LEFT_DELIM_JOIN.sink()` to `column_d
 | Internal join child replaced | RHS → `dummy_scan` | LHS → `column_data_scan` |
 | Pipeline breaker | Yes (if intermediate ops exist) | Never |
 | Build-side data path | `partition_join` → CONCAT → HASH_JOIN "build" port | Standard HASH_JOIN build handling (correlated subquery) |
-| Inner-join build subtree | Synthetic scaffolding (CONCAT_build → PARTITION_build → DUMMY_SCAN); `partition_join` runs inline in `sink()` | Real correlated-subquery subtree under CONCAT_build |
+| Inner-join build subtree | CONCAT_build → PARTITION_build (`partition_join`) → DUMMY_SCAN placeholder; `partition_join` is a framework-scheduled pipeline fed by the fan-out | Real correlated-subquery subtree under CONCAT_build |
 | Cached data scan | N/A | `column_data_scan` feeds probe side |
 
 ## Part 4: Port Wiring

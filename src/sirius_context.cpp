@@ -26,6 +26,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
+#include "log/spdlog_owning_sink.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -50,9 +51,11 @@
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
+#include <unistd.h>  // for isatty/fileno
 
 #include <cctype>
 #include <cstddef>
+#include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
 #include <memory>
@@ -758,6 +761,7 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .successful_rebinds = transparent_rebind_success_count_.load(std::memory_order_relaxed),
     .fallbacks          = transparent_fallback_count_.load(std::memory_order_relaxed),
     .executions         = transparent_execution_count_.load(std::memory_order_relaxed),
+    .runtime_fallbacks  = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
   };
 }
 
@@ -774,6 +778,11 @@ void SiriusContext::record_transparent_fallback() noexcept
 void SiriusContext::record_transparent_execution() noexcept
 {
   transparent_execution_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_runtime_fallback() noexcept
+{
+  transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 namespace {
@@ -820,7 +829,42 @@ void throw_if_s3_no_cpu_fallback(bool plan_reads_s3,
   }
 }
 
+// With enable_duckdb_fallback off, surface a GPU plan-generation failure as a
+// normal query error. Sanitize INTERNAL/FATAL (which would invalidate the whole
+// database) to ExecutorException; keep other exception types as-is.
+[[noreturn]] void rethrow_gpu_error_no_fallback(std::exception& e, const std::string& prefix)
+{
+  duckdb::ErrorData err(e);
+  if (err.Type() == duckdb::ExceptionType::INTERNAL || err.Type() == duckdb::ExceptionType::FATAL) {
+    throw duckdb::ExecutorException(prefix + err.RawMessage());
+  }
+  err.Throw(prefix);
+}
+
 }  // namespace
+
+bool duckdb_fallback_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_duckdb_fallback", setting) && !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  return true;
+}
+
+void print_cpu_fallback_banner()
+{
+  const bool tty  = ::isatty(::fileno(stdout)) != 0;
+  const char* red = tty ? "\033[1;31m" : "";
+  const char* off = tty ? "\033[0m" : "";
+  std::fprintf(stdout,
+               "%s=============================================\n"
+               "Error in Sirius GPU execution, fallback to DuckDB\n"
+               "=============================================%s\n",
+               red,
+               off);
+  std::fflush(stdout);
+}
 
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
@@ -882,11 +926,17 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       // No captured plan to inspect on the replan path; guard on the SQL text so
       // a direct read_parquet('s3://') that fails to re-plan does not CPU-fall-back.
       throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      if (!duckdb_fallback_enabled(context)) {
+        rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
+      }
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
       throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      if (!duckdb_fallback_enabled(context)) {
+        rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
+      }
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
@@ -932,10 +982,26 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
     SIRIUS_LOG_INFO("Transparent execution: Sirius physical plan generated successfully");
 
+    // Stash DuckDB's CPU plan before overwriting it, wrapped in a minimal
+    // PreparedStatementData. On a runtime GPU failure PhysicalSiriusExecution runs
+    // it on a private Executor in the same transaction. It's collector-free here —
+    // exactly what GetResultCollector expects at execute time.
+    auto cpu_fallback   = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
+    cpu_fallback->types = prepared.types;
+    cpu_fallback->names = prepared.names;
+    cpu_fallback->properties    = prepared.properties;
+    cpu_fallback->physical_plan = std::move(prepared.physical_plan);
+
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
-    auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
-      std::move(logical_plan), current_query_sql, prepared.types, prepared.names, 0);
+    auto& sirius_op =
+      new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(std::move(logical_plan),
+                                                                            current_query_sql,
+                                                                            prepared.types,
+                                                                            prepared.names,
+                                                                            std::move(cpu_fallback),
+                                                                            plan_reads_s3,
+                                                                            0);
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.
@@ -945,10 +1011,16 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
   } catch (NotImplementedException& e) {
     throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    if (!duckdb_fallback_enabled(context)) {
+      rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
+    }
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", e.what());
   } catch (std::exception& e) {
     throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    if (!duckdb_fallback_enabled(context)) {
+      rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
+    }
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback: {}", e.what());
   }
@@ -999,7 +1071,18 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
-  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
+  auto flush =
+    Config::LOG_FLUSH_SECONDS <= 0
+      ? std::nullopt
+      : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
+  auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+  sink->set_level(parsed_level.value_or(sirius::log::level::info));
+  sirius::log::set_sink(std::move(sink));
+  // Warn only once the sink is installed, so the message actually reaches it.
+  if (!parsed_level) {
+    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+  }
   read_config_file_if_exists();
 }
 

@@ -126,15 +126,15 @@ class convertible_data_batch : public convertible_data {
       switch (space->get_tier()) {
         case cucascade::memory::Tier::GPU:
           mut.convert_to<cucascade::gpu_table_representation>(
-            converter_registry, mem_space, stream);
+            converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::HOST:
           mut.convert_to<cucascade::host_data_representation>(
-            converter_registry, mem_space, stream);
+            converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::DISK:
           mut.convert_to<cucascade::disk_data_representation>(
-            converter_registry, mem_space, stream);
+            converter_registry, *reservation, stream);
           break;
         default: continue;
       }

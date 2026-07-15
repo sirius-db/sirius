@@ -62,6 +62,7 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
+#include <log/logging.hpp>
 #include <unistd.h>
 
 #include <cstdlib>

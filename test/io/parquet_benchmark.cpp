@@ -21,8 +21,8 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
 #include <glob.h>
-#include <spdlog/common.h>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
+#include <log/spdlog_owning_sink.hpp>
 #include <unistd.h>
 
 #include <algorithm>
@@ -134,7 +134,11 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  spdlog::set_level(spdlog::level::info);  // show per-read trace
+  // Per-read trace goes to log/sirius.log (no backend is installed until the
+  // logger is initialized; without this every log statement is dropped).
+  auto log_sink = sirius::log::make_spdlog_owning_sink({"log", std::nullopt});
+  log_sink->set_level(sirius::log::level::info);
+  sirius::log::set_sink(std::move(log_sink));
 
   std::cout << "Source : " << argv[2] << "\n"
             << "Files  : " << paths.size() << "\n";
