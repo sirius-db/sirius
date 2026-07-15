@@ -26,6 +26,7 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
+#include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -456,6 +457,11 @@ class sirius_scan_manager {
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   bool _pruning_enabled{true};
+
+  /// Mask computations recorded by try_assign_cached_entries for this query's
+  /// duckdb+mvcc cache hits (#819); executed block-in-prepare by
+  /// run_mvcc_mask_jobs before start_metadata_processing, cleared in reset().
+  std::vector<mvcc_mask_job_request> _pending_mvcc_mask_jobs;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
