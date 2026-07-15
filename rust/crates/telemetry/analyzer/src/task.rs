@@ -82,14 +82,19 @@ impl TaskExt for Task {
             .map(|(i, transition)| {
                 // Derive the processing rate from input_bytes over the span.
                 let mut derived_attributes = vec![];
-                if let ModelTaskTransition::Computing(data) = &transition.data
+                let input_bytes = match &transition.data {
+                    ModelTaskTransition::Preparing(data) => Some(data.input_bytes),
+                    ModelTaskTransition::Computing(data) => Some(data.input_bytes),
+                    _ => None,
+                };
+                if let Some(input_bytes) = input_bytes
                     && let Some(next) = raw.get(i + 1)
                 {
                     let span_secs = (next.timestamp() - transition.timestamp()) as f64 / 1e9;
                     if span_secs > 0.0 {
                         derived_attributes.push(Attribute::f64(
                             "bytes_per_sec",
-                            data.input_bytes as f64 / span_secs,
+                            input_bytes as f64 / span_secs,
                         ));
                     }
                 }

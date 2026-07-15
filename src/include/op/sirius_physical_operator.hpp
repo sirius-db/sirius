@@ -27,10 +27,12 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 
+#include <array>
 #include <atomic>
 #include <list>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -56,6 +58,19 @@ class sirius_physical_plan_generator;
 namespace op {
 
 enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
+/**
+ * @brief Display name of a memory tier for telemetry attributes.
+ */
+[[nodiscard]] constexpr const char* tier_display_name(::cucascade::memory::Tier tier)
+{
+  switch (tier) {
+    case ::cucascade::memory::Tier::GPU: return "GPU";
+    case ::cucascade::memory::Tier::HOST: return "HOST";
+    case ::cucascade::memory::Tier::DISK: return "DISK";
+    default: return "UNKNOWN";
+  }
+}
 
 enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 
@@ -157,6 +172,15 @@ class operator_data {
    * represent GPU-resident data should override to return a meaningful estimate.
    */
   [[nodiscard]] virtual std::size_t get_estimated_size_in_bytes() const { return 0; }
+
+  /**
+   * @brief Summarize where this data currently lives, for telemetry.
+   *
+   * Returns a '+'-joined set of memory tiers in tier order (e.g. "GPU+HOST"),
+   * "SOURCE" for fresh reads from a datasource, or "UNKNOWN" when the subclass
+   * cannot tell (the default).
+   */
+  [[nodiscard]] virtual std::string get_origin_tiers() const { return "UNKNOWN"; }
 
   /**
    * @brief Estimate the transient working set needed to materialize this data.
@@ -268,6 +292,23 @@ class pipelineable_operator_data : public operator_data {
       if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
     }
     return total;
+  }
+
+  [[nodiscard]] std::string get_origin_tiers() const override
+  {
+    std::array<bool, static_cast<std::size_t>(::cucascade::memory::Tier::SIZE)> present{};
+    for (auto const& ro : get_read_only_batches(false)) {
+      if (!ro.get_data()) { continue; }
+      auto tier = static_cast<std::size_t>(ro.get_current_tier());
+      if (tier < present.size()) { present[tier] = true; }
+    }
+    std::string result;
+    for (std::size_t i = 0; i < present.size(); ++i) {
+      if (!present[i]) { continue; }
+      if (!result.empty()) { result += '+'; }
+      result += tier_display_name(static_cast<::cucascade::memory::Tier>(i));
+    }
+    return result.empty() ? "UNKNOWN" : result;
   }
 
  private:
