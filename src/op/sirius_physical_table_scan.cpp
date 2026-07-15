@@ -17,6 +17,9 @@
 #include "op/sirius_physical_table_scan.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/function/table/table_scan.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
@@ -245,6 +248,24 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.push_back(std::move(output_batch));
   return std::make_unique<pipelineable_operator_data>(output_batches);
+}
+
+std::string sirius_physical_table_scan::params_to_string() const
+{
+  // Prefer the catalog table name; fall back to the table function name (e.g. READ_PARQUET).
+  std::string result = duckdb::StringUtil::Upper(function.name);
+  if (bind_data) {
+    if (auto* table_bind = dynamic_cast<duckdb::TableScanBindData*>(bind_data.get())) {
+      result = table_bind->table.name;
+    }
+  }
+  if (table_filters && !table_filters->filters.empty()) {
+    auto filters = table_filters_to_string(
+      *table_filters, column_ids, std::span<const std::string>(names.data(), names.size()));
+    if (!filters.empty()) { result += ", filters: " + filters; }
+  }
+  if (!extra_info.file_filters.empty()) { result += ", file filters: " + extra_info.file_filters; }
+  return result;
 }
 
 }  // namespace op

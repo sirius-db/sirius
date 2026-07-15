@@ -160,5 +160,68 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   return result;
 }
 
+namespace {
+
+std::string_view cudf_aggregation_kind_to_sql_name(cudf::aggregation::Kind kind)
+{
+  switch (kind) {
+    case cudf::aggregation::Kind::SUM: return "sum";
+    case cudf::aggregation::Kind::MIN: return "min";
+    case cudf::aggregation::Kind::MAX: return "max";
+    case cudf::aggregation::Kind::MEAN: return "avg";
+    case cudf::aggregation::Kind::COUNT_VALID: return "count";
+    case cudf::aggregation::Kind::COUNT_ALL: return "count";
+    case cudf::aggregation::Kind::NTH_ELEMENT: return "first";
+    case cudf::aggregation::Kind::COLLECT_SET: return "collect_set";
+    case cudf::aggregation::Kind::MERGE_SETS: return "merge_sets";
+    default: return "agg";
+  }
+}
+
+}  // namespace
+
+std::string cudf_aggregate_definitions_to_string(
+  const std::vector<int>& group_idx,
+  const std::vector<cudf::aggregation::Kind>& cudf_aggregates,
+  const std::vector<int>& cudf_aggregate_idx,
+  const std::vector<std::vector<int>>& cudf_aggregate_struct_col_indices,
+  const std::vector<AggregateSlot>& aggregate_slots)
+{
+  std::string keys;
+  for (const int idx : group_idx) {
+    if (!keys.empty()) { keys += ", "; }
+    keys += "#" + std::to_string(idx);
+  }
+
+  std::string aggs;
+  for (const AggregateSlot& slot : aggregate_slots) {
+    if (slot.cudf_idx >= cudf_aggregates.size()) { continue; }  // display-only: never throw
+    if (!aggs.empty()) { aggs += ", "; }
+    const std::string input_col = slot.cudf_idx < cudf_aggregate_idx.size()
+                                    ? "#" + std::to_string(cudf_aggregate_idx[slot.cudf_idx])
+                                    : std::string{"?"};
+    if (slot.is_avg) {
+      aggs += "avg(" + input_col + ")";
+    } else if (slot.is_count_distinct) {
+      std::string cols;
+      if (slot.cudf_idx < cudf_aggregate_struct_col_indices.size()) {
+        for (const int col : cudf_aggregate_struct_col_indices[slot.cudf_idx]) {
+          if (!cols.empty()) { cols += ", "; }
+          cols += "#" + std::to_string(col);
+        }
+      }
+      aggs += "count(DISTINCT " + (cols.empty() ? input_col : cols) + ")";
+    } else if (const auto kind = cudf_aggregates[slot.cudf_idx];
+               kind == cudf::aggregation::Kind::COUNT_ALL) {
+      aggs += "count(*)";
+    } else {
+      aggs += std::string{cudf_aggregation_kind_to_sql_name(kind)} + "(" + input_col + ")";
+    }
+  }
+
+  return "keys: " + (keys.empty() ? std::string{"(none)"} : keys) +
+         "; aggs: " + (aggs.empty() ? std::string{"(none)"} : aggs);
+}
+
 }  // namespace op
 }  // namespace sirius

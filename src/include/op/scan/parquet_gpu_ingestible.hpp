@@ -91,6 +91,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   {
     return std::span<std::string const>(resolved_file_paths.data(), resolved_file_paths.size());
   }
+
+  //! One-line file + pushed-down-filter description for telemetry / debug display.
+  [[nodiscard]] std::string params_to_string() const override;
 };
 
 //===----------------------------------------------------------------------===//

@@ -112,6 +112,10 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
+  //! One-line source + pushed-down-filter description for telemetry / debug display,
+  //! forwarded from the installed ingestible's table_info.
+  std::string params_to_string() const override;
+
   /**
    * @brief Const accessor for the parked table_info. Used by
    *        @c sirius_scan_manager::try_make_cached_ingestible to match

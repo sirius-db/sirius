@@ -66,6 +66,9 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  //! One-line sort keys + limit/offset description for telemetry / debug display.
+  std::string params_to_string() const override;
 };
 
 }  // namespace op

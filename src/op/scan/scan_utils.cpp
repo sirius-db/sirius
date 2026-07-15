@@ -121,4 +121,24 @@ translate_duckdb_expression_with_names(gpu_expression_translator& translator,
   return translator.translate_expression_with_names(*node, std::move(resolver));
 }
 
+std::string table_filters_to_string(const duckdb::TableFilterSet& filters,
+                                    const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+                                    std::span<const std::string> names)
+{
+  std::string result;
+  for (const auto& [column_index, filter] : filters.filters) {
+    if (!filter) { continue; }
+    std::string column_name;
+    if (column_index < column_ids.size()) {
+      const auto col_id = column_ids[column_index].GetPrimaryIndex();
+      column_name       = col_id < names.size() ? names[col_id] : "#" + std::to_string(col_id);
+    } else {
+      column_name = "#" + std::to_string(column_index);
+    }
+    if (!result.empty()) { result += " AND "; }
+    result += filter->ToString(column_name);
+  }
+  return result;
+}
+
 }  // namespace sirius::op
