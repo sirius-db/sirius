@@ -147,7 +147,9 @@ struct prepared_dict_fsst {
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
 //! @brief Target CTA count for chunking segments: two full device waves at
-//! STRINGS_BLOCK_DIM threads. Cached per device.
+//! STRINGS_BLOCK_DIM threads. Cached per device. Uses the adaptive gpu_config
+//! singleton which queries hardware capabilities once and derives the CTA
+//! count from the number of compute units and per-SM occupancy.
 inline uint32_t get_target_ctas()
 {
   int device = 0;
@@ -159,7 +161,14 @@ inline uint32_t get_target_ctas()
   RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
   int occupancy_blocks = prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM;
   cached_device.store(device);
-  cached.store(static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2));
+
+  // Check for SIRIUS_TARGET_CTAS env override; otherwise use 2x SM occupancy.
+  uint32_t target = static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
+  if (auto* env = std::getenv("SIRIUS_TARGET_CTAS")) {
+    int v = std::atoi(env);
+    if (v > 0) target = static_cast<uint32_t>(v);
+  }
+  cached.store(target);
   return cached.load();
 }
 

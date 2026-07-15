@@ -24,6 +24,9 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <cstdio>
+
 #include <exception>
 #include <variant>
 #include <vector>
@@ -352,6 +355,55 @@ void read_yaml_vec(const YAML::Node& node, std::vector<T>& out)
 
 }  // namespace
 
+// ================ operator_params::init_adaptive ================= //
+
+void sirius::operator_params::init_adaptive() {
+  // Query total VRAM via the CUDA/HIP runtime (shimmed on ROCm).
+  // On NVIDIA: cudaMemGetInfo. On ROCm: hipMemGetInfo (via shim).
+  std::size_t free_bytes = 0, total_bytes = 0;
+  auto err = cudaMemGetInfo(&free_bytes, &total_bytes);
+  if (err != cudaSuccess || total_bytes == 0) {
+    // No GPU available or query failed — keep defaults.
+    return;
+  }
+
+  std::size_t const MB = 1024 * 1024;
+  std::size_t const GB = 1024ULL * 1024 * 1024;
+  std::size_t const vram = total_bytes;
+
+  // Helper: clamp a value to [min, max]
+  auto clamp = [](std::size_t v, std::size_t lo, std::size_t hi) {
+    return std::max(std::min(v, hi), lo);
+  };
+
+  // Scan batch: 10% of VRAM, clamped to [128MB, 4GB]
+  scan_task_batch_size = clamp(vram / 10, 128 * MB, 4 * GB);
+
+  // Hash partition: 8% of VRAM, clamped to [128MB, 2GB]
+  hash_partition_bytes = clamp(vram / 12, 128 * MB, 2 * GB);
+
+  // Concat batch: 10% of VRAM, clamped to [128MB, 4GB]
+  concat_batch_bytes = clamp(vram / 10, 128 * MB, 4 * GB);
+
+  // Sort sample: 5% of VRAM, clamped to [64MB, 1GB]
+  sort_sample_bytes = clamp(vram / 20, 64 * MB, 1 * GB);
+
+  // Max build hash table: 8% of VRAM, clamped to [128MB, 2GB]
+  max_build_hash_table_bytes = clamp(vram / 12, 128 * MB, 2 * GB);
+
+  // Sort partition fraction stays at 0.33 (already a fraction, not absolute)
+
+  SIRIUS_LOG_INFO(
+    "operator_params::init_adaptive: VRAM={}MB, scan_batch={}MB, "
+    "hash_part={}MB, build_ht={}MB, concat={}MB, sort_sample={}MB",
+    vram / MB,
+    scan_task_batch_size / MB,
+    hash_partition_bytes / MB,
+    max_build_hash_table_bytes / MB,
+    concat_batch_bytes / MB,
+    sort_sample_bytes / MB);
+}
+
 // ================ sirius_config ================= //
 
 sirius_config::sirius_config()
@@ -362,6 +414,11 @@ sirius_config::sirius_config()
 
 void sirius_config::apply_defaults()
 {
+  // Initialize operator tuning parameters adaptively based on GPU VRAM.
+  // This must be called before the YAML config is loaded so that explicit
+  // values in the YAML override the adaptive defaults.
+  _operator_params.init_adaptive();
+
   // Run the configurator with default values to populate memory space configs
   topology topo;
   gpu_mem_config gpu_cfg;

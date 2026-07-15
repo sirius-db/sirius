@@ -529,6 +529,7 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_ffi.cpp
+    src/cuda/gpu_config.cpp
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
