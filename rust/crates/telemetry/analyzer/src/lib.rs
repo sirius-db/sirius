@@ -1423,7 +1423,11 @@ impl SiriusUiAnalyzer {
             .iter()
             .filter_map(|&id| {
                 if let Some(task) = self.model.tasks.get(&id) {
-                    Some(task.try_to_ui_fsm(epoch))
+                    let pipeline_name = task
+                        .pipeline_uuid()
+                        .and_then(|id| self.model.query_engine.operators.get(&id))
+                        .map(|operator| operator.instance_name());
+                    Some(task.try_to_ui_fsm(epoch, pipeline_name))
                 } else if let Some(db) = self.model.data_batches.get(&id) {
                     Some(db.try_to_ui_fsm(epoch))
                 } else {

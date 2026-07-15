@@ -99,6 +99,10 @@ impl BatchExt for Batch {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
+                    // The transition's typed data (batch_id, pipeline_uuid,
+                    // origin, task_uuid, reason, ...) rendered by the model.
+                    attributes: transition.attributes(),
+                    derived_attributes: vec![],
                 })
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;

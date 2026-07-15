@@ -67,11 +67,9 @@ impl DataBatchExt for DataBatch {
                                 .collect(),
                         })
                         .collect(),
-                    // NOTE(merge): upstream (#1112) also surfaced
-                    // `attributes`/`derived_attributes` here; the quent
-                    // revision this branch builds against has no such fields
-                    // on `FsmTransition` yet.
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
+                    attributes: transition.attributes(),
+                    derived_attributes: vec![],
                 })
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;
