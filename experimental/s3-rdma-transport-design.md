@@ -255,7 +255,7 @@ as the plan that closes the gap between the current tree and this design.
 | **P0a — wire migration landed** | Standard wire protocol merged into `s3RDMA-benchmarktool` (drop 4 non-standard headers; server decodes the address from the token; `x-amz-rdma-reply`) | — |
 | **P0b — gateway hardening open** | Strict descriptor parsing, `buf_size` enforcement, exact-completion check (itemized in the appendix). **Also the precondition for trusting short-write detection on the client** | — |
 | **P1 — unblocked** (#1042 merged) | Add the rdma backend type + factory; the `io_context_registry` constructor picks rdma-vs-rest for the s3 slot by `s3_transport` (`AUTO`→HTTP); routing tests extend the existing cutover suite | — |
-| P2 | `cuobj_rdma_reactor` against a **mock** client; RDMA-rig-free matrix (the delivery tests still need a CUDA GPU) incl. compile-time checks that the two staged-read capabilities stay off, plus the **delivery-failure fault-injection matrix** (§2: quiescence proof, fail-stop incl. an active unprovable chunk with queued siblings of the same request, teardown leak, admission deadlock-freedom) | CUDA GPU |
+| P2 | `cuobj_rdma_reactor` against a **mock** client; RDMA-rig-free matrix (the delivery tests still need a CUDA GPU) incl. compile-time checks that the two staged-read capabilities stay off, plus the **delivery-failure fault-injection matrix** (§2: quiescence proof, fail-stop, the process-fatal hook firing on an active unprovable chunk while siblings of the same request are queued, teardown leak, admission deadlock-freedom) | CUDA GPU |
 | P3 | Real cuObject path, single GPU; arena + D2D + flush + a visibility stress test; measure the full delivery overhead (flush + event create/record/wait/destroy + D2D, replacing the bandwidth-derived estimates; evaluate per-slot event reuse). **Activation gates:** exact-write authority incl. mandatory reply validation (jointly with P0b), the session-ownership decision (§5 Q6), per-device visibility policy (§5 Q2), the ambiguous-failure fencing answer (§5 Q7), and the shared-stream inline-wait saturation test (§2) | CX-6 |
 | P4 | Multi-GPU (per-device arenas, NIC↔GPU affinity), retries, metrics, tuning | CX-6 |
 | P5 | Range coalescing; direct-into-RMM spike; small-read threshold go/no-go (incl. control-plane connection reuse); vs-HTTP benchmark | CX-6 |
@@ -297,8 +297,10 @@ as the plan that closes the gap between the current tree and this design.
    protocol defines what a success response means, but not what silence means.
    Does the cuObject SDK or the gateway offer a fencing / cancellation
    primitive (deregister-and-confirm, descriptor revocation)? Without one, the
-   retry contract (appendix) must quarantine the slot and fail the read on any
-   ambiguous failure — a question for NVIDIA as much as for this team.
+   retry contract (appendix) must fail-stop the reactor and mark the entire
+   arena non-freeable on any ambiguous failure (per-slot quarantine was
+   rejected: repeated quarantines drain the slot pool) — a question for NVIDIA
+   as much as for this team.
 
 ## 6. Risks
 
@@ -412,7 +414,8 @@ Counters follow the REST-reactor instrumentation shape: `s3_rdma_bytes_total`,
 `…_queue_depth_peak`, `…_queue_wait_total` — plus the
 delivery-safety set from §2: `…_fallback_stream_sync_total` (quiescence-ladder
 runs), `…_delivery_fatal_total` (fail-stop transitions), `…_arena_leak_total`
-(arenas leaked at teardown because the device could not be proven quiet).
+(arenas leaked at teardown because a writer — device stream or remote gateway
+— could not be proven quiet).
 
 ### P0 status (in `s3RDMA-benchmarktool`)
 
