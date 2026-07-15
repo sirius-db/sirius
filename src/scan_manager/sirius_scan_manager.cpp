@@ -632,23 +632,41 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
     std::sort(these_files.begin(), these_files.end());
     std::sort(those_files.begin(), those_files.end());
     if (these_files != those_files) { return {}; }
-    return column_superset_projection(column_ids, p->column_ids);
+    return column_projection_for(p->column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
-    // Same duckdb table by qualified name (catalog.schema.table), derived on both
-    // pin and query sides from the resolved DuckTableEntry — so the stored casing is
-    // the table's canonical (case-preserved) name on both sides and a byte-exact
-    // compare is correct. (If a future site ever populates these from parsed input
-    // rather than the resolved entry, switch to a case-insensitive compare.)
-    // A parquet cache has an empty table_name, so it never matches a duckdb scan.
-    if (table_name.empty()) { return {}; }
-    if (catalog_name != d->catalog_name || schema_name != d->schema_name ||
-        table_name != d->table_name) {
-      return {};
-    }
-    return column_superset_projection(column_ids, d->column_ids);
+    if (!matches_duckdb_table(d->catalog_name, d->schema_name, d->table_name)) { return {}; }
+    return column_projection_for(d->column_ids);
   }
   return {};
+}
+
+bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
+                                            std::string_view schema,
+                                            std::string_view table) const
+{
+  // Same duckdb table by qualified name (catalog.schema.table), derived on both
+  // pin and query sides from the resolved DuckTableEntry — so the stored casing is
+  // the table's canonical (case-preserved) name on both sides and a byte-exact
+  // compare is correct. (If a future site ever populates these from parsed input
+  // rather than the resolved entry, switch to a case-insensitive compare.)
+  // A parquet cache has an empty table_name, so it never matches a duckdb scan.
+  if (table_name.empty()) { return false; }
+  return catalog_name == catalog && schema_name == schema && table_name == table;
+}
+
+std::vector<std::size_t> cache_entry_info::column_projection_for(
+  duckdb::vector<duckdb::ColumnIndex> const& requested_ids) const
+{
+  for (auto const& c : requested_ids) {
+    // rowid/virtual/empty/field-identifier columns are never cached; a
+    // request for one is a miss. (GetPrimaryIndex on such an index is a
+    // sentinel — or a throw for field identifiers — not a real column.)
+    if (!c.HasPrimaryIndex() || c.IsRowIdColumn() || c.IsVirtualColumn() || c.IsEmptyColumn()) {
+      return {};
+    }
+  }
+  return column_superset_projection(column_ids, requested_ids);
 }
 
 void sirius_scan_manager::insert_pinned_entry(
@@ -932,6 +950,17 @@ void sirius_scan_manager::visit_pinned_entries(
   for (auto const& [name, entry] : _pinned_entries) {
     if (!visitor(name, entry)) { break; }
   }
+}
+
+pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
+  std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const
+{
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (entry.cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) {
+      return &entry;
+    }
+  }
+  return nullptr;
 }
 
 void validate_pinned_entry_for_serving(pinned_entry const& entry,

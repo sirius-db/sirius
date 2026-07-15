@@ -200,3 +200,44 @@ TEST_CASE("cache_entry_info: a different ingestible format never matches", "[sca
   fill(parquet_scan_info, {"a.parquet"}, {0});
   REQUIRE(duckdb_pin.can_serve_with_columns(parquet_scan_info).empty());
 }
+
+TEST_CASE("cache_entry_info: matches_duckdb_table is the shared identity matcher",
+          "[scan][can_serve]")
+{
+  auto cache = duckdb_cache("db", "main", "lineitem", {0, 1});
+  REQUIRE(cache.matches_duckdb_table("db", "main", "lineitem"));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db2", "main", "lineitem"));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db", "other", "lineitem"));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "orders"));
+
+  auto parquet = parquet_cache({"a.parquet"}, {0});
+  REQUIRE_FALSE(parquet.matches_duckdb_table("", "", ""));  // parquet identity never matches
+}
+
+TEST_CASE("cache_entry_info: column_projection_for misses on sentinel columns", "[scan][can_serve]")
+{
+  auto cache = duckdb_cache("db", "main", "t", {0, 1, 2});
+
+  SECTION("plain subset gathers in the requested order")
+  {
+    auto projection = cache.column_projection_for(make_ids({2, 0}));
+    REQUIRE(projection == std::vector<std::size_t>{2, 0});
+  }
+
+  SECTION("rowid request misses")
+  {
+    duckdb::vector<duckdb::ColumnIndex> ids;
+    ids.emplace_back(duckdb::ColumnIndex(0));
+    ids.emplace_back(duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID));
+    REQUIRE(cache.column_projection_for(ids).empty());
+  }
+
+  SECTION("field-identifier request misses instead of throwing")
+  {
+    duckdb::vector<duckdb::ColumnIndex> ids;
+    ids.emplace_back(duckdb::ColumnIndex(std::string("nested_field")));
+    REQUIRE(cache.column_projection_for(ids).empty());
+  }
+
+  SECTION("missing column misses") { REQUIRE(cache.column_projection_for(make_ids({5})).empty()); }
+}

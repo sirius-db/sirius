@@ -76,6 +76,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -938,6 +939,21 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 
   auto keep            = resolve_pin_kept_indices(schema_names, cols);
   auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
+
+  // #819: update chains version values in place, invisibly to the DELETE
+  // keep-masks — a pin would serve stale values to every query until the
+  // chains are folded away. Refuse loudly (the transient-rows case already
+  // fails the same way); CHECKPOINT folds the chains into the base data.
+  {
+    std::vector<duckdb::storage_t> pinned_storage_cols(keep.begin(), keep.end());
+    if (sirius::op::scan::any_update_chains(
+          storage, pinned_storage_cols, static_cast<std::size_t>(storage.GetTotalRows()))) {
+      throw InvalidInputException(
+        "pin_table: table '%s' has in-memory update chains on a pinned column; run CHECKPOINT "
+        "before pinning",
+        table_ref);
+    }
+  }
 
   auto info     = std::make_unique<duckdb_native_ingestible_table_info>();
   info->storage = &storage;

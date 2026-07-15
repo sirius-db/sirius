@@ -120,6 +120,21 @@ class cache_entry_info {
   [[nodiscard]] std::vector<std::size_t> can_serve_with_columns(
     const op::scan::ingestible_table_info& other) const;
 
+  /// Duckdb-identity check shared by can_serve_with_columns and the plan-time
+  /// MVCC guards (#819) — one matcher, so the probe and prepare can never
+  /// drift. False for parquet entries (empty table_name).
+  [[nodiscard]] bool matches_duckdb_table(std::string_view catalog,
+                                          std::string_view schema,
+                                          std::string_view table) const;
+
+  /// Column-superset gather over @p requested_ids (requested order): for each
+  /// requested column, its position within the cached @c column_ids. Empty
+  /// when the cache cannot serve — a requested rowid/virtual/empty/
+  /// field-identifier column (never cached), or a primary index absent from
+  /// the cached set.
+  [[nodiscard]] std::vector<std::size_t> column_projection_for(
+    duckdb::vector<duckdb::ColumnIndex> const& requested_ids) const;
+
   /// Column names in @c column_ids order — the keys @c data_batches_by_column uses.
   [[nodiscard]] const std::vector<std::string>& column_names() const { return names; }
 };
@@ -389,6 +404,14 @@ class sirius_scan_manager {
 
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
+
+  /// The pinned entry whose duckdb identity matches catalog.schema.table, or
+  /// nullptr. Non-owning; valid only until the next pin/unpin — the same
+  /// single-threaded query-lifecycle discipline as visit_pinned_entries.
+  /// First match wins if one table was pinned under two names. Read by the
+  /// plan-time MVCC guards (#819).
+  [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
+    std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
 
