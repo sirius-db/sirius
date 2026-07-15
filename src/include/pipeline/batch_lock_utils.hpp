@@ -148,6 +148,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
       telemetry::batch_telemetry_registry::instance().on_tier_change(
         mut_accessor.get_batch_id(),
         target_space->get_tier(),
+        target_space->get_id().device_id,
         mut_accessor.get_data()->get_size_in_bytes());
       return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
     }
@@ -174,6 +175,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
         telemetry::batch_telemetry_registry::instance().on_tier_change(
           mut_accessor.get_batch_id(),
           target_space->get_tier(),
+          target_space->get_id().device_id,
           mut_accessor.get_data()->get_size_in_bytes());
       }
       return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));

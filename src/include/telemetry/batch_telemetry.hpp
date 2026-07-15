@@ -104,8 +104,12 @@ class batch_telemetry_registry {
 
   /// The batch's data moved to another memory tier: re-emit every live
   /// placement's current state with the new tier usage. Takes values, not the
-  /// batch — callers hold the batch's exclusive lock.
-  void on_tier_change(uint64_t batch_id, cucascade::memory::Tier tier, uint64_t bytes);
+  /// batch — callers hold the batch's exclusive lock. `device_id` selects the
+  /// per-device GPU tier resource; it is ignored for HOST/DISK.
+  void on_tier_change(uint64_t batch_id,
+                      cucascade::memory::Tier tier,
+                      int32_t device_id,
+                      uint64_t bytes);
 
   /// Drain all remaining placements as consumed{"query_end"} and clear the
   /// consumer-port mappings. Called from SiriusContext::QueryEnd.

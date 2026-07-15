@@ -61,6 +61,7 @@ constexpr std::array<cucascade::memory::Tier, 3> kTiers = {
 struct batch_snapshot {
   uint64_t batch_id;
   cucascade::memory::Tier tier;
+  int32_t device_id;
   uint64_t bytes;
 };
 
@@ -69,10 +70,12 @@ std::optional<batch_snapshot> snapshot(const std::shared_ptr<cucascade::data_bat
   if (!batch) { return std::nullopt; }
   auto ro = batch->to_read_only();
   if (!ro.get_data()) { return std::nullopt; }
+  const auto* space = ro.get_memory_space();
   return batch_snapshot{
-    .batch_id = ro.get_batch_id(),
-    .tier     = ro.get_current_tier(),
-    .bytes    = ro.get_data()->get_size_in_bytes(),
+    .batch_id  = ro.get_batch_id(),
+    .tier      = ro.get_current_tier(),
+    .device_id = space != nullptr ? space->get_id().device_id : 0,
+    .bytes     = ro.get_data()->get_size_in_bytes(),
   };
 }
 
@@ -106,9 +109,16 @@ struct batch_telemetry_registry::impl {
   // Set at install() and immutable until uninstall(); the enabled flag
   // (checked on every entry point) orders access.
   std::shared_ptr<const telemetry_context> context;
-  std::array<std::optional<rust::Box<quent::memory_tier::MemoryTierHandle>>, kTiers.size()>
-    tier_handles;
-  std::array<uuid::UUID, kTiers.size()> tier_resource_ids{};
+  std::vector<rust::Box<quent::memory_tier::MemoryTierHandle>> tier_handles;
+  // (tier, device) -> MemoryTier resource. GPU tiers are per-device
+  // ("GPU-0", "GPU-1", ...); HOST/DISK are engine-wide (device key 0).
+  std::unordered_map<int64_t, uuid::UUID> tier_resources;
+
+  static int64_t tier_key(cucascade::memory::Tier tier, int32_t device_id)
+  {
+    const int32_t device = tier == cucascade::memory::Tier::GPU ? device_id : 0;
+    return (static_cast<int64_t>(tier) << 32) | static_cast<uint32_t>(device);
+  }
 
   std::shared_mutex ports_mutex;
   std::unordered_map<const cucascade::shared_data_repository*, port_info> ports;
@@ -117,10 +127,15 @@ struct batch_telemetry_registry::impl {
 
   shard& shard_of(uint64_t batch_id) { return shards[batch_id % kNumShards]; }
 
-  uuid::UUID tier_resource_id(cucascade::memory::Tier tier) const
+  uuid::UUID tier_resource_id(cucascade::memory::Tier tier, int32_t device_id) const
   {
-    for (size_t i = 0; i < kTiers.size(); ++i) {
-      if (kTiers[i] == tier) { return tier_resource_ids[i]; }
+    if (auto it = tier_resources.find(tier_key(tier, device_id)); it != tier_resources.end()) {
+      return it->second;
+    }
+    // Unknown device (e.g. a batch with no memory space): fall back to any
+    // resource of the tier so the usage still lands on the right tier.
+    for (const auto& [key, id] : tier_resources) {
+      if (static_cast<cucascade::memory::Tier>(key >> 32) == tier) { return id; }
     }
     return uuid::new_nil();
   }
@@ -185,23 +200,39 @@ void batch_telemetry_registry::install(
   }
   impl_->context = std::move(context);
 
-  for (size_t i = 0; i < kTiers.size(); ++i) {
-    uint64_t capacity_bytes = 0;
-    for (const auto* space : memory_manager.get_memory_spaces_for_tier(kTiers[i])) {
-      capacity_bytes += space->get_max_memory();
-    }
+  auto declare_tier = [&](cucascade::memory::Tier tier,
+                          int32_t device_id,
+                          std::string name,
+                          uint64_t capacity_bytes) {
     auto handle = quent::memory_tier::create(impl_->context->context(),
                                              {
-                                               .instance_name   = std::string(tier_name(kTiers[i])),
+                                               .instance_name   = std::move(name),
                                                .parent_group_id = impl_->context->engine_id(),
                                              });
     handle->operating({.capacity_bytes = capacity_bytes});
-    impl_->tier_resource_ids[i] = handle->uuid();
-    impl_->tier_handles[i].emplace(std::move(handle));
+    impl_->tier_resources[impl::tier_key(tier, device_id)] = handle->uuid();
+    impl_->tier_handles.push_back(std::move(handle));
+  };
+
+  // One tier resource per GPU device; HOST and DISK are engine-wide.
+  for (const auto* space : memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    const auto device_id = space->get_id().device_id;
+    declare_tier(cucascade::memory::Tier::GPU,
+                 device_id,
+                 std::format("GPU-{}", device_id),
+                 space->get_max_memory());
+  }
+  for (auto tier : {cucascade::memory::Tier::HOST, cucascade::memory::Tier::DISK}) {
+    uint64_t capacity_bytes = 0;
+    for (const auto* space : memory_manager.get_memory_spaces_for_tier(tier)) {
+      capacity_bytes += space->get_max_memory();
+    }
+    declare_tier(tier, 0, std::string(tier_name(tier)), capacity_bytes);
   }
 
   impl_->enabled.store(true, std::memory_order_release);
-  SIRIUS_LOG_INFO("Batch telemetry installed (tiers: GPU/HOST/DISK).");
+  SIRIUS_LOG_INFO("Batch telemetry installed ({} tier resources).",
+                  impl_->tier_handles.size());
 }
 
 void batch_telemetry_registry::uninstall()
@@ -223,12 +254,11 @@ void batch_telemetry_registry::uninstall()
     impl_->ports.clear();
   }
   for (auto& handle : impl_->tier_handles) {
-    if (handle) {
-      (*handle)->finalizing();
-      (*handle)->exit();
-      handle.reset();
-    }
+    handle->finalizing();
+    handle->exit();
   }
+  impl_->tier_handles.clear();
+  impl_->tier_resources.clear();
   impl_->context.reset();
 }
 
@@ -259,7 +289,7 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
 
   auto snap = snapshot(batch);
   if (!snap) { return; }
-  auto tier_resource_id = impl_->tier_resource_id(snap->tier);
+  auto tier_resource_id = impl_->tier_resource_id(snap->tier, snap->device_id);
 
   auto& shard = impl_->shard_of(snap->batch_id);
   std::lock_guard lock(shard.mutex);
@@ -294,7 +324,7 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
   auto snap = snapshot(batch);
   if (!snap) { return; }
-  auto tier_resource_id = impl_->tier_resource_id(snap->tier);
+  auto tier_resource_id = impl_->tier_resource_id(snap->tier, snap->device_id);
 
   auto& shard = impl_->shard_of(snap->batch_id);
   std::lock_guard lock(shard.mutex);
@@ -363,7 +393,7 @@ void batch_telemetry_registry::on_processing(const std::shared_ptr<cucascade::da
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
   auto snap = snapshot(batch);
   if (!snap) { return; }
-  auto tier_resource_id = impl_->tier_resource_id(snap->tier);
+  auto tier_resource_id = impl_->tier_resource_id(snap->tier, snap->device_id);
 
   auto& shard = impl_->shard_of(snap->batch_id);
   std::lock_guard lock(shard.mutex);
@@ -409,10 +439,11 @@ void batch_telemetry_registry::on_consumed(uint64_t batch_id, uuid::UUID task_uu
 
 void batch_telemetry_registry::on_tier_change(uint64_t batch_id,
                                               cucascade::memory::Tier tier,
+                                              int32_t device_id,
                                               uint64_t bytes)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
-  auto tier_resource_id = impl_->tier_resource_id(tier);
+  auto tier_resource_id = impl_->tier_resource_id(tier, device_id);
 
   auto& shard = impl_->shard_of(batch_id);
   std::lock_guard lock(shard.mutex);

@@ -79,7 +79,20 @@ const MEASURE_COUNT: &str = "count";
 /// Data-flow measure summing batch bytes held in each (state, tier) cell.
 const MEASURE_BYTES: &str = "bytes";
 /// The memory tiers in stable stacking/legend order.
-const MEMORY_TIER_ORDER: [&str; 3] = ["GPU", "HOST", "DISK"];
+/// Stable dimension-key order: GPU tiers first (per-device "GPU-0",
+/// "GPU-1", ... or the legacy aggregate "GPU"), then HOST, then DISK, then
+/// anything unexpected sorted by name.
+fn memory_tier_rank(name: &str) -> (u8, &str) {
+    if name == "GPU" || name.starts_with("GPU-") {
+        (0, name)
+    } else if name == "HOST" {
+        (1, name)
+    } else if name == "DISK" {
+        (2, name)
+    } else {
+        (3, name)
+    }
+}
 
 /// `quent-open` viewer entry: renders Sirius events with [`SiriusUiAnalyzer`].
 pub struct Viewer;
@@ -1259,16 +1272,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         // tier names (none are recorded today) sort after the known ones so
         // every pushed dimension stays declared.
         let present_tiers: HashSet<&str> = tier_names.values().copied().collect();
-        let mut ordered_tiers: Vec<&str> = MEMORY_TIER_ORDER
-            .into_iter()
-            .filter(|tier| present_tiers.contains(tier))
-            .collect();
-        let mut unexpected_tiers: Vec<&str> = present_tiers
-            .into_iter()
-            .filter(|tier| !MEMORY_TIER_ORDER.contains(tier))
-            .collect();
-        unexpected_tiers.sort_unstable();
-        ordered_tiers.extend(unexpected_tiers);
+        let mut ordered_tiers: Vec<&str> = present_tiers.into_iter().collect();
+        ordered_tiers.sort_unstable_by_key(|tier| memory_tier_rank(tier));
         let dimension_keys: Vec<DimensionKeyDecl> = ordered_tiers
             .into_iter()
             .map(|tier| DimensionKeyDecl {
