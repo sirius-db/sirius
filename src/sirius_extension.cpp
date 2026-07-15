@@ -1623,8 +1623,7 @@ static void SetLogBackend(ClientContext& context, SetScope scope, Value& paramet
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
-  // A level change only re-targets the current sink; no need to rebuild it. The
-  // duckdb backend defers to DuckDB's own level, so its set_level is a no-op.
+  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
   auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
   sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
   if (!parsed_level) {
@@ -1644,8 +1643,8 @@ static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
-  // The flush interval is fixed at spdlog-sink construction, so rebuild it when
-  // that backend is active; other backends do not use it.
+  // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
+  // the spdlog backend uses it).
   if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
@@ -1992,10 +1991,8 @@ static void LoadInternal(ExtensionLoader& loader)
   auto* callback_ptr = callback.get();
   config.GetCallbackManager().Register(std::move(callback));
 
-  // Install the duckdb-backed sink now that the DatabaseInstance is available (it
-  // is the default backend and the callback ctor could not build it without db).
-  // The ctor already installed the db-independent backends, so this is a no-op
-  // reinstall for spdlog/noop.
+  // Now that the DatabaseInstance exists, install the configured sink; the
+  // default duckdb backend needs it.
   install_configured_log_sink(&db);
 
   sirius::converter_registry::initialize();

@@ -1090,14 +1090,11 @@ void install_configured_log_sink(DatabaseInstance* db)
   } else if (backend == "noop") {
     sirius::log::set_sink(sirius::log::make_noop_sink());
   } else if (backend == "duckdb") {
-    // The duckdb sink needs the DatabaseInstance and defers its level to DuckDB.
-    // When called from the ctor (db == nullptr) it stays deferred: the facade's
-    // no-op default remains until LoadInternal reinstalls with the real db, which
-    // matches DuckDB logging being off until `enable_logging`.
+    // Needs a DatabaseInstance; with none, defer and leave the current sink.
     if (db) { sirius::log::set_sink(sirius::log::make_duckdb_sink(*db)); }
   } else if (db) {
-    // Surface a bad backend only where a throw is handled (extension load / SET),
-    // never from the callback ctor (db == nullptr) where it would terminate.
+    // Only report a bad backend on the db path; the db-less call is best-effort
+    // and must not throw.
     throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
                                 backend);
   }
@@ -1108,10 +1105,9 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   if (auto* env = std::getenv("SIRIUS_LOG_BACKEND")) { Config::LOG_BACKEND = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
-  // Install the db-independent sink now so the startup diagnostics emitted by
-  // read_config_file_if_exists() -> SiriusContext::initialize() are captured for
-  // the spdlog/noop backends. The duckdb backend is installed later from
-  // LoadInternal, where the DatabaseInstance it needs is available.
+  // Install now (no db yet) so spdlog/noop capture the logs emitted by
+  // read_config_file_if_exists() below; the duckdb backend needs a db (installed
+  // later).
   install_configured_log_sink(nullptr);
   read_config_file_if_exists();
 }

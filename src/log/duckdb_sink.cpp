@@ -41,8 +41,7 @@ duckdb::LogLevel to_duckdb_level(level lvl)
     case warn: return duckdb::LogLevel::LOG_WARNING;
     case error: return duckdb::LogLevel::LOG_ERROR;
     case critical: return duckdb::LogLevel::LOG_FATAL;
-    // `off` is only ever a threshold, never an emitted level; map it to the
-    // highest severity so a stray emission is not silently reclassified lower.
+    // `off` is a threshold, never an emitted level; map it high just in case.
     case off: return duckdb::LogLevel::LOG_FATAL;
   }
   return duckdb::LogLevel::LOG_INFO;
@@ -54,18 +53,19 @@ std::string_view basename(std::string_view path)
   return slash == std::string_view::npos ? path : path.substr(slash + 1);
 }
 
-/// Forwards to DuckDB's global logger. Holds a weak reference to the database so
-/// it becomes a safe no-op after the DatabaseInstance (and its LogManager) is
-/// destroyed, since DuckDB offers no extension-teardown hook to unregister on.
+/// Forwards to DuckDB's global logger under the "Sirius" log type.
 class duckdb_sink final : public sink {
  public:
   explicit duckdb_sink(duckdb::weak_ptr<duckdb::DatabaseInstance> db) : _db(std::move(db)) {}
 
-  // DuckDB owns the level: its enable/level configuration decides what passes.
+  // DuckDB owns the level; nothing to set here.
   void set_level(level) override {}
 
   [[nodiscard]] bool should_log(level lvl) const override
   {
+    // The sink can outlive the db (process-wide, no teardown hook), so it holds a
+    // weak ref and re-locks each call: lock() is a cheap refcount bump, not a db
+    // lock, and yields null once the db is gone — making the call a safe no-op.
     auto db = _db.lock();
     if (!db) { return false; }
     return duckdb::Logger::Get(*db).ShouldLog(log_type, to_duckdb_level(lvl));
@@ -75,11 +75,9 @@ class duckdb_sink final : public sink {
   {
     auto db = _db.lock();
     if (!db) { return; }
-    // DuckDB's WriteLog carries no source location, so fold it into the message
-    // for parity with the spdlog sink's `[file:line]` attribution.
+    // WriteLog takes no source location, so fold file:line into the message.
     auto formatted = std::format("[{}:{}] {}", basename(loc.file_name()), loc.line(), message);
-    // WriteLog can throw when `warnings_as_errors` promotes a warning; a log call
-    // must never propagate into the caller's control flow.
+    // WriteLog can throw (warnings_as_errors promotes a warning); never propagate.
     try {
       duckdb::Logger::Get(*db).WriteLog(log_type, to_duckdb_level(lvl), formatted);
     } catch (...) {  // NOLINT(bugprone-empty-catch)
