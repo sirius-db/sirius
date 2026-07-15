@@ -176,7 +176,10 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto const& input_batch_ro = input_batches[0];
   auto* space                = input_batch_ro.get_memory_space();
 
-  if (_num_partitions.value() < 2 || _partition_keys.empty()) {
+  // Broadcast mode never hash-partitions: the build side replicates its (small) batch to every
+  // slot and the probe side streams through unpartitioned. In both cases execute() just forwards
+  // the input batches; the fan-out to slots happens in sink().
+  if (_broadcast || _num_partitions.value() < 2 || _partition_keys.empty()) {
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
@@ -220,20 +223,47 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = pipelineable_input.get_data_batches();
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
-  int partition_id = 0;
-  for (auto& batch : input_batches) {
+
+  auto deposit = [&](const std::shared_ptr<cucascade::data_batch>& batch, std::size_t slot) {
     for (auto& next_port_info : next_port_after_sink) {
-      // the next operator is a partition consumer operator, so we need to push the batch into the
-      // specific partition
+      // the next operator is a partition consumer operator, so we push the batch into the slot
       auto partition_consumer_op =
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
-      if (partition_consumer_op) {
-        partition_consumer_op->push_data_batch_partitioned(
-          next_port_info.next_operator_port_name, batch, partition_id);
-      } else {
+      if (!partition_consumer_op) {
         throw std::runtime_error("Next operator is not a partition consumer operator");
       }
+      partition_consumer_op->push_data_batch_partitioned(
+        next_port_info.next_operator_port_name, batch, slot);
     }
+  };
+
+  if (_broadcast) {
+    // Broadcast mode (small build table replicated across GPUs):
+    //  - Build side: deposit each (zero-copy shared_ptr) batch into EVERY slot. The executor
+    //    peer-clones it onto each slot's GPU on demand at build time, non-destructively.
+    //  - Probe side: stream each batch into the slot matching its CURRENT GPU, so the per-GPU
+    //    join task finds its probe data already local (no cross-device copy).
+    auto const slots = static_cast<std::size_t>(_num_partitions.value());
+    for (auto& batch : input_batches) {
+      if (_is_build) {
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+          deposit(batch, slot);
+        }
+      } else {
+        std::size_t slot = 0;
+        auto ro          = batch->to_read_only();
+        if (auto* ms = ro.get_memory_space(); ms != nullptr) {
+          slot = slot_for_device(ms->get_device_id());
+        }
+        deposit(batch, slot);
+      }
+    }
+    return;
+  }
+
+  std::size_t partition_id = 0;
+  for (auto& batch : input_batches) {
+    deposit(batch, partition_id);
     partition_id++;
   }
 }
@@ -288,6 +318,14 @@ void sirius_physical_partition::resize_join_input_repo(int num_partitions)
   if (join_port != nullptr && join_port->repo != nullptr) {
     join_port->repo->set_num_partitions(static_cast<std::size_t>(num_partitions));
   }
+}
+
+std::size_t sirius_physical_partition::slot_for_device(int device_id) const
+{
+  for (std::size_t i = 0; i < _active_gpu_ids.size(); ++i) {
+    if (_active_gpu_ids[i] == device_id) { return i; }
+  }
+  return 0;  // fallback: keep the batch on a valid slot if the device is unexpectedly absent
 }
 
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
@@ -360,11 +398,26 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         return false;
       };
       bool const build_foldable = has_build_concat(*this) || has_build_concat(sibling);
+
+      // Broadcast candidate: a small build table on multi-GPU. Rather than routing everything to a
+      // single GPU, propose num_gpus partitions and replicate the (small) build table to every GPU
+      // (each builds its own hash table). The join only accepts this if it is BUILD_PROBE-eligible
+      // (non-right, non-mixed, folds to one build batch); right/mixed joins reject it and fall back
+      // to the normal count. Only the build side can drive broadcast (sizing_partition._is_build).
+      auto const num_gpus = _active_gpu_ids.size();
+      bool const broadcast_candidate =
+        sizing_partition._is_build && num_gpus > 1 && total_bytes < _small_table_bytes;
+      int const proposed_parts = broadcast_candidate ? static_cast<int>(num_gpus) : num_parts;
+
       if (sizing_partition._is_build) {
-        hash_join.update_join_exec_mode(num_parts, total_bytes, build_foldable);
+        hash_join.update_join_exec_mode(proposed_parts, total_bytes, build_foldable);
       }
-      if (_hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
-          hash_join.is_build_probe_mode()) {
+      bool const is_build_probe = _hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
+                                  hash_join.is_build_probe_mode();
+      bool const broadcast     = broadcast_candidate && is_build_probe;
+      int const num_partitions = broadcast ? static_cast<int>(num_gpus) : num_parts;
+
+      if (is_build_probe) {
         // Either sibling may run this block first; configure the build-side CONCAT only.
         auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
           for (auto& next_port : part_op.get_next_ports_after_sink()) {
@@ -376,20 +429,26 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         enable_build_concat_all(*this);
         enable_build_concat_all(sibling);
       }
-      _num_partitions         = num_parts;
-      sibling._num_partitions = num_parts;
-      if (num_parts > 1) {
-        resize_join_input_repo(num_parts);
-        sibling.resize_join_input_repo(num_parts);
+
+      _broadcast         = broadcast;
+      sibling._broadcast = broadcast;
+      if (broadcast) { hash_join.set_broadcast(true); }
+
+      _num_partitions         = num_partitions;
+      sibling._num_partitions = num_partitions;
+      if (num_partitions > 1) {
+        resize_join_input_repo(num_partitions);
+        sibling.resize_join_input_repo(num_partitions);
       }
       SIRIUS_LOG_DEBUG(
         "sirius_physical_partition id {} determined {} partitions from {} bytes on sizing id {} "
-        "({} side), sibling id {}",
+        "({} side){}, sibling id {}",
         this->get_operator_id(),
         _num_partitions.value(),
         total_bytes,
         sizing_partition.get_operator_id(),
         (sizing_partition._is_build ? "build" : "probe"),
+        (broadcast ? " [broadcast]" : ""),
         _sibling_partition_op->get_operator_id());
     }
   } else {

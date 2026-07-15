@@ -31,6 +31,7 @@
 
 #include <stdexcept>
 
+using sirius::op::broadcast_slots_to_discard;
 using sirius::op::BUILD_HASH_TABLE_STATE;
 using sirius::op::build_probe_action;
 using sirius::op::build_probe_mode_eligible;
@@ -249,4 +250,49 @@ TEST_CASE("select_build_probe_action - first ready build wins across many partit
   });
   REQUIRE(d.action == build_probe_action::schedule_build);
   REQUIRE(d.partition == 2);
+}
+
+//===----------------------------------------------------------------------===//
+// broadcast_slots_to_discard
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("broadcast_slots_to_discard - nothing is discarded until the probe side finishes",
+          "[build_probe]")
+{
+  // Build-only slots exist, but probe may still deliver data — discard nothing yet.
+  auto const d = broadcast_slots_to_discard(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+    },
+    /*probe_finished=*/false);
+  REQUIRE(d.empty());
+}
+
+TEST_CASE("broadcast_slots_to_discard - discards only NOT_BUILT slots with build but no probe",
+          "[build_probe]")
+{
+  // p0: has probe -> will be built, keep.  p1: build-only -> discard.  p2: already BUILT -> keep.
+  // p3: build-only -> discard.  p4: no build batch at all -> nothing to discard.
+  auto const d = broadcast_slots_to_discard(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+    },
+    /*probe_finished=*/true);
+  REQUIRE(d == std::vector<std::size_t>{1, 3});
+}
+
+TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[build_probe]")
+{
+  auto const d = broadcast_slots_to_discard(
+    {
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+    },
+    /*probe_finished=*/true);
+  REQUIRE(d == std::vector<std::size_t>{1});
 }

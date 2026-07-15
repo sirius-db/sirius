@@ -113,6 +113,15 @@ struct build_probe_decision {
                                              int num_gpus,
                                              uint64_t max_build_hash_table_bytes);
 
+/// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
+/// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
+/// data. Once the probe upstream is finished (`probe_finished`), any slot that is still NOT_BUILT
+/// with a build batch but no probe batch will never be probed and is returned for discard. Returns
+/// empty while the probe side may still deliver data. Pure/unit-testable counterpart of
+/// discard_build_only_slots_if_probe_complete.
+[[nodiscard]] std::vector<std::size_t> broadcast_slots_to_discard(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished);
+
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
@@ -225,6 +234,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// BUILD_PROBE eligibility test to the historical single-partition rule.
   void set_num_gpus(int num_gpus) { _num_gpus = num_gpus; }
 
+  /// @brief Mark this join as a broadcast (small-build-table) BUILD_PROBE join. Set at runtime by
+  /// the partition operator when it replicates the build table to every GPU. In broadcast mode the
+  /// probe side is not partitioned, so some slots may receive build data but never any probe data;
+  /// those slots are discarded once the probe upstream completes (see get_next_task_hint).
+  void set_broadcast(bool broadcast) { _broadcast = broadcast; }
+
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();
 
@@ -234,6 +249,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// Snapshot each partition's build state and per-partition data availability for the BUILD_PROBE
   /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
   std::vector<build_probe_slot_view> snapshot_build_probe_slots();
+
+  /// Broadcast-mode cleanup: once the probe upstream is finished, any NOT_BUILT slot that holds a
+  /// (replicated) build batch but never received probe data is discarded — its build batch is freed
+  /// on its own GPU and the slot is marked DESTROYED so the operator can complete. No-op unless
+  /// `_broadcast`. Must be called with `op_state_mutex` held.
+  void discard_build_only_slots_if_probe_complete();
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -263,6 +284,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // num_partitions <= _num_gpus. Defaults to 1 so single-GPU / unconfigured paths keep the
   // historical single-partition BUILD_PROBE behavior.
   int _num_gpus = 1;
+
+  // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
+  // the probe side is streamed unpartitioned, so a slot may hold build data but never receive probe
+  // data. Set at runtime via set_broadcast(). Enables the build-only-slot discard on
+  // probe-complete.
+  bool _broadcast = false;
 
   // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
   // that lives entirely on one GPU (partition_idx % _num_gpus). A partition is built once — its

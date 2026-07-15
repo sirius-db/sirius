@@ -107,6 +107,14 @@ class sirius_physical_partition : public sirius_physical_operator {
     _small_table_bytes  = small_table_bytes;
   }
 
+  /// The sorted, deduped device ids of the GPUs the query runs on — identical to the list
+  /// task_creator routes partitions across (`_active_gpu_ids[partition_idx % size]`). Used by
+  /// broadcast mode to map a probe batch's residence GPU back to its partition slot.
+  void set_active_gpu_ids(std::vector<int> active_gpu_ids)
+  {
+    _active_gpu_ids = std::move(active_gpu_ids);
+  }
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
@@ -120,6 +128,11 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// Grow the downstream hash-join input repository for this partition's side to
   /// `num_partitions`. No-op when this partition does not feed a hash join.
   void resize_join_input_repo(int num_partitions);
+
+  /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
+  /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
+  /// safe fallback that keeps the batch on some valid slot).
+  [[nodiscard]] std::size_t slot_for_device(int device_id) const;
   sirius_physical_operator* _parent_op            = nullptr;
   sirius_physical_operator* _sibling_partition_op = nullptr;
   sirius_physical_operator* _hash_join_op =
@@ -138,6 +151,13 @@ class sirius_physical_partition : public sirius_physical_operator {
   uint64_t s_partition_size;
   int _min_num_partitions{1};
   uint64_t _small_table_bytes{0};
+  /// Sorted, deduped active GPU device ids (see set_active_gpu_ids). Empty when unset / single-GPU.
+  std::vector<int> _active_gpu_ids;
+  /// Broadcast mode: the build table is small enough to replicate to every GPU instead of
+  /// hash-partitioning. Set on BOTH sibling partition ops when the join accepts BUILD_PROBE at
+  /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
+  /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
+  bool _broadcast{false};
 };
 
 }  // namespace op

@@ -566,6 +566,57 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   return slots;
 }
 
+std::vector<std::size_t> broadcast_slots_to_discard(std::vector<build_probe_slot_view> const& slots,
+                                                    bool probe_finished)
+{
+  std::vector<std::size_t> to_discard;
+  if (!probe_finished) { return to_discard; }
+  for (std::size_t p = 0; p < slots.size(); ++p) {
+    auto const& s = slots[p];
+    // NOT_BUILT means the slot was never scheduled (so its replicated build batch is still in the
+    // repo); no probe batch with the probe side finished means none is coming. A BUILT slot already
+    // consumed its build batch, and a slot with probe data will still be built — leave those.
+    if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && s.has_build_batch && !s.has_probe_batch) {
+      to_discard.push_back(p);
+    }
+  }
+  return to_discard;
+}
+
+void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
+{
+  if (!_broadcast) { return; }
+  auto* build_port = get_port("build");
+  auto* probe_port = get_port("default");
+  if (!build_port || !probe_port) { return; }
+  // Only once the probe upstream is finished do we know no further probe data can arrive for any
+  // slot. Broadcast replicates the build table to every slot, but the probe side is unpartitioned,
+  // so slots on GPUs that saw no probe rows get build data that will never be probed.
+  bool const probe_finished =
+    probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
+
+  for (std::size_t p : broadcast_slots_to_discard(snapshot_build_probe_slots(), probe_finished)) {
+    // Build-only slot with no probe and none coming: drop its replicated build batch(es), freeing
+    // each on the GPU it was folded onto (rmm requires the owning device to be current).
+    while (auto batch = build_port->repo->pop_next_data_batch(p)) {
+      int device_id = -1;
+      {
+        auto ro = batch->to_read_only();
+        if (auto* ms = ro.get_memory_space(); ms != nullptr) { device_id = ms->get_device_id(); }
+      }
+      std::optional<rmm::cuda_set_device_raii> device_guard;
+      if (device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{device_id}); }
+      batch.reset();
+    }
+    _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
+                                                 std::memory_order_release);
+    SIRIUS_LOG_DEBUG(
+      "sirius_physical_hash_join id {}: broadcast discard of build-only slot {} (probe complete)",
+      this->get_operator_id(),
+      p);
+  }
+}
+
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
@@ -580,6 +631,9 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         "In sirius_physical_hash_join:get_next_task_hint: missing expected ports in operator " +
         std::to_string(this->get_operator_id()));
     }
+    // Broadcast mode: reclaim slots that will never be probed before deciding the next action, so
+    // the operator can reach completion instead of waiting forever on their absent probe data.
+    discard_build_only_slots_if_probe_complete();
     auto const decision = select_build_probe_action(snapshot_build_probe_slots());
     switch (decision.action) {
       case build_probe_action::schedule_build:
@@ -669,15 +723,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       SIRIUS_LOG_WARN(
         "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: expected to pop a "
         "probe batch for partition {} but got none in operator {}",
-        p, this->get_operator_id());
+        p,
+        this->get_operator_id());
     }
     return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_tag(p));
   }
 
   // No SCHEDULING slot and no BUILT slot with probe data. This happens when a hint's READY raced
   // ahead of another task draining the same probe data; there is simply nothing to issue now.
-  SIRIUS_LOG_WARN("In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable "
-    "partition (build/probe already drained) in operator {}", this->get_operator_id());
+  SIRIUS_LOG_WARN(
+    "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable "
+    "partition (build/probe already drained) in operator {}",
+    this->get_operator_id());
   return nullptr;
 }
 

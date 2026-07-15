@@ -476,8 +476,11 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
     if (!op) return;
     if (op->type == op::SiriusPhysicalOperatorType::PARTITION) {
-      static_cast<op::sirius_physical_partition*>(op)->set_min_num_partitions(num_gpus,
-                                                                              small_table_bytes);
+      auto* partition_op = static_cast<op::sirius_physical_partition*>(op);
+      partition_op->set_min_num_partitions(num_gpus, small_table_bytes);
+      // The active GPU id list lets broadcast partitioning map a probe batch's residence GPU to
+      // its partition slot (inverse of task_creator's partition_idx -> GPU routing).
+      partition_op->set_active_gpu_ids(build_ctx_.active_gpu_ids());
     } else if (op->type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
       // Let the join keep one hash table per partition (one per GPU) so BUILD_PROBE is admitted for
       // up to num_gpus partitions rather than only one. Matches the partition floor set above.
