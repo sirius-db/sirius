@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <unordered_set>
 #include <string>
 
 namespace sirius {
@@ -245,6 +246,7 @@ gpu_pipeline_task::gpu_pipeline_task(
     for (const auto& weak_batch : _subscribed_batches) {
       if (auto batch = weak_batch.lock()) {
         registry.on_packaged(batch, pipeline->pipeline_uuid(), telemetry_handle().uuid());
+        _claimed_batch_ids.push_back(batch->get_batch_id());
       }
     }
   }
@@ -258,8 +260,8 @@ gpu_pipeline_task::~gpu_pipeline_task()
   {
     auto& registry       = telemetry::batch_telemetry_registry::instance();
     const auto task_uuid = telemetry_handle().uuid();
-    for (const auto& weak_batch : _subscribed_batches) {
-      if (auto batch = weak_batch.lock()) { registry.on_consumed(batch->get_batch_id(), task_uuid); }
+    for (const auto batch_id : _claimed_batch_ids) {
+      registry.on_consumed(batch_id, task_uuid);
     }
   }
 
@@ -504,10 +506,19 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // is destroyed after the first operator's execute() consumes it.
   {
     // packaged -> processing; tier re-read to reflect prepare-time upgrades.
+    // Batches already released by prepare (merge/concat inputs are consumed
+    // while materializing) transition by id with their last recorded tier.
     auto& registry       = telemetry::batch_telemetry_registry::instance();
     const auto task_uuid = telemetry_handle().uuid();
+    std::unordered_set<uint64_t> live_ids;
     for (const auto& weak_batch : _subscribed_batches) {
-      if (auto batch = weak_batch.lock()) { registry.on_processing(batch, task_uuid); }
+      if (auto batch = weak_batch.lock()) {
+        live_ids.insert(batch->get_batch_id());
+        registry.on_processing(batch, task_uuid);
+      }
+    }
+    for (const auto batch_id : _claimed_batch_ids) {
+      if (!live_ids.contains(batch_id)) { registry.on_processing_by_id(batch_id, task_uuid); }
     }
   }
 

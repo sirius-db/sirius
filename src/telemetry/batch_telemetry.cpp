@@ -414,6 +414,27 @@ void batch_telemetry_registry::on_processing(const std::shared_ptr<cucascade::da
   }
 }
 
+void batch_telemetry_registry::on_processing_by_id(uint64_t batch_id, uuid::UUID task_uuid)
+{
+  if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
+
+  auto& shard = impl_->shard_of(batch_id);
+  std::lock_guard lock(shard.mutex);
+  auto it = shard.placements.find(batch_id);
+  if (it == shard.placements.end()) { return; }
+  for (auto& p : it->second) {
+    if (p.task_uuid == task_uuid && p.state == impl::placement_state::packaged) {
+      p.state = impl::placement_state::processing;
+      p.handle->batch_processing({
+        .instance_name       = "",
+        .task_uuid           = task_uuid,
+        .tier_resource_id    = p.tier_resource_id,
+        .tier_capacity_bytes = p.bytes,
+      });
+    }
+  }
+}
+
 void batch_telemetry_registry::on_consumed(uint64_t batch_id, uuid::UUID task_uuid)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }

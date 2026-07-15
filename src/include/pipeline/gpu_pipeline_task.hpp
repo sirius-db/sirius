@@ -247,6 +247,10 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   /// weak_ptr so that memory can be released as soon as the last owner drops.
   /// This is used in the destructor to unsubscribe.
   std::vector<std::weak_ptr<cucascade::data_batch>> _subscribed_batches;
+  //! Batch ids claimed for telemetry in the constructor. The dtor releases the
+  // claims by id: the weak pointers above are usually dead by then (the strong
+  // refs live in the input data, consumed mid-execution).
+  std::vector<uint64_t> _claimed_batch_ids;
 };
 
 }  // namespace pipeline

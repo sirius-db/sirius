@@ -98,6 +98,11 @@ class batch_telemetry_registry {
   /// packaged -> processing (tier re-read to capture prepare-time upgrades).
   void on_processing(const std::shared_ptr<cucascade::data_batch>& batch, uuid::UUID task_uuid);
 
+  /// Same as on_processing for batches already released by prepare (merge/
+  /// concat inputs are consumed while materializing): transitions the
+  /// placement with its last recorded tier/bytes instead of re-reading.
+  void on_processing_by_id(uint64_t batch_id, uuid::UUID task_uuid);
+
   /// The claiming task is done with the batch: -> consumed + exit. Placements
   /// re-claimed by another task (OOM reschedule) are left untouched.
   void on_consumed(uint64_t batch_id, uuid::UUID task_uuid);
