@@ -5,7 +5,7 @@ use quent_query_engine_analyzer::entities;
 use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
 use quent_query_engine_ui::{
     OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
-    data_flow::{DataFlowTimelineBinned, DataFlowTimelineResponse},
+    DataFlowTimelineBinned, DataFlowTimelineResponse,
 };
 use quent_ui::{
     FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,

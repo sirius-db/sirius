@@ -16,8 +16,6 @@
 
 #include "telemetry/telemetry_context.hpp"
 
-#include "telemetry/batch_telemetry.hpp"
-
 #include "log/logging.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -26,6 +24,7 @@
 #include "telemetry-bridge/gen/operator.rs.h"
 #include "telemetry-bridge/gen/plan.rs.h"
 #include "telemetry-bridge/gen/port.rs.h"
+#include "telemetry/batch_telemetry.hpp"
 
 #include <unistd.h>
 

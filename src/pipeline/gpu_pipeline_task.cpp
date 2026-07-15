@@ -36,8 +36,8 @@
 #include <cstdint>
 #include <format>
 #include <optional>
-#include <unordered_set>
 #include <string>
+#include <unordered_set>
 
 namespace sirius {
 namespace pipeline {

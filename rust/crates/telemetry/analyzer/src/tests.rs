@@ -14,7 +14,7 @@ use quent_events::Event;
 use quent_model::{Capacity, FsmEvent, Ref, Usage};
 use quent_query_engine_analyzer::ui::UiAnalyzer;
 use quent_query_engine_model::{engine, operator, plan, query, query_group, worker};
-use quent_query_engine_ui::{OperatorFilter, QueryFilter, data_flow::DataFlowTimelineResponse};
+use quent_query_engine_ui::{DataFlowTimelineResponse, OperatorFilter, QueryFilter};
 use quent_ui::entities::request::{
     EntityListEntry, EntityListFilter, EntityListRequest, EntityScope, EntitySortKey, Sort,
     SortDir, TimeWindow,

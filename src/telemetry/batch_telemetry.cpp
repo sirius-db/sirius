@@ -24,10 +24,9 @@
 
 #include <cucascade/data/data_batch.hpp>
 
-#include <format>
-
 #include <array>
 #include <atomic>
+#include <format>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -200,22 +199,22 @@ void batch_telemetry_registry::install(
   }
   impl_->context = std::move(context);
 
-  auto declare_tier = [&](cucascade::memory::Tier tier,
-                          int32_t device_id,
-                          std::string name,
-                          uint64_t capacity_bytes) {
-    auto handle = quent::memory_tier::create(impl_->context->context(),
-                                             {
-                                               .instance_name   = std::move(name),
-                                               .parent_group_id = impl_->context->engine_id(),
-                                             });
-    handle->operating({.capacity_bytes = capacity_bytes});
-    impl_->tier_resources[impl::tier_key(tier, device_id)] = handle->uuid();
-    impl_->tier_handles.push_back(std::move(handle));
-  };
+  auto declare_tier =
+    [&](
+      cucascade::memory::Tier tier, int32_t device_id, std::string name, uint64_t capacity_bytes) {
+      auto handle = quent::memory_tier::create(impl_->context->context(),
+                                               {
+                                                 .instance_name   = std::move(name),
+                                                 .parent_group_id = impl_->context->engine_id(),
+                                               });
+      handle->operating({.capacity_bytes = capacity_bytes});
+      impl_->tier_resources[impl::tier_key(tier, device_id)] = handle->uuid();
+      impl_->tier_handles.push_back(std::move(handle));
+    };
 
   // One tier resource per GPU device; HOST and DISK are engine-wide.
-  for (const auto* space : memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+  for (const auto* space :
+       memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
     const auto device_id = space->get_id().device_id;
     declare_tier(cucascade::memory::Tier::GPU,
                  device_id,
@@ -231,8 +230,7 @@ void batch_telemetry_registry::install(
   }
 
   impl_->enabled.store(true, std::memory_order_release);
-  SIRIUS_LOG_INFO("Batch telemetry installed ({} tier resources).",
-                  impl_->tier_handles.size());
+  SIRIUS_LOG_INFO("Batch telemetry installed ({} tier resources).", impl_->tier_handles.size());
 }
 
 void batch_telemetry_registry::uninstall()
@@ -262,8 +260,9 @@ void batch_telemetry_registry::uninstall()
   impl_->context.reset();
 }
 
-void batch_telemetry_registry::register_consumer_port(
-  const cucascade::shared_data_repository* repo, uuid::UUID pipeline_uuid, uuid::UUID port_uuid)
+void batch_telemetry_registry::register_consumer_port(const cucascade::shared_data_repository* repo,
+                                                      uuid::UUID pipeline_uuid,
+                                                      uuid::UUID port_uuid)
 {
   if (!impl_->enabled.load(std::memory_order_acquire) || repo == nullptr) { return; }
   std::unique_lock lock(impl_->ports_mutex);
@@ -295,12 +294,12 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
   std::lock_guard lock(shard.mutex);
   auto handle = quent::batch::create(impl_->context->context(),
                                      {
-                                       .instance_name = std::format("batch-{}", snap->batch_id),
-                                       .batch_id      = snap->batch_id,
-                                       .pipeline_uuid = port.pipeline_uuid,
-                                       .port_uuid     = port.port_uuid,
-                                       .origin        = std::string(origin),
-                                       .tier_resource_id    = tier_resource_id,
+                                       .instance_name    = std::format("batch-{}", snap->batch_id),
+                                       .batch_id         = snap->batch_id,
+                                       .pipeline_uuid    = port.pipeline_uuid,
+                                       .port_uuid        = port.port_uuid,
+                                       .origin           = std::string(origin),
+                                       .tier_resource_id = tier_resource_id,
                                        .tier_capacity_bytes = snap->bytes,
                                      });
   handle->batch_queued({
@@ -341,8 +340,7 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
   }
   if (target == nullptr) {
     for (auto& p : placements) {
-      if (p.pipeline_uuid == consumer_pipeline_uuid &&
-          p.state != impl::placement_state::queued) {
+      if (p.pipeline_uuid == consumer_pipeline_uuid && p.state != impl::placement_state::queued) {
         target = &p;
         break;
       }
