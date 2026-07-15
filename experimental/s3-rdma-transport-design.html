@@ -219,7 +219,7 @@ the absence of normal teardown.
 | D5 | Completion via `semi_future` + `request_manager`: a chunk completes exactly once, on its own worker, after an **inline wait** on its CUDA event — and never before delivery is settled per the **§2 quiescence / fail-stop discipline** | Closes both use-after-free sides at once — a reused slot under an in-flight copy, and a freed destination still being written. A fatal CUDA error is process-level, so the reactor contains it and defers recovery to a process restart |
 | D6 | v1: explicit `RDMA` opt-in, fail loudly, no HTTP fallback; all device reads go RDMA | Fallbacks and premature thresholds mask misconfiguration exactly where RDMA is deliberately deployed |
 | D7 | Optional build feature `SIRIUS_ENABLE_S3_RDMA` (conda `libcuobjclient` or `CUOBJ_SDK_ROOT`); never vendor NVIDIA SDKs | Default-off builds unchanged. Note: conda ships cuObject 1.2.x while the benchmark validated 1.0.0 — version reconciliation is a real task, not a drop-in add |
-| D8 | Dev rig = benchmark server (unsigned, isolated net); production gateways must SigV4-validate before honoring RDMA headers. **The `x-amz-rdma-token` and `Range` headers are signed** — the authorizer's request surface is extended so headers added for RDMA are part of the SigV4 canonical request, and v1 supports the RDMA control plane in **header-signing mode only** — SigV4 query signing can in principle carry headers via `X-Amz-SignedHeaders`, but Sirius's presigner signs only `host` today, so RDMA init rejects `s3_signing_mode = presigned`. Compatibility: the existing pure-virtual `authorize()` stays untouched; the headers-to-sign travel through a **new, separately-named** non-pure virtual (e.g. `authorize_with_headers(request)`) whose default implementation rejects non-empty header sets as unsupported, and which the built-in SigV4 header signer overrides — a defaulted parameter on the existing virtual would break every override, and a same-name overload would make existing three-argument calls ambiguous | Standard SigV4 requires `x-amz-*` headers in the signature; an unsigned token is not bound to the request, so a gateway could not distinguish a tampered descriptor from a legitimate one. Signing token + range binds object, byte range, and destination capability into one authorized request |
+| D8 | Dev rig = benchmark server (unsigned, isolated net); production gateways must SigV4-validate before honoring RDMA headers. **The `x-amz-rdma-token` and `Range` headers are signed**, and v1 supports the RDMA control plane in **header-signing mode only** (RDMA init rejects `s3_signing_mode = presigned`) — surface mechanics in the appendix's "Auth surface extension" | Standard SigV4 requires `x-amz-*` headers in the signature; an unsigned token is not bound to the request, so a gateway could not distinguish a tampered descriptor from a legitimate one. Signing token + range binds object, byte range, and destination capability into one authorized request |
 | **D9** | **Prefetch cache off, structurally**: the reactor defines *only* the host-read and device-read builders and omits the two staged-read ones — the framework then derives "no cache for this backend" on its own | Capabilities are derived from which builders a reactor defines (there is no flag to set); the cache activates only if a backend has a staged-read path. kvikio — Sirius's official fallback backend — already ships this exact minimal profile |
 
 Why D9 works, in one picture:
@@ -291,7 +291,7 @@ as the plan that closes the gap between the current tree and this design.
 | **P0a — wire migration landed** | Standard wire protocol merged into `s3RDMA-benchmarktool` (drop 4 non-standard headers; server decodes the address from the token; `x-amz-rdma-reply`) | — |
 | **P0b — gateway hardening open** | Strict descriptor parsing, `buf_size` enforcement, exact-completion check (itemized in the appendix). **Also the precondition for trusting short-write detection on the client** | — |
 | **P1 — unblocked** (#1042 merged) | Add the rdma backend type + factory; the `io_context_registry` constructor picks rdma-vs-rest for the s3 slot by `s3_transport` (`AUTO`→HTTP); routing tests extend the existing cutover suite | — |
-| P2 | `cuobj_rdma_reactor` against a **mock** client; RDMA-rig-free matrix (the delivery tests still need a CUDA GPU) incl. compile-time checks that the two staged-read capabilities stay off, plus the **delivery-failure fault-injection matrix** (§2: quiescence proof, fail-stop, the process-fatal hook firing on an active unprovable chunk while siblings of the same request are queued, teardown leak, admission deadlock-freedom) | CUDA GPU |
+| P2 | `cuobj_rdma_reactor` against a **mock** client; RDMA-rig-free matrix (the delivery tests still need a CUDA GPU) incl. compile-time checks that the two staged-read capabilities stay off, plus the **delivery-failure fault-injection matrix** (§2: quiescence proof, fail-stop, the process-fatal hook firing on an active unprovable chunk while siblings of the same request are queued (death tests: child process, exit code, no normal teardown), teardown leak, admission deadlock-freedom) | CUDA GPU |
 | P3 | Real cuObject path, single GPU; arena + D2D + flush + a visibility stress test; measure the full delivery overhead (flush + event create/record/wait/destroy + D2D, replacing the bandwidth-derived estimates; evaluate per-slot event reuse). **Activation gates:** exact-write authority incl. mandatory reply validation (jointly with P0b), the session-ownership decision (§5 Q6), per-device visibility policy (§5 Q2), the ambiguous-failure fencing answer (§5 Q7), and the shared-stream inline-wait saturation test (§2) | CX-6 |
 | P4 | Multi-GPU (per-device arenas, NIC↔GPU affinity), retries, metrics, tuning | CX-6 |
 | P5 | Range coalescing; direct-into-RMM spike; small-read threshold go/no-go (incl. control-plane connection reuse); vs-HTTP benchmark | CX-6 |
@@ -387,6 +387,20 @@ server-side (its own config, default 2 MiB) — nothing is negotiated on the wir
 Production gateways SigV4-validate the control request before honoring the
 token, and the token + `Range` are part of that signature (D8): the client
 signs them, the gateway verifies them — an unsigned token is rejected.
+
+### Auth surface extension (D8 mechanics)
+
+The authorizer's request surface is extended so headers added for RDMA are
+part of the SigV4 canonical request. Presigned mode is excluded as a v1
+implementation choice, not a protocol limit: SigV4 query signing can in
+principle carry headers via `X-Amz-SignedHeaders`, but Sirius's presigner
+signs only `host` today. Compatibility: the existing pure-virtual
+`authorize()` stays untouched; the headers-to-sign travel through a **new,
+separately-named** non-pure virtual (e.g. `authorize_with_headers(request)`)
+whose default implementation rejects non-empty header sets as unsupported,
+and which the built-in SigV4 header signer overrides. A defaulted parameter
+on the existing virtual would break every override, and a same-name overload
+would make existing three-argument calls ambiguous.
 
 ### Config (under `object_store_config`)
 
