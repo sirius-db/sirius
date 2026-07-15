@@ -89,7 +89,9 @@ static void flush_logs_best_effort()
   signal(SIGALRM, SIG_DFL);  // ensure default (terminate) disposition
   alarm(3);                  // hard deadline for the log + flush below
   SIRIUS_LOG_WARN("SIRIUS signal handler triggered, flushing logs");
-  sirius::FlushGlobalLogger();
+  // get_sink() never returns null; the flush itself is the risky part, bounded
+  // by the alarm above and by the handler's re-entrancy guard.
+  sirius::log::get_sink()->flush();
   alarm(0);  // flush returned in time; cancel the deadline
 }
 
@@ -107,6 +109,14 @@ static const char* signal_name(int sig)
 
 static void segfault_handler(int sig)
 {
+  // Re-entrancy guard: SA_RESETHAND resets only the delivered signal, so a
+  // *different* fault raised while we run the allocation-heavy backtrace or the
+  // log flush would re-enter this handler. On any such re-entry bail out
+  // immediately rather than risk looping through those unsafe steps again.
+  static volatile sig_atomic_t handling = 0;
+  if (handling) { _exit(1); }
+  handling = 1;
+
   std::array<void*, kBacktraceMaxFrames> frames{};
   int n = backtrace(frames.data(), kBacktraceMaxFrames);
   if (n <= 0) {

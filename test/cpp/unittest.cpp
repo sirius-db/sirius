@@ -19,6 +19,7 @@
 #include "catch.hpp"
 #include "config.hpp"
 #include "log/logging.hpp"
+#include "log/spdlog_owning_sink.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -106,7 +107,14 @@ int main(int argc, char* argv[])
   // Initialize the logger
   std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
   Config::LOG_DIR     = log_dir;
-  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
+  auto flush =
+    Config::LOG_FLUSH_SECONDS <= 0
+      ? std::nullopt
+      : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
+  auto log_sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+  log_sink->set_level(lvl);
+  sirius::log::set_sink(std::move(log_sink));
 
   // Create shared test environments. Both start PAUSED and are only activated
   // by the listener for tests with the matching tag. This avoids GPU memory

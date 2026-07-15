@@ -16,6 +16,8 @@
 
 #include "config.hpp"
 
+#include "log/logging.hpp"
+
 namespace duckdb {
 
 bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;

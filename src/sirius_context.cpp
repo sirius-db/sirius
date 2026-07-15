@@ -26,6 +26,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
+#include "log/spdlog_owning_sink.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -1070,7 +1071,18 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
-  sirius::InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
+  auto flush =
+    Config::LOG_FLUSH_SECONDS <= 0
+      ? std::nullopt
+      : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
+  auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+  sink->set_level(parsed_level.value_or(sirius::log::level::info));
+  sirius::log::set_sink(std::move(sink));
+  // Warn only once the sink is installed, so the message actually reaches it.
+  if (!parsed_level) {
+    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+  }
   read_config_file_if_exists();
 }
 
