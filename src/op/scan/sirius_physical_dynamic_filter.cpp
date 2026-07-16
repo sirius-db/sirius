@@ -62,6 +62,16 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   auto const& idle_batches = input.get_data_batches();
   auto const ro_batches    = input.get_read_only_batches();
 
+  // get_read_only_batches() skips null entries while get_data_batches() keeps them, so the two
+  // vectors are not index-aligned. Build a parallel vector of non-null idle batches so that
+  // aligned_idle_batches[i] corresponds to ro_batches[i] (previously idle_batches[i] paired with
+  // the wrong batch whenever any earlier entry was null).
+  std::vector<std::shared_ptr<::cucascade::data_batch>> aligned_idle_batches;
+  aligned_idle_batches.reserve(ro_batches.size());
+  for (const auto& batch : idle_batches) {
+    if (batch) { aligned_idle_batches.push_back(batch); }
+  }
+
   std::vector<std::shared_ptr<::cucascade::data_batch>> output_batches;
   output_batches.reserve(ro_batches.size());
 
@@ -80,7 +90,7 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
       output_batches.push_back(sirius::make_data_batch(
         std::move(filtered), *ro.get_memory_space(), stream, batch_telemetry()));
     } else {
-      output_batches.push_back(idle_batches[i]);
+      output_batches.push_back(aligned_idle_batches[i]);
     }
   }
   return std::make_unique<pipelineable_operator_data>(std::move(output_batches));

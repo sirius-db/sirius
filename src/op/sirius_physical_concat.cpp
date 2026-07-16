@@ -100,7 +100,9 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
     size_t pulled_count     = 0;
     for (auto& batch_id : batch_ids) {
       auto batch_idle = port_ptr->repo->get_data_batch_by_id(batch_id, i);
+      if (!batch_idle) continue;
       auto batch_ro   = batch_idle->to_read_only();
+      if (!batch_ro.get_data()) continue;
       auto batch_size = batch_ro.get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       if (!_concat_all && total_batch_size > _concat_batch_bytes) {

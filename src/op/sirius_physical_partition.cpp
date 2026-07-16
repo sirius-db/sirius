@@ -246,6 +246,7 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
       std::to_string(this->get_operator_id()));
   }
   auto& repo           = ports.at("default")->repo;
+  if (!ports.at("default")->repo) throw std::runtime_error("partition: null repo");
   auto batch_ids       = repo->get_batch_ids(0);
   uint64_t total_bytes = 0;
   for (auto batch_id : batch_ids) {

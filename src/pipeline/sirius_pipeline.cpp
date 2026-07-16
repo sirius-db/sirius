@@ -128,14 +128,19 @@ void sirius_pipeline::reset_source(bool force)
 
 void sirius_pipeline::is_ready()
 {
-  if (ready) { return; }
-  ready = true;
-  std::reverse(operators.begin(), operators.end());
-  if (!operators.empty()) {
-    // Derive source/sink from operators[] (meta-pipeline pre-populated the sink;
-    // build_pipelines appended intermediates/sources before the reverse above).
-    source = &operators.front().get();
-    sink   = &operators.back().get();
+  // Atomically claim initialization. A plain load+store (check then set) is a TOCTOU
+  // race: two threads could both observe ready==false and both reverse operators[].
+  // compare_exchange_strong makes the check-and-set a single atomic operation, so only
+  // the winner performs the reverse and source/sink derivation; losers no-op.
+  bool expected = false;
+  if (ready.compare_exchange_strong(expected, true)) {
+    std::reverse(operators.begin(), operators.end());
+    if (!operators.empty()) {
+      // Derive source/sink from operators[] (meta-pipeline pre-populated the sink;
+      // build_pipelines appended intermediates/sources before the reverse above).
+      source = &operators.front().get();
+      sink   = &operators.back().get();
+    }
   }
 }
 

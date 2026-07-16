@@ -523,11 +523,15 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
       // Hash table is built, we can process probe only batches.
-      if (ports["default"]->repo->total_size() > 0) {
+      auto it = ports.find("default");
+      if (it == ports.end() || !it->second->repo || !it->second->src_pipeline) {
+        throw std::runtime_error("hash_join: missing default port");
+      }
+      if (it->second->repo->total_size() > 0) {
         return task_creation_hint{TaskCreationHint::READY, this};
       } else {
         // No probe batch available yet, hint to wait for probe input data.
-        auto* producer = &ports["default"]->src_pipeline->get_operators()[0].get();
+        auto* producer = &it->second->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
     } else {

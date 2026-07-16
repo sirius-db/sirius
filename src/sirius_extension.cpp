@@ -1965,7 +1965,7 @@ static void LoadInternal(ExtensionLoader& loader)
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }
 
-std::string SiriusExtension::Name() { return "Sirius	Extension"; }
+std::string SiriusExtension::Name() { return "Sirius Extension"; }
 
 std::string SiriusExtension::Version() const
 {
