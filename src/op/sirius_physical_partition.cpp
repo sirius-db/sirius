@@ -369,6 +369,17 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
   }
 }
 
+broadcast_partition_decision make_broadcast_partition_decision(bool is_build_side,
+                                                               std::size_t num_gpus,
+                                                               uint64_t total_bytes,
+                                                               uint64_t small_table_bytes,
+                                                               int natural_num_partitions)
+{
+  bool const candidate = is_build_side && num_gpus > 1 && total_bytes < small_table_bytes;
+  int const proposed   = candidate ? static_cast<int>(num_gpus) : natural_num_partitions;
+  return broadcast_partition_decision{candidate, proposed, natural_num_partitions};
+}
+
 std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_data()
 {
   // Lock both this and the sibling partition atomically to prevent ABBA deadlock:
@@ -404,18 +415,18 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       // (each builds its own hash table). The join only accepts this if it is BUILD_PROBE-eligible
       // (non-right, non-mixed, folds to one build batch); right/mixed joins reject it and fall back
       // to the normal count. Only the build side can drive broadcast (sizing_partition._is_build).
+      // See make_broadcast_partition_decision for the pure, unit-tested decision.
       auto const num_gpus = _active_gpu_ids.size();
-      bool const broadcast_candidate =
-        sizing_partition._is_build && num_gpus > 1 && total_bytes < _small_table_bytes;
-      int const proposed_parts = broadcast_candidate ? static_cast<int>(num_gpus) : num_parts;
+      auto const decision = make_broadcast_partition_decision(
+        sizing_partition._is_build, num_gpus, total_bytes, _small_table_bytes, num_parts);
 
       if (sizing_partition._is_build) {
-        hash_join.update_join_exec_mode(proposed_parts, total_bytes, build_foldable);
+        hash_join.update_join_exec_mode(decision.proposed_parts, total_bytes, build_foldable);
       }
       bool const is_build_probe = _hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
                                   hash_join.is_build_probe_mode();
-      bool const broadcast     = broadcast_candidate && is_build_probe;
-      int const num_partitions = broadcast ? static_cast<int>(num_gpus) : num_parts;
+      bool const broadcast     = decision.broadcast(is_build_probe);
+      int const num_partitions = decision.num_partitions(is_build_probe, num_gpus);
 
       if (is_build_probe) {
         // Either sibling may run this block first; configure the build-side CONCAT only.

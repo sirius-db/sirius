@@ -26,6 +26,7 @@
 // end-to-end multi-GPU behavior is covered by the [mgpu] integration tests.
 
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_partition.hpp"
 
 #include <catch.hpp>
 
@@ -36,6 +37,7 @@ using sirius::op::BUILD_HASH_TABLE_STATE;
 using sirius::op::build_probe_action;
 using sirius::op::build_probe_mode_eligible;
 using sirius::op::build_probe_slot_view;
+using sirius::op::make_broadcast_partition_decision;
 using sirius::op::select_build_probe_action;
 
 namespace {
@@ -295,4 +297,79 @@ TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[
     },
     /*probe_finished=*/true);
   REQUIRE(d == std::vector<std::size_t>{1});
+}
+
+//===----------------------------------------------------------------------===//
+// make_broadcast_partition_decision — the pure, two-phase broadcast decision that drives
+// sirius_physical_partition::get_next_task_input_data.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("make_broadcast_partition_decision - small build on multi-GPU is a broadcast candidate",
+          "[build_probe][broadcast]")
+{
+  // build side, 4 GPUs, 1 KiB build < 32 MiB threshold -> candidate, propose one partition per GPU.
+  auto const d = make_broadcast_partition_decision(/*is_build_side=*/true,
+                                                   /*num_gpus=*/4,
+                                                   /*total_bytes=*/1024,
+                                                   /*small_table_bytes=*/32u * 1024 * 1024,
+                                                   /*natural_num_partitions=*/1);
+  REQUIRE(d.candidate);
+  REQUIRE(d.proposed_parts == 4);
+  REQUIRE(d.natural_parts == 1);
+}
+
+TEST_CASE("make_broadcast_partition_decision - non-candidates keep the natural partition count",
+          "[build_probe][broadcast]")
+{
+  uint64_t const small = 32u * 1024 * 1024;
+
+  SECTION("probe side never drives broadcast")
+  {
+    auto const d = make_broadcast_partition_decision(/*is_build_side=*/false, 4, 1024, small, 3);
+    REQUIRE_FALSE(d.candidate);
+    REQUIRE(d.proposed_parts == 3);
+  }
+  SECTION("single GPU is never a broadcast candidate")
+  {
+    auto const d = make_broadcast_partition_decision(/*is_build_side=*/true, 1, 1024, small, 1);
+    REQUIRE_FALSE(d.candidate);
+    REQUIRE(d.proposed_parts == 1);
+  }
+  SECTION("a build at or above the threshold is not small enough")
+  {
+    // Strict less-than: total == small_table_bytes is NOT a candidate.
+    auto const d = make_broadcast_partition_decision(/*is_build_side=*/true, 4, small, small, 2);
+    REQUIRE_FALSE(d.candidate);
+    REQUIRE(d.proposed_parts == 2);
+  }
+}
+
+TEST_CASE("make_broadcast_partition_decision - broadcast is finalized against join eligibility",
+          "[build_probe][broadcast]")
+{
+  auto const cand =
+    make_broadcast_partition_decision(/*is_build_side=*/true, 4, 1024, 32u * 1024 * 1024, 1);
+  REQUIRE(cand.candidate);
+
+  SECTION("candidate + join accepted BUILD_PROBE -> broadcast across num_gpus")
+  {
+    REQUIRE(cand.broadcast(/*is_build_probe=*/true));
+    REQUIRE(cand.num_partitions(/*is_build_probe=*/true, /*num_gpus=*/4) == 4);
+  }
+  SECTION("candidate + join rejected BUILD_PROBE (right/mixed) -> fall back to natural count")
+  {
+    REQUIRE_FALSE(cand.broadcast(/*is_build_probe=*/false));
+    REQUIRE(cand.num_partitions(/*is_build_probe=*/false, /*num_gpus=*/4) == 1);
+  }
+
+  SECTION("non-candidate never broadcasts even when BUILD_PROBE is accepted")
+  {
+    auto const non_cand = make_broadcast_partition_decision(/*is_build_side=*/true,
+                                                            4,
+                                                            64u * 1024 * 1024,
+                                                            /*small_table_bytes=*/32u * 1024 * 1024,
+                                                            /*natural_num_partitions=*/2);
+    REQUIRE_FALSE(non_cand.broadcast(/*is_build_probe=*/true));
+    REQUIRE(non_cand.num_partitions(/*is_build_probe=*/true, /*num_gpus=*/4) == 2);
+  }
 }

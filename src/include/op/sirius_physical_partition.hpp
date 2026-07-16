@@ -43,6 +43,45 @@ inline std::string partition_type_to_string(PartitionType type)
   return "UNKNOWN";
 }
 
+/// The broadcast-partitioning decision for a build/probe sibling pair, split into the two phases
+/// the runtime needs. Pure/unit-testable counterpart of the decision block in
+/// sirius_physical_partition::get_next_task_input_data.
+///
+/// A broadcast join replicates a *small* build table to every GPU (one hash table per GPU) instead
+/// of routing the whole build to a single GPU. The decision is two-phase because the partition
+/// count fed to update_join_exec_mode() must be chosen *before* the join reports whether it accepts
+/// BUILD_PROBE, and the final broadcast flag depends on that acceptance:
+///   1. `candidate` / `proposed_parts` are known up front (small build, multi-GPU, build side).
+///   2. `broadcast()` / `num_partitions()` finalize once `is_build_probe` is known.
+struct broadcast_partition_decision {
+  bool candidate;      ///< small build on multi-GPU, replicate-worthy before join eligibility
+  int proposed_parts;  ///< partition count to propose to update_join_exec_mode() (num_gpus if
+                       ///< candidate, else the natural count)
+  int natural_parts;   ///< the non-broadcast partition count (used when broadcast is not taken)
+
+  /// Broadcast is taken only when the candidate condition holds AND the join accepted BUILD_PROBE
+  /// for `proposed_parts` (right-family / mixed joins reject it, falling back to the natural
+  /// count).
+  [[nodiscard]] bool broadcast(bool is_build_probe) const { return candidate && is_build_probe; }
+
+  /// Final partition count: num_gpus when broadcasting, otherwise the natural count.
+  [[nodiscard]] int num_partitions(bool is_build_probe, std::size_t num_gpus) const
+  {
+    return broadcast(is_build_probe) ? static_cast<int>(num_gpus) : natural_parts;
+  }
+};
+
+/// Compute the up-front (phase 1) broadcast decision. `is_build_side` is whether the sizing
+/// partition drives the build side; only the build side can drive broadcast. A build smaller than
+/// `small_table_bytes` on more than one GPU is a broadcast candidate, in which case we propose one
+/// partition per GPU; otherwise we keep `natural_num_partitions`.
+[[nodiscard]] broadcast_partition_decision make_broadcast_partition_decision(
+  bool is_build_side,
+  std::size_t num_gpus,
+  uint64_t total_bytes,
+  uint64_t small_table_bytes,
+  int natural_num_partitions);
+
 class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;

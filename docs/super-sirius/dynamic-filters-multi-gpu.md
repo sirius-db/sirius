@@ -82,17 +82,21 @@ membership or AST kernel.
 
 ### Hash-join broadcast research
 
-The current `BUILD_PROBE` implementation does **not** broadcast one cuco hash
-table to every GPU. Its build and probe tasks are pinned to one real GPU; other
-join modes distribute partitions and migrate/co-locate their data batches. A
-cuco hash table cannot be copied as an opaque object because its wrapper contains
-device pointers and allocator/stream state.
+Sirius never copies one opaque cuco hash table across GPUs. A cuco hash table
+cannot be copied as an opaque object because its wrapper contains device
+pointers and allocator/stream state. Instead, the broadcast small-build-table
+join (`_broadcast`) replicates the small build *table* — the raw build batch —
+to every GPU and lets each GPU build its own hash table from it (see
+[operators.md](operators.md); `sirius_physical_partition.{cpp,hpp}`,
+`sirius_physical_hash_join.{cpp,hpp}`). Large / hash-partitioned joins still
+distribute partitions and migrate/co-locate their data batches, one hash table
+per partition pinned to `partition_idx % num_gpus`.
 
-The useful pattern is the same one used when broadcasting other GPU state: copy
-a flat, finalized representation and reconstruct the pointer-bearing owner on
-the destination. Dynamic filters implement that pattern entirely in Sirius.
-They do not copy a cuco wrapper and do not call or modify CuCascade's
-representation-transfer code.
+Dynamic filters use the same "copy a flat, finalized representation and
+reconstruct the pointer-bearing owner on the destination" pattern, but for the
+*filter*, not the hash table. They implement it entirely in Sirius; they do not
+copy a cuco wrapper and do not call or modify CuCascade's representation-transfer
+code.
 
 ## Implemented design
 
@@ -136,11 +140,19 @@ first queried `cudaDevAttrL2CacheSize`.
 metadata, and one materialized build view; it is not a shared scheduler service
 or a mutable routing registry.
 
-The build-port hook offers that view as soon as the single concat-folded
-`BUILD_PROBE` build batch arrives, acquiring the batch's read-only accessor
-before routing it so the GPU representation stays pinned against downgrade until
-publication completes. The hook and finalization arbitrate through a publication
-state machine independent of the hash-table build state:
+The build-port hook offers that view as soon as a concat-folded `BUILD_PROBE`
+build batch arrives, acquiring the batch's read-only accessor before routing it
+so the GPU representation stays pinned against downgrade until publication
+completes. In a single-partition join exactly one build batch arrives. In a
+**broadcast** join every partition holds the *full* replicated build, so each
+partition's concat_all-folded batch is a complete build side and races this hook
+on its own GPU; the `OPEN -> PUBLISHING` compare-exchange lets exactly one win
+(the first to arrive publishes and replicates; the others fall out at the CAS
+before doing any filter work). A genuinely hash-partitioned (non-broadcast)
+multi-partition build still disables pushdown — each partition holds only a
+slice, so no single batch could emit a complete filter. The hook and
+finalization arbitrate through a publication state machine independent of the
+hash-table build state:
 
 ```text
 OPEN --claim--> PUBLISHING --success--> FINISHED
