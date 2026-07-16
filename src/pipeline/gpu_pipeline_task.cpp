@@ -163,6 +163,48 @@ std::unique_ptr<op::operator_data> run_one_operator(
   nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
   auto start                = std::chrono::high_resolution_clock::now();
   auto operator_output_data = op.execute(operator_input_data, stream);
+
+  // Operator overlap: skip the stream sync for lightweight operators that
+  // don't produce data consumed by the next operator in the same task.
+  // This is controlled by SIRIUS_ENABLE_OPERATOR_OVERLAP (default: on).
+  // The sync is still required for operators that materialize GPU output
+  // consumed downstream (joins, aggregates, sort).
+  static bool const enable_overlap = [] {
+    char const* env = std::getenv("SIRIUS_ENABLE_OPERATOR_OVERLAP");
+    if (env) return env[0] == '1' || env[0] == 't' || env[0] == 'T';
+    return true;  // default: overlap enabled
+  }();
+
+  if (enable_overlap && num_operators > 1) {
+    // Check if this is a lightweight operator that can overlap with the next.
+    // Projection, filter, and scan operators produce output that the next
+    // operator reads — but the GPU kernel completes before the host returns
+    // from execute(), so we only need to sync for operators that do async
+    // memory operations the next operator depends on.
+    auto const op_type = op.get_type();
+    bool const needs_sync =
+      op_type == SiriusPhysicalOperatorType::HASH_JOIN ||
+      op_type == SiriusPhysicalOperatorType::MERGE_GROUP_BY ||
+      op_type == SiriusPhysicalOperatorType::SORT ||
+      op_type == SiriusPhysicalOperatorType::TOP_N ||
+      op_type == SiriusPhysicalOperatorType::MERGE_SORT ||
+      op_type == SiriusPhysicalOperatorType::PARTITION;
+    if (!needs_sync) {
+      // Don't sync — let the next operator start on the same stream.
+      // The stream ordering guarantees correctness: the next kernel on the
+      // same stream won't start until this one finishes.
+      auto end      = std::chrono::high_resolution_clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+      auto peak_bytes        = allocator ? allocator->get_peak_allocated_bytes(stream) : 0;
+      std::string extra_info = fmt::format(
+        "execution time: {:.2f} ms (overlapped), peak allocated: {} bytes ({:.2f} MB)",
+        duration.count() / 1000.0, peak_bytes,
+        static_cast<double>(peak_bytes) / (1024.0 * 1024.0));
+      log_operator_data(op, *operator_output_data, pipeline, task_id, "produced", extra_info);
+      return operator_output_data;
+    }
+  }
+
   stream.synchronize();
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

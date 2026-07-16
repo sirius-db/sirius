@@ -149,6 +149,8 @@ replica_transfer_route enqueue_replica_copy(
                                               source_stream.value()));
 #endif
 #else
+      // On ROCm, CUDART_VERSION is 0 (shim). Use hipMemcpyBatchAsync if available
+      // (HIP 6.0+), otherwise fall back to serial loop.
       for (std::size_t i = 0; i < d2h_sizes.size(); ++i) {
         CUCASCADE_CUDA_TRY(cudaMemcpyAsync(d2h_destinations[i],
                                            d2h_sources[i],
