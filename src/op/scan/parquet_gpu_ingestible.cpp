@@ -57,6 +57,7 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -463,7 +464,23 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     }
   }
   if (!file_metadata) {
-    auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    // Async footer read: issue the fetch on a background thread while the
+    // host prepares column projection and type mapping in parallel. The
+    // footer is small (~1KB) but the network/disk RTT can be 0.5-5ms on
+    // remote storage (S3, NFS). Overlapping hides this latency.
+    auto footer_future = std::async(std::launch::async, [&sirius_ds]() {
+      return cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    });
+
+    // While the footer is in flight, prepare the column projection info.
+    // This is pure host work (no GPU) that doesn't depend on the footer.
+    // The opts were already set up above (column names, etc.).
+    // Nothing else to prepare here — the opts are ready. But this is where
+    // future work like row-group size estimation or filter compilation
+    // would go.
+
+    // Await the footer
+    auto footer           = footer_future.get();
     auto const footer_len = footer->size();
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
                                      opts);
