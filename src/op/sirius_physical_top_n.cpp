@@ -310,6 +310,7 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::get_next_task_input_
   std::lock_guard<std::mutex> lg(lock);
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   bool found_batch = true;
+  if (ports.empty() || !ports.begin()->second->repo) { return nullptr; }
   while (found_batch) {
     auto batch = ports.begin()->second->repo->pop_next_data_batch();
     if (batch) {

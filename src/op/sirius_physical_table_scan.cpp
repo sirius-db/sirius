@@ -76,6 +76,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
   // overhead and improve GPU utilization. The batches are concatenated into one
   // table in execute().
   D_ASSERT(ports.size() == 1);
+  if (ports.empty()) throw std::runtime_error("table_scan: no ports");
   auto& [port_name, port_ptr] = *ports.begin();
 
   std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;

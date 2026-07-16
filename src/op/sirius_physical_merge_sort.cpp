@@ -59,6 +59,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
   // Follows the same pattern as sirius_physical_grouped_aggregate_merge.
   std::lock_guard<std::mutex> lg(_drain_mutex);
 
+  if (ports.empty() || !ports.begin()->second->repo) { return nullptr; }
   auto* repo = ports.begin()->second->repo;
   if (_current_partition_index < repo->num_partitions()) {
     std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
