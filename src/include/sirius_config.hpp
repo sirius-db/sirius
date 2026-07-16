@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "creator/config.hpp"
 #include "exec/config.hpp"
 #include "exec/inspectable_mpsc.hpp"
 #include "scan_manager/config.hpp"
@@ -145,7 +146,7 @@ struct sirius_config {
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_task_creator_config() const noexcept;
+  [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
@@ -187,8 +188,7 @@ struct sirius_config {
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
-  exec::thread_pool_config _task_creator_config{.num_threads        = 2,
-                                                .thread_name_prefix = "task_creator"};
+  creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
