@@ -100,6 +100,28 @@ constexpr uint32_t MIN_ROWS_PER_CHUNK =
        ///< per chunk -> 8 rows per warp at this minimum.
 constexpr uint32_t MAX_BITPACKING_WIDTH = 32;
 
+/// Returns an optimal kernel block dimension for the current GPU.
+/// On AMD (wavefront=64): 384 (6 wavefronts — good occupancy on MI300's
+/// 8-wavefront-per-CU scheduler, better latency hiding than 256=4 wavefronts).
+/// On NVIDIA (warp=32): 256 (8 warps — unchanged from default).
+/// The returned value is always a multiple of the warp size and >= 64.
+/// Override via SIRIUS_KERNEL_BLOCK_DIM env var.
+inline uint32_t adaptive_block_dim() {
+  // Check env override first
+  if (auto* env = std::getenv("SIRIUS_KERNEL_BLOCK_DIM")) {
+    int v = std::atoi(env);
+    if (v >= 64) return static_cast<uint32_t>(v);
+  }
+  int device = 0;
+  cudaGetDevice(&device);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, device);
+  uint32_t warp = prop.warpSize > 0 ? static_cast<uint32_t>(prop.warpSize) : 64;
+  // On AMD (warp=64): 384 = 6 wavefronts. On NVIDIA (warp=32): 256 = 8 warps.
+  if (warp >= 64) return 384;
+  return 256;
+}
+
 /// Above this, take the exact-total sync rather than trust the host upper
 /// bound — a pathological max_string_length could otherwise force a GB-class
 /// over-allocation.

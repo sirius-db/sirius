@@ -130,8 +130,26 @@ void gpu_config::compute_tuning() {
   std::size_t const MB = 1024 * 1024;
   std::size_t const GB = 1024ULL * 1024 * 1024;
 
-  // RMM pool: 75% of VRAM (leaves 25% for HIP runtime + kernel launch)
-  tune_.rmm_pool_size = hw_.total_vram * 3 / 4;
+  // Detect multi-GPU configuration for pool sizing.
+  // On multi-GPU systems, each GPU's pool must leave room for peer-access
+  // overhead and cross-GPU transfer buffers.
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count <= 0) device_count = 1;
+
+  // RMM pool: scale down on multi-GPU to leave room for peer access.
+  // Single GPU: 75%. 2 GPUs: 70%. 4+: 60%.
+  double pool_fraction;
+  if (device_count <= 1) {
+    pool_fraction = 0.75;
+  } else if (device_count <= 2) {
+    pool_fraction = 0.70;
+  } else if (device_count <= 4) {
+    pool_fraction = 0.65;
+  } else {
+    pool_fraction = 0.60;
+  }
+  tune_.rmm_pool_size = static_cast<std::size_t>(hw_.total_vram * pool_fraction);
 
   // Max batch size for Parquet reads: 25% of VRAM, capped at 512MB minimum
   tune_.max_batch_bytes = std::max(hw_.total_vram / 4, 512 * MB);
