@@ -52,6 +52,10 @@ void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
   auto it  = _slots.find(uid);
   if (it == _slots.end()) { return; }
   auto& state = *it->second;
+  // Cached batches always reach post_filter_and_project unfiltered, so the
+  // op's row filter (when present) runs against every drained split — record
+  // that so each split's working-set estimate covers the filter-by-copy peak.
+  state.row_filter_pending = scan_op->get_ingestible().has_row_filter();
   state.attach_batch_provider(std::move(provider));
 }
 
@@ -161,18 +165,22 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  drain_cached_provider(*state.batch_provider, *state.connector, stop);
+  drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
 }
 
 void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
                                                                 split_connector& connector,
-                                                                std::stop_token const& stop)
+                                                                std::stop_token const& stop,
+                                                                bool row_filter_pending)
 {
   try {
     while (!stop.stop_requested()) {
-      auto databatch = provider.get_next_batch();
-      if (!databatch) { break; }
-      connector.push_split(std::make_unique<op::scan::scan_operator_input>(std::move(databatch)));
+      auto next = provider.get_next_batch();
+      if (!next.data) { break; }
+      auto split            = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
+      split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
+      split->row_filter_pending = row_filter_pending;
+      connector.push_split(std::move(split));
     }
     connector.close();
   } catch (...) {

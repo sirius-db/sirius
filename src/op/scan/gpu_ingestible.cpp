@@ -18,7 +18,12 @@
 
 #include <data/data_batch_utils.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/host_keep_mask.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+
+#include <stdexcept>
+#include <string>
+#include <utility>
 
 namespace sirius::op::scan {
 
@@ -33,6 +38,25 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     auto batch  = split.get_cached_batch();
     auto rbatch = batch->to_read_only();
     auto view   = get_cudf_table_view(rbatch);
+    if (split.mvcc_keep_mask.has_mask()) {
+      auto const& mask = split.mvcc_keep_mask;
+      if (mask.row_count != static_cast<std::size_t>(view.num_rows())) {
+        throw std::runtime_error("[gpu_ingestible::materialize_table] mvcc keep-mask covers " +
+                                 std::to_string(mask.row_count) +
+                                 " rows but the cached chunk has " +
+                                 std::to_string(view.num_rows()));
+      }
+      auto masked = apply_host_keep_bitmask(
+        view, mask.view(), mask.row_count, stream, mem_space->get_default_allocator());
+      // The pinned mask words feed a true-async H2D DMA, and for a HOST-tier
+      // chunk `rbatch` owns the staged device copy the filter kernel reads —
+      // neither release is ordered against the stream once this branch
+      // returns. Await the mask work before dropping them, the same
+      // discipline the duckdb-native decoder uses for its staging buffers
+      // (submit_and_await).
+      stream.synchronize();
+      return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
+    }
     return {.table = owning_table_view{std::move(rbatch), view}, .state = filter_state::UNFILTERED};
   }
 }

@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -67,10 +68,14 @@ namespace {
 
 struct cached_databatch_provider : public databatch_provider {
   cached_databatch_provider(pinned_entry const& entry,
-                            std::span<size_t> selected_columns,
+                            std::span<std::size_t const> selected_columns,
                             cached_scan_plan plan,
-                            const telemetry::batch_telemetry_info& telemetry_info)
-    : _plan(std::move(plan)), _entry(entry), _telemetry_info(telemetry_info)
+                            const telemetry::batch_telemetry_info& telemetry_info,
+                            mvcc_chunk_mask_set mvcc_masks)
+    : _plan(std::move(plan)),
+      _entry(entry),
+      _telemetry_info(telemetry_info),
+      _mvcc_masks(std::move(mvcc_masks))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -79,18 +84,21 @@ struct cached_databatch_provider : public databatch_provider {
     });
   }
 
-  std::shared_ptr<cucascade::data_batch> get_next_batch() override
+  databatch_provider::batch get_next_batch() override
   {
     // The atomic cursor walks survivor positions, each mapping to a chunk index.
     auto const cursor = _index.fetch_add(1);
-    if (cursor >= _plan.survivor_chunk_indices.size()) { return nullptr; }
+    if (cursor >= _plan.survivor_chunk_indices.size()) { return {}; }
     auto const index = _plan.survivor_chunk_indices[cursor];
+    std::shared_ptr<cucascade::data_batch> data;
     if (_entry.tier == cucascade::memory::Tier::GPU) {
-      return get_device_databatch(index);
+      data = get_device_databatch(index);
     } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      return get_host_databatch(index);
+      data = get_host_databatch(index);
     }
-    return nullptr;
+    if (!data) { return {}; }
+    auto mask = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
+    return {std::move(data), std::move(mask)};
   }
 
  private:
@@ -137,6 +145,9 @@ struct cached_databatch_provider : public databatch_provider {
   std::vector<size_t> _column_indices;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
+  /// This provider's own copy of the entry's per-chunk keep-masks (empty for
+  /// parquet pins); word storage is shared through each mask's owning pointer.
+  mvcc_chunk_mask_set _mvcc_masks;
   std::atomic<std::size_t> _index{0};
 };
 
@@ -156,16 +167,6 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
     return {p->table_filters.get(), &p->column_ids};
   }
   return {};
-}
-
-std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry,
-  std::span<size_t> selected_columns,
-  cached_scan_plan plan,
-  const telemetry::batch_telemetry_info& telemetry_info)
-{
-  return std::make_unique<cached_databatch_provider>(
-    entry, selected_columns, std::move(plan), telemetry_info);
 }
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
@@ -350,15 +351,19 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
+  std::vector<cached_assignment> cached_assignments;
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
     _metadata_processor->register_pipeline(op, round_robin);
-    // On a pinned-cache hit the coalescer serves this operator from the cached
+    // On a pinned-cache hit the coalescer serves this operator from a cached
     // batch_provider (process_cached_entries); skip the disk-reading
-    // split_provider entirely so no read is issued for the cached scan.
-    if (try_assign_cached_entries(op)) {
+    // split_provider entirely so no read is issued for the cached scan. The
+    // provider itself is built after the mask jobs run (below), so it can
+    // take a copy of the entry's finished mask set.
+    if (auto assignment = try_match_cached_entry(op)) {
+      cached_assignments.push_back(std::move(*assignment));
       _scan_op_order.push_back(op);
       continue;
     }
@@ -381,6 +386,46 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       "[sirius_scan_manager::prepare_for_query] no GPU scan operators found in query");
     return;
   }
+
+  // Compute this query's duckdb MVCC keep-masks BEFORE serving starts, so
+  // masks are finished plain buffers when the sequencer runs (it walks all
+  // ops' slots serially; a wait there would be head-of-line blocking across
+  // every scan op). The dispatcher is fresh and otherwise idle here. Errors
+  // are loud: past the plan-time gate there is no CPU fallback, and the
+  // alternative to failing is serving rows a concurrent DELETE removed.
+  if (!_pending_mvcc_mask_jobs.empty()) {
+    run_mvcc_mask_jobs(
+      _pending_mvcc_mask_jobs, *_dispatcher, _reservation_manager, *_topology_index);
+  }
+
+  // Provider handoff, deferred to behind the mask run so ownership is a
+  // sequential handoff instead of sharing: each matched op's provider takes
+  // its own copy of its entry's completed set (slot-sized — word storage is
+  // shared through the masks' owning pointers), then the requests release
+  // theirs. The sequencer only spawns in start_metadata_processing, so
+  // serving still starts with finished masks.
+  for (auto& assignment : cached_assignments) {
+    mvcc_chunk_mask_set masks;  // stays empty for parquet pins
+    if (assignment.entry->mvcc != nullptr) {
+      auto request = std::ranges::find_if(
+        _pending_mvcc_mask_jobs,
+        [&](mvcc_mask_job_request const& r) { return r.entry_name == assignment.entry_name; });
+      if (request == _pending_mvcc_mask_jobs.end()) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::prepare_for_query] no mask job was queued for mvcc-pinned "
+          "entry '" +
+          assignment.entry_name + "'");
+      }
+      masks = request->masks;
+    }
+    auto provider = make_provider_for_pinned_entry(*assignment.entry,
+                                                   assignment.columns,
+                                                   std::move(assignment.plan),
+                                                   assignment.op->batch_telemetry(),
+                                                   std::move(masks));
+    _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
+  }
+  _pending_mvcc_mask_jobs.clear();
 
   start_metadata_processing();
 }
@@ -511,6 +556,7 @@ void sirius_scan_manager::reset()
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
   _providers_by_op.clear();
+  _pending_mvcc_mask_jobs.clear();
   _metadata_processor.reset();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }
@@ -610,23 +656,41 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
     std::sort(these_files.begin(), these_files.end());
     std::sort(those_files.begin(), those_files.end());
     if (these_files != those_files) { return {}; }
-    return column_superset_projection(column_ids, p->column_ids);
+    return column_projection_for(p->column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
-    // Same duckdb table by qualified name (catalog.schema.table), derived on both
-    // pin and query sides from the resolved DuckTableEntry — so the stored casing is
-    // the table's canonical (case-preserved) name on both sides and a byte-exact
-    // compare is correct. (If a future site ever populates these from parsed input
-    // rather than the resolved entry, switch to a case-insensitive compare.)
-    // A parquet cache has an empty table_name, so it never matches a duckdb scan.
-    if (table_name.empty()) { return {}; }
-    if (catalog_name != d->catalog_name || schema_name != d->schema_name ||
-        table_name != d->table_name) {
-      return {};
-    }
-    return column_superset_projection(column_ids, d->column_ids);
+    if (!matches_duckdb_table(d->catalog_name, d->schema_name, d->table_name)) { return {}; }
+    return column_projection_for(d->column_ids);
   }
   return {};
+}
+
+bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
+                                            std::string_view schema,
+                                            std::string_view table) const
+{
+  // Same duckdb table by qualified name (catalog.schema.table), derived on both
+  // pin and query sides from the resolved DuckTableEntry — so the stored casing is
+  // the table's canonical (case-preserved) name on both sides and a byte-exact
+  // compare is correct. (If a future site ever populates these from parsed input
+  // rather than the resolved entry, switch to a case-insensitive compare.)
+  // A parquet cache has an empty table_name, so it never matches a duckdb scan.
+  if (table_name.empty()) { return false; }
+  return catalog_name == catalog && schema_name == schema && table_name == table;
+}
+
+std::vector<std::size_t> cache_entry_info::column_projection_for(
+  duckdb::vector<duckdb::ColumnIndex> const& requested_ids) const
+{
+  for (auto const& c : requested_ids) {
+    // rowid/virtual/empty/field-identifier columns are never cached; a
+    // request for one is a miss. (GetPrimaryIndex on such an index is a
+    // sentinel — or a throw for field identifiers — not a real column.)
+    if (!c.HasPrimaryIndex() || c.IsRowIdColumn() || c.IsVirtualColumn() || c.IsEmptyColumn()) {
+      return {};
+    }
+  }
+  return column_superset_projection(column_ids, requested_ids);
 }
 
 void sirius_scan_manager::insert_pinned_entry(
@@ -912,6 +976,17 @@ void sirius_scan_manager::visit_pinned_entries(
   }
 }
 
+pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
+  std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const
+{
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (entry.cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns)
 {
@@ -949,6 +1024,17 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   }
 
   throw std::runtime_error("pinned entry has an unsupported tier");
+}
+
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  cached_scan_plan plan,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  mvcc_chunk_mask_set mvcc_masks)
+{
+  return std::make_unique<cached_databatch_provider>(
+    entry, selected_columns, std::move(plan), telemetry_info, std::move(mvcc_masks));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
@@ -1031,21 +1117,30 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
   return plan;
 }
 
-bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
+std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_match_cached_entry(
+  op::scan::sirius_gpu_scan_operator* op)
 {
   const auto& table_info = op->get_ingestible().table_info();
 
-  try {
-    for (auto const& [pinned_name, entry] : _pinned_entries) {
-      // Identity + serviceability gate: empty when this cache cannot serve the scan
-      // (wrong format / file-set / table, or missing a requested column).
-      if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
+  for (auto const& [pinned_name, entry] : _pinned_entries) {
+    // Identity + serviceability gate: empty when this cache cannot serve the scan
+    // (wrong format / file-set / table, or missing a requested column).
+    if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
+    // Cache-or-CPU: for duckdb pins with MVCC metadata, the plan-time guards
+    // promised this scan serves from the pin — the disk-native path is
+    // MVCC-blind and increasingly stale under the pin's checkpoint
+    // suppression, so any failure past the identity gate is a loud error,
+    // never a silent disk fallback.
+    bool const mvcc_strict = entry.mvcc != nullptr;
+    try {
       // Serve cached columns in the ingestible's materialized (disk-decode) order rather
       // than raw column_ids order, so post_filter_and_project's index-based filter and
       // projection bind to the same columns they would on the disk read path.
       auto cols = gather_by_primary_index(entry.cache_info.column_ids,
                                           op->get_ingestible().materialized_column_order());
-      if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
+      if (cols.empty()) {
+        throw std::runtime_error("materialized column set is not a subset of the cached columns");
+      }
       // Serve-time defense: a malformed entry would end the cached batch stream
       // early (nullptr mid-stream reads as end-of-stream) and silently truncate
       // the scan; validate up front so it throws here and the catch below falls
@@ -1072,27 +1167,81 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
           pinned_name,
           total_chunks);
       }
-      auto provider =
-        make_provider_for_pinned_entry(entry, cols, std::move(plan), op->batch_telemetry());
-      _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
+
+      if (entry.mvcc) {
+        auto const* duckdb_info =
+          dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info);
+        if (duckdb_info == nullptr || duckdb_info->storage == nullptr ||
+            duckdb_info->context == nullptr) {
+          throw std::runtime_error("mvcc-pinned entry matched a scan without duckdb table state");
+        }
+        auto const n_chunks      = entry.mvcc->base_row_count_per_chunk.size();
+        auto const stored_chunks = entry.tier == cucascade::memory::Tier::GPU
+                                     ? (entry.data_batches_by_column.empty()
+                                          ? 0
+                                          : entry.data_batches_by_column.begin()->second.size())
+                                     : entry.host_chunks.size();
+        if (stored_chunks != n_chunks) {
+          // Pin-time metadata and entry chunks are kept in lock-step (the
+          // insert merge-path guard); a mismatch means masks would bind to
+          // the wrong rows.
+          throw std::runtime_error("mvcc metadata covers " + std::to_string(n_chunks) +
+                                   " chunk(s) but the entry stores " +
+                                   std::to_string(stored_chunks));
+        }
+        // One mask job per entry per query: a second scan op over the same
+        // entry (e.g. a self-join) shares the pending job's completed set at
+        // handoff instead of re-running the capture+fill walk.
+        auto const already_pending = std::ranges::any_of(
+          _pending_mvcc_mask_jobs,
+          [&](mvcc_mask_job_request const& r) { return r.entry_name == pinned_name; });
+        if (already_pending) {
+          SIRIUS_LOG_INFO(
+            "[sirius_scan_manager] operator '{}' shares pinned entry '{}''s pending mvcc mask "
+            "job",
+            op->get_operator_id(),
+            pinned_name);
+        } else {
+          mvcc_mask_job_request request;
+          request.masks    = mvcc_chunk_mask_set(n_chunks);
+          request.metadata = *entry.mvcc;
+          request.storage  = duckdb_info->storage;
+          request.context  = duckdb_info->context;
+          request.chunk_spaces =
+            entry.tier == cucascade::memory::Tier::GPU
+              ? entry.chunk_memory_spaces
+              : std::vector<cucascade::memory::memory_space*>(n_chunks, entry.memory_space);
+          request.entry_name = pinned_name;
+          _pending_mvcc_mask_jobs.push_back(std::move(request));
+        }
+      }
+
       SIRIUS_LOG_INFO("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
                       pinned_name,
                       op->get_operator_id());
-      return true;
+      return cached_assignment{op, &entry, std::move(cols), pinned_name, std::move(plan)};
+    } catch (std::exception const& e) {
+      if (mvcc_strict) {
+        throw std::runtime_error("[sirius_scan_manager] mvcc-pinned entry '" + pinned_name +
+                                 "' matched operator '" + std::to_string(op->get_operator_id()) +
+                                 "' but cannot serve from the cache: " + e.what());
+      }
+      SIRIUS_LOG_ERROR(
+        "[sirius_scan_manager] error while trying to assign cached entries to "
+        "operator '{}': {}",
+        op->get_operator_id(),
+        e.what());
+      return std::nullopt;
+    } catch (...) {
+      if (mvcc_strict) { throw; }
+      SIRIUS_LOG_ERROR(
+        "[sirius_scan_manager] error while trying to assign cached entries to "
+        "operator '{}'",
+        op->get_operator_id());
+      return std::nullopt;
     }
-  } catch (std::exception const& e) {
-    SIRIUS_LOG_ERROR(
-      "[sirius_scan_manager] error while trying to assign cached entries to "
-      "operator '{}': {}",
-      op->get_operator_id(),
-      e.what());
-  } catch (...) {
-    SIRIUS_LOG_ERROR(
-      "[sirius_scan_manager] error while trying to assign cached entries to "
-      "operator '{}'",
-      op->get_operator_id());
   }
-  return false;
+  return std::nullopt;
 }
 
 }  // namespace sirius::scan_manager
