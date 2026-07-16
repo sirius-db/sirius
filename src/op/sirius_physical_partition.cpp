@@ -421,7 +421,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         sizing_partition._is_build, num_gpus, total_bytes, _small_table_bytes, num_parts);
 
       if (sizing_partition._is_build) {
-        hash_join.update_join_exec_mode(decision.proposed_parts, total_bytes, build_foldable);
+        hash_join.update_join_exec_mode(
+          decision.proposed_parts, total_bytes, build_foldable, decision.candidate);
       }
       bool const is_build_probe = _hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
                                   hash_join.is_build_probe_mode();

@@ -102,16 +102,27 @@ struct build_probe_decision {
   std::vector<build_probe_slot_view> const& slots);
 
 /// Whether a join is eligible to run in BUILD_PROBE mode. Mirrors the gate in
-/// update_join_exec_mode: at most one partition per GPU, each partition's average build side fits a
-/// single hash table, the build side folds to one batch per partition, and the join is neither a
-/// right-family nor a mixed join.
+/// update_join_exec_mode: at most one partition per GPU, each GPU's hash table fits a single hash
+/// table, the build side folds to one batch per partition, and the join is not a right-family,
+/// mixed, or full-outer join.
+///
+/// `is_broadcast` selects how the build size is charged: a broadcast join replicates the ENTIRE
+/// build to every GPU, so each GPU's hash table is the full `build_side_bytes`; a hash-partitioned
+/// build splits across partitions, so the per-partition average applies.
+///
+/// `is_full_outer` (OUTER) is excluded: BUILD_PROBE streams probe batches and calls `full_join`
+/// per batch, emitting unmatched build rows on every batch (and, under broadcast/partitioning, on
+/// every GPU) with no global accumulation — so it over-emits build-side rows. Full outer joins run
+/// on the STANDARD path instead.
 [[nodiscard]] bool build_probe_mode_eligible(int num_partitions,
                                              uint64_t build_side_bytes,
                                              bool build_foldable_to_single_batch,
                                              bool is_right_family,
                                              bool is_mixed_join,
                                              int num_gpus,
-                                             uint64_t max_build_hash_table_bytes);
+                                             uint64_t max_build_hash_table_bytes,
+                                             bool is_full_outer = false,
+                                             bool is_broadcast  = false);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
@@ -222,9 +233,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   ///        runtime-side build-batch invariant in get_next_task_input_data_for_build_probe
   ///        would throw on otherwise-valid small-build joins that are still split into
   ///        multiple batches, so BUILD_PROBE is not entered.
+  /// @param is_broadcast_candidate True when the partition operator intends to replicate the whole
+  ///        (small) build table to every GPU. The build size is then charged in full against
+  ///        max_build_hash_table_bytes (each GPU builds the entire table), not per-partition.
   void update_join_exec_mode(int num_partitions,
                              uint64_t build_side_bytes,
-                             bool build_foldable_to_single_batch);
+                             bool build_foldable_to_single_batch,
+                             bool is_broadcast_candidate = false);
 
   /// @brief Inform the join how many GPUs the query runs on. Set at plan time.
   ///

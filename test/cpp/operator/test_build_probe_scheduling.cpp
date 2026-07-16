@@ -121,6 +121,44 @@ TEST_CASE("build_probe_mode_eligible - excluded join shapes and unfoldable build
   // Build side that cannot fold to a single batch per partition.
   REQUIRE_FALSE(build_probe_mode_eligible(
     1, k100MB, /*build_foldable=*/false, false, false, 1, kMaxBuildBytes));
+  // Full outer joins are excluded: streamed full_join over-emits unmatched build rows per batch.
+  REQUIRE_FALSE(build_probe_mode_eligible(1,
+                                          k100MB,
+                                          true,
+                                          false,
+                                          false,
+                                          1,
+                                          kMaxBuildBytes,
+                                          /*is_full_outer=*/true));
+  // The exclusion holds under multi-partition too (one partition per GPU).
+  REQUIRE_FALSE(build_probe_mode_eligible(
+    4, 4 * k100MB, true, false, false, 4, kMaxBuildBytes, /*is_full_outer=*/true));
+}
+
+TEST_CASE(
+  "build_probe_mode_eligible - broadcast charges the FULL build size, not a partition slice",
+  "[hash_join][build_probe][unit][broadcast]")
+{
+  // 4 GPUs, 400 MB build. Per-partition average is 100 MB; the full replicated build is 400 MB.
+  // With a 150 MB cap, a hash-partitioned build (100 MB/partition) fits, but a broadcast build
+  // (400 MB on every GPU) does not.
+  uint64_t const cap   = 150 * k100MB / 100;  // 150 MB
+  uint64_t const total = 4 * k100MB;          // 400 MB
+  REQUIRE(build_probe_mode_eligible(
+    4, total, true, false, false, 4, cap, /*is_full_outer=*/false, /*is_broadcast=*/false));
+  REQUIRE_FALSE(build_probe_mode_eligible(
+    4, total, true, false, false, 4, cap, /*is_full_outer=*/false, /*is_broadcast=*/true));
+
+  // A genuinely small broadcast build (full size under the cap) stays eligible.
+  REQUIRE(build_probe_mode_eligible(2,
+                                    k100MB,
+                                    true,
+                                    false,
+                                    false,
+                                    2,
+                                    kMaxBuildBytes,
+                                    /*is_full_outer=*/false,
+                                    /*is_broadcast=*/true));
 }
 
 TEST_CASE("build_probe_mode_eligible - degenerate counts are precondition violations that throw",

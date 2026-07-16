@@ -482,7 +482,9 @@ bool build_probe_mode_eligible(int num_partitions,
                                bool is_right_family,
                                bool is_mixed_join,
                                int num_gpus,
-                               uint64_t max_build_hash_table_bytes)
+                               uint64_t max_build_hash_table_bytes,
+                               bool is_full_outer,
+                               bool is_broadcast)
 {
   // Invariants: determine_num_partitions() never returns < 1, and _num_gpus defaults to 1 and is
   // only ever set to a hardware GPU count >= 1. A value < 1 is a programming error (and would make
@@ -495,23 +497,32 @@ bool build_probe_mode_eligible(int num_partitions,
   // One hash table per partition, one partition per GPU: at most num_gpus partitions. With
   // num_gpus == 1 this reduces to the historical single-partition rule.
   if (num_partitions > num_gpus) { return false; }
-  // Each partition holds its own hash table, so gate on the per-partition average build side.
-  uint64_t const per_partition_bytes = build_side_bytes / static_cast<uint64_t>(num_partitions);
-  return per_partition_bytes < max_build_hash_table_bytes && build_foldable_to_single_batch &&
-         !is_right_family && !is_mixed_join;
+  // A broadcast join replicates the ENTIRE build table to every GPU, so each GPU's hash table is
+  // the full build side — charge the full size against the limit. A hash-partitioned build splits
+  // across partitions, so gate on the per-partition average instead.
+  uint64_t const per_gpu_build_bytes =
+    is_broadcast ? build_side_bytes : build_side_bytes / static_cast<uint64_t>(num_partitions);
+  // Full outer (OUTER) is excluded: BUILD_PROBE streams probe batches and calls full_join per
+  // batch, emitting unmatched build rows on every batch (and, under broadcast/partitioning, on
+  // every GPU) with no global accumulation — so it over-emits build-side rows. Full outer joins
+  // run on the STANDARD path.
+  return per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable_to_single_batch &&
+         !is_right_family && !is_mixed_join && !is_full_outer;
 }
 
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
                                                       uint64_t build_side_bytes,
-                                                      bool build_foldable_to_single_batch)
+                                                      bool build_foldable_to_single_batch,
+                                                      bool is_broadcast_candidate)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   // MARK/SEMI/ANTI joins are eligible for BUILD_PROBE: a persistent cudf::filtered_join is built
   // once on the right (filter) side and reused across streamed left probe batches via
   // semi_join/anti_join, which return probe-side (left) match indices.
-  // RIGHT_SEMI/RIGHT_ANTI/RIGHT remain excluded: they emit build-side (right) output, which would
-  // require the persistent table on the left plus cross-batch accumulation, incompatible with the
-  // build-on-right / stream-left model.
+  // RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER remain excluded: they emit build-side (right)
+  // output, which would require the persistent table on the left plus cross-batch (and, on
+  // multi-GPU, cross-partition/cross-GPU) accumulation of unmatched build rows, incompatible with
+  // the build-on-right / stream-left model. Those run on the STANDARD path.
   //
   // On multi-GPU we keep one hash table per partition (one partition per GPU), so BUILD_PROBE is
   // admitted for up to num_gpus partitions rather than only one. The build_foldable_to_single_batch
@@ -524,7 +535,9 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
                                 is_right_family(),
                                 _join_mode == HASH_JOIN_MODE::MIXED_JOIN,
                                 _num_gpus,
-                                _max_build_hash_table_bytes)) {
+                                _max_build_hash_table_bytes,
+                                /*is_full_outer=*/join_type == duckdb::JoinType::OUTER,
+                                /*is_broadcast=*/is_broadcast_candidate)) {
     _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
     // One hash-table slot per partition. Elements are non-movable (atomic build_state), so build a
     // fresh right-sized vector and move-assign it (steals the buffer, no element moves).
