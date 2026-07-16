@@ -56,19 +56,6 @@ namespace sirius::op::scan {
 
 namespace {
 
-/// SIRIUS_METADATA_PARSE_CHUNK: row groups per metadata parse range (the parallel-walk unit).
-std::size_t metadata_parse_chunk()
-{
-  constexpr std::size_t kDefaultParseChunk = 8;
-  if (const char* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
-    try {
-      if (const auto v = std::stoull(env); v > 0) return static_cast<std::size_t>(v);
-    } catch (...) { /* fall through to default */
-    }
-  }
-  return kDefaultParseChunk;
-}
-
 //===----------Batch Coalescer----------===//
 class duckdb_native_batch_coalescer : public batch_coalescer {
  public:

@@ -60,6 +60,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <source_location>
 #include <string>
 
@@ -432,8 +433,31 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
+/// Clears SIRIUS_DISABLE while a test's engine state is alive, then restores
+/// it. The harness keeps SIRIUS_DISABLE=1 so untagged tests' DuckDB instances
+/// don't auto-initialize a SiriusContext; leaking the unset would let later
+/// tests' queries run transparently on the GPU.
+struct scoped_sirius_disable_clear {
+  scoped_sirius_disable_clear()
+  {
+    if (const char* val = ::getenv("SIRIUS_DISABLE")) { _saved = val; }
+    unsetenv("SIRIUS_DISABLE");
+  }
+  ~scoped_sirius_disable_clear()
+  {
+    if (_saved) { setenv("SIRIUS_DISABLE", _saved->c_str(), 1); }
+  }
+  scoped_sirius_disable_clear(const scoped_sirius_disable_clear&)            = delete;
+  scoped_sirius_disable_clear& operator=(const scoped_sirius_disable_clear&) = delete;
+
+ private:
+  std::optional<std::string> _saved;
+};
+
 /// Helper struct to hold initialized engine state for tests.
 struct engine_test_state {
+  // First member: restored last, after the DuckDB instance is gone.
+  std::unique_ptr<scoped_sirius_disable_clear> disable_guard;
   std::unique_ptr<scoped_temp_db_path> db_path;
   duckdb::unique_ptr<DuckDB> db;
   duckdb::unique_ptr<Connection> con;
@@ -452,9 +476,9 @@ engine_test_state setup_and_initialize(const std::string& query)
   engine_test_state state;
   set_test_config_env();
   Config::MODIFIED_PIPELINE = true;
-  unsetenv("SIRIUS_DISABLE");
-  state.db_path = std::make_unique<scoped_temp_db_path>();
-  state.db      = duckdb::make_uniq<DuckDB>(state.db_path->path());
+  state.disable_guard       = std::make_unique<scoped_sirius_disable_clear>();
+  state.db_path             = std::make_unique<scoped_temp_db_path>();
+  state.db                  = duckdb::make_uniq<DuckDB>(state.db_path->path());
   safe_load_extension(*state.db);
   state.con = duckdb::make_uniq<Connection>(*state.db);
   safe_init_gpu_buffer(*state.con);
