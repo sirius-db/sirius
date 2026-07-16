@@ -110,6 +110,9 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "util/segfault_backtrace.hpp"
+#include "vss/cuvs_index_cache.hpp"
+#include "vss/distance_metric.hpp"
+#include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search.hpp"
 
@@ -1688,6 +1691,199 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct CreateAnnIndexData : public TableFunctionData {
+  std::string table_name;
+  std::string column_name;
+  std::string index_name;                ///< management name (for a future drop_ann_index)
+  std::string index_type  = "ivf_flat";  ///< lowercased; only "ivf_flat" supported today
+  std::string metric      = "l2sq";      ///< lowercased; one of l2sq / cosine
+  std::string schema_name = "main";
+  int64_t n_lists         = 0;  ///< IVF-Flat list count; 0 = choose a default at build time
+  bool finished           = false;
+};
+
+static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
+                                                         TableFunctionBindInput& input,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<string>& names)
+{
+  auto result = make_uniq<CreateAnnIndexData>();
+
+  if (input.inputs.size() < 2 || input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+    throw BinderException(
+      "sirius_create_ann_index requires two non-NULL positional arguments: table and column");
+  }
+  result->table_name  = input.inputs[0].ToString();
+  result->column_name = input.inputs[1].ToString();
+
+  for (auto& kv : input.named_parameters) {
+    auto const key = StringUtil::Lower(kv.first);
+    if (kv.second.IsNull()) {
+      throw BinderException("sirius_create_ann_index: named parameter '" + kv.first +
+                            "' cannot be NULL");
+    }
+    if (key == "name") {
+      result->index_name = kv.second.ToString();
+    } else if (key == "metric") {
+      result->metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "index_type") {
+      result->index_type = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "n_lists") {
+      result->n_lists = kv.second.GetValue<int64_t>();
+    } else if (key == "schema_name") {
+      result->schema_name = kv.second.ToString();
+    }
+  }
+
+  if (result->index_type != "ivf_flat") {
+    throw BinderException("sirius_create_ann_index: unsupported index_type '" + result->index_type +
+                          "'; only 'ivf_flat' is supported");
+  }
+  if (result->metric != "l2sq" && result->metric != "cosine") {
+    throw BinderException("sirius_create_ann_index: metric must be one of 'l2sq', 'cosine', got '" +
+                          result->metric + "'");
+  }
+  if (result->n_lists < 0) {
+    throw BinderException("sirius_create_ann_index: n_lists must be >= 0");
+  }
+
+  // Default the management name from the index identity when not given.
+  if (result->index_name.empty()) {
+    result->index_name =
+      result->table_name + "_" + result->column_name + "_" + result->metric + "_ann";
+  }
+
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Success");
+  return std::move(result);
+}
+
+// Map the (already-validated) index_type string to its cache index_kind.
+static sirius::vss::index_kind ann_index_kind_from_type(const std::string& index_type)
+{
+  if (index_type == "ivf_flat") { return sirius::vss::index_kind::ivf_flat; }
+  throw InvalidInputException("sirius_create_ann_index: unsupported index_type '" + index_type +
+                              "'");
+}
+
+// Default IVF-Flat list count
+static std::uint32_t default_ivf_n_lists(int64_t n_rows)
+{
+  auto const approx = static_cast<std::uint32_t>(std::sqrt(static_cast<double>(n_rows)));
+  std::uint32_t n   = approx == 0 ? 1u : approx;
+  return n > 1024u ? 1024u : n;
+}
+
+static void SiriusCreateAnnIndexFunction(ClientContext& context,
+                                         TableFunctionInput& data_p,
+                                         DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<CreateAnnIndexData>();
+  if (data.finished) { return; }
+
+  nvtx3::scoped_range nvtx_range{"SiriusCreateAnnIndexFunction"};
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_create_ann_index requires the Sirius context to be initialized");
+  }
+
+  // --- Resolve the vector column's fixed dimensionality from the catalog. ---
+  auto const qname          = QualifiedName::Parse(data.table_name);
+  std::string const catalog = qname.catalog;  // empty => search path
+  std::string const schema  = !qname.schema.empty() ? qname.schema : data.schema_name;
+  std::string const& table  = qname.name;
+  auto& entry_base = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry      = entry_base.Cast<DuckTableEntry>();
+  auto const& columns     = entry.GetColumns();
+  auto const schema_names = columns.GetColumnNames();
+  auto const schema_types = columns.GetColumnTypes();
+
+  std::size_t col_idx = schema_names.size();
+  for (std::size_t i = 0; i < schema_names.size(); ++i) {
+    if (schema_names[i] == data.column_name) {
+      col_idx = i;
+      break;
+    }
+  }
+  if (col_idx == schema_names.size()) {
+    throw InvalidInputException("sirius_create_ann_index: column '" + data.column_name +
+                                "' not found in table '" + data.table_name + "'");
+  }
+  auto const& col_type = schema_types[col_idx];
+  if (col_type.id() != LogicalTypeId::ARRAY ||
+      ArrayType::GetChildType(col_type).id() != LogicalTypeId::FLOAT) {
+    throw InvalidInputException("sirius_create_ann_index: column '" + data.column_name +
+                                "' must be a FLOAT[N] array column");
+  }
+  auto const dim    = static_cast<int64_t>(ArrayType::GetSize(col_type));
+  auto const metric = sirius::vss::ann_distance_type_from_metric(data.metric);
+
+  // Get the vector column onto a single GPU as one contiguous column for one cuVS index
+  auto& memory_manager = sirius_ctx->get_memory_manager();
+  auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.empty()) {
+    throw InvalidInputException("sirius_create_ann_index: no GPU memory space available");
+  }
+  auto* target_space   = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  int const target_gpu = target_space->get_device_id();
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu}};
+
+  auto& scan_mgr  = sirius_ctx->get_scan_manager();
+  const auto* pin = scan_mgr.find_pinned_entry(entry.name);
+  if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
+    throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
+                                "' must be pinned on the GPU tier before building an index");
+  }
+
+  // Collect the vector column's GPU chunks as views:
+  // a full coalesce of a large dataset overflows cudf's 2^31-element per-column limit
+  // in the LIST child. The chunked builder feeds cuVS one chunk at a time via ivf_flat::extend.
+  auto chunk_views = sirius::vss::pinned_column_chunk_views(*pin, data.column_name, *target_space);
+
+  int64_t n_rows = 0;
+  for (auto const& v : chunk_views) {
+    n_rows += static_cast<int64_t>(v.size());
+  }
+  if (n_rows <= 0) { throw InvalidInputException("sirius_create_ann_index: empty vector column"); }
+
+  std::uint32_t n_lists =
+    data.n_lists > 0 ? static_cast<std::uint32_t>(data.n_lists) : default_ivf_n_lists(n_rows);
+  if (static_cast<int64_t>(n_lists) > n_rows) { n_lists = static_cast<std::uint32_t>(n_rows); }
+
+  // Reserve the index footprint (heuristic, over-estimated to cover build-time
+  // scratch): ~2x the stored vectors + 2x centroids + 1 MiB slack
+  std::size_t const vec_bytes =
+    static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim) * sizeof(float);
+  std::size_t const centroid_bytes =
+    static_cast<std::size_t>(n_lists) * static_cast<std::size_t>(dim) * sizeof(float);
+  std::size_t const footprint = vec_bytes * 2 + centroid_bytes * 2 + (std::size_t{1} << 20);
+
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  auto reservation  = index_cache.reserve_index_memory(footprint, target_gpu);
+
+  // Build IVF-Flat through the reservation's resource, then pin it
+  auto handle = sirius::vss::build_ivf_flat_index_from_chunks(
+    chunk_views, dim, n_lists, metric, reservation->get_memory_resource());
+  reservation->shrink_to_fit();
+
+  sirius::vss::index_metadata meta;
+  meta.kind           = ann_index_kind_from_type(data.index_type);
+  meta.table_name     = entry.name;  // catalog-resolved name (matches query-side derivation)
+  meta.column_name    = data.column_name;
+  meta.dim            = dim;
+  meta.num_rows       = n_rows;
+  meta.n_lists        = static_cast<int64_t>(n_lists);
+  meta.metric         = metric;
+  meta.reserved_bytes = reservation->size();
+  index_cache.insert(data.index_name, std::move(meta), std::move(handle), std::move(reservation));
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 struct SiriusVectorSearchBindData : public TableFunctionData {
   sirius::vss::vector_search_request req;
   // Output column types + trailing distance, for the host_table_chunk_reader.
@@ -1976,6 +2172,20 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
+
+  // sirius_create_ann_index(table, column, name=>, metric=>, index_type=>, n_lists=>,
+  // schema_name=>)
+  TableFunction create_ann_index("sirius_create_ann_index",
+                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                 SiriusCreateAnnIndexFunction,
+                                 SiriusCreateAnnIndexBind);
+  create_ann_index.named_parameters["name"]        = LogicalType::VARCHAR;
+  create_ann_index.named_parameters["metric"]      = LogicalType::VARCHAR;
+  create_ann_index.named_parameters["index_type"]  = LogicalType::VARCHAR;
+  create_ann_index.named_parameters["n_lists"]     = LogicalType::BIGINT;
+  create_ann_index.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  CreateTableFunctionInfo create_ann_index_info(create_ann_index);
+  catalog.CreateTableFunction(transaction, create_ann_index_info);
 
   // sirius_knn_search(table, column, query, k =>, output_columns =>, metric =>,
   // schema_name =>)

@@ -28,4 +28,9 @@ namespace sirius::vss {
  */
 cuvs::distance::DistanceType enn_distance_type_from_metric(std::string_view metric);
 
+/**
+ * @brief Map a user metric string to the cuVS DistanceType for ann.
+ */
+cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metric);
+
 }  // namespace sirius::vss

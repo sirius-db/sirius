@@ -53,6 +53,10 @@ namespace cucascade::memory {
 class small_pinned_host_memory_resource;
 }  // namespace cucascade::memory
 
+namespace sirius::vss {
+class cuvs_index_cache;
+}  // namespace sirius::vss
+
 namespace sirius::memory {
 class numa_small_pinned_mr;
 class topology_index;
@@ -513,6 +517,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// \brief Get the session's cuVS ANN index cache (GPU-resident, pinned indexes).
+  [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
+  [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
+
   /// Coordinate update execution with pin-registry mutations.
   std::shared_lock<std::shared_mutex> lock_pinned_table_updates();
   std::unique_lock<std::shared_mutex> lock_pinned_table_registry();
@@ -650,6 +658,11 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
+  // Session-lifetime cache of GPU-resident, pinned cuVS ANN indexes. Declared
+  // after memory_manager_ so it is destroyed before it: each entry holds a
+  // reservation into the manager's GPU spaces, so the manager must outlive the
+  // cache. Also reset explicitly in terminate() before the manager is torn down.
+  std::unique_ptr<sirius::vss::cuvs_index_cache> cuvs_index_cache_;
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the
   // memory manager's reserved GPU/HOST spaces. Shared by shared_ptr copy with
   // the small-pinned allocator, downgrade executors, task_creator, and
