@@ -376,8 +376,20 @@ void sirius::operator_params::init_adaptive() {
     return std::max(std::min(v, hi), lo);
   };
 
-  // Scan batch: 10% of VRAM, clamped to [128MB, 4GB]
-  scan_task_batch_size = clamp(vram / 10, 128 * MB, 4 * GB);
+  // Scan batch: L2-cache-aware sizing. A batch that fits in L2 gets 4x
+  // bandwidth on repeated access (multi-column projection, filter+gather).
+  // Target: min(10% of VRAM, 4x L2 cache). On MI300 (256MB L2): min(19GB,
+  // 1GB) = 1GB. On 8GB consumer (64MB L2): min(800MB, 256MB) = 256MB.
+  // Clamped to [128MB, 4GB].
+  int device = 0;
+  cudaDeviceProp prop;
+  std::size_t l2_cache = 0;
+  if (cudaGetDevice(&device) == cudaSuccess &&
+      cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+    l2_cache = static_cast<std::size_t>(prop.l2CacheSize);
+  }
+  std::size_t l2_aware_batch = l2_cache > 0 ? l2_cache * 4 : vram / 10;
+  scan_task_batch_size = clamp(std::min(vram / 10, l2_aware_batch), 128 * MB, 4 * GB);
 
   // Hash partition: 8% of VRAM, clamped to [128MB, 2GB]
   hash_partition_bytes = clamp(vram / 12, 128 * MB, 2 * GB);
