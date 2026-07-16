@@ -56,11 +56,15 @@ void sirius_physical_streaming_sink::flush_pending_locked()
 
 void sirius_physical_streaming_sink::try_flush_pending()
 {
-  std::lock_guard<std::mutex> lk(_pending_lock);
-  flush_pending_locked();
-  if (_pending.empty() && _close_when_flushed.load(std::memory_order_acquire)) {
-    _output_channel->close();
+  bool should_close = false;
+  {
+    std::lock_guard<std::mutex> lk(_pending_lock);
+    flush_pending_locked();
+    should_close = _pending.empty() && _close_when_flushed;
   }
+  // close() runs the on_close callback synchronously; call it outside _pending_lock so a
+  // re-entrant callback cannot deadlock. Safe: post-finalize sink() throws, close() is idempotent.
+  if (should_close) { _output_channel->close(); }
 }
 
 std::optional<task_creation_hint> sirius_physical_streaming_sink::get_next_task_hint()
@@ -188,14 +192,19 @@ void sirius_physical_streaming_sink::on_finalize_operator()
   // drained, otherwise defer the close to whichever try_flush_pending() delivers the last handle.
   // _closing is set under the same lock: a concurrent sink() either completes before the close
   // decision or rejects its batch.
-  std::lock_guard<std::mutex> lk(_pending_lock);
-  _closing = true;
-  flush_pending_locked();
-  if (_pending.empty()) {
-    _output_channel->close();
-  } else {
-    _close_when_flushed.store(true, std::memory_order_release);
+  bool should_close = false;
+  {
+    std::lock_guard<std::mutex> lk(_pending_lock);
+    _closing = true;
+    flush_pending_locked();
+    if (_pending.empty()) {
+      should_close = true;
+    } else {
+      _close_when_flushed = true;
+    }
   }
+  // close() outside _pending_lock (see try_flush_pending).
+  if (should_close) { _output_channel->close(); }
 }
 
 }  // namespace sirius::op

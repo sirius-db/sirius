@@ -21,7 +21,6 @@
 
 #include <cucascade/data/data_repository.hpp>
 
-#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -95,7 +94,7 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   std::shared_ptr<cucascade::shared_data_repository> _output_repository;
   std::mutex _pending_lock;
   std::deque<exec::exchange_batch_handle> _pending;
-  std::atomic<bool> _close_when_flushed{false};
+  bool _close_when_flushed{false};  // guarded by _pending_lock
   // Set by on_finalize_operator() under _pending_lock; sink() checks it under the same lock and
   // throws, so a late batch cannot strand behind the closed channel.
   bool _closing{false};
