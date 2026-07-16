@@ -63,11 +63,7 @@ enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
 enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
 
 //===----------------------------------------------------------------------===//
-// BUILD_PROBE scheduling helpers (pure, unit-testable)
-//
-// BUILD_PROBE keeps one hash table per partition. The multi-partition scheduling decision and the
-// mode-eligibility gate are factored into free functions so they can be exercised in unit tests
-// without a live pipeline or GPU.
+// BUILD_PROBE scheduling helpers - BUILD_PROBE keeps one hash table per partition.
 //===----------------------------------------------------------------------===//
 
 /// The action the BUILD_PROBE state machine should take next.
@@ -242,17 +238,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                              bool is_broadcast_candidate = false);
 
   /// @brief Inform the join how many GPUs the query runs on. Set at plan time.
-  ///
-  /// BUILD_PROBE keeps one cuco hash table per partition, and each cuco table must live on a single
-  /// GPU. Partitions are routed to `partition_idx % num_gpus`, so BUILD_PROBE is allowed with up to
-  /// one partition per GPU (`num_partitions <= num_gpus`). Defaults to 1, which reduces the
-  /// BUILD_PROBE eligibility test to the historical single-partition rule.
   void set_num_gpus(int num_gpus) { _num_gpus = num_gpus; }
 
-  /// @brief Mark this join as a broadcast (small-build-table) BUILD_PROBE join. Set at runtime by
-  /// the partition operator when it replicates the build table to every GPU. In broadcast mode the
-  /// probe side is not partitioned, so some slots may receive build data but never any probe data;
-  /// those slots are discarded once the probe upstream completes (see get_next_task_hint).
+  /// @brief Mark this join as a broadcast (small-build-table) BUILD_PROBE join. Set at runtime.
   void set_broadcast(bool broadcast) { _broadcast = broadcast; }
 
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
@@ -294,20 +282,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
 
-  // Number of GPUs the query runs on (set at plan time via set_num_gpus). BUILD_PROBE keeps one
-  // hash table per partition, each pinned to a single GPU, so it is allowed only when
-  // num_partitions <= _num_gpus. Defaults to 1 so single-GPU / unconfigured paths keep the
-  // historical single-partition BUILD_PROBE behavior.
+  // Number of GPUs the query runs on (set at plan time via set_num_gpus).
   int _num_gpus = 1;
 
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
-  // the probe side is streamed unpartitioned, so a slot may hold build data but never receive probe
-  // data. Set at runtime via set_broadcast(). Enables the build-only-slot discard on
-  // probe-complete.
+  // the probe side is streamed unpartitioned.
   bool _broadcast = false;
 
   // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
-  // that lives entirely on one GPU (partition_idx % _num_gpus). A partition is built once — its
+  // that lives entirely on one GPU . A partition is built once — its
   // single SCHEDULED build task release-stores BUILT — and then probed by many streamed probe tasks
   // that only read the table. `build_state` is atomic so get_next_task_hint can observe a slot's
   // progress without holding op_state_mutex while execute() flips it.

@@ -307,11 +307,6 @@ void sirius_physical_partition::set_num_partitions(int num_partitions)
 
 void sirius_physical_partition::resize_join_input_repo(int num_partitions)
 {
-  // Only a partition that feeds a hash join has a per-partition input repo on the join to
-  // pre-size. The probe side feeds the join's "default" port; the build side feeds "build"
-  // (through the build-side CONCAT, but the CONCAT preserves partition_idx into this same
-  // repo). Growing to num_partitions makes size(p) valid for every partition index before
-  // any batch is produced, which the join's BUILD_PROBE scheduling relies on.
   if (_hash_join_op == nullptr) { return; }
   std::string_view const port_id = _is_build ? "build" : "default";
   auto* join_port                = _hash_join_op->get_port(port_id);

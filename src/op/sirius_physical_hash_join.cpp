@@ -1623,15 +1623,8 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   // compute and publish the filter from the build keys. This is gated to the two BUILD_PROBE shapes
   // where a single partition's build batch covers the whole build side, so the one-shot publisher
   // and its single-GPU reduction emit a complete filter:
-  //   - Single partition (`size() == 1`): the classic case; one GPU holds the entire build.
-  //   - Broadcast (`_broadcast`): the small build table is replicated to every GPU, so each
-  //     partition's concat_all-folded batch is the full build. Every partition's build batch races
-  //     this hook; the OPEN->PUBLISHING compare-exchange in publish_dynamic_filters() lets exactly
-  //     one win (the first to arrive) and build/replicate the filter, while the others fall out at
-  //     that CAS before doing any filter work.
-  // A regular hash-partitioned build (multiple partitions, non-broadcast) splits the build across
-  // GPUs, so publishing from one partition's batch would emit an incomplete filter — pushdown stays
-  // disabled for that case (cross-partition aggregation is a future extension).
+  //   - Single partition (`size() == 1`)
+  //   - Broadcast (`_broadcast`)
   std::optional<::cucascade::read_only_data_batch> build_ro;
   if (port_id == "build" && batch) {
     bool claim = false;
