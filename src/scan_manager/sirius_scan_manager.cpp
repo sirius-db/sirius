@@ -1493,6 +1493,12 @@ void sirius_scan_manager::visit_pinned_entries(
   }
 }
 
+const pinned_entry* sirius_scan_manager::find_pinned_entry(std::string_view name) const
+{
+  auto it = _pinned_entries.find(std::string(name));
+  return it == _pinned_entries.end() ? nullptr : &it->second;
+}
+
 pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
   std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const
 {
