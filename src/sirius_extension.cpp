@@ -2174,6 +2174,8 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // Optional params' default values
   req.metric                    = "l2";
   req.k                         = 10;
+  req.use_index           = true;
+  req.n_probes            = 0;
   std::string schema_name       = "main";
   bool output_columns_specified = false;
   for (auto& kv : input.named_parameters) {
@@ -2185,6 +2187,10 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
       req.k = kv.second.GetValue<int64_t>();
     } else if (key == "metric") {
       req.metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "use_index") {
+      req.use_index = kv.second.GetValue<bool>();
+    } else if (key == "n_probes") {
+      req.n_probes = kv.second.GetValue<int64_t>();
     } else if (key == "schema_name") {
       schema_name = kv.second.ToString();
     } else if (key == "output_columns") {
@@ -2195,6 +2201,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
     }
   }
   if (req.k <= 0) { throw BinderException("sirius_knn_search: k must be >= 1"); }
+  if (req.n_probes < 0) { throw BinderException("sirius_knn_search: n_probes must be >= 0"); }
   if (req.metric != "l2" && req.metric != "cosine") {
     throw BinderException("sirius_knn_search: metric must be one of 'l2', 'cosine', got '" +
                           req.metric + "'");
@@ -2478,7 +2485,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, drop_ann_index_info);
 
   // sirius_knn_search(table, column, query, k =>, output_columns =>, metric =>,
-  // schema_name =>)
+  // use_index =>, n_probes =>, schema_name =>)
   TableFunction vector_search("sirius_knn_search",
                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
                               SiriusVectorSearchFunction,
@@ -2487,6 +2494,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_search.named_parameters["k"]              = LogicalType::BIGINT;
   vector_search.named_parameters["output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
   vector_search.named_parameters["metric"]         = LogicalType::VARCHAR;
+  vector_search.named_parameters["use_index"]      = LogicalType::BOOLEAN;
+  vector_search.named_parameters["n_probes"]       = LogicalType::BIGINT;
   vector_search.named_parameters["schema_name"]    = LogicalType::VARCHAR;
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);

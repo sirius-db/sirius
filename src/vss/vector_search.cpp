@@ -126,7 +126,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
                           static_cast<const float*>(query_buf.data()),
                           target_gpu,
                           k};
-  return run_vector_search_enn(c);
+  return req.use_index ? run_vector_search_ann(c) : run_vector_search_enn(c);
 }
 
 }  // namespace sirius::vss

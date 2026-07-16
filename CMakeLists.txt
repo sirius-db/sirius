@@ -446,6 +446,7 @@ set(EXTENSION_SOURCES
     src/vss/enn_top_k.cpp
     src/vss/pinned_column.cpp
     src/vss/vector_search.cpp
+    src/vss/vector_search_ann.cpp
     src/vss/vector_search_enn.cpp)
 # cmake-format: on
 

@@ -41,12 +41,15 @@ struct vector_search_request {
   std::int64_t dim{0};                      ///< Vector dimensionality.
   std::int64_t k{10};                       ///< Top-k neighbors to return.
   std::vector<std::string> output_columns;  ///< Base-table columns to return (in order).
+  bool use_index{true};                     ///< true => ann; false => enn.
+  std::int64_t n_probes{0};                 ///< IVF lists to probe for ann;
 };
 
 /// Run a single-query k-NN search over a GPU-pinned table and return the result
 /// materialized on the HOST tier: one column per @c output_columns entry in
 /// order followed by a trailing FLOAT32 @c distance column, @c k rows
-/// nearest-first. The table must be pinned on the GPU tier.
+/// nearest-first. The table must be pinned on the GPU tier; when @c use_index
+/// is true a matching cuVS index must exist.
 std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   duckdb::SiriusContext& ctx, const vector_search_request& req);
 
