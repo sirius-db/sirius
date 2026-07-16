@@ -11,6 +11,8 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <cuda_runtime.h>
+
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -117,10 +119,17 @@ void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
 
   size_t const n_workers = pool.streams.size();
   if (n_workers == 0) throw plan_error("stream_pool has no streams");
+  // Worker threads must bind the same device as the spawning thread: the fused
+  // codegen path launches kernels through the driver API (cuLaunchKernel), which
+  // uses the calling thread's current context — a fresh std::thread has none, so
+  // without this the launch fails with "invalid resource handle".
+  int device = 0;
+  cudaGetDevice(&device);
   std::vector<std::thread> workers;
   workers.reserve(n_workers);
   for (size_t w = 0; w < n_workers; ++w) {
-    workers.emplace_back([&, w]() {
+    workers.emplace_back([&, w, device]() {
+      cudaSetDevice(device);
       try {
         while (true) {
           size_t i = next.fetch_add(1, std::memory_order_relaxed);

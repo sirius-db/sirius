@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <type_traits>
 
@@ -162,11 +163,8 @@ __constant__ uint8_t d_alp_combos_f64[host_consts_f64::kComboCount];
 // One-shot initialisation of both __constant__ table sets. Idempotent.
 // Uploads run async on the caller's stream and are bounded by a single
 // stream sync, avoiding the legacy default stream entirely.
-void ensure_constants_initialized(rmm::cuda_stream_view stream)
+void alp_upload_constants(rmm::cuda_stream_view stream)
 {
-  static bool initialized = false;
-  if (initialized) return;
-
   // Build packed combo tables on the host then upload.
   uint8_t combos_f32[host_consts_f32::kComboCount];
   {
@@ -243,7 +241,13 @@ void ensure_constants_initialized(rmm::cuda_stream_view stream)
   // Constants must be visible before any kernel that reads them runs; the
   // upload is host-side one-time work so a bounded sync here is acceptable.
   cudaStreamSynchronize(s);
-  initialized = true;
+}
+
+// Thread-safe one-shot init: safe under concurrent multi-stream compression.
+void ensure_constants_initialized(rmm::cuda_stream_view stream)
+{
+  static std::once_flag flag;
+  std::call_once(flag, alp_upload_constants, stream);
 }
 
 // -----------------------------------------------------------------------------

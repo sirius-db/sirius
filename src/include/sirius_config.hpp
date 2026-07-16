@@ -157,6 +157,13 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  /// Degree of column-parallelism for Simpatico (de)compression: simpatico fans
+  /// a table's columns across this many worker threads/streams (one column per
+  /// stream). <=1 = sequential (single-stream). Capped at the column count per
+  /// call. Applies to both the pin-time compress path and the scan-time
+  /// decompress converters.
+  int column_threads{4};
 };
 
 struct sirius_config {

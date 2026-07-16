@@ -31,4 +31,9 @@ namespace sirius {
  */
 void register_compression_converters(cucascade::representation_converter_registry& registry);
 
+/// Column-parallelism degree for the decompress converters (process-global since
+/// converters have no per-context config). Mirrors compression_config::column_threads.
+void set_decompress_column_threads(int n) noexcept;
+[[nodiscard]] int decompress_column_threads() noexcept;
+
 }  // namespace sirius

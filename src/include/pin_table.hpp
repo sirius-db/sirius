@@ -165,6 +165,10 @@ struct compression_pin_config {
   /// compression_config::max_compressed_fraction.
   double max_compressed_fraction{0.95};
   std::vector<std::string> column_names;
+  /// Column-parallelism degree for simpatico::compress_with_plan (<=1 =
+  /// sequential). Capped at the chunk's column count. See
+  /// compression_config::column_threads.
+  int column_threads{1};
 };
 
 /// Result of driving a GPU-tier pin with optional Simpatico compression.

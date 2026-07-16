@@ -41,6 +41,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -317,11 +318,24 @@ host_pin_result materialize_pin_to_host_with_compression(
           // and null masks), so string columns count toward the threshold.
           std::size_t uncompressed_bytes = tbl->alloc_size();
           if (uncompressed_bytes >= compression.min_batch_size_bytes) {
-            auto ct = simpatico::compress_with_plan(tbl->view(),
-                                                    compression.plan_dsl,
-                                                    stream,
-                                                    rmm::mr::get_current_device_resource_ref(),
-                                                    compression.column_names);
+            // Parallel per-column compress when >1 (capped at the column count).
+            // The pool must outlive `ct` (whose buffers free on the pool streams
+            // at teardown), so it is declared before `ct`.
+            const int n_threads = std::min(compression.column_threads, tbl->num_columns());
+            simpatico::stream_pool comp_pool;
+            const bool parallel =
+              n_threads > 1 && comp_pool.init(static_cast<std::size_t>(n_threads));
+            auto ct = parallel
+                        ? simpatico::compress_with_plan(tbl->view(),
+                                                        compression.plan_dsl,
+                                                        comp_pool,
+                                                        rmm::mr::get_current_device_resource_ref(),
+                                                        compression.column_names)
+                        : simpatico::compress_with_plan(tbl->view(),
+                                                        compression.plan_dsl,
+                                                        stream,
+                                                        rmm::mr::get_current_device_resource_ref(),
+                                                        compression.column_names);
 
             // Build the structural header and enumerate the payload buffers
             // (no bytes copied yet).
@@ -433,11 +447,24 @@ device_pin_result materialize_pin_to_device_with_compression(
           // and null masks), so string columns count toward the threshold.
           std::size_t uncompressed_bytes = tbl->alloc_size();
           if (uncompressed_bytes >= compression.min_batch_size_bytes) {
-            auto ct = simpatico::compress_with_plan(tbl->view(),
-                                                    compression.plan_dsl,
-                                                    stream,
-                                                    rmm::mr::get_current_device_resource_ref(),
-                                                    compression.column_names);
+            // Parallel per-column compress when >1 (capped at the column count).
+            // The pool must outlive `ct` (whose buffers free on the pool streams
+            // at teardown), so it is declared before `ct`.
+            const int n_threads = std::min(compression.column_threads, tbl->num_columns());
+            simpatico::stream_pool comp_pool;
+            const bool parallel =
+              n_threads > 1 && comp_pool.init(static_cast<std::size_t>(n_threads));
+            auto ct = parallel
+                        ? simpatico::compress_with_plan(tbl->view(),
+                                                        compression.plan_dsl,
+                                                        comp_pool,
+                                                        rmm::mr::get_current_device_resource_ref(),
+                                                        compression.column_names)
+                        : simpatico::compress_with_plan(tbl->view(),
+                                                        compression.plan_dsl,
+                                                        stream,
+                                                        rmm::mr::get_current_device_resource_ref(),
+                                                        compression.column_names);
 
             std::vector<std::uint8_t> header;
             std::vector<simpatico::payload_buffer_ref> buffers;
