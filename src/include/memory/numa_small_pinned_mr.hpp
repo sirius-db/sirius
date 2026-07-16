@@ -25,6 +25,8 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace sirius::memory {
@@ -144,6 +146,10 @@ class numa_small_pinned_mr {
     int node = node_for_current_device();
     auto it  = pools_.find(node);
     if (it == pools_.end()) { it = pools_.find(fallback_node_); }
+    if (it == pools_.end()) {
+      throw std::runtime_error("numa_small_pinned_mr: no pool for fallback node " +
+                               std::to_string(fallback_node_));
+    }
     return *it->second;
   }
 

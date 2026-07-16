@@ -1051,6 +1051,20 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   };
 
   auto clean_up_and_shutdown = [&]() {
+    // Drain requests whose (re-)submission was deferred into incomplete_requests.
+    // They are not counted in `inflight` (inflight only tracks SQEs actually
+    // submitted to the ring), so they would otherwise be orphaned by the wait
+    // below and their managers would block forever waiting for a completion.
+    // Report each as canceled and release the slot's hold on the request.
+    for (int si : incomplete_requests) {
+      auto& slot = slots[si];
+      if (slot.req) {
+        slot.req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+        slot.reset();
+      }
+    }
+    incomplete_requests.clear();
+
     // wait for all in-flight requests to complete so we don't report spurious errors on shutdown
     while (inflight > 0) {
       auto s = ring.wait_for(SHUTDOWN_POLL_MS);

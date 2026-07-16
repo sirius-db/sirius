@@ -37,6 +37,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstddef>
 #include <exception>
 #include <iterator>
@@ -566,11 +567,16 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
     for (cached_chunk* c : cached_chunks) {
       size_t const copy_start = std::max(c->offset, offset);
       size_t const copy_end   = std::min(c->offset + chunk_bytes, offset + size);
-      cudaMemcpyAsync(dst + (copy_start - offset),
-                      c->data + (copy_start - c->offset),
-                      copy_end - copy_start,
-                      cudaMemcpyHostToDevice,
-                      stream);
+      auto err                = cudaMemcpyAsync(dst + (copy_start - offset),
+                                 c->data + (copy_start - c->offset),
+                                 copy_end - copy_start,
+                                 cudaMemcpyHostToDevice,
+                                 stream);
+      if (err != cudaSuccess) {
+        fprintf(stderr,
+                "prefetching_cache: cudaMemcpyAsync failed: %s\n",
+                cudaGetErrorString(err));
+      }
     }
 
     auto device_id = rmm::get_current_cuda_device();

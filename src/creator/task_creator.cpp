@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <limits>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 
 namespace sirius::creator {
@@ -418,7 +419,12 @@ void task_creator::manager_loop()
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
         _task_scheduler->terminate_query(std::current_exception());
-        stop();
+        // stop() acquires _global_state_mutex and calls _bounded_pool->wait_all(),
+        // which blocks until every dispatched task (including this one) completes.
+        // Calling stop() synchronously from within this dispatched task would
+        // therefore self-deadlock. Detach the shutdown onto a separate thread so
+        // this task can finish and let wait_all() drain.
+        std::thread([this] { stop(); }).detach();
       }
     });
   }

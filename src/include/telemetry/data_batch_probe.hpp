@@ -82,7 +82,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
 
   ~quent_data_batch_probe() override
   {
-    handle_->destructed();
+    try { handle_->destructed(); } catch (...) { /* swallow — cannot throw from noexcept destructor */ }
     handle_->exit();
   }
 

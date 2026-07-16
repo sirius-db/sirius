@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#ifdef SIRIUS_ENABLE_CUCO
 // sirius
 #include <log/logging.hpp>
 #include <op/dynamic_filter_device.hpp>
@@ -384,3 +385,5 @@ std::size_t sirius_dynamic_in_list_filter::estimated_set_bytes(std::size_t num_k
 }
 
 }  // namespace sirius::op
+
+#endif  // SIRIUS_ENABLE_CUCO

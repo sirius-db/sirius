@@ -226,12 +226,15 @@ void gpu_config::apply_env_overrides() {
   }
 
   // SIRIUS_GPU_VRAM_LIMIT — artificially cap reported VRAM (for testing)
-  if (auto v = env_size("SIRIUS_GPU_VRAM_LIMIT")) {
+  static bool already_capped = false;
+  if (!already_capped && (auto v = env_size("SIRIUS_GPU_VRAM_LIMIT"))) {
+    already_capped = true;
     hw_.total_vram = std::min(hw_.total_vram, v);
     // Recompute derived params with the capped VRAM
     compute_tuning();
-    // Re-apply env overrides (they take precedence over recomputed defaults)
-    apply_env_overrides();
+    // Don't call apply_env_overrides() again — env overrides were already
+    // applied before this branch. compute_tuning() recomputed the defaults, and
+    // since already_capped is now true, we won't re-enter this branch.
     return;  // avoid infinite recursion
   }
 }

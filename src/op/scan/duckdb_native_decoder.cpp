@@ -1184,7 +1184,9 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
         auto validity_cols = validity_table->release();
         parent_null_count  = validity_cols[0]->null_count();
         auto released      = validity_cols[0]->release();
-        parent_null_mask   = std::move(*released.null_mask);
+        if (released.null_mask.has_value()) {
+          parent_null_mask = std::move(*released.null_mask);
+        }
       }
 
       // Assemble the LIST column: offsets + child values + array-level null mask

@@ -468,6 +468,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     // host prepares column projection and type mapping in parallel. The
     // footer is small (~1KB) but the network/disk RTT can be 0.5-5ms on
     // remote storage (S3, NFS). Overlapping hides this latency.
+    if (!sirius_ds) {
+      throw std::runtime_error("parquet_gpu_ingestible: null datasource for footer read");
+    }
     auto footer_future = std::async(std::launch::async, [&sirius_ds]() {
       return cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
     });

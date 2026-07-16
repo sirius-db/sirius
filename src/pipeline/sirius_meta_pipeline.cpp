@@ -18,6 +18,8 @@
 
 #include "config.hpp"
 
+#include <stdexcept>
+
 namespace sirius {
 namespace pipeline {
 
@@ -151,7 +153,8 @@ void sirius_meta_pipeline::add_dependencies_from(sirius_pipeline& dependent,
 {
   // find 'start'
   auto it = pipelines.begin();
-  for (; !duckdb::RefersToSameObject(**it, start); it++) {}
+  for (; it != pipelines.end() && !duckdb::RefersToSameObject(**it, start); it++) {}
+  if (it == pipelines.end()) { throw std::runtime_error("sirius_meta_pipeline::add_dependencies_from: pipeline not found"); }
 
   if (!including) { it++; }
 
@@ -183,7 +186,12 @@ void sirius_meta_pipeline::add_recursive_dependencies(
 
   // find the meta pipeline that has the same sink as 'pipeline'
   auto it = child_meta_pipelines.begin();
-  for (; !duckdb::RefersToSameObject(last_child, **it); it++) {}
+  for (; it != child_meta_pipelines.end() && !duckdb::RefersToSameObject(last_child, **it);
+       it++) {}
+  if (it == child_meta_pipelines.end()) {
+    throw std::runtime_error(
+      "sirius_meta_pipeline::add_recursive_dependencies: child meta pipeline not found");
+  }
   D_ASSERT(it != child_meta_pipelines.end());
 
   // skip over it
@@ -217,7 +225,11 @@ void sirius_meta_pipeline::add_finish_event(sirius_pipeline& pipeline)
   // add all pipelines that were added since 'pipeline' was added (including 'pipeline') to the
   // finish group
   auto it = pipelines.begin();
-  for (; !duckdb::RefersToSameObject(**it, pipeline); it++) {}
+  for (; it != pipelines.end() && !duckdb::RefersToSameObject(**it, pipeline); it++) {}
+  if (it == pipelines.end()) {
+    throw std::runtime_error(
+      "sirius_meta_pipeline::add_finish_event: pipeline not found");
+  }
   it++;
   for (; it != pipelines.end(); it++) {
     finish_map.emplace(**it, pipeline);
