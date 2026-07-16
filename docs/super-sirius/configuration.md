@@ -356,9 +356,20 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error |
-| `sirius_log_dir` | `log` | Log output directory |
-| `sirius_log_flush_seconds` | 5 | Log flush interval |
+| `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
+| `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error (`spdlog` only) |
+| `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
+| `sirius_log_flush_seconds` | 3 | Log flush interval in seconds (`spdlog` only) |
+
+- **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
+  `sirius_log_level` and `sirius_log_flush_seconds`.
+- **`duckdb`**: routes logs into DuckDB's own logging under the `Sirius` log type; enable and
+  read them with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`.
+  Level and enable are governed by DuckDB, not `sirius_log_level`.
+- **`noop`**: discards all logs.
+
+These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
+`SIRIUS_LOG_LEVEL` environment variables.
 
 ### Memory
 
