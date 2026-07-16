@@ -115,18 +115,20 @@ Key design invariants:
 - **Backpressure as admission control**: if the channel is full or `_pending` is non-empty,
   `get_next_task_hint()` and `get_next_task_input_data()` return `WAITING{nullptr}` / `nullptr`
   respectively, preventing new tasks from being created. Worker threads never block.
-- **FIFO `_pending` overflow buffer (bounded)**: when `try_push` fails (channel full), the handle
-  is appended to `_pending`. Subsequent calls to `get_next_task_hint()` or `sink()` call
+- **FIFO `_pending` overflow buffer**: when `try_push` fails (channel full), the handle is
+  appended to `_pending`. Subsequent calls to `get_next_task_hint()` or `sink()` call
   `try_flush_pending()` first, draining `_pending` in order before any new handles are attempted.
-  `_pending` is not a second unbounded queue: because admission control refuses new sink tasks
-  while `_pending` is non-empty, its depth is bounded by the operator's in-flight task concurrency,
-  never by the input size.
+  Admission control stops new pulls while `_pending` is non-empty or the channel is full, but the
+  task creator can pull an entire port before any created task executes, so `_pending` depth is
+  bounded only once task creation is paced against completion — the session wiring's job (#839),
+  the same caveat as the streaming source above. Parked batches remain registered, idle, and
+  spill-visible (accounted, spillable state).
 - **Flush-then-close EOS**: `on_finalize_operator()` flushes what fits; if `_pending` is empty
-  it closes the channel immediately; otherwise it sets `_close_when_flushed` and defers the
-  close to the `try_flush_pending()` call triggered by the next consumer pop. Finalize sets a
-  `_closing` flag under `_pending_lock`; a `sink()` that observes it (a batch arriving after
-  finalize — which the pipeline never does) throws rather than stranding the handle behind the
-  closed channel.
+  it closes the channel immediately; otherwise it sets `_close_when_flushed` and the close
+  happens on a later `try_flush_pending()` call. Nothing polls that after finalize — the
+  consumer/session must call `try_flush_pending()` after pops (or wire `on_pop` to it, #839) or
+  deferred EOS stalls. Finalize also sets `_closing` under `_pending_lock`; a `sink()` that
+  observes it throws rather than stranding the handle behind the closed channel.
 - **Locking discipline**: whenever `_pending_lock` and the channel's internal mutex are both
   needed, `_pending_lock` is always acquired first (consistent ordering prevents deadlock);
   the base-class `lock` guards `ports` and is never held simultaneously with `_pending_lock`.
@@ -141,7 +143,7 @@ Hint table:
 | port empty, upstream pipeline finished | `std::nullopt` — EOS |
 | port empty, upstream still running | `WAITING{upstream_op}` — propagate hint up the chain |
 
-**Consumer contract**: pop a handle from the channel, then call `output_repository->pop_data_batch_by_id(handle.batch_id)` to take ownership of the batch. The `try_flush_pending()` flush is triggered by `get_next_task_hint()` (called by the task-creation loop on every iteration), so consumer pops indirectly drive the pending drain.
+**Consumer contract**: pop a handle from the channel, then call `output_repository->pop_data_batch_by_id(handle.batch_id)` to take ownership of the batch. Hint polling drives the pending drain only while the sink's pipeline is still running; after finalize the consumer/session must call `try_flush_pending()` after pops (or wire `exchange_channel::on_pop` to it) so `_pending` drains and the deferred close completes. Channel callbacks run synchronously on the calling thread — they must post/schedule work, never re-enter an operator or take pipeline locks.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`

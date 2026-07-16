@@ -190,7 +190,9 @@ class exchange_channel {
   // A firing operation snapshots the callback under the lock and invokes the copy after
   // unlocking, so replacing a callback does not synchronize with an in-flight invocation:
   // callbacks must not capture raw pointers to objects the channel can outlive (capture a
-  // weak reference instead).
+  // weak reference instead). Callbacks run synchronously on the pushing/popping/closing
+  // thread — post/schedule work from them; do not re-enter a producer/consumer operator or
+  // take pipeline locks (the caller may already hold operator or pipeline mutexes).
   // -----------------------------------------------------------------------
 
   void set_on_push(std::function<void()> cb)

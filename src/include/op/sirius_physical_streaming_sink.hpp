@@ -39,8 +39,10 @@ namespace sirius::op {
 ///   _close_when_flushed so the last try_flush_pending() call closes the channel.
 /// - Backpressure is admission control: a full channel or non-empty _pending makes
 ///   get_next_task_hint() report WAITING, so no new sink tasks are created.
-/// - _pending is bounded: admission control refuses new sink tasks while it is non-empty,
-///   so its depth is bounded by in-flight task concurrency, not by input size.
+/// - _pending holds one handle per sink task created ahead of the consumer; admission control
+///   stops new pulls while it is non-empty or the channel is full. Its depth is bounded only
+///   once task creation is paced against completion — the session wiring's job (#839). Parked
+///   batches stay registered and spill-visible.
 class sirius_physical_streaming_sink : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SINK;
