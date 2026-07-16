@@ -617,6 +617,92 @@ TEST_CASE("streaming_sink lifecycle: sink() after finalize throws and leaves no 
   REQUIRE(out_ch->drained());
 }
 
+TEST_CASE("streaming_sink lifecycle: on_close re-entering the sink does not deadlock (finalize)",
+          "[streaming_sink]")
+{
+  auto [op, out_ch, out_repo] = make_sink();
+  auto in_repo                = wire_input_port(*op);
+
+  // finalize_operator() closes the channel; close() fires this callback synchronously, so it
+  // must run outside _pending_lock or the re-entrant try_flush_pending() self-deadlocks.
+  bool reentered = false;
+  out_ch->set_on_close([&] {
+    reentered = true;
+    op->try_flush_pending();
+  });
+
+  op->finalize_operator();
+  REQUIRE(reentered);
+  REQUIRE(out_ch->closed());
+}
+
+TEST_CASE(
+  "streaming_sink lifecycle: on_close re-entering the sink does not deadlock (deferred close)",
+  "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto stream                 = default_stream();
+  auto [op, out_ch, out_repo] = make_sink(/*capacity=*/1);
+  auto in_repo                = wire_input_port(*op);
+
+  auto b1 = make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32);
+  auto b2 = make_numeric_batch<int32_t>(*gpu_space, {2}, cudf::type_id::INT32);
+  sink_batch(*op, b1, stream);
+  sink_batch(*op, b2, stream);  // b2 → _pending
+  op->finalize_operator();      // close deferred: b2 still pending
+
+  // The deferred close fires from inside try_flush_pending(); the callback re-enters it.
+  out_ch->set_on_close([&] { op->try_flush_pending(); });
+
+  REQUIRE(out_ch->try_pop().has_value());  // free the slot
+  op->try_flush_pending();                 // delivers b2, closes, callback re-enters
+  REQUIRE(out_ch->closed());
+}
+
+TEST_CASE("streaming_sink lifecycle: stalled consumer — _pending grows with the burst size",
+          "[streaming_sink]")
+{
+  // Characterizes the documented caveat: sink tasks created ahead of execution can park
+  // input-many handles while the consumer stalls; every batch stays registered and
+  // spill-visible, and all are delivered once the consumer resumes. Pacing task creation
+  // against completion (the structural bound) is the session wiring's job (#839).
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  constexpr int N             = 12;
+  auto stream                 = default_stream();
+  auto [op, out_ch, out_repo] = make_sink(/*capacity=*/2);
+  auto in_repo                = wire_input_port(*op);
+
+  std::set<uint64_t> expected_ids;
+  for (int i = 0; i < N; ++i) {
+    auto b = make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32);
+    expected_ids.insert(b->get_batch_id());
+    sink_batch(*op, b, stream);  // models an already-created task executing against the stall
+  }
+
+  REQUIRE(out_ch->size() == 2u);         // channel holds capacity
+  REQUIRE(out_repo->total_size() == N);  // all N registered; N-2 parked in _pending
+
+  op->finalize_operator();  // close deferred behind the backlog
+
+  std::set<uint64_t> got_ids;
+  while (!out_ch->drained()) {
+    auto h = out_ch->try_pop();
+    if (!h) {
+      op->try_flush_pending();
+      continue;
+    }
+    got_ids.insert(h->batch_id);
+    out_repo->pop_data_batch_by_id(h->batch_id);
+  }
+  REQUIRE(got_ids == expected_ids);
+}
+
 TEST_CASE("streaming_sink lifecycle: conservation across randomized run", "[streaming_sink]")
 {
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
