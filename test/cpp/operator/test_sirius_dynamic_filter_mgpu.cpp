@@ -261,6 +261,15 @@ TEST_CASE("dynamic-filter replicas require destination reservation admission",
     require_omitted(filter);
   }
 
+  SECTION("Small IN-list")
+  {
+    auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
+    sirius::op::sirius_dynamic_small_in_list_filter filter(
+      keys->view(), stream, build_space.get_default_allocator());
+    stream.synchronize();
+    require_omitted(filter);
+  }
+
   SECTION("Bloom")
   {
     auto keys = cudf::sequence(1024,
@@ -493,4 +502,70 @@ TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
 
   rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
   filter.reset();
+}
+
+TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1",
+          "[dynamic_filter][mgpu][replica][small_in_list]")
+{
+  if (!require_two_gpus()) { return; }
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto replica_spaces = get_replica_spaces(*memory_manager);
+  auto& target_space  = replica_spaces.back().get_gpu_space();
+  auto* target_mr =
+    target_space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(target_mr != nullptr);
+  auto const target_reserved_before  = target_space.get_total_reserved_memory();
+  auto const target_active_before    = target_space.get_active_reservation_count();
+  auto const target_allocated_before = target_mr->get_total_allocated_bytes();
+  std::unique_ptr<sirius::op::sirius_dynamic_small_in_list_filter> filter;
+  {
+    rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
+    auto const& build_space = replica_spaces.front().get_gpu_space();
+    auto const stream       = build_space.acquire_stream();
+    auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
+    filter    = std::make_unique<sirius::op::sirius_dynamic_small_in_list_filter>(
+      keys->view(), stream, build_space.get_default_allocator());
+    stream.synchronize();
+    keys.reset();  // replication must use the filter-owned needle snapshot
+
+    REQUIRE(filter->replica_count() == 1);
+    REQUIRE(filter->is_available_on_device(kBuildDevice));
+    REQUIRE_FALSE(filter->is_available_on_device(kProbeDevice));
+
+    // A remote caller must skip the optional filter until its device-local needle snapshot is
+    // published; it must never dereference the source GPU's buffer.
+    {
+      rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
+      auto const probe_stream = cudf::get_default_stream();
+      auto early_probe =
+        make_values<std::int64_t>({2, 7}, cudf::data_type{cudf::type_id::INT64}, probe_stream);
+      auto early_mask = filter->compute_mask(
+        early_probe->view(), kProbeDevice, probe_stream, cudf::get_current_device_resource_ref());
+      REQUIRE(early_mask == nullptr);
+    }
+
+    replicate_to_both_devices(*filter, replica_spaces);
+    REQUIRE(filter->replica_count() == kReplicaDevices.size());
+    REQUIRE(target_space.get_total_reserved_memory() == target_reserved_before);
+    REQUIRE(target_space.get_active_reservation_count() == target_active_before);
+    REQUIRE(target_mr->get_total_allocated_bytes() > target_allocated_before);
+  }
+
+  {
+    rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
+    auto const stream = cudf::get_default_stream();
+    auto probe =
+      make_values<std::int64_t>({1, 2, 3, 4, 6, 9}, cudf::data_type{cudf::type_id::INT64}, stream);
+    auto mask = filter->compute_mask(
+      probe->view(), kProbeDevice, stream, cudf::get_current_device_resource_ref());
+    REQUIRE(mask != nullptr);
+    REQUIRE(mask_to_host(mask->view(), stream) == std::vector<std::uint8_t>{0, 1, 0, 1, 1, 0});
+  }
+
+  rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
+  filter.reset();
+  REQUIRE(target_space.get_total_reserved_memory() == target_reserved_before);
+  REQUIRE(target_space.get_active_reservation_count() == target_active_before);
+  REQUIRE(target_mr->get_total_allocated_bytes() == target_allocated_before);
 }

@@ -110,6 +110,17 @@ class scan_operator_input : public op::operator_data {
     return *std::get<std::unique_ptr<scan_info>>(materialization_info);
   }
 
+  [[nodiscard]] std::string get_origin_tiers() const override
+  {
+    if (!is_resident()) { return "SOURCE"; }
+    // The batch's tier is only readable through a lock accessor; take the non-blocking
+    // one and fall back to UNKNOWN if the batch is exclusively locked right now.
+    if (auto ro = get_cached_batch()->try_to_read_only()) {
+      return tier_display_name(ro->get_current_tier());
+    }
+    return "UNKNOWN";
+  }
+
   [[nodiscard]] std::shared_ptr<::cucascade::data_batch> get_cached_batch() const
   {
     if (!is_resident()) {

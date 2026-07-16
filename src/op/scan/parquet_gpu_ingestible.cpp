@@ -212,14 +212,6 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
-    SIRIUS_LOG_DEBUG(
-      "[coalesce-debug] parquet_batch_coalescer emit #{}: {} slice(s), output_bytes={}, "
-      "decode_working_bytes={}, cap={}",
-      ++_emit_count,
-      split->rg_slices.size(),
-      split->estimated_bytes(),
-      split->estimated_working_set_bytes(),
-      _cap);
     _slices.clear();
     _acc_working_bytes = 0;
     _acc_rows          = 0;
@@ -441,9 +433,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   auto stream = cudf::get_default_stream();
 
   // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
-  // cached metadata). Fall back to a plain cudf datasource only for local paths
-  // no sirius backend claims.
-  std::shared_ptr<io::sirius_datasource> sirius_ds = io_ctx->open_datasource(file_path);
+  // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
+  // to one suffix-range GET that resolves the size and stashes the footer, so
+  // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
+  // GETs). Fall back to a plain cudf datasource only for local paths no sirius
+  // backend claims.
+  std::shared_ptr<io::sirius_datasource> sirius_ds =
+    io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }

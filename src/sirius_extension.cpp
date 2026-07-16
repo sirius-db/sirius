@@ -76,7 +76,6 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
-#include "log/spdlog_owning_sink.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -434,7 +433,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUProcessingBind(ClientContext& conte
     try {
       auto gpu_physical_plan =
         GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-      auto gpu_prepared    = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared),
+      auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared),
                                                                     std::move(gpu_physical_plan));
       result->gpu_prepared = gpu_prepared;
     } catch (std::exception& e) {
@@ -1265,9 +1264,7 @@ struct ProfilerFunctionData : public GlobalTableFunctionState {
 
 static unique_ptr<GlobalTableFunctionState> ProfilerInit(ClientContext& context,
                                                          TableFunctionInitInput& input)
-{
-  return make_uniq<ProfilerFunctionData>();
-}
+{ return make_uniq<ProfilerFunctionData>(); }
 
 static void ProfilerStartFunction(ClientContext& context,
                                   TableFunctionInput& data_p,
@@ -1448,9 +1445,7 @@ static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 }
 
 static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scope, Value& parameter)
-{
-  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
-}
+{ ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter)); }
 
 // Deprecated alias for `expression_evaluator_strategy`. Kept so existing
 // `SET expression_executor_strategy=...` statements keep working; remove in a future release.
@@ -1602,23 +1597,22 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
 }
 
-// Rebuilds the global sink from the current logging config.
-static void ReinstallLogSink()
+static void SetLogBackend(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
-  auto flush =
-    Config::LOG_FLUSH_SECONDS <= 0
-      ? std::nullopt
-      : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
-  auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
-  sink->set_level(lvl);
-  sirius::log::set_sink(std::move(sink));
+  auto backend = StringValue::Get(parameter);
+  if (backend != "duckdb" && backend != "spdlog" && backend != "noop") {
+    throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
+                                backend);
+  }
+  Config::LOG_BACKEND = std::move(backend);
+  install_configured_log_sink(context.db.get());
+  SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
 }
 
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
-  // A level change only re-targets the current sink; no need to rebuild it.
+  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
   auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
   sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
   if (!parsed_level) {
@@ -1630,15 +1624,17 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  ReinstallLogSink();
+  // log_dir only affects the spdlog backend; rebuild it when that one is active.
+  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
-  // The flush interval is fixed at sink construction, so rebuild the sink.
-  ReinstallLogSink();
+  // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
+  // the spdlog backend uses it).
+  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
@@ -1665,9 +1661,7 @@ static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, 
 }
 
 static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
-{
-  SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
-}
+{ SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter)); }
 
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
@@ -1868,6 +1862,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
+  config.AddExtensionOption("sirius_log_backend",
+                            "Logging backend for Sirius (duckdb, spdlog, noop)",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_BACKEND),
+                            SetLogBackend);
   config.AddExtensionOption("sirius_log_level",
                             "Log level for Sirius (trace, debug, info, warn, error, critical, off)",
                             LogicalType::VARCHAR,
@@ -1928,16 +1927,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",
     "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
-    "runtime membership filter (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan "
-    "to drop non-matching rows before the join (on by default)",
+    "runtime membership filter (raw IN-list for 1-12 supported build rows; otherwise a hash "
+    "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
+    "non-matching rows before the join (on by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
     SetEnableDynamicFilterPushdown);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",
-    "Additionally emit a runtime zone-map (build-key min/max) for read-time row-group pruning "
-    "at the probe scan; requires enable_dynamic_filter_pushdown (off by default)",
+    "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
+    "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
+    "requires enable_dynamic_filter_pushdown (off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);
@@ -1978,6 +1979,12 @@ static void LoadInternal(ExtensionLoader& loader)
   auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
   auto* callback_ptr = callback.get();
   config.GetCallbackManager().Register(std::move(callback));
+
+  // The ctor already installed the db-independent backend; reinstall now that the
+  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
+  // unknown backend name is reported here rather than swallowed by the ctor.
+  install_configured_log_sink(&db);
+
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);

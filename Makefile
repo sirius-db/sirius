@@ -166,12 +166,12 @@ s3-test-large:
 	@# group. Catch2 OR-combines specs within one argument via commas (multiple
 	@# positional args are AND-concatenated instead), so each group runs in a
 	@# single process where same-config cases share one SiriusContext lifecycle.
-	@# SIRIUS_TEST_S3_TPCH is scoped to the first group only: it gates both the
-	@# SF1 TPC-H fixture upload at bring-up and the [tpch][large] case, so the
-	@# second group's bring-up must not see it (it would re-generate/upload).
+	@# SIRIUS_TEST_S3_TPCH gates the SF1 TPC-H fixture + [tpch][large]; SIRIUS_TEST_S3_GLOB_SCALE
+	@# gates the 1001-object fixture + [glob-scale]. Both are scoped to the first group only, so
+	@# the second group's bring-up must not see them (it would re-generate / re-upload).
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	SIRIUS_TEST_S3_TPCH=1 $(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join],[s3][integration][sql][tpch][large]"; \
+	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm],[s3][sql][large][large-q1-no-prewarm],[s3][sql][large][large-join-no-prewarm]"
 
 # TPC-H-over-S3 correctness tier (Q1-Q22 == local CPU oracle, GPU-only). Uploads
