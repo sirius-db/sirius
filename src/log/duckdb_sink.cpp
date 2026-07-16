@@ -86,13 +86,14 @@ class duckdb_sink final : public sink {
   bool flush() override
   {
     auto db = _db.lock();
-    if (!db) { return true; }
+    if (!db) { return false; }
     try {
       db->GetLogManager().Flush();
     } catch (...) {  // NOLINT(bugprone-empty-catch)
     }
-    // Delivered to DuckDB's log storage; further durability is DuckDB's concern.
-    return true;
+    // Best-effort only: Flush() gives no delivery confirmation and the storage may
+    // be non-durable, so we cannot promise the messages reached a final destination.
+    return false;
   }
 
  private:

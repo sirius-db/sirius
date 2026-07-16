@@ -1991,8 +1991,9 @@ static void LoadInternal(ExtensionLoader& loader)
   auto* callback_ptr = callback.get();
   config.GetCallbackManager().Register(std::move(callback));
 
-  // Now that the DatabaseInstance exists, install the configured sink; the
-  // default duckdb backend needs it.
+  // The ctor already installed the db-independent backend; reinstall now that the
+  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
+  // unknown backend name is reported here rather than swallowed by the ctor.
   install_configured_log_sink(&db);
 
   sirius::converter_registry::initialize();
