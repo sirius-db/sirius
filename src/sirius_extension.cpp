@@ -1268,23 +1268,10 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
 
-    // Currently, we do not support mixed compressed/uncompressed results: either all batches were
-    // compressed or none (HOST and DEVICE).
-    if (!host_result.compressed_chunks.empty() && !host_result.host_chunks.empty()) {
-      throw std::runtime_error(
-        "pin_table: unexpected result: both compressed and uncompressed host chunks present");
-    }
-    if (!host_result.compressed_chunks.empty() && host_result.host_chunks.empty()) {
-      scan_mgr.insert_pinned_entry_host_compressed(data.args.name,
-                                                   std::move(cache_info),
-                                                   std::move(host_result.compressed_chunks),
-                                                   *representative_host_space);
-    } else {
-      scan_mgr.insert_pinned_entry_host(data.args.name,
-                                        std::move(cache_info),
-                                        std::move(host_result.host_chunks),
-                                        *representative_host_space);
-    }
+    scan_mgr.insert_pinned_entry_host(data.args.name,
+                                      std::move(cache_info),
+                                      std::move(host_result.chunks),
+                                      *representative_host_space);
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;

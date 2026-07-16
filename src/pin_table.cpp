@@ -374,14 +374,13 @@ host_pin_result materialize_pin_to_host_with_compression(
               }
               stream.synchronize();
 
-              out.compressed_chunks.emplace_back(
-                std::make_shared<sirius::compressed_host_representation>(
-                  *target_host_space,
-                  std::move(blob),
-                  compression.column_names,
-                  static_cast<std::size_t>(payload_bytes),
-                  uncompressed_bytes,
-                  static_cast<int64_t>(tbl->num_rows())));
+              out.chunks.emplace_back(std::make_shared<sirius::compressed_host_representation>(
+                *target_host_space,
+                std::move(blob),
+                compression.column_names,
+                static_cast<std::size_t>(payload_bytes),
+                uncompressed_bytes,
+                static_cast<int64_t>(tbl->num_rows())));
               compressed_this_chunk = true;
             }
           }
@@ -399,7 +398,7 @@ host_pin_result materialize_pin_to_host_with_compression(
         auto host_repr = registry.convert<cucascade::host_data_representation>(
           gpu_repr, target_host_space, stream);
         stream.synchronize();
-        out.host_chunks.emplace_back(std::move(host_repr));
+        out.chunks.emplace_back(std::move(host_repr));
       }
     });
 

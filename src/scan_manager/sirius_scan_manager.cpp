@@ -95,17 +95,15 @@ struct cached_databatch_provider : public databatch_provider {
  private:
   std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
   {
-    if (!_entry.compressed_host_chunks.empty()) {
-      if (index >= _entry.compressed_host_chunks.size()) { return nullptr; }
-      const auto& chunk = _entry.compressed_host_chunks.at(index);
-      if (!chunk) { return nullptr; }
-      auto projected = chunk->select_columns(_column_indices);
-      return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
-    }
     if (index >= _entry.host_chunks.size()) { return nullptr; }
     const auto& chunk = _entry.host_chunks.at(index);
     if (!chunk) { return nullptr; }
-    auto data_rep       = chunk->slice(_column_indices);
+    if (auto* compressed = dynamic_cast<sirius::compressed_host_representation*>(chunk.get())) {
+      auto projected = compressed->select_columns(_column_indices);
+      return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
+    }
+    auto& host          = chunk->cast<cucascade::host_data_representation>();
+    auto data_rep       = host.slice(_column_indices);
     const auto batch_id = get_next_batch_id();
     return cucascade::data_batch::make(
       batch_id,
@@ -795,24 +793,41 @@ void sirius_scan_manager::insert_pinned_entry(
   _pinned_entries[name] = std::move(entry);
 }
 
+namespace {
+
+/// Row count of one pinned host chunk, dispatching on its concrete
+/// representation (a host pin may mix compressed and uncompressed chunks).
+std::size_t pinned_host_chunk_rows(cucascade::idata_representation const& chunk)
+{
+  if (auto const* compressed =
+        dynamic_cast<sirius::compressed_host_representation const*>(&chunk)) {
+    return static_cast<std::size_t>(compressed->num_rows());
+  }
+  auto const& host_table = chunk.cast<cucascade::host_data_representation>().get_host_table();
+  if (host_table && !host_table->columns.empty()) {
+    return static_cast<std::size_t>(host_table->columns.front().num_rows);
+  }
+  return 0;
+}
+
+}  // namespace
+
 void sirius_scan_manager::insert_pinned_entry_host(
   const std::string& name,
   cache_entry_info cache_info,
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+  std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
   cucascade::memory::memory_space& memory_space,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
-  // pinned column. Re-insert always replaces — there is no per-column merge analog
-  // to the GPU path because the chunk-vs-column dimensions are flipped.
+  // pinned column (compressed or uncompressed). Re-insert always replaces — there is
+  // no per-column merge analog to the GPU path because the chunk-vs-column dimensions
+  // are flipped.
   std::size_t new_num_rows = 0;
   for (auto const& chunk : host_chunks) {
     if (!chunk) { continue; }
-    auto const& host_table = chunk->get_host_table();
-    if (host_table && !host_table->columns.empty()) {
-      new_num_rows += static_cast<std::size_t>(host_table->columns.front().num_rows);
-    }
+    new_num_rows += pinned_host_chunk_rows(*chunk);
   }
 
   // Normalize the optional zone-map capture
@@ -837,33 +852,6 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.num_rows     = new_num_rows;
   entry.host_chunks  = std::move(host_chunks);
   entry.zone_maps    = std::move(pin_zone_maps);
-
-  _pinned_entries[name] = std::move(entry);
-}
-
-void sirius_scan_manager::insert_pinned_entry_host_compressed(
-  const std::string& name,
-  cache_entry_info cache_info,
-  std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
-  cucascade::memory::memory_space& memory_space)
-{
-  std::size_t new_num_rows = 0;
-  for (auto const& chunk : compressed_chunks) {
-    if (chunk) { new_num_rows += static_cast<std::size_t>(chunk->num_rows()); }
-  }
-
-  pinned_entry entry;
-  entry.cache_info             = std::move(cache_info);
-  entry.tier                   = cucascade::memory::Tier::HOST;
-  entry.memory_space           = &memory_space;
-  entry.num_rows               = new_num_rows;
-  entry.compressed_host_chunks = std::move(compressed_chunks);
-
-  SIRIUS_LOG_DEBUG(
-    "[sirius_scan_manager::insert_pinned_entry_host_compressed] '{}' chunks={} rows={}",
-    name,
-    entry.compressed_host_chunks.size(),
-    new_num_rows);
 
   _pinned_entries[name] = std::move(entry);
 }

@@ -91,7 +91,8 @@ entry_probe probe_entry(duckdb::Connection& con, const std::string& name)
         }
       } else {
         for (auto const& chunk : entry.host_chunks) {
-          auto const& host_table = chunk->get_host_table();
+          auto const& host_table =
+            chunk->cast<cucascade::host_data_representation>().get_host_table();
           out.actual_chunk_rows.push_back(
             host_table && !host_table->columns.empty()
               ? static_cast<std::size_t>(host_table->columns.front().num_rows)

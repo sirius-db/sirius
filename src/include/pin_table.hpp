@@ -66,6 +66,7 @@ class table;
 
 namespace cucascade {
 class host_data_representation;
+class idata_representation;
 }  // namespace cucascade
 
 namespace sirius {
@@ -139,11 +140,14 @@ materialized_pin materialize_all_batches(
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types);
 
 /// Result of driving a host-tier pin with optional Simpatico compression.
-/// When every batch compresses successfully, @c compressed_chunks is non-empty
-/// and @c host_chunks is empty; otherwise uncompressed chunks land in @c host_chunks.
+/// Compression is decided per chunk (a batch below the size threshold, or one
+/// that fails to compress usefully, is pinned uncompressed), so a single pinned
+/// table may mix the two forms. @c chunks holds one representation per emitted
+/// batch in emission order — each element is either a @c cucascade::
+/// host_data_representation (uncompressed) or a @c sirius::
+/// compressed_host_representation; both derive from @c cucascade::idata_representation.
 struct host_pin_result {
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
-  std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks;
+  std::vector<std::shared_ptr<cucascade::idata_representation>> chunks;
   /// Row count of each materialized batch, in emission order (covers compressed
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
