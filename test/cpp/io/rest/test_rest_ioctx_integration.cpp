@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "io/io_telemetry.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_list_parser.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
@@ -125,6 +126,14 @@ scan_manager_config make_minio_rest_config()
   cfg.rest.request_timeout_s  = 30;
   cfg.rest.max_connections    = 8;
   cfg.rest_n_reactors         = 1;
+  return cfg;
+}
+
+scan_manager_config make_minio_rest_config(
+  std::shared_ptr<sirius::io::io_telemetry_sink> io_telemetry)
+{
+  auto cfg         = make_minio_rest_config();
+  cfg.io_telemetry = std::move(io_telemetry);
   return cfg;
 }
 
@@ -338,9 +347,9 @@ class range_http_server {
     if (_listen_fd >= 0) {
       ::shutdown(_listen_fd, SHUT_RDWR);
       ::close(_listen_fd);
-      _listen_fd = -1;
     }
     if (_thread.joinable()) { _thread.join(); }
+    _listen_fd = -1;
     for (auto& w : _workers) {
       if (w.joinable()) { w.join(); }
     }
@@ -767,13 +776,15 @@ sirius::io::rest::config direct_rest_test_config()
   return cfg;
 }
 
-std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint,
-                                                   sirius::io::rest::config cfg,
-                                                   std::size_t n_reactors = 1)
+std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(
+  std::string endpoint,
+  sirius::io::rest::config cfg,
+  std::shared_ptr<sirius::io::io_telemetry_sink> io_telemetry = nullptr,
+  std::size_t n_reactors                                      = 1)
 {
   auto authorizer = std::make_shared<fixed_url_authorizer>(std::move(endpoint));
   auto ctx        = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
-    cfg, std::move(authorizer), nullptr);
+    cfg, std::move(authorizer), nullptr, std::move(io_telemetry));
   auto ioctx = std::make_shared<rest_ioctx>(n_reactors, std::move(ctx));
   ioctx->start();
   return ioctx;
@@ -786,6 +797,123 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
 
 using capture_sink       = sirius::test::recording_log_sink;
 using scoped_log_capture = sirius::test::scoped_recording_log_sink;
+struct io_telemetry_records {
+  std::vector<sirius::io::logical_io_record> logical;
+  std::vector<sirius::io::backend_io_record> backend;
+  std::size_t dropped{0};
+  std::size_t calls_after_seal{0};
+};
+
+struct io_telemetry_cursor {
+  std::size_t logical{0};
+  std::size_t backend{0};
+};
+
+class recording_io_telemetry_sink final : public sirius::io::io_telemetry_sink {
+ public:
+  void on_logical_read(sirius::io::logical_io_record const& record) noexcept override
+  {
+    try {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_sealed) {
+        ++_calls_after_seal;
+      } else {
+        _logical.push_back(record);
+      }
+    } catch (...) {
+      _dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  void on_backend_read(sirius::io::backend_io_record const& record) noexcept override
+  {
+    try {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_sealed) {
+        ++_calls_after_seal;
+      } else {
+        _backend.push_back(record);
+      }
+    } catch (...) {
+      _dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  [[nodiscard]] io_telemetry_cursor cursor() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return {_logical.size(), _backend.size()};
+  }
+
+  [[nodiscard]] io_telemetry_records records_since(io_telemetry_cursor cursor) const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    REQUIRE(cursor.logical <= _logical.size());
+    REQUIRE(cursor.backend <= _backend.size());
+    return {{_logical.begin() + static_cast<std::ptrdiff_t>(cursor.logical), _logical.end()},
+            {_backend.begin() + static_cast<std::ptrdiff_t>(cursor.backend), _backend.end()},
+            _dropped.load(std::memory_order_relaxed),
+            _calls_after_seal};
+  }
+
+  [[nodiscard]] io_telemetry_records records() const { return records_since({}); }
+
+  void seal()
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _sealed = true;
+  }
+
+ private:
+  mutable std::mutex _mutex;
+  std::vector<sirius::io::logical_io_record> _logical;
+  std::vector<sirius::io::backend_io_record> _backend;
+  std::atomic<std::size_t> _dropped{0};
+  std::size_t _calls_after_seal{0};
+  bool _sealed{false};
+};
+
+bool has_backend_record(io_telemetry_records const& records, sirius::io::io_uuid read_id)
+{
+  return std::any_of(records.backend.begin(), records.backend.end(), [&](auto const& record) {
+    return record.read_id == read_id;
+  });
+}
+
+void require_source_neutral_success(io_telemetry_records const& records,
+                                    std::size_t requested_bytes)
+{
+  REQUIRE(records.dropped == 0);
+  REQUIRE(records.logical.size() == 1);
+  REQUIRE(records.backend.size() == 1);
+
+  auto const& logical = records.logical.front();
+  auto const& backend = records.backend.front();
+  CHECK_FALSE(logical.read_id.is_nil());
+  CHECK(logical.read_id == backend.read_id);
+  CHECK(logical.object_id != 0);
+  CHECK(logical.object_id == backend.object_id);
+  CHECK(logical.bytes == requested_bytes);
+  CHECK(logical.outcome == sirius::io::io_outcome::ok);
+  CHECK(logical.t_begin_ns <= logical.t_end_ns);
+  CHECK(backend.bytes_requested == requested_bytes);
+  CHECK(backend.bytes_delivered == requested_bytes);
+  CHECK(backend.chunks_total >= 1);
+  CHECK(backend.chunks_completed == backend.chunks_total);
+  CHECK(backend.terminal == sirius::io::io_terminal_class::ok);
+  CHECK(backend.t_create_ns <= backend.t_complete_ns);
+}
+
+bool read_ids_are_unique(std::vector<sirius::io::logical_io_record> const& records)
+{
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    if (records[i].read_id.is_nil()) { return false; }
+    for (std::size_t j = i + 1; j < records.size(); ++j) {
+      if (records[i].read_id == records[j].read_id) { return false; }
+    }
+  }
+  return true;
+}
 
 struct list_watchdog_result {
   bool timed_out{false};
@@ -968,7 +1096,7 @@ TEST_CASE("rest perf snapshot attributes blocking host reads separately from chu
     cfg.perf_instrumentation  = true;
     cfg.max_connections       = 1;
     std::size_t const readers = 2;
-    auto ioctx                = make_direct_rest_ioctx(server.endpoint(), cfg, readers);
+    auto ioctx                = make_direct_rest_ioctx(server.endpoint(), cfg, nullptr, readers);
     auto datasource           = ioctx->open_datasource("s3://footer-bucket/native-footer.bin",
                                              static_cast<std::uint64_t>(payload.size()));
 
@@ -2389,4 +2517,426 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
     INFO("teardown completed in-flight request with exception: " << e.what());
     SUCCEED("future resolved with an exception during teardown");
   }
+}
+
+TEST_CASE("IO telemetry records the REST exactly-once outcome matrix",
+          "[.][s3][integration][io_telemetry][rest]")
+{
+  SECTION("direct success emits one joined logical and backend record")
+  {
+    auto payload  = deterministic_payload(16 * 1024);
+    auto recorder = std::make_shared<recording_io_telemetry_sink>();
+    range_http_server server(payload);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint(), direct_rest_test_config(), recorder);
+    auto datasource   = ioctx->open_datasource("s3://telemetry-bucket/direct.bin");
+    auto const before = recorder->cursor();
+
+    std::array<std::uint8_t, 128> got{};
+    REQUIRE(datasource->host_read(37, got.size(), got.data()) == got.size());
+    require_bytes_equal(got, std::span<std::uint8_t const>(payload.data() + 37, got.size()));
+
+    require_source_neutral_success(recorder->records_since(before), got.size());
+  }
+
+  SECTION("footer-stash success emits one logical record and no backend record")
+  {
+    auto payload  = read_binary_file(committed_parquet_fixture("nation.parquet"));
+    auto recorder = std::make_shared<recording_io_telemetry_sink>();
+    range_http_server server(payload);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint(), direct_rest_test_config(), recorder);
+    auto datasource   = ioctx->open_datasource("s3://telemetry-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    auto const before = recorder->cursor();
+
+    std::array<std::uint8_t, 8> got{};
+    REQUIRE(datasource->host_read(payload.size() - got.size(), got.size(), got.data()) ==
+            got.size());
+    require_bytes_equal(
+      got, std::span<std::uint8_t const>(payload.data() + payload.size() - got.size(), got.size()));
+
+    auto const records = recorder->records_since(before);
+    REQUIRE(records.logical.size() == 1);
+    CHECK(records.backend.empty());
+    CHECK_FALSE(records.logical.front().read_id.is_nil());
+    CHECK(records.logical.front().route == sirius::io::io_route::direct);
+    CHECK(records.logical.front().bytes == got.size());
+    CHECK(records.logical.front().outcome == sirius::io::io_outcome::ok);
+  }
+
+  SECTION("terminal HTTP error emits one matching error pair without retry duplicates")
+  {
+    auto payload  = deterministic_payload(16 * 1024);
+    auto recorder = std::make_shared<recording_io_telemetry_sink>();
+    range_fault_policy fault{};
+    fault.fail_all_gets = true;
+    fault.fail_status   = 404;
+    range_http_server server(payload, fault);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint(), direct_rest_test_config(), recorder);
+    auto datasource   = ioctx->open_datasource("s3://telemetry-bucket/missing.bin");
+    auto const before = recorder->cursor();
+
+    std::array<std::uint8_t, 128> got{};
+    CHECK_THROWS(datasource->host_read(0, got.size(), got.data()));
+
+    auto const records = recorder->records_since(before);
+    REQUIRE(records.logical.size() == 1);
+    REQUIRE(records.backend.size() == 1);
+    CHECK(records.logical.front().read_id == records.backend.front().read_id);
+    CHECK(records.logical.front().outcome == sirius::io::io_outcome::error);
+    CHECK(records.backend.front().terminal == sirius::io::io_terminal_class::http_error);
+  }
+
+  SECTION("empty request emits one zero-byte logical success and no backend record")
+  {
+    auto payload  = deterministic_payload(4096);
+    auto recorder = std::make_shared<recording_io_telemetry_sink>();
+    range_http_server server(payload);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint(), direct_rest_test_config(), recorder);
+    auto datasource   = ioctx->open_datasource("s3://telemetry-bucket/empty.bin");
+    auto const before = recorder->cursor();
+
+    std::array<std::uint8_t, 1> unused{};
+    auto future = datasource->host_read_async(0, 0, unused.data());
+    REQUIRE(future.get() == 0);
+
+    auto const records = recorder->records_since(before);
+    REQUIRE(records.logical.size() == 1);
+    CHECK(records.backend.empty());
+    CHECK(records.logical.front().bytes == 0);
+    CHECK(records.logical.front().outcome == sirius::io::io_outcome::ok);
+  }
+
+  SECTION("zero-read path emits no records")
+  {
+    auto payload  = deterministic_payload(4096);
+    auto recorder = std::make_shared<recording_io_telemetry_sink>();
+    range_http_server server(payload);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint(), direct_rest_test_config(), recorder);
+    auto const before = recorder->cursor();
+
+    auto datasource = ioctx->open_datasource("s3://telemetry-bucket/not-read.bin");
+    REQUIRE(datasource != nullptr);
+
+    auto const records = recorder->records_since(before);
+    CHECK(records.logical.empty());
+    CHECK(records.backend.empty());
+  }
+}
+
+TEST_CASE("IO telemetry reports REST retry outcomes without losing attempts",
+          "[.][s3][integration][io_telemetry][rest][retry]")
+{
+  auto payload = deterministic_payload(16 * 1024);
+
+  SECTION("transient HTTP failures retain retry count on success")
+  {
+    auto recorder = std::make_shared<recording_io_telemetry_sink>();
+    range_fault_policy fault{};
+    fault.fail_first_gets = 2;
+    fault.fail_status     = 503;
+    range_http_server server(payload, fault);
+    auto cfg               = direct_rest_test_config();
+    cfg.max_retry_attempts = 4;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg, recorder);
+    auto datasource        = ioctx->open_datasource("s3://telemetry-bucket/retry-success.bin");
+    auto const before      = recorder->cursor();
+
+    std::array<std::uint8_t, 128> got{};
+    REQUIRE(datasource->host_read(0, got.size(), got.data()) == got.size());
+
+    auto const records = recorder->records_since(before);
+    require_source_neutral_success(records, got.size());
+    CHECK(records.backend.front().retries == 2);
+    CHECK(server.get_count() == 3);
+  }
+
+  SECTION("exhausted HTTP retries retain attempts and terminal class")
+  {
+    auto recorder = std::make_shared<recording_io_telemetry_sink>();
+    range_fault_policy fault{};
+    fault.fail_all_gets = true;
+    fault.fail_status   = 503;
+    range_http_server server(payload, fault);
+    auto cfg               = direct_rest_test_config();
+    cfg.max_retry_attempts = 3;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg, recorder);
+    auto datasource        = ioctx->open_datasource("s3://telemetry-bucket/retry-exhausted.bin");
+    auto const before      = recorder->cursor();
+
+    std::array<std::uint8_t, 128> got{};
+    CHECK_THROWS(datasource->host_read(0, got.size(), got.data()));
+
+    auto const records = recorder->records_since(before);
+    REQUIRE(records.logical.size() == 1);
+    REQUIRE(records.backend.size() == 1);
+    CHECK(records.logical.front().read_id == records.backend.front().read_id);
+    CHECK(records.logical.front().outcome == sirius::io::io_outcome::error);
+    CHECK(records.backend.front().retries == cfg.max_retry_attempts - 1);
+    CHECK(records.backend.front().terminal == sirius::io::io_terminal_class::http_error);
+    CHECK(server.get_count() == cfg.max_retry_attempts);
+  }
+
+  SECTION("hard HTTP failures do not retry")
+  {
+    auto recorder = std::make_shared<recording_io_telemetry_sink>();
+    range_fault_policy fault{};
+    fault.fail_all_gets = true;
+    fault.fail_status   = 404;
+    range_http_server server(payload, fault);
+    auto cfg               = direct_rest_test_config();
+    cfg.max_retry_attempts = 4;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg, recorder);
+    auto datasource        = ioctx->open_datasource("s3://telemetry-bucket/retry-hard.bin");
+    auto const before      = recorder->cursor();
+
+    std::array<std::uint8_t, 128> got{};
+    CHECK_THROWS(datasource->host_read(0, got.size(), got.data()));
+
+    auto const records = recorder->records_since(before);
+    REQUIRE(records.logical.size() == 1);
+    REQUIRE(records.backend.size() == 1);
+    CHECK(records.logical.front().read_id == records.backend.front().read_id);
+    CHECK(records.logical.front().outcome == sirius::io::io_outcome::error);
+    CHECK(records.backend.front().retries == 0);
+    CHECK(records.backend.front().terminal == sirius::io::io_terminal_class::http_error);
+    CHECK(server.get_count() == 1);
+  }
+}
+
+TEST_CASE("IO telemetry logical latency brackets REST backend work",
+          "[.][s3][integration][io_telemetry][rest][latency]")
+{
+  auto payload  = deterministic_payload(16 * 1024);
+  auto recorder = std::make_shared<recording_io_telemetry_sink>();
+  range_fault_policy fault{};
+  fault.response_delay = 20ms;
+  range_http_server server(payload, fault);
+  auto ioctx      = make_direct_rest_ioctx(server.endpoint(), direct_rest_test_config(), recorder);
+  auto datasource = ioctx->open_datasource("s3://telemetry-bucket/latency.bin");
+  auto const before = recorder->cursor();
+
+  std::array<std::uint8_t, 128> got{};
+  REQUIRE(datasource->host_read_async(37, got.size(), got.data()).get() == got.size());
+
+  auto const records = recorder->records_since(before);
+  require_source_neutral_success(records, got.size());
+  auto const& logical = records.logical.front();
+  auto const& backend = records.backend.front();
+  CHECK(logical.t_begin_ns <= backend.t_create_ns);
+  CHECK(backend.t_create_ns <= backend.t_complete_ns);
+  CHECK(backend.t_complete_ns <= logical.t_end_ns);
+}
+
+TEST_CASE("IO telemetry counts each public datasource overload once",
+          "[.][s3][integration][io_telemetry][rest][overloads]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket  = require_env("SIRIUS_TEST_S3_BUCKET");
+  auto const payload = read_binary_file(local_fixture_path("small.bin"));
+  auto recorder      = std::make_shared<recording_io_telemetry_sink>();
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{make_minio_rest_config(recorder), *fixture.memory, fixture.topology};
+  auto datasource = manager.create_datasource("s3://" + bucket + "/small.bin");
+  require_rest_ioctx(datasource);
+  std::size_t constexpr offset = 37;
+  std::size_t constexpr bytes  = 128;
+  auto const before            = recorder->cursor();
+
+  SECTION("host pointer sync")
+  {
+    std::array<std::uint8_t, bytes> got{};
+    REQUIRE(datasource->host_read(offset, bytes, got.data()) == bytes);
+    require_bytes_equal(got, std::span<std::uint8_t const>(payload.data() + offset, bytes));
+  }
+
+  SECTION("host owning-buffer sync")
+  {
+    auto got = datasource->host_read(offset, bytes);
+    REQUIRE(got != nullptr);
+    CHECK(got->size() == bytes);
+  }
+
+  SECTION("host pointer async")
+  {
+    std::array<std::uint8_t, bytes> got{};
+    REQUIRE(datasource->host_read_async(offset, bytes, got.data()).get() == bytes);
+    require_bytes_equal(got, std::span<std::uint8_t const>(payload.data() + offset, bytes));
+  }
+
+  SECTION("host owning-buffer async")
+  {
+    auto got = datasource->host_read_async(offset, bytes).get();
+    REQUIRE(got != nullptr);
+    CHECK(got->size() == bytes);
+  }
+
+  SECTION("device owning-buffer sync")
+  {
+    rmm::cuda_stream stream;
+    auto got = datasource->device_read(offset, bytes, stream);
+    REQUIRE(got != nullptr);
+    CHECK(got->size() == bytes);
+  }
+
+  SECTION("device pointer sync")
+  {
+    rmm::cuda_stream stream;
+    rmm::device_buffer got(bytes, stream);
+    REQUIRE(datasource->device_read(
+              offset, bytes, static_cast<std::uint8_t*>(got.data()), stream) == bytes);
+    require_bytes_equal(copy_device_to_host(got, bytes, stream),
+                        std::span<std::uint8_t const>(payload.data() + offset, bytes));
+  }
+
+  SECTION("device pointer async")
+  {
+    rmm::cuda_stream stream;
+    rmm::device_buffer got(bytes, stream);
+    REQUIRE(
+      datasource->device_read_async(offset, bytes, static_cast<std::uint8_t*>(got.data()), stream)
+        .get() == bytes);
+    require_bytes_equal(copy_device_to_host(got, bytes, stream),
+                        std::span<std::uint8_t const>(payload.data() + offset, bytes));
+  }
+
+  require_source_neutral_success(recorder->records_since(before), bytes);
+}
+
+TEST_CASE("IO telemetry off mode leaves a REST ioctx inert",
+          "[.][s3][integration][io_telemetry][off]")
+{
+  auto payload = deterministic_payload(4096);
+  range_http_server server(payload);
+  auto ioctx = make_direct_rest_ioctx(server.endpoint());
+  REQUIRE(ioctx->io_telemetry() == nullptr);
+  auto datasource = ioctx->open_datasource("s3://telemetry-bucket/off.bin");
+
+  std::array<std::uint8_t, 128> got{};
+  REQUIRE(datasource->host_read(0, got.size(), got.data()) == got.size());
+  require_bytes_equal(got, std::span<std::uint8_t const>(payload.data(), got.size()));
+  CHECK(ioctx->io_telemetry() == nullptr);
+}
+
+TEST_CASE("IO telemetry recorder adds up concurrent REST reads without races",
+          "[.][s3][integration][io_telemetry][concurrency][tsan]")
+{
+  auto payload  = deterministic_payload(256 * 1024);
+  auto recorder = std::make_shared<recording_io_telemetry_sink>();
+  range_fault_policy fault{};
+  fault.response_delay = 10ms;
+  range_http_server server(payload, fault);
+  auto cfg            = direct_rest_test_config();
+  cfg.max_connections = 4;
+  cfg.chunk_size      = 1024;
+  cfg.max_n_chunks    = 1;
+  auto ioctx          = make_direct_rest_ioctx(server.endpoint(), cfg, recorder);
+  auto datasource     = ioctx->open_datasource("s3://telemetry-bucket/concurrent.bin");
+  auto const before   = recorder->cursor();
+
+  std::size_t constexpr readers = 16;
+  std::atomic<std::size_t> ready{0};
+  std::atomic<bool> go{false};
+  std::vector<std::exception_ptr> errors(readers);
+  std::vector<std::thread> threads;
+  threads.reserve(readers);
+  for (std::size_t i = 0; i < readers; ++i) {
+    threads.emplace_back([&, i, local = datasource->duplicate()]() mutable {
+      try {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        std::array<std::uint8_t, 256> got{};
+        auto const offset = i * 1024 + 13;
+        auto const n      = local->host_read(offset, got.size(), got.data());
+        if (n != got.size() ||
+            !std::equal(
+              got.begin(), got.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset))) {
+          throw std::runtime_error("concurrent REST read returned incorrect bytes");
+        }
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != readers) {
+    std::this_thread::yield();
+  }
+  go.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (auto const& error : errors) {
+    if (error) { std::rethrow_exception(error); }
+  }
+
+  auto const records = recorder->records_since(before);
+  CHECK(records.dropped == 0);
+  REQUIRE(records.logical.size() == readers);
+  REQUIRE(records.backend.size() == readers);
+  CHECK(read_ids_are_unique(records.logical));
+  for (auto const& logical : records.logical) {
+    CHECK(logical.outcome == sirius::io::io_outcome::ok);
+    CHECK(has_backend_record(records, logical.read_id));
+  }
+}
+
+TEST_CASE("IO telemetry finalizes queued REST reads once during teardown",
+          "[.][s3][integration][io_telemetry][lifecycle]")
+{
+  auto payload  = deterministic_payload(128 * 1024);
+  auto recorder = std::make_shared<recording_io_telemetry_sink>();
+  range_fault_policy fault{};
+  fault.response_delay = 250ms;
+  range_http_server server(payload, fault);
+  auto cfg            = direct_rest_test_config();
+  cfg.max_connections = 1;
+  auto ioctx          = make_direct_rest_ioctx(server.endpoint(), cfg, recorder);
+  auto first          = ioctx->open_datasource("s3://telemetry-bucket/teardown.bin");
+  auto second         = first->duplicate();
+  auto const before   = recorder->cursor();
+
+  std::array<std::uint8_t, 4096> first_bytes{};
+  std::array<std::uint8_t, 4096> second_bytes{};
+  auto first_future = first->host_read_async(0, first_bytes.size(), first_bytes.data());
+  auto second_future =
+    second->host_read_async(first_bytes.size(), second_bytes.size(), second_bytes.data());
+  std::this_thread::sleep_for(20ms);
+  first.reset();
+  second.reset();
+  ioctx.reset();
+
+  REQUIRE(first_future.wait_for(5s) == std::future_status::ready);
+  REQUIRE(second_future.wait_for(5s) == std::future_status::ready);
+  for (auto* future : {&first_future, &second_future}) {
+    try {
+      (void)future->get();
+    } catch (...) {
+    }
+  }
+
+  auto const records = recorder->records_since(before);
+  REQUIRE(records.logical.size() == 2);
+  REQUIRE(records.backend.size() == 2);
+  CHECK(read_ids_are_unique(records.logical));
+  bool saw_cancelled = false;
+  for (auto const& backend : records.backend) {
+    auto const terminal = backend.terminal;
+    if (terminal == sirius::io::io_terminal_class::cancelled ||
+        terminal == sirius::io::io_terminal_class::shutdown) {
+      saw_cancelled = true;
+      auto const matching =
+        std::find_if(records.logical.begin(), records.logical.end(), [&](auto const& logical) {
+          return logical.read_id == backend.read_id;
+        });
+      REQUIRE(matching != records.logical.end());
+      CHECK(matching->outcome == sirius::io::io_outcome::cancelled);
+    }
+  }
+  CHECK(saw_cancelled);
+
+  recorder->seal();
+  std::this_thread::sleep_for(50ms);
+  CHECK(recorder->records().calls_after_seal == 0);
 }

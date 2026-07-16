@@ -299,6 +299,16 @@ class templated_ioctx : public sirius_ioctx {
     }
   }
 
+  /// No-op when either the context or the sink is absent — the off path stays
+  /// a single branch.
+  void install_request_telemetry(request_type& req, const io_read_context* telemetry_ctx)
+  {
+    if (telemetry_ctx == nullptr) { return; }
+    if (auto sink = this->io_telemetry_shared()) {
+      req.install_telemetry(std::move(sink), *telemetry_ctx);
+    }
+  }
+
   virtual std::vector<Reactor*> next_reactor([[maybe_unused]] const io_object_type& obj,
                                              [[maybe_unused]] size_t n_chunks,
                                              [[maybe_unused]] io_op_type type,
@@ -317,16 +327,37 @@ class templated_ioctx : public sirius_ioctx {
                       size_t size,
                       uint8_t* dst) override
   {
+    return host_read_io(obj, offset, size, dst, nullptr);
+  }
+
+  size_t host_read_io(const sirius_io_object& obj,
+                      size_t offset,
+                      size_t size,
+                      uint8_t* dst,
+                      const io_read_context* telemetry_ctx) override
+  {
     auto& tobj = as_typed(obj);
     size       = std::min(size, tobj.size() > offset ? tobj.size() - offset : size_t{0});
     if (size == 0) return 0;
-    return next_reactor(tobj, 1, io_op_type::host).at(0)->host_read(tobj, offset, size, dst);
+    return next_reactor(tobj, 1, io_op_type::host)
+      .at(0)
+      ->host_read(tobj, offset, size, dst, telemetry_ctx);
   }
 
   exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
                                                size_t offset,
                                                size_t size,
                                                uint8_t* dst) noexcept override
+  {
+    return host_read_async_io(obj, offset, size, dst, nullptr);
+  }
+
+  exec::semi_future<size_t> host_read_async_io(
+    const sirius_io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    const io_read_context* telemetry_ctx) noexcept override
   {
     if (size == 0) return exec::make_semi_future<size_t>(0);
     try {
@@ -340,6 +371,7 @@ class templated_ioctx : public sirius_ioctx {
       }
 
       auto req = Reactor::prep_host_rx_request(_config, tobj, io_object_segment{offset, size, dst});
+      install_request_telemetry(*req, telemetry_ctx);
       auto semi = req->get_future();
       auto reqs = request_type::splits(std::move(req), reactors.size());
       assert(reqs.size() <= reactors.size());
@@ -360,6 +392,17 @@ class templated_ioctx : public sirius_ioctx {
                                                  uint8_t* dst,
                                                  rmm::cuda_stream_view stream) noexcept override
   {
+    return device_read_async_io(obj, offset, size, dst, stream, nullptr);
+  }
+
+  exec::semi_future<size_t> device_read_async_io(
+    const sirius_io_object& obj,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    rmm::cuda_stream_view stream,
+    const io_read_context* telemetry_ctx) noexcept override
+  {
     if constexpr (reactor_traits_t::supports_device_read) {
       try {
         auto& tobj    = as_typed(obj);
@@ -371,6 +414,7 @@ class templated_ioctx : public sirius_ioctx {
         }
         request_type_ptr req =
           Reactor::prep_device_rx_request(_config, tobj, dst, offset, size, stream, device_id);
+        install_request_telemetry(*req, telemetry_ctx);
         auto semi = req->get_future();
         auto reqs = request_type::splits(std::move(req), reactors.size());
         assert(reqs.size() <= reactors.size());
@@ -396,6 +440,18 @@ class templated_ioctx : public sirius_ioctx {
     uint8_t* dst,
     rmm::cuda_stream_view stream) noexcept override
   {
+    return host_to_device_read_async_io(obj, slices, offset, size, dst, stream, nullptr);
+  }
+
+  exec::semi_future<size_t> host_to_device_read_async_io(
+    const sirius_io_object& obj,
+    std::span<io_object_segment> slices,
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    rmm::cuda_stream_view stream,
+    const io_read_context* telemetry_ctx) noexcept override
+  {
     if constexpr (reactor_traits_t::supports_host_to_device_read) {
       try {
         auto& tobj    = as_typed(obj);
@@ -407,6 +463,7 @@ class templated_ioctx : public sirius_ioctx {
         }
         request_type_ptr req = Reactor::prep_host_to_device_rx_request(
           _config, tobj, slices, dst, offset, size, stream, device_id);
+        install_request_telemetry(*req, telemetry_ctx);
         auto semi = req->get_future();
         auto reqs = request_type::splits(std::move(req), reactors.size());
         assert(reqs.size() <= reactors.size());
@@ -428,6 +485,14 @@ class templated_ioctx : public sirius_ioctx {
   exec::semi_future<size_t> host_read_ranges_async_io(
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept override
   {
+    return host_read_ranges_async_io(obj, segments, nullptr);
+  }
+
+  exec::semi_future<size_t> host_read_ranges_async_io(
+    const sirius_io_object& obj,
+    std::span<io_object_segment> segments,
+    const io_read_context* telemetry_ctx) noexcept override
+  {
     if constexpr (reactor_traits_t::supports_vector_host_read) {
       try {
         auto& tobj = as_typed(obj);
@@ -438,7 +503,8 @@ class templated_ioctx : public sirius_ioctx {
             std::runtime_error("host_read_ranges_async_io: no available reactors")));
         }
 
-        auto req  = Reactor::prep_host_rxv_request(_config, tobj, segments);
+        auto req = Reactor::prep_host_rxv_request(_config, tobj, segments);
+        install_request_telemetry(*req, telemetry_ctx);
         auto semi = req->get_future();
         auto reqs = request_type::splits(std::move(req), reactors.size());
         assert(reqs.size() <= reactors.size());

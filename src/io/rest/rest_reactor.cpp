@@ -764,7 +764,11 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
 // synchronous paths
 // ---------------------------------------------------------------------------
 
-size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst)
+size_t rest_reactor::host_read(const io_object_type& file,
+                               size_t offset,
+                               size_t size,
+                               uint8_t* dst,
+                               const io_read_context* telemetry_ctx)
 {
   if (size == 0) { return 0; }
   size = std::min(size, file.size() > offset ? file.size() - offset : size_t{0});
@@ -789,6 +793,7 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
   // block: get() rethrows the first reported error or returns the byte count.
   auto req = prep_host_rx_request(
     _config, file, io_object_segment{offset, size, dst}, /*perf_blocking_host_get=*/true);
+  if (telemetry_ctx != nullptr) { req->install_telemetry(_ctx->io_telemetry(), *telemetry_ctx); }
   auto fut = req->get_future();
   enqueue(std::move(req));
   return std::move(fut).get();
@@ -1366,7 +1371,9 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         } else {
           _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
           it->manager->report_error(
-            std::make_exception_ptr(std::runtime_error("rest_reactor: device H2D copy failed")));
+            std::make_exception_ptr(std::runtime_error("rest_reactor: device H2D copy failed")),
+            std::source_location::current(),
+            io_terminal_class::cuda_error);
         }
         it = copying.erase(it);
       }
@@ -1394,16 +1401,21 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     auto schedule_retry = [&](std::unique_ptr<rest_chunked_rx_request> req,
                               std::string const& retry_after,
                               bool is_auth,
-                              std::string const& reason) {
+                              std::string const& reason,
+                              io_terminal_class reason_class) {
       std::size_t& counter = is_auth ? req->auth_attempt : req->attempt;
       std::size_t const max_attempts =
         is_auth ? _config.max_auth_retry_attempts : _config.max_retry_attempts;
       if (counter + 1 >= max_attempts) {
         _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
-        req->manager->report_error(std::make_exception_ptr(std::runtime_error(
-          "rest_reactor: exhausted retries for " + req->object.bucket + "/" + req->object.key)));
+        req->manager->report_error(
+          std::make_exception_ptr(std::runtime_error("rest_reactor: exhausted retries for " +
+                                                     req->object.bucket + "/" + req->object.key)),
+          std::source_location::current(),
+          reason_class);
         return;
       }
+      req->manager->note_retry();
       // Backoff tracks the transient-attempt count; an auth retry re-presigns
       // and reuses the current step without inflating it.
       auto const delay = compute_backoff(req->attempt, retry_after, _config);
@@ -1531,10 +1543,13 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         auto const start = content_range_start(s.hc.content_range);
         if (!start || *start != req.chunk.offset) {
           _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
-          req.manager->report_error(std::make_exception_ptr(std::runtime_error(
-            "rest_reactor: 206 Content-Range mismatch (got '" + s.hc.content_range +
-            "', requested offset " + std::to_string(req.chunk.offset) + ") for " +
-            req.object.bucket + "/" + req.object.key)));
+          req.manager->report_error(
+            std::make_exception_ptr(std::runtime_error(
+              "rest_reactor: 206 Content-Range mismatch (got '" + s.hc.content_range +
+              "', requested offset " + std::to_string(req.chunk.offset) + ") for " +
+              req.object.bucket + "/" + req.object.key)),
+            std::source_location::current(),
+            io_terminal_class::http_error);
           return false;
         }
       }
@@ -1575,7 +1590,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           cudaError_t const err = req.copy_h2d_async(cev);
           if (err != cudaSuccess) {
             _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
-            req.manager->report_error(err);
+            req.manager->report_error(
+              err, std::source_location::current(), io_terminal_class::cuda_error);
             return false;
           }
           if (_config.perf_instrumentation) {
@@ -1610,9 +1626,11 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         // Server ignored Range and returned the whole object: the bytes start
         // at offset 0, not req.offset — non-retriable, would loop forever.
         _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
-        req.manager->report_error(std::make_exception_ptr(
-          std::runtime_error("rest_reactor: server ignored Range (HTTP 200) for " +
-                             req.object.bucket + "/" + req.object.key)));
+        req.manager->report_error(std::make_exception_ptr(std::runtime_error(
+                                    "rest_reactor: server ignored Range (HTTP 200) for " +
+                                    req.object.bucket + "/" + req.object.key)),
+                                  std::source_location::current(),
+                                  io_terminal_class::http_error);
         return false;
       }
       // Error or truncated transfer.  A short read or a transient HTTP / curl
@@ -1632,15 +1650,21 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         schedule_retry(std::move(s.req),
                        s.hc.retry_after,
                        /*is_auth=*/auth_retriable && !retriable,
-                       reason);
+                       reason,
+                       (rc != CURLE_OK || short_read) ? io_terminal_class::transport_error
+                                                      : io_terminal_class::http_error);
         return false;
       }
       std::string const msg = rc != CURLE_OK
                                 ? std::string(curl_easy_strerror(rc))
                                 : (ok_range ? "short read" : "HTTP " + std::to_string(status));
       _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
-      req.manager->report_error(std::make_exception_ptr(std::runtime_error(
-        "rest_reactor: " + msg + " for " + req.object.bucket + "/" + req.object.key)));
+      req.manager->report_error(
+        std::make_exception_ptr(std::runtime_error("rest_reactor: " + msg + " for " +
+                                                   req.object.bucket + "/" + req.object.key)),
+        std::source_location::current(),
+        (rc != CURLE_OK || ok_range) ? io_terminal_class::transport_error
+                                     : io_terminal_class::http_error);
       return false;
     };
 
@@ -1737,18 +1761,26 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     for (auto& s : slots) {
       if (s.req) {
         curl_multi_remove_handle(multi.get(), s.easy.get());
-        s.req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+        s.req->manager->report_error(std::make_error_code(std::errc::operation_canceled),
+                                     std::source_location::current(),
+                                     io_terminal_class::shutdown);
         s.reset();
       }
     }
     for (auto& e : retry_heap) {
       if (e.req) {
-        e.req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+        e.req->manager->report_error(std::make_error_code(std::errc::operation_canceled),
+                                     std::source_location::current(),
+                                     io_terminal_class::shutdown);
       }
     }
     retry_heap.clear();
     for (auto& r : ready) {
-      if (r) { r->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
+      if (r) {
+        r->manager->report_error(std::make_error_code(std::errc::operation_canceled),
+                                 std::source_location::current(),
+                                 io_terminal_class::shutdown);
+      }
     }
     ready.clear();
   } catch (const std::exception& e) {
@@ -1757,7 +1789,11 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
   std::unique_ptr<rest_chunked_rx_request> dr;
   while (_requests.try_dequeue(dr)) {
-    if (dr) { dr->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
+    if (dr) {
+      dr->manager->report_error(std::make_error_code(std::errc::operation_canceled),
+                                std::source_location::current(),
+                                io_terminal_class::shutdown);
+    }
     dr.reset();
   }
 }

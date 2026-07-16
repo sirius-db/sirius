@@ -29,10 +29,11 @@
 namespace sirius::io::rest {
 
 rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
-  : templated_ioctx<rest_reactor>(n_reactors, [ctx = std::move(ctx), i = 0]() mutable {
+  : templated_ioctx<rest_reactor>(n_reactors, [ctx, i = 0]() mutable {
       return std::make_unique<rest_reactor>(ctx, std::format("rest-{}", i++));
     })
 {
+  set_io_telemetry(ctx->io_telemetry());
 }
 
 rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept

@@ -19,6 +19,7 @@
 #include "exec/semi_future.hpp"
 #include "io/cache/types.hpp"
 #include "io/details/slot_pool.hpp"
+#include "io/io_telemetry.hpp"
 #include "io/types.hpp"
 #include "io/uring/config.hpp"
 #include "io/uring/types.hpp"
@@ -225,8 +226,11 @@ class uring_reactor {
   void shutdown();
 
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
-  size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
-
+  size_t host_read(const io_object_type& file,
+                   size_t offset,
+                   size_t size,
+                   uint8_t* dst,
+                   const io_read_context* telemetry_ctx = nullptr);
   void enqueue(request_type_ptr req);
 
   /// Whether @p path can be served by this reactor.  Local-disk only:

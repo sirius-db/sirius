@@ -805,8 +805,11 @@ bool uring_reactor::supports(std::string_view path)
 size_t uring_reactor::host_read(const io_object_type& file,
                                 size_t offset,
                                 size_t size,
-                                uint8_t* dst)
+                                uint8_t* dst,
+                                const io_read_context* /*telemetry_ctx*/)
 {
+  // Telemetry is deferred for uring (its sink is never wired); the parameter
+  // only satisfies the shared templated_ioctx dispatch shape.
   if (size == 0) return 0;
   // Loop until either the full requested size is read, EOF (n == 0), or a
   // real error. pread on a regular file should only return short on EOF, but
@@ -1066,7 +1069,9 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     chunk_io_request_type_ptr dr = nullptr;
     while (_requests.try_dequeue(dr)) {
       if (dr) {
-        dr->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+        dr->manager->report_error(std::make_error_code(std::errc::operation_canceled),
+                                  std::source_location::current(),
+                                  io_terminal_class::shutdown);
         dr.reset(nullptr);
       } else {
         break;  // queue empty

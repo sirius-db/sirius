@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/io_telemetry.hpp"
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 
@@ -92,6 +94,23 @@ class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
   /// Total size of the underlying object, populated by the reactor at
   /// construction time and stored on the io_object thereafter.
   [[nodiscard]] virtual size_t size() const noexcept = 0;
+
+  /// Session-salted telemetry identity, computed lazily from @c object_path()
+  /// and cached. Never the plaintext key.
+  [[nodiscard]] uint64_t telemetry_object_id() const noexcept
+  {
+    uint64_t v = _telemetry_object_id.load(std::memory_order_relaxed);
+    if (v == 0) {
+      const auto& path = object_path();
+      v                = make_io_object_identity(path.data(), path.size());
+      if (v == 0) { v = 1; }
+      _telemetry_object_id.store(v, std::memory_order_relaxed);
+    }
+    return v;
+  }
+
+ private:
+  mutable std::atomic<uint64_t> _telemetry_object_id{0};
 };
 
 class sirius_io_object_metadata {

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "io/cache/types.hpp"
+#include "io/io_telemetry.hpp"
 #include "io/rest/config.hpp"
 #include "io/rest/types.hpp"
 #include "io/s3/s3_object_ref.hpp"
@@ -186,8 +187,12 @@ class rest_reactor {
    public:
     reactor_context(config cfg,
                     std::shared_ptr<s3::s3_request_authorizer> authorizer,
-                    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
-      : _config(std::move(cfg)), _authorizer(std::move(authorizer)), _host_mr(host_mr)
+                    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr,
+                    std::shared_ptr<io_telemetry_sink> io_telemetry             = nullptr)
+      : _config(std::move(cfg)),
+        _authorizer(std::move(authorizer)),
+        _host_mr(host_mr),
+        _io_telemetry(std::move(io_telemetry))
     {
     }
 
@@ -201,11 +206,16 @@ class rest_reactor {
     {
       return _host_mr;
     }
+    [[nodiscard]] const std::shared_ptr<io_telemetry_sink>& io_telemetry() const noexcept
+    {
+      return _io_telemetry;
+    }
 
    private:
     config _config;
     std::shared_ptr<s3::s3_request_authorizer> _authorizer;
     cucascade::memory::fixed_size_host_memory_resource* _host_mr{nullptr};
+    std::shared_ptr<io_telemetry_sink> _io_telemetry;
   };
 
   using io_object_type       = rest_io_object;
@@ -269,7 +279,11 @@ class rest_reactor {
   void shutdown();
 
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
-  size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
+  size_t host_read(const io_object_type& file,
+                   size_t offset,
+                   size_t size,
+                   uint8_t* dst,
+                   const io_read_context* telemetry_ctx = nullptr);
 
   /// Blocking HEAD to discover an object's size.  Used by the ioctx to build
   /// an @c rest_io_object.  @p bucket / @p key identify the object.
