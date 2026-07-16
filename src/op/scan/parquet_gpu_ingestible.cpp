@@ -265,22 +265,17 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
 //===----------------------------------------------------------------------===//
 std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() const
 {
-  if (!datasource || !datasource->uses_prefetching_cache() || !file_metadata || !reader_options) {
-    return {};
-  }
-  std::vector<cudf::size_type> rg_indices;
-  rg_indices.reserve(row_groups.size());
-  for (auto const& rg : row_groups) {
-    rg_indices.push_back(rg.index);
-  }
-  auto ranges = column_chunk_ranges(*file_metadata, *reader_options, rg_indices);
-  if (ranges.empty()) { return {}; }
-  fadvise_entry entry;
-  entry.datasource = datasource;
-  entry.ranges     = std::move(ranges);
-  std::vector<fadvise_entry> out;
-  out.push_back(std::move(entry));
-  return out;
+  if (!file_metadata || !reader_options) { return {}; }
+  std::vector<fadvise_entry> entries;
+  append_fadvise_entry(entries, datasource, [this] {
+    std::vector<cudf::size_type> rg_indices;
+    rg_indices.reserve(row_groups.size());
+    for (auto const& rg : row_groups) {
+      rg_indices.push_back(rg.index);
+    }
+    return column_chunk_ranges(*file_metadata, *reader_options, rg_indices);
+  });
+  return entries;
 }
 
 std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() const
@@ -289,16 +284,10 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
   std::vector<fadvise_entry> entries;
   entries.reserve(rg_slices.size());
   for (auto const& slice : rg_slices) {
-    if (!slice.datasource || !slice.datasource->uses_prefetching_cache() || !slice.file_metadata) {
-      continue;
-    }
-    auto ranges =
-      column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
-    if (ranges.empty()) { continue; }
-    fadvise_entry entry;
-    entry.datasource = slice.datasource;
-    entry.ranges     = std::move(ranges);
-    entries.push_back(std::move(entry));
+    if (!slice.file_metadata) { continue; }
+    append_fadvise_entry(entries, slice.datasource, [&slice, this] {
+      return column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
+    });
   }
   return entries;
 }

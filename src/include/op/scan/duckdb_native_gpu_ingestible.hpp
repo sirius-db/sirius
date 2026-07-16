@@ -118,16 +118,17 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// groups currently held. The scan sequencer fadvises these to prefetch.
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override
   {
-    if (!datasource || !datasource->uses_prefetching_cache() || block_manager == nullptr) {
-      return {};
-    }
-    fadvise_entry entry;
-    entry.datasource = datasource;
-    for (auto const& rg : row_groups) {
-      auto ranges = row_group_file_ranges(*block_manager, rg);
-      entry.ranges.insert(entry.ranges.end(), ranges.begin(), ranges.end());
-    }
-    return {std::move(entry)};
+    if (block_manager == nullptr) { return {}; }
+    std::vector<fadvise_entry> entries;
+    append_fadvise_entry(entries, datasource, [this] {
+      std::vector<cudf::io::text::byte_range_info> ranges;
+      for (auto const& rg : row_groups) {
+        auto rg_ranges = row_group_file_ranges(*block_manager, rg);
+        ranges.insert(ranges.end(), rg_ranges.begin(), rg_ranges.end());
+      }
+      return ranges;
+    });
+    return entries;
   }
 
   /// Decoded (GPU) byte budget for this unit; drives memory reservation.

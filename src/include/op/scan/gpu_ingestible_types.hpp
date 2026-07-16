@@ -20,6 +20,7 @@
 
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 #pragma once
@@ -106,6 +107,18 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   [[nodiscard]] virtual std::size_t estimated_working_set_bytes() const noexcept
   {
     return estimated_bytes();
+  }
+
+ protected:
+  template <typename RangeFactory>
+  static void append_fadvise_entry(std::vector<fadvise_entry>& entries,
+                                   std::shared_ptr<sirius::io::sirius_datasource> const& datasource,
+                                   RangeFactory&& make_ranges)
+  {
+    if (!datasource || !datasource->uses_prefetching_cache()) { return; }
+    auto ranges = std::forward<RangeFactory>(make_ranges)();
+    if (ranges.empty()) { return; }
+    entries.push_back(fadvise_entry{datasource, std::move(ranges)});
   }
 };
 
