@@ -1534,6 +1534,11 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     }
   } else {
     // Defense-in-depth for older representations that predate mandatory writer events.
+    // The build batch was produced on a *different* stream than publish_stream (see
+    // comment above), and without a writer event there is no handle to that producing
+    // stream. cudaStreamSynchronize(publish_stream) would therefore NOT wait for the
+    // build's writes and could publish a filter over incomplete data, so a device-wide
+    // sync is the only correct fallback here.
     auto const status = cudaDeviceSynchronize();
     if (status != cudaSuccess) {
       throw std::runtime_error(

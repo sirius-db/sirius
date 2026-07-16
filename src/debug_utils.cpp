@@ -441,7 +441,7 @@ void format_rows_to_output(std::string& output,
 
       case cudf::type_id::STRING: {
         cudf::strings_column_view scv(col);
-        auto const num_offsets = num_rows + 1;
+        int64_t const num_offsets = static_cast<int64_t>(num_rows) + 1;
         std::vector<int32_t> host_offsets(num_offsets);
         cudaMemcpyAsync(host_offsets.data(),
                         scv.offsets().data<int32_t>() + col.offset(),
@@ -1172,7 +1172,7 @@ void debug_diff(cucascade::data_batch& batch_a,
                                      cudf::column_view const& col,
                                      host_column_nulls const& nulls) -> std::vector<std::string> {
             std::vector<std::string> result(num_rows);
-            auto const num_offsets = num_rows + 1;
+            int64_t const num_offsets = static_cast<int64_t>(num_rows) + 1;
             std::vector<int32_t> host_offsets(num_offsets);
             cudaMemcpyAsync(host_offsets.data(),
                             scv.offsets().data<int32_t>() + col.offset(),

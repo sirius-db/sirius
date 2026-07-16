@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#ifdef SIRIUS_ENABLE_CUCASCADE
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime.h>
@@ -226,3 +227,5 @@ replica_transfer_route enqueue_replica_copy(
 }
 
 }  // namespace sirius::op::detail
+
+#endif  // SIRIUS_ENABLE_CUCASCADE

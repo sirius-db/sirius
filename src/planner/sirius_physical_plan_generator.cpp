@@ -877,7 +877,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       // plan = create_plan(op.Cast<duckdb::LogicalCreateSecret>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_EXPLAIN:
-      throw duckdb::NotImplementedException("Explain not supported");
+      // Sirius has no GPU EXPLAIN operator. Leave plan null so the no-plan guard
+      // below fires and the transparent-execution layer falls back to DuckDB's
+      // native EXPLAIN (EXPLAIN is metadata-only, no GPU work to accelerate).
       // plan = create_plan(op.Cast<duckdb::LogicalExplain>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#ifdef SIRIUS_ENABLE_CUCO
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 
@@ -397,3 +398,5 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
 }
 
 }  // namespace sirius::op
+
+#endif  // SIRIUS_ENABLE_CUCO

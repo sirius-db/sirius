@@ -171,7 +171,7 @@ struct TaskManagerLoopThreadHandleWrapper {
 
   ~TaskManagerLoopThreadHandleWrapper()
   {
-    handle->finalizing();
+    try { handle->finalizing(); } catch (...) { /* swallow — cannot throw from noexcept destructor */ }
     handle->exit();
   }
 
@@ -200,7 +200,7 @@ struct TaskQueueHandleWrapper {
 
   ~TaskQueueHandleWrapper()
   {
-    handle->finalizing();
+    try { handle->finalizing(); } catch (...) { /* swallow — cannot throw from noexcept destructor */ }
     handle->exit();
   }
 
