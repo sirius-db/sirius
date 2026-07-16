@@ -23,7 +23,6 @@
 #include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
-#include "duckdb/execution/column_binding_resolver.hpp"    // duckdb::ColumnBindingResolver
 #include "duckdb/main/client_context.hpp"                  // duckdb::ClientContext
 #include "duckdb/main/config.hpp"                          // duckdb::DBConfig
 #include "duckdb/main/connection.hpp"                      // duckdb::Connection
@@ -158,10 +157,6 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
       duckdb::Optimizer optimizer(*planner.binder, client);
       logical_plan = optimizer.Optimize(std::move(logical_plan));
     }
-    logical_plan->ResolveOperatorTypes();
-    duckdb::ColumnBindingResolver resolver;
-    duckdb::ColumnBindingResolver::Verify(*logical_plan);
-    resolver.VisitOperator(*logical_plan);
 
     // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly on the engine.
     auto physical_plan =

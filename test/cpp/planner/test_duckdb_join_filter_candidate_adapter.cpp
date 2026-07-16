@@ -138,28 +138,25 @@ TEST_CASE("extract classifies absent when the join has no pushdown metadata",
 TEST_CASE("extract classifies statistics_only when probe_info is empty",
           "[dynamic_filter][adapter]")
 {
-  auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
-  join->filter_pushdown = make_pushdown_info({0}, false);
+  for (auto const& condition_indexes :
+       {duckdb::vector<duckdb::idx_t>{}, duckdb::vector<duckdb::idx_t>{0}}) {
+    for (bool const build_hint : {false, true}) {
+      auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
+      join->filter_pushdown = make_pushdown_info(condition_indexes, build_hint);
 
-  auto candidate = extract(*join);
+      auto candidate = extract(*join);
 
-  REQUIRE(candidate.kind() == duckdb_candidate_kind::statistics_only);
-  REQUIRE_FALSE(candidate.build_subtree_has_filter_hint());
-  REQUIRE(candidate.condition_indexes().empty());
-  REQUIRE(candidate.targets().empty());
-  REQUIRE(candidate.condition_comparisons().empty());
+      REQUIRE(candidate.kind() == duckdb_candidate_kind::statistics_only);
+      REQUIRE(candidate.build_subtree_has_filter_hint() == build_hint);
+      REQUIRE(candidate.condition_indexes().empty());
+      REQUIRE(candidate.targets().empty());
+      REQUIRE(candidate.condition_comparisons().empty());
+    }
+  }
 }
 
 TEST_CASE("extract rejects anomalous targetless metadata", "[dynamic_filter][adapter]")
 {
-  SECTION("empty condition ordinals")
-  {
-    auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
-    join->filter_pushdown = make_pushdown_info({}, false);
-
-    require_malformed_carries_only_kind(extract(*join));
-  }
-
   SECTION("out-of-range condition ordinal")
   {
     auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
@@ -173,14 +170,6 @@ TEST_CASE("extract rejects anomalous targetless metadata", "[dynamic_filter][ada
     auto join =
       make_join({duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_EQUAL});
     join->filter_pushdown = make_pushdown_info({0, 0}, false);
-
-    require_malformed_carries_only_kind(extract(*join));
-  }
-
-  SECTION("build-side filter hint without a probe target")
-  {
-    auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
-    join->filter_pushdown = make_pushdown_info({0}, true);
 
     require_malformed_carries_only_kind(extract(*join));
   }
@@ -323,6 +312,24 @@ TEST_CASE("extract fails closed on target column-arity mismatch", "[dynamic_filt
   require_malformed_carries_only_kind(extract(*join));
 }
 
+TEST_CASE("extract drops an arity-corrupt target and keeps its valid sibling",
+          "[dynamic_filter][adapter]")
+{
+  auto bad  = duckdb::make_shared_ptr<duckdb::DynamicTableFilterSet>();
+  auto good = duckdb::make_shared_ptr<duckdb::DynamicTableFilterSet>();
+  auto join =
+    make_join({duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_EQUAL});
+  join->filter_pushdown = make_pushdown_info({0, 1});
+  join->filter_pushdown->probe_info.push_back(make_target(bad, 1));
+  join->filter_pushdown->probe_info.push_back(make_target(good, 2));
+
+  auto candidate = extract(*join);
+
+  REQUIRE(candidate.kind() == duckdb_candidate_kind::admitted);
+  REQUIRE(candidate.targets().size() == 1);
+  REQUIRE(candidate.targets()[0].channel_identity().get() == good.get());
+}
+
 TEST_CASE("extract drops a null-channel target and keeps its live sibling",
           "[dynamic_filter][adapter]")
 {
@@ -352,7 +359,8 @@ TEST_CASE("extract fails closed when every recorded target has a null channel",
   require_malformed_carries_only_kind(extract(*join));
 }
 
-TEST_CASE("extract checks target arity before the null-channel drop", "[dynamic_filter][adapter]")
+TEST_CASE("extract drops an arity-corrupt null-channel target without disturbing a valid sibling",
+          "[dynamic_filter][adapter]")
 {
   auto dyn              = duckdb::make_shared_ptr<duckdb::DynamicTableFilterSet>();
   auto join             = make_join({duckdb::ExpressionType::COMPARE_EQUAL});
@@ -360,9 +368,10 @@ TEST_CASE("extract checks target arity before the null-channel drop", "[dynamic_
   join->filter_pushdown->probe_info.push_back(make_target(nullptr, 2));  // null AND corrupt arity
   join->filter_pushdown->probe_info.push_back(make_target(dyn, 1));      // live sibling
 
-  // Arity corruption impeaches the candidate even on a null-channel target: the whole candidate
-  // fails closed rather than the corrupt entry being silently dropped.
-  require_malformed_carries_only_kind(extract(*join));
+  auto candidate = extract(*join);
+  REQUIRE(candidate.kind() == duckdb_candidate_kind::admitted);
+  REQUIRE(candidate.targets().size() == 1);
+  REQUIRE(candidate.targets()[0].channel_identity().get() == dyn.get());
 }
 
 //===-----------------------------------------------------------------------------------------===//

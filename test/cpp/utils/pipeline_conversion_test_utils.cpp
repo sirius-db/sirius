@@ -24,7 +24,6 @@
 #include "sirius_context.hpp"
 
 #include <duckdb.hpp>
-#include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/database.hpp>
@@ -77,10 +76,12 @@ class optimizer_disable_guard {
   std::set<duckdb::OptimizerType> original_disabled_optimizers_;
 };
 
-//! Parse + plan + optimize + resolve a SQL query, mirroring the sirius-specific order of
-//! `SiriusTableFunctionData::ExtractPlan`: `ResolveOperatorTypes` BEFORE `ColumnBindingResolver`.
-//! DuckDB's `Connection::ExtractPlan` uses the reverse order, which trips sirius plan
-//! generation with an "inequal types" binder error on some queries.
+//! Parse + plan + optimize a SQL query, mirroring `SiriusTableFunctionData::ExtractPlan`.
+//! The returned plan is deliberately UNRESOLVED (no ResolveOperatorTypes / ColumnBindingResolver):
+//! create_plan(unique_ptr) performs the one resolution pass itself, in the sirius-specific order
+//! (`ResolveOperatorTypes` before `ColumnBindingResolver` — DuckDB's `Connection::ExtractPlan`
+//! uses the reverse order, which trips sirius plan generation with an "inequal types" binder
+//! error on some queries), around the C1a-2a exact join-node correlation point.
 duckdb::unique_ptr<duckdb::LogicalOperator> extract_logical_plan_sirius_order(
   duckdb::ClientContext& context, const std::string& query)
 {
@@ -96,10 +97,9 @@ duckdb::unique_ptr<duckdb::LogicalOperator> extract_logical_plan_sirius_order(
     duckdb::Optimizer optimizer(*planner.binder, context);
     plan = optimizer.Optimize(std::move(plan));
   }
-  plan->ResolveOperatorTypes();
-  duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*plan);
-  resolver.VisitOperator(*plan);
+  // Deliberately not resolved here: the plan flows into create_plan(unique_ptr), which runs
+  // ResolveOperatorTypes and the sole verified ColumnBindingResolver pass itself, around the
+  // C1a-2a exact join-node correlation point.
   return plan;
 }
 

@@ -283,13 +283,6 @@ struct SiriusTableFunctionData : public TableFunctionData {
         plan = optimizer.Optimize(std::move(plan));
       }
 
-      // After optimization, refresh types before column binding resolution
-      // to ensure types are consistent (some optimizers may have set stale types)
-      plan->ResolveOperatorTypes();
-
-      ColumnBindingResolver resolver;
-      ColumnBindingResolver::Verify(*plan);
-      resolver.VisitOperator(*plan);
     } catch (...) {
       CleanupConnection(context);
       throw;
@@ -1701,7 +1694,8 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
   auto* params = get_operator_params(context);
   if (!params) { return; }
   const double threshold = parameter.GetValue<double>();
-  if (threshold <= 0.0) {
+  // The negated form also rejects NaN. Positive infinity is accepted and disables the gate.
+  if (!(threshold > 0.0)) {
     throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
                                 threshold);
   }
@@ -1942,9 +1936,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",
-    "Additionally emit a runtime zone-map (build-key min/max) for read-time row-group pruning at "
-    "the "
-    "probe scan; requires enable_dynamic_filter_pushdown (off by default)",
+    "Additionally emit a runtime zone-map (build-key min/max) for read-time row-group pruning "
+    "at the probe scan; requires enable_dynamic_filter_pushdown (off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);
@@ -1952,7 +1945,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
-    "fraction of the key's domain; >= 1.0 effectively disables the gate",
+    "fraction of the key's domain; positive infinity disables the gate",
     LogicalType::DOUBLE,
     Value::DOUBLE(sirius::operator_params{}.dynamic_filter_domain_coverage_threshold),
     SetDynamicFilterDomainCoverageThreshold);

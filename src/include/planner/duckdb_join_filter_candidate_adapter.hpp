@@ -34,30 +34,36 @@
  *                                                          v
  *                                              downstream Sirius planning
  *
- * DuckDB's JoinFilterPushdownInfo (join_filter_pushdown.hpp) is the DuckDB planner's internal
- * representation of dynamic-filter metadata. 2 of its member vectors are:
- *  - join_condition[]:     the indexes of the join conditions for which DuckDB will build filters,
- *  - probe_info[]:         the probe targets (one per LogicalGet) and the columns in each target
- *                          that correspond to the join_condition[] entries.
+ * DuckDB's `JoinFilterPushdownInfo` (`join_filter_pushdown.hpp`) is the DuckDB planner's internal
+ * representation of dynamic-filter metadata. Two of its member vectors are:
  *
- * A `DuckDB filter ordinal` is the index position into the aligned join_condition[] and
- * probe_info[t].columns[] vectors for each JoinFilterPushdownFilter target t.
+ * - `join_condition[]`: indexes of the join conditions for which DuckDB will build filters;
+ * - `probe_info[]`: probe targets (one per `LogicalGet`) and the columns in each target that
+ *   correspond to the `join_condition[]` entries.
  *
- * For a join
+ * A DuckDB filter ordinal is the index position into the aligned `join_condition[]` and
+ * `probe_info[t].columns[]` vectors for each `JoinFilterPushdownFilter` target `t`.
+ *
+ * For a join:
+ *
+ * ```text
  *   ON f.a = d.a AND f.ts < d.ts AND f.b = d.b     -- conditions[0], [1], [2]
  * where DuckDB recorded join_condition = [2, 0]:
  *   DuckDB filter ordinal j     0                     1
  *   join_condition[j]           2  (f.b = d.b)        0  (f.a = d.a)
  *   target t's columns          columns[0] -> b       columns[1] -> a
  *                               (each an index into this scan's column_ids vector)
+ * ```
  */
 
+// duckdb
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/shared_ptr.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/execution/operator/join/join_filter_pushdown.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+// standard library
 #include <cstddef>
 #include <vector>
 
@@ -79,7 +85,7 @@ using duckdb_dynamic_filter_channel = duckdb::shared_ptr<duckdb::DynamicTableFil
  */
 enum class duckdb_candidate_kind {
   absent,           ///< No JoinFilterPushdownInfo was attached to the join.
-  statistics_only,  ///< DuckDB deliberately recorded no probe target; the build hint is false.
+  statistics_only,  ///< DuckDB deliberately recorded no probe target; the hint is observational.
   admitted,         ///< The recorded indexes, target arity, and channel identities are usable.
   malformed,        ///< The adapter can prove that the recorded structure is inconsistent.
 };
@@ -140,7 +146,8 @@ class duckdb_probe_target_candidate final {
  *                            condition_comparisons[j]   comparison at that condition index
  *   per target t             targets[t].columns[j]      where key j lands in scan t's output
  *
- * (Runtime mirrors this: one filter is built per ordinal j and pushed to every target.)
+ * (Runtime uses the same correlation: every filter generated for ordinal `j` is fanned out to
+ * each target.)
  *
  * Later planning wraps these raw adapter values in strong ordinal types and may compact admitted
  * equality keys into a third space, the Sirius key ordinal.
@@ -166,7 +173,8 @@ class duckdb_join_filter_candidate final {
   friend class duckdb_join_filter_candidate_adapter::detail::candidate_builder;
 
   [[nodiscard]] static duckdb_join_filter_candidate absent();
-  [[nodiscard]] static duckdb_join_filter_candidate statistics_only();
+  [[nodiscard]] static duckdb_join_filter_candidate statistics_only(
+    bool build_subtree_has_filter_hint);
   [[nodiscard]] static duckdb_join_filter_candidate malformed();
   [[nodiscard]] static duckdb_join_filter_candidate admitted(
     bool build_subtree_has_filter_hint,
@@ -194,20 +202,21 @@ class duckdb_join_filter_candidate final {
  *
  * Consumers receive Sirius-owned structural values and do not retain or dereference DuckDB's
  * `JoinFilterPushdownInfo`. The opaque channel handle is the deliberate exception: it keeps the
- * shared route identity alive without exposing mutation. Planner code that still reads
- * `filter_pushdown` / `dynamic_filters` directly predates the adapter; follow-up units route those
- * reads through it.
+ * shared route identity alive without exposing mutation. The remaining direct planner reads of
+ * `filter_pushdown` / `dynamic_filters` belong to the intentionally preserved legacy runtime path,
+ * which remains production authority through C1a-2a and is removed at the C1a-2b freeze cutover.
  */
 namespace duckdb_join_filter_candidate_adapter {
 
 namespace detail {
 
 /**
- * @brief Clone the subset of metadata consumed by Sirius, exposed only for unit tests.
+ * @brief Clone the subset of metadata consumed by Sirius during logical-plan preservation.
  *
  * Shares each `DynamicTableFilterSet` to preserve route identity and intentionally omits
  * `min_max_aggregates`. The result is only for Sirius planning and must not be handed to DuckDB's
  * physical join execution; the untouched original retains the complete CPU-fallback metadata.
+ * The detail function is declared here so preservation behavior can also be tested directly.
  */
 [[nodiscard]] duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> clone_sirius_filter_pushdown_info(
   duckdb::JoinFilterPushdownInfo const& src);
@@ -233,12 +242,17 @@ void preserve_dynamic_filter_metadata(duckdb::LogicalOperator const& original,
 /**
  * @brief Classify and snapshot one comparison join's dynamic-filter metadata into Sirius values.
  *
- * Fails closed (@c malformed) on structural corruption it can prove locally:
- *  - an out-of-range or duplicate condition index,
- *  - a target whose column count disagrees with the recorded ordinal count,
- *  - recorded targets with an empty ordinal list, or
- *  - targetless metadata carrying a build-side filter hint, or
- *  - a non-empty `probe_info` whose every channel identity is null.
+ * Fails closed (@c malformed) on producer-level structural corruption it can prove locally:
+ *
+ * - an out-of-range or duplicate condition index;
+ * - recorded targets with an empty ordinal list; or
+ * - a non-empty `probe_info` from which no arity-correct target with a non-null channel survives.
+ *
+ * A target whose column count disagrees with the recorded ordinal count is dropped as one
+ * corrupt route. Other structurally valid targets remain eligible; if none survive, the
+ * candidate is malformed. Metadata whose `probe_info` is empty is @c statistics_only regardless
+ * of the build hint. The hint is retained as an observation and is not canonical-sidecar route
+ * admission; the intentionally preserved legacy runtime path still applies its existing hint gate.
  *
  * A malformed result carries only `kind == malformed`; callers must not rely on partially copied
  * fields from the rejected metadata.

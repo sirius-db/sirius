@@ -20,12 +20,14 @@
  *        build-side keys are proven unique at plan construction time.
  */
 
+#include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
@@ -35,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 
 using namespace duckdb;
 
@@ -71,9 +74,13 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
+enum class internal_plan_failure { tolerate, propagate };
+
 /// Generate a Sirius physical plan from a SQL query string.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
-  Connection& con, const std::string& query)
+  Connection& con,
+  const std::string& query,
+  internal_plan_failure failure_policy = internal_plan_failure::tolerate)
 {
   auto& context = *con.context;
 
@@ -102,18 +109,15 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
       plan = optimizer.Optimize(std::move(plan));
     }
 
-    plan->ResolveOperatorTypes();
-
-    ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
-    resolver.VisitOperator(*plan);
-
+    // create_plan(unique_ptr) owns type/binding resolution and correlates the exact logical
+    // join-node set across the resolver before extracting immutable dynamic-filter candidates.
     sirius::planner::sirius_physical_plan_generator gen(context);
     result = gen.create_plan(std::move(plan));
   } catch (duckdb::InternalException&) {
     // Plan generation can fail for DuckDB internal table scans (not the primary Sirius use case).
     con.Query("ROLLBACK");
     DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
+    if (failure_policy == internal_plan_failure::propagate) { throw; }
     return nullptr;
   } catch (...) {
     con.Query("ROLLBACK");
@@ -136,6 +140,20 @@ sirius::op::sirius_physical_hash_join* find_hash_join(sirius::op::sirius_physica
   for (auto& child : root->children) {
     auto* found = find_hash_join(child.get());
     if (found) { return found; }
+  }
+  return nullptr;
+}
+
+std::shared_ptr<sirius::op::sirius_dynamic_filter_set> find_dynamic_filter_channel(
+  sirius::op::sirius_physical_operator* root)
+{
+  if (!root) { return nullptr; }
+  if (root->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    auto& scan = root->Cast<sirius::op::sirius_physical_table_scan>();
+    if (scan.sirius_dynamic_filters) { return scan.sirius_dynamic_filters; }
+  }
+  for (auto& child : root->children) {
+    if (auto channel = find_dynamic_filter_channel(child.get())) { return channel; }
   }
   return nullptr;
 }
@@ -391,4 +409,96 @@ TEST_CASE_METHOD(distinct_hash_join_fixture,
   auto* hj = find_hash_join(plan.get());
   REQUIRE(hj);
   CHECK(hj->unique_build_keys);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic-filter sidecar (C1a-2a): the canonical planner model is attached and
+// resolved during REAL planning, not just when unit-constructed.
+// This lives here (rather than with the builder unit tests) because this file
+// already owns the real-planning fixture and helpers.
+// ---------------------------------------------------------------------------
+
+TEST_CASE_METHOD(distinct_hash_join_fixture,
+                 "dynamic-filter sidecar builder is attached and resolved during real planning",
+                 "[dynamic_filter][distinct_hash_join][isolated_context]")
+{
+  // DuckDB's build-side flag is observation only in the canonical model. Phase 1 deliberately
+  // leaves this unfiltered build unwired, while the sidecar still records its live target and
+  // admitted key without registering a second producer.
+  auto plan =
+    generate_sirius_plan(*con,
+                         "SELECT * FROM lineitem JOIN pk_orders ON l_orderkey = o_orderkey",
+                         internal_plan_failure::propagate);
+  REQUIRE(plan);
+
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  REQUIRE(hj->has_dynamic_filter_planning_view());
+
+  auto const view = hj->planning_view();
+  CHECK(view.publication_plan_id.is_valid());
+  CHECK_FALSE(view.build_subtree_has_filter_hint);
+  CHECK(view.enabled);
+  // The strongest no-double-registration proof available: the sidecar recorded this target, yet
+  // because the legacy path declined to wire (unfiltered build) NO producer was registered, so
+  // the generator dropped the producerless channel and its consumer path from the final tree
+  // entirely (make_gpu_scan_leaf). A channel surviving here would mean someone registered.
+  CHECK(find_dynamic_filter_channel(plan.get()) == nullptr);
+  REQUIRE(view.scan_targets.size() == 1);
+  CHECK(view.scan_targets[0].target_id.is_valid());
+  CHECK(view.scan_targets[0].channel_id.is_valid());
+  REQUIRE(view.by_duckdb_ordinal.size() == 1);
+  auto const& ordinal = view.by_duckdb_ordinal[0];
+  CHECK(ordinal.duckdb_ordinal == sirius::op::duckdb_filter_ordinal{0});
+  CHECK(ordinal.decision == sirius::op::dynamic_filter_key_decision::admitted);
+  REQUIRE(ordinal.admitted_key.has_value());
+  CHECK(ordinal.admitted_key->ordinal == sirius::op::sirius_key_ordinal{0});
+}
+
+TEST_CASE_METHOD(distinct_hash_join_fixture,
+                 "dynamic-filter sidecar preserves a filtered build hint without deriving "
+                 "admission from legacy wiring",
+                 "[dynamic_filter][distinct_hash_join][isolated_context]")
+{
+  // A filtered build side sets DuckDB's observation hint. The sidecar target remains a canonical
+  // value regardless of whether Phase 1 can also obtain GPU/HOST replica placements.
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT * FROM lineitem JOIN pk_orders ON l_orderkey = o_orderkey WHERE o_custkey = 100",
+    internal_plan_failure::propagate);
+  REQUIRE(plan);
+
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  REQUIRE(hj->has_dynamic_filter_planning_view());
+
+  auto const view = hj->planning_view();
+  CHECK(view.publication_plan_id.is_valid());
+  CHECK(view.build_subtree_has_filter_hint);
+  CHECK(view.enabled);
+  REQUIRE_FALSE(view.scan_targets.empty());
+  for (auto const& target : view.scan_targets) {
+    CHECK(target.target_id.is_valid());
+    CHECK(target.channel_id.is_valid());
+    CHECK(target.probe_col_idx.size() == view.by_duckdb_ordinal.size());
+    CHECK(target.probe_col_type.size() == view.by_duckdb_ordinal.size());
+  }
+}
+
+TEST_CASE_METHOD(distinct_hash_join_fixture,
+                 "planning_view throws for a join that is not a dynamic-filter producer",
+                 "[dynamic_filter][distinct_hash_join][isolated_context]")
+{
+  // DuckDB's join-filter-pushdown optimizer skips LEFT joins outright, so this join carries no
+  // pushdown metadata, the candidate is `absent`, and no sidecar builder is attached. The
+  // sanctioned view must then fail loudly rather than fabricate values.
+  auto plan =
+    generate_sirius_plan(*con,
+                         "SELECT * FROM lineitem LEFT JOIN pk_orders ON l_orderkey = o_orderkey",
+                         internal_plan_failure::propagate);
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  REQUIRE_FALSE(hj->has_dynamic_filter_planning_view());
+  REQUIRE_THROWS_AS(hj->planning_view(), sirius::internal_exception);
 }

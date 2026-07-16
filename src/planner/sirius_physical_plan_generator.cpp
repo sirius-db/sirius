@@ -769,6 +769,10 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
+  // Correlate the exact comparison-join node set across column binding resolution:
+  //   capture exact node set -> ColumnBindingResolver -> extract immutable adapter values
+  candidate_cache.capture_pre_resolver(*op);
+
   // Resolve the types of each operator.
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
   op->ResolveOperatorTypes();
@@ -777,8 +781,14 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // Resolve the column references.
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
   duckdb::ColumnBindingResolver resolver;
+  duckdb::ColumnBindingResolver::Verify(*op);
   resolver.VisitOperator(*op);
   profiler.EndPhase();
+
+  // Extract one immutable candidate per join before physical-plan construction moves conditions
+  // and filter-pushdown metadata out of the logical nodes. `plan_comparison_join()` and, later, C3
+  // discovery consume the cache.
+  candidate_cache.extract_post_resolver(*op);
 
   // then create the main physical plan
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);

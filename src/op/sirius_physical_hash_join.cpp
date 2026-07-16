@@ -86,6 +86,16 @@ static bool is_equality(sirius::comparison_type c)
   return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
 }
 
+[[nodiscard]] static std::optional<cudf::data_type> dynamic_filter_membership_type(
+  sirius::logical_type const& type) noexcept
+{
+  switch (type.id()) {
+    case sirius::type_id::INTEGER: return cudf::data_type{cudf::type_id::INT32};
+    case sirius::type_id::BIGINT: return cudf::data_type{cudf::type_id::INT64};
+    default: return std::nullopt;
+  }
+}
+
 static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
                                                     rmm::cuda_stream_view stream)
 {
@@ -218,14 +228,16 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   std::size_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p,
   uint64_t max_build_hash_table_bytes,
-  dynamic_filter_publish_plan dynamic_filter_plan)
+  dynamic_filter_publish_plan dynamic_filter_plan,
+  std::unique_ptr<dynamic_filter_publish_plan_builder> dynamic_filter_builder)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
     conditions(std::move(cond)),
     join_type(join_type),
     delim_types(std::move(delim_types)),
-    _dynamic_filter_plan(std::move(dynamic_filter_plan))
+    _dynamic_filter_plan(std::move(dynamic_filter_plan)),
+    _dynamic_filter_builder(std::move(dynamic_filter_builder))
 {
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   reorder_join_conditions(conditions);
@@ -349,6 +361,85 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   if (!is_all_inequality_join && (num_equality_conditions < conditions.size())) {
     _join_mode = HASH_JOIN_MODE::MIXED_JOIN;
   }
+
+  //===----------Dynamic Filter Key Resolution----------===//
+  // This sidecar currently has no runtime consumer.
+  if (_dynamic_filter_builder) {
+    auto const& build_input_types = children[1]->get_types();
+    std::vector<dynamic_filter_key_decision> decisions;
+    std::vector<dynamic_filter_key_plan> resolved_keys;
+    decisions.reserve(_dynamic_filter_builder->key_candidates().size());
+
+    for (auto const& candidate : _dynamic_filter_builder->key_candidates()) {
+      auto const cond_idx = static_cast<std::size_t>(candidate.condition_index.value);
+      if (!candidate.is_equality) {
+        decisions.push_back(dynamic_filter_key_decision::non_equality);
+        continue;
+      }
+      if (!candidate.has_direct_uncast_keys) {
+        decisions.push_back(dynamic_filter_key_decision::not_direct_uncast);
+        continue;
+      }
+      if (!candidate.has_supported_membership_type) {
+        decisions.push_back(dynamic_filter_key_decision::unsupported_membership_type);
+        continue;
+      }
+      // These producer-level conditions are also enforced by planner construction. Keeping the
+      // check here prevents a manually assembled builder from admitting a RIGHT/MIXED producer.
+      if ((join_type != duckdb::JoinType::INNER && join_type != duckdb::JoinType::SEMI) ||
+          _join_mode == HASH_JOIN_MODE::MIXED_JOIN) {
+        decisions.push_back(dynamic_filter_key_decision::unresolved);
+        continue;
+      }
+      if (cond_idx >= conditions.size() ||
+          conditions[cond_idx].comparison != sirius::comparison_type::equal) {
+        decisions.push_back(dynamic_filter_key_decision::unresolved);
+        continue;
+      }
+      // key_casts/right_key_col_indices hold one entry per EQUALITY condition, and both DuckDB
+      // and Sirius sort equality conditions first, so cond_idx addresses them directly whenever
+      // it is inside their range.
+      if (cond_idx < key_casts.size() &&
+          (key_casts[cond_idx].cast_right || key_casts[cond_idx].cast_left)) {
+        decisions.push_back(dynamic_filter_key_decision::unresolved);
+        continue;
+      }
+      if (cond_idx >= right_key_col_indices.size()) {
+        decisions.push_back(dynamic_filter_key_decision::unresolved);
+        continue;
+      }
+      auto const build_column_index = static_cast<std::size_t>(right_key_col_indices[cond_idx]);
+      if (build_column_index >= build_input_types.size()) {
+        decisions.push_back(dynamic_filter_key_decision::unresolved);
+        continue;
+      }
+      auto const build_type = dynamic_filter_membership_type(build_input_types[build_column_index]);
+      if (!build_type) {
+        decisions.push_back(dynamic_filter_key_decision::unresolved);
+        continue;
+      }
+      bool const target_types_match =
+        std::all_of(_dynamic_filter_builder->scan_targets().begin(),
+                    _dynamic_filter_builder->scan_targets().end(),
+                    [&](auto const& target) {
+                      auto const ordinal = candidate.duckdb_ordinal.value;
+                      return ordinal < target.probe_col_type.size() &&
+                             target.probe_col_type[ordinal] == *build_type;
+                    });
+      if (!target_types_match) {
+        decisions.push_back(dynamic_filter_key_decision::unresolved);
+        continue;
+      }
+      resolved_keys.push_back(dynamic_filter_key_plan{sirius_key_ordinal{resolved_keys.size()},
+                                                      candidate.duckdb_ordinal,
+                                                      candidate.condition_index,
+                                                      build_column_index,
+                                                      *build_type});
+      decisions.push_back(dynamic_filter_key_decision::admitted);
+    }
+    _dynamic_filter_builder->resolve_keys(
+      std::move(decisions), std::move(resolved_keys), build_input_types.size());
+  }
 };
 
 sirius_physical_hash_join::sirius_physical_hash_join(
@@ -372,6 +463,16 @@ sirius_physical_hash_join::sirius_physical_hash_join(
                               max_build_hash_table_bytes,
                               {})
 {
+}
+
+dynamic_filter_planning_view sirius_physical_hash_join::planning_view() const
+{
+  if (!_dynamic_filter_builder) {
+    throw sirius::internal_exception(
+      "[sirius_physical_hash_join] planning_view() on a join that is not a dynamic-filter "
+      "producer");
+  }
+  return _dynamic_filter_builder->planning_view();
 }
 
 //===--------------------------------------------------------------------===//

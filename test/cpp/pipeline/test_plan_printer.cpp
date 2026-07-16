@@ -46,7 +46,6 @@
 
 // duckdb
 #include <duckdb.hpp>
-#include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/execution/physical_operator.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
@@ -381,10 +380,9 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(
   duckdb::Optimizer optimizer(*planner.binder, *con.context);
   logical_plan = optimizer.Optimize(std::move(logical_plan));
 
-  logical_plan->ResolveOperatorTypes();
-  duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*logical_plan);
-  resolver.VisitOperator(*logical_plan);
+  // Deliberately not resolved here: create_plan(unique_ptr) runs ResolveOperatorTypes and the
+  // sole verified ColumnBindingResolver pass itself, after capturing the exact comparison-join
+  // node set for C1a-2a correlation.
 
   sirius_physical_plan_generator physical_planner(*con.context);
   auto sirius_physical_plan = physical_planner.create_plan(std::move(logical_plan));

@@ -321,6 +321,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
     src/planner/duckdb_join_filter_candidate_adapter.cpp
+    src/planner/dynamic_filter_candidate_cache.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
@@ -629,6 +630,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
     test/cpp/operator/test_crc32_partition_hash.cpp
+    test/cpp/operator/test_dynamic_filter_publish_plan_builder.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
@@ -651,6 +653,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
+    test/cpp/planner/test_dynamic_filter_candidate_cache.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp

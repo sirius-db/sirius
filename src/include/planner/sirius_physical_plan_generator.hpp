@@ -20,7 +20,9 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "op/dynamic_filter_identity.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "planner/dynamic_filter_candidate_cache.hpp"
 
 #include <memory>
 #include <string>
@@ -82,6 +84,27 @@ class sirius_physical_plan_generator {
   // duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::GPUIntermediateRelation>>
   // gpu_recursive_cte_tables;
 
+ private:
+  /// Dynamic-filter planning is one generator-owned transaction:
+  ///
+  /// ```text
+  /// DuckDB logical tree
+  ///          |
+  ///          | capture exact join-node set now
+  ///          | (C1b will also capture source evidence here)
+  ///          v
+  /// ColumnBindingResolver rewrites the tree
+  ///          |
+  ///          | extract one Sirius-owned candidate per join
+  ///          v
+  /// recursive physical planning
+  ///          |
+  ///          +--> scan (consumer) and producer find the same channel object
+  ///          +--> producer receives a sidecar builder and strong planning IDs
+  ///          v
+  /// pipeline conversion (the legacy publication path stays authoritative until C1a-2b)
+  /// ```
+  ///
   /// @brief Map from duckdb::DynamicTableFilterSet pointers to sirius_dynamic_filter_set channels.
   /// DuckDB pairs a producer (join) and a consumer (scan) by planting the same
   /// DynamicTableFilterSet pointer on both sides, so we key the channels by these pointers.
@@ -89,14 +112,48 @@ class sirius_physical_plan_generator {
                      std::shared_ptr<sirius::op::sirius_dynamic_filter_set>>
     dynamic_filter_channels;
 
+  /// @brief One immutable dynamic-filter candidate per comparison join. Consumed by
+  /// plan_comparison_join() and, later, C3 route discovery via candidate_for().
+  dynamic_filter_candidate_cache candidate_cache;
+
+  /// @brief The minting authority for dynamic-filter identity in this plan:
+  ///
+  /// - Publication-plan IDs (one per producing join)
+  /// - Target IDs (one per producer-to-scan edge)
+  /// - Channel IDs (one per shared scan channel)
+  ///
+  /// C3's route registry must receive this same allocator through the generator handoff.
+  sirius::op::dynamic_filter_identity_allocator dynamic_filter_id_allocator;
+
+  /// @brief One publication-plan ID per producing logical join, no matter how many targets it
+  /// adds or how many times it is looked at. Keyed by logical node address, like the candidate
+  /// cache (stable through create_plan()).
+  std::unordered_map<duckdb::LogicalOperator const*, sirius::op::dynamic_filter_publication_plan_id>
+    dynamic_filter_publication_ids;
+
+  /// @brief One channel ID per shared scan channel: producers that feed the same scan reuse the
+  /// same channel ID (but keep distinct target IDs). Keyed by the same preserved DuckDB pointer
+  /// that keys @ref dynamic_filter_channels.
+  std::unordered_map<duckdb::DynamicTableFilterSet const*, sirius::op::dynamic_filter_channel_id>
+    dynamic_filter_channel_ids;
+
  public:
-  /// @brief Look up or create the dynamic filter channel keyed by @p key. Returns nullptr if @p key
-  /// is null. Same pointer in repeated calls returns the same channel.
+  /// @brief Look up or create the dynamic-filter channel keyed by @p key.
+  ///
+  /// Returns nullptr when @p key is null or dynamic-filter pushdown is disabled. Repeated calls
+  /// with the same non-null key return the same channel.
   [[nodiscard]] std::shared_ptr<sirius::op::sirius_dynamic_filter_set>
   get_or_create_dynamic_filter_channel(duckdb::DynamicTableFilterSet const* key);
 
+  /// @brief How many distinct dynamic-filter channels this planning transaction has created.
+  [[nodiscard]] std::size_t dynamic_filter_channel_count() const noexcept
+  {
+    return dynamic_filter_channels.size();
+  }
+
   //! Creates a plan from the logical operator. This involves resolving column bindings and
-  //! generating physical operator nodes.
+  //! generating physical operator nodes. A generator owns one planning transaction, so this
+  //! entrypoint may be called exactly once per generator instance.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::unique_ptr<duckdb::LogicalOperator> logical);
 

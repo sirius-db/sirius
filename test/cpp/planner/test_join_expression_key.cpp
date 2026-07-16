@@ -28,7 +28,6 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
@@ -104,12 +103,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
       plan = optimizer.Optimize(std::move(plan));
     }
 
-    plan->ResolveOperatorTypes();
-
-    ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
-    resolver.VisitOperator(*plan);
-
+    // Deliberately not resolved here: create_plan(unique_ptr) runs ResolveOperatorTypes and
+    // the sole verified ColumnBindingResolver pass itself, after capturing the exact
+    // comparison-join node set for C1a-2a correlation.
     sirius::planner::sirius_physical_plan_generator gen(context);
     result = gen.create_plan(std::move(plan));
   } catch (duckdb::InternalException&) {

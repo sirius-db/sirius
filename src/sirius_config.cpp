@@ -176,6 +176,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold);
+  if (!(opt.dynamic_filter_domain_coverage_threshold > 0.0)) {
+    throw std::runtime_error("dynamic_filter_domain_coverage_threshold must be > 0.0");
+  }
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.reject_unknown();

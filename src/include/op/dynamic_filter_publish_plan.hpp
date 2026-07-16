@@ -16,10 +16,22 @@
 
 #pragma once
 
-#include "op/dynamic_filter_replica_space.hpp"
+/**
+ * @file
+ * @brief The immutable value used by the legacy runtime publication path.
+ *
+ * C1a-2a leaves `JoinFilterPushdownInfo` together with this plan as the sole runtime publication
+ * authority. The canonical planner sidecar is declared separately in
+ * `dynamic_filter_publish_plan_builder.hpp`.
+ */
 
+// sirius
+#include <op/dynamic_filter_replica_space.hpp>
+
+// cudf
 #include <cudf/types.hpp>
 
+// standard library
 #include <cstddef>
 #include <memory>
 #include <vector>
@@ -28,26 +40,19 @@ namespace sirius::op {
 
 class sirius_dynamic_filter_set;
 
-//===----------------------------------------------------------------------===//
-// dynamic_filter_publish_plan
-//===----------------------------------------------------------------------===//
-/// @brief Immutable plan-time description of one hash join's dynamic-filter publication.
-///
-/// The planner owns routing and placement decisions. The runtime publisher consumes this value but
-/// cannot mutate its targets, policy, or device set after operator construction. Replica placements
-/// cover every active GPU space, each paired with its planned HOST staging space. The build GPU's
-/// space is included because it sources filter construction and the remote transfers, not because a
-/// second copy is made there; only other GPUs receive replicas. Their owner follows the lifetime
-/// contract on @ref dynamic_filter_replica_space.
+/// @brief Immutable plan-time description consumed by the legacy runtime publisher.
 class dynamic_filter_publish_plan final {
  public:
   struct probe_target {
+    /// Existing scan-created delivery channel.
     std::shared_ptr<sirius_dynamic_filter_set> filter_set;
+    /// One entry per DuckDB filter ordinal; each value indexes the target scan's `column_ids`.
     std::vector<std::size_t> probe_col_idx;
+    /// Storage type corresponding to each `probe_col_idx` entry.
     std::vector<cudf::data_type> probe_col_type;
   };
 
-  /// Default fraction of a key's domain a build may cover and still publish that key's filters.
+  /// Default coverage cutoff; a key is skipped when estimated coverage is at least this value.
   static constexpr double k_default_domain_coverage_threshold = 0.9;
 
   dynamic_filter_publish_plan() = default;
@@ -64,8 +69,9 @@ class dynamic_filter_publish_plan final {
     return _probe_targets;
   }
   [[nodiscard]] bool emit_zone_map_filters() const noexcept { return _emit_zone_map_filters; }
-  /// Per pushed key, aligned with the pushdown info's join_condition: the unfiltered cardinality
-  /// of the base table the build key traces to, or 0 when untraceable (coverage gates off).
+  /// Per DuckDB filter ordinal, aligned with `JoinFilterPushdownInfo::join_condition`: the best
+  /// available cardinality estimate for the base table to which the build key traces, or zero when
+  /// untraceable, which disables the coverage gate for that ordinal.
   [[nodiscard]] std::vector<std::size_t> const& build_key_domain_cardinalities() const noexcept
   {
     return _build_key_domain_cardinalities;
@@ -84,8 +90,7 @@ class dynamic_filter_publish_plan final {
   bool _emit_zone_map_filters = false;
   std::vector<std::size_t> _build_key_domain_cardinalities;
   double _domain_coverage_threshold = k_default_domain_coverage_threshold;
-  /// Non-owning GPU/HOST placements. See @ref dynamic_filter_replica_space for the lifetime
-  /// contract.
+  /// Non-owning GPU/HOST placements. See dynamic_filter_replica_space for the lifetime contract.
   std::vector<dynamic_filter_replica_space> _replica_spaces;
 };
 

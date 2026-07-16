@@ -16,6 +16,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -46,6 +47,7 @@
 #include "sirius_context.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
 
 namespace sirius::planner {
@@ -279,6 +281,124 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
 //===----------------------------------------------------------------------===//
 namespace {
 
+[[nodiscard]] bool is_dynamic_filter_producer_join(duckdb::JoinType join_type) noexcept
+{
+  return join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::SEMI;
+}
+
+[[nodiscard]] bool is_membership_key_type(duckdb::LogicalType const& type) noexcept
+{
+  return type.id() == duckdb::LogicalTypeId::INTEGER || type.id() == duckdb::LogicalTypeId::BIGINT;
+}
+
+[[nodiscard]] bool is_statically_admissible(
+  sirius::op::dynamic_filter_key_candidate const& candidate) noexcept
+{
+  return candidate.is_equality && candidate.has_direct_uncast_keys &&
+         candidate.has_supported_membership_type;
+}
+
+struct dynamic_filter_key_snapshot {
+  /// One record per DuckDB filter ordinal, preserving `j` alignment with condition indexes and
+  /// every target's columns.
+  std::vector<sirius::op::dynamic_filter_key_candidate> key_candidates;
+  /// Indices into duckdb_join_filter_candidate::targets() whose arity matches the full key count
+  /// and whose column types match every statically admissible key.
+  std::vector<std::size_t> compatible_target_indexes;
+};
+
+[[nodiscard]] dynamic_filter_key_snapshot snapshot_dynamic_filter_key_candidates(
+  duckdb::LogicalComparisonJoin const& join, duckdb_join_filter_candidate const& candidate)
+{
+  auto const& condition_indexes     = candidate.condition_indexes();
+  auto const& condition_comparisons = candidate.condition_comparisons();
+  // Alignment and in-range condition indexes are the adapter's extraction guarantees.
+  D_ASSERT(condition_indexes.size() == condition_comparisons.size());
+
+  dynamic_filter_key_snapshot result;
+  result.key_candidates.reserve(condition_indexes.size());
+  for (std::size_t j = 0; j < condition_indexes.size(); ++j) {
+    auto const condition_index = condition_indexes[j];
+    D_ASSERT(condition_index < join.conditions.size());
+
+    auto const& condition  = join.conditions[condition_index];
+    bool const is_equality = condition_comparisons[j] == duckdb::ExpressionType::COMPARE_EQUAL &&
+                             condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL;
+    bool const has_direct_uncast_keys =
+      condition.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+      condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
+    bool const has_supported_membership_type =
+      has_direct_uncast_keys && condition.left->return_type == condition.right->return_type &&
+      is_membership_key_type(condition.left->return_type);
+
+    result.key_candidates.push_back(
+      sirius::op::dynamic_filter_key_candidate{sirius::op::duckdb_filter_ordinal{j},
+                                               sirius::op::join_condition_index{condition_index},
+                                               is_equality,
+                                               has_direct_uncast_keys,
+                                               has_supported_membership_type});
+  }
+
+  // A target is one complete route. Type drift on one route must not discard compatible sibling
+  // routes, so retain target indexes whose columns match every statically admissible key.
+  for (std::size_t target_index = 0; target_index < candidate.targets().size(); ++target_index) {
+    auto const& target = candidate.targets()[target_index];
+    // Require one probe column for every selected key. Same-provenance multi-key joins satisfy
+    // this and are narrowed as independent per-column filters. For `(A JOIN C) JOIN B`, however,
+    // no single scan target can represent both halves of a mixed-provenance
+    // `(A.key, C.key) = (B.key1, B.key2)` route. Such routes are unsupported and yield no target
+    // today; this equality also rejects partial or corrupt route metadata.
+    bool compatible = target.columns().size() == result.key_candidates.size();
+    for (std::size_t j = 0; compatible && j < result.key_candidates.size(); ++j) {
+      if (!is_statically_admissible(result.key_candidates[j])) { continue; }
+      auto const condition_index = condition_indexes[j];
+      compatible =
+        target.columns()[j].storage_type == join.conditions[condition_index].left->return_type;
+    }
+    if (compatible) { result.compatible_target_indexes.push_back(target_index); }
+  }
+  return result;
+}
+
+/// One replica placement per GPU device (configuration may yield several); the first wins.
+void keep_first_replica_per_device(std::vector<sirius::op::dynamic_filter_replica_space>& spaces)
+{
+  std::unordered_set<int> devices;
+  std::erase_if(spaces, [&devices](auto const& space) {
+    return !devices.insert(space.get_gpu_space().get_device_id()).second;
+  });
+}
+
+[[nodiscard]] std::vector<sirius::op::dynamic_filter_replica_space>
+snapshot_dynamic_filter_replica_spaces(duckdb::SiriusContext& sirius_context)
+{
+  auto& memory_manager   = sirius_context.get_memory_manager();
+  auto const gpu_spaces  = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  auto const host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (gpu_spaces.empty() || host_spaces.empty()) { return {}; }
+
+  auto const& topology = sirius_context.get_config().get_hw_topology();
+  std::vector<sirius::op::dynamic_filter_replica_space> result;
+  result.reserve(gpu_spaces.size());
+  for (auto const* gpu_space : gpu_spaces) {
+    auto const gpu_id = gpu_space->get_device_id();
+    auto const gpu_info =
+      std::find_if(topology.gpus.begin(), topology.gpus.end(), [gpu_id](auto const& gpu) {
+        return static_cast<int>(gpu.id) == gpu_id;
+      });
+    auto const numa_node = gpu_info == topology.gpus.end() ? -1 : gpu_info->numa_node;
+    auto const local_host =
+      std::find_if(host_spaces.begin(), host_spaces.end(), [numa_node](auto const* host) {
+        return numa_node >= 0 && host->get_device_id() == numa_node;
+      });
+    auto const* host_space  = local_host == host_spaces.end() ? host_spaces.front() : *local_host;
+    auto* mutable_gpu_space = memory_manager.get_memory_space(cucascade::memory::Tier::GPU, gpu_id);
+    if (mutable_gpu_space == nullptr) { return {}; }
+    result.emplace_back(*mutable_gpu_space, *host_space);
+  }
+  return result;
+}
+
 /// Resolve @p binding through the logical subtree to the LogicalGet that produces it, or nullptr
 /// when the column is computed (cast, expression, aggregate result) or not from a base scan.
 duckdb::LogicalGet* trace_binding_to_get(duckdb::LogicalOperator& node,
@@ -326,10 +446,11 @@ duckdb::LogicalGet* trace_binding_to_get(duckdb::LogicalOperator& node,
   }
 }
 
-/// Per pushed key (aligned with the pushdown info's join_condition): the unfiltered cardinality of
-/// the base table the build key traces to, or 0 when untraceable — the publish coverage gates are
-/// then off for that key and the consumer-side gate is the backstop. Must run before create_plan,
-/// which drains op.conditions and the logical children.
+/// Per pushed key, aligned with `filter_pushdown->join_condition`: the best available cardinality
+/// estimate for the base table to which the build key traces. Prefer the table function's
+/// pre-filter estimate; otherwise use `LogicalGet::estimated_cardinality`. Store zero when the key
+/// cannot be traced. A zero disables the publisher's coverage gates for that key. This must run
+/// before recursively planning the children, which may drain the logical subtree.
 std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalComparisonJoin& op,
                                                         duckdb::ClientContext& context)
 {
@@ -465,17 +586,26 @@ static void materialize_expression_join_keys(
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
 {
-  // now visit the children
+  // Capture child cardinalities before recursive child planning.
   D_ASSERT(op.children.size() == 2);
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
-  // Gather per-key domain evidence BEFORE create_plan, which moves data out of the logical nodes
-  // (same constraint as prove_unique_columns below) and drains op.conditions.
+  // Snapshot key provenance before expression-key materialization can rewrite a computed
+  // expression to look like a plain reference.
+  auto const& filter_candidate = candidate_cache.candidate_for(op);
+  dynamic_filter_key_snapshot filter_key_snapshot;
+  if (filter_candidate.kind() == sirius::planner::duckdb_candidate_kind::admitted &&
+      is_dynamic_filter_producer_join(op.join_type)) {
+    filter_key_snapshot = snapshot_dynamic_filter_key_candidates(op, filter_candidate);
+  }
+
+  // Gather per-key domain evidence before recursively planning either child, which may move data
+  // out of the logical subtrees needed for source tracing.
   auto build_key_domains =
     op.filter_pushdown ? build_key_domain_cardinalities(op, context) : std::vector<std::size_t>{};
 
-  // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
+  // Prove build-side uniqueness before recursively planning the build child.
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
@@ -495,8 +625,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   std::size_t has_range              = 0;
   [[maybe_unused]] bool has_equality = op.HasEquality(has_range);
-  bool can_merge                     = has_range > 0;
-  bool can_iejoin                    = has_range >= 2 && recursive_cte_tables.empty();
+  bool const can_claim_build_probe =
+    std::all_of(op.conditions.begin(), op.conditions.end(), [](auto const& condition) {
+      return condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+             condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+    });
+  bool can_merge  = has_range > 0;
+  bool can_iejoin = has_range >= 2 && recursive_cte_tables.empty();
   switch (op.join_type) {
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:
@@ -527,9 +662,52 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto sirius_context   = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     const auto& op_params = sirius_context->get_config().get_operator_params();
 
-    // Build the dynamic filter producer's immutable publication plan before moving DuckDB's
-    // pushdown metadata into the physical join. Routing and device placement are plan-time
-    // decisions; runtime code only consumes this value.
+    // Draft producer-to-scan edges from the snapshotted keys and the scan-created channels; this
+    // pass registers no producer.
+    std::vector<sirius::op::dynamic_filter_publish_plan_builder::scan_target_draft>
+      canonical_target_drafts;
+    auto const has_admissible_key = std::any_of(filter_key_snapshot.key_candidates.begin(),
+                                                filter_key_snapshot.key_candidates.end(),
+                                                is_statically_admissible);
+    if (filter_candidate.kind() == sirius::planner::duckdb_candidate_kind::admitted &&
+        is_dynamic_filter_producer_join(op.join_type) && can_claim_build_probe &&
+        has_admissible_key) {
+      canonical_target_drafts.reserve(filter_key_snapshot.compatible_target_indexes.size());
+      // Each compatible index selects one complete route from this join's cached DuckDB targets.
+      for (auto const target_index : filter_key_snapshot.compatible_target_indexes) {
+        auto const& target_candidate = filter_candidate.targets()[target_index];
+        auto const channel_key       = target_candidate.channel_identity().get();
+        auto const channel_it        = dynamic_filter_channels.find(channel_key);
+        if (channel_it == dynamic_filter_channels.end() || channel_it->second == nullptr) {
+          continue;
+        }
+
+        // Reuse one channel ID for the shared channel; mint one target ID for this join-to-scan
+        // edge.
+        auto& channel_id = dynamic_filter_channel_ids[channel_key];
+        if (!channel_id.is_valid()) { channel_id = dynamic_filter_id_allocator.mint_channel_id(); }
+        sirius::op::dynamic_filter_publish_plan_builder::scan_target_draft draft{
+          dynamic_filter_id_allocator.mint_target_id(), channel_id, channel_it->second, {}, {}};
+        draft.probe_col_idx.reserve(target_candidate.columns().size());
+        draft.probe_col_type.reserve(target_candidate.columns().size());
+        for (auto const& col : target_candidate.columns()) {
+          draft.probe_col_idx.push_back(col.column_index);
+          auto storage_type = cudf::data_type{cudf::type_id::EMPTY};
+          try {
+            storage_type = sirius::get_cudf_type(sirius::from_duckdb(col.storage_type));
+          } catch (duckdb::InvalidInputException const&) {
+            // Rejected key ordinals may carry unsupported types. Admitted ordinals were proved
+            // INTEGER/BIGINT and exact-match above, and the hash-join resolution ladder
+            // re-derives their types fail-closed.
+          }
+          draft.probe_col_type.push_back(storage_type);
+        }
+        canonical_target_drafts.push_back(std::move(draft));
+      }
+    }
+
+    // Build the legacy dynamic-filter publication plan. The legacy path remains the sole runtime
+    // authority in C1a-2a.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> filter_targets;
     std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
     if (op.filter_pushdown) {
@@ -565,7 +743,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
               auto storage_type = cudf::data_type{cudf::type_id::EMPTY};
               try {
                 storage_type = sirius::get_cudf_type(sirius::from_duckdb(col.storage_type));
-              } catch (std::exception const&) {
+              } catch (duckdb::InvalidInputException const&) {
                 // EMPTY type will prevent zone-map filter construction for this column
               }
               target.probe_col_type.push_back(storage_type);
@@ -607,6 +785,39 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         }
       }
     }
+
+    // Assemble the C1a-2a sidecar, whose constructor preconditions were established above,
+    // alongside—not instead of—the legacy publication plan.
+    std::unique_ptr<sirius::op::dynamic_filter_publish_plan_builder> filter_plan_builder;
+    if (!canonical_target_drafts.empty()) {
+      // Give this logical producer one stable publication identity across all of its targets.
+      auto& publication_id = dynamic_filter_publication_ids[&op];
+      if (!publication_id.is_valid()) {
+        publication_id = dynamic_filter_id_allocator.mint_publication_plan_id();
+      }
+
+      sirius::op::dynamic_filter_publish_plan_builder::descriptor builder_descriptor;
+      builder_descriptor.publication_plan_id = publication_id;
+      builder_descriptor.build_subtree_has_filter_hint =
+        filter_candidate.build_subtree_has_filter_hint();
+      builder_descriptor.join_condition_count  = conditions.size();
+      builder_descriptor.scan_targets          = std::move(canonical_target_drafts);
+      builder_descriptor.emit_zone_map_filters = op_params.enable_dynamic_zone_map_filter;
+      builder_descriptor.domain_coverage_threshold =
+        op_params.dynamic_filter_domain_coverage_threshold;
+      builder_descriptor.replica_spaces = filter_replica_spaces;
+      if (!filter_candidate.build_subtree_has_filter_hint()) {
+        // The legacy path skips placement discovery when the hint is false. Because the canonical
+        // model records the hint rather than treating it as admission, snapshot the available
+        // GPU/HOST replica placements directly for the future freeze.
+        builder_descriptor.replica_spaces = snapshot_dynamic_filter_replica_spaces(*sirius_context);
+      }
+      keep_first_replica_per_device(builder_descriptor.replica_spaces);
+      builder_descriptor.key_candidates = std::move(filter_key_snapshot.key_candidates);
+      filter_plan_builder = std::make_unique<sirius::op::dynamic_filter_publish_plan_builder>(
+        std::move(builder_descriptor));
+    }
+
     sirius::op::dynamic_filter_publish_plan filter_plan{
       std::move(filter_targets),
       op_params.enable_dynamic_zone_map_filter,
@@ -626,7 +837,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
       op_params.max_build_hash_table_bytes,
-      std::move(filter_plan));
+      std::move(filter_plan),
+      std::move(filter_plan_builder));
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats                   = std::move(op.join_stats);
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;

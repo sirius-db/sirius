@@ -29,6 +29,7 @@
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter_publish_plan_builder.hpp"
 #include "op/dynamic_filter_replica_space.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
@@ -40,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -84,7 +86,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    dynamic_filter_publish_plan dynamic_filter_plan = {});
+    dynamic_filter_publish_plan dynamic_filter_plan = {},
+    std::unique_ptr<dynamic_filter_publish_plan_builder> dynamic_filter_builder = nullptr);
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -252,11 +255,37 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     CLOSED       ///< Finalization closed the window before the hook claimed it.
   };
 
-  /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
+  /// Legacy runtime targets, policy, and replica-space description. Key ordinals remain in
+  /// `filter_pushdown`; both are immutable during execution.
   dynamic_filter_publish_plan const _dynamic_filter_plan;
   /// Exactly-once arbitration between the publication hook and finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
+
+ private:
+  /// @brief The resolved C1a-2a canonical planner sidecar for this join.
+  ///
+  /// Null when planning created no sidecar, including non-producers, rejected candidates, and
+  /// candidates with no compatible existing scan target. The constructor records key decisions
+  /// through `resolve_keys()` and no subsequent code mutates the builder. This remains sidecar
+  /// only: `_dynamic_filter_plan` and `filter_pushdown` are the production authority until the
+  /// C1a-2b freeze cuts publication over to a frozen canonical plan.
+  std::unique_ptr<dynamic_filter_publish_plan_builder> _dynamic_filter_builder;
+
+ public:
+  /// @brief True when this fully constructed join owns a resolved canonical planning sidecar.
+  [[nodiscard]] bool has_dynamic_filter_planning_view() const noexcept
+  {
+    return _dynamic_filter_builder != nullptr;
+  }
+
+  /// @brief Return the channel-free pre-freeze read surface for later route discovery.
+  ///
+  /// Call `has_dynamic_filter_planning_view()` before traversal. This accessor throws when the join
+  /// owns no canonical sidecar; the returned spans borrow the join-owned builder's storage.
+  [[nodiscard]] dynamic_filter_planning_view planning_view() const;
+
+ protected:
   //===----------------------------------------------------------------------===//
 
  public:

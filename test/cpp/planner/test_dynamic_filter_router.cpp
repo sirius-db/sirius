@@ -68,7 +68,7 @@ TEST_CASE_METHOD(router_fixture,
 {
   sirius_physical_plan_generator gen(*con.context);
   REQUIRE(gen.get_or_create_dynamic_filter_channel(nullptr) == nullptr);
-  REQUIRE(gen.dynamic_filter_channels.empty());
+  REQUIRE(gen.dynamic_filter_channel_count() == 0);
 }
 
 TEST_CASE_METHOD(router_fixture,
@@ -82,7 +82,7 @@ TEST_CASE_METHOD(router_fixture,
 
   REQUIRE(channel != nullptr);
   REQUIRE(channel->empty());
-  REQUIRE(gen.dynamic_filter_channels.size() == 1);
+  REQUIRE(gen.dynamic_filter_channel_count() == 1);
 }
 
 TEST_CASE_METHOD(router_fixture,
@@ -96,7 +96,7 @@ TEST_CASE_METHOD(router_fixture,
   auto second = gen.get_or_create_dynamic_filter_channel(&key);
 
   REQUIRE(first.get() == second.get());
-  REQUIRE(gen.dynamic_filter_channels.size() == 1);
+  REQUIRE(gen.dynamic_filter_channel_count() == 1);
 }
 
 TEST_CASE_METHOD(router_fixture,
@@ -113,7 +113,7 @@ TEST_CASE_METHOD(router_fixture,
   REQUIRE(channel_a != nullptr);
   REQUIRE(channel_b != nullptr);
   REQUIRE(channel_a.get() != channel_b.get());
-  REQUIRE(gen.dynamic_filter_channels.size() == 2);
+  REQUIRE(gen.dynamic_filter_channel_count() == 2);
 }
 
 TEST_CASE_METHOD(router_fixture,
@@ -142,7 +142,7 @@ TEST_CASE_METHOD(
   // The off-by-default contract: with the master switch off the router wires nothing, so neither
   // producer nor consumer attaches and there is zero overhead.
   REQUIRE(gen.get_or_create_dynamic_filter_channel(&key) == nullptr);
-  REQUIRE(gen.dynamic_filter_channels.empty());
+  REQUIRE(gen.dynamic_filter_channel_count() == 0);
 }
 
 TEST_CASE_METHOD(router_fixture,
@@ -158,5 +158,5 @@ TEST_CASE_METHOD(router_fixture,
 
   set_pushdown_enabled(true);
   REQUIRE(gen.get_or_create_dynamic_filter_channel(&key_on) != nullptr);
-  REQUIRE(gen.dynamic_filter_channels.size() == 1);
+  REQUIRE(gen.dynamic_filter_channel_count() == 1);
 }

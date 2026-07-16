@@ -14,14 +14,17 @@
  * limitations under the License.
  */
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
+// sirius
+#include <planner/duckdb_join_filter_candidate_adapter.hpp>
 
+// duckdb
 #include <duckdb/common/helper.hpp>
 #include <duckdb/common/typedefs.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/table_filter.hpp>
 
+// standard library
 #include <algorithm>
 #include <cstddef>
 #include <limits>
@@ -109,9 +112,11 @@ duckdb_join_filter_candidate duckdb_join_filter_candidate::absent()
   return duckdb_join_filter_candidate{duckdb_candidate_kind::absent, false, {}, {}, {}};
 }
 
-duckdb_join_filter_candidate duckdb_join_filter_candidate::statistics_only()
+duckdb_join_filter_candidate duckdb_join_filter_candidate::statistics_only(
+  bool build_subtree_has_filter_hint)
 {
-  return duckdb_join_filter_candidate{duckdb_candidate_kind::statistics_only, false, {}, {}, {}};
+  return duckdb_join_filter_candidate{
+    duckdb_candidate_kind::statistics_only, build_subtree_has_filter_hint, {}, {}, {}};
 }
 
 duckdb_join_filter_candidate duckdb_join_filter_candidate::malformed()
@@ -213,9 +218,10 @@ class candidate_builder final {
     return duckdb_join_filter_candidate::absent();
   }
 
-  [[nodiscard]] static duckdb_join_filter_candidate statistics_only()
+  [[nodiscard]] static duckdb_join_filter_candidate statistics_only(
+    bool build_subtree_has_filter_hint)
   {
-    return duckdb_join_filter_candidate::statistics_only();
+    return duckdb_join_filter_candidate::statistics_only(build_subtree_has_filter_hint);
   }
 
   [[nodiscard]] static duckdb_join_filter_candidate malformed()
@@ -293,7 +299,7 @@ void preserve_aligned(duckdb::LogicalOperator const& original, duckdb::LogicalOp
 void preserve_dynamic_filter_metadata(duckdb::LogicalOperator const& original,
                                       duckdb::LogicalOperator& copy)
 {
-  // Check the complete pair before copying anything so preservation is all-or-nothing.
+  // Preflight the complete tree shape so a structural mismatch copies no metadata.
   if (!structurally_aligned(original, copy)) { return; }
   preserve_aligned(original, copy);
 }
@@ -305,7 +311,12 @@ duckdb_join_filter_candidate extract(duckdb::LogicalComparisonJoin const& op)
 
   auto const malformed = []() { return detail::candidate_builder::malformed(); };
 
-  if (info.join_condition.empty()) { return malformed(); }
+  if (info.join_condition.empty()) {
+    if (info.probe_info.empty()) {
+      return detail::candidate_builder::statistics_only(info.build_side_has_filter);
+    }
+    return malformed();
+  }
 
   std::vector<std::size_t> condition_indexes;
   std::vector<duckdb::ExpressionType> condition_comparisons;
@@ -323,14 +334,15 @@ duckdb_join_filter_candidate extract(duckdb::LogicalComparisonJoin const& op)
   }
 
   if (info.probe_info.empty()) {
-    if (info.build_side_has_filter) { return malformed(); }
-    return detail::candidate_builder::statistics_only();
+    return detail::candidate_builder::statistics_only(info.build_side_has_filter);
   }
 
   std::vector<duckdb_probe_target_candidate> targets;
   targets.reserve(info.probe_info.size());
   for (auto const& pi : info.probe_info) {
-    if (pi.columns.size() != info.join_condition.size()) { return malformed(); }
+    // Arity corruption belongs to this route, not to valid sibling routes. Drop the complete
+    // target before reading any of its parallel column values.
+    if (pi.columns.size() != info.join_condition.size()) { continue; }
     if (!pi.dynamic_filters) { continue; }
 
     std::vector<duckdb_probe_target_candidate::probe_column> columns;
