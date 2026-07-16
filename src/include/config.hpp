@@ -72,6 +72,7 @@ struct Config {
   static uint64_t MAX_SORT_PARTITION_BYTES;
 
   // Logging configuration
+  static std::string LOG_BACKEND;
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;
   static int LOG_FLUSH_SECONDS;
