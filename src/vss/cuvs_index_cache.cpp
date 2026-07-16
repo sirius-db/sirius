@@ -104,6 +104,26 @@ const pinned_index_entry* cuvs_index_cache::find_by_column(
   return nullptr;
 }
 
+std::size_t cuvs_index_cache::erase_by_column(std::string_view table,
+                                              std::string_view column,
+                                              cuvs::distance::DistanceType metric)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  auto const wanted   = canonical_metric(metric);
+  std::size_t removed = 0;
+  for (auto it = _entries.begin(); it != _entries.end();) {
+    auto const& meta = it->second.meta;
+    if (meta.table_name == table && meta.column_name == column &&
+        canonical_metric(meta.metric) == wanted) {
+      it = _entries.erase(it);
+      ++removed;
+    } else {
+      ++it;
+    }
+  }
+  return removed;
+}
+
 bool cuvs_index_cache::contains(std::string_view name) const
 {
   std::lock_guard<std::mutex> lock(_mutex);

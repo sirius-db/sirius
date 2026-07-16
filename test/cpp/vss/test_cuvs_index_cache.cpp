@@ -184,3 +184,32 @@ TEST_CASE("cuvs_index_cache find_by_column returns a match among several entries
   REQUIRE(e->meta.table_name == "docs");
   REQUIRE(e->meta.column_name == "title_vec");
 }
+
+TEST_CASE("cuvs_index_cache erase_by_column drops the matching index before a rebuild", "[vss]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  SECTION("removes the identity match regardless of its management name, leaving others")
+  {
+    insert_dummy(cache, "custom_name", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+    insert_dummy(cache, "other", make_meta("docs", "title_vec", Metric::L2SqrtExpanded));
+
+    REQUIRE(cache.erase_by_column("docs", "vec", Metric::L2SqrtExpanded) == 1);
+    REQUIRE(cache.find("custom_name") == nullptr);
+    REQUIRE(cache.find("other") != nullptr);  // different column untouched
+  }
+  SECTION("matches up to metric canonicalization (unexpanded query drops an expanded index)")
+  {
+    insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+    REQUIRE(cache.erase_by_column("docs", "vec", Metric::L2SqrtUnexpanded) == 1);
+    REQUIRE(cache.size() == 0);
+  }
+  SECTION("no match removes nothing")
+  {
+    insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+    REQUIRE(cache.erase_by_column("docs", "vec", Metric::CosineExpanded) == 0);
+    REQUIRE(cache.erase_by_column("docs", "other", Metric::L2SqrtExpanded) == 0);
+    REQUIRE(cache.size() == 1);
+  }
+}

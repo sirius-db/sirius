@@ -179,6 +179,14 @@ class cuvs_index_cache {
                                                          std::string_view column,
                                                          cuvs::distance::DistanceType metric) const;
 
+  /// Remove every entry whose auto-routing identity matches (@p table, @p column,
+  /// @p metric), freeing each index and releasing its reservation. Metrics are
+  /// compared up to canonicalization, matching @ref find_by_column. Returns the
+  /// number of entries removed.
+  std::size_t erase_by_column(std::string_view table,
+                              std::string_view column,
+                              cuvs::distance::DistanceType metric);
+
   [[nodiscard]] bool contains(std::string_view name) const;
 
   /// Remove the entry for @p name, freeing its index and releasing its
