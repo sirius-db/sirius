@@ -22,6 +22,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
 
@@ -49,8 +50,6 @@ class task_creator;
 }
 
 namespace pipeline {
-
-class gpu_pipeline_executor;
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
@@ -132,6 +131,20 @@ class task_scheduler {
   [[nodiscard]] exec::inspectable_mpsc<sirius::parallel::itask>* get_pipeline_task_queue() noexcept
   {
     return &_task_queue;
+  }
+
+  /**
+   * @brief Call @p fn(device_id, executor) for each GPU executor, in ascending device_id order.
+   *
+   * Safe to call after a query completes (quiescent executors). Useful for
+   * collecting per-GPU metrics without exposing the internal executor map.
+   */
+  template <typename Fn>
+  void visit_executors(Fn&& fn) const
+  {
+    for (auto const& [device_id, exec] : _gpu_executors) {
+      fn(device_id, *exec);
+    }
   }
 
   /**

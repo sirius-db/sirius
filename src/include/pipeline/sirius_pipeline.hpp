@@ -28,6 +28,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -137,6 +138,17 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   // operators like left and right delim joins. Returns an empty vector if the sink is not set.
   [[nodiscard]] std::vector<op::sirius_physical_operator::next_port_info>
   get_next_ports_after_sink() const;
+
+  //! A cross-pipeline port described as its peer operator plus the port's barrier type.
+  using port_barrier_info = std::pair<op::sirius_physical_operator*, op::MemoryBarrierType>;
+
+  //! Returns the (producer operator, barrier) pair for every port feeding data into this
+  //! pipeline. The producer operator is the sink of the upstream (source) pipeline.
+  [[nodiscard]] std::vector<port_barrier_info> get_ingress_ports_info() const;
+
+  //! Returns the (consumer operator, barrier) pair for every port this pipeline feeds data into.
+  //! The consumer operator is the downstream operator that receives the sink's output.
+  [[nodiscard]] std::vector<port_barrier_info> get_egress_ports_info() const;
 
   //! Set the pipeline ID
   void set_pipeline_id(size_t id) { pipeline_id = id; }

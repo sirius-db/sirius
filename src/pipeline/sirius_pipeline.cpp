@@ -67,6 +67,36 @@ sirius_pipeline::get_next_ports_after_sink() const
   return ports;
 }
 
+std::vector<sirius_pipeline::port_barrier_info> sirius_pipeline::get_ingress_ports_info() const
+{
+  std::vector<port_barrier_info> result;
+  // Input ports live on operators at the start of the pipeline (and on the sink
+  // for build-side inputs). `operators` contains every operator (source through
+  // sink) after finalize_pipeline_structure(), so walking it collects them all.
+  for (const auto& op_ref : operators) {
+    auto& op = op_ref.get();
+    for (auto port_id : op.get_port_ids()) {
+      auto* p = op.get_port(port_id);
+      if (p == nullptr || !p->src_pipeline) { continue; }
+      result.emplace_back(p->src_pipeline->get_sink().get(), p->type);
+    }
+  }
+  return result;
+}
+
+std::vector<sirius_pipeline::port_barrier_info> sirius_pipeline::get_egress_ports_info() const
+{
+  std::vector<port_barrier_info> result;
+  for (const auto& port_info : get_next_ports_after_sink()) {
+    auto* consumer = port_info.next_operator;
+    if (consumer == nullptr) { continue; }
+    auto* p = consumer->get_port(port_info.next_operator_port_name);
+    if (p == nullptr) { continue; }
+    result.emplace_back(consumer, p->type);
+  }
+  return result;
+}
+
 void sirius_pipeline::reset_sink()
 {
   if (sink) {

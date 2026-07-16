@@ -853,9 +853,7 @@ namespace {
 class recording_task_creator : public sirius::creator::task_creator {
  public:
   explicit recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr)
-    : task_creator(sirius::exec::thread_pool_config{.num_threads        = 1,
-                                                    .thread_name_prefix = "test_task_creator"},
-                   mem_mgr)
+    : task_creator(sirius::creator::task_creator_config{}, mem_mgr)
   {
   }
 

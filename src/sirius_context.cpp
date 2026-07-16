@@ -266,7 +266,7 @@ void SiriusContext::QueryEnd()
   // teardown ends up releasing those BlockHandles after parts of DuckDB's
   // DatabaseInstance have already been torn down (~DBConfig fires ~SiriusContext
   // mid-DB destruction), which SIGSEGVs in ~BlockMemory.
-  if (task_creator_) { task_creator_->reset(/*keep_parquet_metadata=*/true); }
+  if (task_creator_) { task_creator_->reset(); }
   release_query_lifecycle_slot();
 }
 

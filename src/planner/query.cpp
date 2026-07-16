@@ -16,9 +16,9 @@
 
 #include "planner/query.hpp"
 
-#include "sirius_engine.hpp"
-#include "sirius_interface.hpp"
 #include "telemetry/telemetry_context.hpp"
+
+#include <cstdlib>
 
 namespace sirius::planner {
 
@@ -62,9 +62,9 @@ void query::build_indices()
   }
 }
 
-const duckdb::vector<op::sirius_physical_operator*>& query::get_scan_operators() const
+std::span<op::sirius_physical_operator* const> query::get_scan_operators() const
 {
-  return _scan_operators;
+  return {_scan_operators.data(), _scan_operators.size()};
 }
 
 duckdb::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_physical_operator* op)
