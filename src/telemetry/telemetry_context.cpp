@@ -27,6 +27,7 @@
 
 #include <unistd.h>
 
+#include <cstdint>
 #include <format>
 #include <memory>
 #include <string>
@@ -197,6 +198,9 @@ void emit_plan_telemetry(
   // next one's source); declare each operator_uuid at most once.
   std::unordered_set<uuid::UUID, uuid_hash> declared_operators;
 
+  // (upstream_id << 32 | downstream_id) pairs already linked by an intra-pipeline chain edge.
+  std::unordered_set<uint64_t> chained_operator_pairs;
+
   for (const auto& pipeline : pipelines) {
     const auto operators = pipeline->get_operators();
 
@@ -207,7 +211,7 @@ void emit_plan_telemetry(
       if (!declared_operators.insert(op.get_operator_uuid()).second) { continue; }
       operator_obs->declaration(
         op.get_operator_uuid(),
-        quent::operator_::Declaration{
+        {
           .plan_id             = plan_id,
           .parent_operator_ids = {},
           .instance_name       = std::format("{}-{}", op.get_name(), op.get_operator_id()),
@@ -216,18 +220,36 @@ void emit_plan_telemetry(
         });
 
       quent::CustomAttributes stats{};
-      stats.i64_attrs.push_back(
-        quent::I64Attr{.key = "operator_id", .value = static_cast<int64_t>(op.get_operator_id())});
-      stats.i64_attrs.push_back(quent::I64Attr{
-        .key = "pipeline_id", .value = static_cast<int64_t>(pipeline->get_pipeline_id())});
-      stats.i64_attrs.push_back(quent::I64Attr{
-        .key = "estimated_cardinality", .value = static_cast<int64_t>(op.estimated_cardinality)});
+      stats.i64_attrs = {
+        {.key = "operator_id", .value = static_cast<int64_t>(op.get_operator_id())},
+        {.key = "pipeline_id", .value = static_cast<int64_t>(pipeline->get_pipeline_id())},
+        {.key = "estimated_cardinality", .value = static_cast<int64_t>(op.estimated_cardinality)},
+      };
       if (auto params = op.params_to_string(); !params.empty()) {
-        stats.string_attrs.push_back(
-          quent::StringAttr{.key = "params", .value = std::move(params)});
+        stats.string_attrs.push_back({.key = "params", .value = std::move(params)});
       }
-      operator_obs->statistics(op.get_operator_uuid(),
-                               quent::operator_::Statistics{.custom_attributes = std::move(stats)});
+      operator_obs->statistics(op.get_operator_uuid(), {.custom_attributes = std::move(stats)});
+    }
+
+    // Chain consecutive operators of the pipeline (execution order: source -> ... -> sink)
+    // through synthesized port pairs. The runtime only wires real ports at pipeline
+    // boundaries, so without these edges every interior operator floats in the plan view:
+    // filters/projections render as sources and joins as sinks. Child pipelines share their
+    // operator prefix with the parent, so dedupe pairs to avoid duplicate edges.
+    for (std::size_t i = 0; i + 1 < operators.size(); ++i) {
+      const auto& upstream   = operators[i].get();
+      const auto& downstream = operators[i + 1].get();
+      const auto pair_key    = (static_cast<uint64_t>(upstream.get_operator_id()) << 32) |
+                            static_cast<uint64_t>(downstream.get_operator_id());
+      if (!chained_operator_pairs.insert(pair_key).second) { continue; }
+
+      const auto out_port = uuid::now_v7();
+      const auto in_port  = uuid::now_v7();
+      port_obs->declaration(out_port,
+                            {.operator_id = upstream.get_operator_uuid(), .instance_name = "out"});
+      port_obs->declaration(in_port,
+                            {.operator_id = downstream.get_operator_uuid(), .instance_name = "in"});
+      edges.push_back({.source = out_port, .target = in_port});
     }
 
     // Receiver ports on pipeline source operators.
@@ -247,6 +269,10 @@ void emit_plan_telemetry(
     const auto sink = pipeline->get_sink();
     for (const auto& [next_operator, next_operator_port_name, pseudo_sink_port_uuid] :
          pipeline->get_next_ports_after_sink()) {
+      // A sink can push into a port it owns itself (a join is one pipeline's sink and the
+      // next one's source); the intra-pipeline chain already links it, so skip the self-edge.
+      if (sink && next_operator->get_operator_uuid() == sink->get_operator_uuid()) { continue; }
+
       // Declare the pseudo-sink port, attributed to the sink operator that owns it.
       port_obs->declaration(pseudo_sink_port_uuid,
                             quent::port::Declaration{
