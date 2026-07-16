@@ -1368,6 +1368,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 dimension_name: "Memory Tier".to_owned(),
                 dimension_keys,
                 measures,
+                default_measure: Some(MEASURE_BYTES.to_owned()),
             },
             operators,
         }))
