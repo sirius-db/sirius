@@ -136,9 +136,9 @@ class sirius_datasource : public cudf::io::datasource {
 
   void prefetch(cache::prefetching_stage site);
 
- private:
-  [[nodiscard]] bool uses_prefetching_cache();
+  [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
+ private:
   std::shared_ptr<sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius_io_object> _io_object;
   /// Handle of the most recent speculative/immediate insert into the
