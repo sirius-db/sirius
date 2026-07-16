@@ -1939,17 +1939,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",
     "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
-    "runtime membership filter (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan "
-    "to drop non-matching rows before the join (on by default)",
+    "runtime membership filter (raw IN-list for 1-12 supported build rows; otherwise a hash "
+    "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
+    "non-matching rows before the join (on by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
     SetEnableDynamicFilterPushdown);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",
-    "Additionally emit a runtime zone-map (build-key min/max) for read-time row-group pruning at "
-    "the "
-    "probe scan; requires enable_dynamic_filter_pushdown (off by default)",
+    "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
+    "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
+    "requires enable_dynamic_filter_pushdown (off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);

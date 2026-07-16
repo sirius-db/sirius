@@ -115,7 +115,8 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
 
   // Build up to 2 complementary filters per join key:
   //  1) a zone-map (read-time ROW-GROUP pruning, the only path that cuts scan I/O)
-  //  2) a membership filter (IN-list / Bloom, post-decode) chosen by L2-cache fit.
+  //  2) a post-decode membership filter: linear-scan IN-list for a tiny build, otherwise a
+  //     hash-set IN-list or Bloom filter chosen by L2-cache fit.
   // The two ride different consumer paths and compose; either may be absent for a key.
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(
     _filter_pushdown.join_condition.size());
@@ -238,9 +239,11 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
       }
     }
 
-    // (2) Membership filter — post-decode. Prefer the exact IN-list when its set fits the device L2
-    // cache; otherwise fall back to the Bloom whenever the key type supports it; `none` only when
-    // the key type has no Bloom support (anything other than INT32/INT64).
+    // (2) Membership filter — post-decode. Prefer, in order:
+    //  - A. the exact IN-list with a brute-force scan for a very small key set (no hash build);
+    //  - B. the hash-based IN-list when its cuco set fits the device L2 cache;
+    //  - C. otherwise the Bloom filter whenever the key type supports it;
+    // `none` only when the key type has no membership support (anything other than INT32/INT64).
     auto const set_bytes =
       sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(build_rows, col.type());
     auto const bloom_bytes  = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
@@ -248,7 +251,12 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     bool const in_list_fits = l2_bytes > 0 &&
                               sirius::op::sirius_dynamic_in_list_filter::supports(col) &&
                               set_bytes <= l2_bytes;
-    if (in_list_fits) {
+    if (sirius::op::sirius_dynamic_small_in_list_filter::supports(col)) {
+      nvtx3::scoped_range vr{"dynfilter::build_small_in_list"};
+      per_key_membership[k] = std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
+        col, stream, allocator_ref);
+      choice = "small_in_list";
+    } else if (in_list_fits) {
       nvtx3::scoped_range vr{"dynfilter::build_in_list"};
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);
@@ -278,9 +286,9 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
       std::any_of(per_key_zone_map.begin(), per_key_zone_map.end(), built)) {
     stream.synchronize();
 
-    // Build each structure only on the producer. Remote GPUs receive the finished static-set slots,
-    // Bloom words, or exact zone bounds. Replication completes before the single logical filter is
-    // published, so consumers never wait and never observe a cross-device pointer.
+    // Build each structure only on the producer. Remote GPUs receive raw needles, finished
+    // static-set slots, Bloom words, or exact zone bounds. Replication completes before the filter
+    // is published, so consumers never wait and never observe a cross-device pointer.
     nvtx3::scoped_range replicate_range{"dynfilter::replicate_devices"};
     auto replicate = [this](std::shared_ptr<sirius_dynamic_filter> const& filter) {
       if (!filter) { return; }
