@@ -9,6 +9,9 @@ use instrumentation_model::batch::{
     MemoryTier, MemoryTierFinalizing, MemoryTierInitializing, MemoryTierOperating,
     MemoryTierTransition,
 };
+use instrumentation_model::task::{
+    Computing, Created, Finalizing, Preparing, Queued, Reserving, TaskTransition,
+};
 use quent_analyzer::{AnalyzerError, resource::collection::ResourceCollection};
 use quent_events::Event;
 use quent_model::{Capacity, FsmEvent, Ref, Usage};
@@ -319,6 +322,85 @@ fn fixture(with_batches: bool) -> Fixture {
     }
 }
 
+/// Append one task on the op1 pipeline holding a GPU working-space
+/// reservation, following a legal Task FSM path (created → queued → reserving
+/// → preparing → computing → finalizing → exit). Only preparing/computing
+/// carry the `reservation` tier usage (2048 bytes on GPU); every other usage
+/// is absent, as the model permits.
+///
+/// Timestamps relative to the query epoch:
+/// - t=0    created
+/// - t=100  queued (no reservation: contributes nothing to working space)
+/// - t=200  reserving (no reservation usage yet)
+/// - t=400  preparing, reservation 2048 B on GPU
+/// - t=700  computing, reservation 2048 B on GPU
+/// - t=900  finalizing (reservation released)
+/// - t=1000 exit
+fn add_working_space_task(fixture: &mut Fixture) {
+    let task_id = fixture.task_1_id;
+    let task_event = |ts: u64, seq: u64, state: TaskTransition| {
+        Event::new(task_id, ts, SiriusEvent::Task(FsmEvent { seq, state }))
+    };
+    fixture.events.extend([
+        task_event(
+            EPOCH,
+            0,
+            TaskTransition::Created(Created {
+                instance_name: "task 1".to_string(),
+                pipeline_uuid: fixture.op1_id,
+            }),
+        ),
+        task_event(
+            EPOCH + 100,
+            1,
+            TaskTransition::Queued(Queued { queue: None }),
+        ),
+        task_event(
+            EPOCH + 200,
+            2,
+            TaskTransition::Reserving(Reserving {
+                instance_name: "task 1".to_string(),
+                requested_bytes: 2048,
+                input_basis: 1000,
+                peak_estimate: 2048,
+                bytes_to_materialize: 1000,
+                manager_thread: None,
+            }),
+        ),
+        task_event(
+            EPOCH + 400,
+            3,
+            TaskTransition::Preparing(Preparing {
+                instance_name: "task 1".to_string(),
+                target_tier: "GPU".to_string(),
+                executor_thread: None,
+                reservation: tier_usage(fixture.gpu_id, 2048),
+            }),
+        ),
+        task_event(
+            EPOCH + 700,
+            4,
+            TaskTransition::Computing(Computing {
+                instance_name: "task 1".to_string(),
+                current_operator_id: 0,
+                input_bytes: 1000,
+                peak_allocated_bytes: 1500,
+                executor_thread: None,
+                reservation: tier_usage(fixture.gpu_id, 2048),
+            }),
+        ),
+        task_event(
+            EPOCH + 900,
+            5,
+            TaskTransition::Finalizing(Finalizing {
+                instance_name: "task 1".to_string(),
+                success: true,
+            }),
+        ),
+        task_event(EPOCH + 1000, 6, TaskTransition::Exit),
+    ]);
+}
+
 fn analyzer(fixture: &mut Fixture) -> SiriusUiAnalyzer {
     let events = std::mem::take(&mut fixture.events);
     SiriusUiAnalyzer::try_new(fixture.engine_id, events.into_iter())
@@ -422,6 +504,9 @@ fn data_flow_timeline_bins() {
     // no tier residency.
     assert!(!count.contains_key("batch_registered"));
     assert!(!count.contains_key("batch_consumed"));
+    // No task in this fixture holds a working-space reservation, so the
+    // synthetic task series is absent.
+    assert!(!count.contains_key("task_working_space"));
 
     let bytes = &series.values["bytes"];
     assert_eq!(
@@ -432,6 +517,57 @@ fn data_flow_timeline_bins() {
         bytes["batch_processing"]["GPU"],
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0]
     );
+}
+
+#[test]
+fn data_flow_timeline_task_working_space() {
+    let mut fixture = fixture(true);
+    add_working_space_task(&mut fixture);
+    let analyzer = analyzer(&mut fixture);
+
+    let response = analyzer
+        .data_flow_timeline(request(fixture.query_id, &[]))
+        .expect("data flow timeline");
+    let DataFlowTimelineResponse::Binned(binned) = response else {
+        panic!("expected a binned response");
+    };
+
+    // The task lives on op1 like batch A: still a single operator series.
+    assert_eq!(binned.operators.len(), 1);
+    let series = &binned.operators[&fixture.op1_id];
+
+    // The synthetic working-space series covers exactly the reservation-
+    // holding state spans: preparing [400, 700) + computing [700, 900).
+    // created/queued/reserving ([0, 400)) and finalizing ([900, 1000)) carry
+    // no tier usage and contribute nothing.
+    let count = &series.values["count"];
+    assert_eq!(
+        count["task_working_space"]["GPU"],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+    );
+    // The reservation stays on GPU: no other tier appears in the series.
+    assert_eq!(count["task_working_space"].len(), 1);
+
+    let bytes = &series.values["bytes"];
+    assert_eq!(
+        bytes["task_working_space"]["GPU"],
+        [0.0, 0.0, 0.0, 0.0, 2048.0, 2048.0, 2048.0, 2048.0, 2048.0, 0.0]
+    );
+
+    // The batch lifecycle series coexist, unchanged from the batch-only run.
+    assert_eq!(
+        count["batch_queued"]["GPU"],
+        [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        count["batch_processing"]["GPU"],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    );
+    assert_eq!(
+        bytes["batch_packaged"]["HOST"],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0, 1000.0, 0.0, 0.0]
+    );
+    assert!(!count.contains_key("batch_registered"));
 }
 
 #[test]
