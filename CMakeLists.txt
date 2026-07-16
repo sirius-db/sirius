@@ -285,6 +285,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_streaming_sink.cpp
+    src/exec/stream_session.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
@@ -571,6 +572,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_exchange_channel.cpp
+    test/cpp/exec/test_stream_session.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_semi_future.cpp

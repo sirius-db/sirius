@@ -311,11 +311,13 @@ void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _tas
 
 void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
-  // If this pipeline's sink is the RESULT_COLLECTOR, it is the terminal
-  // pipeline of the query — there is no downstream consumer to schedule and
-  // no parent pipeline whose status needs updating. Returning early avoids
-  // racing with engine teardown after mark_completed() signals the future.
-  if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+  // If this pipeline's sink is the RESULT_COLLECTOR or a terminal STREAMING_SINK, it is a
+  // terminal pipeline of the query — its "downstream" is an external exchange consumer, not
+  // another engine pipeline, so there is no consumer to schedule and no parent whose status
+  // needs updating. Returning early avoids racing with engine teardown after the query
+  // completes.
+  if (auto s = get_sink(); s && (s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
+                                 s->type == op::SiriusPhysicalOperatorType::STREAMING_SINK)) {
     return;
   }
 
@@ -386,6 +388,15 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
           pipeline_finished.store(true);
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
+          }
+          // A terminal STREAMING_SINK heads its own pipeline as both source and sink, so it is
+          // absent from get_operators() (intermediates only) and would otherwise never be
+          // finalized — leaving its exchange channel open forever. Finalizing it here runs its
+          // flush-then-close EOS exactly when the pipeline drains. The channel's on_close (if
+          // any) must not take a pipeline lock; the session wires no such callback. (#839)
+          if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::STREAMING_SINK &&
+                                   !s->finalized.load()) {
+            s->finalize_operator();
           }
           end_nvtx_range_if_finished();
           should_notify = true;

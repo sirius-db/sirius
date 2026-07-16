@@ -80,6 +80,14 @@ struct operator_params {
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
+  /// Default capacity, in batch handles, of a streaming exchange channel when a stream binding
+  /// leaves it unset. Bounds how many exchange batches a source/sink queues before backpressure
+  /// (sirius::exec::stream_session / exchange_channel).
+  uint64_t exchange_capacity_items = 16;
+
+  /// Default byte capacity of a streaming exchange channel (0 = no byte bound).
+  uint64_t exchange_capacity_bytes = 0;
+
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 

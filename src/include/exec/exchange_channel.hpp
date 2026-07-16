@@ -24,6 +24,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 
 namespace sirius::exec {
@@ -46,8 +47,10 @@ struct exchange_batch_handle {
 class exchange_channel {
  public:
   struct config {
-    std::size_t capacity_items;      // required, > 0
-    std::size_t capacity_bytes = 0;  // 0 = no byte bound
+    std::size_t capacity_items;          // required, > 0
+    std::size_t capacity_bytes     = 0;  // 0 = no byte bound
+    std::uint32_t expected_senders = 1;  // fan-in width; close_sender() closes the channel
+                                         // once this many distinct senders have signalled EOS
   };
 
   explicit exchange_channel(config cfg) : _cfg(std::move(cfg))
@@ -107,6 +110,27 @@ class exchange_channel {
     if (cb) cb();
   }
 
+  /// Records end-of-stream from one sender (idempotent per sender_id). Closes the channel once
+  /// the number of distinct senders that have signalled EOS reaches config.expected_senders, so
+  /// an early close from a single sender of a fan-in stream does not terminate it prematurely.
+  /// Returns true iff this call closed the channel; fires the on-close callback exactly once,
+  /// like close(). A prior force close() makes this a no-op.
+  bool close_sender(std::uint32_t sender_id)
+  {
+    std::function<void()> cb;
+    {
+      std::unique_lock<std::mutex> lock(_mutex);
+      if (_closed) return false;
+      _closed_senders.insert(sender_id);
+      if (_closed_senders.size() < _cfg.expected_senders) return false;
+      _closed = true;
+      cb      = _on_close;
+    }
+    _cv.notify_all();
+    if (cb) cb();
+    return true;
+  }
+
   // -----------------------------------------------------------------------
   // Consumer side
   // -----------------------------------------------------------------------
@@ -141,6 +165,15 @@ class exchange_channel {
     _cv.notify_all();
     if (cb) cb();
     return result;
+  }
+
+  /// Blocks until a handle is available to pop or the channel is closed (EOS). Non-consuming
+  /// sibling of pop(): it observes readability without removing anything, so a woken caller
+  /// still has to pop/try_pop. Wrapper/test side only — engine workers never block here.
+  void wait_readable()
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _cv.wait(lock, [&] { return !_queue.empty() || _closed; });
   }
 
   // -----------------------------------------------------------------------
@@ -274,6 +307,7 @@ class exchange_channel {
   std::deque<exchange_batch_handle> _queue;
   std::size_t _total_bytes{0};
   bool _closed{false};
+  std::set<std::uint32_t> _closed_senders;  // distinct senders that have signalled EOS
   std::function<void()> _on_push;
   std::function<void()> _on_pop;
   std::function<void()> _on_close;

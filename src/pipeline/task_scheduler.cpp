@@ -188,6 +188,18 @@ std::future<void> task_scheduler::start_query()
   return _completion_handler->get_awaitable();
 }
 
+std::future<void> task_scheduler::get_query_awaitable()
+{
+  std::scoped_lock lock(_query_mutex);
+  return _completion_handler->get_awaitable();
+}
+
+void task_scheduler::set_on_query_error(std::function<void()> cb)
+{
+  std::scoped_lock lock(_query_mutex);
+  _completion_handler->set_on_error(std::move(cb));
+}
+
 void task_scheduler::terminate_query(std::exception_ptr error)
 {
   _completion_handler->report_error(std::move(error));

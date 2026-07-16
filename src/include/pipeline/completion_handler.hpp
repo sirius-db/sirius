@@ -18,7 +18,10 @@
 
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <future>
+#include <mutex>
+#include <utility>
 
 namespace sirius::pipeline {
 
@@ -58,6 +61,7 @@ class completion_handler {
       } catch (...) {
         // Promise already satisfied or other error - ignore
       }
+      fire_on_error();
     }
   }
 
@@ -79,6 +83,7 @@ class completion_handler {
       } catch (...) {
         // Promise already satisfied or other error - ignore
       }
+      fire_on_error();
     }
   }
 
@@ -121,10 +126,54 @@ class completion_handler {
    */
   [[nodiscard]] bool has_error() const noexcept { return _has_error.load(); }
 
+  /**
+   * @brief Register a callback fired exactly once when an error is reported.
+   *
+   * Used by sirius::exec::stream_session to force-close its channels on a query error so
+   * external producer/consumer threads blocked on a channel unblock instead of hanging. If an
+   * error has already been reported when this is called, the callback fires synchronously here.
+   * The callback runs on the erroring worker thread — it must only post/schedule or close
+   * channels, never take pipeline locks or re-enter an operator (same constraint as the
+   * exchange_channel hooks).
+   */
+  void set_on_error(std::function<void()> cb)
+  {
+    std::function<void()> fire_now;
+    {
+      std::lock_guard<std::mutex> lock(_on_error_mutex);
+      if (_error_fired) { fire_now = cb; }
+      _on_error = std::move(cb);
+    }
+    if (fire_now) {
+      try {
+        fire_now();
+      } catch (...) { /* a teardown callback must not escape */
+      }
+    }
+  }
+
  private:
+  /// Fire the on-error callback at most once. Called only by the report_error CAS winner.
+  void fire_on_error() noexcept
+  {
+    std::function<void()> cb;
+    {
+      std::lock_guard<std::mutex> lock(_on_error_mutex);
+      _error_fired = true;
+      cb           = _on_error;
+    }
+    try {
+      if (cb) cb();
+    } catch (...) { /* noexcept boundary: swallow */
+    }
+  }
+
   std::promise<void> _promise;
   std::atomic<bool> _completed{false};
   std::atomic<bool> _has_error{false};
+  std::mutex _on_error_mutex;
+  std::function<void()> _on_error;
+  bool _error_fired{false};  // guarded by _on_error_mutex
 };
 
 }  // namespace sirius::pipeline

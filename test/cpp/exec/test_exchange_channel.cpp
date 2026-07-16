@@ -526,3 +526,126 @@ TEST_CASE("exchange_channel: rejects a push that would overflow byte accounting"
   REQUIRE(ch.size_bytes() == 0);
   REQUIRE(ch.try_push(make_handle(4, 1)));
 }
+
+// ============================================================================
+// CH-19: close_sender with the default expected_senders (1) closes on the
+// first EOS, like close(), and fires on_close exactly once.
+// ============================================================================
+
+TEST_CASE("exchange_channel: close_sender with a single expected sender", "[exchange_channel]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4});
+
+  std::atomic<int> close_count{0};
+  ch.set_on_close([&] { close_count.fetch_add(1, std::memory_order_relaxed); });
+
+  REQUIRE(ch.close_sender(0));  // reaches expected_senders == 1 → closes
+  REQUIRE(ch.closed());
+  REQUIRE(close_count.load() == 1);
+
+  // Idempotent: a second EOS (same or different id) neither reopens nor re-fires.
+  REQUIRE_FALSE(ch.close_sender(0));
+  REQUIRE_FALSE(ch.close_sender(1));
+  REQUIRE(close_count.load() == 1);
+}
+
+// ============================================================================
+// CH-20: fan-in EOS — a channel with expected_senders = N stays open until N
+// distinct senders have signalled, so an early close from one sender does not
+// terminate the stream (issue #839, question 1).
+// ============================================================================
+
+TEST_CASE("exchange_channel: fan-in close_sender waits for all senders", "[exchange_channel]")
+{
+  constexpr std::uint32_t N = 3;
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4, .expected_senders = N});
+
+  std::atomic<int> close_count{0};
+  ch.set_on_close([&] { close_count.fetch_add(1, std::memory_order_relaxed); });
+
+  REQUIRE_FALSE(ch.close_sender(0));  // 1 of 3
+  REQUIRE_FALSE(ch.closed());
+  // A duplicate from an already-closed sender does not advance the count.
+  REQUIRE_FALSE(ch.close_sender(0));
+  REQUIRE_FALSE(ch.closed());
+
+  REQUIRE_FALSE(ch.close_sender(1));  // 2 of 3
+  REQUIRE_FALSE(ch.closed());
+
+  REQUIRE(ch.close_sender(2));  // 3 of 3 → closes exactly once
+  REQUIRE(ch.closed());
+  REQUIRE(close_count.load() == 1);
+}
+
+// ============================================================================
+// CH-21: a force close() short-circuits per-sender tracking; a later
+// close_sender() is then a no-op.
+// ============================================================================
+
+TEST_CASE("exchange_channel: force close() supersedes close_sender()", "[exchange_channel]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4, .expected_senders = 3});
+
+  ch.close();  // force close (error/cancel path) before all senders are done
+  REQUIRE(ch.closed());
+  REQUIRE_FALSE(ch.close_sender(0));  // already closed → no-op, returns false
+  REQUIRE(ch.closed());
+}
+
+// ============================================================================
+// CH-22: wait_readable wakes when a handle is pushed.
+// ============================================================================
+
+TEST_CASE("exchange_channel: wait_readable wakes on push", "[exchange_channel]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4});
+
+  std::atomic<bool> woke{false};
+  std::thread waiter([&] {
+    ch.wait_readable();  // blocks: empty and open
+    woke.store(true, std::memory_order_release);
+  });
+
+  std::this_thread::sleep_for(10ms);
+  REQUIRE_FALSE(woke.load());
+
+  REQUIRE(ch.try_push(make_handle(1)));
+  waiter.join();
+  REQUIRE(woke.load());
+  // Non-consuming: the handle is still there for the caller to pop.
+  REQUIRE(ch.size() == 1);
+}
+
+// ============================================================================
+// CH-23: wait_readable wakes when the channel closes (EOS), even with no data.
+// ============================================================================
+
+TEST_CASE("exchange_channel: wait_readable wakes on close", "[exchange_channel]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4});
+
+  std::atomic<bool> woke{false};
+  std::thread waiter([&] {
+    ch.wait_readable();
+    woke.store(true, std::memory_order_release);
+  });
+
+  std::this_thread::sleep_for(10ms);
+  REQUIRE_FALSE(woke.load());
+
+  ch.close();
+  waiter.join();
+  REQUIRE(woke.load());
+}
+
+// ============================================================================
+// CH-24: wait_readable returns immediately when a handle is already queued.
+// ============================================================================
+
+TEST_CASE("exchange_channel: wait_readable returns immediately when readable", "[exchange_channel]")
+{
+  exchange_channel ch(exchange_channel::config{.capacity_items = 4});
+  REQUIRE(ch.try_push(make_handle(1)));
+  ch.wait_readable();  // must not block
+  REQUIRE(ch.size() == 1);
+}

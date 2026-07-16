@@ -156,6 +156,29 @@ class task_scheduler {
   std::future<void> start_query();
 
   /**
+   * @brief Return the completion future without scheduling any scan source.
+   *
+   * start_query() schedules the query's first GPU_SCAN/GPU_VALUES source and would throw for a
+   * pure-streaming plan that has none. A sirius::exec::stream_session schedules its own
+   * streaming sources instead, so it obtains the completion future through this method. The
+   * returned future is only satisfied on a query error (report_error) — a streaming query has
+   * no single completion event, so the session detects normal completion via its output
+   * channels. prepare_for_query must have been called first.
+   *
+   * @return A future satisfied (with the exception) if the query errors.
+   */
+  std::future<void> get_query_awaitable();
+
+  /**
+   * @brief Register a callback fired once if the running query errors.
+   *
+   * Forwards to the current completion_handler (see completion_handler::set_on_error). Used by
+   * stream_session to force-close its channels on error so blocked external threads unblock.
+   * prepare_for_query must have been called first.
+   */
+  void set_on_query_error(std::function<void()> cb);
+
+  /**
    * @brief Terminate the query execution and report the error to duckdb.
    *
    * @param error The error to report.
