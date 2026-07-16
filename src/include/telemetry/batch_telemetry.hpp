@@ -120,6 +120,11 @@ class batch_telemetry_registry {
   /// consumer-port mappings. Called from SiriusContext::QueryEnd.
   void on_query_end();
 
+  /// The MemoryTier resource for (tier, device), e.g. for task states that
+  /// report their processing-space reservation on the same tier resources
+  /// batches use. Nil when the registry is not installed.
+  [[nodiscard]] uuid::UUID tier_resource(cucascade::memory::Tier tier, int32_t device_id) const;
+
   batch_telemetry_registry(const batch_telemetry_registry&)            = delete;
   batch_telemetry_registry& operator=(const batch_telemetry_registry&) = delete;
   batch_telemetry_registry(batch_telemetry_registry&&)                 = delete;

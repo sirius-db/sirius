@@ -251,6 +251,10 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   // claims by id: the weak pointers above are usually dead by then (the strong
   // refs live in the input data, consumed mid-execution).
   std::vector<uint64_t> _claimed_batch_ids;
+  //! Telemetry: the processing-space reservation this task holds, reported as
+  // a MemoryTier usage on the preparing/computing states (nil id = none).
+  uuid::UUID _reservation_tier_resource_id{};
+  uint64_t _reservation_bytes = 0;
 };
 
 }  // namespace pipeline

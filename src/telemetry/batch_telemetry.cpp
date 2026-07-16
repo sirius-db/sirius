@@ -476,6 +476,13 @@ void batch_telemetry_registry::on_tier_change(uint64_t batch_id,
   }
 }
 
+uuid::UUID batch_telemetry_registry::tier_resource(cucascade::memory::Tier tier,
+                                                   int32_t device_id) const
+{
+  if (!impl_->enabled.load(std::memory_order_acquire)) { return uuid::new_nil(); }
+  return impl_->tier_resource_id(tier, device_id);
+}
+
 void batch_telemetry_registry::on_query_end()
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }

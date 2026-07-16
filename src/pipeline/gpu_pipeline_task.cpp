@@ -322,7 +322,10 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         .current_operator_id = static_cast<uint32_t>(
           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
         .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),
+        .peak_allocated_bytes        = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
         .executor_thread_resource_id = executor_thread_resource_id,
+        .reservation_resource_id     = _reservation_tier_resource_id,
+        .reservation_capacity_bytes  = _reservation_bytes,
       });
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, _task_id, operators.size(), _allocator);
@@ -456,10 +459,17 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute: executor thread telemetry handle is not initialized");
   }
+  _reservation_bytes = reservation_bytes;
+  if (requested_memory_space != nullptr) {
+    _reservation_tier_resource_id = telemetry::batch_telemetry_registry::instance().tier_resource(
+      requested_memory_space->get_tier(), requested_memory_space->get_id().device_id);
+  }
   telemetry_handle().preparing({
-    .instance_name               = "",
-    .target_tier                 = "GPU",
-    .executor_thread_resource_id = executor_thread_resource_id,
+    .instance_name                = "",
+    .target_tier                  = "GPU",
+    .executor_thread_resource_id  = executor_thread_resource_id,
+    .reservation_resource_id      = _reservation_tier_resource_id,
+    .reservation_capacity_bytes   = _reservation_bytes,
   });
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
