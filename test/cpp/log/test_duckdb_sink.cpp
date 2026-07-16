@@ -46,7 +46,7 @@ TEST_CASE("duckdb sink forwards Sirius logs into duckdb_logs", "[log]")
   // DuckDB logging is off by default: the sink defers and drops everything.
   CHECK_FALSE(sink->should_log(level::error));
 
-  REQUIRE_FALSE(con.Query("PRAGMA enable_logging")->HasError());
+  REQUIRE_FALSE(con.Query("CALL enable_logging()")->HasError());
 
   // With logging enabled (default INFO threshold), error-and-above passes.
   CHECK(sink->should_log(level::error));
@@ -54,7 +54,8 @@ TEST_CASE("duckdb sink forwards Sirius logs into duckdb_logs", "[log]")
   sink_restorer restore;
   sirius::log::set_sink(sink);
   SIRIUS_LOG_ERROR("duckdb sink marker {}", 4242);
-  CHECK(sink->flush());
+  // flush() forwards to storage but reports false — best-effort, no delivery guarantee.
+  CHECK_FALSE(sink->flush());
 
   auto result = con.Query("SELECT message FROM duckdb_logs WHERE type = 'Sirius'");
   REQUIRE_FALSE(result->HasError());
@@ -75,12 +76,12 @@ TEST_CASE("duckdb sink is a safe no-op after the database is destroyed", "[log]"
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE_FALSE(con.Query("PRAGMA enable_logging")->HasError());
+    REQUIRE_FALSE(con.Query("CALL enable_logging()")->HasError());
     sink = sirius::log::make_duckdb_sink(*db.instance);
     CHECK(sink->should_log(level::error));
   }
   // The DatabaseInstance is gone; the sink's weak reference has expired.
   CHECK_FALSE(sink->should_log(level::error));
   sink->log(level::error, std::source_location::current(), "after destroy");  // must not crash
-  CHECK(sink->flush());
+  CHECK_FALSE(sink->flush());  // safe no-op, reports false once the db is gone
 }
