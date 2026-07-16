@@ -229,12 +229,12 @@ sirius:
 
 ## Executor Configuration
 
-**Files:** `src/include/exec/config.hpp`, `src/include/creator/config.hpp`, `src/include/exec/inspectable_mpsc.hpp`
+**Files:** `src/include/exec/config.hpp`, `src/include/creator/config.hpp`
 
 The `sirius.executor` block configures the thread pools and task scheduling. It has four
-per-pool sub-blocks (`task_creator`, `pipeline`, `downgrade`, and `scan_manager`) plus one
-scheduler-wide key (`task_queue_ordering`). The `scan_manager` sub-block is large and is
-documented in [Scan Manager & IO Configuration](#scan-manager--io-configuration) below.
+per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`. The
+`scan_manager` sub-block is large and is documented in
+[Scan Manager & IO Configuration](#scan-manager--io-configuration) below.
 
 Every thread-pool sub-block shares three keys:
 
@@ -243,12 +243,6 @@ Every thread-pool sub-block shares three keys:
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
 | `thread_name_prefix` | string | per pool | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin the pool's threads to. |
-
-Scheduler-wide key (directly under `sirius.executor`):
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `task_queue_ordering` | enum: `fifo`, `lifo` | `fifo` | Pop order for the task scheduler's pipeline-level task queue. `fifo` preserves legacy behavior; `lifo` pops the newest task first (a depth-first scheduler). Values are lowercase. |
 
 ### `sirius.executor.task_creator`
 

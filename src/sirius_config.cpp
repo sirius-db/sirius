@@ -437,7 +437,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
-      er.optional("task_queue_ordering", _task_queue_ordering);
       er.reject_unknown();
     }
 

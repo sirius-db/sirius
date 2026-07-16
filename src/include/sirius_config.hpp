@@ -19,7 +19,6 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
-#include "exec/inspectable_mpsc.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -157,13 +156,6 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
-  /// Pop ordering for the task_scheduler's pipeline-level task queue. See
-  /// exec::queue_ordering for semantics. Defaults to FIFO (legacy behavior).
-  [[nodiscard]] exec::queue_ordering get_task_queue_ordering() const noexcept
-  {
-    return _task_queue_ordering;
-  }
-
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -192,7 +184,6 @@ struct sirius_config {
   exec::downgrade_executor_config _downgrade_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
-  exec::queue_ordering _task_queue_ordering{exec::queue_ordering::FIFO};
 };
 
 }  // namespace sirius
