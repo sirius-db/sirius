@@ -53,9 +53,9 @@
 // and no host cumsum are needed to write. `live_words[c]` reports the actual
 // bit-packed word count for chunk c.
 //
-// The OverAllocate→Compact story (compact_in_place before store, decode seeing
-// only Compact) is documented canonically on `bitpack_compressed_representation`
-// in codegen/plan/representation.hpp.
+// The OverAllocate→Compact story (compact_bitpack_packed before store, decode
+// seeing only Compact) is documented canonically on that function in
+// bridge/codegen_runtime.cpp.
 
 #pragma once
 

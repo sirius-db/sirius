@@ -66,7 +66,7 @@ std::unique_ptr<cudf::column> snappy_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
   return detail::nvcomp_decompress_impl(
-    snappy_ops(), compressed_data.get(), compressed_size, original_type, num_rows, stream, mr);
+    snappy_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
 }
 
 std::unique_ptr<compressed_representation> snappy_compressor::compress(

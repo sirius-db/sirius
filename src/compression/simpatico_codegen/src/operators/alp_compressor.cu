@@ -600,17 +600,17 @@ std::unique_ptr<cudf::column> alp_decompress_impl(alp_compressed_representation 
 
   const int block = 256;
   int grid        = (repr.num_rows + block - 1) / block;
-  alp_decode_kernel<T><<<grid, block, 0, stream.value()>>>(repr.integers->view().data<int_t>(),
-                                                           repr.metadata->view().data<uint16_t>(),
+  alp_decode_kernel<T><<<grid, block, 0, stream.value()>>>(repr.integers()->view().data<int_t>(),
+                                                           repr.metadata()->view().data<uint16_t>(),
                                                            repr.num_rows,
                                                            out->mutable_view().data<T>());
 
-  cudf::size_type exc_n = repr.exceptions ? repr.exceptions->size() : 0;
+  cudf::size_type exc_n = repr.exceptions() ? repr.exceptions()->size() : 0;
   if (exc_n > 0) {
     int egrid = (exc_n + block - 1) / block;
     alp_scatter_exceptions_kernel<T>
-      <<<egrid, block, 0, stream.value()>>>(repr.exceptions->view().data<T>(),
-                                            repr.exception_positions->view().data<int32_t>(),
+      <<<egrid, block, 0, stream.value()>>>(repr.exceptions()->view().data<T>(),
+                                            repr.exception_positions()->view().data<int32_t>(),
                                             exc_n,
                                             out->mutable_view().data<T>());
   }
@@ -633,13 +633,12 @@ alp_compressed_representation::alp_compressed_representation(
   std::unique_ptr<cudf::column> exceptions_in,
   std::unique_ptr<cudf::column> exception_positions_in,
   std::unique_ptr<cudf::column> metadata_in)
-  : compressed_representation(type, n_rows),
-    num_vectors(n_vectors),
-    integers(std::move(integers_in)),
-    exceptions(std::move(exceptions_in)),
-    exception_positions(std::move(exception_positions_in)),
-    metadata(std::move(metadata_in))
+  : compressed_representation(type, n_rows), num_vectors(n_vectors)
 {
+  channels_.push_back(std::move(integers_in));
+  channels_.push_back(std::move(exceptions_in));
+  channels_.push_back(std::move(exception_positions_in));
+  channels_.push_back(std::move(metadata_in));
 }
 
 std::unique_ptr<cudf::column> alp_compressed_representation::decompress(

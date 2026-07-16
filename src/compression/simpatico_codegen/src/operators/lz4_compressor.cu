@@ -71,7 +71,7 @@ std::unique_ptr<cudf::column> lz4_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
   return detail::nvcomp_decompress_impl(
-    lz4_ops(), compressed_data.get(), compressed_size, original_type, num_rows, stream, mr);
+    lz4_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
 }
 
 std::unique_ptr<compressed_representation> lz4_compressor::compress(

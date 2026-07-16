@@ -22,27 +22,30 @@ namespace simpatico {
 std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
-  if (num_rows == 0 || !offsets_) {
+  auto& offsets   = channels_[0];
+  auto& chars     = channels_[1];
+  auto* null_mask = channels_.size() > 2 ? channels_[2].get() : nullptr;
+  if (num_rows == 0 || !offsets) {
     return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }
 
-  auto chars_contents = chars_->release();
+  auto chars_contents = chars->release();
   rmm::device_buffer chars_buf =
     chars_contents.data ? std::move(*chars_contents.data) : rmm::device_buffer(0, stream, mr);
 
   cudf::size_type nc = 0;
   rmm::device_buffer mask_buf(0, stream, mr);
-  if (null_mask_) {
+  if (null_mask) {
     auto const* bits =
-      reinterpret_cast<cudf::bitmask_type const*>(null_mask_->view().data<std::uint8_t>());
+      reinterpret_cast<cudf::bitmask_type const*>(null_mask->view().data<std::uint8_t>());
     nc = cudf::null_count(bits, 0, num_rows, stream);
     if (nc > 0) {
-      auto mask_contents = null_mask_->release();
+      auto mask_contents = null_mask->release();
       mask_buf           = std::move(*mask_contents.data);
     }
   }
   return cudf::make_strings_column(
-    num_rows, std::move(offsets_), std::move(chars_buf), nc, std::move(mask_buf));
+    num_rows, std::move(offsets), std::move(chars_buf), nc, std::move(mask_buf));
 }
 
 std::unique_ptr<compressed_representation> str_split_compressor::compress(

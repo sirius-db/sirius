@@ -255,22 +255,22 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   // only for legacy blobs that predate the field (ld.num_rows == 0).
   const cudf::size_type node_rows =
     ld.num_rows > 0 ? static_cast<cudf::size_type>(ld.num_rows) : col_num_rows;
-  auto make_fused_rep = [&](const char* kind_tag) {
-    auto rep = std::make_unique<codegen_fused_representation>(
-      kind_tag, tag_to_dtype(ld.type_tag), node_rows);
+  auto make_fused_rep = [&](OpId op_id) {
+    auto rep =
+      std::make_unique<codegen_fused_representation>(op_id, tag_to_dtype(ld.type_tag), node_rows);
     for (std::size_t i = 0; i < bufs.size(); ++i) {
       rep->buffers.emplace_back(bufs[i].name, make_col(i));
     }
     return std::unique_ptr<compressed_representation>(std::move(rep));
   };
 
-  if (ld.kind == OpId::Delta) { return make_fused_rep("delta"); }
-  if (ld.kind == OpId::Rle) { return make_fused_rep("rle"); }
-  if (ld.kind == OpId::For) { return make_fused_rep("for"); }
-  if (ld.kind == OpId::Zigzag) { return make_fused_rep("zigzag"); }
+  if (ld.kind == OpId::Delta || ld.kind == OpId::Rle || ld.kind == OpId::For ||
+      ld.kind == OpId::Zigzag) {
+    return make_fused_rep(ld.kind);
+  }
   if (ld.kind == OpId::Identity) {
     bool is_fused = !(bufs.size() == 1 && bufs[0].name == "data");
-    if (is_fused) return make_fused_rep("RawFused");
+    if (is_fused) return make_fused_rep(ld.kind);
   }
 
   // All other kinds (and non-fused identity): route through reconstruct_representation.
@@ -723,17 +723,10 @@ std::string build_compressed_table_header(compressed_table const& table,
 
   // A STRING column is physically split across offsets and chars (plus an
   // optional null mask), so no single parent head() pointer describes its
-  // bytes. Reject identity STRING and any unexpected raw STRING channel before
-  // exposing a fabricated contiguous payload range.
+  // bytes. identity on a STRING column decomposes via str_split; reject any
+  // remaining raw STRING channel before exposing a fabricated payload range.
   for (auto const& descs : all_descs) {
     for (auto const& desc : descs) {
-      if (desc.kind == OpId::Identity &&
-          tag_to_dtype(desc.type_tag).id() == cudf::type_id::STRING) {
-        out_header.clear();
-        out_buffers.clear();
-        out_payload_bytes = 0;
-        return "identity STRING leaves are not serializable; use str_split";
-      }
       for (auto const& buffer : desc.buffers) {
         if (tag_to_dtype(buffer.type_tag).id() == cudf::type_id::STRING) {
           out_header.clear();

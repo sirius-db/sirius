@@ -144,7 +144,7 @@ bool parse_nvcomp_cascaded_suffix(std::string_view suffix, int* deltas, int* rle
 std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
-  if (num_rows == 0 || compressed_data == nullptr || compressed_size == 0) {
+  if (num_rows == 0 || payload_data() == nullptr || payload_size() == 0) {
     return cudf::make_fixed_width_column(
       original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
   }
@@ -155,13 +155,8 @@ std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
   copts.num_RLEs                            = compress_num_RLEs;
   copts.use_bp                              = compress_use_bp;
 
-  return detail::nvcomp_decompress_impl(make_cascaded_ops(copts),
-                                        compressed_data.get(),
-                                        compressed_size,
-                                        original_type,
-                                        num_rows,
-                                        stream,
-                                        mr);
+  return detail::nvcomp_decompress_impl(
+    make_cascaded_ops(copts), payload_data(), payload_size(), original_type, num_rows, stream, mr);
 }
 
 std::unique_ptr<compressed_representation> cascaded_compressor::compress(

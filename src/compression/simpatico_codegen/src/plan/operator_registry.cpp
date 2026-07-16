@@ -53,10 +53,9 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Bitextract,     "bitextract",      {},                                                                     {"bitextract_f32", "bitextract_f64"}, false, true, false},
     {OpId::Identity,       "identity",        {"data"},                                                               {},                                false, false, false},
     {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             {},                                false, false, false},
-    // Variable arity (2 or 3: offsets, chars[, null_mask]) -> empty channels, like Dictionary.
-    // Cataloged so string exploration can discover the decomposed shape
-    // (offsets -> delta -> bitpack, chars -> byte codec); STRING-only via the try_operator static gate.
-    {OpId::StrSplit,       "str_split",       {},                                                                     {"str_split"},                     false, true,  false},
+    // 2 or 3 channels: offsets, chars[, null_mask]. null_mask is optional (present only when
+    // nullable); the generic named_channels() skips nullptr slots so arity is correct at runtime.
+    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     {"str_split"},                     false, true,  false},
   };
   // clang-format on
   return kTable;

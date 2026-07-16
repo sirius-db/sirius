@@ -398,21 +398,14 @@ void test_error_bad_version()
 
 // Error: identity on a STRING column has no single contiguous payload buffer;
 // build_compressed_table_header must reject it loudly and clear its outputs.
-void test_identity_string_header_rejected()
+// identity on a STRING column decomposes via str_split, so it round-trips to
+// file (both the file path and the in-memory pin path).
+void test_identity_string_roundtrip()
 {
   auto stream = cudf::get_default_stream();
   auto input  = make_string_table(128, stream);
-  auto source = simpatico::compress_with_plan(
-    input->view(), "input -> identity\n", stream, rmm::mr::get_current_device_resource_ref());
-
-  std::vector<std::uint8_t> header{1, 2, 3};
-  std::vector<simpatico::payload_buffer_ref> buffers{{7, nullptr, 9}};
-  std::uint64_t payload_bytes = 11;
-  auto const error =
-    simpatico::build_compressed_table_header(source, header, buffers, payload_bytes, stream);
-  expect(!error.empty(), "identity_string_header: expected loud rejection");
-  expect(header.empty() && buffers.empty() && payload_bytes == 0,
-         "identity_string_header: outputs were not cleared on rejection");
+  io_roundtrip("identity_string", input->view(), "input -> identity\n");
+  memory_roundtrip("identity_string_mem", input->view(), "input -> identity\n");
 }
 
 // The two production STRING plan shapes from plans/tpch_sf1000 (customer/
@@ -463,6 +456,11 @@ void test_str_split_plan_shapes_roundtrip()
   io_roundtrip("str_split_phone_shape", phone_tbl->view(), phone_dsl);
   memory_roundtrip("str_split_address_shape_mem", addr_tbl->view(), address_dsl);
   memory_roundtrip("str_split_phone_shape_mem", phone_tbl->view(), phone_dsl);
+
+  // Bare terminal: the str_split rep itself is the node's stored leaf.
+  std::string const bare_dsl = "input -> str_split\n";
+  io_roundtrip("str_split_bare_terminal", addr_tbl->view(), bare_dsl);
+  memory_roundtrip("str_split_bare_terminal_mem", addr_tbl->view(), bare_dsl);
 }
 
 }  // namespace
@@ -496,7 +494,7 @@ int main()
     {"error_garbage", test_error_garbage},
     {"error_bad_magic", test_error_bad_magic},
     {"error_bad_version", test_error_bad_version},
-    {"identity_string_header_rejected", test_identity_string_header_rejected},
+    {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
   };
 

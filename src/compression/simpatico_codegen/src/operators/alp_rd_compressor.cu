@@ -486,20 +486,20 @@ std::unique_ptr<cudf::column> alp_rd_decompress_impl(alp_rd_compressed_represent
   const int block = 256;
   int grid        = (repr.num_rows + block - 1) / block;
   alp_rd_decode_kernel<T>
-    <<<grid, block, 0, stream.value()>>>(repr.right_parts->view().data<uint_t>(),
-                                         repr.dict_indices->view().data<uint8_t>(),
-                                         repr.dict->view().data<uint16_t>(),
+    <<<grid, block, 0, stream.value()>>>(repr.right_parts()->view().data<uint_t>(),
+                                         repr.dict_indices()->view().data<uint8_t>(),
+                                         repr.dict()->view().data<uint16_t>(),
                                          repr.right_bw,
                                          repr.num_rows,
                                          out->mutable_view().data<T>());
 
-  cudf::size_type exc_n = repr.exceptions ? repr.exceptions->size() : 0;
+  cudf::size_type exc_n = repr.exceptions() ? repr.exceptions()->size() : 0;
   if (exc_n > 0) {
     int egrid = (exc_n + block - 1) / block;
     alp_rd_scatter_exceptions_kernel<T>
-      <<<egrid, block, 0, stream.value()>>>(repr.exceptions->view().data<uint16_t>(),
-                                            repr.exception_positions->view().data<int32_t>(),
-                                            repr.right_parts->view().data<uint_t>(),
+      <<<egrid, block, 0, stream.value()>>>(repr.exceptions()->view().data<uint16_t>(),
+                                            repr.exception_positions()->view().data<int32_t>(),
+                                            repr.right_parts()->view().data<uint_t>(),
                                             exc_n,
                                             repr.right_bw,
                                             out->mutable_view().data<T>());
@@ -525,15 +525,14 @@ alp_rd_compressed_representation::alp_rd_compressed_representation(
   std::unique_ptr<cudf::column> metadata_in,
   std::unique_ptr<cudf::column> exceptions_in,
   std::unique_ptr<cudf::column> exception_positions_in)
-  : compressed_representation(type, n_rows),
-    right_bw(right_bw_in),
-    right_parts(std::move(right_parts_in)),
-    dict_indices(std::move(dict_indices_in)),
-    dict(std::move(dict_in)),
-    metadata(std::move(metadata_in)),
-    exceptions(std::move(exceptions_in)),
-    exception_positions(std::move(exception_positions_in))
+  : compressed_representation(type, n_rows), right_bw(right_bw_in)
 {
+  channels_.push_back(std::move(right_parts_in));
+  channels_.push_back(std::move(dict_indices_in));
+  channels_.push_back(std::move(dict_in));
+  channels_.push_back(std::move(metadata_in));
+  channels_.push_back(std::move(exceptions_in));
+  channels_.push_back(std::move(exception_positions_in));
 }
 
 std::unique_ptr<cudf::column> alp_rd_compressed_representation::decompress(

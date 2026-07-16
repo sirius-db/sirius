@@ -109,8 +109,8 @@ std::unique_ptr<cudf::column> bitcomp_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
   return detail::nvcomp_decompress_impl(make_bitcomp_ops(compress_algorithm),
-                                        compressed_data.get(),
-                                        compressed_size,
+                                        payload_data(),
+                                        payload_size(),
                                         original_type,
                                         num_rows,
                                         stream,

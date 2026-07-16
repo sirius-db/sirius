@@ -24,15 +24,10 @@ void expect(bool cond, char const* msg)
 simpatico::compressed_representation const* find_bitpack_leaf(simpatico::PlanTree const& tree)
 {
   for (auto const& node : tree.nodes) {
-    if (node.rep &&
-        dynamic_cast<simpatico::bitpack_compressed_representation const*>(node.rep.get())) {
-      return node.rep.get();
-    }
+    if (node.rep && node.rep->kind() == simpatico::OpId::Bitpack) { return node.rep.get(); }
     for (auto const& [path, rep] : node.channels) {
       (void)path;
-      if (rep && dynamic_cast<simpatico::bitpack_compressed_representation const*>(rep.get())) {
-        return rep.get();
-      }
+      if (rep && rep->kind() == simpatico::OpId::Bitpack) { return rep.get(); }
     }
   }
   return nullptr;

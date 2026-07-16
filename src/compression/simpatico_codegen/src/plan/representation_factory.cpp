@@ -125,6 +125,20 @@ std::unique_ptr<compressed_representation> identity_compressed_representation::f
   return std::make_unique<identity_compressed_representation>(std::move(outputs[0]));
 }
 
+std::unique_ptr<compressed_representation> identity_compressor::compress(
+  cudf::column_view column_to_compress,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  // A STRING column can't be stored as one contiguous payload; str_split
+  // decomposes it into serializable offsets/chars[/null_mask] channels.
+  if (column_to_compress.type().id() == cudf::type_id::STRING) {
+    return str_split_compressor{}.compress(column_to_compress, stream, mr);
+  }
+  auto col_copy = std::make_unique<cudf::column>(column_to_compress, stream, mr);
+  return std::make_unique<identity_compressed_representation>(std::move(col_copy));
+}
+
 namespace {
 
 // Reads a "null_mask" channel column (UINT8 bitmask bytes, as emitted by
@@ -243,7 +257,10 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
   return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
 }
 
-std::unique_ptr<compressed_representation> bitpack_compressed_representation::from_outputs(
+// Bitpack has no rep subclass of its own — it reconstructs as a
+// codegen_fused_representation (the codegen decode path inverts it), so its
+// reconstruction lives here as a file-local factory rather than a static member.
+static std::unique_ptr<compressed_representation> bitpack_from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
   rmm::cuda_stream_view stream,
@@ -309,12 +326,15 @@ std::unique_ptr<compressed_representation> bitpack_compressed_representation::fr
       num_rows += c;
   }
 
-  return std::make_unique<bitpack_compressed_representation>(original_type,
-                                                             num_rows,
-                                                             std::move(chunk_min),
-                                                             std::move(chunk_count),
-                                                             std::move(chunk_bits),
-                                                             std::move(packed));
+  // Bitpack reconstructs as a codegen_fused_representation; the codegen decode
+  // path inverts it. Buffers are tagged with the registry channel names; packed
+  // may be null (tail-routed), which named_channels() skips.
+  auto rep = std::make_unique<codegen_fused_representation>(OpId::Bitpack, original_type, num_rows);
+  rep->buffers.emplace_back("chunk_min", std::move(chunk_min));
+  rep->buffers.emplace_back("chunk_count", std::move(chunk_count));
+  rep->buffers.emplace_back("chunk_bits", std::move(chunk_bits));
+  rep->buffers.emplace_back("packed", std::move(packed));
+  return rep;
 }
 
 // The four buffers are independent leaves that may each be further compressed
@@ -723,7 +743,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
       return dictionary_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out);
     case OpId::Bitpack:
-      return bitpack_compressed_representation::from_outputs(
+      return bitpack_from_outputs(
         output_names, std::move(outputs), stream, mr, error_out, num_rows_hint);
     case OpId::Alp:
       return alp_compressed_representation::from_outputs(
