@@ -44,7 +44,7 @@ struct pinned_entry;
 
 namespace sirius::vss {
 
-/// Resolved handles for vector search table function implementation. Built
+/// Resolved handles shared by the ANN and ENN table-function search impls. Built
 /// once by @ref run_vector_search after it locates the GPU space, pinned table,
 /// host space, and uploads the query, then passed by const-ref to whichever impl
 /// runs. All references outlive the impl call.
@@ -73,6 +73,10 @@ std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
 
 /// ENN search, tiled per pinned chunk and merged.
 std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
+  const vector_search_context& c);
+
+/// ANN search over a pinned IVF-Flat index.
+std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
   const vector_search_context& c);
 
 }  // namespace sirius::vss
