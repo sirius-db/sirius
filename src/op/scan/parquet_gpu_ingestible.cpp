@@ -265,7 +265,9 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
 //===----------------------------------------------------------------------===//
 std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() const
 {
-  if (!datasource || !file_metadata || !reader_options) { return {}; }
+  if (!datasource || !datasource->uses_prefetching_cache() || !file_metadata || !reader_options) {
+    return {};
+  }
   std::vector<cudf::size_type> rg_indices;
   rg_indices.reserve(row_groups.size());
   for (auto const& rg : row_groups) {
@@ -287,7 +289,9 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
   std::vector<fadvise_entry> entries;
   entries.reserve(rg_slices.size());
   for (auto const& slice : rg_slices) {
-    if (!slice.datasource || !slice.file_metadata) { continue; }
+    if (!slice.datasource || !slice.datasource->uses_prefetching_cache() || !slice.file_metadata) {
+      continue;
+    }
     auto ranges =
       column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
     if (ranges.empty()) { continue; }

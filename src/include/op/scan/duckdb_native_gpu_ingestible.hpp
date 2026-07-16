@@ -118,7 +118,9 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// groups currently held. The scan sequencer fadvises these to prefetch.
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override
   {
-    if (!datasource || block_manager == nullptr) { return {}; }
+    if (!datasource || !datasource->uses_prefetching_cache() || block_manager == nullptr) {
+      return {};
+    }
     fadvise_entry entry;
     entry.datasource = datasource;
     for (auto const& rg : row_groups) {
