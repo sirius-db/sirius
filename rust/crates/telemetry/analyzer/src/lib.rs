@@ -74,6 +74,11 @@ const BATCH_TYPE_NAME: &str = "batch";
 /// later), so the analyzer omits it from every aggregated series — it would
 /// only ever render as noise slivers at extreme zoom.
 const BATCH_REGISTERED_STATE: &str = "batch_registered";
+/// Synthetic data-flow series: the processing space (memory reservation) tasks
+/// hold on a tier while preparing/computing, shown beside the batch lifecycle
+/// states in the DAG view. Note the reservation includes room to materialize
+/// the task's inputs, so it can overlap the input batches' resident bytes.
+const TASK_WORKING_SPACE_STATE: &str = "task_working_space";
 /// Data-flow measure counting batches residing in each (state, tier) cell.
 const MEASURE_COUNT: &str = "count";
 /// Data-flow measure summing batch bytes held in each (state, tier) cell.
@@ -1238,6 +1243,62 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                 series: operator_id,
                                 measure: MEASURE_BYTES,
                                 state,
+                                dimension,
+                            },
+                            span,
+                            bytes as f64,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Task processing space: tasks report their memory reservation as a
+        // tier usage while preparing/computing. Surface it as one synthetic
+        // series per operator so the DAG shows working space beside the batch
+        // lifecycle states (count = tasks holding space, bytes = reservation).
+        for task in view.tasks() {
+            let Some(operator_id) = task.pipeline_uuid() else {
+                continue;
+            };
+            for pair in task.transitions().windows(2) {
+                let (from, to) = (&pair[0], &pair[1]);
+                let Ok(span) = SpanNanoSec::try_new(from.timestamp(), to.timestamp()) else {
+                    continue;
+                };
+                let Some(tier_usage) = from
+                    .usages
+                    .iter()
+                    .find(|u| tier_names.contains_key(&u.resource_id))
+                else {
+                    continue;
+                };
+                let dimension = tier_names[&tier_usage.resource_id];
+                if want_count {
+                    builder.try_push(
+                        DistributionKey {
+                            series: operator_id,
+                            measure: MEASURE_COUNT,
+                            state: TASK_WORKING_SPACE_STATE,
+                            dimension,
+                        },
+                        span,
+                        1.0,
+                    )?;
+                }
+                if want_bytes {
+                    let bytes: u64 = tier_usage
+                        .capacities
+                        .iter()
+                        .filter(|c| c.name == crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME)
+                        .filter_map(|c| c.value)
+                        .sum();
+                    if bytes > 0 {
+                        builder.try_push(
+                            DistributionKey {
+                                series: operator_id,
+                                measure: MEASURE_BYTES,
+                                state: TASK_WORKING_SPACE_STATE,
                                 dimension,
                             },
                             span,
