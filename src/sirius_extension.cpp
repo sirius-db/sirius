@@ -1566,15 +1566,6 @@ static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, 
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
-static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  params->default_scan_task_varchar_size = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_VARCHAR_SIZE to {}",
-                   params->default_scan_task_varchar_size);
-}
-
 static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1867,13 +1858,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.scan_task_batch_size),
                             SetDefaultScanTaskBatchSize);
-  // Default varchar size for estimating rows per batch
-  config.AddExtensionOption(
-    "default_scan_task_varchar_size",
-    "The default varchar size for estimating rows per batch in a duckdb scan task",
-    LogicalType::UBIGINT,
-    Value::UBIGINT(sirius::operator_params{}.default_scan_task_varchar_size),
-    SetDefaultScanTaskVarcharSize);
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",

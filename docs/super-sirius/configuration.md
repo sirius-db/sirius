@@ -86,7 +86,6 @@ sirius:
     task_creator: { num_threads: 1 }
   operator_params:
     scan_task_batch_size:       805306368   # 768 MiB
-    default_scan_task_varchar_size: 256
     max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
@@ -349,7 +348,6 @@ Four optional nested sub-configs tune the individual backends and caches:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scan_task_batch_size` | 512 MB | Target batch size for DuckDB scan tasks |
-| `default_scan_task_varchar_size` | 256 B | Estimated size per VARCHAR value for row count estimation |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | 512 MB | Target partition size for hash joins and group-bys |
 | `concat_batch_bytes` | 512 MB | Target output batch size for CONCAT operator |
@@ -517,7 +515,6 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
 | `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
 | `scan_task_batch_size` | 512 MB | Target scan batch size |
-| `default_scan_task_varchar_size` | 256 | VARCHAR size estimate |
 
 ### Pipeline / Operator
 
