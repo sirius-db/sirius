@@ -47,9 +47,9 @@ namespace sirius::io::rdma {
 /// GPUDirect RDMA write-ordering: a flush before the consuming copy is needed
 /// unless the platform orders NIC writes for all devices.  @p writes_ordering
 /// is the CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING value
-/// (NONE = 0, OWNER = 100, ALL_DEVICES = 200); whether OWNER truly needs the
-/// flush for same-device consumers is validated on the rig — until then this
-/// stays conservative.
+/// (NONE = 0, OWNER = 100, ALL_DEVICES = 200).  Whether OWNER suffices for
+/// same-device consumers has not been validated on hardware, so OWNER is
+/// treated as requiring the flush.
 [[nodiscard]] constexpr bool flush_required(int writes_ordering) noexcept
 {
   constexpr int k_all_devices_ordered = 200;  // CU_..._ORDERING_ALL_DEVICES
@@ -60,13 +60,13 @@ namespace sirius::io::rdma {
 /// (the wrapper terminates).
 void default_fatal_hook(const char* what, cudaError_t rc) noexcept;
 
-/// Frozen sticky/context-fatal CUDA codes — the in-repo source of truth for
-/// the pre-boundary classification (contract §5 item 2).  Adjudication
-/// rationale and change control: `s3-rdma-sticky-set.md` v2 / invariant-matrix
-/// row 16.  `is_context_fatal` scans this array and the parameterized death
-/// tests iterate it, so dropping a code fails a test.  A code is sticky iff
-/// NVIDIA documentation demands process terminate/relaunch, declares the
-/// context/device unusable, or requires a GPU reset / node reboot.
+/// Sticky/context-fatal CUDA codes: the single source of truth for
+/// classifying CUDA errors before the delivery boundary (safety contract:
+/// experimental/s3-rdma-transport-design.md, Section 3).  `is_context_fatal`
+/// scans this array and the parameterized death tests iterate it, so dropping
+/// a code fails a test.  A code belongs here iff NVIDIA documentation demands
+/// process terminate/relaunch, declares the context/device unusable, or
+/// requires a GPU reset / node reboot.
 inline constexpr auto k_sticky_context_fatal_codes = std::to_array<cudaError_t>({
   cudaErrorECCUncorrectable,
   cudaErrorNvlinkUncorrectable,
@@ -89,12 +89,12 @@ inline constexpr auto k_sticky_context_fatal_codes = std::to_array<cudaError_t>(
   cudaErrorExternalDevice,
 });
 
-/// CUDA delivery seam (F01): every CUDA call on the device-chunk delivery path
-/// goes through these, so tests can inject failures without faking CUDA side
+/// CUDA delivery seam: every CUDA call on the device-chunk delivery path goes
+/// through these, so tests can inject failures without faking CUDA side
 /// effects.  Defaults are the real CUDA runtime entry points; the indirection
-/// is one std::function call per op against a 100+ µs blocking GET.  Injected
-/// at CONSTRUCTION only (via the @c s3_rdma_ioctx constructor) — there is no
-/// runtime setter, so workers never race a swap.
+/// costs one std::function call per op against a 100+ µs blocking GET.
+/// Injected at construction only (via the @c s3_rdma_ioctx constructor);
+/// there is no runtime setter, so workers never race a swap.
 struct cuda_delivery_ops {
   // Lambdas rather than &function: several runtime entry points carry C++
   // overload sets in cuda_runtime.h, so a bare address is ambiguous.
@@ -131,10 +131,9 @@ struct cuda_delivery_ops {
   std::function<void(const char*, cudaError_t)> fatal_hook = default_fatal_hook;
 };
 
-/// The ONLY entry to the fatal hook (contract §5 items 3/7): noexcept and
-/// non-returning — invokes the hook, swallows anything it throws, and calls
-/// std::terminate().  No stack unwinding, no slot release, no future
-/// resolution can follow.
+/// The only entry to the fatal hook: noexcept and non-returning.  It invokes
+/// the hook, swallows anything the hook throws, and calls std::terminate().
+/// No stack unwinding, no slot release, and no future resolution can follow.
 [[noreturn]] void invoke_fatal(const cuda_delivery_ops& ops,
                                const char* what,
                                cudaError_t rc) noexcept;
@@ -210,7 +209,8 @@ struct cuobj_chunked_rx_request {
  * terminates exactly once (chunk_complete / report_error) on a worker thread —
  * the read's future resolves when its last chunk releases the shared
  * @c request_manager.  With no client configured every path fails loudly with
- * a "not implemented" error (the transport-selection contract).  @c shutdown
+ * a "not implemented" error; it never silently falls back to another
+ * transport.  @c shutdown
  * drains queued work, then joins the workers; it is idempotent, and work
  * enqueued afterwards fails cleanly.
  */
@@ -228,7 +228,7 @@ class cuobj_rdma_reactor {
 
   /// Shared per-pool state: the effective config + the transfer client (may be
   /// null until the real data path is configured) + the CUDA delivery seam
-  /// (immutable after construction — F01).
+  /// (immutable after construction).
   class reactor_context {
    public:
     reactor_context(config cfg,
@@ -310,10 +310,11 @@ class cuobj_rdma_reactor {
     std::unique_ptr<slot_pool> pool;
     std::shared_ptr<rdma_client> registrar;  // deregisters base on teardown
     bool leaked{false};                      // non-freeable flag: the destructor then skips
-                                             // deregister + cudaFree.  Set by the RDMA fail-stop
-                                             // transition (execution step 4); no current path
-                                             // sets it — a CUDA-fatal outcome terminates the
-                                             // process (step 3), so the arena dies with it.
+                                             // deregister + cudaFree.  Reserved for an RDMA
+                                             // fail-stop that cannot prove the NIC is
+                                             // quiesced; no current path sets it, because a
+                                             // CUDA-fatal outcome terminates the process and
+                                             // the arena dies with it.
     ~arena();
   };
 
@@ -321,12 +322,11 @@ class cuobj_rdma_reactor {
   /// fail-stop terminal states entered exactly once by @c enter_failed:
   /// intake stops (enqueue fails fast naming the first fatal error), queued
   /// chunks are drained by error, and an active chunk is aborted before its
-  /// GET by the owner worker's pre-boundary @c delivery_fatal check — never
-  /// resolved cross-worker.  STOPPING/JOINED are ordinary shutdown.  This
-  /// transition is DORMANT after step 3 (the CUDA-fatal path terminates the
-  /// process instead); execution step 4 wires the RDMA fail-stop trigger and
-  /// the whole-arena non-freeable marking into it.  The recoverable
-  /// quiescence ladder is gone (v1.2 archive).
+  /// GET by the owner worker's pre-boundary @c delivery_fatal check; a chunk
+  /// is never resolved from another worker.  STOPPING/JOINED are ordinary
+  /// shutdown.  No current path enters FAILING (a fatal CUDA outcome
+  /// terminates the process instead); the transition is reserved for
+  /// RDMA-side fail-stop triggers, which also mark the arenas non-freeable.
   enum class reactor_state : uint8_t { created, running, failing, failed, stopping, joined };
 
   void worker_loop();

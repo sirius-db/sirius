@@ -30,12 +30,12 @@ namespace sirius::io::rdma {
  * @brief The production @c rdma_client: SigV4 HTTP control plane + cuObject
  *        data plane.
  *
- * The HTTP half — @c head and host-destination @c get (ranged, SigV4-signed
- * via the shared authorizer, libcurl transport) — always compiles and needs no
+ * The HTTP half (@c head and host-destination @c get: ranged, SigV4-signed
+ * via the shared authorizer, libcurl transport) always compiles and needs no
  * RDMA hardware or SDK; it serves the bind-time footer / metadata path.
  *
- * The device half — @c get into a registered landing-arena slot (cuObjGet) and
- * @c register_memory / @c deregister_memory — requires building with
+ * The device half (@c get into a registered landing-arena slot via cuObjGet,
+ * plus @c register_memory / @c deregister_memory) requires building with
  * @c SIRIUS_ENABLE_S3_RDMA (cuObject SDK).  Without it, device-destination
  * gets fail loudly with an error naming the flag; registration is a no-op.
  * Destination kind is detected per call (host vs device pointer).

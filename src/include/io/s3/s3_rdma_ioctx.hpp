@@ -31,18 +31,19 @@ namespace sirius::io::s3 {
  * `object_store_config::s3_transport == transport::RDMA`.  One reactor owns the
  * whole worker pool (`s3_rdma_max_inflight` blocking workers = the global
  * in-flight ceiling); GPU affinity lives in the per-device landing arenas, not
- * the reactor count.  The capability profile is structural — device reads
- * supported, the staged host-to-device and vector host-read paths deliberately
- * absent — so the prefetch cache is never built for this backend.
+ * the reactor count.  The capability profile advertises device reads but
+ * deliberately omits the staged host-to-device and vector host-read paths, so
+ * the prefetch cache is never built for this backend.
  *
  * Without a configured @c rdma_client every data path fails loudly with a
- * "not implemented" error (the transport-selection contract); with one, reads
- * are served through the client (the mock in tests, cuObject later).
+ * "not implemented" error rather than falling back to another transport; with
+ * one, reads are served through the client (the mock in tests, or the
+ * cuObject-backed client).
  */
 class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
  public:
-  /// @p delivery is the CUDA delivery seam (F01) — construction-time only, no
-  /// setter; defaults to the real CUDA runtime.  Throws std::invalid_argument
+  /// @p delivery is the CUDA delivery seam (construction-time only, no
+  /// setter); defaults to the real CUDA runtime.  Throws std::invalid_argument
   /// when a member was nulled out.
   explicit s3_rdma_ioctx(object_store_config cfg,
                          std::shared_ptr<rdma::rdma_client> client = nullptr,

@@ -146,8 +146,9 @@ io_context_registry::factory_type make_rest_ioctx_factory(
 /// S3-over-RDMA (s3://) backend, registered instead of the RESTful one when
 /// @c config.object_store.s3_transport is RDMA.  Takes no reservation manager —
 /// the transport stages through registered device memory, not host bounce
-/// buffers.  Construction needs no live endpoint configuration; selecting RDMA
-/// and touching S3 fails loudly until the RDMA data path is implemented.
+/// buffers.  Construction needs no live endpoint configuration; this factory
+/// does not yet wire an RDMA client into the ioctx, so any S3 access through
+/// the backend fails loudly.
 io_context_registry::factory_type make_rdma_ioctx_factory();
 
 }  // namespace sirius::io

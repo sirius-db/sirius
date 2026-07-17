@@ -22,13 +22,12 @@
 namespace sirius::io::rdma {
 
 /**
- * @brief Blocking S3-over-RDMA transfer client — the cuObject seam.
+ * @brief Blocking S3-over-RDMA transfer client interface.
  *
  * The reactor drives one blocking @c get per worker; the client owns the
- * transport (control plane, data placement, registration). The mock
+ * transport (control plane, data placement, registration).  The mock
  * implementation serves tests from memory; the cuObject-backed implementation
- * arrives with the real data path and requires a registered landing-arena slot
- * for device destinations.
+ * requires a registered landing-arena slot for device destinations.
  */
 class rdma_client {
  public:

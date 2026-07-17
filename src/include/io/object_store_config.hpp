@@ -43,7 +43,7 @@ struct object_store_config {
   /// RDMA reactor sizing (transport::RDMA only). @c s3_rdma_max_inflight is the
   /// worker count = the global in-flight ceiling (one blocking GET per worker);
   /// the per-device landing arena is @c max_inflight × @c slot_size bytes.
-  /// Defaults calibrated on a 100G link — scale bytes in flight with line rate.
+  /// Defaults are sized for a 100G link; scale bytes in flight with line rate.
   size_t s3_rdma_max_inflight    = 8;
   size_t s3_rdma_arena_slot_size = 4UL << 20;
 

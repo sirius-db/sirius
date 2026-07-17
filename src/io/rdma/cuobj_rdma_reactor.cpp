@@ -72,11 +72,9 @@ cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg)
   return cfg;
 }
 
-/// Pre-boundary sticky/context-fatal classification, driven by the single
-/// in-repo table @c k_sticky_context_fatal_codes (the adjudication rationale
-/// and change control live in s3-rdma-sticky-set.md / invariant-matrix row
-/// 16).  Consulted on the PRE-boundary legs only; post-boundary every failure
-/// is fatal regardless.
+/// Sticky/context-fatal classification, driven by the single table
+/// @c k_sticky_context_fatal_codes.  Consulted before the delivery boundary
+/// only; past the boundary every failure is fatal regardless.
 bool is_context_fatal(cudaError_t rc) noexcept
 {
   for (const cudaError_t code : k_sticky_context_fatal_codes) {
@@ -85,7 +83,7 @@ bool is_context_fatal(cudaError_t rc) noexcept
   return false;
 }
 
-/// RAII owner of the delivery completion event (F01): destroy runs only when
+/// RAII owner of the delivery completion event: destroy runs only when
 /// create succeeded, and a destroy failure is logged without ever overriding
 /// the delivery result.
 struct event_guard {
@@ -107,11 +105,11 @@ struct event_guard {
       rc = cudaErrorUnknown;
     }
     if (rc != cudaSuccess) {
-      // Contract §5 item 4: destroy-after-success is log-ONLY — it must never
-      // fail the delivery.  The dtor is implicitly noexcept and the log path
-      // formats + calls a sink (neither noexcept), so a throwing sink or a
-      // formatting bad_alloc here would std::terminate and leave the future
-      // unresolved.  Swallow everything: best-effort diagnostics, never fatal.
+      // Destroy-after-success is log-only; it must never fail the delivery.
+      // The dtor is implicitly noexcept and the log path formats + calls a
+      // sink (neither noexcept), so a throwing sink or a formatting bad_alloc
+      // here would std::terminate and leave the future unresolved.  Swallow
+      // everything: best-effort diagnostics, never fatal.
       try {
         SIRIUS_LOG_WARN(
           "cuobj_rdma_reactor: completion event destroy failed ({}); delivery result "
@@ -179,8 +177,8 @@ cuobj_rdma_reactor::arena::~arena()
   if (base == nullptr) { return; }
   if (leaked) {
     return;
-  }  // F01: deliberately leaked — deregistering/freeing
-     // under an un-quiesced device is the use-after-free
+  }  // deliberately leaked: deregistering or freeing
+     // under an un-quiesced device is a use-after-free
   if (registrar) { registrar->deregister_memory(base); }
   (void)cudaFree(base);
 }
@@ -375,10 +373,10 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
 
     const auto& ops = _ctx->delivery_ops();
 
-    // Contract §5.1: captured-stream validation runs BEFORE the RDMA GET —
-    // release builds included — so a doomed request makes no remote side
-    // effect.  A sticky probe result is context health, not slot lifetime:
-    // process-fatal even though nothing is in flight.
+    // Captured-stream validation runs before the RDMA GET, in release builds
+    // too, so a doomed request makes no remote side effect.  A sticky probe
+    // result is context health, not slot lifetime: process-fatal even though
+    // nothing is in flight.
     {
       cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
       const cudaError_t capture_rc    = ops.stream_capture_query(chunk.stream.value(), &capture);
@@ -397,10 +395,10 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
     uint8_t* slot_ptr = ar.base + static_cast<size_t>(slot) * _config.arena_slot_size;
     const size_t n    = get_with_retry(chunk.bucket, chunk.key, chunk.offset, chunk.size, slot_ptr);
 
-    // Owner-worker convergence (F01): after a fatal transition never start new
-    // CUDA work on the dead context.  The owner resolves its own chunk here,
-    // pre-enqueue — nothing is in flight on the slot, so the plain RAII
-    // release below is safe.
+    // After a fatal transition never start new CUDA work on the dead
+    // context.  The owning worker resolves its own chunk here, before any
+    // CUDA work is enqueued; nothing is in flight on the slot, so the plain
+    // RAII release below is safe.
     if (delivery_fatal()) {
       throw std::runtime_error("cuobj_rdma_reactor: chunk aborted after a fatal delivery state (" +
                                first_fatal_message() + ")");
@@ -417,11 +415,11 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
       _flush_total.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // F01 discipline: the completion event exists BEFORE the enqueue, so a
-    // create failure unwinds with nothing in flight (safe release,
-    // recoverable).  Inline completion wait: the D2D of one slot is
-    // microseconds against the blocking GET that preceded it — no parked-copy
-    // machinery.
+    // The completion event exists before the enqueue, so a create failure
+    // unwinds with nothing in flight (safe release, recoverable).  The
+    // completion wait is inline: the D2D copy of one slot takes microseconds
+    // against the blocking GET that preceded it, so no parked-copy machinery
+    // is needed.
     event_guard event{ops};
     const cudaError_t create_rc = ops.event_create(&event.handle, cudaEventDisableTiming);
     if (create_rc != cudaSuccess) {
@@ -431,10 +429,11 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
       throw_on_cuda_error(create_rc, "completion event create failed");
     }
     event.created = true;
-    // ---- Contract §5 boundary: the first memcpy_async call.  From here the
+    // ---- Delivery boundary: the first memcpy_async call (safety contract:
+    // experimental/s3-rdma-transport-design.md, Section 3).  From here the
     // only returning path is an event wait that reports cudaSuccess; every
-    // other outcome — error return or exception from the memcpy, the record,
-    // or the wait — is process-fatal through invoke_fatal.  No unwinding
+    // other outcome (error return or exception from the memcpy, the record,
+    // or the wait) is process-fatal through invoke_fatal.  No unwinding
     // runs: the slot_release and event_guard destructors above never fire,
     // no future resolves, and the arena is never freed.  Only static
     // literals reach the hook (no throwing formatting on this path).
@@ -546,8 +545,8 @@ void cuobj_rdma_reactor::enqueue(request_type_ptr req)
     if (!_ctx->client()) {
       failure = std::make_exception_ptr(not_implemented("enqueue"));
     } else if (_state == reactor_state::failing || _state == reactor_state::failed) {
-      // F01 fail-fast point: static prep_* cannot see reactor state, so a
-      // fatal delivery state surfaces here, naming the first fatal error.
+      // The static prep_* builders cannot see reactor state, so a fatal
+      // delivery state surfaces here, naming the first fatal error.
       failure = std::make_exception_ptr(
         std::runtime_error("cuobj_rdma_reactor::enqueue: reactor entered a fatal delivery state (" +
                            _first_fatal_message + ")"));
