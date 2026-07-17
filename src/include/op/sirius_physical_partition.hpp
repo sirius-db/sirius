@@ -172,7 +172,6 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
   /// safe fallback that keeps the batch on some valid slot).
   [[nodiscard]] std::size_t slot_for_device(int device_id) const;
-  sirius_physical_operator* _parent_op            = nullptr;
   sirius_physical_operator* _sibling_partition_op = nullptr;
   sirius_physical_operator* _hash_join_op =
     nullptr;  // hash join operator that this partition operator feeds into (optional: for
