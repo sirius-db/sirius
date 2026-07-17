@@ -23,8 +23,11 @@
 
 #include <cuda_runtime.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cassert>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -125,11 +128,40 @@ struct event_guard {
 
 }  // namespace
 
+void default_fatal_hook(const char* what, cudaError_t rc) noexcept
+{
+  const auto emit = [](const char* text) {
+    if (text == nullptr) { return; }
+    size_t len = 0;
+    while (text[len] != '\0') {
+      ++len;
+    }
+    (void)!::write(STDERR_FILENO, text, len);
+  };
+  emit("cuobj_rdma_reactor: process-fatal CUDA delivery failure: ");
+  emit(what);
+  emit(": ");
+  emit(cudaGetErrorName(rc));
+  emit("\n");
+}
+
+[[noreturn]] void invoke_fatal(const cuda_delivery_ops& ops,
+                               const char* what,
+                               cudaError_t rc) noexcept
+{
+  try {
+    if (ops.fatal_hook) { ops.fatal_hook(what, rc); }
+  } catch (...) {  // NOLINT(bugprone-empty-catch) — a throwing hook dies the same way
+  }
+  std::terminate();
+}
+
 void validate(const cuda_delivery_ops& ops)
 {
   const bool complete = ops.event_create && ops.event_record && ops.event_synchronize &&
                         ops.event_destroy && ops.memcpy_async && ops.stream_synchronize &&
-                        ops.device_synchronize;
+                        ops.device_synchronize && ops.flush && ops.stream_capture_query &&
+                        ops.fatal_hook;
   if (!complete) {
     throw std::invalid_argument(
       "cuda_delivery_ops: every delivery op must be callable (the defaults are the real CUDA "

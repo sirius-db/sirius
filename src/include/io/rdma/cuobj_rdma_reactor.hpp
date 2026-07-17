@@ -55,6 +55,10 @@ namespace sirius::io::rdma {
   return writes_ordering < k_all_devices_ordered;
 }
 
+/// Default @c cuda_delivery_ops::fatal_hook: raw stderr writes, then return
+/// (the wrapper terminates).
+void default_fatal_hook(const char* what, cudaError_t rc) noexcept;
+
 /// CUDA delivery seam (F01): every CUDA call on the device-chunk delivery path
 /// goes through these, so tests can inject failures without faking CUDA side
 /// effects.  Defaults are the real CUDA runtime entry points; the indirection
@@ -83,7 +87,31 @@ struct cuda_delivery_ops {
     return cudaStreamSynchronize(stream);
   };
   std::function<cudaError_t()> device_synchronize = [] { return cudaDeviceSynchronize(); };
+  /// GPUDirect write-visibility flush (pre-boundary leg; one call per exact
+  /// completion when the platform's ordering attribute requires it).
+  std::function<cudaError_t()> flush = [] {
+    return cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+                                              cudaFlushGPUDirectRDMAWritesToOwner);
+  };
+  /// Stream-capture probe (pre-boundary leg; runs BEFORE the RDMA GET so a
+  /// doomed request makes no remote side effect).
+  std::function<cudaError_t(cudaStream_t, cudaStreamCaptureStatus*)> stream_capture_query =
+    [](cudaStream_t stream, cudaStreamCaptureStatus* status) {
+      return cudaStreamIsCapturing(stream, status);
+    };
+  /// Delivery-fatal diagnostic sink.  Reached ONLY through @c invoke_fatal;
+  /// the process dies whether this returns or throws.  The default performs
+  /// raw writes only — no allocation, no formatting, no throwing.
+  std::function<void(const char*, cudaError_t)> fatal_hook = default_fatal_hook;
 };
+
+/// The ONLY entry to the fatal hook (contract §5 items 3/7): noexcept and
+/// non-returning — invokes the hook, swallows anything it throws, and calls
+/// std::terminate().  No stack unwinding, no slot release, no future
+/// resolution can follow.
+[[noreturn]] void invoke_fatal(const cuda_delivery_ops& ops,
+                               const char* what,
+                               cudaError_t rc) noexcept;
 
 /// Throws std::invalid_argument when any member is null — every op must stay
 /// callable (the defaults above; partial injections keep the rest real).
