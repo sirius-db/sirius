@@ -483,6 +483,51 @@ TEST_CASE("mvcc visibility: any_update_chains flags updated columns only",
   exec_ok(*env.con, "ROLLBACK");
 }
 
+TEST_CASE("mvcc visibility: any_uncheckpointed_appends flags transient segments only",
+          "[duckdb_mvcc_visibility][scan]")
+{
+  vis_test_db env;
+  exec_ok(*env.con,
+          "CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(10000)");
+  exec_ok(*env.con, "CHECKPOINT");
+
+  std::vector<duckdb::storage_t> const both{0, 1};
+
+  // Checkpointed image: everything persistent.
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // A committed small append lands as transient segments.
+  exec_ok(*env.con, "INSERT INTO t VALUES (10000, 10000)");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  REQUIRE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // CHECKPOINT folds the append into the persistent image.
+  exec_ok(*env.con, "CHECKPOINT");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // Deletes carry version state but no transient segments.
+  exec_ok(*env.con, "DELETE FROM t WHERE rowid < 10");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // A bulk insert (>= one row group) is optimistically flushed by
+  // MergeStorage: PERSISTENT-uncheckpointed, checkpoint-shaped segments —
+  // deliberately NOT flagged (the documented pin asymmetry).
+  vis_test_db bulk_env;
+  exec_ok(*bulk_env.con, "CREATE TABLE tb(k INTEGER)");
+  exec_ok(*bulk_env.con, "INSERT INTO tb SELECT range::INTEGER FROM range(130000)");
+  std::vector<duckdb::storage_t> const one{0};
+  exec_ok(*bulk_env.con, "BEGIN TRANSACTION");
+  REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*bulk_env.con, "tb"), one));
+  exec_ok(*bulk_env.con, "ROLLBACK");
+}
+
 TEST_CASE("mvcc visibility: checkpoint-grown row groups fill at unaligned offsets",
           "[duckdb_mvcc_visibility][scan]")
 {

@@ -345,6 +345,28 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
 }
 
 TEST_CASE_METHOD(PinMvccDeleteFixture,
+                 "mvcc guards: pinning a table with uncheckpointed appends is refused until "
+                 "CHECKPOINT",
+                 "[integration][gpu_execution][pin_table_mvcc_delete]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, (range * 2)::INTEGER AS v "
+    "FROM range(50000);");
+  run_ok("CHECKPOINT;");
+  run_ok("INSERT INTO t VALUES (50000, 100000);");  // small append -> transient segments
+
+  auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  REQUIRE_THAT(refused->GetError(), Catch::Contains("uncheckpointed rows"));
+
+  run_ok("CHECKPOINT;");  // flushes the append into the persistent image
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  compare_gpu_vs_cpu("SELECT count(*), sum(v) FROM t;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccDeleteFixture,
                  "mvcc delete: a masked pinned table joins an unpinned table correctly",
                  "[integration][gpu_execution][pin_table_mvcc_delete]")
 {

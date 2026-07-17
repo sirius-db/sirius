@@ -129,6 +129,20 @@ bool any_update_chains(duckdb::DataTable& storage,
                        std::span<duckdb::storage_t const> storage_column_indices,
                        std::size_t row_prefix);
 
+/**
+ * @brief True when any row group carries TRANSIENT (in-memory, uncheckpointed)
+ *        segments on any of @p storage_column_indices.
+ *
+ * Committed small appends land as transient segments the pin's disk-image
+ * walk cannot stage; pin_table refuses such tables deliberately (CHECKPOINT
+ * folds them into the persistent image). Bulk-flushed appends (MergeStorage
+ * after a >= row-group-sized insert) are PERSISTENT-uncheckpointed and
+ * checkpoint-shaped — indistinguishable from checkpointed data, deliberately
+ * not detected here. SERIAL — may lazily load column data.
+ */
+bool any_uncheckpointed_appends(duckdb::DataTable& storage,
+                                std::span<duckdb::storage_t const> storage_column_indices);
+
 /// Whether the MVCC-blind disk-native read of a table is exact for a given
 /// snapshot, and if not, why.
 enum class native_read_mvcc_state : std::uint8_t {

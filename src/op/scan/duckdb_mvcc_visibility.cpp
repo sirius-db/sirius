@@ -247,6 +247,25 @@ bool any_update_chains(duckdb::DataTable& storage,
   return false;
 }
 
+bool any_uncheckpointed_appends(duckdb::DataTable& storage,
+                                std::span<duckdb::storage_t const> storage_column_indices)
+{
+  if (storage_column_indices.empty()) { return false; }
+  auto tree = storage.GetRowGroupCollection()->GetRowGroups();
+  for (duckdb::idx_t rg_index = 0;; ++rg_index) {
+    auto node = tree->GetSegmentByIndex(static_cast<int64_t>(rg_index));
+    if (!node) { return false; }
+    auto& rg = node->GetNode();
+    for (auto col : storage_column_indices) {
+      for (auto& seg_node : rg.GetRawColumnData(col).GetSegmentTree().SegmentNodes()) {
+        if (seg_node.GetNode().segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
+          return true;
+        }
+      }
+    }
+  }
+}
+
 native_read_mvcc_state check_native_read_mvcc_state(
   duckdb::DataTable& storage,
   std::span<duckdb::storage_t const> scanned_columns,

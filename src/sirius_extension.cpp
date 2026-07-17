@@ -942,8 +942,8 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 
   // Update chains version values in place, invisibly to the DELETE
   // keep-masks — a pin would serve stale values to every query until the
-  // chains are folded away. Refuse loudly (the transient-rows case already
-  // fails the same way); CHECKPOINT folds the chains into the base data.
+  // chains are folded away. Refuse loudly; CHECKPOINT folds the chains into
+  // the base data.
   {
     std::vector<duckdb::storage_t> pinned_storage_cols(keep.begin(), keep.end());
     if (sirius::op::scan::any_update_chains(
@@ -952,6 +952,16 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
         "pin_table: table '%s' has in-memory update chains on a pinned column; run CHECKPOINT "
         "before pinning",
         table_ref);
+    }
+    // Committed-but-uncheckpointed appends live in transient (in-memory)
+    // segments the pin's disk-image walk cannot stage; without this check the
+    // failure surfaces as a decoder byte-size error deep in the pin. Refuse
+    // with the fix spelled out. Bulk-flushed appends (optimistically written
+    // by >= row-group-sized inserts) are checkpoint-shaped and ride along in
+    // the base — outside the supported contract, not detectable here.
+    if (sirius::op::scan::any_uncheckpointed_appends(storage, pinned_storage_cols)) {
+      throw InvalidInputException(
+        "pin_table: table '%s' has uncheckpointed rows; run CHECKPOINT before pinning", table_ref);
     }
   }
 
