@@ -35,6 +35,24 @@ namespace sirius::cuda {
 
 namespace cg = cooperative_groups;
 
+/// Wavefront / warp width for the persistent kernel.
+///
+/// AMD CDNA/RDNA wavefronts are 64 threads wide, while NVIDIA CUDA warps are
+/// 32 threads wide. The warp-shuffle reductions and shared-memory sizing below
+/// must match the hardware width or the reduction will be incorrect (e.g. a
+/// 32-wide warp run through a 64-wide tiled_partition reads garbage lanes).
+#ifdef __HIP_PLATFORM_AMD__
+constexpr uint32_t kWavefrontWidth = 64;
+#else
+constexpr uint32_t kWavefrontWidth = 32;
+#endif
+
+/// Upper bound on the number of warps a block may contain. The block dimension
+/// is fixed at 256 (see launch_persistent_scan_filter_agg), so the max warp
+/// count is 256 / min(kWavefrontWidth) = 8 on NVIDIA, 4 on AMD. 16 covers both
+/// with headroom should the block dimension grow.
+constexpr uint32_t kMaxWarpsPerBlock = 16;
+
 /// Aggregate type enumeration.
 enum class agg_type : uint8_t {
   COUNT,  // count matching rows
@@ -63,6 +81,12 @@ struct persistent_kernel_desc {
   filter_op filter;             // which filter to apply
   int64_t filter_value;         // the filter comparison value (cast to column type)
   int64_t* result;              // device pointer to the result (atomic)
+  bool is_unsigned;             // whether the column's elements are an unsigned integer
+                                // type. When true, read_value zero-extends (e.g.
+                                // uint8_t 255 → 255) instead of sign-extending
+                                // (int8_t 255 → -1). Without this, SUM/MIN/MAX over
+                                // unsigned columns (e.g. INT8 UNSIGNED, UINT16) get
+                                // garbage values.
 };
 
 /// Device function: apply the filter to a single value.
@@ -80,13 +104,33 @@ __device__ __forceinline__ bool apply_filter(int64_t val, filter_op op, int64_t 
 }
 
 /// Device function: read a value from the column at row index.
-__device__ __forceinline__ int64_t read_value(void const* data, uint32_t stride, uint32_t row) {
+///
+/// @param is_unsigned  When true, the element is an unsigned integer type and is
+///                     zero-extended to int64_t (e.g. uint8_t 255 → 255). When
+///                     false, the element is a signed integer type and is
+///                     sign-extended (e.g. int8_t 255 → -1).
+__device__ __forceinline__ int64_t read_value(void const* data, uint32_t stride, uint32_t row,
+                                              bool is_unsigned) {
   auto const* base = static_cast<char const*>(data);
   switch (stride) {
-    case 1: return static_cast<int64_t>(*reinterpret_cast<int8_t const*>(base + row));
-    case 2: return static_cast<int64_t>(*reinterpret_cast<int16_t const*>(base + row * 2));
-    case 4: return static_cast<int64_t>(*reinterpret_cast<int32_t const*>(base + row * 4));
-    case 8: return *reinterpret_cast<int64_t const*>(base + row * 8);
+    case 1:
+      return is_unsigned
+               ? static_cast<int64_t>(*reinterpret_cast<uint8_t const*>(base + row))
+               : static_cast<int64_t>(*reinterpret_cast<int8_t const*>(base + row));
+    case 2:
+      return is_unsigned
+               ? static_cast<int64_t>(*reinterpret_cast<uint16_t const*>(base + row * 2))
+               : static_cast<int64_t>(*reinterpret_cast<int16_t const*>(base + row * 2));
+    case 4:
+      return is_unsigned
+               ? static_cast<int64_t>(*reinterpret_cast<uint32_t const*>(base + row * 4))
+               : static_cast<int64_t>(*reinterpret_cast<int32_t const*>(base + row * 4));
+    case 8:
+      // 64-bit values are identity: the bit pattern is the same whether read as
+      // signed or unsigned (we still return int64_t; for genuine uint64 columns
+      // above INT64_MAX the aggregate result would be wrong, but that is an
+      // existing limitation and not made worse here).
+      return *reinterpret_cast<int64_t const*>(base + row * 8);
     default: return 0;
   }
 }
@@ -107,7 +151,7 @@ __global__ void persistent_scan_filter_agg(persistent_kernel_desc desc) {
   int64_t local_max   = INT64_MIN;
 
   for (uint32_t row = start + threadIdx.x; row < end; row += blockDim.x) {
-    int64_t val = read_value(desc.column_data, desc.column_stride, row);
+    int64_t val = read_value(desc.column_data, desc.column_stride, row, desc.is_unsigned);
     if (apply_filter(val, desc.filter, desc.filter_value)) {
       local_count++;
       local_sum += val;
@@ -116,8 +160,10 @@ __global__ void persistent_scan_filter_agg(persistent_kernel_desc desc) {
     }
   }
 
-  // Warp-level reduction using shuffle
-  auto warp = cg::tiled_partition<64>(block);  // AMD wavefront = 64
+  // Warp-level reduction using shuffle. The tile width must match the
+  // hardware wavefront/warp width: 64 on AMD (HIP), 32 on NVIDIA (CUDA). A
+  // mismatch corrupts the shuffle reduction.
+  auto warp = cg::tiled_partition<kWavefrontWidth>(block);
   for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
     local_count += warp.shfl_down(local_count, offset);
     local_sum   += warp.shfl_down(local_sum, offset);
@@ -126,11 +172,11 @@ __global__ void persistent_scan_filter_agg(persistent_kernel_desc desc) {
   }
 
   // First thread in each warp writes to shared memory
-  __shared__ int64_t sm_count[16];  // max 16 warps per block (1024/64)
-  __shared__ int64_t sm_sum[16];
-  __shared__ int64_t sm_min[16];
-  __shared__ int64_t sm_max[16];
-  uint32_t const warp_id = threadIdx.x / 64;
+  __shared__ int64_t sm_count[kMaxWarpsPerBlock];  // sized for max warps/block
+  __shared__ int64_t sm_sum[kMaxWarpsPerBlock];
+  __shared__ int64_t sm_min[kMaxWarpsPerBlock];
+  __shared__ int64_t sm_max[kMaxWarpsPerBlock];
+  uint32_t const warp_id = threadIdx.x / kWavefrontWidth;
   if (warp.thread_rank() == 0) {
     sm_count[warp_id] = local_count;
     sm_sum[warp_id]   = local_sum;
@@ -141,7 +187,7 @@ __global__ void persistent_scan_filter_agg(persistent_kernel_desc desc) {
 
   // First warp reduces across warps
   if (warp_id == 0) {
-    int num_warps = (blockDim.x + 63) / 64;
+    int num_warps = (blockDim.x + kWavefrontWidth - 1) / kWavefrontWidth;
     local_count = (threadIdx.x < num_warps) ? sm_count[threadIdx.x] : 0;
     local_sum   = (threadIdx.x < num_warps) ? sm_sum[threadIdx.x]   : 0;
     local_min   = (threadIdx.x < num_warps) ? sm_min[threadIdx.x]   : INT64_MAX;
@@ -186,10 +232,14 @@ __global__ void persistent_scan_filter_agg(persistent_kernel_desc desc) {
 /// @param result        Device pointer to initialized result (0 for count/sum,
 ///                       INT64_MAX for min, INT64_MIN for max)
 /// @param stream        CUDA/HIP stream
+/// @param is_unsigned   True if the column's element type is an unsigned integer
+///                       type (e.g. UINT8/UINT16/UINT32). Drives zero- vs
+///                       sign-extension in read_value so SUM/MIN/MAX produce
+///                       correct results for unsigned columns.
 void launch_persistent_scan_filter_agg(
     void const* column_data, uint32_t stride, uint32_t num_rows,
     agg_type agg, filter_op filter, int64_t filter_value,
-    int64_t* result, cudaStream_t stream) {
+    int64_t* result, cudaStream_t stream, bool is_unsigned = false) {
   if (num_rows == 0) return;
 
   uint32_t const block_dim = 256;
@@ -203,6 +253,7 @@ void launch_persistent_scan_filter_agg(
   desc.filter       = filter;
   desc.filter_value = filter_value;
   desc.result       = result;
+  desc.is_unsigned  = is_unsigned;
 
   persistent_scan_filter_agg<<<grid_dim, block_dim, 0, stream>>>(desc);
 }

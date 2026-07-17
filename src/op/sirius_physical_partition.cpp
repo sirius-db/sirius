@@ -268,20 +268,29 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   // prevents OOM on small-VRAM GPUs (e.g. 8GB consumer cards running TPC-H
   // Q21 with a 3-table join). On large-VRAM GPUs (MI300), the data typically
   // fits in 40% of VRAM, so this doesn't trigger and partitions stay at 1.
+  //
+  // Note: budgets are derived from FREE VRAM, not total VRAM. A GPU whose VRAM
+  // is already partially consumed (other processes, RMM pool, live batches)
+  // must size partitions against what is actually available, otherwise the
+  // "fits in 30% of VRAM" assumption underestimates pressure and causes OOM.
   {
     size_t free_vram = 0, total_vram = 0;
-    if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && total_vram > 0) {
-      size_t const vram_40pct = total_vram * 2 / 5;  // 40% of total VRAM
+    if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_vram > 0) {
+      size_t const vram_40pct = free_vram * 2 / 5;  // 40% of free VRAM
       if (total_bytes > vram_40pct) {
-        size_t const per_partition_budget = std::max(total_vram * 3 / 10, size_t{128 * 1024 * 1024});
+        size_t const per_partition_budget = std::max(free_vram * 3 / 10, size_t{128 * 1024 * 1024});
         int vram_partitions = static_cast<int>(
           (total_bytes + per_partition_budget - 1) / per_partition_budget);
         num_partitions = std::max(num_partitions, vram_partitions);
-        // Cap at 32 partitions (safety)
-        num_partitions = std::min(num_partitions, 32);
       }
     }
   }
+
+  // Cap at 32 partitions (safety). This applies to ALL partition-count paths
+  // — not just the VRAM branch above — so a pathological s_partition_size or
+  // multi-GPU floor can never blow the partition count past what downstream
+  // operators (hash_join, merge_group_by) can fan out to.
+  num_partitions = std::min(num_partitions, 32);
 
   // Multi-GPU floor: if the input is big enough to justify using the second
   // GPU, force at least num_gpus partitions so partition-based operators
@@ -291,6 +300,9 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   if (_min_num_partitions > 1 && total_bytes >= _small_table_bytes) {
     num_partitions = std::max(num_partitions, _min_num_partitions);
   }
+  // Final safety cap after the multi-GPU floor: _min_num_partitions can raise
+  // the count above 32, so clamp once more before returning.
+  num_partitions = std::min(num_partitions, 32);
   return std::make_pair(num_partitions, total_bytes);
 }
 

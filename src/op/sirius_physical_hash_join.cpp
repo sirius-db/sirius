@@ -1031,11 +1031,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
               {},  // ascending
               stream);
             if (sorted_idx && sorted_idx->size() == build_keys.num_rows()) {
-              build_keys_result.owned_sorted_keys = cudf::gather(
+              // The gathered table must outlive the hash table built from its
+              // view below, so hold it in a class member (_built_sorted_keys_table)
+              // rather than a local that would be destroyed at scope exit.
+              auto gathered = cudf::gather(
                 cudf::table_view{build_keys}, *sorted_idx,
-                cudf::out_of_bounds::DONT_CHECK,
-                cudf::copy_if_unsafe::YES, stream);
-              build_keys = build_keys_result.owned_sorted_keys->view();
+                cudf::out_of_bounds_policy::DONT_CHECK,
+                stream);
+              build_keys = gathered->view();
+              _built_sorted_keys_table = std::move(gathered);
               SIRIUS_LOG_DEBUG(
                 "sirius_physical_hash_join id {}: pre-sorted {} build rows "
                 "for L2 cache locality ({} MB)",
@@ -1569,6 +1573,7 @@ void sirius_physical_hash_join::on_finalize_operator()
     _filtered_table.reset();
     _build_table = std::nullopt;
     _built_table_cast_columns.clear();
+    _built_sorted_keys_table.reset();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
   }
 }

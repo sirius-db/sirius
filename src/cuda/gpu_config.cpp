@@ -67,6 +67,15 @@ bool env_bool(char const* name, bool default_val) {
 
 }  // namespace
 
+// NOTE: gpu_config::instance() and the gpu_config singleton are useful
+// infrastructure for runtime hardware detection and adaptive tuning, but they
+// are NOT yet wired into the live execution paths. The engine still derives
+// tuning parameters through the legacy hardcoded/env-var code paths (e.g.
+// get_target_ctas in cuda/scan/strings/common.cuh, the partition sizing in
+// sirius_physical_partition). Do not assume that constructing or consulting
+// gpu_config has any effect on query execution today. This is kept as
+// forward-looking plumbing; when it is wired in, the legacy paths should be
+// migrated to read from this singleton instead.
 gpu_config const& gpu_config::instance() {
   static gpu_config inst;
   return inst;
@@ -230,11 +239,27 @@ void gpu_config::apply_env_overrides() {
   if (!already_capped && (auto v = env_size("SIRIUS_GPU_VRAM_LIMIT"))) {
     already_capped = true;
     hw_.total_vram = std::min(hw_.total_vram, v);
+    // Save the env-overridden tuning values that were already applied by the
+    // preceding apply_env_overrides() calls. compute_tuning() below recomputes
+    // EVERY tuning field from hardware defaults, which silently discards every
+    // SIRIUS_* env override set above (the historical bug). Snapshotting and
+    // restoring them keeps the overrides intact while still letting the capped
+    // VRAM influence derived hardware-dependent fields.
+    gpu_tuning_params saved = tune_;
     // Recompute derived params with the capped VRAM
     compute_tuning();
+    // Restore the env-driven overrides that compute_tuning() just clobbered.
+    tune_.max_batch_bytes        = saved.max_batch_bytes;
+    tune_.rmm_pool_size          = saved.rmm_pool_size;
+    tune_.hash_join_min_partitions = saved.hash_join_min_partitions;
+    tune_.hash_join_max_partitions = saved.hash_join_max_partitions;
+    tune_.target_ctas            = saved.target_ctas;
+    tune_.groupby_initial_size   = saved.groupby_initial_size;
+    tune_.enable_spilling        = saved.enable_spilling;
+    tune_.scan_parallelism       = saved.scan_parallelism;
     // Don't call apply_env_overrides() again — env overrides were already
-    // applied before this branch. compute_tuning() recomputed the defaults, and
-    // since already_capped is now true, we won't re-enter this branch.
+    // applied before this branch and have just been restored above. Since
+    // already_capped is now true, we won't re-enter this branch either.
     return;  // avoid infinite recursion
   }
 }
