@@ -321,8 +321,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         .instance_name       = std::format("{}({})", op.get_name(), op.get_operator_id()),
         .current_operator_id = static_cast<uint32_t>(
           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
-        .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),
-        .peak_allocated_bytes        = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
+        .input_bytes          = operator_input_output_data->get_estimated_size_in_bytes(),
+        .peak_allocated_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
         .executor_thread_resource_id = executor_thread_resource_id,
         .reservation_resource_id     = _reservation_tier_resource_id,
         .reservation_capacity_bytes  = _reservation_bytes,
