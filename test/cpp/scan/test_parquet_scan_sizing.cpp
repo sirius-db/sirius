@@ -148,6 +148,29 @@ duckdb::vector<duckdb::HivePartitioningIndex> year_partition()
 
 }  // namespace
 
+TEST_CASE("parquet scans without a prefetch cache skip advisory ranges",
+          "[scan][parquet][prefetch]")
+{
+  auto ingestible = scan::make_ingestible(make_nation_info(false));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  REQUIRE_FALSE(ioctx->uses_prefetching_cache());
+  auto task = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return ioctx; });
+  REQUIRE(task);
+
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto batches   = coalescer->push(task());
+  auto tail      = coalescer->flush();
+  for (auto& batch : tail) {
+    batches.push_back(std::move(batch));
+  }
+  REQUIRE(batches.size() == 1);
+
+  auto* batch = dynamic_cast<scan::parquet_split_info*>(batches.front().get());
+  REQUIRE(batch);
+  CHECK(batch->fadvise_entries().empty());
+}
+
 TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][sizing]")
 {
   auto info                    = std::make_unique<scan::parquet_ingestible_table_info>();

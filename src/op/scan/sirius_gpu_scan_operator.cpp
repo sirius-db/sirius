@@ -37,6 +37,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library
+#include <algorithm>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -129,7 +130,9 @@ std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
   // Match the legacy 8x fresh-read heuristic for projected data, then add any
   // filter-only columns that must also be decoded. Keeping the latter additive
   // avoids applying the expansion factor twice to the transient working set.
-  if (stats.resident) { return stats.bytes; }
+  // Resident (cached) chunks surface their mask/filter copy peaks through the
+  // split's working-set estimate; a plain chunk reports it equal to bytes.
+  if (stats.resident) { return std::max(stats.bytes, stats.working_set_bytes); }
   auto const filter_only_bytes =
     stats.working_set_bytes > stats.bytes ? stats.working_set_bytes - stats.bytes : 0;
   return stats.bytes * 8 + filter_only_bytes;

@@ -23,6 +23,8 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <chrono>
+
 namespace sirius {
 namespace pipeline {
 
@@ -40,6 +42,8 @@ struct task_request {
   int device_id;
   bool is_scan{false};
   task_request_kind kind{task_request_kind::device_ready};
+  std::chrono::high_resolution_clock::time_point created_at{
+    std::chrono::high_resolution_clock::now()};
 };
 
 class task_request_queue {

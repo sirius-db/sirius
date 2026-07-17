@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/s3/s3_list_parser.hpp"
+
 #include <chrono>
 #include <cstddef>
 
@@ -101,6 +103,14 @@ struct config {
   /// for multi-GB single files, lower it for many-tiny-file / low-bandwidth
   /// workloads.
   std::size_t footer_probe_bytes{512UL << 10};  // 512 KiB
+
+  /// S3 LIST / glob safety caps (both throw "narrow the glob prefix", never
+  /// truncate).  @c list_max_matches bounds the files a glob keeps / a
+  /// whole-listing accumulates (result memory); @c list_max_scanned bounds the
+  /// objects a LIST sweep looks at across pages (time / LIST round-trips).  The
+  /// two axes diverge when a prefix is huge but few keys match, so both exist.
+  std::size_t list_max_matches{s3::default_max_list_objects};     // 100'000
+  std::size_t list_max_scanned{s3::default_max_scanned_objects};  // 1'000'000
 };
 
 }  // namespace sirius::io::rest

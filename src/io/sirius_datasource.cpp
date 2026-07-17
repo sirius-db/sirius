@@ -229,10 +229,9 @@ void sirius_datasource::prefetch(cache::prefetching_stage site)
   }
 }
 
-bool sirius_datasource::uses_prefetching_cache()
+bool sirius_datasource::uses_prefetching_cache() const noexcept
 {
-  auto* cache = _io_ctx->cache();
-  return cache != nullptr && _io_ctx->can_use_prefetching_cache();
+  return _io_ctx->uses_prefetching_cache();
 }
 
 }  // namespace sirius::io

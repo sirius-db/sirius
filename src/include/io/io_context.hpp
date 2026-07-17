@@ -25,6 +25,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -109,6 +110,12 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// can, e.g., prefetch a parquet footer in the same round-trip as the size.
   [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
                                                                    open_hint hint);
+
+  /// As above, with the object's size already known (e.g. from an S3
+  /// ListObjectsV2 response), so a backend that can act on it skips its size
+  /// discovery entirely (no HEAD for object stores).
+  [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
+                                                                   std::uint64_t known_size);
 
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
@@ -248,6 +255,14 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// distinct virtual — not a defaulted argument on the pure virtual above — so
   /// the hint dispatches on the dynamic type instead of binding statically.
   virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint);
+
+  /// Known-size variant.  The base implementation ignores @p known_size and
+  /// delegates to the required @c create_io_object(path); a backend whose size
+  /// discovery would otherwise cost a round-trip overrides this to build the
+  /// io_object without one.  Same distinct-virtual rationale as the hint
+  /// variant above.
+  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path,
+                                                             std::uint64_t known_size);
 
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
