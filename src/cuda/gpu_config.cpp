@@ -243,8 +243,11 @@ void gpu_config::apply_env_overrides() {
     // preceding apply_env_overrides() calls. compute_tuning() below recomputes
     // EVERY tuning field from hardware defaults, which silently discards every
     // SIRIUS_* env override set above (the historical bug). Snapshotting and
-    // restoring them keeps the overrides intact while still letting the capped
-    // VRAM influence derived hardware-dependent fields.
+    // restoring them keeps the overrides intact. Note: because all 8 env-
+    // overridable fields are restored, the capped VRAM only affects hw_.total_vram
+    // itself (reported in the log) — it does NOT change derived tuning params
+    // when env overrides are present. This is intentional: env overrides take
+    // absolute precedence over hardware-derived defaults.
     gpu_tuning_params saved = tune_;
     // Recompute derived params with the capped VRAM
     compute_tuning();

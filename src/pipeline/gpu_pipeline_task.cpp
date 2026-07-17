@@ -193,6 +193,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
       // Don't sync — let the next operator start on the same stream.
       // The stream ordering guarantees correctness: the next kernel on the
       // same stream won't start until this one finishes.
+      validate_operator_output_types(operator_output_data.get(), op);
       auto end      = std::chrono::high_resolution_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
       auto peak_bytes        = allocator ? allocator->get_peak_allocated_bytes(stream) : 0;
