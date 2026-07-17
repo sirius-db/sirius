@@ -59,6 +59,9 @@ sirius_physical_result_collector::sirius_physical_result_collector(
     names(data.prepared->names)
 {
   this->types = sirius::from_duckdb_vec(data.prepared->types);
+  // Full DuckDB types incl. nested children — sirius::logical_type cannot
+  // represent them.
+  this->result_column_types = data.prepared->types;
 }
 
 std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
@@ -96,7 +99,7 @@ sirius_physical_materialized_collector::sirius_physical_materialized_collector(
   ::sirius::sirius_prepared_statement_data& data, duckdb::ClientContext& client_ctx)
   : sirius_physical_result_collector(data),
     result_collection(
-      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, sirius::to_duckdb_vec(types))),
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, result_column_types)),
     _client_ctx(client_ctx)
 {
 }
@@ -109,7 +112,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
   // Return an empty result collection if the result_collection is null (from a move)
   if (!result_collection) {
     result_collection =
-      duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, sirius::to_duckdb_vec(types));
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
   }
 
   return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
@@ -218,7 +221,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] host_table allocation is null (cannot read chunks)");
     }
 
-    host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);
+    host_table_chunk_reader chunk_reader(_client_ctx, host_table, result_column_types);
 
     // Push chunks to result collection
     while (true) {
@@ -233,8 +236,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       std::lock_guard<std::mutex> guard(lock);
       // Initialize result collection if it is null (from a move)
       if (!result_collection) {
-        result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(
-          _client_ctx, sirius::to_duckdb_vec(types));
+        result_collection =
+          duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
       }
       result_collection->Append(chunk);
     }
