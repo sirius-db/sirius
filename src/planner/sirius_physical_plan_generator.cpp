@@ -117,6 +117,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
         "has no URI parameter");
     }
     info->resolved_file_paths = {scan_op.parameters.front().GetValue<std::string>()};
+    sirius::op::scan::canonicalize_scan_file_paths(info->resolved_file_paths);
   } else {
     auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
@@ -128,6 +129,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
       file_paths.push_back(file.path);
     }
     info->resolved_file_paths = std::move(file_paths);
+    sirius::op::scan::canonicalize_scan_file_paths(info->resolved_file_paths);
     info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
   }
   // `scan_output_arity` drives the provider's expected column count — without it the runtime

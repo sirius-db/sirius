@@ -93,6 +93,16 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   }
 };
 
+/// Canonical identity form for a parquet file path so pinned-cache matching
+/// (@ref cache_entry_info::can_serve_with_columns, a raw set-equality on
+/// resolved_file_paths) is independent of spelling: relative vs absolute,
+/// redundant '/', './..', 'file://', and symlinks all collapse. Remote URIs
+/// (scheme://) pass through. Apply wherever resolved_file_paths is populated.
+[[nodiscard]] std::string canonical_scan_file_path(std::string const& raw);
+
+/// In-place @ref canonical_scan_file_path over a resolved-file-path vector.
+void canonicalize_scan_file_paths(std::vector<std::string>& paths);
+
 //===----------------------------------------------------------------------===//
 // parquet_split_info
 //===----------------------------------------------------------------------===//
