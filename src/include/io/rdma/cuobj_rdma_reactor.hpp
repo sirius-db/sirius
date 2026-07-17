@@ -130,11 +130,9 @@ struct rdma_perf_snapshot {
                                  ///< while slots == workers; kept for staged-completion shapes)
   uint64_t flush_total{0};       ///< GPUDirect write flushes performed (0 while flushing is off)
   uint64_t inflight_peak{0};     ///< max chunks concurrently being processed by the worker pool
-  uint64_t fallback_stream_sync_total{0};  ///< F01 quiescence-ladder runs after a post-enqueue
-                                           ///< delivery failure (stream rung invoked)
-  uint64_t delivery_fatal_total{0};        ///< fail-stop transitions (exactly-once per reactor)
-  uint64_t arena_leak_total{0};  ///< arenas deliberately leaked at teardown because device
-                                 ///< quiescence could not be established after a fatal state
+  uint64_t delivery_fatal_total{0};  ///< fail-stop transitions (exactly-once per reactor)
+  uint64_t arena_leak_total{0};      ///< arenas deliberately leaked at teardown because device
+                                     ///< quiescence could not be established after a fatal state
 };
 
 /// s3://bucket/key object handle resolved by @c s3_rdma_ioctx::create_io_object
@@ -312,15 +310,6 @@ class cuobj_rdma_reactor {
   /// out the queue (its chunks are error-reported OUTSIDE the lock), notifies,
   /// and bumps delivery_fatal_total.  Later callers return with no effect.
   void enter_failed(std::exception_ptr fatal, std::string message);
-  /// F01 quiescence ladder for post-enqueue delivery failures.  Runs the real
-  /// stream sync — per the CUDA contract an error return is a deferred report
-  /// delivered AFTER the wait, i.e. still proof of quiescence; only the
-  /// cannot-have-waited codes (invalid handle / stream capture) escalate to
-  /// the device rung.  quiesced_recoverable ⇒ returns (slot release + error
-  /// resolution are now safe); quiesced_context_fatal / cannot_establish ⇒
-  /// enters the failed state (then returns; the caller reports the original
-  /// error).  Never resolves anything itself.
-  void quiesce_or_fail_stop(const cuobj_chunked_rx_request& chunk);
   /// Bounded-retry transfer into @p dst: up to max_get_attempts client gets
   /// (+ the short-read check), backoff between attempts, abort when stopping
   /// or after a fatal transition.  Counts retries/short reads; throws the
@@ -352,7 +341,6 @@ class cuobj_rdma_reactor {
   std::atomic<uint64_t> _slot_wait_total{0};
   std::atomic<uint64_t> _flush_total{0};
   std::atomic<uint64_t> _inflight_peak{0};
-  std::atomic<uint64_t> _fallback_stream_sync_total{0};
   std::atomic<uint64_t> _delivery_fatal_total{0};
   std::atomic<uint64_t> _arena_leak_total{0};
 };

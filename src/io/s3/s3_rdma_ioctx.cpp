@@ -67,7 +67,6 @@ rdma::rdma_perf_snapshot s3_rdma_ioctx::perf_snapshot() const noexcept
     total.slot_wait_total += s.slot_wait_total;
     total.flush_total += s.flush_total;
     total.inflight_peak = std::max(total.inflight_peak, s.inflight_peak);
-    total.fallback_stream_sync_total += s.fallback_stream_sync_total;
     total.delivery_fatal_total += s.delivery_fatal_total;
     total.arena_leak_total += s.arena_leak_total;
   }
