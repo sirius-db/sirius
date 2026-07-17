@@ -28,8 +28,6 @@ namespace sirius::creator {
  * @brief How a scheduling request should be serviced.
  *
  * - active:    create tasks in response to input from an active operator
- * - eager:     create tasks for an operator that received data, but its dependencies are not yet
- * met.
  * - lookahead: proactively create tasks for operators that might be needed soon.
  */
 enum class request_type { active, lookahead };
@@ -62,9 +60,8 @@ struct task_creator_config {
   exec::thread_pool_config thread_pool{.num_threads = 2, .thread_name_prefix = "task_creator"};
 
   /// The most speculative request type the task creator is allowed to use when
-  /// servicing scheduling requests: active (demand-driven only), eager (also
-  /// pivot to plan-graph producers when the hint chain dead-ends), or
-  /// lookahead (additionally warm up not-yet-activated scans one task at a time).
+  /// servicing scheduling requests: active (demand-driven only) or lookahead
+  /// (additionally warm up not-yet-activated scans one task at a time).
   request_type strategy{request_type::active};
 };
 
