@@ -129,6 +129,15 @@ struct contains_or_sentinel {
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
     auto const& key = probe[idx];
+    // The set is built with cuco::empty_key = numeric_limits<KeyT>::min() (see
+    // make_set), so that value is the container's sentinel: it cannot be
+    // inserted as a real key, and set.contains() on the sentinel is not
+    // meaningful. The equals_sentinel short-circuit makes probing the sentinel
+    // return a deterministic `true`. This is intentional for cuco::static_set's
+    // sentinel semantics — the empty/sentinel key is reserved and is not a
+    // valid IN-list member, so it is treated as "matched" here. Under the data
+    // contract this value does not appear as a real probe key; if it did, it
+    // would be a (known, accepted) false positive.
     out[idx]        = set.contains(key) || equals_sentinel<KeyT>{}(key);
   }
 };

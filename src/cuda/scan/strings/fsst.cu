@@ -337,6 +337,10 @@ __global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_gather_fsst_chunked(
     auto const my_cumsum = my_cumsum_ptr[i];
     auto const prev_cumsum =
       (i > 0) ? my_cumsum_ptr[i - 1] : (desc.is_first_chunk ? 0 : *(my_cumsum_ptr - 1));
+    // Guard against a malformed cumsum (corrupt segment): the length kernel
+    // validates this (kernel_compute_decompressed_lengths_fsst); the gather
+    // must too or it OOB-reads dict_end_ptr - my_cumsum and decodes garbage.
+    if (my_cumsum > sm_hdr.dict_end || prev_cumsum > my_cumsum) continue;
     auto const comp_len = my_cumsum - prev_cumsum;
     if (comp_len == 0) continue;
 

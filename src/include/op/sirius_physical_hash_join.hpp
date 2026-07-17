@@ -207,10 +207,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::vector<std::unique_ptr<cudf::column>>
     _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the
                                 // build table
-  std::unique_ptr<cudf::table>
-    _built_sorted_keys_table;  // scope holder for the L2-cache-optimized pre-sorted build keys table
-                               // (when the build side is large); the hash table references its view,
-                               // so it must outlive the hash table. See sirius_physical_hash_join.cpp.
   //
   // Number of equality conditions after reordering; inequality conditions follow at higher indices.
   std::size_t num_equality_conditions = 0;
