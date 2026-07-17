@@ -422,8 +422,12 @@ staged_column stage_one_fixed_width_column(
       ss.row_count   = static_cast<uint32_t>(seg.segment_count);
       ss.compression = seg.compression;
 
-      pinned_segment_bytes p;
-      if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+      if (seg.host_ptr != nullptr) {
+        // Host-backed segment (insert-delta staging): the bytes already sit in
+        // host memory owned by the enclosing scan_info; ride the CONSTANT/
+        // ROARING host-copy lane instead of a file read.
+        stage_host_copy(s, {{}, seg.host_ptr, seg.bytes_size}, ss);
+      } else if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
         auto const& stats = constant_stats_for(
           partition_stats, rg.row_group_index, col_md.column_id, owned_stats_cache);
         stage_host_copy(s, extract_constant_bytes(stats, projected_type), ss);
@@ -444,7 +448,9 @@ staged_column stage_one_fixed_width_column(
       // we ship as UNCOMPRESSED — even when source was ROARING.
       vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
 
-      if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
+      if (vseg.host_ptr != nullptr) {
+        stage_host_copy(s, {{}, vseg.host_ptr, vseg.bytes_size}, vs);
+      } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         // ROARING stays on BufferManager: CreatePersistentSegment drives
         // reads internally and we don't have a host_read shape for it yet.
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
@@ -486,7 +492,7 @@ staged_column stage_one_varchar_column(staging_state& s,
                           std::to_string(static_cast<int>(seg.compression)) + " (column " +
                           std::to_string(col_md.column_id) + ")");
       }
-      if (seg.block_id < 0) {
+      if (seg.host_ptr == nullptr && seg.block_id < 0) {
         throw_unsupported("varchar CONSTANT segment (column " + std::to_string(col_md.column_id) +
                           ")");
       }
@@ -494,9 +500,13 @@ staged_column stage_one_varchar_column(staging_state& s,
       ss.row_offset        = row_cursor + static_cast<uint32_t>(seg.segment_start);
       ss.row_count         = static_cast<uint32_t>(seg.segment_count);
       ss.compression       = seg.compression;
-      ss.max_string_length = *seg.max_string_length;  // walker invariant
+      ss.max_string_length = *seg.max_string_length;  // walker/capture invariant
 
-      stage_device_read(s, sf_bm, seg, ss);
+      if (seg.host_ptr != nullptr) {
+        stage_host_copy(s, {{}, seg.host_ptr, seg.bytes_size}, ss);
+      } else {
+        stage_device_read(s, sf_bm, seg, ss);
+      }
       out.data.push_back(ss);
     }
 
@@ -509,8 +519,9 @@ staged_column stage_one_varchar_column(staging_state& s,
       vs.row_count   = static_cast<uint32_t>(vseg.segment_count);
       vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
 
-      pinned_segment_bytes p;
-      if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
+      if (vseg.host_ptr != nullptr) {
+        stage_host_copy(s, {{}, vseg.host_ptr, vseg.bytes_size}, vs);
+      } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         stage_device_read(s, sf_bm, vseg, vs);
@@ -837,6 +848,22 @@ void submit_and_await(rmm::device_buffer& device_buf,
   }
 }
 
+/// @brief H2D for a split with no file reads (every segment host-backed or
+/// CPU-produced): no io, no pinned staging blocks, no SiriusContext — just the
+/// direct host->device copies, synced so the caller may drop the source
+/// buffers' owners afterwards (same discipline as submit_and_await).
+void submit_host_only_and_await(rmm::device_buffer& device_buf,
+                                staging_state const& s,
+                                rmm::cuda_stream_view stream)
+{
+  auto* device_base = static_cast<uint8_t*>(device_buf.data());
+  for (auto const& h : s.host_copies) {
+    RMM_CUDA_TRY(cudaMemcpyAsync(
+      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
+  }
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+}
+
 //===----------------------------------------------------------------------===//
 // Build codec runs from staged segments.
 //===----------------------------------------------------------------------===//
@@ -940,9 +967,10 @@ std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
 std::unique_ptr<cudf::table> decode_duckdb_native_split(
   std::vector<duckdb_row_group_metadata> const& row_groups,
   duckdb_native_ingestible_table_info const& table_info,
-  sirius::io::sirius_datasource& datasource,
+  sirius::io::sirius_datasource* datasource,
   cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  duckdb::vector<duckdb::PartitionStatistics> const* carried_partition_stats)
 {
   if (row_groups.empty()) {
     // Empty / fully-pruned split: emit a schema-correct 0-row table (one empty
@@ -977,7 +1005,15 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
 
   // PartitionRowGroup lookup needed for CONSTANT segments + held alive for the
   // duration of the decode (its destructor releases an internal reference).
-  auto partition_stats = storage.GetPartitionStats(context);
+  // Insert-delta splits carry capture-time stats instead: GetPartitionStats
+  // touches ClientContext / LocalStorage, which are not safe off the query
+  // thread, and delta decodes run on task threads.
+  duckdb::vector<duckdb::PartitionStatistics> fetched_partition_stats;
+  if (carried_partition_stats == nullptr) {
+    fetched_partition_stats = storage.GetPartitionStats(context);
+  }
+  auto const& partition_stats =
+    carried_partition_stats != nullptr ? *carried_partition_stats : fetched_partition_stats;
   std::vector<std::unique_ptr<duckdb::BaseStatistics>> owned_stats_cache;
 
   auto mr_ref = mem_space.get_default_allocator();
@@ -1033,7 +1069,11 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   }
 
   rmm::device_buffer device_buf(staging.running_offset, stream, mr_ref);
-  if (staging.running_offset > 0) {
+  if (!staging.reads.empty()) {
+    if (datasource == nullptr) {
+      throw std::runtime_error(std::string(kTag) +
+                               " split staged file reads but carries no datasource");
+    }
     auto sirius_st = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     if (!sirius_st) {
       throw std::runtime_error(std::string(kTag) + " no sirius_state on the ClientContext");
@@ -1054,11 +1094,15 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     std::size_t const coalesce_max_gap = sf_bm->GetBlockHeaderSize();
     submit_and_await(device_buf,
                      staging,
-                     datasource,
+                     *datasource,
                      sirius_st->get_memory_manager(),
                      host_numa,
                      coalesce_max_gap,
                      stream);
+  } else if (!staging.host_copies.empty()) {
+    // All-host split (insert-delta transient bytes / CONSTANT-only): no file
+    // io, no host staging blocks, no SiriusContext dependency.
+    submit_host_only_and_await(device_buf, staging, stream);
   }
 
   // Group fixed-width columns for a single gpu_decode_table call; varchar

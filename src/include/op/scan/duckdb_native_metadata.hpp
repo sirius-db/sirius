@@ -60,8 +60,14 @@ struct duckdb_segment_descriptor {
   /// Some; Some(0) is the legal all-empty-row-group case.
   std::optional<std::uint32_t> max_string_length;
   /// Byte size of this segment's main-block payload. Excludes
-  /// `additional_blocks`; 0 when `block_id < 0`.
+  /// `additional_blocks`; 0 when `block_id < 0` and `host_ptr` is null.
   std::size_t bytes_size = 0;
+  /// Host-backed source: when set, the decoder copies [host_ptr, host_ptr +
+  /// bytes_size) to the device instead of reading `block_id` from the file.
+  /// Used by the insert-delta job for in-memory (transient) segments; the
+  /// bytes' owner is the enclosing scan_info's staging keep-alive, never this
+  /// descriptor.
+  std::uint8_t const* host_ptr = nullptr;
 };
 
 /// Side note of metadata for ARRAY type
