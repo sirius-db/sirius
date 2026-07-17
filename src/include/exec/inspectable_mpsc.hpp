@@ -79,6 +79,18 @@ class inspectable_mpsc {
   inspectable_mpsc& operator=(inspectable_mpsc&&)      = delete;
 
   /**
+   * \brief Blocks waiting for an item.
+   * \return Returns true if the queue is not empty, false if interrupted.
+   */
+  bool wait()
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _cv.wait(lock, [this] { return !_queue.empty() || !_active; });
+    if (_queue.empty()) { return false; }
+    return true;
+  }
+
+  /**
    * \brief Pushes an item into the queue.
    * \return Returns false if the queue has been interrupted.
    */

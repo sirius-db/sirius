@@ -465,11 +465,13 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       requested_memory_space->get_tier(), requested_memory_space->get_id().device_id);
   }
   telemetry_handle().preparing({
-    .instance_name                = "",
-    .target_tier                  = "GPU",
-    .executor_thread_resource_id  = executor_thread_resource_id,
-    .reservation_resource_id      = _reservation_tier_resource_id,
-    .reservation_capacity_bytes   = _reservation_bytes,
+    .instance_name               = "",
+    .origin_tier                 = local_state._input_data->get_origin_tiers(),
+    .target_tier                 = "GPU",
+    .input_bytes                 = local_state._input_data->get_estimated_size_in_bytes(),
+    .executor_thread_resource_id = executor_thread_resource_id,
+    .reservation_resource_id     = _reservation_tier_resource_id,
+    .reservation_capacity_bytes  = _reservation_bytes,
   });
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
@@ -603,7 +605,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
   const bool input_resident = ls._input_data && ls._input_data->is_resident();
   auto working_set_bytes    = input_basis;
-  if (input_type == op::operator_data_type::GPU_SCAN && !input_resident && ls._input_data) {
+  // Resident (cached) scan inputs report mask/filter copy peaks through their
+  // working-set estimate too — it seeds the cold-start guess below via
+  // input_stats, so do not gate this on residency.
+  if (input_type == op::operator_data_type::GPU_SCAN && ls._input_data) {
     working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
@@ -614,6 +619,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
 
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
+    // Non-resident scans keep the per-split decode floor even with history;
+    // resident (cached) scans trust the learned peak — their mask/filter
+    // model only seeds the cold start, and a warm undershoot is repaired by
+    // record_on_failure + retry.
     if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }

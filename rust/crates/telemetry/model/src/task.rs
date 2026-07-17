@@ -78,7 +78,9 @@ state! {
     // resource.
     Preparing {
         attributes: {
+            origin_tier: String,
             target_tier: String,
+            input_bytes: u64,
         },
         usages: {
             executor_thread: ExecutorThread,

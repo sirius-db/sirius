@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "creator/config.hpp"
 #include "exec/config.hpp"
 #include "exec/inspectable_mpsc.hpp"
 #include "scan_manager/config.hpp"
@@ -95,17 +96,18 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a
-  /// runtime membership filter (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan,
-  /// which applies it post-decode to drop non-matching rows before the join. On by default; the
-  /// master switch for the feature.
+  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
+  /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
+  /// probe-GPU L2, or a Bloom, into the probe-side scan. The scan applies membership post-decode to
+  /// drop non-matching rows before the join. On by default; the master switch for the feature.
   bool enable_dynamic_filter_pushdown = true;
 
   /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
-  /// for READ-time row-group pruning at the probe scan. Off by default and requires
-  /// enable_dynamic_filter_pushdown: on TPC-H-shaped joins DuckDB's static transitive-predicate
-  /// pushdown already prunes range-derivable builds, and scattered keys prune nothing, so the
-  /// zone-map only pays off on clustered-keyset joins whose narrow key range is runtime-determined.
+  /// for READ-time row-group pruning on parquet scans; duckdb-native scans apply it row-wise
+  /// post-decode instead. Off by default and requires enable_dynamic_filter_pushdown: on
+  /// TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes
+  /// range-derivable builds, and scattered keys prune nothing, so the zone-map only pays off on
+  /// clustered-keyset joins whose narrow key range is runtime-determined.
   bool enable_dynamic_zone_map_filter = false;
 
   /// Skip publishing a key's dynamic filters when the build covers at least this fraction of the
@@ -148,7 +150,7 @@ struct sirius_config {
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_task_creator_config() const noexcept;
+  [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
@@ -190,8 +192,7 @@ struct sirius_config {
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
-  exec::thread_pool_config _task_creator_config{.num_threads        = 2,
-                                                .thread_name_prefix = "task_creator"};
+  creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};

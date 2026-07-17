@@ -48,8 +48,11 @@ logical_type from_duckdb(const duckdb::LogicalType& t)
     case LogicalTypeId::TIMESTAMP: return logical_type::make(type_id::TIMESTAMP);
     case LogicalTypeId::TIMESTAMP_NS: return logical_type::make(type_id::TIMESTAMP_NS);
     case LogicalTypeId::VARCHAR: return logical_type::make(type_id::VARCHAR);
+    // sirius::logical_type is flat for nested types; the real nested type travels
+    // separately (result collector). A DuckDB MAP is physically LIST<STRUCT<key,value>>.
     case LogicalTypeId::STRUCT: return logical_type::make(type_id::STRUCT);
     case LogicalTypeId::LIST: return logical_type::make(type_id::LIST);
+    case LogicalTypeId::MAP: return logical_type::make(type_id::LIST);
     case LogicalTypeId::ARRAY: {
       const auto& child_type = duckdb::ArrayType::GetChildType(t);
       const auto array_size  = duckdb::ArrayType::GetSize(t);

@@ -1,0 +1,71 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "exec/config.hpp"
+
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+namespace sirius::creator {
+
+/**
+ * @brief How a scheduling request should be serviced.
+ *
+ * - active:    create tasks in response to input from an active operator
+ * - eager:     create tasks for an operator that received data, but its dependencies are not yet
+ * met.
+ * - lookahead: proactively create tasks for operators that might be needed soon.
+ */
+enum class request_type { active, lookahead };
+
+/// ADL-discoverable string conversion so yaml_reader can parse request_type values.
+inline bool string_to_enum(std::string_view sv, request_type& out)
+{
+  static const std::unordered_map<std::string_view, request_type> map = {
+    {"active", request_type::active},
+    {"lookahead", request_type::lookahead},
+  };
+  auto it = map.find(sv);
+  if (it == map.end()) { return false; }
+  out = it->second;
+  return true;
+}
+
+inline bool enum_to_string(request_type type, std::string& s)
+{
+  switch (type) {
+    case request_type::active: s = "active"; return true;
+    case request_type::lookahead: s = "lookahead"; return true;
+    default: return false;
+  }
+}
+
+/// Configuration for the task creator.
+/// Embeds the thread pool config plus the task creation strategy.
+struct task_creator_config {
+  exec::thread_pool_config thread_pool{.num_threads = 2, .thread_name_prefix = "task_creator"};
+
+  /// The most speculative request type the task creator is allowed to use when
+  /// servicing scheduling requests: active (demand-driven only), eager (also
+  /// pivot to plan-graph producers when the hint chain dead-ends), or
+  /// lookahead (additionally warm up not-yet-activated scans one task at a time).
+  request_type strategy{request_type::active};
+};
+
+}  // namespace sirius::creator

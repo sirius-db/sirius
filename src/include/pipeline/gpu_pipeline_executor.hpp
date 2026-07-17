@@ -26,6 +26,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 
+#include <atomic>
 #include <memory>
 #include <thread>
 
@@ -48,6 +49,10 @@ class task_creator;
 }
 
 namespace pipeline {
+
+struct executor_metrics {
+  size_t tasks_executed{0};
+};
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
@@ -104,6 +109,11 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   [[nodiscard]] bool is_task_queue_empty() const noexcept;
 
   /**
+   * @brief Return a snapshot of this executor's runtime metrics.
+   */
+  [[nodiscard]] executor_metrics get_metrics() const noexcept;
+
+  /**
    * @brief Set the completion handler for query completion signaling
    *
    * @param handler Pointer to the completion handler
@@ -131,6 +141,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
+  std::atomic<size_t> _tasks_executed{0};
 };
 
 }  // namespace pipeline

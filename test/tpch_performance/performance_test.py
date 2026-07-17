@@ -1068,6 +1068,7 @@ def main():
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
 
+    drop_os_cache()
     with open(runtime_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
