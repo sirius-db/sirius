@@ -113,4 +113,17 @@ compressed_table read_compressed_table_from_memory(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
+/// Like @ref read_compressed_table_from_memory but reconstructs only the columns
+/// in @p selected_columns (indices into the full table's column order, in the
+/// order the caller wants them). Only those columns' payload buffers are fetched,
+/// so serving a projection of a wide pin does not pull every column to the GPU.
+/// Out-of-range indices write an error to @p error_out and return an empty table.
+compressed_table read_compressed_table_subset_from_memory(
+  std::span<const std::uint8_t> header,
+  payload_fetch_fn const& fetch,
+  std::span<const std::size_t> selected_columns,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out            = nullptr);
+
 }  // namespace simpatico

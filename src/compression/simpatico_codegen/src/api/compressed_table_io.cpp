@@ -21,6 +21,7 @@
 
 #include <array>
 #include <bit>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -238,8 +239,25 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    auto col           = cudf::make_numeric_column(
-      dt, static_cast<cudf::size_type>(bd.num_rows), cudf::mask_state::UNALLOCATED, stream, mr);
+    // simpatico_bitunpack_one (decode kPrelude) does a fixed 3-word gather
+    // — packed[word_in], [word_in+1], [word_in+2] — so decoding the last
+    // element of a bitpacked "packed" buffer reads up to 2 uint32 words past
+    // its logical end. Over-allocate those buffers by 2 words of tail slop so
+    // the read stays in bounds. The slop is masked off in the decode, so its
+    // (uninitialized) contents never affect the result; only its addressability
+    // matters. Without it the OOB read faults the context and cascades into
+    // unrelated decode-kernel launch failures on concurrent streams.
+    constexpr cudf::size_type kBitpackGatherSlopBytes = 2 * static_cast<cudf::size_type>(sizeof(std::uint32_t));
+    cudf::size_type pad_elems = 0;
+    if (bd.name == "packed") {
+      auto const elem = std::max<std::size_t>(cudf::size_of(dt), 1);
+      pad_elems       = static_cast<cudf::size_type>((kBitpackGatherSlopBytes + elem - 1) / elem);
+    }
+    auto col = cudf::make_numeric_column(dt,
+                                         static_cast<cudf::size_type>(bd.num_rows) + pad_elems,
+                                         cudf::mask_state::UNALLOCATED,
+                                         stream,
+                                         mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -807,6 +825,35 @@ compressed_table read_compressed_table_from_memory(std::span<const std::uint8_t>
   std::vector<ColRecord> col_records;
   if (!parse_hpln_header(r, col_records, error_out)) return {};
   return reconstruct_from_records(col_records, fetch, stream, mr, error_out);
+}
+
+compressed_table read_compressed_table_subset_from_memory(
+  std::span<const std::uint8_t> header,
+  payload_fetch_fn const& fetch,
+  std::span<const std::size_t> selected_columns,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> col_records;
+  if (!parse_hpln_header(r, col_records, error_out)) return {};
+  // Keep only the requested columns' records; reconstruct_from_records fetches
+  // payload buffers only for the records handed to it, so a subset read pulls
+  // just those columns' bytes to the GPU (buffer offsets in the header are
+  // absolute, so dropping columns does not disturb the survivors' fetches).
+  std::vector<ColRecord> selected;
+  selected.reserve(selected_columns.size());
+  for (auto idx : selected_columns) {
+    if (idx >= col_records.size()) {
+      if (error_out) {
+        *error_out = "read_compressed_table_subset_from_memory: column index out of range";
+      }
+      return {};
+    }
+    selected.push_back(std::move(col_records[idx]));
+  }
+  return reconstruct_from_records(selected, fetch, stream, mr, error_out);
 }
 
 }  // namespace simpatico

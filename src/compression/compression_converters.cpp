@@ -94,29 +94,21 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
 {
+  // Reconstruct only the requested columns. read_compressed_table_subset_from_memory
+  // fetches just those columns' payload buffers, so serving a projection of a wide
+  // pin does not pull every column's compressed bytes onto the GPU — that over-fetch
+  // both wasted device memory and drove concurrent decode workers into the memory
+  // adaptor's over-reservation path.
   std::string read_error;
-  simpatico::compressed_table ct = simpatico::read_compressed_table_from_memory(
-    header, fetch, stream, rmm::mr::get_current_device_resource_ref(), &read_error);
+  simpatico::compressed_table subset =
+    selected_indices.has_value()
+      ? simpatico::read_compressed_table_subset_from_memory(
+          header, fetch, *selected_indices, stream,
+          rmm::mr::get_current_device_resource_ref(), &read_error)
+      : simpatico::read_compressed_table_from_memory(
+          header, fetch, stream, rmm::mr::get_current_device_resource_ref(), &read_error);
   if (!read_error.empty()) {
-    throw std::runtime_error("[compression_converters] read_compressed_table_from_memory failed: " +
-                             read_error);
-  }
-
-  // Project to the selected columns before decompressing to avoid
-  // inflating memory with unrequested columns.
-  simpatico::compressed_table subset;
-  if (selected_indices.has_value()) {
-    const auto& indices = *selected_indices;
-    subset.columns.reserve(indices.size());
-    for (auto idx : indices) {
-      if (idx >= ct.columns.size()) {
-        throw std::out_of_range(
-          "[compression_converters] selected column index out of range during decompress");
-      }
-      subset.columns.push_back(std::move(ct.columns[idx]));
-    }
-  } else {
-    subset = std::move(ct);
+    throw std::runtime_error("[compression_converters] reconstruct failed: " + read_error);
   }
 
   // Parallel per-column decode when >1 (capped at the column count); the
@@ -124,10 +116,22 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // resident before it is wrapped against `stream` below.
   const int n_threads =
     std::min(decompress_column_threads(), static_cast<int>(subset.columns.size()));
-  auto decompressed =
-    n_threads > 1
-      ? simpatico::decompress(subset, n_threads, rmm::mr::get_current_device_resource_ref())
-      : simpatico::decompress(subset, stream, rmm::mr::get_current_device_resource_ref());
+  std::unique_ptr<cudf::table> decompressed;
+  if (n_threads > 1) {
+    // The reconstruct above fetched every compressed leaf buffer to device on
+    // `stream`. The parallel decode runs each column on its own pool stream, so
+    // those reads are NOT ordered after the fetch on `stream`. Without a barrier
+    // a worker's D2H read of a codec frame header (e.g. nvcomp's num_chunks)
+    // races the still-in-flight H2D fetch and reads a garbage size — which then
+    // sizes a std::vector and throws length_error/bad_alloc. Order the fetch
+    // before the pool-stream reads. (The serial path below already runs on
+    // `stream`, so it is stream-ordered and needs no barrier.)
+    stream.synchronize();
+    decompressed =
+      simpatico::decompress(subset, n_threads, rmm::mr::get_current_device_resource_ref());
+  } else {
+    decompressed = simpatico::decompress(subset, stream, rmm::mr::get_current_device_resource_ref());
+  }
 
   if (n_threads > 1) {
     // Re-point the parallel result's buffers off the (now-destroyed) internal
