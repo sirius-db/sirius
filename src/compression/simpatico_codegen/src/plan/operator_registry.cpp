@@ -31,31 +31,31 @@ std::optional<std::string_view> after_prefix(std::string const& name, std::strin
 
 std::vector<OperatorInfo> const& operator_registry()
 {
-  // Catalog order: all_compressor_names() flattens catalog_names in this order.
+  // Catalog order: all_compressor_names() emits explorable ops in this order.
   // channels mirror each rep's named_channels(); {} = variable-arity.
   // clang-format off
   // One row per operator; kept on a single line each (formatting disabled).
-  //  id               name              channels                                                                 catalog_names                      term   pre    cg
+  //  id               name              channels                                                                 expl   term   pre    cg
   static const std::vector<OperatorInfo> kTable = {
-    {OpId::Delta,          "delta",           {"differences"},                                                        {"delta"},                         false, true,  true},
-    {OpId::Rle,            "rle",             {"runs", "values"},                                                     {"rle"},                           false, true,  true},
-    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   {"bitpack"},                       false, false, true},
-    {OpId::For,            "for",             {"deltas", "references"},                                               {"for"},                           false, true,  true},
-    {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             {"zigzag"},                        false, true,  true},
-    {OpId::Dictionary,     "dictionary",      {},                                                                     {"dictionary"},                    false, false, false},
-    {OpId::Alp,            "alp",             {"integers", "exceptions", "exception_positions", "metadata"},          {"alp"},                           false, true,  false},
-    {OpId::AlpRd,          "alp_rd",          {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"}, {"alp_rd"},      false, true,  false},
-    {OpId::Ans,            "ans",             {"output"},                                                             {"ans"},                           true,  false, false},
-    {OpId::Bitcomp,        "bitcomp",         {"output"},                                                             {"bitcomp"},                       true,  false, false},
-    {OpId::Snappy,         "snappy",          {"output"},                                                             {"snappy"},                        true,  false, false},
-    {OpId::Deflate,        "deflate",         {"output"},                                                             {"deflate"},                       true,  false, false},
-    {OpId::Lz4,            "lz4",             {"output"},                                                             {"lz4"},                           true,  false, false},
-    {OpId::Bitextract,     "bitextract",      {},                                                                     {"bitextract_f32", "bitextract_f64"}, false, true, false},
-    {OpId::Identity,       "identity",        {"data"},                                                               {},                                false, false, false},
-    {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             {},                                false, false, false},
+    {OpId::Delta,          "delta",           {"differences"},                                                        true,  false, true,  true},
+    {OpId::Rle,            "rle",             {"runs", "values"},                                                     true,  false, true,  true},
+    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   true,  false, false, true},
+    {OpId::For,            "for",             {"deltas", "references"},                                               true,  false, true,  true},
+    {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true},
+    {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false},
+    {OpId::Alp,            "alp",             {"integers", "exceptions", "exception_positions", "metadata"},          true,  false, true,  false},
+    {OpId::AlpRd,          "alp_rd",          {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"}, true, false, true, false},
+    {OpId::Ans,            "ans",             {"output"},                                                             true,  true,  false, false},
+    {OpId::Bitcomp,        "bitcomp",         {"output"},                                                             true,  true,  false, false},
+    {OpId::Snappy,         "snappy",          {"output"},                                                             true,  true,  false, false},
+    {OpId::Deflate,        "deflate",         {"output"},                                                             true,  true,  false, false},
+    {OpId::Lz4,            "lz4",             {"output"},                                                             true,  true,  false, false},
+    {OpId::Bitextract,     "bitextract",      {},                                                                     true,  false, true,  false},
+    {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false},
+    {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             false, false, false, false},
     // 2 or 3 channels: offsets, chars[, null_mask]. null_mask is optional (present only when
     // nullable); the generic named_channels() skips nullptr slots so arity is correct at runtime.
-    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     {"str_split"},                     false, true,  false},
+    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     true,  false, true,  false},
   };
   // clang-format on
   return kTable;
@@ -103,6 +103,37 @@ std::optional<ChannelId> channel_id(OpId id, std::string_view channel)
     if (ch[i] == channel) return static_cast<ChannelId>(i);
   }
   return std::nullopt;
+}
+
+std::vector<std::string> const& all_compressor_names()
+{
+  static std::vector<std::string> const names = [] {
+    std::vector<std::string> out;
+    for (auto const& op : operator_registry()) {
+      if (!op.explorable) continue;
+      // bitextract's DSL names are its float aliases, not the bare op name.
+      if (op.id == OpId::Bitextract) {
+        out.emplace_back("bitextract_f32");
+        out.emplace_back("bitextract_f64");
+      } else {
+        out.emplace_back(op.name);
+      }
+    }
+    return out;
+  }();
+  return names;
+}
+
+bool is_terminal_compressor(std::string const& name)
+{
+  auto id = op_id_from_name(name);
+  return id && op_info(*id).terminal;
+}
+
+bool is_preprocessing_compressor(std::string const& name)
+{
+  auto id = op_id_from_name(name);
+  return id && op_info(*id).preprocessing;
 }
 
 // Resolve a DSL compressor name to a compressor instance, or nullptr if the

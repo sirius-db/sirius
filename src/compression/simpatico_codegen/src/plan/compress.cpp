@@ -579,23 +579,10 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   // parallelism is the caller's job (one column per worker thread, each on its
   // own stream). Intermediate device buffers are freed eagerly by the walk.
 
-  // Front-end: parse the DSL into a flat step list, canonicalize it, and build
-  // the canonical PlanTree + producer path map. The step list is only a
-  // transient parse artifact here; the walk below is entirely tree-native.
-  std::vector<plan_step> steps;
-  std::string parse_error;
-  if (!parse_plan_dsl(plan_dsl, &steps, &parse_error)) {
-    if (error_out) *error_out = parse_error;
-    return nullptr;
-  }
   auto compound = std::make_unique<PlanTree>();
   {
-    std::string tree_err;
-    auto tree = plan_tree_from_steps(steps, &tree_err);
-    if (!tree) {
-      if (error_out) *error_out = "plan-tree build: " + tree_err;
-      return nullptr;
-    }
+    auto tree = plan_tree_from_dsl(plan_dsl, error_out);
+    if (!tree) return nullptr;
     *compound = std::move(*tree);
   }
   PlanTree& tree = *compound;

@@ -53,9 +53,7 @@ struct OperatorInfo {
   // Canonical channel order, mirroring the rep's named_channels(). Empty for
   // variable-arity ops (dictionary, bitextract) whose channels are not fixed.
   std::vector<std::string> channels;
-  // Names surfaced by all_compressor_names() for this op (usually {name};
-  // bitextract expands to its float aliases). Empty = excluded from the catalog.
-  std::vector<std::string> catalog_names;
+  bool explorable;     // surfaced by all_compressor_names() (false = excluded, e.g. identity)
   bool terminal;       // emits an opaque byte payload that ends a cascade branch
   bool preprocessing;  // reshapes data without necessarily shrinking it
   bool codegen;        // inverted by the JIT codegen decode path, not a rep's decompress()
@@ -76,6 +74,17 @@ std::vector<std::string> const* canonical_channels(OpId id);
 
 // Canonical index of `channel` within op `id`'s channel set, or nullopt.
 std::optional<ChannelId> channel_id(OpId id, std::string_view channel);
+
+// Operator names the explorer / sweep attempt, in catalog order. bitextract
+// expands to its float aliases; non-explorable ops (identity, nvcomp_cascaded)
+// are excluded.
+std::vector<std::string> const& all_compressor_names();
+
+// Terminal ops emit an opaque byte payload that ends a cascade branch.
+bool is_terminal_compressor(std::string const& name);
+
+// Preprocessing (transform) ops reshape data without necessarily shrinking it.
+bool is_preprocessing_compressor(std::string const& name);
 
 }  // namespace simpatico
 

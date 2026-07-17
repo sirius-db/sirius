@@ -95,8 +95,6 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
 /// metadata (e.g. ``leaf_meta::ans`` / ``leaf_meta::bitcomp`` with
 /// ``uncompressed_size`` and ``original_type_id``) that cannot be recovered
 /// from the channel buffers alone. Used by the decode driver.
-/// ``num_rows_hint`` is the serialized per-leaf row count (0 = unknown); it
-/// lets bitpack reconstruction skip a device read of chunk_count.
 std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,
@@ -104,8 +102,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
-  leaf_meta_v const& meta     = leaf_meta::none{},
-  std::uint64_t num_rows_hint = 0);
+  leaf_meta_v const& meta = leaf_meta::none{});
 
 }  // namespace simpatico
 

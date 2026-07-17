@@ -13,7 +13,8 @@
 // deflate, bitextract_*) and to EVERY input dtype class.
 //
 // The enumeration reuses the exact machinery the explorer uses
-// (explore/operator_catalog.hpp):
+// (all_compressor_names from operator_registry; try_operator from
+// compression_explorer):
 //
 //   * `all_compressor_names()` — the operator catalog.
 //   * `try_operator(op, column, ...)` — apply one op; failure means the op is
@@ -61,7 +62,8 @@
 #include "api/simpatico_codegen.hpp"
 #include "codegen/jit/kernel_cache.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"
-#include "explore/operator_catalog.hpp"
+#include "codegen/plan/operator_registry.hpp"
+#include "explore/compression_explorer.hpp"
 #include "test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>

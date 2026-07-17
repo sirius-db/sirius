@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/plan/bitjoin_layout.hpp"
 
-#include "codegen/plan/representation.hpp"  // parse_bitjoin_spec, launch_bitjoin_field, launch_check_truncation
+#include "codegen/plan/bit_spec.hpp"        // parse_bitjoin_spec
+#include "codegen/plan/representation.hpp"  // launch_bitjoin_field, launch_check_truncation
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>

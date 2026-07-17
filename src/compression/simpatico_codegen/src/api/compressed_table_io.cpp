@@ -273,9 +273,9 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   // only for legacy blobs that predate the field (ld.num_rows == 0).
   const cudf::size_type node_rows =
     ld.num_rows > 0 ? static_cast<cudf::size_type>(ld.num_rows) : col_num_rows;
-  auto make_fused_rep = [&](OpId op_id) {
+  auto make_fused_rep = [&](OpId op_id, cudf::size_type rows) {
     auto rep =
-      std::make_unique<codegen_fused_representation>(op_id, tag_to_dtype(ld.type_tag), node_rows);
+      std::make_unique<codegen_fused_representation>(op_id, tag_to_dtype(ld.type_tag), rows);
     for (std::size_t i = 0; i < bufs.size(); ++i) {
       rep->buffers.emplace_back(bufs[i].name, make_col(i));
     }
@@ -284,11 +284,37 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 
   if (ld.kind == OpId::Delta || ld.kind == OpId::Rle || ld.kind == OpId::For ||
       ld.kind == OpId::Zigzag) {
-    return make_fused_rep(ld.kind);
+    return make_fused_rep(ld.kind, node_rows);
+  }
+  if (ld.kind == OpId::Bitpack) {
+    // Bitpack reconstructs as a fused rep like the four transforms above, but its
+    // logical row count is not any buffer's size (chunk_min/count/bits are
+    // per-chunk, packed is words). Prefer the serialized num_rows; for legacy
+    // blobs lacking it, sum chunk_count.
+    cudf::size_type rows = static_cast<cudf::size_type>(ld.num_rows);
+    if (ld.num_rows == 0) {
+      for (std::size_t i = 0; i < bufs.size(); ++i) {
+        if (bufs[i].name != "chunk_count") continue;
+        auto cc = make_col(i);
+        std::vector<std::int32_t> h(static_cast<std::size_t>(cc->size()));
+        if (!h.empty()) {
+          cudaMemcpyAsync(h.data(),
+                          cc->view().head<std::int32_t>(),
+                          h.size() * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost,
+                          stream.value());
+          cudaStreamSynchronize(stream.value());
+          for (auto c : h)
+            rows += c;
+        }
+        break;
+      }
+    }
+    return make_fused_rep(ld.kind, rows);
   }
   if (ld.kind == OpId::Identity) {
     bool is_fused = !(bufs.size() == 1 && bufs[0].name == "data");
-    if (is_fused) return make_fused_rep(ld.kind);
+    if (is_fused) return make_fused_rep(ld.kind, node_rows);
   }
 
   // All other kinds (and non-fused identity): route through reconstruct_representation.
@@ -311,7 +337,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     cols.push_back(make_col(i));
   }
   return reconstruct_representation(
-    std::string(cname), names, std::move(cols), stream, mr, err, ld.meta, ld.num_rows);
+    std::string(cname), names, std::move(cols), stream, mr, err, ld.meta);
 }
 
 static constexpr std::uint8_t kVersion = 10;

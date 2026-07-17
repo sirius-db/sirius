@@ -9,14 +9,15 @@
 
 #include "explore/compression_explorer.hpp"
 
-#include "codegen/plan/bitjoin_layout.hpp"  // copy_column_view
+#include "codegen/plan/bitjoin_layout.hpp"     // copy_column_view
+#include "codegen/plan/operator_registry.hpp"  // is_terminal_compressor
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
-#include "explore/operator_catalog.hpp"
 
 #include <cudf/copying.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -41,11 +42,10 @@ namespace {
 // Utilities
 // ---------------------------------------------------------------------------
 //
-// The operator catalog (`all_compressor_names`), the terminal/preprocessing
-// classification, `format_output_names`, and the single-op `try_operator`
-// primitive live in explore/operator_catalog.{hpp,cpp} so this explorer and the
-// operator-sweep test share one source of truth for operator applicability and
-// channel production.
+// The operator catalog (`all_compressor_names`) and the terminal/preprocessing
+// classification live in operator_registry; `format_output_names`, `try_operator`,
+// and `make_dsl_step` live here (below) so this explorer and the operator-sweep
+// test share one source of truth for operator applicability and channel production.
 
 template <typename Fn>
 double time_cuda_ms(cudaStream_t stream, Fn&& fn)
@@ -277,6 +277,119 @@ size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view 
 }
 
 // ---------------------------------------------------------------------------
+// Single-op trial + DSL-step formatting (shared with the operator sweep test)
+// ---------------------------------------------------------------------------
+
+std::string format_output_names(std::vector<compressible_output> const& outs)
+{
+  std::ostringstream oss;
+  for (std::size_t i = 0; i < outs.size(); ++i) {
+    if (i > 0) oss << ", ";
+    oss << outs[i].name;
+  }
+  return oss.str();
+}
+
+operator_trial try_operator(std::string const& name,
+                            cudf::column_view col,
+                            rmm::cuda_stream_view stream,
+                            rmm::device_async_resource_ref mr)
+{
+  operator_trial r;
+
+  // Static type gate: reject operators that are incompatible with the input
+  // dtype before touching the GPU so that a type mismatch can never corrupt
+  // the CUDA context or produce a misleading "success" result.
+  auto const tid      = col.type().id();
+  bool const is_float = cudf::is_floating_point(col.type());
+  // Chrono columns compress as their integer storage (see encode_fused_subtree),
+  // so they take the integer op set.
+  bool const is_int = cudf::is_integral(col.type()) || cudf::is_chrono(col.type());
+  bool const is_str = (tid == cudf::type_id::STRING);
+
+  // bitextract is meaningful only on its native floating-point type; applying it
+  // to integer data produces larger output and its intermediate columns can crash
+  // downstream operators.
+  if (name == "bitextract_f64" && tid != cudf::type_id::FLOAT64) {
+    r.error_message = name + ": requires float64 input";
+    return r;
+  }
+  if (name == "bitextract_f32" && tid != cudf::type_id::FLOAT32) {
+    r.error_message = name + ": requires float32 input";
+    return r;
+  }
+  if ((name == "alp" || name == "alp_rd") && !is_float) {
+    r.error_message = name + ": requires floating-point input";
+    return r;
+  }
+  if ((name == "dictionary" || name == "dictionary_fast" || name == "str_split") && !is_str) {
+    r.error_message = name + ": requires string input";
+    return r;
+  }
+  // Integer-only preprocessing operators
+  if ((name == "delta" || name == "for" || name == "zigzag" || name == "bitpack" ||
+       name == "rle") &&
+      !is_int && !is_float) {
+    r.error_message = name + ": requires numeric input";
+    return r;
+  }
+
+  // Clear any residual CUDA error before attempting so a previous failure on
+  // the same stream does not poison this attempt.
+  cudaGetLastError();
+  try {
+    std::string err;
+    auto rep             = compress_single_op(name, col, stream, mr, &err);
+    cudaError_t sync_err = cudaStreamSynchronize(stream.value());
+    if (sync_err != cudaSuccess) {
+      // A kernel on this stream faulted.  Clear the error so subsequent
+      // operators can proceed and bail out of this attempt cleanly.
+      cudaGetLastError();
+      r.error_message = "stream sync after " + name + ": " + cudaGetErrorString(sync_err);
+      return r;
+    }
+    if (!rep) {
+      r.error_message = "compress_single_op (" + name + "): " + err;
+      return r;
+    }
+    r.outputs = rep->named_channels(stream);
+    r.repr    = std::shared_ptr<compressed_representation>(std::move(rep));
+    for (auto const& o : r.outputs) {
+      r.output_bytes += column_size_bytes_ex(o.view, stream);
+    }
+    r.success = true;
+  } catch (std::exception const& e) {
+    cudaGetLastError();  // clear any CUDA error state left by the exception
+    r.error_message = e.what();
+  } catch (...) {
+    cudaGetLastError();
+    r.error_message = "unknown exception in " + name;
+  }
+  return r;
+}
+
+dsl_step make_dsl_step(std::string const& input_path,
+                       std::string const& op_name,
+                       std::vector<compressible_output> const& outputs)
+{
+  dsl_step step;
+  bool const terminal     = is_terminal_compressor(op_name);
+  std::string const names = format_output_names(outputs);
+
+  std::ostringstream line;
+  line << input_path << " -> " << op_name;
+  if (!terminal && !names.empty()) line << " -> " << names;
+  step.line = line.str();
+
+  step.output_paths.reserve(outputs.size());
+  for (auto const& o : outputs) {
+    step.output_paths.push_back(input_path == "input" ? op_name + "." + o.name
+                                                      : input_path + "." + o.name);
+  }
+  return step;
+}
+
+// ---------------------------------------------------------------------------
 // BFS Explorer
 // ---------------------------------------------------------------------------
 
@@ -287,9 +400,7 @@ size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view 
 // near-identical frontier points and a ratio trim would starve the fast/low-
 // ratio end (e.g. str_split before its channels are compressed). Dropped
 // candidates free their GPU reprs on return.
-void prune_beam(std::vector<std::unique_ptr<bfs_candidate>>& beam,
-                size_t cap,
-                size_t original_size)
+void prune_beam(std::vector<std::unique_ptr<bfs_candidate>>& beam, size_t cap, size_t original_size)
 {
   size_t const n = beam.size();
   if (n <= cap) return;
@@ -316,7 +427,8 @@ void prune_beam(std::vector<std::unique_ptr<bfs_candidate>>& beam,
         break;
       }
   std::vector<size_t> front, rest;
-  for (size_t i : pool) (dominated[i] ? rest : front).push_back(i);
+  for (size_t i : pool)
+    (dominated[i] ? rest : front).push_back(i);
 
   if (front.size() <= want) {
     keep.insert(keep.end(), front.begin(), front.end());
@@ -328,7 +440,7 @@ void prune_beam(std::vector<std::unique_ptr<bfs_candidate>>& beam,
     for (double const* obj : {r.data(), s.data()}) {
       auto by_obj = front;
       std::sort(by_obj.begin(), by_obj.end(), [&](size_t a, size_t b) { return obj[a] < obj[b]; });
-      double span = std::max(obj[by_obj.back()] - obj[by_obj.front()], 1e-12);
+      double span           = std::max(obj[by_obj.back()] - obj[by_obj.front()], 1e-12);
       crowd[by_obj.front()] = crowd[by_obj.back()] = std::numeric_limits<double>::infinity();
       for (size_t k = 1; k + 1 < by_obj.size(); ++k)
         crowd[by_obj[k]] += (obj[by_obj[k + 1]] - obj[by_obj[k - 1]]) / span;
@@ -339,7 +451,8 @@ void prune_beam(std::vector<std::unique_ptr<bfs_candidate>>& beam,
 
   std::vector<std::unique_ptr<bfs_candidate>> kept;
   kept.reserve(keep.size());
-  for (size_t i : keep) kept.push_back(std::move(beam[i]));
+  for (size_t i : keep)
+    kept.push_back(std::move(beam[i]));
   beam.swap(kept);  // old beam (with the dropped tail) freed on return
 }
 
@@ -610,14 +723,13 @@ exploration_result explore_column_compression(cudf::column_view input,
     std::vector<double> rr(m), ss(m), crowd(m, 0.0);
     for (size_t i = 0; i < m; ++i) {
       rr[i] = finalists[i].compression_ratio;
-      ss[i] = finalists[i].decode_cost > 0.0
-                ? (double)original_size / finalists[i].decode_cost
-                : std::numeric_limits<double>::infinity();
+      ss[i] = finalists[i].decode_cost > 0.0 ? (double)original_size / finalists[i].decode_cost
+                                             : std::numeric_limits<double>::infinity();
     }
     for (double const* obj : {rr.data(), ss.data()}) {
       auto by = pool;
       std::sort(by.begin(), by.end(), [&](size_t a, size_t b) { return obj[a] < obj[b]; });
-      double span = std::max(obj[by.back()] - obj[by.front()], 1e-12);
+      double span       = std::max(obj[by.back()] - obj[by.front()], 1e-12);
       crowd[by.front()] = crowd[by.back()] = std::numeric_limits<double>::infinity();
       for (size_t k = 1; k + 1 < by.size(); ++k)
         crowd[by[k]] += (obj[by[k + 1]] - obj[by[k - 1]]) / span;
@@ -748,8 +860,7 @@ exploration_result explore_column_compression(cudf::column_view input,
   // and let the final selection pick across seeds and neighbors alike.
   if (!finalists.empty()) {
     static constexpr size_t kMaxNeighborMeasurements = 24;
-    static constexpr std::string_view kSwapOps[]     = {
-      "ans", "bitcomp", "lz4", "snappy", "deflate"};
+    static constexpr std::string_view kSwapOps[] = {"ans", "bitcomp", "lz4", "snappy", "deflate"};
 
     auto measure_dsl = [&](std::string const& dsl, ranked_candidate& out) -> bool {
       size_t bytes      = 0;

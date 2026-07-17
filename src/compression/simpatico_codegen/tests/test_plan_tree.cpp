@@ -174,8 +174,7 @@ void test_operator_registry()
   // and each channel's index matches its position.
   for (auto const& op : simpatico::operator_registry()) {
     expect(op_info(op.id).id == op.id, "op_info round-trips id");
-    for (auto const& cat : op.catalog_names)
-      expect(op_id_from_name(cat) == op.id, "catalog name resolves to its op");
+    expect(op_id_from_name(std::string(op.name)) == op.id, "op name resolves to its op");
     for (simpatico::ChannelId i = 0; i < op.channels.size(); ++i)
       expect(channel_id(op.id, op.channels[i]) == i, "channel index matches position");
   }

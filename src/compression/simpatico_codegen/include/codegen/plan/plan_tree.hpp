@@ -2,6 +2,7 @@
 #ifndef CODEGEN_PLAN_TREE_HPP
 #define CODEGEN_PLAN_TREE_HPP
 
+#include "codegen/plan/bit_spec.hpp"  // bitfield_spec
 #include "codegen/plan/leaf_desc.hpp"
 #include "codegen/plan/operator_registry.hpp"  // ChannelId
 #include "codegen/plan/plan_dsl.hpp"

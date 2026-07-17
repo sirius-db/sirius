@@ -1,6 +1,7 @@
 #ifndef SIMPATICO_REPRESENTATION_HPP
 #define SIMPATICO_REPRESENTATION_HPP
 
+#include "codegen/plan/bit_spec.hpp"
 #include "codegen/plan/leaf_desc.hpp"
 #include "codegen/util/dictionary_view_helper.hpp"
 
@@ -492,36 +493,34 @@ struct nvcomp_payload_rep : compressed_representation {
   }
 };
 
+// Template base for nvcomp codecs whose leaf metadata is exactly
+// (uncompressed_size, type_id): snappy, lz4, deflate, ans. Fixes
+// kind()/describe_meta() from its parameters; each concrete struct supplies its
+// own decompress() (.cu file) and from_outputs() (representation_factory.cpp).
+// bitcomp/cascaded carry extra compress opts and derive from nvcomp_payload_rep.
+template <OpId K, typename MetaT>
+struct nvcomp_simple_rep_base : nvcomp_payload_rep {
+  using nvcomp_payload_rep::nvcomp_payload_rep;
+
+  OpId kind() const override { return K; }
+  leaf_meta_v describe_meta() const override
+  {
+    return MetaT{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
+  }
+
+  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr) const override = 0;
+};
+
 // -----------------------------------------------------------------------------
 // nvcomp ANS / Bitcomp compressors
 // -----------------------------------------------------------------------------
 
-struct ans_compressed_representation : nvcomp_payload_rep {
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out,
-    leaf_meta_v const& meta = leaf_meta::none{});
-
-  ans_compressed_representation(cudf::data_type t,
-                                cudf::size_type n,
-                                std::unique_ptr<rmm::device_buffer> data,
-                                size_t comp_size,
-                                size_t uncomp_size)
-    : nvcomp_payload_rep(t, n, std::move(data), comp_size, uncomp_size)
-  {
-  }
-
+// Reconstructed generically via nvcomp_simple_from_outputs (representation_factory.cpp).
+struct ans_compressed_representation : nvcomp_simple_rep_base<OpId::Ans, leaf_meta::ans> {
+  using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
-
-  OpId kind() const override { return OpId::Ans; }
-  leaf_meta_v describe_meta() const override
-  {
-    return leaf_meta::ans{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
-  }
 };
 
 struct ans_compressor : compressor {
@@ -673,52 +672,19 @@ struct cascaded_compressor : compressor {
 };
 
 // -----------------------------------------------------------------------------
-// Simple nvcomp codecs: Snappy, LZ4, GDeflate ("deflate" in the DSL)
-//
-// All three share the same rep layout (compressed byte payload + sizes, held by
-// nvcomp_payload_rep) and the same metadata structure. This template base fixes
-// kind()/describe_meta() from its parameters; each concrete struct supplies:
-//  - decompress()   — manager-specific, defined in the matching .cu file
-//  - from_outputs() — defined in representation_factory.cpp
+// Simple nvcomp codecs: Snappy, LZ4, GDeflate ("deflate" in the DSL) — see
+// nvcomp_simple_rep_base above.
 // -----------------------------------------------------------------------------
 
-template <OpId K, typename MetaT>
-struct nvcomp_simple_rep_base : nvcomp_payload_rep {
-  using nvcomp_payload_rep::nvcomp_payload_rep;
-
-  OpId kind() const override { return K; }
-  leaf_meta_v describe_meta() const override
-  {
-    return MetaT{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
-  }
-
-  // decompress() is manager-specific — defined in the matching .cu file.
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) const override = 0;
-};
-
+// snappy/lz4/deflate: reconstructed generically via nvcomp_simple_from_outputs.
 struct snappy_compressed_representation : nvcomp_simple_rep_base<OpId::Snappy, leaf_meta::snappy> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out,
-    leaf_meta_v const& meta = leaf_meta::none{});
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 };
 
 struct lz4_compressed_representation : nvcomp_simple_rep_base<OpId::Lz4, leaf_meta::lz4> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out,
-    leaf_meta_v const& meta = leaf_meta::none{});
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 };
@@ -726,13 +692,6 @@ struct lz4_compressed_representation : nvcomp_simple_rep_base<OpId::Lz4, leaf_me
 struct deflate_compressed_representation
   : nvcomp_simple_rep_base<OpId::Deflate, leaf_meta::deflate> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out,
-    leaf_meta_v const& meta = leaf_meta::none{});
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 };
@@ -886,231 +845,8 @@ struct alp_rd_compressor : compressor {
 };
 
 // ── bitextract / bitjoin ──────────────────────────────────────────────────────
-//
-// Bit-field layout convention (shared by bitextract and bitjoin):
-//
-//   Fields are packed MSB-first in the order they appear, both in the DSL
-//   line and in a spec like `bitextract_1sign_8exponent_23mantissa`. The
-//   first field occupies the top bits of the packed value; the next field
-//   the bits immediately below, and so on. If the listed fields cover fewer
-//   bits than the packed type's width, the unused high-end bits above the
-//   first field are zero (bitjoin) or ignored (bitextract).
-//
-//   Concretely, for a packed type of width `W` and fields with widths
-//   `b_0, b_1, ..., b_{n-1}` listed in DSL order, field `i` occupies bits
-//   `[W - sum(b_0..b_i) , W - sum(b_0..b_i) + b_i - 1]` of the packed value.
-//
-//   Example: `input_3:0, input_7:4 -> bitjoin_u8 -> swapped` packs input
-//   bits [3:0] into output bits [7:4] and input bits [7:4] into [3:0].
-//
-// Packed-type token (where the type lives in each operator's name):
-//
-//   - bitjoin's packed type is the OUTPUT and is required at the END of
-//     the spec:           `bitjoin_<fields>_<type>` or `bitjoin_<type>`
-//   - bitextract's packed type is the INPUT and is optional at the FRONT:
-//                         `bitextract_[<type>_]<fields>` or alias `bitextract_f{16,32,64}`
-//
-//   The recognised type tokens are `u8`/`u16`/`u32`/`u64`, `i8`/`i16`/`i32`/`i64`,
-//   `f32`/`f64` (with `uint8`/`int8`/... long forms accepted by bitjoin).
-//   For bitextract the type token is unambiguous because field tokens always
-//   start with a digit (`<bits><name>`).
-//
-//   When the bitextract type prefix is absent, the spec reconstructs as the
-//   smallest unsigned int that fits the sum of field widths. This is enough
-//   for symmetric round-trips on unsigned inputs, but loses signedness/width
-//   information for signed inputs. Compression therefore auto-injects the
-//   actual column type into the stored DSL (see `compress_with_plan`), so
-//   `.hpln` files always carry an explicit type prefix and round-trips are
-//   exact without any side-channel.
-
-struct bitfield_spec {
-  uint32_t bits;
-  std::string name;
-};
-
-/// Result of parsing a bitextract or bitjoin spec suffix.
-struct bitextract_spec_result {
-  std::vector<bitfield_spec> fields;
-  cudf::data_type output_type{cudf::type_id::EMPTY};
-};
-
-/// Compressor-name prefix for the bitextract family ("bitextract_<spec>").
-inline constexpr std::string_view kBitextractPrefix = "bitextract_";
-
-/// If `name` starts with `kBitextractPrefix`, return the spec suffix; otherwise nullopt.
-inline std::optional<std::string_view> strip_bitextract_prefix(std::string_view name)
-{
-  if (name.size() > kBitextractPrefix.size() &&
-      name.compare(0, kBitextractPrefix.size(), kBitextractPrefix) == 0) {
-    return name.substr(kBitextractPrefix.size());
-  }
-  return std::nullopt;
-}
-
-/// IEEE-754 float aliases shared by parse_bitextract_spec and parse_bitjoin_spec.
-inline std::optional<bitextract_spec_result> parse_float_alias(std::string_view suffix)
-{
-  if (suffix == "f16")
-    return bitextract_spec_result{{{1, "sign"}, {5, "exponent"}, {10, "mantissa"}},
-                                  cudf::data_type(cudf::type_id::UINT16)};
-  if (suffix == "f32")
-    return bitextract_spec_result{{{1, "sign"}, {8, "exponent"}, {23, "mantissa"}},
-                                  cudf::data_type(cudf::type_id::FLOAT32)};
-  if (suffix == "f64")
-    return bitextract_spec_result{{{1, "sign"}, {11, "exponent"}, {52, "mantissa"}},
-                                  cudf::data_type(cudf::type_id::FLOAT64)};
-  return std::nullopt;
-}
-
-/// Map a packed-type token (`u8`/`i16`/`f32`/...) to a cudf::data_type.
-/// Returns EMPTY if the token is unrecognised. Long forms (`uint8`) are also accepted.
-inline cudf::data_type parse_packed_type_token(std::string_view tok)
-{
-  if (tok == "u8" || tok == "uint8") return cudf::data_type(cudf::type_id::UINT8);
-  if (tok == "u16" || tok == "uint16") return cudf::data_type(cudf::type_id::UINT16);
-  if (tok == "u32" || tok == "uint32") return cudf::data_type(cudf::type_id::UINT32);
-  if (tok == "u64" || tok == "uint64") return cudf::data_type(cudf::type_id::UINT64);
-  if (tok == "i8" || tok == "int8") return cudf::data_type(cudf::type_id::INT8);
-  if (tok == "i16" || tok == "int16") return cudf::data_type(cudf::type_id::INT16);
-  if (tok == "i32" || tok == "int32") return cudf::data_type(cudf::type_id::INT32);
-  if (tok == "i64" || tok == "int64") return cudf::data_type(cudf::type_id::INT64);
-  if (tok == "f32") return cudf::data_type(cudf::type_id::FLOAT32);
-  if (tok == "f64") return cudf::data_type(cudf::type_id::FLOAT64);
-  return cudf::data_type(cudf::type_id::EMPTY);
-}
-
-/// Canonical "namespace" form of a compressor name, with any optional
-/// packed-type prefix stripped from the bitextract spec. Float aliases are
-/// preserved because they are part of the operator's identity.
-///
-/// This is what `parse_plan_dsl` uses to derive output paths, so a bitextract
-/// step's downstream paths are stable across DSL forms — i.e. both
-/// `bitextract_3hi_5lo` and `bitextract_i16_3hi_5lo` share the namespace
-/// `bitextract_3hi_5lo.<field>`. That decouples the auto-injected type prefix
-/// (stored in `step.compressor` for type reconstruction) from the path layout
-/// (used by the leaves map).
-inline std::string bitextract_canonical_name(std::string const& compressor)
-{
-  auto suffix = strip_bitextract_prefix(compressor);
-  if (!suffix) return compressor;
-  if (*suffix == "f32" || *suffix == "f64") return compressor;
-  if (suffix->empty() || std::isdigit(static_cast<unsigned char>((*suffix)[0]))) {
-    return compressor;  // generic form, no type prefix to strip
-  }
-  size_t us = suffix->find('_');
-  if (us == std::string_view::npos) return compressor;
-  if (parse_packed_type_token(suffix->substr(0, us)).id() == cudf::type_id::EMPTY) {
-    return compressor;  // first segment isn't a type token, leave alone
-  }
-  return std::string("bitextract_") + std::string(suffix->substr(us + 1));
-}
-
-/// Canonicalize a path token by applying `bitextract_canonical_name` to the
-/// leftmost dot-separated segment. Lets users reference bitextract outputs
-/// downstream in either typed or untyped form interchangeably.
-inline std::string canonicalize_path(std::string const& path)
-{
-  size_t dot            = path.find('.');
-  std::string head      = (dot == std::string::npos) ? path : path.substr(0, dot);
-  std::string canonical = bitextract_canonical_name(head);
-  if (canonical == head) return path;
-  return (dot == std::string::npos) ? canonical : canonical + path.substr(dot);
-}
-
-/// Parse the field-list portion of a bitextract spec ("3hi_5lo", "1sign_8exponent_23mantissa").
-/// Each token must be `<digits><name>`. Returns empty fields on malformed input.
-inline std::vector<bitfield_spec> parse_bitfield_list(std::string_view fields_suffix)
-{
-  std::vector<bitfield_spec> fields;
-  size_t pos = 0;
-  while (pos <= fields_suffix.size()) {
-    size_t next          = fields_suffix.find('_', pos);
-    std::string_view tok = (next == std::string_view::npos) ? fields_suffix.substr(pos)
-                                                            : fields_suffix.substr(pos, next - pos);
-    size_t d             = 0;
-    while (d < tok.size() && std::isdigit(static_cast<unsigned char>(tok[d])))
-      ++d;
-    if (d == 0 || d == tok.size()) return {};
-    uint32_t bits = 0;
-    for (size_t k = 0; k < d; ++k)
-      bits = bits * 10 + static_cast<uint32_t>(tok[k] - '0');
-    if (bits == 0) return {};
-    fields.push_back({bits, std::string(tok.substr(d))});
-    if (next == std::string_view::npos) break;
-    pos = next + 1;
-  }
-  return fields;
-}
-
-/// Parse a bitextract spec. Accepted forms:
-///   - alias              "f32" / "f64"
-///   - generic            "3hi_5lo"                 (output type defaults to smallest uintN that
-///   fits)
-///   - typed              "i16_3hi_5lo" / "u32_4a_4b_24c"
-/// On failure returns a result with empty fields.
-///
-/// "f16" is deliberately not an accepted alias here (unlike parse_bitjoin_spec):
-/// cudf has no native FLOAT16 storage, so there is no genuine 16-bit-wide
-/// column to split — bitextract needs its input to actually be the width the
-/// spec assumes, which only holds for f32/f64.
-inline bitextract_spec_result parse_bitextract_spec(std::string_view suffix)
-{
-  if (suffix != "f16") {
-    if (auto alias = parse_float_alias(suffix)) return *alias;
-  }
-
-  // Optional leading packed-type token: unambiguous because field tokens
-  // always start with a digit (`<bits><name>`).
-  cudf::data_type explicit_type(cudf::type_id::EMPTY);
-  std::string_view fields_suffix = suffix;
-  if (!suffix.empty() && !std::isdigit(static_cast<unsigned char>(suffix[0]))) {
-    size_t us = suffix.find('_');
-    if (us == std::string_view::npos) return {};
-    explicit_type = parse_packed_type_token(suffix.substr(0, us));
-    if (explicit_type.id() == cudf::type_id::EMPTY) return {};
-    fields_suffix = suffix.substr(us + 1);
-  }
-
-  auto fields = parse_bitfield_list(fields_suffix);
-  if (fields.empty()) return {};
-
-  cudf::data_type out_type = explicit_type;
-  if (out_type.id() == cudf::type_id::EMPTY) {
-    uint32_t total_bits = 0;
-    for (auto const& f : fields)
-      total_bits += f.bits;
-    out_type = (total_bits <= 8)    ? cudf::data_type(cudf::type_id::UINT8)
-               : (total_bits <= 16) ? cudf::data_type(cudf::type_id::UINT16)
-               : (total_bits <= 32) ? cudf::data_type(cudf::type_id::UINT32)
-                                    : cudf::data_type(cudf::type_id::UINT64);
-  }
-  return {std::move(fields), out_type};
-}
-
-/// Parse a bitjoin spec. Accepted forms:
-///   - alias              "f16" / "f32" / "f64"
-///   - bare type          "u32"                       (fields provided via DSL bit-range tokens)
-///   - typed fields       "1sign_8exponent_23mantissa_f32" / "3hi_5lo_u8"
-/// The packed type is the LAST underscore-separated token. On failure returns empty fields.
-inline bitextract_spec_result parse_bitjoin_spec(std::string_view suffix)
-{
-  if (auto alias = parse_float_alias(suffix)) return *alias;
-
-  size_t last               = suffix.rfind('_');
-  std::string_view type_tok = (last == std::string_view::npos) ? suffix : suffix.substr(last + 1);
-  std::string_view fields_tok =
-    (last == std::string_view::npos) ? std::string_view{} : suffix.substr(0, last);
-
-  cudf::data_type out_type = parse_packed_type_token(type_tok);
-  if (out_type.id() == cudf::type_id::EMPTY) return {};
-
-  // Bare output type (e.g. "bitjoin_u32"): caller provides bit ranges in the DSL input list.
-  if (fields_tok.empty()) return {{}, out_type};
-
-  auto fields = parse_bitfield_list(fields_tok);
-  if (fields.empty()) return {};
-  return {std::move(fields), out_type};
-}
+// Bit-spec parsing (bitfield_spec, bitextract_spec_result, parse_* etc.) lives
+// in bit_spec.hpp (included above).
 
 // Forward declarations — implemented in bitjoin_bitextract.cu
 void launch_bitextract_field(cudf::column_view const& input_col,

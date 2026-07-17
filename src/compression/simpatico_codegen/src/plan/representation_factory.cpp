@@ -257,86 +257,6 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
   return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
 }
 
-// Bitpack has no rep subclass of its own — it reconstructs as a
-// codegen_fused_representation (the codegen decode path inverts it), so its
-// reconstruction lives here as a file-local factory rather than a static member.
-static std::unique_ptr<compressed_representation> bitpack_from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref /*mr*/,
-  std::string* error_out,
-  std::uint64_t num_rows_hint)
-{
-  // The ``packed`` channel may have been entropy-tail-routed at compress
-  // time (e.g. ``…packed -> ans``); when that happens the writer drops it
-  // and the file-read path enumerates only 3 channels. Accept either the
-  // full 4 (chunk_min, chunk_count, chunk_bits, packed) or the 3 meta
-  // channels with ``packed`` absent — the codegen decode gather resolves the
-  // dropped channel from its sibling entropy leaf before launching. Match
-  // by name so a missing ``packed`` is unambiguous regardless of count.
-  std::unique_ptr<cudf::column> chunk_min, chunk_count, chunk_bits, packed;
-  if (output_names.size() != outputs.size()) {
-    if (error_out) *error_out = "bitpack: output_names / outputs size mismatch";
-    return nullptr;
-  }
-  for (size_t i = 0; i < output_names.size(); ++i) {
-    auto const& nm = output_names[i];
-    if (nm == "chunk_min")
-      chunk_min = std::move(outputs[i]);
-    else if (nm == "chunk_count")
-      chunk_count = std::move(outputs[i]);
-    else if (nm == "chunk_bits")
-      chunk_bits = std::move(outputs[i]);
-    else if (nm == "packed")
-      packed = std::move(outputs[i]);
-    else {
-      if (error_out) *error_out = "bitpack: unexpected output channel '" + nm + "'";
-      return nullptr;
-    }
-  }
-  if (!chunk_min || !chunk_count || !chunk_bits) {
-    if (error_out) {
-      *error_out =
-        "bitpack requires chunk_min, chunk_count, chunk_bits "
-        "(packed may be dropped when entropy-tail-routed)";
-    }
-    return nullptr;
-  }
-  // ``packed`` may legitimately be null here (tail-routed).
-
-  cudf::data_type original_type = chunk_min->type();
-
-  // The serialized per-leaf num_rows (the same sum recorded at compress time)
-  // lets the from-wire path skip the D2H + sync; a zero hint (decode-driver
-  // path) falls back to summing chunk_count with a stream-aware memcpy that
-  // respects stream ordering (fixes multistream crash).
-  cudf::size_type num_rows = 0;
-  if (num_rows_hint > 0) {
-    num_rows = static_cast<cudf::size_type>(num_rows_hint);
-  } else if (chunk_count->size() > 0) {
-    std::vector<int32_t> h_counts(static_cast<size_t>(chunk_count->size()));
-    cudaMemcpyAsync(h_counts.data(),
-                    chunk_count->view().head<int32_t>(),
-                    h_counts.size() * sizeof(int32_t),
-                    cudaMemcpyDeviceToHost,
-                    stream.value());
-    cudaStreamSynchronize(stream.value());
-    for (auto c : h_counts)
-      num_rows += c;
-  }
-
-  // Bitpack reconstructs as a codegen_fused_representation; the codegen decode
-  // path inverts it. Buffers are tagged with the registry channel names; packed
-  // may be null (tail-routed), which named_channels() skips.
-  auto rep = std::make_unique<codegen_fused_representation>(OpId::Bitpack, original_type, num_rows);
-  rep->buffers.emplace_back("chunk_min", std::move(chunk_min));
-  rep->buffers.emplace_back("chunk_count", std::move(chunk_count));
-  rep->buffers.emplace_back("chunk_bits", std::move(chunk_bits));
-  rep->buffers.emplace_back("packed", std::move(packed));
-  return rep;
-}
-
 // The four buffers are independent leaves that may each be further compressed
 // by `for`/`bitpack`/`fastlanes`/`identity`.
 std::unique_ptr<compressed_representation> alp_compressed_representation::from_outputs(
@@ -657,57 +577,6 @@ std::unique_ptr<compressed_representation> nvcomp_simple_from_outputs(
 }
 }  // anonymous namespace
 
-// Single ``output`` channel: trimmed UINT8 payload (no header).
-// uncompressed_size and original_type_id come from leaf_meta::ans —
-// identical layout to leaf_meta::snappy/lz4/deflate, same constructor shape.
-std::unique_ptr<compressed_representation> ans_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out,
-  leaf_meta_v const& meta)
-{
-  return nvcomp_simple_from_outputs<ans_compressed_representation, leaf_meta::ans>(
-    "ans", output_names, std::move(outputs), stream, mr, error_out, meta);
-}
-
-std::unique_ptr<compressed_representation> snappy_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out,
-  leaf_meta_v const& meta)
-{
-  return nvcomp_simple_from_outputs<snappy_compressed_representation, leaf_meta::snappy>(
-    "snappy", output_names, std::move(outputs), stream, mr, error_out, meta);
-}
-
-std::unique_ptr<compressed_representation> lz4_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out,
-  leaf_meta_v const& meta)
-{
-  return nvcomp_simple_from_outputs<lz4_compressed_representation, leaf_meta::lz4>(
-    "lz4", output_names, std::move(outputs), stream, mr, error_out, meta);
-}
-
-std::unique_ptr<compressed_representation> deflate_compressed_representation::from_outputs(
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out,
-  leaf_meta_v const& meta)
-{
-  return nvcomp_simple_from_outputs<deflate_compressed_representation, leaf_meta::deflate>(
-    "deflate", output_names, std::move(outputs), stream, mr, error_out, meta);
-}
-
 // ── thin dispatcher ───────────────────────────────────────────────────────────
 // Resolves a compressor name to its OpId (via the operator registry, so all
 // parameterised suffix forms are handled uniformly) and dispatches to the
@@ -722,8 +591,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
-  leaf_meta_v const& meta,
-  std::uint64_t num_rows_hint)
+  leaf_meta_v const& meta)
 {
   auto const unsupported = [&]() -> std::unique_ptr<compressed_representation> {
     if (error_out) {
@@ -742,9 +610,6 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
     case OpId::Dictionary:
       return dictionary_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out);
-    case OpId::Bitpack:
-      return bitpack_from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out, num_rows_hint);
     case OpId::Alp:
       return alp_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out);
@@ -761,20 +626,22 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
       return bitextract_compressed_representation::from_outputs(
         std::move(spec), output_names, std::move(outputs), error_out);
     }
+    // The simple byte-stream codecs share one body (single UINT8 'output'
+    // channel + (uncompressed_size, type_id) meta) — reconstructed generically.
     case OpId::Ans:
-      return ans_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out, meta);
+      return nvcomp_simple_from_outputs<ans_compressed_representation, leaf_meta::ans>(
+        "ans", output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Snappy:
+      return nvcomp_simple_from_outputs<snappy_compressed_representation, leaf_meta::snappy>(
+        "snappy", output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Lz4:
+      return nvcomp_simple_from_outputs<lz4_compressed_representation, leaf_meta::lz4>(
+        "lz4", output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Deflate:
+      return nvcomp_simple_from_outputs<deflate_compressed_representation, leaf_meta::deflate>(
+        "deflate", output_names, std::move(outputs), stream, mr, error_out, meta);
     case OpId::Bitcomp:
       return bitcomp_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::Snappy:
-      return snappy_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::Lz4:
-      return lz4_compressed_representation::from_outputs(
-        output_names, std::move(outputs), stream, mr, error_out, meta);
-    case OpId::Deflate:
-      return deflate_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out, meta);
     case OpId::NvcompCascaded:
       return cascaded_compressed_representation::from_outputs(
@@ -782,6 +649,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
     case OpId::StrSplit:
       return str_split_compressed_representation::from_outputs(
         output_names, std::move(outputs), stream, mr, error_out);
+    case OpId::Bitpack:
     case OpId::Delta:
     case OpId::Rle:
     case OpId::For:

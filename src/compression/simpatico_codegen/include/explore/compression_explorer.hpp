@@ -7,11 +7,14 @@
 
 #pragma once
 
+#include "codegen/plan/representation.hpp"  // compressible_output, compressed_representation
+
 #include <cudf/column/column_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -87,5 +90,40 @@ exploration_result explore_column_compression(cudf::column_view input,
 
 /// Byte size of a column (for compression ratio computation).
 size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view stream);
+
+// ---------------------------------------------------------------------------
+// Single-op trial + DSL-step formatting (shared with the operator sweep test)
+// ---------------------------------------------------------------------------
+
+/// Result of applying a single operator to a column.
+struct operator_trial {
+  bool success = false;
+  std::string error_message;
+  std::vector<compressible_output> outputs;         ///< typed channels of the resulting rep
+  std::size_t output_bytes = 0;                     ///< sum of logical channel byte sizes
+  std::shared_ptr<compressed_representation> repr;  ///< keeps the outputs' views valid
+};
+
+/// Apply `name` to `col`, sync, and collect the typed output channels. Never
+/// throws; returns {success=false} on any failure (op not applicable to the
+/// dtype, GPU error, ...).
+operator_trial try_operator(std::string const& name,
+                            cudf::column_view col,
+                            rmm::cuda_stream_view stream,
+                            rmm::device_async_resource_ref mr);
+
+/// Format the `a, b, c` channel-name list for a DSL step.
+std::string format_output_names(std::vector<compressible_output> const& outs);
+
+/// A formatted DSL step plus the output paths its channels take (for chaining).
+struct dsl_step {
+  std::string line;
+  std::vector<std::string> output_paths;
+};
+
+/// Build the DSL step for applying `op_name` to `input_path`, producing `outputs`.
+dsl_step make_dsl_step(std::string const& input_path,
+                       std::string const& op_name,
+                       std::vector<compressible_output> const& outputs);
 
 }  // namespace simpatico

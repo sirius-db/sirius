@@ -64,6 +64,7 @@ add_library(
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
+  src/plan/bit_spec.cpp
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp
   src/plan/operator_registry.cpp
@@ -77,7 +78,6 @@ add_library(
   src/bridge/codegen_runtime.cpp
   src/simpatico_codegen.cpp
   src/api/compressed_table_io.cpp
-  src/explore/operator_catalog.cpp
   src/explore/compression_explorer.cpp)
 set_target_properties(simpatico PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(simpatico PUBLIC cxx_std_20)
