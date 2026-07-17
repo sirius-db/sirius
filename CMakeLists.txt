@@ -267,6 +267,7 @@ set(EXTENSION_SOURCES
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
+    src/op/scan/duckdb_insert_delta.cpp
     src/op/scan/duckdb_mvcc_visibility.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
@@ -686,6 +687,7 @@ set(TEST_SOURCES
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
+    test/cpp/scan/test_duckdb_insert_delta.cpp
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
     test/cpp/scan/test_duckdb_native_dynamic_filter_remap.cpp
