@@ -42,6 +42,8 @@
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
+#include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <scan_manager/mvcc_chunk_mask.hpp>
 #include <unistd.h>
 
 #include <cstdint>
@@ -377,4 +379,79 @@ TEST_CASE("file reads staged without a datasource throw loudly",
     threw_datasource = std::string(e.what()).find("datasource") != std::string::npos;
   }
   REQUIRE(threw_datasource);
+}
+
+TEST_CASE("materialize_table applies the mvcc keep-mask to metadata splits",
+          "[scan][duckdb_native_host_backed]")
+{
+  host_backed_test_db env;
+  build_table(*env.con);
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+
+  auto cols         = all_cols();
+  auto types        = all_types();
+  auto md           = walk_all(storage, *env.con->context, cols, types);
+  auto exp          = fetch_expected(*env.con);
+  auto const n_rows = exp.id.size();
+
+  auto mem_mgr    = initialize_memory_manager();
+  auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+
+  std::vector<std::shared_ptr<void>> keepalive;
+  host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
+
+  auto info             = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage         = &storage;
+  info->context         = env.con->context.get();
+  info->projected_cols  = cols;
+  info->projected_types = types;
+  auto ingestible       = make_ingestible(std::move(info));
+
+  // Keep every third row.
+  auto const n_words = (n_rows + 31) / 32;
+  auto words         = std::make_shared<std::vector<std::uint32_t>>(n_words, 0u);
+  std::size_t kept   = 0;
+  for (std::size_t i = 0; i < n_rows; ++i) {
+    if (i % 3 == 0) {
+      (*words)[i / 32] |= (1u << (i % 32));
+      ++kept;
+    }
+  }
+
+  SECTION("kept rows survive, dropped rows disappear")
+  {
+    auto sinfo               = std::make_unique<duckdb_native_scan_info>();
+    sinfo->row_groups        = std::move(md);
+    sinfo->host_backed_only  = true;
+    sinfo->staging_keepalive = keepalive;
+    scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+    input.gpu_memory_space = gpu_space;
+    input.mvcc_keep_mask   = sirius::scan_manager::mvcc_chunk_mask{
+      std::shared_ptr<std::uint32_t[]>(words, words->data()), n_rows};
+
+    auto result = ingestible->materialize_table(input, stream.view());
+    auto view   = result.table.view();
+    REQUIRE(static_cast<std::size_t>(view.num_rows()) == kept);
+    auto ids = download<int32_t>(view.column(0).data<int32_t>(), kept, stream.view());
+    for (std::size_t k = 0; k < kept; ++k) {
+      if (ids[k] != exp.id[k * 3]) { FAIL("kept-row mismatch at " << k); }
+    }
+  }
+
+  SECTION("row-count mismatch throws")
+  {
+    auto sinfo               = std::make_unique<duckdb_native_scan_info>();
+    sinfo->row_groups        = std::move(md);
+    sinfo->host_backed_only  = true;
+    sinfo->staging_keepalive = keepalive;
+    scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+    input.gpu_memory_space = gpu_space;
+    input.mvcc_keep_mask   = sirius::scan_manager::mvcc_chunk_mask{
+      std::shared_ptr<std::uint32_t[]>(words, words->data()), n_rows - 1};
+
+    REQUIRE_THROWS(ingestible->materialize_table(input, stream.view()));
+  }
 }
