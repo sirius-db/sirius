@@ -178,11 +178,14 @@ inline uint32_t get_target_ctas()
   RMM_CUDA_TRY(cudaGetDevice(&device));
   static std::atomic<int> cached_device{-1};
   static std::atomic<uint32_t> cached{0};
-  if (cached_device.load() == device) return cached.load();
+  // Acquire-load both: the writer publishes cached before cached_device (see
+  // below), so if we observe a matching device we are guaranteed to also
+  // observe the published CTA count.
+  if (cached_device.load(std::memory_order_acquire) == device)
+    return cached.load(std::memory_order_acquire);
   cudaDeviceProp prop;
   RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
-  int occupancy_blocks = prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM;
-  cached_device.store(device);
+  int occupancy_blocks = std::max(prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM, 1);
 
   // Check for SIRIUS_TARGET_CTAS env override; otherwise use 2x SM occupancy.
   uint32_t target = static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
@@ -190,7 +193,11 @@ inline uint32_t get_target_ctas()
     int v = std::atoi(env);
     if (v > 0) target = static_cast<uint32_t>(v);
   }
-  cached.store(target);
+  // Publish the computed value BEFORE the device id so a concurrent caller
+  // never observes cached_device matching its device while cached is still 0
+  // (which would yield a stale/uninitialized CTA count).
+  cached.store(target, std::memory_order_release);
+  cached_device.store(device, std::memory_order_release);
   return cached.load();
 }
 
