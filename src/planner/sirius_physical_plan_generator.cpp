@@ -27,6 +27,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -65,6 +66,13 @@
 namespace sirius::planner {
 
 namespace {
+bool is_nested_logical_type(duckdb::LogicalType const& type)
+{
+  auto const id = type.id();
+  return id == duckdb::LogicalTypeId::STRUCT || id == duckdb::LogicalTypeId::LIST ||
+         id == duckdb::LogicalTypeId::MAP;
+}
+
 /// Read the dynamic-filter-pushdown enable flag from the active SiriusContext config. Defaults to
 /// disabled when the state is unavailable (no config to consult outside a configured query).
 bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
@@ -644,6 +652,49 @@ void insert_gpu_pipeline_operators_recursive(
 }
 
 }  // namespace
+
+void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,
+                                                                    std::string_view operation)
+{
+  // A nested-typed BOUND_REF names the offending column directly.
+  if (is_nested_logical_type(expr.return_type) &&
+      expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    auto name = expr.GetName();
+    if (name.empty()) { name = expr.ToString(); }
+    throw std::runtime_error("nested column operation on column '" + name + "' (" +
+                             expr.return_type.ToString() + ") is unsupported in " +
+                             std::string(operation) +
+                             ": Sirius reads and projects nested columns but cannot operate on "
+                             "them yet");
+  }
+
+  // Recurse first so a column reference wins over a constructed nested value.
+  duckdb::ExpressionIterator::EnumerateChildren(expr,
+                                                [&operation](duckdb::Expression const& child) {
+                                                  reject_nested_column_operation(child, operation);
+                                                });
+
+  // Constructed nested values (struct_pack, list constructors, ...) cannot run
+  // on the GPU path either.
+  if (is_nested_logical_type(expr.return_type)) {
+    throw std::runtime_error("nested column operation on '" + expr.ToString() + "' (" +
+                             expr.return_type.ToString() + ") is unsupported in " +
+                             std::string(operation));
+  }
+}
+
+void sirius_physical_plan_generator::reject_nested_column_type(duckdb::LogicalType const& type,
+                                                               std::string_view column_name,
+                                                               std::string_view operation)
+{
+  if (is_nested_logical_type(type)) {
+    throw std::runtime_error("nested column operation on column '" + std::string(column_name) +
+                             "' (" + type.ToString() + ") is unsupported in " +
+                             std::string(operation) +
+                             ": Sirius reads and projects nested columns but cannot operate on "
+                             "them yet");
+  }
+}
 
 sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context)
   : context(context)
