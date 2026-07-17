@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef SIMPATICO_OPERATOR_REGISTRY_HPP
-#define SIMPATICO_OPERATOR_REGISTRY_HPP
+#pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace simpatico {
+
+struct compressor;  // defined in representation.hpp
 
 // Stable identity of an operator *kind*. Doubles as the on-disk leaf tag
 // (serialised as a uint8_t in the .hpln format). Values for leaf ops are
@@ -86,6 +88,13 @@ bool is_terminal_compressor(std::string const& name);
 // Preprocessing (transform) ops reshape data without necessarily shrinking it.
 bool is_preprocessing_compressor(std::string const& name);
 
-}  // namespace simpatico
+/// Resolve a DSL compressor name to a compressor instance, or nullptr if
+/// the name is unknown. The fused ops (delta / rle / bitpack / for / zigzag) are
+/// not here — they go through the JIT codegen encoder, not a compressor factory.
+///
+/// Recognised names (incl. parameterised suffix forms):
+///   identity, dictionary, for, alp, alp_rd, ans,
+///   bitcomp[_default|_sparse], bitextract_<spec>.
+std::unique_ptr<compressor> make_compressor(std::string const& name);
 
-#endif  // SIMPATICO_OPERATOR_REGISTRY_HPP
+}  // namespace simpatico

@@ -661,9 +661,9 @@ bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
 //      non-fusable nodes, in which case the compress walk handles the node with
 //      the generic (non-fused) path.
 //   2. ``cje::render`` walks the tree and emits the kernel +
-//      ``BufferSpec`` list in DFS-preorder node_id order.
+//      ``EncodeBufferSpec`` list in DFS-preorder node_id order.
 //   3. ``cje::compile_plain_kernel`` via the kernel cache.
-//   4. ``rmm::device_buffer`` per BufferSpec; pointers passed to
+//   4. ``rmm::device_buffer`` per EncodeBufferSpec; pointers passed to
 //      ``cuLaunchKernel`` in walker-mandated order.
 //   5. Per-node post-processing:
 //        * Rle  : device-side inclusive scan of rle_runs_offsets
@@ -728,7 +728,7 @@ namespace {
 // list is tiny (≤5 per node, ≤dozens per tree).  Aborts (debug only)
 // if the field is missing: it's a render/codegen contract violation
 // that should never happen at runtime.
-std::size_t find_buffer_idx(const std::vector<cje::BufferSpec>& bufs,
+std::size_t find_buffer_idx(const std::vector<cje::EncodeBufferSpec>& bufs,
                             std::int32_t node_id,
                             std::string_view field)
 {
@@ -737,7 +737,7 @@ std::size_t find_buffer_idx(const std::vector<cje::BufferSpec>& bufs,
   }
   std::fprintf(stderr,
                "simpatico::codegen: encode bridge: BUG - missing buffer (nid=%d field=%.*s); "
-               "BufferSpec list out of sync with walker emit_X — likely a recent walker "
+               "EncodeBufferSpec list out of sync with walker emit_X — likely a recent walker "
                "change that didn't update the bridge's per-op buffer fan-out\n",
                node_id,
                static_cast<int>(field.size()),
@@ -789,7 +789,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                                          "cpp encode");
     if (kernel == nullptr) { return -1; }
 
-    // Allocate one rmm::device_buffer per BufferSpec.  Buffers are moved
+    // Allocate one rmm::device_buffer per EncodeBufferSpec.  Buffers are moved
     // into cudf::columns during rep construction below — the vector
     // serves as the kernel-arg backing storage in the meantime.
     // ``stream`` is always supplied by the caller (encode_fused_subtree →
@@ -817,7 +817,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
       }
     }
 
-    // Build the kernel arg vector.  Order: (flat, n, then BufferSpecs
+    // Build the kernel arg vector.  Order: (flat, n, then EncodeBufferSpecs
     // in walker-emit order — matches add_param order inside the
     // emit_X functions).
     CUdeviceptr d_flat   = static_cast<CUdeviceptr>(data_ptr);
@@ -834,8 +834,8 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                       1,
                                       1,
                                       static_cast<unsigned>(spec.block_x),
-                                      static_cast<unsigned>(spec.block_y),
-                                      static_cast<unsigned>(spec.block_z),
+                                      1,
+                                      1,
                                       static_cast<unsigned>(spec.shared_bytes),
                                       stream.value(),
                                       args.data(),

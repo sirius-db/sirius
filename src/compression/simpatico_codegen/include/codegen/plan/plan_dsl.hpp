@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef SIMPATICO_PLAN_DSL_HPP
-#define SIMPATICO_PLAN_DSL_HPP
+#pragma once
 
 #include <cstdint>
 #include <optional>
@@ -37,5 +36,3 @@ bool parse_plan_dsl(std::string_view dsl, std::vector<plan_step>* out, std::stri
 std::string render_plan_steps(std::vector<plan_step> const& steps);
 
 }  // namespace simpatico
-
-#endif  // SIMPATICO_PLAN_DSL_HPP

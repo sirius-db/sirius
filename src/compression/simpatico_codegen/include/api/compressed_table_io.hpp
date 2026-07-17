@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// C++-native .hpln v9 writer/reader for compressed_table.
+// C++-native .hpln writer/reader for compressed_table.
 //
 // The plan tree is serialized structurally (a node array); the read path
 // rebuilds it directly and attaches each rep to its (node, slot). No DSL text
 // is stored — render it from the tree on demand with render_plan_tree.
 //
-// File layout (v9):
+// File layout:
 //   [Binary header]
 //     "HPLN" (4 bytes)
-//     version = 9 (uint8)
+//     version (uint8)
 //     num_cols (uint16 LE)
 //     per column:
 //       name_len (uint16 LE) + name bytes   [0 = no name]
@@ -69,7 +69,7 @@ compressed_table read_compressed_table(
 
 // ─── In-memory (pinned host) serialization ──────────────────────────────────
 //
-// Splits the .hpln v9 stream into its two natural regions so the caller can keep
+// Splits the .hpln stream into its two natural regions so the caller can keep
 // the (large) payload in its own store — e.g. cuCascade pinned host memory —
 // while the (small) structural header stays a flat byte vector that can be re-parsed
 // quickly during decompression.
@@ -83,7 +83,7 @@ struct payload_buffer_ref {
   std::uint64_t size_bytes = 0;
 };
 
-/// Build the .hpln v9 header for @p table into @p out_header and enumerate every
+/// Build the .hpln header for @p table into @p out_header and enumerate every
 /// payload buffer (in header order, matching describe()) into @p out_buffers with
 /// dense byte offsets; @p out_payload_bytes receives the total payload size. No
 /// bytes are copied — the caller stages each buffer from its `device_ptr` into

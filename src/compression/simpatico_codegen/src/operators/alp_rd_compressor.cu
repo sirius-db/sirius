@@ -567,14 +567,4 @@ std::unique_ptr<compressed_representation> alp_rd_compressor::compress(
   }
 }
 
-std::unique_ptr<cudf::column> alp_rd_compressor::decompress(
-  compressed_representation const& data_to_decompress,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  auto const* repr = dynamic_cast<alp_rd_compressed_representation const*>(&data_to_decompress);
-  if (repr == nullptr) return nullptr;
-  return repr->decompress(stream, mr);
-}
-
 }  // namespace simpatico

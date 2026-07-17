@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -83,6 +84,14 @@ inline std::string op_kind_name(OpKind op)
   }
   return "UNKNOWN";
 }
+
+// Thrown when a renderer rejects a tree shape (an op it can't emit). Distinct
+// from CompileError (nvrtc) so call sites can tell "shape not supported yet"
+// from "shape rendered but the source didn't compile". Shared by the encode and
+// decode renderers.
+struct RenderError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 // ---------------------------------------------------------------------------
 // Buffer contract between the JIT encoder and decoder: a tree-wide set of

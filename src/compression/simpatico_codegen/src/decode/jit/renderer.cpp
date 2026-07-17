@@ -37,6 +37,7 @@
 #include "codegen/decode/jit/renderer.hpp"
 
 #include "codegen/jit/fused_tree.hpp"
+#include "codegen/jit/render_util.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -53,6 +54,10 @@ namespace codegen::decode::jit {
 
 namespace {
 
+using ::codegen::jit::make_entry_symbol;
+using ::codegen::jit::replace_all;
+using ::codegen::jit::unsigned_counterpart;
+
 // ---------------------------------------------------------------------
 // Dtype table — element size per supported scalar type.
 // ---------------------------------------------------------------------
@@ -62,14 +67,6 @@ std::size_t dtype_elem_size(const std::string& name)
   if (name == "int32_t") return 4;
   if (name == "int64_t") return 8;
   return 0;  // 0 => unsupported (caller throws)
-}
-
-// Same-width unsigned type name, for arithmetic that must wrap modulo 2^N
-// instead of relying on signed overflow (UB) -- must mirror the encode
-// side's subtraction exactly (see encode/jit/renderer.cpp).
-const char* unsigned_counterpart(std::size_t elem_size)
-{
-  return (elem_size == 8) ? "uint64_t" : "uint32_t";
 }
 
 // Exact-width unsigned type name. A signed element must pass through this
@@ -82,61 +79,10 @@ const char* exact_unsigned(std::size_t elem_size)
   return (elem_size == 8) ? "uint64_t" : (elem_size == 1) ? "uint8_t" : "uint32_t";
 }
 
-// ---------------------------------------------------------------------
-// String utilities (lifted from the encode walker).
-// ---------------------------------------------------------------------
-std::string replace_all(std::string s, std::string_view needle, std::string_view repl)
-{
-  std::string out;
-  out.reserve(s.size());
-  std::size_t pos = 0;
-  while (true) {
-    auto found = s.find(needle, pos);
-    if (found == std::string::npos) {
-      out.append(s, pos, std::string::npos);
-      break;
-    }
-    out.append(s, pos, found - pos);
-    out.append(repl);
-    pos = found + needle.size();
-  }
-  return out;
-}
-
 // Substitute a value source's __POS__ token with the given position expr.
 std::string at_pos(const std::string& read_expr, const std::string& pos_expr)
 {
   return replace_all(read_expr, "__POS__", pos_expr);
-}
-
-void append_op_segment(std::ostringstream& oss, const ::codegen::jit::FusedTree& node)
-{
-  switch (node.op) {
-    case ::codegen::OpKind::Bitpack: oss << "bp"; break;
-    case ::codegen::OpKind::Delta: oss << "dl"; break;
-    case ::codegen::OpKind::Rle: oss << "rl"; break;
-    case ::codegen::OpKind::For: oss << "fr"; break;
-    case ::codegen::OpKind::Zigzag: oss << "zz"; break;
-    default: oss << "un"; break;
-  }
-  for (const auto& [k, child] : node.children) {
-    (void)k;
-    oss << "_";
-    append_op_segment(oss, *child);
-  }
-}
-
-std::string make_entry_symbol(const ::codegen::jit::FusedTree& tree,
-                              const std::string& element_dtype)
-{
-  std::ostringstream oss;
-  oss << "simpatico_decode_";
-  append_op_segment(oss, tree);
-  oss << "_";
-  for (char c : element_dtype) {
-    oss << (std::isalnum(static_cast<unsigned char>(c)) || c == '_' ? c : '_');
-  }
-  return oss.str();
 }
 
 // ---------------------------------------------------------------------
@@ -283,7 +229,7 @@ class Walker {
   DecodeKernelSpec finalize(const ::codegen::jit::FusedTree& tree)
   {
     DecodeKernelSpec spec;
-    spec.entry_symbol = make_entry_symbol(tree, dtype_);
+    spec.entry_symbol = make_entry_symbol(tree, dtype_, "simpatico_decode_");
 
     std::ostringstream src;
     src << kPrelude;

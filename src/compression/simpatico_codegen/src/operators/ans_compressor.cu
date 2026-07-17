@@ -119,16 +119,6 @@ std::unique_ptr<compressed_representation> ans_compressor::compress(
     dt, n, std::move(comp_buf), actual_size, uncompressed_size);
 }
 
-std::unique_ptr<cudf::column> ans_compressor::decompress(
-  compressed_representation const& data_to_decompress,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  auto const* ans_repr = dynamic_cast<ans_compressed_representation const*>(&data_to_decompress);
-  if (ans_repr == nullptr) return nullptr;
-  return ans_repr->decompress(stream, mr);
-}
-
 namespace detail {
 }  // namespace detail
 

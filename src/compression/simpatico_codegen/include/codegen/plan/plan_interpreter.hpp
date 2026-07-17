@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef SIMPATICO_PLAN_INTERPRETER_HPP
-#define SIMPATICO_PLAN_INTERPRETER_HPP
+#pragma once
 
 #include "codegen/plan/leaf_desc.hpp"
 #include "codegen/plan/plan_dsl.hpp"
@@ -105,5 +104,3 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   leaf_meta_v const& meta = leaf_meta::none{});
 
 }  // namespace simpatico
-
-#endif  // SIMPATICO_PLAN_INTERPRETER_HPP

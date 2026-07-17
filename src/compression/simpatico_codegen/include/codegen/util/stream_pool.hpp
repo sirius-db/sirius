@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef SIMPATICO_UTIL_STREAM_POOL_HPP
-#define SIMPATICO_UTIL_STREAM_POOL_HPP
+#pragma once
 
 #include <cuda_runtime.h>
 
@@ -42,5 +41,3 @@ struct stream_pool {
 };
 
 }  // namespace simpatico
-
-#endif  // SIMPATICO_UTIL_STREAM_POOL_HPP

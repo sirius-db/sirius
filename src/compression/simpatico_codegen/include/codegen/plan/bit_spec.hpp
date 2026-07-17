@@ -1,5 +1,4 @@
-#ifndef SIMPATICO_BIT_SPEC_HPP
-#define SIMPATICO_BIT_SPEC_HPP
+#pragma once
 
 #include <cudf/types.hpp>
 
@@ -115,5 +114,3 @@ bitextract_spec_result parse_bitextract_spec(std::string_view suffix);
 bitextract_spec_result parse_bitjoin_spec(std::string_view suffix);
 
 }  // namespace simpatico
-
-#endif

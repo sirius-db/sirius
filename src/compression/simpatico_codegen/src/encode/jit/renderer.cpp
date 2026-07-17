@@ -58,7 +58,7 @@
 // with its node_id (assigned in DFS-preorder lex-sorted children) so
 // the same op kind (Bitpack, etc.) can appear twice in a tree without
 // collision.  The kernel parameter list order is the same order as
-// the BufferSpecs in EncodeKernelSpec::buffers — that's the contract
+// the EncodeBufferSpecs in EncodeKernelSpec::buffers — that's the contract
 // the launcher relies on for passing CUdeviceptr args via cuLaunchKernel.
 //
 // Failure handling
@@ -71,6 +71,7 @@
 #include "codegen/encode/jit/renderer.hpp"
 
 #include "codegen/jit/fused_tree.hpp"
+#include "codegen/jit/render_util.hpp"
 
 #include <cctype>
 #include <cstdint>
@@ -84,6 +85,10 @@
 namespace codegen::encode::jit {
 
 namespace {
+
+using ::codegen::jit::make_entry_symbol;
+using ::codegen::jit::replace_all;
+using ::codegen::jit::unsigned_counterpart;
 
 // ---------------------------------------------------------------------
 // Dtype table — one source of truth for the per-type info the walker
@@ -107,74 +112,12 @@ const DtypeInfo* lookup_dtype(const std::string& name)
   return (it == table.end()) ? nullptr : &it->second;
 }
 
-// Same-width unsigned type name, for arithmetic that must wrap modulo 2^N
-// instead of relying on signed overflow (UB).
-const char* unsigned_counterpart(std::size_t elem_size)
-{
-  return (elem_size == 8) ? "uint64_t" : "uint32_t";
-}
-
-// ---------------------------------------------------------------------
-// String utilities.
-// ---------------------------------------------------------------------
-
-std::string replace_all(std::string s, std::string_view needle, std::string_view repl)
-{
-  std::string out;
-  out.reserve(s.size());
-  std::size_t pos = 0;
-  while (true) {
-    auto found = s.find(needle, pos);
-    if (found == std::string::npos) {
-      out.append(s, pos, std::string::npos);
-      break;
-    }
-    out.append(s, pos, found - pos);
-    out.append(repl);
-    pos = found + needle.size();
-  }
-  return out;
-}
-
 // Substitute the LaneInput's `__LANE__` token with the given lane
 // expression.  The result is a valid C++ expression in `tid` (or
 // whatever the caller passed) producing the input element value.
 std::string at_lane(const std::string& read_expr, const std::string& lane_expr)
 {
   return replace_all(read_expr, "__LANE__", lane_expr);
-}
-
-// Walk-order op tag for the entry symbol.  Kept short — the
-// kernel-cache key is the source hash, not the symbol.
-void append_op_segment(std::ostringstream& oss, const ::codegen::jit::FusedTree& node)
-{
-  switch (node.op) {
-    case ::codegen::OpKind::Bitpack: oss << "bp"; break;
-    case ::codegen::OpKind::Delta: oss << "dl"; break;
-    case ::codegen::OpKind::Rle: oss << "rl"; break;
-    case ::codegen::OpKind::Raw: oss << "rw"; break;
-    case ::codegen::OpKind::For: oss << "fr"; break;
-    case ::codegen::OpKind::Zigzag: oss << "zz"; break;
-    default: oss << "un"; break;
-  }
-  for (const auto& [k, child] : node.children) {
-    (void)k;
-    oss << "_";
-    append_op_segment(oss, *child);
-  }
-}
-
-std::string make_entry_symbol(const ::codegen::jit::FusedTree& tree,
-                              const std::string& element_dtype)
-{
-  std::ostringstream oss;
-  oss << "simpatico_encode_";
-  append_op_segment(oss, tree);
-  oss << "_";
-  for (char c : element_dtype) {
-    oss << (std::isalnum(static_cast<unsigned char>(c)) || c == '_' ? c : '_');
-  }
-  return oss.str();
 }
 
 // ---------------------------------------------------------------------
@@ -306,7 +249,7 @@ class Walker {
   std::int32_t next_node_id_ = 0;
   std::ostringstream params_;  // post-(flat,n) params, joined with ",\n"
   std::ostringstream body_;    // kernel body lines
-  std::vector<BufferSpec> buffers_;
+  std::vector<EncodeBufferSpec> buffers_;
   SharedMemAllocator sm_;
 
   std::int32_t take_id() { return next_node_id_++; }
@@ -323,7 +266,7 @@ class Walker {
                   std::size_t length,
                   bool no_pre_zero = false)
   {
-    BufferSpec b;
+    EncodeBufferSpec b;
     b.node_id     = node_id;
     b.field       = field;
     b.elem_size   = elem_size;
@@ -335,7 +278,7 @@ class Walker {
   EncodeKernelSpec finalize(const ::codegen::jit::FusedTree& tree)
   {
     EncodeKernelSpec spec;
-    spec.entry_symbol = make_entry_symbol(tree, dtype_);
+    spec.entry_symbol = make_entry_symbol(tree, dtype_, "simpatico_encode_");
 
     std::ostringstream src;
     src << kPrelude;

@@ -1,5 +1,4 @@
-#ifndef SIMPATICO_DICTIONARY_VIEW_HELPER_HPP
-#define SIMPATICO_DICTIONARY_VIEW_HELPER_HPP
+#pragma once
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
@@ -64,5 +63,3 @@ inline std::pair<char const*, int64_t> get_dictionary_keys_chars_info(
 }
 
 }  // namespace simpatico
-
-#endif

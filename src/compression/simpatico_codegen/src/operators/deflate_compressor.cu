@@ -84,15 +84,6 @@ std::unique_ptr<compressed_representation> deflate_compressor::compress(
   return std::make_unique<deflate_compressed_representation>(dt, n, std::move(buf), actual, uncomp);
 }
 
-std::unique_ptr<cudf::column> deflate_compressor::decompress(compressed_representation const& rep,
-                                                             rmm::cuda_stream_view stream,
-                                                             rmm::device_async_resource_ref mr)
-{
-  auto const* r = dynamic_cast<deflate_compressed_representation const*>(&rep);
-  if (!r) return nullptr;
-  return r->decompress(stream, mr);
-}
-
 namespace detail {
 }  // namespace detail
 

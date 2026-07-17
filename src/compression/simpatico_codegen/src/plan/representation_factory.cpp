@@ -125,20 +125,6 @@ std::unique_ptr<compressed_representation> identity_compressed_representation::f
   return std::make_unique<identity_compressed_representation>(std::move(outputs[0]));
 }
 
-std::unique_ptr<compressed_representation> identity_compressor::compress(
-  cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  // A STRING column can't be stored as one contiguous payload; str_split
-  // decomposes it into serializable offsets/chars[/null_mask] channels.
-  if (column_to_compress.type().id() == cudf::type_id::STRING) {
-    return str_split_compressor{}.compress(column_to_compress, stream, mr);
-  }
-  auto col_copy = std::make_unique<cudf::column>(column_to_compress, stream, mr);
-  return std::make_unique<identity_compressed_representation>(std::move(col_copy));
-}
-
 namespace {
 
 // Reads a "null_mask" channel column (UINT8 bitmask bytes, as emitted by

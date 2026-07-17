@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef CODEGEN_LEAF_DESC_HPP
-#define CODEGEN_LEAF_DESC_HPP
+#pragma once
 
 #include "codegen/plan/operator_registry.hpp"
 
@@ -164,5 +163,3 @@ inline cudf::data_type tag_to_dtype(std::uint8_t tag) noexcept
 }
 
 }  // namespace simpatico
-
-#endif  // CODEGEN_LEAF_DESC_HPP

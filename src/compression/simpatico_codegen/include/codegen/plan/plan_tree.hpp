@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef CODEGEN_PLAN_TREE_HPP
-#define CODEGEN_PLAN_TREE_HPP
+#pragma once
 
 #include "codegen/plan/bit_spec.hpp"  // bitfield_spec
 #include "codegen/plan/leaf_desc.hpp"
@@ -19,8 +18,6 @@
 #include <vector>
 
 namespace simpatico {
-
-struct compressed_representation;
 
 using NodeId = std::uint32_t;
 
@@ -139,5 +136,3 @@ std::string dotted_label(PlanTree const& tree, NodeId node);
 std::string render_plan_tree(PlanTree const& tree);
 
 }  // namespace simpatico
-
-#endif  // CODEGEN_PLAN_TREE_HPP

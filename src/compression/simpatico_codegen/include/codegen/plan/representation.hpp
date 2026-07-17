@@ -1,5 +1,4 @@
-#ifndef SIMPATICO_REPRESENTATION_HPP
-#define SIMPATICO_REPRESENTATION_HPP
+#pragma once
 
 #include "codegen/plan/bit_spec.hpp"
 #include "codegen/plan/leaf_desc.hpp"
@@ -161,33 +160,24 @@ struct identity_compressed_representation : compressed_representation {
   OpId kind() const override { return OpId::Identity; }
 };
 
-/// Base compressor: compress(column, stream, mr) -> compressed_representation, decompress(stream,
-/// mr) -> column.
+/// Base compressor: compress(column, stream, mr) -> compressed_representation.
+/// Decompression is representation-driven (compressed_representation::decompress),
+/// so the compressor factory itself has no decompress entry point.
 struct compressor {
   virtual ~compressor() = default;
   virtual std::unique_ptr<compressed_representation> compress(
     cudf::column_view column_to_compress,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) = 0;
-  virtual std::unique_ptr<cudf::column> decompress(
-    compressed_representation const& data_to_decompress,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) = 0;
 };
 
 /// Identity compressor: no-op passthrough, used for leaf nodes that are stored as-is.
 /// A STRING column has no single contiguous payload, so compress() delegates to
-/// str_split (defined out-of-line so str_split_compressor is visible).
+/// str_split; the body is defined inline below, after str_split_compressor is declared.
 struct identity_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override
-  {
-    return data_to_decompress.decompress(stream, mr);
-  }
 };
 
 /// Dictionary format: stores the encoded dictionary column and a copy of keys chars.
@@ -336,9 +326,6 @@ struct dictionary_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 };
 
 // -----------------------------------------------------------------------------
@@ -388,10 +375,21 @@ struct str_split_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 };
+
+// A STRING column has no single contiguous payload, so it decomposes via
+// str_split; any other type is copied verbatim into an identity leaf.
+inline std::unique_ptr<compressed_representation> identity_compressor::compress(
+  cudf::column_view column_to_compress,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (column_to_compress.type().id() == cudf::type_id::STRING) {
+    return str_split_compressor{}.compress(column_to_compress, stream, mr);
+  }
+  auto col_copy = std::make_unique<cudf::column>(column_to_compress, stream, mr);
+  return std::make_unique<identity_compressed_representation>(std::move(col_copy));
+}
 
 // -----------------------------------------------------------------------------
 // nvcomp-backed representations
@@ -467,9 +465,6 @@ struct ans_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 };
 
 // Parses a bitcomp suffix into the algorithm knob. `suffix` is the
@@ -523,9 +518,6 @@ struct bitcomp_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 
  private:
   int algorithm_;
@@ -601,9 +593,6 @@ struct cascaded_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 
  private:
   int num_deltas_;
@@ -640,27 +629,18 @@ struct snappy_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 };
 
 struct lz4_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 };
 
 struct deflate_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 };
 
 // -----------------------------------------------------------------------------
@@ -714,9 +694,6 @@ struct alp_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 };
 
 // ALP-RD (Right-Dictionary), FLOAT32, multi-output. Column-wide K=8 dict +
@@ -779,9 +756,6 @@ struct alp_rd_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override;
 };
 
 // ── bitextract / bitjoin ──────────────────────────────────────────────────────
@@ -854,13 +828,6 @@ struct bitextract_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
-
-  std::unique_ptr<cudf::column> decompress(compressed_representation const& repr,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr) override
-  {
-    return repr.decompress(stream, mr);
-  }
 };
 
 // -----------------------------------------------------------------------------
@@ -905,15 +872,4 @@ struct codegen_fused_representation : compressed_representation {
   OpId kind() const override { return op_id_; }
 };
 
-/// Resolve a DSL compressor name to a compressor instance, or nullptr if
-/// the name is unknown. The fused ops (delta / rle / bitpack / for / zigzag) are
-/// not here — they go through the JIT codegen encoder, not a compressor factory.
-///
-/// Recognised names (incl. parameterised suffix forms):
-///   identity, dictionary, for, alp, alp_rd, ans,
-///   bitcomp[_default|_sparse], bitextract_<spec>.
-std::unique_ptr<compressor> make_compressor(std::string const& name);
-
 }  // namespace simpatico
-
-#endif

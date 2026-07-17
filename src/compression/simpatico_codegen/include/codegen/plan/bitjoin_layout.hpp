@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef SIMPATICO_PLAN_BITJOIN_LAYOUT_HPP
-#define SIMPATICO_PLAN_BITJOIN_LAYOUT_HPP
+#pragma once
 
 #include "codegen/plan/plan_dsl.hpp"   // bit_range
 #include "codegen/plan/plan_tree.hpp"  // ValueId, ValueIdHash
@@ -66,5 +65,3 @@ std::unique_ptr<cudf::column> copy_column_view_as_uint8(cudf::column_view const&
                                                         rmm::device_async_resource_ref mr);
 
 }  // namespace simpatico
-
-#endif  // SIMPATICO_PLAN_BITJOIN_LAYOUT_HPP

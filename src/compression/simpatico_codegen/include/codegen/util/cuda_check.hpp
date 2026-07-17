@@ -2,8 +2,7 @@
 // Shared CUDA-error check: throw a std::runtime_error tagged with `context` when
 // a CUDA call fails, so callers can propagate cleanly instead of open-coding the
 // same if/throw. nvcomp-status checks stay local to the nvcomp layer.
-#ifndef SIMPATICO_CUDA_CHECK_HPP
-#define SIMPATICO_CUDA_CHECK_HPP
+#pragma once
 
 #include <cuda_runtime.h>
 
@@ -20,5 +19,3 @@ inline void throw_if_cuda_error(cudaError_t err, const char* context)
 }
 
 }  // namespace simpatico
-
-#endif  // SIMPATICO_CUDA_CHECK_HPP

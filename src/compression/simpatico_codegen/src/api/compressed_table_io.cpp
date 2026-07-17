@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// C++-native .hpln v8 write/read for compressed_table.
+// C++-native .hpln write/read for compressed_table.
 // See compressed_table_io.hpp for the on-disk layout.
 
 #include "api/compressed_table_io.hpp"
@@ -227,7 +227,6 @@ using leaf_buffer_fill =
 
 static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   leaf_desc const& ld,
-  cudf::size_type col_num_rows,
   leaf_buffer_fill const& fill,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
@@ -264,18 +263,16 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     return col;
   };
 
-  // Delta, Rle, For and Zigzag are codegen-only operators: encode always
+  // Delta, Rle, For, Zigzag and Bitpack are codegen-only operators: encode always
   // produces a JIT codegen_fused_representation carrying the fused region's
-  // manifest buffers, so their leaves are reconstructed unconditionally as a
-  // fused rep.
-  // A fused rep's num_rows drives the codegen decode grid. Use the node's own
-  // output length (round-tripped in leaf_desc); fall back to the column row count
-  // only for legacy blobs that predate the field (ld.num_rows == 0).
-  const cudf::size_type node_rows =
-    ld.num_rows > 0 ? static_cast<cudf::size_type>(ld.num_rows) : col_num_rows;
-  auto make_fused_rep = [&](OpId op_id, cudf::size_type rows) {
+  // manifest buffers, so their leaves are reconstructed unconditionally as a fused
+  // rep. num_rows -- the node's own output length, round-tripped in leaf_desc --
+  // drives the codegen decode grid (for Bitpack it is not derivable from any
+  // buffer, since chunk_min/count/bits are per-chunk and packed is words).
+  const cudf::size_type node_rows = static_cast<cudf::size_type>(ld.num_rows);
+  auto make_fused_rep             = [&](OpId op_id) {
     auto rep =
-      std::make_unique<codegen_fused_representation>(op_id, tag_to_dtype(ld.type_tag), rows);
+      std::make_unique<codegen_fused_representation>(op_id, tag_to_dtype(ld.type_tag), node_rows);
     for (std::size_t i = 0; i < bufs.size(); ++i) {
       rep->buffers.emplace_back(bufs[i].name, make_col(i));
     }
@@ -283,38 +280,12 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   };
 
   if (ld.kind == OpId::Delta || ld.kind == OpId::Rle || ld.kind == OpId::For ||
-      ld.kind == OpId::Zigzag) {
-    return make_fused_rep(ld.kind, node_rows);
-  }
-  if (ld.kind == OpId::Bitpack) {
-    // Bitpack reconstructs as a fused rep like the four transforms above, but its
-    // logical row count is not any buffer's size (chunk_min/count/bits are
-    // per-chunk, packed is words). Prefer the serialized num_rows; for legacy
-    // blobs lacking it, sum chunk_count.
-    cudf::size_type rows = static_cast<cudf::size_type>(ld.num_rows);
-    if (ld.num_rows == 0) {
-      for (std::size_t i = 0; i < bufs.size(); ++i) {
-        if (bufs[i].name != "chunk_count") continue;
-        auto cc = make_col(i);
-        std::vector<std::int32_t> h(static_cast<std::size_t>(cc->size()));
-        if (!h.empty()) {
-          cudaMemcpyAsync(h.data(),
-                          cc->view().head<std::int32_t>(),
-                          h.size() * sizeof(std::int32_t),
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
-          cudaStreamSynchronize(stream.value());
-          for (auto c : h)
-            rows += c;
-        }
-        break;
-      }
-    }
-    return make_fused_rep(ld.kind, rows);
+      ld.kind == OpId::Zigzag || ld.kind == OpId::Bitpack) {
+    return make_fused_rep(ld.kind);
   }
   if (ld.kind == OpId::Identity) {
     bool is_fused = !(bufs.size() == 1 && bufs[0].name == "data");
-    if (is_fused) return make_fused_rep(ld.kind, node_rows);
+    if (is_fused) return make_fused_rep(ld.kind);
   }
 
   // All other kinds (and non-fused identity): route through reconstruct_representation.
@@ -435,7 +406,7 @@ struct ColRecord {
   std::vector<std::vector<std::uint64_t>> buf_offsets;  // [leaf][buffer] -> payload offset
 };
 
-// Parse the .hpln v8 header from `r` into one ColRecord per column. On success
+// Parse the .hpln header from `r` into one ColRecord per column. On success
 // `r` is left pointing just past the header (i.e. at the payload region for the
 // concatenated file layout). Returns false and sets *err on any structural error.
 static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::string* err)
@@ -559,8 +530,7 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
       };
 
       std::string rep_err;
-      auto rep = rep_from_leaf_desc(
-        ld, static_cast<cudf::size_type>(cr.num_rows), fill, stream, mr, &rep_err);
+      auto rep = rep_from_leaf_desc(ld, fill, stream, mr, &rep_err);
       if (!rep) return fail("rep_from_leaf_desc (col " + std::to_string(ci) + "): " + rep_err);
 
       PlanNode& node = nodes[ld.node_index];

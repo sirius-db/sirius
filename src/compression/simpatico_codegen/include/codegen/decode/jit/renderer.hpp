@@ -81,10 +81,9 @@ struct DecodeKernelSpec {
   std::string note;  // human-readable diagnostic
 };
 
-// Thrown when the renderer rejects a tree shape (unsupported op).
-struct RenderError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
+// Renderer rejected a tree shape (an op it can't emit). Shared with the encode
+// renderer — see codegen::jit::RenderError.
+using ::codegen::jit::RenderError;
 
 // Render a DecodeKernelSpec for `tree` parametrised over `element_dtype`
 // ("int32_t" / "int64_t").  `num_chunks` is used only to size the

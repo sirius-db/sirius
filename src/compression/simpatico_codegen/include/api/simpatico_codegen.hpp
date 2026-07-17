@@ -126,18 +126,6 @@ compressed_table compress_with_plan(
 
 // ── Decompression ─────────────────────────────────────────────────────────────
 
-/// Decompress a single compressed column.
-///
-/// @param compound  Compressed column payload.
-/// @param stream    CUDA stream for all GPU operations.
-/// @param mr        Device memory resource; nullptr selects the RMM default.
-/// @returns  Newly allocated decompressed column.
-/// @throws std::runtime_error on GPU error.
-std::unique_ptr<cudf::column> decompress(
-  const PlanTree& tree,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
-
 /// Decompress all columns of @p table sequentially on a single CUDA stream.
 ///
 /// @param table   Compressed table.

@@ -149,16 +149,6 @@ std::unique_ptr<compressed_representation> bitcomp_compressor::compress(
     dt, n, std::move(comp_buf), actual_size, uncompressed_size, algorithm_);
 }
 
-std::unique_ptr<cudf::column> bitcomp_compressor::decompress(
-  compressed_representation const& data_to_decompress,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  auto const* bc_repr = dynamic_cast<bitcomp_compressed_representation const*>(&data_to_decompress);
-  if (bc_repr == nullptr) return nullptr;
-  return bc_repr->decompress(stream, mr);
-}
-
 namespace detail {
 }  // namespace detail
 

@@ -300,16 +300,6 @@ compressed_table compress_with_plan(cudf::table_view table,
 
 // ── decompress ────────────────────────────────────────────────────────────────
 
-std::unique_ptr<cudf::column> decompress(const PlanTree& tree,
-                                         rmm::cuda_stream_view stream,
-                                         rmm::device_async_resource_ref mr)
-{
-  std::string err;
-  auto col = decompress_column(tree, stream, mr, &err);
-  if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
-  return col;
-}
-
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::cuda_stream_view stream,
                                         rmm::device_async_resource_ref mr)
@@ -318,7 +308,10 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
   cols.reserve(table.num_columns());
   for (auto const& col : table.columns) {
     if (!col.compound) throw plan_error("compressed_table column missing compound");
-    cols.push_back(apply_stored_dtype(simpatico::decompress(*col.compound, stream, mr), col.dtype));
+    std::string err;
+    auto c = decompress_column(*col.compound, stream, mr, &err);
+    if (!c) throw plan_error(err.empty() ? "decompress failed" : err);
+    cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
   }
   return std::make_unique<cudf::table>(std::move(cols));
 }

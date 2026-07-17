@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#ifndef CODEGEN_BRIDGE_FUSED_TREE_BUILD_HPP
-#define CODEGEN_BRIDGE_FUSED_TREE_BUILD_HPP
+#pragma once
 
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/plan/plan_tree.hpp"
@@ -63,5 +62,3 @@ struct BuiltFusedTree {
 std::optional<BuiltFusedTree> build_fused_tree(PlanTree const& tree, NodeId root);
 
 }  // namespace simpatico
-
-#endif  // CODEGEN_BRIDGE_FUSED_TREE_BUILD_HPP

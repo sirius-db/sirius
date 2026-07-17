@@ -293,15 +293,4 @@ std::unique_ptr<compressed_representation> dictionary_compressor::compress(
   return dictionary_compress_impl(column_to_compress, stream, mr);
 }
 
-std::unique_ptr<cudf::column> dictionary_compressor::decompress(
-  compressed_representation const& data_to_decompress,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  auto const* dict_repr =
-    dynamic_cast<dictionary_compressed_representation const*>(&data_to_decompress);
-  if (dict_repr == nullptr) { return nullptr; }
-  return dict_repr->decompress(stream, mr);
-}
-
 }  // namespace simpatico

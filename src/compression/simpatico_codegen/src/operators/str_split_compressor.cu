@@ -137,14 +137,4 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
     n, std::move(offsets), std::move(chars), std::move(null_mask));
 }
 
-std::unique_ptr<cudf::column> str_split_compressor::decompress(
-  compressed_representation const& data_to_decompress,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  auto const* repr = dynamic_cast<str_split_compressed_representation const*>(&data_to_decompress);
-  if (repr == nullptr) return nullptr;
-  return repr->decompress(stream, mr);
-}
-
 }  // namespace simpatico

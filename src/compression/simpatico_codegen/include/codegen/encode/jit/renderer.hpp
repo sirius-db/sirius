@@ -3,7 +3,7 @@
 // Walks a `codegen::jit::FusedTree` and produces:
 //   1. The CUDA-C++ source for a kernel that performs the GPU encode,
 //      ready to hand to `compile_plain_kernel`.
-//   2. The `BufferSpec` list the caller must allocate before launching
+//   2. The `EncodeBufferSpec` list the caller must allocate before launching
 //      (per-op output buffers in the OverAllocate layout).
 //   3. The launch geometry (grid/block/shared) the caller must use.
 //
@@ -74,11 +74,10 @@ namespace codegen::encode::jit {
 // launching the kernel and pass the device pointers in `field` order
 // (see `EncodeKernelSpec::buffer_field_order`).
 //
-// `field` matches the manifest key the decode-side reads from
-// (`codegen::jit::buffer_manifest.hpp`), so a caller building
-// LabeledBuffers for decode can use the spec list verbatim as the
-// labels.
-struct BufferSpec {
+// `field` matches the manifest key the decode-side reads from (the per-op
+// buffer contract documented in decode/jit/renderer.hpp), so a caller building
+// LabeledBuffers for decode can use the spec list verbatim as the labels.
+struct EncodeBufferSpec {
   int32_t node_id;          // FusedTree node id (DFS-preorder lex-sorted children)
   std::string field;        // manifest key ("chunk_min", "packed", "live_words", ...)
   std::size_t elem_size;    // sizeof one element of the buffer's logical dtype
@@ -106,14 +105,12 @@ struct EncodeKernelSpec {
   // kernel's parameter list (after the leading `flat`/`n` inputs).
   // Always sorted by `node_id` then by an op-defined field-order so
   // the binding is deterministic across runs.
-  std::vector<BufferSpec> buffers;
+  std::vector<EncodeBufferSpec> buffers;
 
   // Launch geometry.
   // grid_x = num_chunks_for(n).  The renderer hard-codes this rule;
   // the caller computes the grid size from input length.
   int block_x      = 1024;
-  int block_y      = 1;
-  int block_z      = 1;
   int shared_bytes = 0;
 
   // Diagnostic.  Empty for valid renders; populated with a short
@@ -122,12 +119,9 @@ struct EncodeKernelSpec {
   std::string note;
 };
 
-// Thrown when the renderer rejects a tree shape.  Distinct from
-// `CompileError` (nvrtc) so call sites can distinguish "shape not
-// supported yet" from "shape rendered but the source didn't compile".
-struct RenderError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
+// Renderer rejected a tree shape (an op it can't emit). Shared with the decode
+// renderer — see codegen::jit::RenderError.
+using ::codegen::jit::RenderError;
 
 // Render an EncodeKernelSpec for `tree` parametrised over `element_dtype`.
 //
@@ -136,7 +130,7 @@ struct RenderError : std::runtime_error {
 //                    "int64_t").  Threaded into the kernel signature
 //                    and the per-op intrinsics.
 // `num_chunks`     : ceil(n / kChunkSize) — used to size the per-node
-//                    output BufferSpecs.  Caller computes this from the
+//                    output EncodeBufferSpecs.  Caller computes this from the
 //                    input length so the spec list is self-contained
 //                    (no second walk needed at launch time).
 //
