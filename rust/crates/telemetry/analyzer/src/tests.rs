@@ -17,13 +17,13 @@ use quent_events::Event;
 use quent_model::{Capacity, FsmEvent, Ref, Usage};
 use quent_query_engine_analyzer::ui::UiAnalyzer;
 use quent_query_engine_model::{engine, operator, plan, query, query_group, worker};
-use quent_query_engine_ui::{DataFlowTimelineResponse, OperatorFilter, QueryFilter};
+use quent_query_engine_ui::{OperatorFilter, QueryFilter};
 use quent_ui::entities::request::{
     EntityListEntry, EntityListFilter, EntityListRequest, EntityScope, EntitySortKey, Sort,
     SortDir, TimeWindow,
 };
 use quent_ui::timeline::{
-    distribution::DistributionTimelineRequest,
+    categorical::CategoricalTimelineRequest,
     request::{
         EntityFilter, ResourceTimelineRequest, SingleTimelineRequest, TimelineConfig,
         TimelineRequest,
@@ -408,8 +408,8 @@ fn analyzer(fixture: &mut Fixture) -> SiriusUiAnalyzer {
 }
 
 /// A request for the full query window [0, 1000) ns in 10 bins of 100 ns.
-fn request(query_id: Uuid, measures: &[&str]) -> DistributionTimelineRequest<QueryFilter> {
-    DistributionTimelineRequest {
+fn request(query_id: Uuid, measures: &[&str]) -> CategoricalTimelineRequest<QueryFilter> {
+    CategoricalTimelineRequest {
         measures: measures.iter().map(|m| m.to_string()).collect(),
         config: TimelineConfig {
             num_bins: 10,
@@ -455,12 +455,9 @@ fn data_flow_timeline_bins() {
     let mut fixture = fixture(true);
     let analyzer = analyzer(&mut fixture);
 
-    let response = analyzer
+    let binned = analyzer
         .data_flow_timeline(request(fixture.query_id, &[]))
         .expect("data flow timeline");
-    let DataFlowTimelineResponse::Binned(binned) = response else {
-        panic!("expected a binned response");
-    };
 
     assert_eq!(binned.decl.entity_type_name, "batch");
     assert_eq!(binned.decl.dimension_name, "Memory Tier");
@@ -525,12 +522,9 @@ fn data_flow_timeline_task_working_space() {
     add_working_space_task(&mut fixture);
     let analyzer = analyzer(&mut fixture);
 
-    let response = analyzer
+    let binned = analyzer
         .data_flow_timeline(request(fixture.query_id, &[]))
         .expect("data flow timeline");
-    let DataFlowTimelineResponse::Binned(binned) = response else {
-        panic!("expected a binned response");
-    };
 
     // The task lives on op1 like batch A: still a single operator series.
     assert_eq!(binned.operators.len(), 1);
@@ -575,10 +569,12 @@ fn data_flow_timeline_unsupported_without_batches() {
     let mut fixture = fixture(false);
     let analyzer = analyzer(&mut fixture);
 
-    let response = analyzer
+    // No batch telemetry: the endpoint reports the feature as unsupported
+    // via an error (the server maps it to HTTP 501).
+    let error = analyzer
         .data_flow_timeline(request(fixture.query_id, &[]))
-        .expect("data flow timeline");
-    assert!(matches!(response, DataFlowTimelineResponse::Unsupported));
+        .expect_err("data flow is unsupported without batch telemetry");
+    assert!(matches!(error, AnalyzerError::Unsupported));
 }
 
 #[test]
@@ -587,12 +583,9 @@ fn data_flow_timeline_measures_filter() {
     let analyzer = analyzer(&mut fixture);
 
     // Only "bytes": the count measure is neither declared nor computed.
-    let response = analyzer
+    let binned = analyzer
         .data_flow_timeline(request(fixture.query_id, &["bytes"]))
         .expect("data flow timeline");
-    let DataFlowTimelineResponse::Binned(binned) = response else {
-        panic!("expected a binned response");
-    };
     let measures: Vec<&str> = binned.decl.measures.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(measures, ["bytes"]);
     let series = &binned.operators[&fixture.op1_id];
@@ -603,6 +596,12 @@ fn data_flow_timeline_measures_filter() {
     let error = analyzer
         .data_flow_timeline(request(fixture.query_id, &["bogus"]))
         .expect_err("unknown measures are rejected");
+    assert!(matches!(error, AnalyzerError::InvalidArgument(_)));
+
+    // A typo next to a valid measure is an error too, not silently ignored.
+    let error = analyzer
+        .data_flow_timeline(request(fixture.query_id, &["count", "bogus"]))
+        .expect_err("unknown measures are rejected even alongside valid ones");
     assert!(matches!(error, AnalyzerError::InvalidArgument(_)));
 }
 

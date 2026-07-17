@@ -4,15 +4,14 @@ pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::entities;
 use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
 use quent_query_engine_ui::{
-    OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
-    DataFlowTimelineBinned, DataFlowTimelineResponse,
+    DataFlowTimelineBinned, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
 use quent_ui::{
     FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
     quantity::{CapacityKind, QuantitySpec},
     timeline::{
-        distribution::{
-            DimensionKeyDecl, DistributionDecl, DistributionSeries, DistributionTimelineRequest,
+        categorical::{
+            CategoricalDecl, CategoricalSeries, CategoricalTimelineRequest, DimensionKeyDecl,
             MeasureDecl,
         },
         request::{
@@ -39,7 +38,7 @@ use quent_analyzer::{
         tree::ResourceTreeNode,
     },
     timeline::binned::{
-        distribution::{DistributionKey, DistributionTimelineBuilder},
+        categorical::{CategoricalKey, CategoricalTimelineBuilder},
         resource::{
             ResourceTimeline, ResourceTimelineBuilder, ResourceTimelineByKey,
             ResourceTimelineByKeyBuilder,
@@ -1152,29 +1151,35 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
     fn data_flow_timeline(
         &self,
-        request: DistributionTimelineRequest<QueryFilter>,
-    ) -> AnalyzerResult<DataFlowTimelineResponse> {
+        request: CategoricalTimelineRequest<QueryFilter>,
+    ) -> AnalyzerResult<DataFlowTimelineBinned> {
         // Datasets recorded before Batch instrumentation existed have no batch
-        // events; report the feature as unsupported so the UI hides the view.
+        // events; report the feature as unsupported (HTTP 501) so the UI hides
+        // the view.
         if self.model.batches.is_empty() {
-            return Ok(DataFlowTimelineResponse::Unsupported);
+            return Err(AnalyzerError::Unsupported);
         }
 
         let query_id = request.app_params.query_id;
         let epoch = self.query_engine_model().query_epoch(query_id)?;
         let config = request.config.try_into_binned_span(epoch)?;
 
-        // Which of the declared measures to compute; empty means all.
+        // Which of the declared measures to compute; empty means all. Any
+        // unknown name is an error, even alongside valid ones — silently
+        // ignoring it would hide client typos.
+        if let Some(unknown) = request
+            .measures
+            .iter()
+            .find(|m| *m != MEASURE_COUNT && *m != MEASURE_BYTES)
+        {
+            return Err(AnalyzerError::InvalidArgument(format!(
+                "unknown measure '{unknown}'; declared measures are '{MEASURE_COUNT}' and '{MEASURE_BYTES}'"
+            )));
+        }
         let want =
             |name: &str| request.measures.is_empty() || request.measures.iter().any(|m| m == name);
         let want_count = want(MEASURE_COUNT);
         let want_bytes = want(MEASURE_BYTES);
-        if !want_count && !want_bytes {
-            return Err(AnalyzerError::InvalidArgument(format!(
-                "unknown measures {:?}; declared measures are '{MEASURE_COUNT}' and '{MEASURE_BYTES}'",
-                request.measures
-            )));
-        }
 
         let view = self.model.query_view(query_id)?;
 
@@ -1189,7 +1194,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .map(|r| (r.id(), r.instance_name()))
             .collect();
 
-        let mut builder = DistributionTimelineBuilder::<Uuid>::new(config);
+        let mut builder = CategoricalTimelineBuilder::new(config);
         // The view's batches are already restricted to this query's operators.
         for batch in view.batches() {
             let Some(operator_id) = batch.pipeline_uuid() else {
@@ -1220,7 +1225,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 let dimension = tier_names[&tier_usage.resource_id];
                 if want_count {
                     builder.try_push(
-                        DistributionKey {
+                        CategoricalKey {
                             series: operator_id,
                             measure: MEASURE_COUNT,
                             state,
@@ -1239,7 +1244,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .sum();
                     if bytes > 0 {
                         builder.try_push(
-                            DistributionKey {
+                            CategoricalKey {
                                 series: operator_id,
                                 measure: MEASURE_BYTES,
                                 state,
@@ -1276,7 +1281,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 let dimension = tier_names[&tier_usage.resource_id];
                 if want_count {
                     builder.try_push(
-                        DistributionKey {
+                        CategoricalKey {
                             series: operator_id,
                             measure: MEASURE_COUNT,
                             state: TASK_WORKING_SPACE_STATE,
@@ -1295,7 +1300,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .sum();
                     if bytes > 0 {
                         builder.try_push(
-                            DistributionKey {
+                            CategoricalKey {
                                 series: operator_id,
                                 measure: MEASURE_BYTES,
                                 state: TASK_WORKING_SPACE_STATE,
@@ -1312,7 +1317,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         // Pivot the flat aggregation into per-operator nested series. All-zero
         // series (e.g. from zero-duration states) are omitted; the protocol
         // treats absent entries as all-zero bins.
-        let mut operators: StdHashMap<Uuid, DistributionSeries> = StdHashMap::new();
+        let mut operators: StdHashMap<Uuid, CategoricalSeries> = StdHashMap::new();
         for (key, bins) in builder.build().data {
             if bins.iter().all(|v| *v == 0.0) {
                 continue;
@@ -1361,9 +1366,9 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             });
         }
 
-        Ok(DataFlowTimelineResponse::Binned(DataFlowTimelineBinned {
+        Ok(DataFlowTimelineBinned {
             config: config.try_to_secs_relative(epoch)?,
-            decl: DistributionDecl {
+            decl: CategoricalDecl {
                 entity_type_name: Batch::fsm_type_declaration().name,
                 dimension_name: "Memory Tier".to_owned(),
                 dimension_keys,
@@ -1371,7 +1376,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 default_measure: Some(MEASURE_BYTES.to_owned()),
             },
             operators,
-        }))
+        })
     }
 }
 
