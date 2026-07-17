@@ -253,7 +253,7 @@ std::filesystem::path write_s3_transport_config(std::string_view transport)
          "  executor:\n"
          "    scan_manager:\n"
          "      use_sirius_datasource: true\n"
-         "      num_threads: 1\n"
+         "      num_threads: 3\n"
          "      uring_n_reactors: 1\n"
          "      rest_n_reactors: 1\n"
          "      object_store:\n"
