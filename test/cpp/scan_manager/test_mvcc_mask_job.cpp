@@ -271,6 +271,58 @@ TEST_CASE("run_mvcc_mask_jobs keeps pinned masks for dirty chunks only",
   exec_ok(*tdb.con, "ROLLBACK");
 }
 
+TEST_CASE("run_mvcc_mask_jobs fills checkpoint-grown chunks through a single task",
+          "[mvcc_mask_job][scan_manager]")
+{
+  auto& e = env();
+  job_test_db tdb;
+  // Checkpoint, append, checkpoint again: the append keeps its own row group,
+  // so its slice starts at bit offset 50000 — not a mask-word multiple — and
+  // the job must serialize this chunk's fill instead of slicing it across
+  // tasks.
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  exec_ok(*tdb.con, "INSERT INTO t SELECT range::INTEGER + 50000 FROM range(100)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  exec_ok(*tdb.con, "DELETE FROM t WHERE k IN (49995, 49999, 50000, 50001, 50031, 50032)");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  auto metadata = make_metadata(*tdb.con, storage);
+  REQUIRE(metadata.base_row_count_per_chunk.size() == 1);
+
+  auto* host_space = e.mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(host_space != nullptr);
+
+  mvcc_mask_job_request request;
+  request.masks        = mvcc_chunk_mask_set(1);
+  request.metadata     = metadata;
+  request.storage      = &storage;
+  request.context      = tdb.con->context.get();
+  request.chunk_spaces = {host_space};
+  request.entry_name   = "t";
+  std::vector<mvcc_mask_job_request> requests;
+  requests.push_back(std::move(request));
+
+  sirius::exec::static_thread_pool pool(4);
+  sirius::exec::scoped_dispatcher dispatcher(pool, 4);
+  run_mvcc_mask_jobs(requests, dispatcher, *e.mgr, e.topology);
+
+  auto const& mask = requests[0].masks[0];
+  REQUIRE(mask.has_mask());
+  REQUIRE(mask.row_count == 50100);
+  for (std::size_t r = 0; r < 50100; ++r) {
+    bool const deleted =
+      (r == 49995 || r == 49999 || r == 50000 || r == 50001 || r == 50031 || r == 50032);
+    if (bit_at(mask.view(), r) != !deleted) {
+      INFO("row " << r);
+      REQUIRE(bit_at(mask.view(), r) == !deleted);
+    }
+  }
+
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
 TEST_CASE("run_mvcc_mask_jobs is a no-op for version-state-free tables",
           "[mvcc_mask_job][scan_manager]")
 {

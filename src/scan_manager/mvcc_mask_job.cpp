@@ -29,6 +29,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/transaction/transaction_data.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -238,7 +239,7 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
           c,
           bytes,
           block_size);
-        auto storage = std::make_shared<std::vector<std::uint32_t>>(n_words);
+        auto storage = std::make_shared<std::vector<std::uint32_t>>(n_words, 0u);
         plan_requests[p]->masks[c] =
           mvcc_chunk_mask{std::shared_ptr<std::uint32_t[]>(storage, storage->data()), rows};
         workset.works.push_back(make_work(p, c));
@@ -285,11 +286,13 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
     bundle->blocks      = fsmr->allocate_multiple_blocks(total_bytes, bundle->reservation.get());
 
     for (auto const& slot : layout.slots) {
-      auto* base = reinterpret_cast<std::uint8_t*>(bundle->blocks->at(slot.block).data());
+      auto* base  = reinterpret_cast<std::uint8_t*>(bundle->blocks->at(slot.block).data());
+      auto* words = reinterpret_cast<std::uint32_t*>(base + slot.offset);
+      // Zero-initialize the carve: the fill writer is bit-exact at word edges
+      // and must never read indeterminate memory through them.
+      std::fill_n(words, slot.bytes / sizeof(std::uint32_t), 0u);
       plan_requests[slot.plan]->masks[slot.chunk] =
-        mvcc_chunk_mask{std::shared_ptr<std::uint32_t[]>(
-                          bundle, reinterpret_cast<std::uint32_t*>(base + slot.offset)),
-                        slot.rows};
+        mvcc_chunk_mask{std::shared_ptr<std::uint32_t[]>(bundle, words), slot.rows};
       workset.works.push_back(make_work(slot.plan, slot.chunk));
     }
   }
@@ -303,8 +306,17 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
   auto const parse_chunk = op::scan::metadata_parse_chunk();
   for (auto& work_ptr : workset.works) {
     auto* work = work_ptr.get();
-    for (std::size_t begin = 0; begin < work->slices.size(); begin += parse_chunk) {
-      auto const count = std::min(parse_chunk, work->slices.size() - begin);
+    // Parallel range slicing requires every slice to start on a mask-word
+    // boundary (concurrent tasks must never share a word). Checkpoint-grown
+    // tables can have row groups of any size, so a chunk with unaligned
+    // offsets fills through ONE task — serial within the chunk, still
+    // parallel across chunks and entries.
+    bool const word_aligned = std::all_of(work->slices.begin(),
+                                          work->slices.end(),
+                                          [](auto const& s) { return s.chunk_offset % 32 == 0; });
+    auto const step         = word_aligned ? parse_chunk : work->slices.size();
+    for (std::size_t begin = 0; begin < work->slices.size(); begin += step) {
+      auto const count = std::min(step, work->slices.size() - begin);
       workset.fill_tasks.push_back([work, begin, count] {
         auto const& mask = (*work->masks)[work->chunk_index];
         std::span<std::uint32_t> words{mask.words.get(), (mask.row_count + 31) / 32};

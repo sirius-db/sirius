@@ -483,6 +483,48 @@ TEST_CASE("mvcc visibility: any_update_chains flags updated columns only",
   exec_ok(*env.con, "ROLLBACK");
 }
 
+TEST_CASE("mvcc visibility: checkpoint-grown row groups fill at unaligned offsets",
+          "[duckdb_mvcc_visibility][scan]")
+{
+  vis_test_db env;
+  // Checkpoint, append, checkpoint again: the append lands in its own row
+  // group (checkpoint's small-row-group vacuum leaves the large first one
+  // alone), so the second slice starts at chunk offset 50000 — not a
+  // mask-word multiple (50000 % 32 == 16).
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000)");
+  exec_ok(*env.con, "CHECKPOINT");
+  exec_ok(*env.con, "INSERT INTO t SELECT range::INTEGER + 50000 FROM range(100)");
+  exec_ok(*env.con, "CHECKPOINT");
+  // Straddle the row-group boundary and both edges of the shared mask word.
+  exec_ok(*env.con, "DELETE FROM t WHERE k IN (49995, 49999, 50000, 50001, 50031, 50032)");
+
+  constexpr std::size_t kTotal = 50100;
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  auto metadata = make_metadata(*env.con, storage, /*rgs_per_chunk=*/8);
+  REQUIRE(metadata.base_row_count_per_chunk == std::vector<std::size_t>{kTotal});
+
+  auto plan = capture_mvcc_visibility_plan(storage, *env.con->context, metadata);
+  REQUIRE(plan.mvcc_row_groups.size() == 1);
+  REQUIRE(plan.mvcc_row_groups[0].size() == 2);
+  REQUIRE(plan.mvcc_row_groups[0][1].chunk_offset == 50000);  // unaligned by design
+
+  std::vector<std::uint32_t> words((kTotal + 31) / 32, 0u);
+  bool const dropped =
+    fill_keep_mask_for_row_groups(plan.mvcc_row_groups[0], plan.transaction, words);
+  REQUIRE(dropped);
+
+  auto visible = visible_rowids(*env.con, "t", kTotal);
+  for (std::size_t i = 0; i < kTotal; ++i) {
+    bool const kept = ((words[i / 32] >> (i % 32)) & 1u) != 0;
+    if (kept != visible[i]) {
+      INFO("rowid " << i);
+      REQUIRE(kept == static_cast<bool>(visible[i]));
+    }
+  }
+  exec_ok(*env.con, "ROLLBACK");
+}
+
 TEST_CASE("mvcc visibility: fused native-read check is precise where the probe is conservative",
           "[duckdb_mvcc_visibility][scan]")
 {
