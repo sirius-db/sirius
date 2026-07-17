@@ -108,6 +108,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   output_batches.reserve(input_batches.size());
 
   for (auto& input_ro : input_batches) {
+    // Null check BEFORE get_cudf_table_view (which throws on null data)
+    if (!input_ro.get_data()) { continue; }
     auto input_view = sirius::get_cudf_table_view(input_ro);
     auto* space = input_ro.get_memory_space();
     if (!space) { continue; }
