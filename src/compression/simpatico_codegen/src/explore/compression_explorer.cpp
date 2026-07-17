@@ -322,7 +322,7 @@ operator_trial try_operator(std::string const& name,
     r.error_message = name + ": requires floating-point input";
     return r;
   }
-  if ((name == "dictionary" || name == "dictionary_fast" || name == "str_split") && !is_str) {
+  if ((name == "dictionary" || name == "str_split") && !is_str) {
     r.error_message = name + ": requires string input";
     return r;
   }

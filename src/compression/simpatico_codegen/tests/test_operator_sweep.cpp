@@ -441,7 +441,7 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
         }
       }
     };
-    must_apply("string", {"dictionary", "dictionary_fast", "str_split"});
+    must_apply("string", {"dictionary", "str_split"});
     must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack"});
     must_apply("date", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
   }

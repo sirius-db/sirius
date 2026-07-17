@@ -689,28 +689,11 @@ leaf_desc make_leaf_desc(std::uint32_t node_index,
   d.meta     = rep->describe_meta();
   for (auto const& ch : rep->named_channels(stream)) {
     leaf_buffer_desc bd;
-    bd.name     = ch.name;
-    bd.type_tag = dtype_to_tag(ch.view.type());
-    bd.num_rows = static_cast<std::uint64_t>(ch.view.size());
-    // cudf::size_of() only supports fixed-width types (e.g. dictionary's
-    // fast-mode "keys" channel is a raw STRING column) — account for
-    // offsets + chars directly instead of calling it on a STRING view.
-    if (ch.view.type().id() == cudf::type_id::STRING) {
-      if (ch.view.num_children() == 0) {
-        if (ch.view.size() != 0) {
-          throw std::logic_error("non-empty STRING channel has no offsets child.");
-        }
-        bd.size_bytes = 0;
-      } else {
-        cudf::strings_column_view scv(ch.view);
-        auto const offsets_width = static_cast<size_t>(cudf::size_of(scv.offsets().type()));
-        bd.size_bytes            = static_cast<std::uint64_t>(ch.view.size() + 1) * offsets_width +
-                        static_cast<std::uint64_t>(scv.chars_size(stream));
-      }
-    } else {
-      bd.size_bytes = static_cast<std::uint64_t>(ch.view.size()) *
-                      static_cast<std::uint64_t>(cudf::size_of(ch.view.type()));
-    }
+    bd.name       = ch.name;
+    bd.type_tag   = dtype_to_tag(ch.view.type());
+    bd.num_rows   = static_cast<std::uint64_t>(ch.view.size());
+    bd.size_bytes = static_cast<std::uint64_t>(ch.view.size()) *
+                    static_cast<std::uint64_t>(cudf::size_of(ch.view.type()));
     bd.device_ptr = ch.view.head<void>();
     d.buffers.push_back(std::move(bd));
   }
@@ -764,24 +747,6 @@ std::string build_compressed_table_header(compressed_table const& table,
                                           rmm::cuda_stream_view stream)
 {
   auto const all_descs = table.describe(stream);
-
-  // A STRING column is physically split across offsets and chars (plus an
-  // optional null mask), so no single parent head() pointer describes its
-  // bytes. identity on a STRING column decomposes via str_split; reject any
-  // remaining raw STRING channel before exposing a fabricated payload range.
-  for (auto const& descs : all_descs) {
-    for (auto const& desc : descs) {
-      for (auto const& buffer : desc.buffers) {
-        if (tag_to_dtype(buffer.type_tag).id() == cudf::type_id::STRING) {
-          out_header.clear();
-          out_buffers.clear();
-          out_payload_bytes = 0;
-          return "raw STRING payload channels are not serializable; decompose into offsets and "
-                 "chars";
-        }
-      }
-    }
-  }
 
   out_header.clear();
   out_buffers.clear();

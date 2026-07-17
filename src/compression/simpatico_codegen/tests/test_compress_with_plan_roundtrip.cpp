@@ -780,33 +780,14 @@ int main()
     }
 
     {
-      // dictionary_fast: the 2-buffer (keys+indices) in-memory dictionary variant.
-      // Roundtrips like `dictionary`, including nulls.
-      auto stream                   = cudf::get_default_stream();
-      std::vector<std::string> vals = {
-        "apple", "banana", "apple", "cherry", "banana", "apple", "date", "cherry"};
-      auto t = make_strings_table(vals, {}, stream);
-      roundtrip_once(t->view(), "input -> dictionary_fast\n", 1, "dictionary_fast");
-      roundtrip_once(t->view(), "input -> dictionary_fast\n", 2, "dictionary_fast_mt");
-
-      std::vector<bool> valid = {true, false, true, true, false, true, true, false};
-      auto tn                 = make_strings_table(vals, valid, stream);
-      auto ct =
-        roundtrip_once(tn->view(), "input -> dictionary_fast\n", 1, "dictionary_fast_nulls");
-      auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
-      expect(decoded->view().column(0).null_count() == 3, "dictionary_fast_nulls: null_count");
-    }
-
-    {
       // Degenerate STRING shapes: zero-row / childless-empty / all-null /
-      // all-empty-string inputs through dictionary, dictionary_fast and
-      // str_split. describe() runs on every rep too — the zero-row full
-      // dictionary used to segfault there (childless DICTIONARY32).
+      // all-empty-string inputs through dictionary and str_split. describe()
+      // runs on every rep too — the zero-row full dictionary used to segfault
+      // there (childless DICTIONARY32).
       auto stream = cudf::get_default_stream();
       auto mr     = rmm::mr::get_current_device_resource_ref();
 
-      for (char const* plan :
-           {"input -> dictionary\n", "input -> dictionary_fast\n", "input -> str_split\n"}) {
+      for (char const* plan : {"input -> dictionary\n", "input -> str_split\n"}) {
         // describe() runs on a FRESH compress: str_split's single-shot
         // decompress consumes its channels, so describe-after-decompress
         // legitimately enumerates nothing.

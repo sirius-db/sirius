@@ -180,39 +180,17 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
     if (error_out) *error_out = "dictionary: output_names / outputs size mismatch";
     return nullptr;
   }
-  // Both forms accept a trailing optional "null_mask" channel (UINT8 bitmask
-  // bytes of the decoded column) — reattached below so validity survives
-  // channel-based round-trips (.hpln IO and decomposed plans).
+  // Accepts a trailing optional "null_mask" channel (UINT8 bitmask bytes of the
+  // decoded column) — reattached below so validity survives channel-based
+  // round-trips (.hpln IO and decomposed plans).
   bool const has_mask = !output_names.empty() && output_names.back() == "null_mask";
 
-  // Fast path: keys (strings column) + indices. This avoids expensive
-  // make_strings_column reconstruction.
-  if (output_names.size() == (has_mask ? 3u : 2u) && output_names[0] == "keys" &&
-      output_names[1] == "indices") {
-    auto keys    = std::move(outputs[0]);
-    auto indices = std::move(outputs[1]);
-    if (has_mask) {
-      rmm::device_buffer mask;
-      cudf::size_type null_count = 0;
-      if (!take_null_mask_channel(
-            std::move(outputs[2]), indices->size(), &mask, &null_count, stream, error_out)) {
-        return nullptr;
-      }
-      // Fast mode carries validity on the indices column (the fast ctor /
-      // decompress path derives the parent mask from it).
-      if (null_count > 0) indices->set_null_mask(std::move(mask), null_count);
-    }
-    return std::make_unique<dictionary_compressed_representation>(std::move(keys),
-                                                                  std::move(indices));
-  }
-
-  // Legacy path: keys_offsets, keys_chars, indices (+ null_mask).
+  // keys_offsets, keys_chars, indices (+ null_mask).
   if (outputs.size() != (has_mask ? 4u : 3u) || output_names[0] != "keys_offsets" ||
       output_names[1] != "keys_chars" || output_names[2] != "indices") {
     if (error_out) {
       *error_out =
-        "dictionary outputs must be named 'keys_offsets, keys_chars, "
-        "indices[, null_mask]' or 'keys, indices[, null_mask]'";
+        "dictionary outputs must be named 'keys_offsets, keys_chars, indices[, null_mask]'";
     }
     return nullptr;
   }

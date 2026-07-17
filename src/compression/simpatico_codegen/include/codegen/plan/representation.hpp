@@ -123,22 +123,8 @@ struct compressed_representation {
   {
     size_t total = 0;
     for (auto const& o : named_channels(stream)) {
-      // cudf::size_of() only supports fixed-width types (e.g. dictionary's
-      // fast-mode "keys" channel is a raw STRING column) — account for
-      // offsets + chars directly instead of calling it on a STRING view.
-      if (o.view.type().id() == cudf::type_id::STRING) {
-        if (o.view.num_children() == 0) {
-          if (o.view.size() == 0) continue;
-          throw std::logic_error("non-empty STRING channel has no offsets child.");
-        }
-        cudf::strings_column_view scv(o.view);
-        auto const offsets_width = static_cast<size_t>(cudf::size_of(scv.offsets().type()));
-        total += static_cast<size_t>(o.view.size() + 1) * offsets_width +
-                 static_cast<size_t>(scv.chars_size(stream));
-      } else {
-        total +=
-          static_cast<size_t>(o.view.size()) * static_cast<size_t>(cudf::size_of(o.view.type()));
-      }
+      total +=
+        static_cast<size_t>(o.view.size()) * static_cast<size_t>(cudf::size_of(o.view.type()));
     }
     return total;
   }
@@ -206,14 +192,8 @@ struct identity_compressor : compressor {
 
 /// Dictionary format: stores the encoded dictionary column and a copy of keys chars.
 /// In modern cuDF, chars are not accessible as a column_view, so we copy them into a UINT8 column.
-///
-/// Two modes of operation:
-/// 1. Full dict_column mode: stores the complete dictionary column from encode()
-/// 2. Keys+indices mode: stores separate keys (strings) and indices columns for fast reconstruction
-///    This mode avoids the expensive make_strings_column reconstruction.
 struct dictionary_compressed_representation : compressed_representation {
-  // Accepts the (keys, indices[, null_mask]) form or the (keys_offsets,
-  // keys_chars, indices[, null_mask]) form.
+  // Accepts the (keys_offsets, keys_chars, indices[, null_mask]) form.
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -235,34 +215,16 @@ struct dictionary_compressed_representation : compressed_representation {
   // via from_outputs, which cannot see the mask carried on the stored columns.
   mutable std::unique_ptr<cudf::column> null_mask_copy;
 
-  // For fast reconstruction mode: store keys and indices separately
-  std::unique_ptr<cudf::column> keys_column;   // Keys as strings column (for fast reconstruction)
-  std::unique_ptr<cudf::column> indices_only;  // Indices column (for fast reconstruction)
-  bool fast_mode = false;                      // True if using keys+indices mode
-
   // Constant key byte-width, measured lazily at first decompress (0 = variable, -1 = unmeasured).
   mutable std::int64_t constant_key_width = -1;
 
   explicit dictionary_compressed_representation(std::unique_ptr<cudf::column> dict_col)
-    : dict_column(std::move(dict_col)), keys_chars_copy(nullptr), fast_mode(false)
+    : dict_column(std::move(dict_col)), keys_chars_copy(nullptr)
   {
     // Per the base-class contract these describe the RECONSTRUCTED column
     // (dictionary decode yields STRING), not the stored dictionary form.
     original_type = cudf::data_type{cudf::type_id::STRING};
     num_rows      = dict_column ? dict_column->size() : 0;
-  }
-
-  // Fast reconstruction constructor: keys (strings column) + indices
-  dictionary_compressed_representation(std::unique_ptr<cudf::column> keys,
-                                       std::unique_ptr<cudf::column> indices)
-    : dict_column(nullptr),
-      keys_chars_copy(nullptr),
-      keys_column(std::move(keys)),
-      indices_only(std::move(indices)),
-      fast_mode(true)
-  {
-    original_type = cudf::data_type{cudf::type_id::STRING};
-    num_rows      = indices_only ? indices_only->size() : 0;
   }
 
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
@@ -272,23 +234,8 @@ struct dictionary_compressed_representation : compressed_representation {
   {
     std::vector<compressible_output> outputs;
 
-    if (fast_mode) {
-      // Fast mode: expose keys (strings) and indices directly. The indices
-      // column carries the parent validity (get_indices_annotated), but a
-      // codec routed onto the indices channel keeps only its data bytes, so
-      // for a nullable column the mask additionally travels as its own
-      // channel.
-      if (keys_column) { outputs.push_back({"keys", keys_column->view()}); }
-      if (indices_only) { outputs.push_back({"indices", indices_only->view()}); }
-      if (indices_only && indices_only->null_count() > 0) {
-        ensure_null_mask_copy(indices_only->view(), stream);
-        outputs.push_back({"null_mask", null_mask_copy->view()});
-      }
-      return outputs;
-    }
-
-    // Full dict_column mode: expose keys_offsets, keys_chars, indices and —
-    // for a nullable column — null_mask.
+    // Expose keys_offsets, keys_chars, indices and — for a nullable column —
+    // null_mask.
     auto dict_view            = dict_column->view();
     bool const childless_dict = dict_column->num_children() == 0;  // zero-row compress
     bool const childless_keys =  // encode of an all-null column: zero keys, no offsets child
@@ -361,9 +308,7 @@ struct dictionary_compressed_representation : compressed_representation {
 
   std::vector<std::string> required_channels() const override
   {
-    bool const nullable = fast_mode ? (indices_only && indices_only->null_count() > 0)
-                                    : (dict_column && dict_column->null_count() > 0);
-    if (nullable) return {"null_mask"};
+    if (dict_column && dict_column->null_count() > 0) return {"null_mask"};
     return {};
   }
 
@@ -385,20 +330,15 @@ struct dictionary_compressed_representation : compressed_representation {
   }
 };
 
-/// Dictionary compressor: STRING column only. Encodes via cudf dictionary encode; stores keys
-/// buffer + offsets + indices. `fast` selects the 2-buffer keys+indices in-memory representation
-/// (DSL name "dictionary_fast") instead of the 3-buffer keys_offsets/keys_chars/indices form.
+/// Dictionary compressor: STRING column only. Encodes via cudf dictionary encode; stores the
+/// keys buffer + offsets + indices (keys_offsets/keys_chars/indices form).
 struct dictionary_compressor : compressor {
-  explicit dictionary_compressor(bool fast = false) : fast_(fast) {}
-
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
   std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
                                            rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) override;
-
-  bool fast_;
 };
 
 // -----------------------------------------------------------------------------
