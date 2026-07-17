@@ -174,7 +174,6 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
-  r.optional("default_scan_task_varchar_size", yaml::bytes(opt.default_scan_task_varchar_size));
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
@@ -276,7 +275,7 @@ struct gpu_mem_config {
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_gpu(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_fraction_per_gpu(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_gpu(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_gpu(downgrade_trigger_fraction, downgrade_stop_fraction);
     builder.track_reservation_per_stream(track_per_stream_reservation);
@@ -322,10 +321,17 @@ struct host_mem_config {
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_fraction_per_host(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_host(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_host(downgrade_trigger_fraction, downgrade_stop_fraction);
     builder.set_per_host_capacity(numa_region_capacity_bytes);
+    // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
+    // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
+    // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see
+    // reservation_manager_configurator::build()). Passing our {block_size, pool_size,
+    // initial_number_pools} positionally therefore lands each value in the correctly-named
+    // cucascade config field — the names line up with the resulting config struct, not with the
+    // setter's parameter names.
     builder.set_host_pool_features(block_size, pool_size, initial_number_pools);
   }
 };
@@ -431,7 +437,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
-      er.optional("task_queue_ordering", _task_queue_ordering);
       er.reject_unknown();
     }
 

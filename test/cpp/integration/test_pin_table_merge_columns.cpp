@@ -98,7 +98,6 @@ void write_config(fs::path const& yaml_path)
        "      monitor_period: 10ms\n"
        "  operator_params:\n"
        "    scan_task_batch_size: 100000000\n"
-       "    default_scan_task_varchar_size: 256\n"
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: 100000000\n"
        "    concat_batch_bytes: 100000000\n"

@@ -19,7 +19,6 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
-#include "exec/inspectable_mpsc.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -33,7 +32,6 @@ namespace sirius {
 namespace config {
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
@@ -65,9 +63,6 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
-
-  /// Default size estimate (bytes) for VARCHAR columns when computing rows per batch.
-  uint64_t default_scan_task_varchar_size = config::DEFAULT_SCAN_TASK_VARCHAR_SIZE;
 
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
@@ -161,13 +156,6 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
-  /// Pop ordering for the task_scheduler's pipeline-level task queue. See
-  /// exec::queue_ordering for semantics. Defaults to FIFO (legacy behavior).
-  [[nodiscard]] exec::queue_ordering get_task_queue_ordering() const noexcept
-  {
-    return _task_queue_ordering;
-  }
-
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -196,7 +184,6 @@ struct sirius_config {
   exec::downgrade_executor_config _downgrade_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
-  exec::queue_ordering _task_queue_ordering{exec::queue_ordering::FIFO};
 };
 
 }  // namespace sirius
