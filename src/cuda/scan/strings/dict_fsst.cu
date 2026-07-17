@@ -213,7 +213,9 @@ __global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_build_dict_fsst_data
         uint8_t code = cp[pos++];
         if (code < FSST_ESC) {
           decomp_len += sm_len[code];
-        } else {
+        } else if (pos < comp_len) {
+          // Trailing escape (corrupt input) is dropped — stay in sync with the
+          // length kernel in fsst.cu (kernel_compute_decompressed_lengths_fsst).
           ++pos;
           ++decomp_len;
         }
@@ -386,6 +388,9 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
       int seg_i = desc.seg_row_start + i;
       int idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
       if (idx == 0) continue;  // NULL — pass-1 emitted length 0
+      // Guard: a corrupt/oversized idx would OOB-read memcpy_off. The length
+      // kernel checks the same bound (kernel_compute_lengths_dict_fsst).
+      if (idx >= desc.dict_count) continue;
       int op          = d_offsets[desc.global_row_start + i];
       int entry_start = memcpy_off[idx];
       int entry_len   = memcpy_off[idx + 1] - entry_start;
@@ -438,6 +443,10 @@ __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ d
   int seg_idx = blockIdx.x;
   if (seg_idx >= num_segments) return;
   auto const desc = descs[seg_idx];
+  // Stub descriptors (from malformed segments) have dict_count == 0; their
+  // dict_indices_offset is 0, so reading dict indices would dereference the
+  // raw segment bytes and wrongly mark rows null. Match the gather kernel's guard.
+  if (desc.dict_count == 0) return;
   uint32_t const* d_idx =
     reinterpret_cast<uint32_t const*>(desc.d_bytes + desc.dict_indices_offset);
 

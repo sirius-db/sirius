@@ -119,18 +119,18 @@ __device__ __forceinline__ int64_t read_value(void const* data, uint32_t stride,
                : static_cast<int64_t>(*reinterpret_cast<int8_t const*>(base + row));
     case 2:
       return is_unsigned
-               ? static_cast<int64_t>(*reinterpret_cast<uint16_t const*>(base + row * 2))
-               : static_cast<int64_t>(*reinterpret_cast<int16_t const*>(base + row * 2));
+               ? static_cast<int64_t>(*reinterpret_cast<uint16_t const*>(base + static_cast<std::size_t>(row) * 2))
+               : static_cast<int64_t>(*reinterpret_cast<int16_t const*>(base + static_cast<std::size_t>(row) * 2));
     case 4:
       return is_unsigned
-               ? static_cast<int64_t>(*reinterpret_cast<uint32_t const*>(base + row * 4))
-               : static_cast<int64_t>(*reinterpret_cast<int32_t const*>(base + row * 4));
+               ? static_cast<int64_t>(*reinterpret_cast<uint32_t const*>(base + static_cast<std::size_t>(row) * 4))
+               : static_cast<int64_t>(*reinterpret_cast<int32_t const*>(base + static_cast<std::size_t>(row) * 4));
     case 8:
       // 64-bit values are identity: the bit pattern is the same whether read as
       // signed or unsigned (we still return int64_t; for genuine uint64 columns
       // above INT64_MAX the aggregate result would be wrong, but that is an
       // existing limitation and not made worse here).
-      return *reinterpret_cast<int64_t const*>(base + row * 8);
+      return *reinterpret_cast<int64_t const*>(base + static_cast<std::size_t>(row) * 8);
     default: return 0;
   }
 }

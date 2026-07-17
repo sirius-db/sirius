@@ -87,6 +87,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     // Check if limit is already exhausted
     if (_remaining_limit.load(std::memory_order_acquire) <= 0) { break; }
 
+    if (!batch.get_data()) { continue; }
     auto view     = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
     auto num_rows = static_cast<int64_t>(view.num_rows());
 

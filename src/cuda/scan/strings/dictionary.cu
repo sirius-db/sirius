@@ -143,6 +143,9 @@ __global__ void kernel_gather_dict(string_chunk_desc const* __restrict__ descs,
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     if (sel == 0) continue;
+    // Guard: a corrupt/oversized sel would OOB-read idx_bytes. The length
+    // kernel checks the same bound (see kernel_compute_lengths_dict).
+    if (sel >= sm_hdr.index_buffer_count) continue;
     auto const end_off = dict_index_at(idx_bytes, sel);
     auto const str_len = end_off - dict_index_at(idx_bytes, sel - 1);
     auto const out_pos = d_offsets[desc.global_row_start + i];
@@ -182,6 +185,9 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
     auto const segment_idx = desc.seg_row_start + i;
     auto const sel         = unpack_value<uint32_t>(d_sel, segment_idx, sm_hdr.bitpacking_width);
     if (sel == 0) continue;
+    // Guard: a corrupt/oversized sel would OOB-read idx_bytes. The length
+    // kernel checks the same bound (see kernel_compute_lengths_dict).
+    if (sel >= sm_hdr.index_buffer_count) continue;
     auto const end_off    = dict_index_at(idx_bytes, sel);
     auto const str_len    = end_off - dict_index_at(idx_bytes, sel - 1);
     auto const offset_ptr = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
