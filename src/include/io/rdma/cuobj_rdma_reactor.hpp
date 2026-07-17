@@ -26,6 +26,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -59,6 +60,35 @@ namespace sirius::io::rdma {
 /// (the wrapper terminates).
 void default_fatal_hook(const char* what, cudaError_t rc) noexcept;
 
+/// Frozen sticky/context-fatal CUDA codes — the in-repo source of truth for
+/// the pre-boundary classification (contract §5 item 2).  Adjudication
+/// rationale and change control: `s3-rdma-sticky-set.md` v2 / invariant-matrix
+/// row 16.  `is_context_fatal` scans this array and the parameterized death
+/// tests iterate it, so dropping a code fails a test.  A code is sticky iff
+/// NVIDIA documentation demands process terminate/relaunch, declares the
+/// context/device unusable, or requires a GPU reset / node reboot.
+inline constexpr auto k_sticky_context_fatal_codes = std::to_array<cudaError_t>({
+  cudaErrorECCUncorrectable,
+  cudaErrorNvlinkUncorrectable,
+#if CUDART_VERSION >= 12080
+  cudaErrorContained,
+#endif
+  cudaErrorIllegalAddress,
+  cudaErrorLaunchTimeout,
+  cudaErrorAssert,
+  cudaErrorHardwareStackError,
+  cudaErrorIllegalInstruction,
+  cudaErrorMisalignedAddress,
+  cudaErrorInvalidAddressSpace,
+  cudaErrorInvalidPc,
+  cudaErrorLaunchFailure,
+#if CUDART_VERSION >= 12080
+  cudaErrorTensorMemoryLeak,
+#endif
+  cudaErrorMpsClientTerminated,
+  cudaErrorExternalDevice,
+});
+
 /// CUDA delivery seam (F01): every CUDA call on the device-chunk delivery path
 /// goes through these, so tests can inject failures without faking CUDA side
 /// effects.  Defaults are the real CUDA runtime entry points; the indirection
@@ -83,10 +113,6 @@ struct cuda_delivery_ops {
       [](void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
         return cudaMemcpyAsync(dst, src, count, kind, stream);
       };
-  std::function<cudaError_t(cudaStream_t)> stream_synchronize = [](cudaStream_t stream) {
-    return cudaStreamSynchronize(stream);
-  };
-  std::function<cudaError_t()> device_synchronize = [] { return cudaDeviceSynchronize(); };
   /// GPUDirect write-visibility flush (pre-boundary leg; one call per exact
   /// completion when the platform's ordering attribute requires it).
   std::function<cudaError_t()> flush = [] {
@@ -283,21 +309,24 @@ class cuobj_rdma_reactor {
     uint8_t* base{nullptr};
     std::unique_ptr<slot_pool> pool;
     std::shared_ptr<rdma_client> registrar;  // deregisters base on teardown
-    bool leaked{false};                      // F01: set at the fail-stop teardown probe — the
-                                             // destructor then skips deregister + cudaFree
-                                             // (freeing under an un-quiesced device is the UAF;
-                                             // leaking is safe)
+    bool leaked{false};                      // non-freeable flag: the destructor then skips
+                                             // deregister + cudaFree.  Set by the RDMA fail-stop
+                                             // transition (execution step 4); no current path
+                                             // sets it — a CUDA-fatal outcome terminates the
+                                             // process (step 3), so the arena dies with it.
     ~arena();
   };
 
-  /// Reactor lifecycle (single state machine — F01).  FAILING/FAILED are the
-  /// fail-stop terminal states entered exactly once by @c enter_failed after
-  /// an unrecoverable delivery failure: intake stops (enqueue fails fast
-  /// naming the first fatal error), queued chunks are drained by error, and
-  /// every ACTIVE chunk converges through its OWNER worker's own quiescence
-  /// ladder — never resolved cross-worker.  STOPPING/JOINED are ordinary
-  /// shutdown.  A failed reactor cannot restart; a fatal CUDA error is a
-  /// process-level event (restart is the recovery) — fail-stop is containment.
+  /// Reactor lifecycle (single state machine).  FAILING/FAILED are the
+  /// fail-stop terminal states entered exactly once by @c enter_failed:
+  /// intake stops (enqueue fails fast naming the first fatal error), queued
+  /// chunks are drained by error, and an active chunk is aborted before its
+  /// GET by the owner worker's pre-boundary @c delivery_fatal check — never
+  /// resolved cross-worker.  STOPPING/JOINED are ordinary shutdown.  This
+  /// transition is DORMANT after step 3 (the CUDA-fatal path terminates the
+  /// process instead); execution step 4 wires the RDMA fail-stop trigger and
+  /// the whole-arena non-freeable marking into it.  The recoverable
+  /// quiescence ladder is gone (v1.2 archive).
   enum class reactor_state : uint8_t { created, running, failing, failed, stopping, joined };
 
   void worker_loop();

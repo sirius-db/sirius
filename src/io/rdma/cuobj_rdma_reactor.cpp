@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -71,35 +72,17 @@ cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg)
   return cfg;
 }
 
-/// Sticky/context-fatal codes — regenerated from the frozen adjudication
-/// artifact doc/s3support/s3-rdma-sticky-set.md (v2).  A code is sticky iff
-/// NVIDIA documentation demands process terminate/relaunch, declares the
-/// context/device unusable, or requires a GPU reset / node reboot.  Consulted
-/// on the PRE-boundary legs only; post-boundary every failure is fatal.
-bool is_context_fatal(cudaError_t rc)
+/// Pre-boundary sticky/context-fatal classification, driven by the single
+/// in-repo table @c k_sticky_context_fatal_codes (the adjudication rationale
+/// and change control live in s3-rdma-sticky-set.md / invariant-matrix row
+/// 16).  Consulted on the PRE-boundary legs only; post-boundary every failure
+/// is fatal regardless.
+bool is_context_fatal(cudaError_t rc) noexcept
 {
-  switch (rc) {
-    case cudaErrorECCUncorrectable:
-    case cudaErrorNvlinkUncorrectable:
-#if CUDART_VERSION >= 12080
-    case cudaErrorContained:
-#endif
-    case cudaErrorIllegalAddress:
-    case cudaErrorLaunchTimeout:
-    case cudaErrorAssert:
-    case cudaErrorHardwareStackError:
-    case cudaErrorIllegalInstruction:
-    case cudaErrorMisalignedAddress:
-    case cudaErrorInvalidAddressSpace:
-    case cudaErrorInvalidPc:
-    case cudaErrorLaunchFailure:
-#if CUDART_VERSION >= 12080
-    case cudaErrorTensorMemoryLeak:
-#endif
-    case cudaErrorMpsClientTerminated:
-    case cudaErrorExternalDevice: return true;
-    default: return false;
+  for (const cudaError_t code : k_sticky_context_fatal_codes) {
+    if (rc == code) { return true; }
   }
+  return false;
 }
 
 /// RAII owner of the delivery completion event (F01): destroy runs only when
@@ -124,10 +107,18 @@ struct event_guard {
       rc = cudaErrorUnknown;
     }
     if (rc != cudaSuccess) {
-      SIRIUS_LOG_WARN(
-        "cuobj_rdma_reactor: completion event destroy failed ({}); delivery result "
-        "preserved",
-        cudaGetErrorString(rc));
+      // Contract §5 item 4: destroy-after-success is log-ONLY — it must never
+      // fail the delivery.  The dtor is implicitly noexcept and the log path
+      // formats + calls a sink (neither noexcept), so a throwing sink or a
+      // formatting bad_alloc here would std::terminate and leave the future
+      // unresolved.  Swallow everything: best-effort diagnostics, never fatal.
+      try {
+        SIRIUS_LOG_WARN(
+          "cuobj_rdma_reactor: completion event destroy failed ({}); delivery result "
+          "preserved",
+          cudaGetErrorString(rc));
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
     }
   }
 };
@@ -136,19 +127,28 @@ struct event_guard {
 
 void default_fatal_hook(const char* what, cudaError_t rc) noexcept
 {
+  // The hard guarantee is std::terminate in invoke_fatal; this diagnostic
+  // must never delay it.  A stalled stderr consumer (full pipe) would block a
+  // plain write() forever, so flip stderr to non-blocking for the duration —
+  // a full pipe then yields EAGAIN instead of blocking.  We are terminating,
+  // so the brief flag change on the shared fd is acceptable; restore it after.
+  const int flags = ::fcntl(STDERR_FILENO, F_GETFL);
+  if (flags != -1) { (void)::fcntl(STDERR_FILENO, F_SETFL, flags | O_NONBLOCK); }
   const auto emit = [](const char* text) {
     if (text == nullptr) { return; }
     size_t len = 0;
     while (text[len] != '\0') {
       ++len;
     }
-    (void)!::write(STDERR_FILENO, text, len);
+    (void)!::write(
+      STDERR_FILENO, text, len);  // single non-blocking attempt; EAGAIN/partial dropped
   };
   emit("cuobj_rdma_reactor: process-fatal CUDA delivery failure: ");
   emit(what);
   emit(": ");
   emit(cudaGetErrorName(rc));
   emit("\n");
+  if (flags != -1) { (void)::fcntl(STDERR_FILENO, F_SETFL, flags); }
 }
 
 [[noreturn]] void invoke_fatal(const cuda_delivery_ops& ops,
@@ -165,9 +165,8 @@ void default_fatal_hook(const char* what, cudaError_t rc) noexcept
 void validate(const cuda_delivery_ops& ops)
 {
   const bool complete = ops.event_create && ops.event_record && ops.event_synchronize &&
-                        ops.event_destroy && ops.memcpy_async && ops.stream_synchronize &&
-                        ops.device_synchronize && ops.flush && ops.stream_capture_query &&
-                        ops.fatal_hook;
+                        ops.event_destroy && ops.memcpy_async && ops.flush &&
+                        ops.stream_capture_query && ops.fatal_hook;
   if (!complete) {
     throw std::invalid_argument(
       "cuda_delivery_ops: every delivery op must be callable (the defaults are the real CUDA "
