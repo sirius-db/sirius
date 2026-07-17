@@ -671,17 +671,26 @@ TEST_CASE("right-family sibling partitions round up from the probe input", "[phy
   build_repo->add_data_batch(std::move(build_batch), 0);
   probe_repo->add_data_batch(std::move(probe_batch), 0);
 
-  auto attach_port = [](sirius_physical_partition& partition,
+  // The join's per-partition input repos that the sizing decision pre-sizes via
+  // resize_join_input_repo (created during pipeline construction in production): the build side
+  // targets the join's "build" port, the probe side its "default" port.
+  auto join_build_repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto join_default_repo = std::make_unique<cucascade::shared_data_repository>();
+
+  auto attach_port = [](sirius_physical_operator& op,
+                        std::string_view port_id,
                         cucascade::shared_data_repository& repo) {
     auto port           = std::make_unique<sirius_physical_operator::port>();
     port->type          = MemoryBarrierType::FULL;
     port->repo          = &repo;
     port->src_pipeline  = nullptr;
     port->dest_pipeline = nullptr;
-    partition.add_port("default", std::move(port));
+    op.add_port(port_id, std::move(port));
   };
-  attach_port(build_partition, *build_repo);
-  attach_port(probe_partition, *probe_repo);
+  attach_port(build_partition, "default", *build_repo);
+  attach_port(probe_partition, "default", *probe_repo);
+  attach_port(*fixture.hash_join, "build", *join_build_repo);
+  attach_port(*fixture.hash_join, "default", *join_default_repo);
 
   // Enter through the non-driving build side first. It must still size both siblings from probe.
   auto build_input = build_partition.get_next_task_input_data();
