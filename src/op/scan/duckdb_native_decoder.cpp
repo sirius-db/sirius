@@ -329,7 +329,9 @@ void append_segment_file_ranges(duckdb::SingleFileBlockManager const& bm,
                                 duckdb_segment_descriptor const& seg,
                                 std::vector<cudf::io::text::byte_range_info>& out)
 {
-  if (seg.bytes_size > 0) {  // main payload; CONSTANT/blockless => bytes_size == 0, skip
+  // Main payload. CONSTANT/blockless segments have bytes_size == 0; host-backed
+  // (insert-delta) segments have bytes_size > 0 but no block — both read no file.
+  if (seg.bytes_size > 0 && seg.block_id >= 0) {
     auto const off =
       duckdb_block_payload_offset(bm, seg.block_id) + static_cast<std::size_t>(seg.block_offset);
     out.emplace_back(static_cast<std::int64_t>(off), static_cast<std::int64_t>(seg.bytes_size));

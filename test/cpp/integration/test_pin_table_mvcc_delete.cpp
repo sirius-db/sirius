@@ -269,7 +269,7 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
 }
 
 TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "mvcc guards: committed post-pin inserts decline to CPU with correct rows",
+                 "mvcc insert: committed post-pin inserts serve from the cache plus the delta",
                  "[integration][gpu_execution][pin_table_mvcc_delete]")
 {
   run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000);");
@@ -277,12 +277,12 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
   run_ok("INSERT INTO t SELECT range::INTEGER + 50000 FROM range(100);");
-  expect_fallback_matches_cpu(*this, "SELECT count(*), max(k) FROM t;");
+  compare_gpu_vs_cpu("SELECT count(*), max(k), sum(k) FROM t;");
   run_ok("CALL unpin_table('t');");
 }
 
 TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "mvcc guards: own-transaction inserts decline, rollback resumes GPU serving",
+                 "mvcc guards: own-transaction inserts decline; commit serves, rollback resumes",
                  "[integration][gpu_execution][pin_table_mvcc_delete]")
 {
   run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000);");
@@ -295,6 +295,11 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("ROLLBACK;");
 
   compare_gpu_vs_cpu("SELECT count(*), max(k) FROM t;");  // cache serving resumes
+
+  run_ok("BEGIN TRANSACTION;");
+  run_ok("INSERT INTO t VALUES (900001), (900002);");
+  run_ok("COMMIT;");
+  compare_gpu_vs_cpu("SELECT count(*), max(k) FROM t;");  // committed rows ride the delta
   run_ok("CALL unpin_table('t');");
 }
 

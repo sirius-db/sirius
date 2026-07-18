@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/scan/duckdb_insert_delta.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
 #include "sirius_config.hpp"
 
@@ -49,10 +50,6 @@ class sirius_datasource;
 namespace sirius::memory {
 class topology_index;
 }  // namespace sirius::memory
-
-namespace sirius::op::scan {
-class duckdb_native_scan_info;
-}  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
 

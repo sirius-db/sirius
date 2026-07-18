@@ -183,22 +183,35 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             static_cast<unsigned long long>(entry->mvcc->v_base),
             table.name);
         }
-        // (b) insert-present: committed rows beyond the pinned prefix, or
-        // this transaction's own uncommitted appends (transaction-local
-        // storage) — not served from the cache until the insert-delta
-        // reader lands.
-        if (static_cast<std::size_t>(storage.GetTotalRows()) > n_cache) {
-          throw duckdb::NotImplementedException(
-            "duckdb-native scan: table '%s' has rows beyond the %llu pinned at pin time; "
-            "post-pin inserts are not served from the cache yet",
-            table.name,
-            static_cast<unsigned long long>(n_cache));
-        }
+        // (b) transaction-local appends: rows in this transaction's
+        // LocalStorage live outside the table's segment trees, so neither
+        // the cache nor the insert delta can serve them. Committed rows
+        // beyond the pinned prefix ARE served: the prepare-time insert-delta
+        // job stages them, masked to this snapshot's visibility.
         if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
             "transaction-local inserts are not served from the cache",
             table.name);
+        }
+        // (b') v1 scope: the insert delta does not serve ARRAY columns —
+        // decline while rows beyond the pinned prefix exist (the capture's
+        // own ARRAY check backstops the plan→prepare insert race, loudly).
+        if (static_cast<std::size_t>(storage.GetTotalRows()) > n_cache) {
+          for (auto const& col_idx : column_ids) {
+            if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() ||
+                col_idx.IsVirtualColumn() || col_idx.IsEmptyColumn()) {
+              continue;
+            }
+            auto const primary = col_idx.GetPrimaryIndex();
+            if (primary < op.returned_types.size() &&
+                op.returned_types[primary].id() == duckdb::LogicalTypeId::ARRAY) {
+              throw duckdb::NotImplementedException(
+                "duckdb-native scan: table '%s' has rows beyond the pinned prefix and an ARRAY "
+                "projection; the insert delta does not serve ARRAY columns",
+                table.name);
+            }
+          }
         }
         bool pin_serves = !has_unservable_column;
         if (pin_serves && !column_ids.empty()) {
