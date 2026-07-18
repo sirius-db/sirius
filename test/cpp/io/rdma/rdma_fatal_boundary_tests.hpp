@@ -265,11 +265,8 @@ class recording_client final : public rdma_client {
 cuobj_rdma_reactor::config reactor_config()
 {
   cuobj_rdma_reactor::config cfg;
-  cfg.max_inflight       = 1;
-  cfg.arena_slot_size    = k_slot_size;
-  cfg.max_get_attempts   = 1;
-  cfg.retry_backoff_base = 0ms;
-  cfg.retry_jitter       = 0ms;
+  cfg.max_inflight    = 1;
+  cfg.arena_slot_size = k_slot_size;
   return cfg;
 }
 

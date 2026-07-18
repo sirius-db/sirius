@@ -283,7 +283,7 @@ TEST_CASE("s3_rdma creates the completion event before enqueueing D2D",
   CHECK(message_contains(error, "event"));
   CHECK(memcpy_calls.load() == 0);
   CHECK(destroy_calls.load() == 0);
-  CHECK(ctx->perf_snapshot().delivery_fatal_total == 0);
+  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
 
   rmm::device_buffer follow_up(payload.size(), stream);
   auto follow_up_future = issue_device_read(*ds, payload.size(), follow_up, stream);
@@ -341,7 +341,7 @@ TEST_CASE("s3_rdma ioctx snapshot aggregates all delivery safety counters",
   CHECK(snapshot.bytes_total == payload.size());
   CHECK(snapshot.requests_total == 1);
   CHECK(snapshot.error_total == 0);
-  CHECK(snapshot.delivery_fatal_total == 0);
+  CHECK(snapshot.fail_stop_total == 0);
   CHECK(snapshot.arena_leak_total == 0);
   CHECK(destroy_calls.load() == 1);
 }
@@ -370,7 +370,7 @@ TEST_CASE("s3_rdma event RAII destroys exactly created events without overriding
     issue_device_read(*success_ds, payload.size(), success_buffer, success_stream);
   REQUIRE(require_ready_value(success_future) == payload.size());
   CHECK(destroy_calls.load() == 1);
-  CHECK(success_ctx->perf_snapshot().delivery_fatal_total == 0);
+  CHECK(success_ctx->perf_snapshot().fail_stop_total == 0);
 
   auto create_client = seeded_client("create-without-destroy", payload);
   std::atomic<int> create_destroy_calls{0};

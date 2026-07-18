@@ -302,6 +302,12 @@ TEST_CASE("cuobj_rdma_reactor mock gate enforces max inflight backpressure",
   client->open_gate();
   REQUIRE(require_ready_value(fut) == payload.size());
   CHECK(client->gets_issued() == ceil_div(payload.size(), kSlotSize));
+
+  auto const snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.requests_total == 1);
+  CHECK(snapshot.envelope_depth_peak == 1);
+  CHECK(snapshot.slots_in_use_peak <= kMaxInflight);
+  CHECK(snapshot.envelope_wait_total == 0);
 }
 
 TEST_CASE("cuobj_rdma_reactor reports short mock reads as failed futures",
@@ -325,6 +331,19 @@ TEST_CASE("cuobj_rdma_reactor reports short mock reads as failed futures",
   CHECK((message.find("short") != std::string::npos ||
          message.find(std::to_string(kShort)) != std::string::npos ||
          message.find(std::to_string(payload.size())) != std::string::npos));
+  CHECK(client->gets_issued() == 1);
+
+  auto const snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.retries_total == 0);
+  CHECK(snapshot.short_read_total == 1);
+  CHECK(snapshot.fail_stop_total == 1);
+  CHECK(snapshot.arena_leak_total == 1);
+
+  auto follow_up =
+    ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
+  CHECK_FALSE(require_ready_error(follow_up).empty());
+  CHECK(client->gets_issued() == 1);
+  CHECK(ctx->perf_snapshot().fail_stop_total == 1);
 }
 
 TEST_CASE("cuobj_rdma_reactor propagates mock transport errors", "[s3][rdma][reactor][gpu]")
@@ -343,6 +362,19 @@ TEST_CASE("cuobj_rdma_reactor propagates mock transport errors", "[s3][rdma][rea
   auto fut =
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
   CHECK(require_ready_error(fut).find("mock transport down") != std::string::npos);
+  CHECK(client->gets_issued() == 1);
+
+  auto const snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.retries_total == 0);
+  CHECK(snapshot.fail_stop_total == 1);
+  CHECK(snapshot.arena_leak_total == 1);
+
+  client->clear_fault();
+  auto follow_up =
+    ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
+  CHECK_FALSE(require_ready_error(follow_up).empty());
+  CHECK(client->gets_issued() == 1);
+  CHECK(ctx->perf_snapshot().fail_stop_total == 1);
 }
 
 TEST_CASE("s3_rdma_ioctx mock open fails on missing object", "[s3][rdma][reactor]")
@@ -389,8 +421,36 @@ TEST_CASE("cuobj_rdma_reactor shutdown drains gated work and is idempotent",
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
   REQUIRE(wait_until([&] { return client->gets_issued() > 0; }));
 
+  std::promise<void> first_shutdown_started;
+  std::promise<void> second_shutdown_started;
+  auto first_started        = first_shutdown_started.get_future();
+  auto second_started       = second_shutdown_started.get_future();
+  auto first_shutdown       = std::async(std::launch::async, [&] {
+    first_shutdown_started.set_value();
+    ctx->shutdown();
+  });
+  auto second_shutdown      = std::async(std::launch::async, [&] {
+    second_shutdown_started.set_value();
+    ctx->shutdown();
+  });
+  auto const first_entered  = first_started.wait_for(5s) == std::future_status::ready;
+  auto const second_entered = second_started.wait_for(5s) == std::future_status::ready;
+  auto const first_blocked =
+    first_entered && first_shutdown.wait_for(50ms) != std::future_status::ready;
+  auto const second_blocked =
+    second_entered && second_shutdown.wait_for(50ms) != std::future_status::ready;
+
   client->open_gate();
-  ctx->shutdown();
+  auto const first_finished  = first_shutdown.wait_for(5s) == std::future_status::ready;
+  auto const second_finished = second_shutdown.wait_for(5s) == std::future_status::ready;
+  REQUIRE(first_finished);
+  REQUIRE(second_finished);
+  first_shutdown.get();
+  second_shutdown.get();
+  CHECK(first_entered);
+  CHECK(second_entered);
+  CHECK(first_blocked);
+  CHECK(second_blocked);
   ctx->shutdown();
   REQUIRE(require_ready_value(fut) == payload.size());
 }

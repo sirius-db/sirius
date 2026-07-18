@@ -53,10 +53,9 @@ using sirius::io::rdma::rdma_perf_snapshot;
 using sirius::io::s3::s3_rdma_ioctx;
 using namespace std::chrono_literals;
 
-constexpr std::size_t k_max_inflight     = 2;
-constexpr std::size_t k_slot_size        = 64UL << 10;
-constexpr std::size_t k_max_get_attempts = 3;
-constexpr std::string_view k_bucket      = "bucket";
+constexpr std::size_t k_max_inflight = 2;
+constexpr std::size_t k_slot_size    = 64UL << 10;
+constexpr std::string_view k_bucket  = "bucket";
 
 std::size_t ceil_div(std::size_t value, std::size_t divisor)
 {
@@ -79,11 +78,8 @@ object_store_config make_rdma_object_store_config()
 cuobj_rdma_reactor::config make_reactor_config()
 {
   cuobj_rdma_reactor::config cfg;
-  cfg.max_inflight       = k_max_inflight;
-  cfg.arena_slot_size    = k_slot_size;
-  cfg.max_get_attempts   = k_max_get_attempts;
-  cfg.retry_backoff_base = 0ms;
-  cfg.retry_jitter       = 0ms;
+  cfg.max_inflight    = k_max_inflight;
+  cfg.arena_slot_size = k_slot_size;
   return cfg;
 }
 
@@ -119,6 +115,12 @@ void require_zero_snapshot(rdma_perf_snapshot const& snapshot)
   CHECK(snapshot.slot_wait_total == 0);
   CHECK(snapshot.flush_total == 0);
   CHECK(snapshot.inflight_peak == 0);
+  CHECK(snapshot.envelope_wait_total == 0);
+  CHECK(snapshot.envelope_wait_ns_total == 0);
+  CHECK(snapshot.envelope_depth_peak == 0);
+  CHECK(snapshot.slots_in_use_peak == 0);
+  CHECK(snapshot.fail_stop_total == 0);
+  CHECK(snapshot.arena_leak_total == 0);
 }
 
 void require_snapshots_equal(rdma_perf_snapshot const& lhs, rdma_perf_snapshot const& rhs)
@@ -131,6 +133,12 @@ void require_snapshots_equal(rdma_perf_snapshot const& lhs, rdma_perf_snapshot c
   CHECK(lhs.slot_wait_total == rhs.slot_wait_total);
   CHECK(lhs.flush_total == rhs.flush_total);
   CHECK(lhs.inflight_peak == rhs.inflight_peak);
+  CHECK(lhs.envelope_wait_total == rhs.envelope_wait_total);
+  CHECK(lhs.envelope_wait_ns_total == rhs.envelope_wait_ns_total);
+  CHECK(lhs.envelope_depth_peak == rhs.envelope_depth_peak);
+  CHECK(lhs.slots_in_use_peak == rhs.slots_in_use_peak);
+  CHECK(lhs.fail_stop_total == rhs.fail_stop_total);
+  CHECK(lhs.arena_leak_total == rhs.arena_leak_total);
 }
 
 std::shared_ptr<mock_rdma_client> seeded_client(std::string key,
@@ -239,29 +247,6 @@ TEST_CASE("s3_rdma retry metrics start at zero on a fresh ioctx", "[s3][rdma][me
   require_zero_snapshot(ctx->perf_snapshot());
 }
 
-TEST_CASE("s3_rdma host reads are retried and counted", "[s3][rdma][retry][metrics]")
-{
-  using namespace s3_rdma_p4a_tests;
-
-  auto payload = pattern_bytes(4096);
-  auto client  = seeded_client("host-retry", payload);
-  client->fail_next_gets(1, "flaky-host");
-
-  auto ctx = make_started_ioctx(client);
-  auto ds  = open_ds(ctx, "host-retry");
-
-  std::vector<std::uint8_t> got(payload.size());
-  REQUIRE(ds->host_read(0, got.size(), got.data()) == got.size());
-  require_bytes_equal(got, payload);
-
-  auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.bytes_total == payload.size());
-  CHECK(snapshot.requests_total == 1);
-  CHECK(snapshot.retries_total == 1);
-  CHECK(snapshot.error_total == 0);
-  CHECK(client->gets_issued() == 2);
-}
-
 TEST_CASE("s3_rdma ioctx perf snapshot is the single reactor aggregate", "[s3][rdma][metrics]")
 {
   using namespace s3_rdma_p4a_tests;
@@ -286,117 +271,8 @@ TEST_CASE("s3_rdma ioctx perf snapshot is the single reactor aggregate", "[s3][r
   require_snapshots_equal(ctx->perf_snapshot(), direct_reactor->perf_snapshot());
 }
 
-TEST_CASE("s3_rdma transient device get failure recovers and records one retry",
-          "[s3][rdma][retry][metrics][gpu]")
-{
-  using namespace s3_rdma_p4a_tests;
-  if (!cuda_device_available()) { return; }
-
-  auto payload = pattern_bytes(k_slot_size);
-  auto client  = seeded_client("flaky-device", payload);
-  client->fail_next_gets(1, "flaky");
-
-  auto ctx = make_started_ioctx(client);
-  auto ds  = open_ds(ctx, "flaky-device");
-  rmm::cuda_stream stream;
-  rmm::device_buffer device(payload.size(), stream);
-
-  auto fut = issue_device_read(*ds, 0, payload.size(), device, stream);
-  REQUIRE(require_ready_value(fut) == payload.size());
-  auto got = copy_device_to_host(device.data(), payload.size(), stream);
-  require_bytes_equal(got, payload);
-
-  auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.retries_total == 1);
-  CHECK(snapshot.error_total == 0);
-  CHECK(client->gets_issued() == 2);
-}
-
-TEST_CASE("s3_rdma persistent device get failure exhausts retries without fallback",
-          "[s3][rdma][retry][metrics][gpu]")
-{
-  using namespace s3_rdma_p4a_tests;
-  if (!cuda_device_available()) { return; }
-
-  auto payload = pattern_bytes(k_slot_size);
-  auto client  = seeded_client("persistent-error", payload);
-  auto ctx     = make_started_ioctx(client);
-  auto ds      = open_ds(ctx, "persistent-error");
-  REQUIRE(ds->io_ctx()->type() == sirius::io::io_context_type::rdma);
-  client->fail_gets("down");
-
-  rmm::cuda_stream stream;
-  rmm::device_buffer device(payload.size(), stream);
-  auto fut           = issue_device_read(*ds, 0, payload.size(), device, stream);
-  auto const message = require_ready_error(fut);
-
-  CHECK(message.find("down") != std::string::npos);
-  CHECK(ds->io_ctx()->type() == sirius::io::io_context_type::rdma);
-  CHECK(client->gets_issued() == k_max_get_attempts);
-
-  auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.requests_total == 1);
-  CHECK(snapshot.retries_total == k_max_get_attempts - 1);
-  CHECK(snapshot.error_total == 1);
-}
-
-TEST_CASE("s3_rdma persistent short reads exhaust retries and count each short read",
-          "[s3][rdma][retry][metrics][gpu]")
-{
-  using namespace s3_rdma_p4a_tests;
-  if (!cuda_device_available()) { return; }
-
-  constexpr std::size_t k_short = k_slot_size / 2;
-  auto payload                  = pattern_bytes(k_slot_size);
-  auto client                   = seeded_client("short-read", payload);
-  client->short_read(k_short);
-
-  auto ctx = make_started_ioctx(client);
-  auto ds  = open_ds(ctx, "short-read");
-  rmm::cuda_stream stream;
-  rmm::device_buffer device(payload.size(), stream);
-
-  auto fut           = issue_device_read(*ds, 0, payload.size(), device, stream);
-  auto const message = require_ready_error(fut);
-
-  CHECK(message.find("short") != std::string::npos);
-  CHECK(client->gets_issued() == k_max_get_attempts);
-
-  auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.short_read_total == k_max_get_attempts);
-  CHECK(snapshot.retries_total == k_max_get_attempts - 1);
-  CHECK(snapshot.error_total == 1);
-}
-
-TEST_CASE("s3_rdma retries one flaky chunk inside a large device read",
-          "[s3][rdma][retry][metrics][gpu]")
-{
-  using namespace s3_rdma_p4a_tests;
-  if (!cuda_device_available()) { return; }
-
-  auto payload = pattern_bytes(3 * k_slot_size + 17);
-  auto client  = seeded_client("large-flaky", payload);
-  client->fail_next_gets(1, "one flaky chunk");
-
-  auto ctx = make_started_ioctx(client);
-  auto ds  = open_ds(ctx, "large-flaky");
-  rmm::cuda_stream stream;
-  rmm::device_buffer device(payload.size(), stream);
-
-  auto fut = issue_device_read(*ds, 0, payload.size(), device, stream);
-  REQUIRE(require_ready_value(fut) == payload.size());
-  auto got = copy_device_to_host(device.data(), payload.size(), stream);
-  require_bytes_equal(got, payload);
-
-  auto const n_chunks = ceil_div(payload.size(), k_slot_size);
-  CHECK(client->gets_issued() == n_chunks + 1);
-
-  auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.retries_total == 1);
-  CHECK(snapshot.error_total == 0);
-}
-
-TEST_CASE("s3_rdma clean device read metrics count chunks and bytes", "[s3][rdma][metrics][gpu]")
+TEST_CASE("s3_rdma clean device read metrics count logical requests and bytes",
+          "[s3][rdma][metrics][gpu]")
 {
   using namespace s3_rdma_p4a_tests;
   if (!cuda_device_available()) { return; }
@@ -412,12 +288,15 @@ TEST_CASE("s3_rdma clean device read metrics count chunks and bytes", "[s3][rdma
   REQUIRE(require_ready_value(fut) == payload.size());
 
   auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.requests_total == ceil_div(payload.size(), k_slot_size));
+  CHECK(snapshot.requests_total == 1);
   CHECK(snapshot.bytes_total == payload.size());
   CHECK(snapshot.error_total == 0);
   CHECK(snapshot.retries_total == 0);
   CHECK(snapshot.inflight_peak >= 1);
   CHECK(snapshot.inflight_peak <= k_max_inflight);
+  CHECK(snapshot.slots_in_use_peak >= 1);
+  CHECK(snapshot.slots_in_use_peak <= k_max_inflight);
+  CHECK(snapshot.envelope_depth_peak == 1);
   CHECK(snapshot.flush_total == 0);
 }
 
@@ -442,6 +321,7 @@ TEST_CASE("s3_rdma slot wait remains zero under gated backpressure", "[s3][rdma]
   client->open_gate();
   REQUIRE(require_ready_value(fut) == payload.size());
   CHECK(ctx->perf_snapshot().slot_wait_total == 0);
+  CHECK(ctx->perf_snapshot().slots_in_use_peak <= k_max_inflight);
 }
 
 TEST_CASE("s3_rdma perf counters accumulate monotonically and can be sampled in flight",
@@ -475,7 +355,9 @@ TEST_CASE("s3_rdma perf counters accumulate monotonically and can be sampled in 
   auto const after_second = ctx->perf_snapshot();
 
   CHECK(after_second.bytes_total == 2 * payload.size());
-  CHECK(after_second.requests_total == 2 * ceil_div(payload.size(), k_slot_size));
+  CHECK(after_second.requests_total == 2);
   CHECK(after_second.retries_total == after_first.retries_total);
   CHECK(after_second.error_total == 0);
+  CHECK(after_second.envelope_depth_peak >= after_first.envelope_depth_peak);
+  CHECK(after_second.slots_in_use_peak >= after_first.slots_in_use_peak);
 }
