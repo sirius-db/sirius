@@ -125,8 +125,11 @@ class GpuExecutionFixture {
     REQUIRE_FALSE(result->HasError());
   }
 
-  /// Collect all rows as sorted vectors of stringified values for deterministic comparison.
-  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  /// Collect all rows as vectors of stringified values. When `sort` is true the
+  /// rows are sorted for order-insensitive multiset comparison; pass false to
+  /// preserve emitted order (e.g. to verify ORDER BY / NULLS FIRST|LAST).
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
+                                                            bool sort = true)
   {
     std::vector<std::vector<std::string>> rows;
     for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
@@ -137,11 +140,24 @@ class GpuExecutionFixture {
       }
       rows.push_back(std::move(row));
     }
-    std::sort(rows.begin(), rows.end());
+    if (sort) { std::sort(rows.begin(), rows.end()); }
     return rows;
   }
 
-  void compare_gpu_vs_cpu(const std::string& query)
+  /// GPU-vs-CPU comparison that ignores row order (rows are sorted first). Use
+  /// for filters, joins, aggregates, and any query without an ORDER BY.
+  void compare_gpu_vs_cpu(const std::string& query) { compare_gpu_vs_cpu_impl(query, false); }
+
+  /// GPU-vs-CPU comparison that preserves row order. Use for queries with a
+  /// deterministic output order (ORDER BY / LIMIT) so NULLS FIRST|LAST placement
+  /// is actually verified rather than sorted away.
+  void compare_gpu_vs_cpu_ordered(const std::string& query)
+  {
+    compare_gpu_vs_cpu_impl(query, true);
+  }
+
+ private:
+  void compare_gpu_vs_cpu_impl(const std::string& query, bool ordered)
   {
     // Run on GPU (transparent, plain SQL goes through the Sirius optimizer hook).
     con->Query("SET gpu_execution = true;");
@@ -169,8 +185,10 @@ class GpuExecutionFixture {
 
     auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
     auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
-    auto gpu_rows = collect_rows(gpu_mat);
-    auto cpu_rows = collect_rows(cpu_mat);
+    // For ordered queries, keep emitted order so NULLS FIRST|LAST is verified;
+    // otherwise sort both sides for an order-insensitive multiset comparison.
+    auto gpu_rows = collect_rows(gpu_mat, !ordered);
+    auto cpu_rows = collect_rows(cpu_mat, !ordered);
 
     for (size_t r = 0; r < gpu_rows.size(); r++) {
       for (size_t c = 0; c < gpu_rows[r].size(); c++) {
@@ -183,6 +201,7 @@ class GpuExecutionFixture {
     }
   }
 
+ public:
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> con;
   std::string temp_db_path;
