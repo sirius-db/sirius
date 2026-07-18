@@ -95,7 +95,13 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 
  private:
+  /// Retained so the ioctx reaches the admission gate (control permits, the
+  /// terminal error) through the same context the reactor holds.
+  s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx,
+                std::shared_ptr<rdma::rdma_client> client);
+
   std::shared_ptr<rdma::rdma_client> _client;
+  std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> _reactor_ctx;
 };
 
 }  // namespace sirius::io::s3

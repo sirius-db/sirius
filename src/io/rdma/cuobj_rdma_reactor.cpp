@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cassert>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -63,13 +64,6 @@ size_t clipped_size(const cuobj_rdma_io_object& file, size_t offset, size_t size
   const size_t file_size = file.size();
   if (offset >= file_size) { return 0; }
   return std::min(size, file_size - offset);
-}
-
-cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg)
-{
-  if (cfg.max_inflight == 0) { cfg.max_inflight = 1; }
-  if (cfg.arena_slot_size == 0) { cfg.arena_slot_size = 64UL << 10; }
-  return cfg;
 }
 
 /// Sticky/context-fatal classification, driven by the single table
@@ -120,6 +114,14 @@ struct event_guard {
     }
   }
 };
+
+/// Monotonic peak update: plain load/store lets a smaller concurrent value
+/// overwrite a larger one, under-reporting the peak.
+void update_peak(std::atomic<uint64_t>& peak, uint64_t value) noexcept
+{
+  uint64_t prev = peak.load(std::memory_order_relaxed);
+  while (value > prev && !peak.compare_exchange_weak(prev, value, std::memory_order_relaxed)) {}
+}
 
 }  // namespace
 
@@ -172,6 +174,35 @@ void validate(const cuda_delivery_ops& ops)
   }
 }
 
+cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg)
+{
+  if (cfg.max_inflight == 0) { cfg.max_inflight = 1; }
+  if (cfg.arena_slot_size == 0) { cfg.arena_slot_size = 64UL << 10; }
+  if (cfg.queue_cap.has_value()) {
+    if (*cfg.queue_cap == 0) {
+      throw std::invalid_argument("cuobj_rdma_reactor: queue_cap must be positive");
+    }
+  } else {
+    if (cfg.max_inflight > std::numeric_limits<size_t>::max() / 4) {
+      throw std::overflow_error(
+        "cuobj_rdma_reactor: the derived queue_cap (4 x max_inflight) overflows");
+    }
+    cfg.queue_cap = 4 * cfg.max_inflight;
+  }
+  return cfg;
+}
+
+cuobj_rdma_reactor::reactor_context::reactor_context(config cfg,
+                                                     std::shared_ptr<rdma_client> client,
+                                                     cuda_delivery_ops delivery)
+  : _config(sanitized(cfg)),
+    _client(std::move(client)),
+    _delivery(std::move(delivery)),
+    _gate(*_config.queue_cap)
+{
+  validate(_delivery);
+}
+
 cuobj_rdma_reactor::arena::~arena()
 {
   if (base == nullptr) { return; }
@@ -184,8 +215,11 @@ cuobj_rdma_reactor::arena::~arena()
 }
 
 cuobj_rdma_reactor::cuobj_rdma_reactor(std::shared_ptr<reactor_context> ctx)
-  : _ctx(std::move(ctx)), _config(sanitized(_ctx->cfg()))
+  : _ctx(std::move(ctx)), _config(_ctx->cfg())
 {
+  // Bound before the reactor is externally visible and before any worker
+  // exists, so the bind is single-threaded and immutable.
+  _ctx->gate().bind_arena_marker(&cuobj_rdma_reactor::mark_arenas_non_freeable, this);
 }
 
 cuobj_rdma_reactor::~cuobj_rdma_reactor()
@@ -196,11 +230,23 @@ cuobj_rdma_reactor::~cuobj_rdma_reactor()
   }
 }
 
+void cuobj_rdma_reactor::mark_arenas_non_freeable(void* opaque) noexcept
+{
+  auto* self = static_cast<cuobj_rdma_reactor*>(opaque);
+  std::lock_guard lk{self->_arena_mtx};
+  for (auto& [device_id, ar] : self->_arenas) {
+    if (ar && !ar->leaked) {
+      ar->leaked = true;
+      self->_arena_leak_total.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
 void cuobj_rdma_reactor::start()
 {
-  std::lock_guard lk{_mtx};
-  if (_state != reactor_state::created) { return; }
-  _state = reactor_state::running;
+  std::lock_guard lk{_lifecycle_mtx};
+  if (_started) { return; }
+  _started = true;
   _workers.reserve(_config.max_inflight);
   for (size_t i = 0; i < _config.max_inflight; ++i) {
     _workers.emplace_back([this] { worker_loop(); });
@@ -209,148 +255,120 @@ void cuobj_rdma_reactor::start()
 
 void cuobj_rdma_reactor::shutdown()
 {
-  {
-    std::unique_lock lk{_mtx};
-    if (_state == reactor_state::joined) { return; }
-    _state = reactor_state::stopping;
-    _cv.notify_all();
-    _drained_cv.wait(lk, [&] { return _queue.empty() && _active == 0; });
-    _state = reactor_state::joined;
-    _cv.notify_all();
+  std::unique_lock lk{_lifecycle_mtx};
+  if (_joined) { return; }
+  if (_closing) {
+    // A joiner is already elected; block until it finishes.
+    _joined_cv.wait(lk, [&] { return _joined; });
+    return;
   }
+  _closing = true;
+  lk.unlock();
+
+  auto& gate = _ctx->gate();
+  auto batch = gate.begin_close();
+  if (batch.has_token()) {
+    batch.error_complete_all(
+      std::make_exception_ptr(std::runtime_error("cuobj_rdma_reactor: transport closed")));
+    gate.complete_drain(std::move(batch).take_token());
+  }
+  // Issued work publishes before this returns: permits, claim guards, and the
+  // drain all resolve first.
+  gate.await_closed();
   for (auto& worker : _workers) {
     if (worker.joinable()) { worker.join(); }
   }
   _workers.clear();
+
+  lk.lock();
+  _joined = true;
+  _joined_cv.notify_all();
 }
 
-void cuobj_rdma_reactor::interrupt() { _cv.notify_all(); }
-
-bool cuobj_rdma_reactor::stopping()
-{
-  std::lock_guard lk{_mtx};
-  return _state == reactor_state::failing || _state == reactor_state::failed ||
-         _state == reactor_state::stopping || _state == reactor_state::joined;
-}
-
-bool cuobj_rdma_reactor::delivery_fatal()
-{
-  std::lock_guard lk{_mtx};
-  return _first_fatal != nullptr;
-}
-
-std::string cuobj_rdma_reactor::first_fatal_message()
-{
-  std::lock_guard lk{_mtx};
-  return _first_fatal_message;
-}
-
-void cuobj_rdma_reactor::enter_failed(std::exception_ptr fatal, std::string message)
-{
-  std::deque<std::unique_ptr<cuobj_chunked_rx_request>> drained;
-  {
-    std::lock_guard lk{_mtx};
-    if (_state != reactor_state::running) { return; }  // exactly-once; shutdown keeps its own path
-    _state               = reactor_state::failing;
-    _first_fatal         = fatal;
-    _first_fatal_message = std::move(message);
-    drained.swap(_queue);
-    _delivery_fatal_total.fetch_add(1, std::memory_order_relaxed);
-    _cv.notify_all();
-    _drained_cv.notify_all();
-  }
-  SIRIUS_LOG_ERROR(
-    "cuobj_rdma_reactor: FATAL delivery state — {}; intake stopped, {} queued "
-    "chunk(s) drained by error; a fatal CUDA error is process-level: restart is "
-    "the recovery",
-    _first_fatal_message,
-    drained.size());
-  for (auto& chunk : drained) {
-    if (chunk && chunk->manager) { chunk->manager->report_error(fatal); }
-  }
-  {
-    std::lock_guard lk{_mtx};
-    if (_state == reactor_state::failing) { _state = reactor_state::failed; }
-  }
-}
+void cuobj_rdma_reactor::interrupt() {}
 
 rdma_perf_snapshot cuobj_rdma_reactor::perf_snapshot() const noexcept
 {
+  const auto& gate = _ctx->gate();
   rdma_perf_snapshot s;
-  s.bytes_total          = _bytes_total.load(std::memory_order_relaxed);
-  s.requests_total       = _requests_total.load(std::memory_order_relaxed);
-  s.retries_total        = _retries_total.load(std::memory_order_relaxed);
-  s.short_read_total     = _short_read_total.load(std::memory_order_relaxed);
-  s.error_total          = _error_total.load(std::memory_order_relaxed);
-  s.slot_wait_total      = _slot_wait_total.load(std::memory_order_relaxed);
-  s.flush_total          = _flush_total.load(std::memory_order_relaxed);
-  s.inflight_peak        = _inflight_peak.load(std::memory_order_relaxed);
-  s.delivery_fatal_total = _delivery_fatal_total.load(std::memory_order_relaxed);
-  s.arena_leak_total     = _arena_leak_total.load(std::memory_order_relaxed);
+  s.bytes_total            = _bytes_total.load(std::memory_order_relaxed);
+  s.requests_total         = _requests_total.load(std::memory_order_relaxed);
+  s.retries_total          = _retries_total.load(std::memory_order_relaxed);
+  s.short_read_total       = _short_read_total.load(std::memory_order_relaxed);
+  s.error_total            = _error_total.load(std::memory_order_relaxed);
+  s.slot_wait_total        = _slot_wait_total.load(std::memory_order_relaxed);
+  s.flush_total            = _flush_total.load(std::memory_order_relaxed);
+  s.inflight_peak          = _inflight_peak.load(std::memory_order_relaxed);
+  s.envelope_wait_total    = gate.envelope_wait_total();
+  s.envelope_wait_ns_total = gate.envelope_wait_ns_total();
+  s.envelope_depth_peak    = gate.envelope_depth_peak();
+  s.slots_in_use_peak      = _slots_in_use_peak.load(std::memory_order_relaxed);
+  s.fail_stop_total        = gate.fail_stop_total();
+  s.arena_leak_total       = _arena_leak_total.load(std::memory_order_relaxed);
   return s;
 }
 
-size_t cuobj_rdma_reactor::get_with_retry(
-  std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst)
+size_t cuobj_rdma_reactor::one_shot_get(const cuobj_chunked_rx_request& chunk,
+                                        void* dst,
+                                        bool& transport_failure)
 {
   auto& client = *_ctx->client();
-  for (size_t attempt = 1;; ++attempt) {
-    try {
-      const size_t n = client.get(bucket, key, offset, size, dst);
-      if (n != size) {
-        _short_read_total.fetch_add(1, std::memory_order_relaxed);
-        throw short_read_error(n, size);
-      }
-      return n;
-    } catch (...) {
-      if (attempt >= _config.max_get_attempts || stopping()) { throw; }
-      _retries_total.fetch_add(1, std::memory_order_relaxed);
-      auto delay = _config.retry_backoff_base * attempt;
-      if (_config.retry_jitter.count() > 0) {
-        delay += std::chrono::milliseconds{
-          static_cast<int64_t>(attempt * 1315423911U % (_config.retry_jitter.count() + 1))};
-      }
-      if (delay.count() > 0) { std::this_thread::sleep_for(delay); }
-    }
+  size_t n     = 0;
+  try {
+    n = client.get(chunk.route->bucket, chunk.route->key, chunk.offset, chunk.size, dst);
+  } catch (...) {
+    transport_failure = true;
+    throw;
   }
+  if (n != chunk.size) {
+    _short_read_total.fetch_add(1, std::memory_order_relaxed);
+    transport_failure = true;
+    throw short_read_error(n, chunk.size);
+  }
+  return n;
 }
 
 void cuobj_rdma_reactor::worker_loop()
 {
+  auto& gate = _ctx->gate();
   for (;;) {
-    std::unique_ptr<cuobj_chunked_rx_request> chunk;
-    {
-      std::unique_lock lk{_mtx};
-      _cv.wait(lk, [&] {
-        return _state == reactor_state::stopping || _state == reactor_state::joined ||
-               !_queue.empty();
-      });
-      if (_queue.empty()) {
-        if (_state == reactor_state::stopping || _state == reactor_state::joined) { return; }
-        continue;
-      }
-      chunk = std::move(_queue.front());
-      _queue.pop_front();
-      ++_active;
-      if (auto peak = _inflight_peak.load(std::memory_order_relaxed); _active > peak) {
-        _inflight_peak.store(_active, std::memory_order_relaxed);
-      }
-    }
-    process_chunk(*chunk);
-    {
-      std::lock_guard lk{_mtx};
-      --_active;
-      if (_queue.empty() && _active == 0) { _drained_cv.notify_all(); }
-    }
+    auto claimed = gate.claim();
+    if (!claimed.has_value()) { return; }  // admission closed: the exit signal
+    update_peak(_inflight_peak, _inflight.fetch_add(1, std::memory_order_relaxed) + 1);
+    process_claimed(std::move(*claimed));
+    _inflight.fetch_sub(1, std::memory_order_relaxed);
   }
 }
 
-void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
+void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_arg)
 {
-  _requests_total.fetch_add(1, std::memory_order_relaxed);
+  auto& gate = _ctx->gate();
+  // Declaration order carries the teardown ordering (members are destroyed
+  // in reverse): `claimed` is destroyed FIRST, publishing the request's
+  // outcome by dropping the manager reference; then the permit releases its
+  // outstanding-work count; the arena slot is released LAST — after a
+  // transport failure's fail_stop, arena marking, and error report have all
+  // run, so a slot whose remote write state is unknown is never handed to
+  // another worker mid-transition.
+  struct slot_holder {
+    cuobj_rdma_reactor* self{nullptr};
+    slot_pool* pool{nullptr};
+    int slot{slot_pool::no_slot};
+    ~slot_holder()
+    {
+      if (pool == nullptr) { return; }
+      pool->release(slot);
+      self->_slots_in_use.fetch_sub(1, std::memory_order_relaxed);
+    }
+  } held_slot;
+  std::optional<admission_gate::admission_permit> permit;
+  std::optional<admission_gate::claimed_chunk> claimed{std::move(claimed_arg)};
+  bool transport_failure = false;
   try {
+    const auto& chunk = claimed->chunk();
     if (!chunk.is_device) {
-      const size_t n = get_with_retry(chunk.bucket, chunk.key, chunk.offset, chunk.size, chunk.dst);
+      permit.emplace(gate.acquire_get(std::move(*claimed)));
+      const size_t n = one_shot_get(chunk, chunk.dst, transport_failure);
       _bytes_total.fetch_add(n, std::memory_order_relaxed);
       chunk.manager->chunk_complete(n);
       return;
@@ -365,11 +383,12 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
       _slot_wait_total.fetch_add(1, std::memory_order_relaxed);
       slot = ar.pool->acquire();
     }
-    struct slot_release {
-      slot_pool* pool;
-      int slot;
-      ~slot_release() { pool->release(slot); }
-    } release{ar.pool.get(), slot};
+    update_peak(_slots_in_use_peak, _slots_in_use.fetch_add(1, std::memory_order_relaxed) + 1);
+    // Member-wise on purpose: assigning a braced temporary would run the
+    // temporary's destructor and release the slot immediately.
+    held_slot.self = this;
+    held_slot.pool = ar.pool.get();
+    held_slot.slot = slot;
 
     const auto& ops = _ctx->delivery_ops();
 
@@ -393,15 +412,15 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
     }
 
     uint8_t* slot_ptr = ar.base + static_cast<size_t>(slot) * _config.arena_slot_size;
-    const size_t n    = get_with_retry(chunk.bucket, chunk.key, chunk.offset, chunk.size, slot_ptr);
+    permit.emplace(gate.acquire_get(std::move(*claimed)));
+    const size_t n = one_shot_get(chunk, slot_ptr, transport_failure);
 
-    // After a fatal transition never start new CUDA work on the dead
-    // context.  The owning worker resolves its own chunk here, before any
-    // CUDA work is enqueued; nothing is in flight on the slot, so the plain
-    // RAII release below is safe.
-    if (delivery_fatal()) {
-      throw std::runtime_error("cuobj_rdma_reactor: chunk aborted after a fatal delivery state (" +
-                               first_fatal_message() + ")");
+    // A fatal latched by another worker while our GET was in flight: never
+    // start new CUDA work on the dead context.  The owning worker resolves
+    // its own chunk here, before any CUDA work is enqueued; nothing is in
+    // flight on the slot, so the plain RAII release below is safe.
+    if (gate.first_fatal() != nullptr) {
+      throw std::runtime_error("cuobj_rdma_reactor: chunk aborted after a fatal delivery state");
     }
 
     if (_ctx->flush_before_copy()) {
@@ -457,15 +476,36 @@ void cuobj_rdma_reactor::process_chunk(cuobj_chunked_rx_request& chunk)
     chunk.manager->chunk_complete(n);
   } catch (...) {
     _error_total.fetch_add(1, std::memory_order_relaxed);
-    chunk.manager->report_error(std::current_exception());
+    auto error = std::current_exception();
+    if (transport_failure) {
+      // One-shot: an RDMA failure is ambiguous about remote/NIC state, so it
+      // poisons the transport rather than retrying.  The arena marking runs
+      // inside the transition; queued work drains by error right here.
+      auto batch = gate.fail_stop(error);
+      if (batch.has_token()) {
+        batch.error_complete_all(error);
+        gate.complete_drain(std::move(batch).take_token());
+      }
+    }
+    // Publication before release: report the failing chunk while the claim
+    // guard / get permit is still held (their destructors run after this
+    // frame, claimed first).
+    claimed->report_error(error);
   }
 }
 
 cuobj_rdma_reactor::arena& cuobj_rdma_reactor::arena_for_device(int device_id)
 {
+  {
+    std::lock_guard lk{_arena_mtx};
+    if (auto it = _arenas.find(device_id); it != _arenas.end()) { return *it->second; }
+  }
+  // Creation only: refuse when admission is closed, and hold the gate's
+  // creation scope across the insert so the arena is either present at a
+  // fail-stop's marking point or never created (lock order gate -> arena).
+  auto scope = _ctx->gate().enter_creation();
   std::lock_guard lk{_arena_mtx};
-  auto it = _arenas.find(device_id);
-  if (it != _arenas.end()) { return *it->second; }
+  if (auto it = _arenas.find(device_id); it != _arenas.end()) { return *it->second; }
 
   auto ar = std::make_unique<arena>();
   throw_on_cuda_error(
@@ -488,8 +528,7 @@ cuobj_rdma_reactor::request_type_ptr cuobj_rdma_reactor::prep_host_rx_request(
   auto manager = std::make_shared<request_manager>(n, 1);
   std::vector<std::unique_ptr<cuobj_chunked_rx_request>> chunks;
   auto chunk     = std::make_unique<cuobj_chunked_rx_request>();
-  chunk->bucket  = file.bucket();
-  chunk->key     = file.key();
+  chunk->route   = std::make_shared<const rx_route>(rx_route{file.bucket(), file.key()});
   chunk->offset  = segment.offset;
   chunk->size    = n;
   chunk->dst     = segment.data();
@@ -510,26 +549,24 @@ cuobj_rdma_reactor::request_type_ptr cuobj_rdma_reactor::prep_device_rx_request(
   const size_t total = clipped_size(file, offset, size);
   if (total == 0) { return request_type::create({}); }
 
+  // One descriptor for the WHOLE logical request; the admission gate
+  // materializes slot-sized chunks lazily at claim time.  The manager's
+  // fan-in count must match that chunking exactly.
   const size_t slot_size = cfg.arena_slot_size != 0 ? cfg.arena_slot_size : (64UL << 10);
   const size_t n_chunks  = (total + slot_size - 1) / slot_size;
   auto manager           = std::make_shared<request_manager>(total, n_chunks);
 
   std::vector<std::unique_ptr<cuobj_chunked_rx_request>> chunks;
-  chunks.reserve(n_chunks);
-  for (size_t i = 0; i < n_chunks; ++i) {
-    const size_t delta = i * slot_size;
-    auto chunk         = std::make_unique<cuobj_chunked_rx_request>();
-    chunk->bucket      = file.bucket();
-    chunk->key         = file.key();
-    chunk->offset      = offset + delta;
-    chunk->size        = std::min(slot_size, total - delta);
-    chunk->dst         = dst + delta;
-    chunk->is_device   = true;
-    chunk->stream      = stream;
-    chunk->device_id   = device_id;
-    chunk->manager     = manager;
-    chunks.push_back(std::move(chunk));
-  }
+  auto whole       = std::make_unique<cuobj_chunked_rx_request>();
+  whole->route     = std::make_shared<const rx_route>(rx_route{file.bucket(), file.key()});
+  whole->offset    = offset;
+  whole->size      = total;
+  whole->dst       = dst;
+  whole->is_device = true;
+  whole->stream    = stream;
+  whole->device_id = device_id;
+  whole->manager   = std::move(manager);
+  chunks.push_back(std::move(whole));
   return request_type::create(std::move(chunks));
 }
 
@@ -540,35 +577,39 @@ void cuobj_rdma_reactor::enqueue(request_type_ptr req)
   if (chunks.empty()) { return; }
 
   std::exception_ptr failure;
-  {
-    std::lock_guard lk{_mtx};
-    if (!_ctx->client()) {
-      failure = std::make_exception_ptr(not_implemented("enqueue"));
-    } else if (_state == reactor_state::failing || _state == reactor_state::failed) {
-      // The static prep_* builders cannot see reactor state, so a fatal
-      // delivery state surfaces here, naming the first fatal error.
-      failure = std::make_exception_ptr(
-        std::runtime_error("cuobj_rdma_reactor::enqueue: reactor entered a fatal delivery state (" +
-                           _first_fatal_message + ")"));
-    } else if (_state == reactor_state::stopping || _state == reactor_state::joined) {
-      failure = std::make_exception_ptr(
-        std::runtime_error("cuobj_rdma_reactor::enqueue: reactor is shut down"));
-    } else if (_state != reactor_state::running) {
-      failure = std::make_exception_ptr(
-        std::runtime_error("cuobj_rdma_reactor::enqueue: reactor is not started"));
-    } else {
-      for (auto& chunk : chunks) {
-        _queue.push_back(std::move(chunk));
+  if (!_ctx->client()) {
+    failure = std::make_exception_ptr(not_implemented("enqueue"));
+  } else {
+    auto& gate = _ctx->gate();
+    try {
+      bool admitted = false;
+      for (auto& descriptor : chunks) {
+        if (!descriptor) { continue; }
+        admission_gate::envelope env{
+          std::string{},
+          std::string{},
+          descriptor->offset,
+          descriptor->size,
+          descriptor->dst,
+          descriptor->is_device,
+          descriptor->stream,
+          descriptor->device_id,
+          descriptor->manager,
+          descriptor->is_device ? _config.arena_slot_size : descriptor->size};
+        gate.submit(descriptor->route,
+                    std::move(env));  // may block at the cap; throws once terminal
+        admitted = true;
       }
+      if (admitted) { _requests_total.fetch_add(1, std::memory_order_relaxed); }
+    } catch (...) {
+      failure = std::current_exception();
     }
   }
   if (failure) {
-    for (auto& chunk : chunks) {
-      if (chunk) { chunk->manager->report_error(failure); }
+    for (auto& descriptor : chunks) {
+      if (descriptor && descriptor->manager) { descriptor->manager->report_error(failure); }
     }
-    return;
   }
-  _cv.notify_all();
 }
 
 size_t cuobj_rdma_reactor::host_read(const io_object_type& file,
@@ -579,15 +620,23 @@ size_t cuobj_rdma_reactor::host_read(const io_object_type& file,
   if (!_ctx->client()) { throw not_implemented("host_read"); }
   const size_t n = clipped_size(file, offset, size);
   if (n == 0) { return 0; }
+
+  auto manager = std::make_shared<request_manager>(n, 1);
+  auto future  = manager->get_future();
+  auto route   = std::make_shared<const rx_route>(rx_route{file.bucket(), file.key()});
+  admission_gate::envelope env{std::string{},
+                               std::string{},
+                               offset,
+                               n,
+                               dst,
+                               /*is_device=*/false,
+                               rmm::cuda_stream_view{},
+                               /*device_id=*/-1,
+                               std::move(manager),
+                               /*slot_bytes=*/n};
+  _ctx->gate().submit(std::move(route), std::move(env));
   _requests_total.fetch_add(1, std::memory_order_relaxed);
-  try {
-    const size_t got = get_with_retry(file.bucket(), file.key(), offset, n, dst);
-    _bytes_total.fetch_add(got, std::memory_order_relaxed);
-    return got;
-  } catch (...) {
-    _error_total.fetch_add(1, std::memory_order_relaxed);
-    throw;
-  }
+  return std::move(future).get();
 }
 
 std::unique_ptr<cuobj_rdma_reactor::io_object_type> cuobj_rdma_reactor::create_io_object(

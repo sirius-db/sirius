@@ -19,6 +19,7 @@
 #include "io/cache/types.hpp"
 #include "io/details/slot_pool.hpp"
 #include "io/io_request.hpp"
+#include "io/rdma/rdma_admission_gate.hpp"
 #include "io/rdma/rdma_client.hpp"
 #include "io/types.hpp"
 
@@ -28,15 +29,14 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -146,18 +146,22 @@ void validate(const cuda_delivery_ops& ops);
 /// atomics (the REST backend's perf-snapshot pattern).  Values accumulate for
 /// the reactor's lifetime and are never reset.
 struct rdma_perf_snapshot {
-  uint64_t bytes_total{0};       ///< bytes successfully delivered (device + host paths)
-  uint64_t requests_total{0};    ///< chunks / sync host reads processed (a retried one counts once)
-  uint64_t retries_total{0};     ///< retry attempts performed (attempts beyond the first)
-  uint64_t short_read_total{0};  ///< short reads observed (every occurrence, retried or terminal)
+  uint64_t bytes_total{0};     ///< bytes successfully delivered (device + host paths)
+  uint64_t requests_total{0};  ///< logical read requests admitted (one per envelope, not per chunk)
+  uint64_t retries_total{0};   ///< always 0: a transport failure fail-stops instead of retrying
+  uint64_t short_read_total{0};  ///< short reads observed (each one is terminal)
   uint64_t error_total{0};       ///< chunks / sync host reads that failed terminally
   uint64_t slot_wait_total{0};   ///< arena-slot acquisitions that had to block (0 by construction
                                  ///< while slots == workers; kept for staged-completion shapes)
   uint64_t flush_total{0};       ///< GPUDirect write flushes performed (0 while flushing is off)
   uint64_t inflight_peak{0};     ///< max chunks concurrently being processed by the worker pool
-  uint64_t delivery_fatal_total{0};  ///< fail-stop transitions (exactly-once per reactor)
-  uint64_t arena_leak_total{0};      ///< arenas deliberately leaked at teardown because device
-                                     ///< quiescence could not be established after a fatal state
+  uint64_t envelope_wait_total{0};     ///< submits that blocked at the envelope-queue cap
+  uint64_t envelope_wait_ns_total{0};  ///< total nanoseconds submitters spent blocked at the cap
+  uint64_t envelope_depth_peak{0};     ///< max queued envelopes (logical requests)
+  uint64_t slots_in_use_peak{0};       ///< max landing-arena slots concurrently held
+  uint64_t fail_stop_total{0};         ///< fail-stop transitions (exactly-once per reactor)
+  uint64_t arena_leak_total{0};        ///< arenas made non-freeable by a fail-stop (leaked at
+                                       ///< teardown: no deregister, no free)
 };
 
 /// s3://bucket/key object handle resolved by @c s3_rdma_ioctx::create_io_object
@@ -183,65 +187,51 @@ class cuobj_rdma_io_object : public sirius_io_object {
   size_t _file_size;
 };
 
-/// One transfer chunk: a slot-sized (or smaller) contiguous file range bound
-/// to its final destination.  Device chunks stage through a landing-arena slot
-/// before a device-to-device copy on @c stream; host chunks deliver directly.
-struct cuobj_chunked_rx_request {
-  std::string bucket;
-  std::string key;
-  size_t offset{0};
-  size_t size{0};
-  uint8_t* dst{nullptr};
-  bool is_device{false};
-  rmm::cuda_stream_view stream{};
-  int device_id{-1};
-  std::shared_ptr<request_manager> manager;
-};
-
 /**
  * @brief S3-over-RDMA reactor: a pool of @c max_inflight blocking workers over
  *        an @c rdma_client, delivering device reads through a per-device
  *        landing arena (cudaMalloc, slot-pooled) + a D2D copy on the request
  *        stream.
  *
- * Concurrency model: the client's @c get blocks, so the worker count IS the
- * in-flight ceiling; slot exhaustion is natural backpressure.  A chunk
- * terminates exactly once (chunk_complete / report_error) on a worker thread —
- * the read's future resolves when its last chunk releases the shared
- * @c request_manager.  With no client configured every path fails loudly with
- * a "not implemented" error; it never silently falls back to another
- * transport.  @c shutdown
- * drains queued work, then joins the workers; it is idempotent, and work
- * enqueued afterwards fails cleanly.
+ * Concurrency model: intake goes through the context's @c admission_gate —
+ * one envelope per logical read request, bounded by @c queue_cap; workers
+ * claim chunks lazily from the front envelope.  The client's @c get blocks,
+ * so the worker count IS the in-flight ceiling; slot exhaustion is natural
+ * backpressure.  A chunk terminates exactly once (chunk_complete /
+ * report_error) on a worker thread — the read's future resolves when its last
+ * chunk releases the shared @c request_manager.  A transport failure (thrown
+ * GET or short read) is one-shot: it fail-stops the gate, marks every landing
+ * arena non-freeable, and error-completes queued work; there is no retry and
+ * no fallback.  With no client configured every path fails loudly with a
+ * "not implemented" error.  @c shutdown closes admission, error-completes
+ * unissued work, waits for issued work to publish, then joins the workers;
+ * concurrent callers block until the elected joiner finishes.
  */
 class cuobj_rdma_reactor {
  public:
   struct config {
     size_t max_inflight{8};
     size_t arena_slot_size{4UL << 20};
-    /// Total transfer attempts per chunk / sync host read (the first + retries).
-    /// Only client transport failures and short reads retry — never CUDA work.
-    size_t max_get_attempts{3};
-    std::chrono::milliseconds retry_backoff_base{5};
-    std::chrono::milliseconds retry_jitter{5};
+    /// Envelope-queue bound (logical requests).  Unset derives
+    /// 4 x max_inflight after sanitizing; an explicit zero is rejected.
+    std::optional<size_t> queue_cap{};
   };
 
-  /// Shared per-pool state: the effective config + the transfer client (may be
-  /// null until the real data path is configured) + the CUDA delivery seam
-  /// (immutable after construction).
+  /// Shared per-pool state: the sanitized config + the transfer client (may be
+  /// null until the real data path is configured) + the CUDA delivery seam +
+  /// the admission gate (all immutable bindings after construction).  Config
+  /// errors surface here, at construction.
   class reactor_context {
    public:
     reactor_context(config cfg,
                     std::shared_ptr<rdma_client> client,
-                    cuda_delivery_ops delivery = {})
-      : _config(cfg), _client(std::move(client)), _delivery(std::move(delivery))
-    {
-      validate(_delivery);
-    }
+                    cuda_delivery_ops delivery = {});
 
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
     [[nodiscard]] const std::shared_ptr<rdma_client>& client() const noexcept { return _client; }
     [[nodiscard]] const cuda_delivery_ops& delivery_ops() const noexcept { return _delivery; }
+    [[nodiscard]] admission_gate& gate() noexcept { return _gate; }
+    [[nodiscard]] const admission_gate& gate() const noexcept { return _gate; }
 
     /// Flush GPUDirect writes before the consuming D2D copy.  Off by default;
     /// set at init from the device's writes-ordering attribute
@@ -253,6 +243,7 @@ class cuobj_rdma_reactor {
     config _config;
     std::shared_ptr<rdma_client> _client;
     cuda_delivery_ops _delivery;
+    admission_gate _gate;
     bool _flush_before_copy{false};
   };
 
@@ -309,54 +300,37 @@ class cuobj_rdma_reactor {
     uint8_t* base{nullptr};
     std::unique_ptr<slot_pool> pool;
     std::shared_ptr<rdma_client> registrar;  // deregisters base on teardown
-    bool leaked{false};                      // non-freeable flag: the destructor then skips
-                                             // deregister + cudaFree.  Reserved for an RDMA
-                                             // fail-stop that cannot prove the NIC is
-                                             // quiesced; no current path sets it, because a
-                                             // CUDA-fatal outcome terminates the process and
-                                             // the arena dies with it.
+    bool leaked{false};                      // non-freeable flag, set for every arena by the
+                                             // fail-stop marker: the destructor then skips
+                                             // deregister + cudaFree, because touching
+                                             // registered memory under an un-quiesced NIC is
+                                             // a use-after-free.
     ~arena();
   };
 
-  /// Reactor lifecycle (single state machine).  FAILING/FAILED are the
-  /// fail-stop terminal states entered exactly once by @c enter_failed:
-  /// intake stops (enqueue fails fast naming the first fatal error), queued
-  /// chunks are drained by error, and an active chunk is aborted before its
-  /// GET by the owner worker's pre-boundary @c delivery_fatal check; a chunk
-  /// is never resolved from another worker.  STOPPING/JOINED are ordinary
-  /// shutdown.  No current path enters FAILING (a fatal CUDA outcome
-  /// terminates the process instead); the transition is reserved for
-  /// RDMA-side fail-stop triggers, which also mark the arenas non-freeable.
-  enum class reactor_state : uint8_t { created, running, failing, failed, stopping, joined };
-
   void worker_loop();
-  void process_chunk(cuobj_chunked_rx_request& chunk);
+  /// One chunk end to end: arena/slot resolution, the pre-GET checks, the
+  /// one-shot client GET under the get permit, then the CUDA delivery
+  /// boundary.  A transport failure fail-stops the gate; the failing chunk is
+  /// error-reported before its guard or permit releases.
+  void process_claimed(admission_gate::claimed_chunk claimed_arg);
+  /// Single client GET + exact-completion check.  Sets @p transport_failure
+  /// before rethrowing so the caller can tell an RDMA failure (fail-stop)
+  /// from a CUDA-side one (error-complete only).
+  size_t one_shot_get(const cuobj_chunked_rx_request& chunk, void* dst, bool& transport_failure);
   arena& arena_for_device(int device_id);
-  [[nodiscard]] bool stopping();
-  [[nodiscard]] bool delivery_fatal();
-  [[nodiscard]] std::string first_fatal_message();
-  /// Exactly-once fail-stop transition: latches the first fatal error, swaps
-  /// out the queue (its chunks are error-reported OUTSIDE the lock), notifies,
-  /// and bumps delivery_fatal_total.  Later callers return with no effect.
-  void enter_failed(std::exception_ptr fatal, std::string message);
-  /// Bounded-retry transfer into @p dst: up to max_get_attempts client gets
-  /// (+ the short-read check), backoff between attempts, abort when stopping
-  /// or after a fatal transition.  Counts retries/short reads; throws the
-  /// last error on exhaustion.
-  size_t get_with_retry(
-    std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst);
+  /// The gate's whole-arena marker: flips every arena non-freeable and counts
+  /// each, called under the held gate mutex (lock order gate -> arena).
+  static void mark_arenas_non_freeable(void* opaque) noexcept;
 
   std::shared_ptr<reactor_context> _ctx;
   config _config;
 
-  std::mutex _mtx;
-  std::condition_variable _cv;
-  std::condition_variable _drained_cv;
-  std::deque<std::unique_ptr<cuobj_chunked_rx_request>> _queue;
-  size_t _active{0};
-  reactor_state _state{reactor_state::created};
-  std::exception_ptr _first_fatal;   // set once by enter_failed
-  std::string _first_fatal_message;  // its message, for fail-fast errors
+  std::mutex _lifecycle_mtx;
+  std::condition_variable _joined_cv;
+  bool _started{false};
+  bool _closing{false};
+  bool _joined{false};
   std::vector<std::thread> _workers;
 
   std::mutex _arena_mtx;
@@ -369,9 +343,17 @@ class cuobj_rdma_reactor {
   std::atomic<uint64_t> _error_total{0};
   std::atomic<uint64_t> _slot_wait_total{0};
   std::atomic<uint64_t> _flush_total{0};
+  std::atomic<uint64_t> _inflight{0};
   std::atomic<uint64_t> _inflight_peak{0};
-  std::atomic<uint64_t> _delivery_fatal_total{0};
+  std::atomic<uint64_t> _slots_in_use{0};
+  std::atomic<uint64_t> _slots_in_use_peak{0};
   std::atomic<uint64_t> _arena_leak_total{0};
 };
+
+/// Sanitized copy of @p cfg: zero worker count and slot size fall back to
+/// their minimum viable values, and the envelope cap resolves to an explicit
+/// positive value — 4 x max_inflight when unset (overflow-checked), rejected
+/// when explicitly zero.
+[[nodiscard]] cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg);
 
 }  // namespace sirius::io::rdma

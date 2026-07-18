@@ -296,7 +296,10 @@ TEST_CASE("cuobj_rdma_reactor mock gate enforces max inflight backpressure",
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
 
   REQUIRE(wait_until([&] { return client->gets_issued() >= kMaxInflight; }));
-  CHECK(client->peak_concurrent_gets() <= kMaxInflight);
+  CHECK(client->peak_concurrent_gets() == kMaxInflight);
+  auto const blocked_snapshot = ctx->perf_snapshot();
+  CHECK(blocked_snapshot.inflight_peak == kMaxInflight);
+  CHECK(blocked_snapshot.slots_in_use_peak == kMaxInflight);
   CHECK(fut.wait_for(50ms) != std::future_status::ready);
 
   client->open_gate();
@@ -306,7 +309,8 @@ TEST_CASE("cuobj_rdma_reactor mock gate enforces max inflight backpressure",
   auto const snapshot = ctx->perf_snapshot();
   CHECK(snapshot.requests_total == 1);
   CHECK(snapshot.envelope_depth_peak == 1);
-  CHECK(snapshot.slots_in_use_peak <= kMaxInflight);
+  CHECK(snapshot.inflight_peak == kMaxInflight);
+  CHECK(snapshot.slots_in_use_peak == kMaxInflight);
   CHECK(snapshot.envelope_wait_total == 0);
 }
 
@@ -403,7 +407,7 @@ TEST_CASE("cuobj_rdma_reactor resolves zero-length device reads without work",
   REQUIRE(require_ready_value(clipped, 250ms) == 0);
 }
 
-TEST_CASE("cuobj_rdma_reactor shutdown drains gated work and is idempotent",
+TEST_CASE("cuobj_rdma_reactor shutdown completes issued GETs and errors unissued chunks",
           "[s3][rdma][reactor][gpu]")
 {
   if (!cuda_device_available()) { return; }
@@ -419,7 +423,7 @@ TEST_CASE("cuobj_rdma_reactor shutdown drains gated work and is idempotent",
 
   auto fut =
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
-  REQUIRE(wait_until([&] { return client->gets_issued() > 0; }));
+  REQUIRE(wait_until([&] { return client->gets_issued() >= kMaxInflight; }));
 
   std::promise<void> first_shutdown_started;
   std::promise<void> second_shutdown_started;
@@ -452,7 +456,16 @@ TEST_CASE("cuobj_rdma_reactor shutdown drains gated work and is idempotent",
   CHECK(first_blocked);
   CHECK(second_blocked);
   ctx->shutdown();
-  REQUIRE(require_ready_value(fut) == payload.size());
+
+  auto const message = require_ready_error(fut);
+  CHECK(message.find("transport closed") != std::string::npos);
+  CHECK(client->gets_issued() == kMaxInflight);
+
+  constexpr auto completed_bytes = kMaxInflight * kSlotSize;
+  auto const snapshot            = ctx->perf_snapshot();
+  CHECK(snapshot.bytes_total == completed_bytes);
+  auto got = copy_device_to_host(device.data(), completed_bytes, stream);
+  require_bytes_equal(got, slice(payload, 0, completed_bytes));
 }
 
 TEST_CASE("cuobj_rdma_reactor recycles arena slots across sequential reads",

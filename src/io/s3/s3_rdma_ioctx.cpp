@@ -44,13 +44,21 @@ rdma::cuobj_rdma_reactor::config reactor_config_from(const object_store_config& 
 s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg,
                              std::shared_ptr<rdma::rdma_client> client,
                              rdma::cuda_delivery_ops delivery)
+  // The second argument stays a copy: constructor-argument evaluation order
+  // is unspecified, so a move here could empty `client` before the context
+  // captures it.
+  : s3_rdma_ioctx(std::make_shared<rdma::cuobj_rdma_reactor::reactor_context>(
+                    reactor_config_from(cfg), client, std::move(delivery)),
+                  client)
+{
+}
+
+s3_rdma_ioctx::s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx,
+                             std::shared_ptr<rdma::rdma_client> client)
   : templated_ioctx<rdma::cuobj_rdma_reactor>(
-      1,
-      [ctx = std::make_shared<rdma::cuobj_rdma_reactor::reactor_context>(
-         reactor_config_from(cfg), client, std::move(delivery))] {
-        return std::make_unique<rdma::cuobj_rdma_reactor>(ctx);
-      }),
-    _client(std::move(client))
+      1, [reactor_ctx] { return std::make_unique<rdma::cuobj_rdma_reactor>(reactor_ctx); }),
+    _client(std::move(client)),
+    _reactor_ctx(std::move(reactor_ctx))
 {
 }
 
@@ -67,7 +75,11 @@ rdma::rdma_perf_snapshot s3_rdma_ioctx::perf_snapshot() const noexcept
     total.slot_wait_total += s.slot_wait_total;
     total.flush_total += s.flush_total;
     total.inflight_peak = std::max(total.inflight_peak, s.inflight_peak);
-    total.delivery_fatal_total += s.delivery_fatal_total;
+    total.envelope_wait_total += s.envelope_wait_total;
+    total.envelope_wait_ns_total += s.envelope_wait_ns_total;
+    total.envelope_depth_peak = std::max(total.envelope_depth_peak, s.envelope_depth_peak);
+    total.slots_in_use_peak   = std::max(total.slots_in_use_peak, s.slots_in_use_peak);
+    total.fail_stop_total += s.fail_stop_total;
     total.arena_leak_total += s.arena_leak_total;
   }
   return total;
@@ -136,6 +148,9 @@ std::shared_ptr<sirius_io_object> s3_rdma_ioctx::create_io_object(std::string pa
     throw std::invalid_argument("s3_rdma_ioctx::create_io_object: unsupported scheme '" +
                                 parsed.scheme + "'");
   }
+  // The control permit covers the full HEAD: a closed or failed transport
+  // refuses new opens with its terminal error instead of touching the wire.
+  auto permit       = _reactor_ctx->gate().acquire_control();
   const size_t size = _client->head(parsed.host, parsed.path);
   return std::make_shared<rdma::cuobj_rdma_io_object>(
     std::move(path), std::move(parsed.host), std::move(parsed.path), size);
