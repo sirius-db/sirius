@@ -18,6 +18,7 @@
 #include "io/cache/prefetching_cache.hpp"
 #include "io/datasource_factory.hpp"
 #include "io/io_context.hpp"
+#include "io/rdma/mock_rdma_client.hpp"
 #include "io/rest/config.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_rdma_ioctx.hpp"
@@ -27,8 +28,8 @@
 #include "op/scan/parquet_metadata.hpp"
 #include "planner/query.hpp"
 #include "scan/test_utils.hpp"
-// P1 RDMA routing tests need to observe the scan manager's lazy per-path
-// ioctx cache. Keep the access seam local to this test TU.
+// RDMA routing tests need to observe the scan manager's lazy per-path ioctx
+// cache. Keep the access seam local to this test TU.
 #define private public
 #include "scan_manager/sirius_scan_manager.hpp"
 #undef private
@@ -62,6 +63,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -161,21 +163,27 @@ bool is_local_backend(std::optional<io_context_type> type)
   return type.has_value() && (*type == io_context_type::uring || *type == io_context_type::kvikio);
 }
 
-bool message_contains_rdma_not_implemented(std::string const& message)
+bool message_contains_all(std::string_view message,
+                          std::initializer_list<std::string_view> fragments)
 {
-  return message.find("RDMA") != std::string::npos &&
-         message.find("not implemented") != std::string::npos;
+  return std::all_of(fragments.begin(), fragments.end(), [&](std::string_view fragment) {
+    return message.find(fragment) != std::string_view::npos;
+  });
 }
 
 template <typename Fn>
-void require_rdma_not_implemented(Fn&& fn)
+void require_exception(Fn&& fn, std::initializer_list<std::string_view> fragments)
 {
+  std::optional<std::string> message;
   try {
     std::forward<Fn>(fn)();
-    FAIL("expected RDMA not implemented error");
-  } catch (std::runtime_error const& e) {
-    CHECK(message_contains_rdma_not_implemented(e.what()));
+  } catch (std::exception const& e) {
+    message = e.what();
+  } catch (...) {
+    FAIL("expected a std::exception");
   }
+  REQUIRE(message.has_value());
+  CHECK(message_contains_all(*message, fragments));
 }
 
 cucascade::memory::system_topology_info single_gpu_topology()
@@ -228,8 +236,15 @@ scan_manager_config make_s3_scan_config_with_transport(object_store_config::tran
 
 scan_manager_config make_rdma_scan_config(bool use_sirius_datasource = true)
 {
-  return make_s3_scan_config_with_transport(object_store_config::transport::RDMA,
-                                            use_sirius_datasource);
+  auto cfg =
+    make_s3_scan_config_with_transport(object_store_config::transport::RDMA, use_sirius_datasource);
+  cfg.object_store.s3_rdma_data.endpoint        = "http://127.0.0.1:2";
+  cfg.object_store.s3_rdma_data.region          = cfg.object_store.region;
+  cfg.object_store.s3_rdma_data.access_key      = cfg.object_store.access_key;
+  cfg.object_store.s3_rdma_data.secret_key      = cfg.object_store.secret_key;
+  cfg.object_store.s3_rdma_data.s3_signing_mode = object_store_config::signing_mode::header;
+  cfg.object_store.s3_rdma_data.tls_verify      = false;
+  return cfg;
 }
 
 scan_manager_config make_unconfigured_rdma_scan_config(bool use_sirius_datasource = true)
@@ -263,21 +278,18 @@ std::filesystem::path write_s3_transport_config(std::string_view transport)
          "        secret_key: routing-test-secret-key\n"
          "        tls_verify: false\n"
          "        s3_transport: "
-      << transport << "\n";
+      << transport
+      << "\n"
+         "        s3_rdma_data:\n"
+         "          endpoint: http://127.0.0.1:2\n"
+         "          region: us-east-1\n"
+         "          access_key: routing-test-access-key\n"
+         "          secret_key: routing-test-secret-key\n"
+         "          signing_mode: header\n"
+         "          tls_verify: false\n";
   REQUIRE(out);
   return path;
 }
-
-class dummy_io_object final : public sirius::io::sirius_io_object {
- public:
-  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
-  [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
-  [[nodiscard]] size_t size() const noexcept override { return _size; }
-
- private:
-  std::string _path{"s3://bucket/key.parquet"};
-  size_t _size{4096};
-};
 
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
@@ -823,7 +835,7 @@ TEST_CASE("s3_transport selects exactly one s3 backend in the io registry", "[s3
   }
 }
 
-TEST_CASE("s3_rdma_ioctx factory builds the P1 stub with the D9 capability profile",
+TEST_CASE("s3_rdma_ioctx factory builds the configured RDMA capability profile",
           "[s3][rdma][routing]")
 {
   auto factory = sirius::io::make_rdma_ioctx_factory();
@@ -851,18 +863,71 @@ TEST_CASE("s3_rdma_ioctx factory builds the P1 stub with the D9 capability profi
   CHECK(aligned[1].size() == ranges[1].size());
 }
 
-TEST_CASE("rdma transport can construct the stub without object-store credentials",
-          "[s3][rdma][routing]")
+TEST_CASE("explicit RDMA rejects incomplete endpoint configuration", "[s3][rdma][routing]")
 {
   scan_manager_fixture fixture;
-  io_context_registry registry{make_unconfigured_rdma_scan_config(), *fixture.memory};
+  require_exception(
+    [&] { io_context_registry registry{make_unconfigured_rdma_scan_config(), *fixture.memory}; },
+    {"RDMA", "endpoint"});
+}
 
-  CHECK(registry.lookup_path("s3://bucket/key.parquet") == io_context_type::rdma);
-  CHECK(registry.make_ioctx(io_context_type::restful) == nullptr);
+TEST_CASE("s3_rdma AC8 rejects presigned signing on the data plane", "[s3][rdma][routing][config]")
+{
+  scan_manager_fixture fixture;
+  auto cfg                                      = make_rdma_scan_config();
+  cfg.object_store.s3_rdma_data.s3_signing_mode = object_store_config::signing_mode::presigned;
 
-  auto ctx = registry.make_ioctx(io_context_type::rdma);
-  REQUIRE(ctx != nullptr);
-  CHECK(ctx->type() == io_context_type::rdma);
+  require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
+                    {"data", "presigned"});
+}
+
+TEST_CASE("s3_rdma AC9 rejects a missing data endpoint during registry construction",
+          "[s3][rdma][routing][config]")
+{
+  scan_manager_fixture fixture;
+  auto cfg = make_rdma_scan_config();
+  cfg.object_store.s3_rdma_data.endpoint.clear();
+
+  require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
+                    {"data", "endpoint"});
+}
+
+TEST_CASE("s3_rdma AC9 propagates data-session capability errors through ioctx_for_path",
+          "[s3][rdma][routing][scan_manager]")
+{
+  scan_manager_fixture fixture;
+  auto cfg = make_rdma_scan_config();
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto control  = std::make_shared<sirius::io::rdma::mock_s3_control_client>();
+  auto sessions = std::make_shared<sirius::io::rdma::mock_rdma_data_session_factory>();
+  sessions->fail_acquire("injected data-session capability failure");
+  sirius::io::rdma::rdma_transport_clients clients{std::move(control), std::move(sessions)};
+  manager._ioctx_registry.register_ioctx(
+    io_context_type::rdma,
+    [](std::string_view path) { return path.starts_with("s3://"); },
+    [clients = std::move(clients)](scan_manager_config const& manager_cfg) {
+      return std::make_shared<s3_rdma_ioctx>(manager_cfg.object_store, clients);
+    });
+
+  require_exception([&] { (void)manager.ioctx_for_path("s3://routing-bucket/data.parquet"); },
+                    {"data-session", "capability"});
+}
+
+TEST_CASE("s3_rdma AC9 converts an explicit-RDMA null factory result into an initialization error",
+          "[s3][rdma][routing][scan_manager]")
+{
+  scan_manager_fixture fixture;
+  auto cfg = make_rdma_scan_config();
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  manager._ioctx_registry.register_ioctx(
+    io_context_type::rdma,
+    [](std::string_view path) { return path.starts_with("s3://"); },
+    [](scan_manager_config const&) -> std::shared_ptr<sirius::io::sirius_ioctx> {
+      return nullptr;
+    });
+
+  require_exception([&] { (void)manager.ioctx_for_path("s3://routing-bucket/data.parquet"); },
+                    {"RDMA", "initialization"});
 }
 
 TEST_CASE("scan_manager keeps rdma routed ioctx cached and cache-unarmed",
@@ -923,8 +988,9 @@ TEST_CASE("rdma transport fails loudly on datasource creation instead of falling
   scan_manager_fixture fixture;
   sirius_scan_manager manager{make_rdma_scan_config(), *fixture.memory, fixture.topology};
 
-  require_rdma_not_implemented(
-    [&] { (void)manager.create_datasource("s3://routing-bucket/data.parquet"); });
+  CHECK_THROWS((void)manager.create_datasource("s3://routing-bucket/data.parquet"));
+  CHECK(manager._ioctx_registry.lookup_path("s3://routing-bucket/data.parquet") ==
+        io_context_type::rdma);
 }
 
 TEST_CASE("s3_transport parsed from sirius_config reaches registry selection",
@@ -948,34 +1014,13 @@ TEST_CASE("s3_transport parsed from sirius_config reaches registry selection",
   check_transport("rdma", io_context_type::rdma);
 }
 
-TEST_CASE("rdma stub read entry points fail loudly", "[s3][rdma]")
+TEST_CASE("s3_rdma_ioctx rejects a missing data-session capability during start", "[s3][rdma]")
 {
-  s3_rdma_ioctx ctx{object_store_config{}};
-  dummy_io_object obj;
-  std::array<std::uint8_t, 64> dst{};
-  rmm::cuda_stream stream;
+  auto control = std::make_shared<sirius::io::rdma::mock_s3_control_client>();
+  sirius::io::rdma::rdma_transport_clients clients{std::move(control), nullptr};
+  s3_rdma_ioctx ctx{object_store_config{}, std::move(clients)};
 
-  require_rdma_not_implemented([&] { (void)ctx.host_read_io(obj, 0, dst.size(), dst.data()); });
-  require_rdma_not_implemented([&] {
-    auto fut = ctx.host_read_async_io(obj, 0, dst.size(), dst.data());
-    (void)std::move(fut).get(100ms);
-  });
-  require_rdma_not_implemented([&] {
-    auto fut = ctx.device_read_async_io(obj, 0, dst.size(), dst.data(), stream);
-    (void)std::move(fut).get(100ms);
-  });
-  require_rdma_not_implemented([&] {
-    std::array<sirius::io::io_object_segment, 1> slices{
-      sirius::io::io_object_segment{0, dst.size(), dst.data()}};
-    auto fut = ctx.host_to_device_read_async_io(obj, slices, 0, dst.size(), dst.data(), stream);
-    (void)std::move(fut).get(100ms);
-  });
-  require_rdma_not_implemented([&] {
-    std::array<sirius::io::io_object_segment, 1> segments{
-      sirius::io::io_object_segment{0, dst.size(), dst.data()}};
-    auto fut = ctx.host_read_ranges_async_io(obj, segments);
-    (void)std::move(fut).get(100ms);
-  });
+  require_exception([&] { ctx.start(); }, {"RDMA", "initialization"});
 }
 
 TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][perf]")

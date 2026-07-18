@@ -23,9 +23,9 @@
 #include "io/rdma/cuobj_rdma_reactor.hpp"
 #include "io/rdma/mock_rdma_client.hpp"
 #include "io/rdma/rdma_admission_gate.hpp"
-#include "io/rdma/rdma_client.hpp"
 #include "io/s3/s3_rdma_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
+#include "rdma_test_transport.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -61,9 +61,8 @@ using sirius::io::request_manager;
 using sirius::io::rdma::admission_gate;
 using sirius::io::rdma::cuda_delivery_ops;
 using sirius::io::rdma::cuobj_rdma_reactor;
-using sirius::io::rdma::mock_rdma_client;
-using sirius::io::rdma::rdma_client;
 using sirius::io::s3::s3_rdma_ioctx;
+using sirius::test::rdma::mock_transport_fixture;
 using namespace std::chrono_literals;
 
 constexpr std::size_t k_slot_size       = 64UL << 10;
@@ -183,88 +182,41 @@ void record_marker(void* opaque) noexcept
   static_cast<marker_state*>(opaque)->calls.fetch_add(1, std::memory_order_relaxed);
 }
 
-class observing_rdma_client final : public rdma_client {
+class observing_transport final {
  public:
-  observing_rdma_client() : _inner(std::make_shared<mock_rdma_client>()) {}
+  observing_transport() : _transport(std::make_shared<mock_transport_fixture>()) {}
 
   void put_object(std::string key, std::vector<std::uint8_t> bytes)
   {
-    _inner->put_object(std::string{k_bucket}, std::move(key), std::move(bytes));
+    _transport->put_object(std::string{k_bucket}, std::move(key), std::move(bytes));
   }
 
-  void close_get_gate() { _inner->close_gate(); }
-  void open_get_gate() { _inner->open_gate(); }
-  void fail_gets(std::string message) { _inner->fail_gets(std::move(message)); }
-  void short_read(std::size_t bytes) { _inner->short_read(bytes); }
+  void close_get_gate() { _transport->close_get_gate(); }
+  void open_get_gate() { _transport->open_get_gate(); }
+  void fail_gets(std::string message) { _transport->fail_gets(std::move(message)); }
+  void short_read(std::size_t bytes) { _transport->short_write(bytes); }
 
-  [[nodiscard]] std::size_t get_count() const
-  {
-    std::lock_guard lock{_mutex};
-    return _get_count;
-  }
-
-  [[nodiscard]] std::size_t register_count() const
-  {
-    std::lock_guard lock{_mutex};
-    return _register_count;
-  }
-
-  [[nodiscard]] std::size_t deregister_count() const
-  {
-    std::lock_guard lock{_mutex};
-    return _deregister_count;
-  }
+  [[nodiscard]] std::size_t get_count() const { return _transport->gets_issued(); }
+  [[nodiscard]] std::size_t register_count() const { return _transport->register_count(); }
+  [[nodiscard]] std::size_t deregister_count() const { return _transport->deregister_count(); }
 
   bool wait_for_get_count(std::size_t expected, std::chrono::milliseconds timeout = k_ready_timeout)
   {
-    std::unique_lock lock{_mutex};
-    return _get_cv.wait_for(lock, timeout, [&] { return _get_count >= expected; });
-  }
-
-  std::size_t head(std::string_view bucket, std::string_view key) override
-  {
-    return _inner->head(bucket, key);
-  }
-
-  std::size_t get(std::string_view bucket,
-                  std::string_view key,
-                  std::size_t offset,
-                  std::size_t size,
-                  void* dst) override
-  {
-    {
-      std::lock_guard lock{_mutex};
-      ++_get_count;
+    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (get_count() >= expected) { return true; }
+      std::this_thread::sleep_for(2ms);
     }
-    _get_cv.notify_all();
-    return _inner->get(bucket, key, offset, size, dst);
+    return get_count() >= expected;
   }
 
-  void register_memory(void* base, std::size_t bytes) override
+  [[nodiscard]] sirius::io::rdma::rdma_transport_clients clients() const
   {
-    {
-      std::lock_guard lock{_mutex};
-      ++_register_count;
-    }
-    _inner->register_memory(base, bytes);
-  }
-
-  void deregister_memory(void* base) noexcept override
-  {
-    {
-      std::lock_guard lock{_mutex};
-      ++_deregister_count;
-    }
-    _inner->deregister_memory(base);
+    return _transport->clients();
   }
 
  private:
-  std::shared_ptr<mock_rdma_client> _inner;
-  mutable std::mutex _mutex;
-  std::condition_variable _get_cv;
-  std::size_t _get_count{0};
-  std::size_t _register_count{0};
-  std::size_t _deregister_count{0};
+  std::shared_ptr<mock_transport_fixture> _transport;
 };
 
 class blocking_event_wait {
@@ -336,12 +288,12 @@ bool cuda_device_available()
   return true;
 }
 
-std::shared_ptr<s3_rdma_ioctx> make_started_ioctx(std::shared_ptr<observing_rdma_client> client,
+std::shared_ptr<s3_rdma_ioctx> make_started_ioctx(std::shared_ptr<observing_transport> transport,
                                                   cuda_delivery_ops delivery = {},
                                                   std::size_t max_inflight   = k_default_workers)
 {
   auto ctx = std::make_shared<s3_rdma_ioctx>(
-    reactor_object_store_config(max_inflight), std::move(client), std::move(delivery));
+    reactor_object_store_config(max_inflight), transport->clients(), std::move(delivery));
   ctx->start();
   return ctx;
 }
@@ -771,7 +723,7 @@ TEST_CASE("s3_rdma AC10 one RDMA failure fail-stops without retry or arena relea
 
   auto exercise_failure = [](bool short_read) {
     auto payload = payload_bytes(short_read ? 31 : 29);
-    auto client  = std::make_shared<observing_rdma_client>();
+    auto client  = std::make_shared<observing_transport>();
     client->put_object(short_read ? "one-shot-short" : "one-shot-throw", payload);
     if (short_read) {
       client->short_read(payload.size() / 2);
@@ -815,7 +767,7 @@ TEST_CASE("s3_rdma AC11 teardown waits for GET and D2D and never frees a failed 
   SECTION("normal close waits for an issued GET")
   {
     auto payload = payload_bytes(37);
-    auto client  = std::make_shared<observing_rdma_client>();
+    auto client  = std::make_shared<observing_transport>();
     client->put_object("teardown-get", payload);
     client->close_get_gate();
     auto ctx        = make_started_ioctx(client);
@@ -856,7 +808,7 @@ TEST_CASE("s3_rdma AC11 teardown waits for GET and D2D and never frees a failed 
   SECTION("normal close waits for D2D confirmation")
   {
     auto payload = payload_bytes(41);
-    auto client  = std::make_shared<observing_rdma_client>();
+    auto client  = std::make_shared<observing_transport>();
     client->put_object("teardown-d2d", payload);
     auto event_wait = std::make_shared<blocking_event_wait>();
     cuda_delivery_ops ops;
@@ -899,7 +851,7 @@ TEST_CASE("s3_rdma AC11 teardown waits for GET and D2D and never frees a failed 
   SECTION("fail-stop leaves the registered arena non-freeable")
   {
     auto payload = payload_bytes(43);
-    auto client  = std::make_shared<observing_rdma_client>();
+    auto client  = std::make_shared<observing_transport>();
     client->put_object("teardown-failed", payload);
     client->fail_gets("AC11 fail-stop");
     auto ctx        = make_started_ioctx(client);
@@ -924,7 +876,7 @@ TEST_CASE("s3_rdma AC12 admission and slot metrics count logical requests",
 
   constexpr std::size_t request_count = 6;
   auto payload                        = payload_bytes(47);
-  auto client                         = std::make_shared<observing_rdma_client>();
+  auto client                         = std::make_shared<observing_transport>();
   client->put_object("admission-metrics", payload);
   client->close_get_gate();
   auto ctx        = make_started_ioctx(client, cuda_delivery_ops{}, 1);

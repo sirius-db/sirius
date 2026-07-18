@@ -22,6 +22,7 @@
 #include "io/s3/s3_rdma_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/templated_ioctx.hpp"
+#include "rdma_test_transport.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -53,8 +54,9 @@ namespace {
 
 using sirius::io::object_store_config;
 using sirius::io::rdma::cuobj_rdma_reactor;
-using sirius::io::rdma::mock_rdma_client;
 using sirius::io::s3::s3_rdma_ioctx;
+using sirius::test::rdma::mock_transport_fixture;
+using sirius::test::rdma::seeded_mock_transport;
 using namespace std::chrono_literals;
 
 constexpr std::size_t kMaxInflight = 2;
@@ -113,19 +115,17 @@ bool cuda_device_available()
   return true;
 }
 
-std::shared_ptr<mock_rdma_client> seeded_client(std::string key,
-                                                std::vector<std::uint8_t> bytes,
-                                                std::string bucket = "bucket")
+std::shared_ptr<mock_transport_fixture> seeded_transport(std::string key,
+                                                         std::vector<std::uint8_t> bytes,
+                                                         std::string bucket = "bucket")
 {
-  auto client = std::make_shared<mock_rdma_client>();
-  client->put_object(std::move(bucket), std::move(key), std::move(bytes));
-  return client;
+  return seeded_mock_transport(std::move(bucket), std::move(key), std::move(bytes));
 }
 
-std::shared_ptr<s3_rdma_ioctx> make_started_ioctx(std::shared_ptr<mock_rdma_client> client,
+std::shared_ptr<s3_rdma_ioctx> make_started_ioctx(std::shared_ptr<mock_transport_fixture> transport,
                                                   object_store_config cfg = make_mock_rdma_config())
 {
-  auto ctx = std::make_shared<s3_rdma_ioctx>(std::move(cfg), std::move(client));
+  auto ctx = std::make_shared<s3_rdma_ioctx>(std::move(cfg), transport->clients());
   ctx->start();
   return ctx;
 }
@@ -202,7 +202,7 @@ TEST_CASE("cuobj_rdma_reactor exposes the P2 structural contract", "[s3][rdma][r
   CHECK(cuobj_rdma_reactor::preferred_prefetching_stage() ==
         sirius::io::cache::prefetching_stage::none);
 
-  auto ctx = make_started_ioctx(std::make_shared<mock_rdma_client>());
+  auto ctx = make_started_ioctx(std::make_shared<mock_transport_fixture>());
   CHECK(ctx->type() == sirius::io::io_context_type::rdma);
   CHECK(ctx->supports("s3://bucket/key"));
   CHECK(ctx->supports_device_read());
@@ -211,18 +211,20 @@ TEST_CASE("cuobj_rdma_reactor exposes the P2 structural contract", "[s3][rdma][r
   CHECK_FALSE(ctx->can_use_prefetching_cache());
 }
 
-TEST_CASE("mock RDMA client reports absent objects through head", "[s3][rdma][reactor]")
+TEST_CASE("mock RDMA control client reports absent objects as HTTP results", "[s3][rdma][reactor]")
 {
-  mock_rdma_client client;
-  CHECK_THROWS_AS(client.head("bucket", "missing"), std::runtime_error);
+  sirius::io::rdma::mock_s3_control_client client;
+  auto const result = client.head(sirius::io::rdma::rx_route{"bucket", "missing"});
+  CHECK(result.outcome.http_status == 404);
+  CHECK(result.outcome.transport_error.empty());
 }
 
 TEST_CASE("s3_rdma_ioctx mock host reads exact and EOF-clipped ranges", "[s3][rdma][reactor]")
 {
-  auto payload = pattern_bytes(512);
-  auto client  = seeded_client("host-object", payload);
-  auto ctx     = make_started_ioctx(client);
-  auto ds      = ctx->open_datasource("s3://bucket/host-object");
+  auto payload   = pattern_bytes(512);
+  auto transport = seeded_transport("host-object", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = ctx->open_datasource("s3://bucket/host-object");
 
   REQUIRE(ds->size() == payload.size());
 
@@ -242,10 +244,10 @@ TEST_CASE("s3_rdma_ioctx mock device read chunks and delivers bytes", "[s3][rdma
 {
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(3 * kSlotSize + 123);
-  auto client  = seeded_client("device-object", payload);
-  auto ctx     = make_started_ioctx(client);
-  auto ds      = ctx->open_datasource("s3://bucket/device-object");
+  auto payload   = pattern_bytes(3 * kSlotSize + 123);
+  auto transport = seeded_transport("device-object", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = ctx->open_datasource("s3://bucket/device-object");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
 
@@ -255,7 +257,7 @@ TEST_CASE("s3_rdma_ioctx mock device read chunks and delivers bytes", "[s3][rdma
 
   auto got = copy_device_to_host(device.data(), payload.size(), stream);
   require_bytes_equal(got, payload);
-  CHECK(client->gets_issued() == ceil_div(payload.size(), kSlotSize));
+  CHECK(transport->gets_issued() == ceil_div(payload.size(), kSlotSize));
 }
 
 TEST_CASE("s3_rdma_ioctx mock device read honors offsets across chunks", "[s3][rdma][reactor][gpu]")
@@ -265,8 +267,8 @@ TEST_CASE("s3_rdma_ioctx mock device read honors offsets across chunks", "[s3][r
   auto payload          = pattern_bytes(4 * kSlotSize + 37);
   constexpr auto offset = kSlotSize - 17;
   constexpr auto size   = 2 * kSlotSize + 33;
-  auto client           = seeded_client("offset-object", payload);
-  auto ctx              = make_started_ioctx(client);
+  auto transport        = seeded_transport("offset-object", payload);
+  auto ctx              = make_started_ioctx(transport);
   auto ds               = ctx->open_datasource("s3://bucket/offset-object");
   rmm::cuda_stream stream;
   rmm::device_buffer device(size, stream);
@@ -283,11 +285,11 @@ TEST_CASE("cuobj_rdma_reactor mock gate enforces max inflight backpressure",
 {
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(5 * kSlotSize + 1);
-  auto client  = seeded_client("gated-object", payload);
-  client->close_gate();
+  auto payload   = pattern_bytes(5 * kSlotSize + 1);
+  auto transport = seeded_transport("gated-object", payload);
+  transport->close_get_gate();
 
-  auto ctx = make_started_ioctx(client);
+  auto ctx = make_started_ioctx(transport);
   auto ds  = ctx->open_datasource("s3://bucket/gated-object");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
@@ -295,16 +297,16 @@ TEST_CASE("cuobj_rdma_reactor mock gate enforces max inflight backpressure",
   auto fut =
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
 
-  REQUIRE(wait_until([&] { return client->gets_issued() >= kMaxInflight; }));
-  CHECK(client->peak_concurrent_gets() == kMaxInflight);
+  REQUIRE(wait_until([&] { return transport->gets_issued() >= kMaxInflight; }));
+  CHECK(transport->peak_concurrent_gets() == kMaxInflight);
   auto const blocked_snapshot = ctx->perf_snapshot();
   CHECK(blocked_snapshot.inflight_peak == kMaxInflight);
   CHECK(blocked_snapshot.slots_in_use_peak == kMaxInflight);
   CHECK(fut.wait_for(50ms) != std::future_status::ready);
 
-  client->open_gate();
+  transport->open_get_gate();
   REQUIRE(require_ready_value(fut) == payload.size());
-  CHECK(client->gets_issued() == ceil_div(payload.size(), kSlotSize));
+  CHECK(transport->gets_issued() == ceil_div(payload.size(), kSlotSize));
 
   auto const snapshot = ctx->perf_snapshot();
   CHECK(snapshot.requests_total == 1);
@@ -321,10 +323,10 @@ TEST_CASE("cuobj_rdma_reactor reports short mock reads as failed futures",
 
   constexpr std::size_t kShort = kSlotSize / 2;
   auto payload                 = pattern_bytes(kSlotSize);
-  auto client                  = seeded_client("short-object", payload);
-  client->short_read(kShort);
+  auto transport               = seeded_transport("short-object", payload);
+  transport->short_write(kShort);
 
-  auto ctx = make_started_ioctx(client);
+  auto ctx = make_started_ioctx(transport);
   auto ds  = ctx->open_datasource("s3://bucket/short-object");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
@@ -335,7 +337,7 @@ TEST_CASE("cuobj_rdma_reactor reports short mock reads as failed futures",
   CHECK((message.find("short") != std::string::npos ||
          message.find(std::to_string(kShort)) != std::string::npos ||
          message.find(std::to_string(payload.size())) != std::string::npos));
-  CHECK(client->gets_issued() == 1);
+  CHECK(transport->gets_issued() == 1);
 
   auto const snapshot = ctx->perf_snapshot();
   CHECK(snapshot.retries_total == 0);
@@ -346,7 +348,7 @@ TEST_CASE("cuobj_rdma_reactor reports short mock reads as failed futures",
   auto follow_up =
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
   CHECK_FALSE(require_ready_error(follow_up).empty());
-  CHECK(client->gets_issued() == 1);
+  CHECK(transport->gets_issued() == 1);
   CHECK(ctx->perf_snapshot().fail_stop_total == 1);
 }
 
@@ -354,11 +356,11 @@ TEST_CASE("cuobj_rdma_reactor propagates mock transport errors", "[s3][rdma][rea
 {
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(kSlotSize);
-  auto client  = seeded_client("error-object", payload);
-  client->fail_gets("mock transport down");
+  auto payload   = pattern_bytes(kSlotSize);
+  auto transport = seeded_transport("error-object", payload);
+  transport->fail_gets("mock transport down");
 
-  auto ctx = make_started_ioctx(client);
+  auto ctx = make_started_ioctx(transport);
   auto ds  = ctx->open_datasource("s3://bucket/error-object");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
@@ -366,24 +368,23 @@ TEST_CASE("cuobj_rdma_reactor propagates mock transport errors", "[s3][rdma][rea
   auto fut =
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
   CHECK(require_ready_error(fut).find("mock transport down") != std::string::npos);
-  CHECK(client->gets_issued() == 1);
+  CHECK(transport->gets_issued() == 1);
 
   auto const snapshot = ctx->perf_snapshot();
   CHECK(snapshot.retries_total == 0);
   CHECK(snapshot.fail_stop_total == 1);
   CHECK(snapshot.arena_leak_total == 1);
 
-  client->clear_fault();
   auto follow_up =
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
   CHECK_FALSE(require_ready_error(follow_up).empty());
-  CHECK(client->gets_issued() == 1);
+  CHECK(transport->gets_issued() == 1);
   CHECK(ctx->perf_snapshot().fail_stop_total == 1);
 }
 
 TEST_CASE("s3_rdma_ioctx mock open fails on missing object", "[s3][rdma][reactor]")
 {
-  auto ctx = make_started_ioctx(std::make_shared<mock_rdma_client>());
+  auto ctx = make_started_ioctx(std::make_shared<mock_transport_fixture>());
   CHECK_THROWS_AS(ctx->open_datasource("s3://bucket/absent"), std::runtime_error);
 }
 
@@ -392,10 +393,10 @@ TEST_CASE("cuobj_rdma_reactor resolves zero-length device reads without work",
 {
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(128);
-  auto client  = seeded_client("zero-object", payload);
-  auto ctx     = make_started_ioctx(client);
-  auto ds      = ctx->open_datasource("s3://bucket/zero-object");
+  auto payload   = pattern_bytes(128);
+  auto transport = seeded_transport("zero-object", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = ctx->open_datasource("s3://bucket/zero-object");
   rmm::cuda_stream stream;
   rmm::device_buffer device(1, stream);
 
@@ -412,18 +413,18 @@ TEST_CASE("cuobj_rdma_reactor shutdown completes issued GETs and errors unissued
 {
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(2 * kSlotSize + 7);
-  auto client  = seeded_client("shutdown-object", payload);
-  client->close_gate();
+  auto payload   = pattern_bytes(2 * kSlotSize + 7);
+  auto transport = seeded_transport("shutdown-object", payload);
+  transport->close_get_gate();
 
-  auto ctx = make_started_ioctx(client);
+  auto ctx = make_started_ioctx(transport);
   auto ds  = ctx->open_datasource("s3://bucket/shutdown-object");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
 
   auto fut =
     ds->device_read_async(0, payload.size(), static_cast<std::uint8_t*>(device.data()), stream);
-  REQUIRE(wait_until([&] { return client->gets_issued() >= kMaxInflight; }));
+  REQUIRE(wait_until([&] { return transport->gets_issued() >= kMaxInflight; }));
 
   std::promise<void> first_shutdown_started;
   std::promise<void> second_shutdown_started;
@@ -444,7 +445,7 @@ TEST_CASE("cuobj_rdma_reactor shutdown completes issued GETs and errors unissued
   auto const second_blocked =
     second_entered && second_shutdown.wait_for(50ms) != std::future_status::ready;
 
-  client->open_gate();
+  transport->open_get_gate();
   auto const first_finished  = first_shutdown.wait_for(5s) == std::future_status::ready;
   auto const second_finished = second_shutdown.wait_for(5s) == std::future_status::ready;
   REQUIRE(first_finished);
@@ -459,7 +460,7 @@ TEST_CASE("cuobj_rdma_reactor shutdown completes issued GETs and errors unissued
 
   auto const message = require_ready_error(fut);
   CHECK(message.find("transport closed") != std::string::npos);
-  CHECK(client->gets_issued() == kMaxInflight);
+  CHECK(transport->gets_issued() == kMaxInflight);
 
   constexpr auto completed_bytes = kMaxInflight * kSlotSize;
   auto const snapshot            = ctx->perf_snapshot();
@@ -473,10 +474,10 @@ TEST_CASE("cuobj_rdma_reactor recycles arena slots across sequential reads",
 {
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(3 * kSlotSize + 5);
-  auto client  = seeded_client("reuse-object", payload);
-  auto ctx     = make_started_ioctx(client);
-  auto ds      = ctx->open_datasource("s3://bucket/reuse-object");
+  auto payload   = pattern_bytes(3 * kSlotSize + 5);
+  auto transport = seeded_transport("reuse-object", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = ctx->open_datasource("s3://bucket/reuse-object");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
 
@@ -494,10 +495,10 @@ TEST_CASE("cuobj_rdma_reactor fails device reads issued after shutdown cleanly",
 {
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(kSlotSize);
-  auto client  = seeded_client("post-shutdown-object", payload);
-  auto ctx     = make_started_ioctx(client);
-  auto ds      = ctx->open_datasource("s3://bucket/post-shutdown-object");
+  auto payload   = pattern_bytes(kSlotSize);
+  auto transport = seeded_transport("post-shutdown-object", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = ctx->open_datasource("s3://bucket/post-shutdown-object");
   ctx->shutdown();
 
   rmm::cuda_stream stream;
@@ -520,12 +521,12 @@ TEST_CASE("cuobj_rdma_reactor serves concurrent mock readers through one ioctx",
 {
   if (!cuda_device_available()) { return; }
 
-  auto left   = pattern_bytes(2 * kSlotSize + 11, 3);
-  auto right  = pattern_bytes(2 * kSlotSize + 29, 97);
-  auto client = std::make_shared<mock_rdma_client>();
-  client->put_object("bucket", "left", left);
-  client->put_object("bucket", "right", right);
-  auto ctx = make_started_ioctx(client);
+  auto left      = pattern_bytes(2 * kSlotSize + 11, 3);
+  auto right     = pattern_bytes(2 * kSlotSize + 29, 97);
+  auto transport = std::make_shared<mock_transport_fixture>();
+  transport->put_object("bucket", "left", left);
+  transport->put_object("bucket", "right", right);
+  auto ctx = make_started_ioctx(transport);
 
   auto left_future = std::async(
     std::launch::async, [&] { return read_device_object_or_throw(ctx, "left", left.size()); });

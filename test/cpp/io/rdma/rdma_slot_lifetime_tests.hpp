@@ -20,9 +20,9 @@
 #include "io/object_store_config.hpp"
 #include "io/rdma/cuobj_rdma_reactor.hpp"
 #include "io/rdma/mock_rdma_client.hpp"
-#include "io/rdma/rdma_client.hpp"
 #include "io/s3/s3_rdma_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
+#include "rdma_test_transport.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -36,7 +36,6 @@
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -48,96 +47,14 @@ namespace s3_rdma_f01_tests {
 
 using sirius::io::object_store_config;
 using sirius::io::rdma::cuda_delivery_ops;
-using sirius::io::rdma::mock_rdma_client;
-using sirius::io::rdma::rdma_client;
 using sirius::io::s3::s3_rdma_ioctx;
+using sirius::test::rdma::mock_transport_fixture;
+using sirius::test::rdma::seeded_mock_transport;
 using namespace std::chrono_literals;
 
 constexpr std::size_t k_max_inflight = 2;
 constexpr std::size_t k_slot_size    = 64UL << 10;
 constexpr std::string_view k_bucket  = "bucket";
-
-class recording_rdma_client final : public rdma_client {
- public:
-  explicit recording_rdma_client(std::shared_ptr<mock_rdma_client> inner) : _inner(std::move(inner))
-  {
-    if (!_inner) { throw std::invalid_argument("recording_rdma_client: null inner client"); }
-  }
-
-  void put_object(std::string key,
-                  std::vector<std::uint8_t> bytes,
-                  std::string bucket = std::string{k_bucket})
-  {
-    _inner->put_object(std::move(bucket), std::move(key), std::move(bytes));
-  }
-
-  [[nodiscard]] std::size_t get_count() const
-  {
-    std::lock_guard lk{_mtx};
-    return _get_destinations.size();
-  }
-
-  [[nodiscard]] void* get_destination(std::size_t zero_based_call) const
-  {
-    std::lock_guard lk{_mtx};
-    return _get_destinations.at(zero_based_call);
-  }
-
-  [[nodiscard]] std::size_t register_count() const
-  {
-    std::lock_guard lk{_mtx};
-    return _registered_bases.size();
-  }
-
-  [[nodiscard]] std::size_t deregister_count() const
-  {
-    std::lock_guard lk{_mtx};
-    return _deregistered_bases.size();
-  }
-
-  std::size_t head(std::string_view bucket, std::string_view key) override
-  {
-    return _inner->head(bucket, key);
-  }
-
-  std::size_t get(std::string_view bucket,
-                  std::string_view key,
-                  std::size_t offset,
-                  std::size_t size,
-                  void* dst) override
-  {
-    {
-      std::lock_guard lk{_mtx};
-      _get_destinations.push_back(dst);
-    }
-    return _inner->get(bucket, key, offset, size, dst);
-  }
-
-  void register_memory(void* base, std::size_t bytes) override
-  {
-    {
-      std::lock_guard lk{_mtx};
-      _registered_bases.push_back(base);
-    }
-    _inner->register_memory(base, bytes);
-  }
-
-  void deregister_memory(void* base) noexcept override
-  {
-    {
-      std::lock_guard lk{_mtx};
-      _deregistered_bases.push_back(base);
-    }
-    _inner->deregister_memory(base);
-  }
-
- private:
-  std::shared_ptr<mock_rdma_client> _inner;
-  mutable std::mutex _mtx;
-  std::vector<void*> _get_destinations;
-  std::vector<void*> _registered_bases;
-  std::vector<void*> _deregistered_bases;
-};
 
 object_store_config make_config(std::size_t max_inflight = k_max_inflight)
 {
@@ -161,20 +78,18 @@ std::vector<std::uint8_t> pattern_bytes(std::size_t size, std::uint8_t salt = 41
   return bytes;
 }
 
-std::shared_ptr<recording_rdma_client> seeded_client(std::string key,
-                                                     std::vector<std::uint8_t> bytes)
+std::shared_ptr<mock_transport_fixture> seeded_transport(std::string key,
+                                                         std::vector<std::uint8_t> bytes)
 {
-  auto client = std::make_shared<recording_rdma_client>(std::make_shared<mock_rdma_client>());
-  client->put_object(std::move(key), std::move(bytes));
-  return client;
+  return seeded_mock_transport(std::string{k_bucket}, std::move(key), std::move(bytes));
 }
 
-std::shared_ptr<s3_rdma_ioctx> make_started_ioctx(std::shared_ptr<recording_rdma_client> client,
+std::shared_ptr<s3_rdma_ioctx> make_started_ioctx(std::shared_ptr<mock_transport_fixture> transport,
                                                   cuda_delivery_ops ops    = {},
                                                   std::size_t max_inflight = k_max_inflight)
 {
-  auto ctx =
-    std::make_shared<s3_rdma_ioctx>(make_config(max_inflight), std::move(client), std::move(ops));
+  auto ctx = std::make_shared<s3_rdma_ioctx>(
+    make_config(max_inflight), transport->clients(), std::move(ops));
   ctx->start();
   return ctx;
 }
@@ -252,8 +167,8 @@ TEST_CASE("s3_rdma creates the completion event before enqueueing D2D",
   using namespace s3_rdma_f01_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(k_slot_size);
-  auto client  = seeded_client("event-create", payload);
+  auto payload   = pattern_bytes(k_slot_size);
+  auto transport = seeded_transport("event-create", payload);
   std::atomic<int> create_calls{0};
   std::atomic<int> memcpy_calls{0};
   std::atomic<int> destroy_calls{0};
@@ -273,7 +188,7 @@ TEST_CASE("s3_rdma creates the completion event before enqueueing D2D",
     return cudaEventDestroy(event);
   };
 
-  auto ctx = make_started_ioctx(client, std::move(ops));
+  auto ctx = make_started_ioctx(transport, std::move(ops));
   auto ds  = open_ds(ctx, "event-create");
   rmm::cuda_stream stream;
   rmm::device_buffer first(payload.size(), stream);
@@ -298,10 +213,10 @@ TEST_CASE("s3_rdma default delivery ops preserve byte-exact multi-chunk reads",
   using namespace s3_rdma_f01_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(3 * k_slot_size + 211, 37);
-  auto client  = seeded_client("success-regression", payload);
-  auto ctx     = make_started_ioctx(client, cuda_delivery_ops{});
-  auto ds      = open_ds(ctx, "success-regression");
+  auto payload   = pattern_bytes(3 * k_slot_size + 211, 37);
+  auto transport = seeded_transport("success-regression", payload);
+  auto ctx       = make_started_ioctx(transport, cuda_delivery_ops{});
+  auto ds        = open_ds(ctx, "success-regression");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
 
@@ -318,8 +233,8 @@ TEST_CASE("s3_rdma ioctx snapshot aggregates all delivery safety counters",
   using namespace s3_rdma_f01_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(k_slot_size, 43);
-  auto client  = seeded_client("safety-counters", payload);
+  auto payload   = pattern_bytes(k_slot_size, 43);
+  auto transport = seeded_transport("safety-counters", payload);
   std::atomic<int> destroy_calls{0};
 
   cuda_delivery_ops ops;
@@ -329,7 +244,7 @@ TEST_CASE("s3_rdma ioctx snapshot aggregates all delivery safety counters",
     return real_result == cudaSuccess ? cudaErrorUnknown : real_result;
   };
 
-  auto ctx = make_started_ioctx(client, std::move(ops), 1);
+  auto ctx = make_started_ioctx(transport, std::move(ops), 1);
   auto ds  = open_ds(ctx, "safety-counters");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
@@ -352,8 +267,8 @@ TEST_CASE("s3_rdma event RAII destroys exactly created events without overriding
   using namespace s3_rdma_f01_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload        = pattern_bytes(k_slot_size, 47);
-  auto success_client = seeded_client("destroy-failure", payload);
+  auto payload           = pattern_bytes(k_slot_size, 47);
+  auto success_transport = seeded_transport("destroy-failure", payload);
   std::atomic<int> destroy_calls{0};
 
   cuda_delivery_ops destroy_ops;
@@ -362,7 +277,7 @@ TEST_CASE("s3_rdma event RAII destroys exactly created events without overriding
     auto const real_result = cudaEventDestroy(event);
     return real_result == cudaSuccess ? cudaErrorUnknown : real_result;
   };
-  auto success_ctx = make_started_ioctx(success_client, std::move(destroy_ops), 1);
+  auto success_ctx = make_started_ioctx(success_transport, std::move(destroy_ops), 1);
   auto success_ds  = open_ds(success_ctx, "destroy-failure");
   rmm::cuda_stream success_stream;
   rmm::device_buffer success_buffer(payload.size(), success_stream);
@@ -372,7 +287,7 @@ TEST_CASE("s3_rdma event RAII destroys exactly created events without overriding
   CHECK(destroy_calls.load() == 1);
   CHECK(success_ctx->perf_snapshot().fail_stop_total == 0);
 
-  auto create_client = seeded_client("create-without-destroy", payload);
+  auto create_transport = seeded_transport("create-without-destroy", payload);
   std::atomic<int> create_destroy_calls{0};
   std::atomic<int> memcpy_calls{0};
   cuda_delivery_ops create_ops;
@@ -386,7 +301,7 @@ TEST_CASE("s3_rdma event RAII destroys exactly created events without overriding
       memcpy_calls.fetch_add(1);
       return cudaMemcpyAsync(dst, src, size, kind, stream);
     };
-  auto create_ctx = make_started_ioctx(create_client, std::move(create_ops), 1);
+  auto create_ctx = make_started_ioctx(create_transport, std::move(create_ops), 1);
   auto create_ds  = open_ds(create_ctx, "create-without-destroy");
   rmm::cuda_stream create_stream;
   rmm::device_buffer create_buffer(payload.size(), create_stream);

@@ -19,7 +19,6 @@
 #include "catch.hpp"
 #include "io/rdma/cuobj_rdma_reactor.hpp"
 #include "io/rdma/mock_rdma_client.hpp"
-#include "io/rdma/rdma_client.hpp"
 #include "log/sink.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -61,8 +60,11 @@ using sirius::exec::semi_future;
 using sirius::io::rdma::cuda_delivery_ops;
 using sirius::io::rdma::cuobj_rdma_io_object;
 using sirius::io::rdma::cuobj_rdma_reactor;
-using sirius::io::rdma::mock_rdma_client;
-using sirius::io::rdma::rdma_client;
+using sirius::io::rdma::data_get_result;
+using sirius::io::rdma::mock_rdma_data_session_factory;
+using sirius::io::rdma::rdma_data_session;
+using sirius::io::rdma::rdma_data_session_factory;
+using sirius::io::rdma::rx_route;
 using namespace std::chrono_literals;
 
 constexpr std::size_t k_slot_size               = 64UL << 10;
@@ -202,10 +204,56 @@ bool cuda_device_available()
   return true;
 }
 
-class recording_client final : public rdma_client {
+struct recording_session_state {
+  explicit recording_session_state(bool mark) : mark_deregister(mark) {}
+
+  bool mark_deregister;
+  mutable std::mutex mutex;
+  std::vector<void*> destinations;
+};
+
+class recording_session final : public rdma_data_session {
  public:
-  explicit recording_client(bool mark_deregister = false)
-    : _inner(std::make_shared<mock_rdma_client>()), _mark_deregister(mark_deregister)
+  recording_session(std::unique_ptr<rdma_data_session> inner,
+                    std::shared_ptr<recording_session_state> state)
+    : _inner(std::move(inner)), _state(std::move(state))
+  {
+    if (!_inner) { throw std::invalid_argument("recording_session: null inner session"); }
+  }
+
+  void register_memory(void* base, std::size_t bytes) override
+  {
+    _inner->register_memory(base, bytes);
+  }
+
+  void deregister_memory(void* base) noexcept override
+  {
+    if (_state->mark_deregister) { emit_marker(k_arena_mark); }
+    _inner->deregister_memory(base);
+  }
+
+  data_get_result get(const rx_route& route,
+                      std::size_t offset,
+                      std::size_t size,
+                      void* dst) override
+  {
+    {
+      std::lock_guard lock{_state->mutex};
+      _state->destinations.push_back(dst);
+    }
+    return _inner->get(route, offset, size, dst);
+  }
+
+ private:
+  std::unique_ptr<rdma_data_session> _inner;
+  std::shared_ptr<recording_session_state> _state;
+};
+
+class recording_session_factory final : public rdma_data_session_factory {
+ public:
+  explicit recording_session_factory(bool mark_deregister = false)
+    : _inner(std::make_shared<mock_rdma_data_session_factory>()),
+      _state(std::make_shared<recording_session_state>(mark_deregister))
   {
   }
 
@@ -216,50 +264,24 @@ class recording_client final : public rdma_client {
 
   [[nodiscard]] std::size_t get_count() const
   {
-    std::lock_guard lock{_mutex};
-    return _destinations.size();
+    std::lock_guard lock{_state->mutex};
+    return _state->destinations.size();
   }
 
   [[nodiscard]] void* get_destination(std::size_t index) const
   {
-    std::lock_guard lock{_mutex};
-    return _destinations.at(index);
+    std::lock_guard lock{_state->mutex};
+    return _state->destinations.at(index);
   }
 
-  std::size_t head(std::string_view bucket, std::string_view key) override
+  std::unique_ptr<rdma_data_session> acquire() override
   {
-    return _inner->head(bucket, key);
-  }
-
-  std::size_t get(std::string_view bucket,
-                  std::string_view key,
-                  std::size_t offset,
-                  std::size_t size,
-                  void* dst) override
-  {
-    {
-      std::lock_guard lock{_mutex};
-      _destinations.push_back(dst);
-    }
-    return _inner->get(bucket, key, offset, size, dst);
-  }
-
-  void register_memory(void* base, std::size_t bytes) override
-  {
-    _inner->register_memory(base, bytes);
-  }
-
-  void deregister_memory(void* base) noexcept override
-  {
-    if (_mark_deregister) { emit_marker(k_arena_mark); }
-    _inner->deregister_memory(base);
+    return std::make_unique<recording_session>(_inner->acquire(), _state);
   }
 
  private:
-  std::shared_ptr<mock_rdma_client> _inner;
-  bool _mark_deregister;
-  mutable std::mutex _mutex;
-  std::vector<void*> _destinations;
+  std::shared_ptr<mock_rdma_data_session_factory> _inner;
+  std::shared_ptr<recording_session_state> _state;
 };
 
 cuobj_rdma_reactor::config reactor_config()
@@ -284,9 +306,12 @@ class reactor_fixture {
   explicit reactor_fixture(cuda_delivery_ops ops,
                            bool flush_before_copy = false,
                            bool mark_deregister   = false)
-    : client(std::make_shared<recording_client>(mark_deregister)),
+    : client(std::make_shared<recording_session_factory>(mark_deregister)),
+      control(std::make_shared<sirius::io::rdma::mock_s3_control_client>()),
       context(std::make_shared<cuobj_rdma_reactor::reactor_context>(
-        reactor_config(), client, std::move(ops))),
+        reactor_config(),
+        sirius::io::rdma::rdma_transport_clients{control, client},
+        std::move(ops))),
       reactor(context),
       object("s3://bucket/fatal-boundary", std::string{k_bucket}, std::string{k_key}, k_slot_size)
   {
@@ -317,9 +342,10 @@ class reactor_fixture {
 
   void shutdown() { reactor.shutdown(); }
 
-  std::shared_ptr<recording_client> client;
+  std::shared_ptr<recording_session_factory> client;
 
  private:
+  std::shared_ptr<sirius::io::rdma::mock_s3_control_client> control;
   std::shared_ptr<cuobj_rdma_reactor::reactor_context> context;
   cuobj_rdma_reactor reactor;
   cuobj_rdma_io_object object;

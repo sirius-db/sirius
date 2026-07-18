@@ -26,9 +26,9 @@
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 #include "io/sirius_datasource.hpp"
+#ifdef SIRIUS_HAVE_TESTCONTAINERS
 #include "utils/s3_container.hpp"
-
-#include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -49,7 +49,8 @@
 namespace s3_rdma_p3a_tests {
 
 using sirius::io::object_store_config;
-using sirius::io::rdma::cuobj_rdma_client;
+using sirius::io::rdma::curl_s3_control_client;
+using sirius::io::rdma::rx_route;
 using sirius::io::s3::s3_rdma_ioctx;
 
 constexpr std::string_view k_bucket_env     = "SIRIUS_TEST_S3_BUCKET";
@@ -86,12 +87,14 @@ std::string require_env(std::string_view name)
   return value;
 }
 
+#ifdef SIRIUS_HAVE_TESTCONTAINERS
 bool ensure_minio_env()
 {
   if (sirius::test::ensure_s3_container_env()) { return true; }
   SUCCEED("SIRIUS_TEST_S3_* not set; skipping S3 RDMA real-client MinIO test");
   return false;
 }
+#endif
 
 minio_env read_minio_env()
 {
@@ -109,11 +112,6 @@ std::vector<std::uint8_t> read_binary_file(std::filesystem::path const& path)
   REQUIRE(in.good());
   std::vector<char> chars((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   return std::vector<std::uint8_t>(chars.begin(), chars.end());
-}
-
-bool contains(std::string_view haystack, std::string_view needle)
-{
-  return haystack.find(needle) != std::string_view::npos;
 }
 
 void require_bytes_equal(std::span<const std::uint8_t> got, std::span<const std::uint8_t> expected)
@@ -153,10 +151,16 @@ std::shared_ptr<sirius::io::s3::s3_request_authorizer> make_authorizer(
     std::move(creds), cfg.region, cfg.endpoint);
 }
 
-std::shared_ptr<cuobj_rdma_client> make_real_client(object_store_config const& cfg)
+std::shared_ptr<curl_s3_control_client> make_real_client(object_store_config const& cfg)
 {
-  return std::make_shared<cuobj_rdma_client>(
+  return std::make_shared<curl_s3_control_client>(
     make_authorizer(cfg), cfg.ca_bundle_path, cfg.tls_verify);
+}
+
+sirius::io::rdma::rdma_transport_clients make_transport_clients(object_store_config const& cfg)
+{
+  return sirius::io::rdma::rdma_transport_clients{
+    make_real_client(cfg), std::make_shared<sirius::io::rdma::mock_rdma_data_session_factory>()};
 }
 
 std::string signing_name(signing_case signing)
@@ -164,41 +168,19 @@ std::string signing_name(signing_case signing)
   return signing == signing_case::presigned ? "presigned" : "header";
 }
 
-bool cuda_device_available()
-{
-  int count       = 0;
-  cudaError_t err = cudaGetDeviceCount(&count);
-  if (err != cudaSuccess || count == 0) {
-    WARN("Skipping S3 RDMA real-client device-path test: no CUDA device is available");
-    return false;
-  }
-  REQUIRE(cudaSetDevice(0) == cudaSuccess);
-  return true;
-}
-
-class default_registration_client final : public sirius::io::rdma::rdma_client {
- public:
-  std::size_t head(std::string_view, std::string_view) override { return 0; }
-
-  std::size_t get(std::string_view, std::string_view, std::size_t, std::size_t, void*) override
-  {
-    return 0;
-  }
-};
-
 }  // namespace s3_rdma_p3a_tests
 
-TEST_CASE("rdma_client registration hooks are backward-compatible no-ops", "[s3][rdma][client]")
+TEST_CASE("mock RDMA data sessions expose registration lifetime", "[s3][rdma][client]")
 {
-  s3_rdma_p3a_tests::default_registration_client base_client;
+  sirius::io::rdma::mock_rdma_data_session_factory factory;
+  auto session = factory.acquire();
+  REQUIRE(session != nullptr);
   std::array<std::uint8_t, 16> host{};
 
-  CHECK_NOTHROW(base_client.register_memory(host.data(), host.size()));
-  CHECK_NOTHROW(base_client.deregister_memory(host.data()));
-
-  sirius::io::rdma::mock_rdma_client mock_client;
-  CHECK_NOTHROW(mock_client.register_memory(host.data(), host.size()));
-  CHECK_NOTHROW(mock_client.deregister_memory(host.data()));
+  CHECK_NOTHROW(session->register_memory(host.data(), host.size()));
+  CHECK_NOTHROW(session->deregister_memory(host.data()));
+  CHECK(factory.register_count() == 1);
+  CHECK(factory.deregister_count() == 1);
 }
 
 TEST_CASE("cuobj_rdma_reactor flush decision matches GPUDirect ordering classes",
@@ -209,11 +191,13 @@ TEST_CASE("cuobj_rdma_reactor flush decision matches GPUDirect ordering classes"
   constexpr int k_all_devices_ordered = 200;
 
   CHECK(sirius::io::rdma::flush_required(k_no_ordering));
-  CHECK(sirius::io::rdma::flush_required(k_owner_ordered));
+  CHECK_FALSE(sirius::io::rdma::flush_required(k_owner_ordered));
   CHECK_FALSE(sirius::io::rdma::flush_required(k_all_devices_ordered));
 }
 
-TEST_CASE("cuobj_rdma_client HEADs MinIO objects with both signing modes",
+#ifdef SIRIUS_HAVE_TESTCONTAINERS
+
+TEST_CASE("curl S3 control client HEADs MinIO objects with both signing modes",
           "[s3][rdma][client][integration]")
 {
   using namespace s3_rdma_p3a_tests;
@@ -225,20 +209,20 @@ TEST_CASE("cuobj_rdma_client HEADs MinIO objects with both signing modes",
   for (auto signing : {signing_case::presigned, signing_case::header}) {
     DYNAMIC_SECTION(signing_name(signing))
     {
-      auto client = make_real_client(object_store_cfg(env, signing));
-      CHECK(client->head(env.bucket, k_fixture_key) == payload.size());
+      auto client      = make_real_client(object_store_cfg(env, signing));
+      auto const found = client->head(rx_route{env.bucket, std::string{k_fixture_key}});
+      CHECK(found.outcome.http_status == 200);
+      CHECK(found.outcome.transport_error.empty());
+      CHECK(found.object_size == payload.size());
 
-      try {
-        (void)client->head(env.bucket, "does-not-exist-for-rdma-client.bin");
-        FAIL("expected HEAD on an absent object to throw");
-      } catch (std::runtime_error const& e) {
-        CHECK(s3_rdma_p3a_tests::contains(e.what(), "does-not-exist-for-rdma-client.bin"));
-      }
+      auto const missing = client->head(rx_route{env.bucket, "does-not-exist-for-rdma-client.bin"});
+      CHECK(missing.outcome.http_status == 404);
+      CHECK(missing.outcome.transport_error.empty());
     }
   }
 }
 
-TEST_CASE("cuobj_rdma_client host GET reads MinIO ranges exactly with both signing modes",
+TEST_CASE("curl S3 control client reads MinIO ranges exactly with both signing modes",
           "[s3][rdma][client][integration]")
 {
   using namespace s3_rdma_p3a_tests;
@@ -252,31 +236,39 @@ TEST_CASE("cuobj_rdma_client host GET reads MinIO ranges exactly with both signi
     DYNAMIC_SECTION(signing_name(signing))
     {
       auto client = make_real_client(object_store_cfg(env, signing));
+      rx_route route{env.bucket, std::string{k_fixture_key}};
 
       std::vector<std::uint8_t> start(4096);
-      REQUIRE(client->get(env.bucket, k_fixture_key, 0, start.size(), start.data()) ==
-              start.size());
+      auto const start_result = client->range_get(route, 0, start.size(), start.data());
+      REQUIRE(start_result.outcome.http_status == 206);
+      REQUIRE(start_result.delivered_bytes == start.size());
       require_bytes_equal(start, std::span<const std::uint8_t>(payload.data(), start.size()));
 
       std::vector<std::uint8_t> mid(2048);
       constexpr std::size_t mid_offset = 1234;
-      REQUIRE(client->get(env.bucket, k_fixture_key, mid_offset, mid.size(), mid.data()) ==
-              mid.size());
+      auto const mid_result = client->range_get(route, mid_offset, mid.size(), mid.data());
+      REQUIRE(mid_result.outcome.http_status == 206);
+      REQUIRE(mid_result.delivered_bytes == mid.size());
       require_bytes_equal(mid,
                           std::span<const std::uint8_t>(payload.data() + mid_offset, mid.size()));
 
       std::vector<std::uint8_t> crossing(64, std::uint8_t{0xaa});
       auto const tail_offset = payload.size() - 17;
-      REQUIRE(client->get(
-                env.bucket, k_fixture_key, tail_offset, crossing.size(), crossing.data()) == 17);
+      auto const crossing_result =
+        client->range_get(route, tail_offset, crossing.size(), crossing.data());
+      REQUIRE(crossing_result.outcome.http_status == 206);
+      REQUIRE(crossing_result.delivered_bytes == 17);
       require_bytes_equal(std::span<const std::uint8_t>(crossing.data(), 17),
                           std::span<const std::uint8_t>(payload.data() + tail_offset, 17));
 
       std::array<std::uint8_t, 8> eof{};
       eof.fill(std::uint8_t{0xcc});
-      CHECK(client->get(env.bucket, k_fixture_key, payload.size(), eof.size(), eof.data()) == 0);
-      CHECK(client->get(env.bucket, k_fixture_key, payload.size() + 99, eof.size(), eof.data()) ==
-            0);
+      auto const at_eof = client->range_get(route, payload.size(), eof.size(), eof.data());
+      CHECK(at_eof.outcome.http_status == 416);
+      CHECK(at_eof.delivered_bytes == 0);
+      auto const past_eof = client->range_get(route, payload.size() + 99, eof.size(), eof.data());
+      CHECK(past_eof.outcome.http_status == 416);
+      CHECK(past_eof.delivered_bytes == 0);
       CHECK(std::all_of(eof.begin(), eof.end(), [](std::uint8_t b) { return b == 0xcc; }));
     }
   }
@@ -295,7 +287,7 @@ TEST_CASE("s3_rdma_ioctx uses the real client for host reads through MinIO",
     DYNAMIC_SECTION(signing_name(signing))
     {
       auto cfg = object_store_cfg(env, signing);
-      auto ctx = std::make_shared<s3_rdma_ioctx>(cfg, make_real_client(cfg));
+      auto ctx = std::make_shared<s3_rdma_ioctx>(cfg, make_transport_clients(cfg));
       ctx->start();
 
       auto datasource =
@@ -313,28 +305,7 @@ TEST_CASE("s3_rdma_ioctx uses the real client for host reads through MinIO",
   }
 }
 
-TEST_CASE("cuobj_rdma_client device GET fails loudly when RDMA SDK support is disabled",
-          "[s3][rdma][client][integration][gpu]")
-{
-  using namespace s3_rdma_p3a_tests;
-  if (!ensure_minio_env()) { return; }
-  if (!cuda_device_available()) { return; }
-
-  auto const env = read_minio_env();
-  auto client    = make_real_client(object_store_cfg(env, signing_case::presigned));
-
-  void* device_dst = nullptr;
-  REQUIRE(cudaMalloc(&device_dst, 16) == cudaSuccess);
-  try {
-    (void)client->get(env.bucket, k_fixture_key, 0, 16, device_dst);
-    FAIL("expected device GET to fail in the default build");
-  } catch (std::runtime_error const& e) {
-    CHECK(s3_rdma_p3a_tests::contains(e.what(), "SIRIUS_ENABLE_S3_RDMA"));
-  }
-  CHECK(cudaFree(device_dst) == cudaSuccess);
-}
-
-TEST_CASE("cuobj_rdma_client surfaces MinIO authentication failures",
+TEST_CASE("curl S3 control client reports MinIO authentication failures",
           "[s3][rdma][client][integration]")
 {
   using namespace s3_rdma_p3a_tests;
@@ -347,11 +318,30 @@ TEST_CASE("cuobj_rdma_client surfaces MinIO authentication failures",
     {
       auto client = make_real_client(object_store_cfg(env, signing, "wrong-secret-key"));
 
-      CHECK_THROWS_AS(client->head(env.bucket, k_fixture_key), std::runtime_error);
+      auto const head = client->head(rx_route{env.bucket, std::string{k_fixture_key}});
+      CHECK(head.outcome.http_status >= 400);
+      CHECK(head.outcome.transport_error.empty());
 
       std::array<std::uint8_t, 16> dst{};
-      CHECK_THROWS_AS(client->get(env.bucket, k_fixture_key, 0, dst.size(), dst.data()),
-                      std::runtime_error);
+      auto const get = client->range_get(
+        rx_route{env.bucket, std::string{k_fixture_key}}, 0, dst.size(), dst.data());
+      CHECK(get.outcome.http_status >= 400);
+      CHECK(get.outcome.transport_error.empty());
     }
   }
+}
+
+#endif
+
+TEST_CASE("s3_rdma_ioctx start rejects a missing data-session factory", "[s3][rdma][client]")
+{
+  using namespace s3_rdma_p3a_tests;
+
+  object_store_config cfg;
+  cfg.s3_transport = object_store_config::transport::RDMA;
+  sirius::io::rdma::rdma_transport_clients clients{
+    std::make_shared<sirius::io::rdma::mock_s3_control_client>(), nullptr};
+  s3_rdma_ioctx ctx{std::move(cfg), std::move(clients)};
+
+  CHECK_THROWS_WITH(ctx.start(), Catch::Contains("RDMA initialization"));
 }

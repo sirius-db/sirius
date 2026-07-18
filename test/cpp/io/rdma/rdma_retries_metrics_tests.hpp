@@ -22,6 +22,7 @@
 #include "io/rdma/mock_rdma_client.hpp"
 #include "io/s3/s3_rdma_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
+#include "rdma_test_transport.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -48,9 +49,10 @@ namespace s3_rdma_p4a_tests {
 using sirius::io::object_store_config;
 using sirius::io::rdma::cuobj_rdma_io_object;
 using sirius::io::rdma::cuobj_rdma_reactor;
-using sirius::io::rdma::mock_rdma_client;
 using sirius::io::rdma::rdma_perf_snapshot;
 using sirius::io::s3::s3_rdma_ioctx;
+using sirius::test::rdma::mock_transport_fixture;
+using sirius::test::rdma::seeded_mock_transport;
 using namespace std::chrono_literals;
 
 constexpr std::size_t k_max_inflight = 2;
@@ -141,27 +143,26 @@ void require_snapshots_equal(rdma_perf_snapshot const& lhs, rdma_perf_snapshot c
   CHECK(lhs.arena_leak_total == rhs.arena_leak_total);
 }
 
-std::shared_ptr<mock_rdma_client> seeded_client(std::string key,
-                                                std::vector<std::uint8_t> bytes,
-                                                std::string bucket = std::string{k_bucket})
+std::shared_ptr<mock_transport_fixture> seeded_transport(std::string key,
+                                                         std::vector<std::uint8_t> bytes,
+                                                         std::string bucket = std::string{k_bucket})
 {
-  auto client = std::make_shared<mock_rdma_client>();
-  client->put_object(std::move(bucket), std::move(key), std::move(bytes));
-  return client;
+  return seeded_mock_transport(std::move(bucket), std::move(key), std::move(bytes));
 }
 
-std::shared_ptr<s3_rdma_ioctx> make_started_ioctx(std::shared_ptr<mock_rdma_client> client)
+std::shared_ptr<s3_rdma_ioctx> make_started_ioctx(std::shared_ptr<mock_transport_fixture> transport)
 {
-  auto ctx = std::make_shared<s3_rdma_ioctx>(make_rdma_object_store_config(), std::move(client));
+  auto ctx = std::make_shared<s3_rdma_ioctx>(make_rdma_object_store_config(), transport->clients());
   ctx->start();
   return ctx;
 }
 
-std::unique_ptr<cuobj_rdma_reactor> make_started_reactor(std::shared_ptr<mock_rdma_client> client)
+std::unique_ptr<cuobj_rdma_reactor> make_started_reactor(
+  std::shared_ptr<mock_transport_fixture> transport)
 {
   auto reactor =
     std::make_unique<cuobj_rdma_reactor>(std::make_shared<cuobj_rdma_reactor::reactor_context>(
-      make_reactor_config(), std::move(client)));
+      make_reactor_config(), transport->clients()));
   reactor->start();
   return reactor;
 }
@@ -243,7 +244,7 @@ TEST_CASE("s3_rdma retry metrics start at zero on a fresh ioctx", "[s3][rdma][me
 {
   using namespace s3_rdma_p4a_tests;
 
-  auto ctx = make_started_ioctx(std::make_shared<mock_rdma_client>());
+  auto ctx = make_started_ioctx(std::make_shared<mock_transport_fixture>());
   require_zero_snapshot(ctx->perf_snapshot());
 }
 
@@ -253,17 +254,17 @@ TEST_CASE("s3_rdma ioctx perf snapshot is the single reactor aggregate", "[s3][r
 
   auto payload = pattern_bytes(2048);
 
-  auto direct_client  = seeded_client("direct", payload);
-  auto direct_reactor = make_started_reactor(direct_client);
+  auto direct_transport = seeded_transport("direct", payload);
+  auto direct_reactor   = make_started_reactor(direct_transport);
   cuobj_rdma_io_object direct_obj("s3://bucket/direct", "bucket", "direct", payload.size());
   std::vector<std::uint8_t> direct_got(payload.size());
   REQUIRE(direct_reactor->host_read(direct_obj, 0, direct_got.size(), direct_got.data()) ==
           direct_got.size());
   require_bytes_equal(direct_got, payload);
 
-  auto ioctx_client = seeded_client("via-ioctx", payload);
-  auto ctx          = make_started_ioctx(ioctx_client);
-  auto ds           = open_ds(ctx, "via-ioctx");
+  auto ioctx_transport = seeded_transport("via-ioctx", payload);
+  auto ctx             = make_started_ioctx(ioctx_transport);
+  auto ds              = open_ds(ctx, "via-ioctx");
   std::vector<std::uint8_t> ioctx_got(payload.size());
   REQUIRE(ds->host_read(0, ioctx_got.size(), ioctx_got.data()) == ioctx_got.size());
   require_bytes_equal(ioctx_got, payload);
@@ -277,10 +278,10 @@ TEST_CASE("s3_rdma clean device read metrics count logical requests and bytes",
   using namespace s3_rdma_p4a_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(2 * k_slot_size + 31);
-  auto client  = seeded_client("metrics-clean", payload);
-  auto ctx     = make_started_ioctx(client);
-  auto ds      = open_ds(ctx, "metrics-clean");
+  auto payload   = pattern_bytes(2 * k_slot_size + 31);
+  auto transport = seeded_transport("metrics-clean", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = open_ds(ctx, "metrics-clean");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
 
@@ -305,20 +306,20 @@ TEST_CASE("s3_rdma slot wait remains zero under gated backpressure", "[s3][rdma]
   using namespace s3_rdma_p4a_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(5 * k_slot_size + 1);
-  auto client  = seeded_client("gated-metrics", payload);
-  client->close_gate();
+  auto payload   = pattern_bytes(5 * k_slot_size + 1);
+  auto transport = seeded_transport("gated-metrics", payload);
+  transport->close_get_gate();
 
-  auto ctx = make_started_ioctx(client);
+  auto ctx = make_started_ioctx(transport);
   auto ds  = open_ds(ctx, "gated-metrics");
   rmm::cuda_stream stream;
   rmm::device_buffer device(payload.size(), stream);
 
   auto fut = issue_device_read(*ds, 0, payload.size(), device, stream);
-  REQUIRE(wait_until([&] { return client->gets_issued() >= k_max_inflight; }));
-  CHECK(client->peak_concurrent_gets() <= k_max_inflight);
+  REQUIRE(wait_until([&] { return transport->gets_issued() >= k_max_inflight; }));
+  CHECK(transport->peak_concurrent_gets() <= k_max_inflight);
 
-  client->open_gate();
+  transport->open_get_gate();
   REQUIRE(require_ready_value(fut) == payload.size());
   CHECK(ctx->perf_snapshot().slot_wait_total == 0);
   CHECK(ctx->perf_snapshot().slots_in_use_peak <= k_max_inflight);
@@ -330,10 +331,10 @@ TEST_CASE("s3_rdma perf counters accumulate monotonically and can be sampled in 
   using namespace s3_rdma_p4a_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload = pattern_bytes(2 * k_slot_size);
-  auto client  = seeded_client("monotonic", payload);
-  auto ctx     = make_started_ioctx(client);
-  auto ds      = open_ds(ctx, "monotonic");
+  auto payload   = pattern_bytes(2 * k_slot_size);
+  auto transport = seeded_transport("monotonic", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = open_ds(ctx, "monotonic");
   rmm::cuda_stream stream;
   rmm::device_buffer first(payload.size(), stream);
   rmm::device_buffer second(payload.size(), stream);
@@ -342,14 +343,14 @@ TEST_CASE("s3_rdma perf counters accumulate monotonically and can be sampled in 
   REQUIRE(require_ready_value(first_fut) == payload.size());
   auto const after_first = ctx->perf_snapshot();
 
-  client->close_gate();
+  transport->close_get_gate();
   auto second_fut = issue_device_read(*ds, 0, payload.size(), second, stream);
-  REQUIRE(
-    wait_until([&] { return client->gets_issued() >= ceil_div(payload.size(), k_slot_size) + 1; }));
+  REQUIRE(wait_until(
+    [&] { return transport->gets_issued() >= ceil_div(payload.size(), k_slot_size) + 1; }));
   auto const during_second = ctx->perf_snapshot();
   CHECK(during_second.bytes_total >= after_first.bytes_total);
   CHECK(during_second.requests_total >= after_first.requests_total);
-  client->open_gate();
+  transport->open_get_gate();
 
   REQUIRE(require_ready_value(second_fut) == payload.size());
   auto const after_second = ctx->perf_snapshot();
