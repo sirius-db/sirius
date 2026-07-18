@@ -45,14 +45,11 @@ constexpr std::size_t kWordBits = 32;
 static_assert(sizeof(std::uint32_t) == sizeof(cudf::bitmask_type),
               "bit-packed keep-masks assume cudf::bitmask_type is 32-bit");
 
-/// Set or clear bits [begin, begin + count) of @p words, bit-exact at both
-/// edges (read-modify-write on partial edge words, whole-word fills between).
-/// Any begin/count is legal: checkpoint-grown tables have row groups of
-/// arbitrary sizes, so slice offsets need not be word-aligned. The caller
-/// guarantees no CONCURRENT writer shares an edge word — the mask job slices
-/// parallel tasks only on word-aligned offsets and fills unaligned chunks
-/// through a single task — and prepare zero-initializes every carved mask,
-/// so edge reads never see indeterminate memory.
+/// Set or clear bits [begin, begin + count) of @p words: read-modify-write on
+/// partial edge words, whole-word fills between, so any begin/count is legal.
+/// Caller contract: no concurrent writer shares an edge word (the mask job
+/// slices parallel tasks only on word-aligned offsets), and the words start
+/// zeroed so edge reads never see indeterminate memory.
 void write_bit_range(std::span<std::uint32_t> words,
                      std::size_t begin,
                      std::size_t count,
@@ -171,9 +168,8 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
     }
 
     // Checkpoint-grown tables have row groups of arbitrary sizes, so this
-    // offset need not be word-aligned: the fill writer is bit-exact at word
-    // edges, and the mask job serializes chunks with unaligned offsets into
-    // a single fill task (parallel slicing requires aligned offsets).
+    // offset may be unaligned; the fill writer handles word edges and the
+    // mask job serializes unaligned chunks into a single fill task.
     auto const chunk_offset = expected_start - chunk_start;
 
     bool const dirty = row_group_has_version_state(*node);

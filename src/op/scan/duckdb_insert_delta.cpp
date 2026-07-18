@@ -57,8 +57,7 @@ constexpr char const* kTag = "[insert_delta]";
   throw std::runtime_error(std::string(kTag) + " " + std::move(what));
 }
 
-// Mirrors the walker's visitor (duckdb_native_metadata.cpp): collects a
-// segment's compression-function "additional" block ids (overflow blocks).
+// Collects a segment's extra compression-function block ids (overflow blocks).
 struct collect_block_ids : public duckdb::BlockIdVisitor {
   explicit collect_block_ids(std::vector<duckdb::block_id_t>& out) : out(out) {}
   void Visit(duckdb::block_id_t block_id) override { out.push_back(block_id); }
@@ -71,9 +70,9 @@ bool is_constant_or_empty_validity(duckdb::CompressionType c)
          c == duckdb::CompressionType::COMPRESSION_EMPTY;
 }
 
-/// One column tree's walk over the row group's delta slice [k, k + row_count)
-/// (row-group-relative rows). @p is_validity selects the validity rules
-/// (codec set, bit-granular staging extents).
+/// Walk one column tree over the delta slice [k, k + row_count), in
+/// row-group-relative rows. Validity trees get their own codec rules and
+/// bit-granular staging extents.
 void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
                      bool is_validity,
                      bool is_varchar,
@@ -105,9 +104,9 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
     out_seg.compression   = compression;
 
     if (segment.segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
-      // Small committed appends: in-memory only, and always UNCOMPRESSED —
-      // DuckDB compresses exclusively at checkpoint, which is suppressed
-      // while pinned. Anything else means a checkpoint ran under the pin.
+      // DuckDB compresses transient segments only at checkpoint, and
+      // checkpoints are suppressed while pinned; a compressed one here means
+      // a checkpoint ran anyway.
       if (compression != duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         throw_capture("TRANSIENT segment on column " + std::to_string(column_id) + " row group " +
                       std::to_string(rg_index) + " is compressed (" +
@@ -116,9 +115,9 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
       }
       out_seg.is_transient = true;
       if (is_validity) {
-        // Bit-packed: byte-granular copies only. Transient validity starts
-        // exactly at the delta boundary (appends begin at the persistent
-        // tail); assert instead of assuming.
+        // Validity is bit-packed, so the copy must start on a byte boundary.
+        // Transient validity starts exactly at the delta boundary, so this
+        // holds; check rather than assume.
         if ((lo - seg_start) % 8 != 0 || (lo - k) % 8 != 0) {
           throw_capture("transient validity segment on column " + std::to_string(column_id) +
                         " row group " + std::to_string(rg_index) +
@@ -127,9 +126,9 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
         out_seg.copy_src_offset = (lo - seg_start) / 8;
         out_seg.bytes_size      = ((hi - lo) + 7) / 8;
       } else if (is_varchar) {
-        // Stage the segment's whole used extent: the uncompressed-string
-        // dictionary is self-describing ({size, end} header at the base,
-        // chars packed at the tail), so tail-clamped row counts read fine.
+        // Stage the segment's whole used extent. The uncompressed-string
+        // dictionary is self-describing, so a tail-clamped row count still
+        // decodes correctly.
         if (lo != seg_start) {
           throw_capture("transient varchar segment on column " + std::to_string(column_id) +
                         " row group " + std::to_string(rg_index) +
@@ -143,10 +142,9 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
         out_seg.bytes_size      = (hi - lo) * type_size;
       }
     } else {
-      // Bulk-flushed appends (MergeStorage): checkpoint-shaped PERSISTENT
-      // blocks, compressed like a checkpoint — decoded through the existing
-      // file-read lane; no prepare-time byte work. Partial coverage is legal
-      // only at the n_total snapshot tail (a merge committing mid-capture).
+      // Persistent segments decode straight from the file; nothing is staged.
+      // Partial coverage is legal only at the n_total snapshot tail, where a
+      // merge committed mid-capture.
       if (lo != seg_start || (hi != seg_end && hi != delta_end)) {
         throw_capture("persistent segment on column " + std::to_string(column_id) + " row group " +
                       std::to_string(rg_index) +
@@ -172,10 +170,9 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
     }
 
     if (is_varchar && !is_validity) {
-      // Same stat discipline as the walker: absent stat refuses, and a
-      // marker-bearing (overflow) segment must never reach the GPU string
-      // decoder. The plan-time table-stat probe normally declines first;
-      // this is the stats-drift backstop.
+      // Overflow strings must never reach the GPU string decoder. The
+      // plan-time table-stat probe normally declines first; this catches
+      // stats drift.
       if (!duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
         throw_capture("varchar delta segment on column " + std::to_string(column_id) +
                       " row group " + std::to_string(rg_index) + ": Max String Length stat absent");
@@ -214,9 +211,9 @@ insert_delta_plan capture_insert_delta_plan(
   plan.n_total        = static_cast<std::size_t>(storage.GetTotalRows());
   if (plan.n_total <= n_cache) { return plan; }
 
-  // Capture-time partition stats: CONSTANT-compressed persistent delta
-  // segments decode their value from these, and GetPartitionStats touches
-  // ClientContext — not safe on the decode task threads.
+  // CONSTANT persistent segments decode their value from partition stats, and
+  // GetPartitionStats needs the ClientContext; capture the stats now rather
+  // than on a decode task thread.
   plan.partition_stats = std::make_shared<duckdb::vector<duckdb::PartitionStatistics>>(
     storage.GetPartitionStats(context));
 
@@ -251,8 +248,8 @@ insert_delta_plan capture_insert_delta_plan(
       auto const& type = column_types[ci];
 
       if (type.is_array() || dynamic_cast<duckdb::ArrayColumnData*>(&col_data) != nullptr) {
-        // v1 scope: ARRAY projections with a delta are declined at plan time;
-        // reaching capture means the delta appeared between plan and prepare.
+        // ARRAY deltas are declined at plan time; hitting this means the
+        // delta appeared between plan and prepare.
         throw_capture("ARRAY column " + std::to_string(col) +
                       " in the insert delta is not supported");
       }
@@ -284,7 +281,7 @@ insert_delta_plan capture_insert_delta_plan(
                       rg_plan.row_count,
                       col_plan.validity_segments);
 
-      // The data segments must tile the delta slice exactly — a gap would
+      // The data segments must tile the delta slice exactly; a gap would
       // decode garbage rows the mask never drops.
       std::size_t data_rows = 0;
       for (auto const& s : col_plan.data_segments) {
@@ -296,7 +293,6 @@ insert_delta_plan capture_insert_delta_plan(
                       std::to_string(rg_plan.row_count) + " rows");
       }
 
-      // Staging slab layout (transient bytes) + scheduling budget.
       for (auto* segs : {&col_plan.data_segments, &col_plan.validity_segments}) {
         for (auto& s : *segs) {
           if (!s.is_transient) { continue; }
@@ -343,9 +339,8 @@ std::size_t count_visible_delta_rows(insert_delta_row_group const& rg,
   };
 
   if (!rg.has_version_state) {
-    // No version state at capture: every covered row is visible (the probe
-    // is conservative the other way — it can flag clean row groups, never
-    // miss dirty ones).
+    // No version state at capture means every covered row is visible. The
+    // probe can flag a clean row group but never misses a dirty one.
     set_range(k, end);
     return rg.row_count;
   }
@@ -362,7 +357,7 @@ std::size_t count_visible_delta_rows(insert_delta_row_group const& rg,
       options, static_cast<duckdb::idx_t>(vector_idx), sel, static_cast<duckdb::idx_t>(max_count)));
     auto const from       = std::max(vec_start, k);
     if (count == max_count) {
-      // All visible — sel may be UNFILLED on this fast path; never read it.
+      // All rows visible. GetSelVector may leave sel unfilled here; never read it.
       set_range(from, vec_start + max_count);
       visible += vec_start + max_count - from;
       continue;

@@ -516,9 +516,8 @@ TEST_CASE("mvcc visibility: any_uncheckpointed_appends flags transient segments 
   REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
   exec_ok(*env.con, "ROLLBACK");
 
-  // A bulk insert (>= one row group) is optimistically flushed by
-  // MergeStorage: PERSISTENT-uncheckpointed, checkpoint-shaped segments —
-  // deliberately NOT flagged (the documented pin asymmetry).
+  // A bulk insert (>= one row group) is optimistically flushed by MergeStorage
+  // as persistent, checkpoint-shaped segments; deliberately not flagged.
   vis_test_db bulk_env;
   exec_ok(*bulk_env.con, "CREATE TABLE tb(k INTEGER)");
   exec_ok(*bulk_env.con, "INSERT INTO tb SELECT range::INTEGER FROM range(130000)");
@@ -532,10 +531,9 @@ TEST_CASE("mvcc visibility: checkpoint-grown row groups fill at unaligned offset
           "[duckdb_mvcc_visibility][scan]")
 {
   vis_test_db env;
-  // Checkpoint, append, checkpoint again: the append lands in its own row
-  // group (checkpoint's small-row-group vacuum leaves the large first one
-  // alone), so the second slice starts at chunk offset 50000 — not a
-  // mask-word multiple (50000 % 32 == 16).
+  // Checkpoint, append, checkpoint again: the vacuum leaves the large first
+  // row group alone, so the append keeps its own row group and the second
+  // slice starts at unaligned chunk offset 50000 (50000 % 32 == 16).
   exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000)");
   exec_ok(*env.con, "CHECKPOINT");
   exec_ok(*env.con, "INSERT INTO t SELECT range::INTEGER + 50000 FROM range(100)");

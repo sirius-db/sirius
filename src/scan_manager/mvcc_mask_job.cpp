@@ -306,11 +306,10 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
   auto const parse_chunk = op::scan::metadata_parse_chunk();
   for (auto& work_ptr : workset.works) {
     auto* work = work_ptr.get();
-    // Parallel range slicing requires every slice to start on a mask-word
-    // boundary (concurrent tasks must never share a word). Checkpoint-grown
-    // tables can have row groups of any size, so a chunk with unaligned
-    // offsets fills through ONE task — serial within the chunk, still
-    // parallel across chunks and entries.
+    // Parallel slicing requires every slice to start on a mask-word boundary
+    // (concurrent tasks must never share a word). Checkpoint-grown tables can
+    // have row groups of any size, so a chunk with unaligned offsets fills
+    // through a single task; other chunks still fill in parallel.
     bool const word_aligned = std::all_of(work->slices.begin(),
                                           work->slices.end(),
                                           [](auto const& s) { return s.chunk_offset % 32 == 0; });

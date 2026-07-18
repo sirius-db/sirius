@@ -44,8 +44,8 @@ namespace ccm = cucascade::memory;
 
 constexpr std::size_t kCarveAlign = 64;  // cache-line-aligned carve within the bundle storage
 
-/// Keeps a bundle's pinned staging alive for as long as any published split
-/// references it. Member order matters (blocks release into the reservation).
+/// Keeps a bundle's pinned staging alive while any split references it.
+/// Member order matters: blocks must be destroyed before the reservation.
 struct pinned_staging_bundle {
   std::unique_ptr<ccm::reservation> reservation;
   std::unique_ptr<ccm::fixed_size_host_memory_resource::multiple_blocks_allocation> blocks;
@@ -91,7 +91,7 @@ insert_delta_workset prepare_insert_delta_tasks(
         request.entry_name + "'");
     }
 
-    // Stage 1 — SERIAL capture (prepare thread; ClientContext discipline).
+    // Captures run serially on this thread; ClientContext is not thread-safe.
     try {
       request.plan = op::scan::capture_insert_delta_plan(*request.storage,
                                                          *request.context,
@@ -105,10 +105,9 @@ insert_delta_workset prepare_insert_delta_tasks(
     request.bundles.clear();
     if (request.plan.empty()) { continue; }
 
-    // Stage 2 — bundle planning: close on the byte budget, the cudf int32
-    // varchar-chars threshold, or a row count that leaves the cumulative
-    // bundle rows off a byte boundary (staged validity runs need byte-aligned
-    // row offsets).
+    // Close a bundle on the byte budget, the cudf int32 varchar threshold, or
+    // a cumulative row count off a byte boundary: staged validity needs
+    // byte-aligned row offsets.
     auto const& rgs = request.plan.row_groups;
     std::vector<std::vector<std::size_t>> bundles_rgs;
     {
@@ -147,9 +146,9 @@ insert_delta_workset prepare_insert_delta_tasks(
       flush();
     }
 
-    // Stage 3 — per-bundle storage carve (staging slab + mask words) and the
-    // fill task. One task per bundle: its mask is single-writer, so the bit
-    // offsets need no word alignment.
+    // Carve each bundle's staging slab and mask words, then build its fill
+    // task. One task per bundle keeps the mask single-writer, so bit offsets
+    // need no word alignment.
     for (auto& rg_list : bundles_rgs) {
       insert_delta_bundle bundle;
       bundle.rg_indices = std::move(rg_list);
@@ -169,7 +168,6 @@ insert_delta_workset prepare_insert_delta_tasks(
 
       std::uint8_t* base = nullptr;
       if (total_size <= block_size) {
-        // Reservation-first pinned storage on the bundle's GPU's NUMA node.
         ccm::any_memory_space_in_tier_with_preference host_req(
           ccm::Tier::HOST, numa_node_for_device(bundle.preferred_device, topology));
         auto reservation = reservation_manager.request_reservation(host_req, block_size);
@@ -191,9 +189,9 @@ insert_delta_workset prepare_insert_delta_tasks(
         base                = reinterpret_cast<std::uint8_t*>(pinned->blocks->at(0).data());
         bundle.staging      = std::move(pinned);
       } else {
-        // Staging blocks are not virtually contiguous, so an oversized bundle
-        // keeps plain pageable memory: cudaMemcpyAsync stages pageable bytes
-        // out before returning, so only the true-async-DMA benefit is lost.
+        // Staging blocks are not virtually contiguous, so oversized bundles
+        // use pageable memory. cudaMemcpyAsync stages pageable bytes before
+        // returning, so only the async-DMA benefit is lost.
         SIRIUS_LOG_INFO(
           "[prepare_insert_delta_tasks] pinned entry '{}': delta bundle needs {} bytes (> one "
           "{}-byte staging block); using pageable host memory for it",
@@ -245,11 +243,11 @@ void finalize_insert_delta_jobs(insert_delta_workset& workset)
   for (auto& work : workset.works) {
     auto& bundle = work->request->bundles[work->bundle_index];
     if (work->visible == bundle.total_rows) {
-      // Every covered row visible: serve unmasked (no upload, no kernel).
+      // Every row visible: serve unmasked.
       bundle.mask = mvcc_chunk_mask{};
     } else if (work->visible == 0) {
-      // Nothing visible (all inserted after this snapshot, or all deleted):
-      // tombstone; the sweep below drops it.
+      // Nothing visible under this snapshot: mark empty so the sweep below
+      // drops the bundle.
       bundle.total_rows = 0;
     }
     touched.insert(work->request);
@@ -280,7 +278,6 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
   duckdb::SingleFileBlockManager const* block_manager)
 {
-  // Resolve each operator column into the request's union.
   std::vector<std::size_t> union_idx;
   union_idx.reserve(op_projected_cols.size());
   for (auto const& pc : op_projected_cols) {

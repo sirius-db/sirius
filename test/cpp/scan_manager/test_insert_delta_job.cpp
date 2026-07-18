@@ -14,12 +14,10 @@
  * limitations under the License.
  */
 
-// Gates for the prepare-time insert-delta job: bundles must carry finished
-// pinned staging + masks before serving starts, masks survive only where
-// rows are invisible (finalize drops all-invisible bundles and unmasks
-// all-visible ones), bundle planning respects the byte budget and the
-// validity byte-alignment cut, and per-operator cuts subset the union while
-// sharing the staged bytes and mask words.
+// Tests for the prepare-time insert-delta job: bundle staging and masks,
+// finalize (all-invisible bundles dropped, all-visible ones unmasked),
+// byte-budget planning, and per-operator cuts that share the staged storage.
+// Capture-level tests live in test/cpp/scan/test_duckdb_insert_delta.cpp.
 
 #include "operator/operator_test_utils.hpp"
 
@@ -226,8 +224,8 @@ TEST_CASE("insert-delta job: all-invisible bundles are dropped", "[insert_delta_
   exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(1000)");
   exec_ok(*tdb.con, "CHECKPOINT");
 
-  // Pin the snapshot BEFORE the second connection's insert (the per-database
-  // transaction spawns lazily, so touch the table).
+  // Pin the snapshot before the second connection's insert: the transaction
+  // spawns lazily, so touch the table.
   exec_ok(*tdb.con, "BEGIN TRANSACTION");
   exec_ok(*tdb.con, "SELECT count(*) FROM t");
   duckdb::Connection con2(*tdb.db);

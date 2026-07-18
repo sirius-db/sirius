@@ -113,16 +113,16 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   std::shared_ptr<sirius::io::sirius_datasource> datasource;
   /// Resolves block ids to file offsets when deriving the on-disk ranges below.
   duckdb::SingleFileBlockManager const* block_manager = nullptr;
-  /// Owners of the bytes host-backed descriptors (`host_ptr`) point into —
-  /// insert-delta staging. Shared across the per-operator split copies cut
-  /// from one delta capture; must outlive the decode of this split.
+  /// Owners of the bytes that host-backed descriptors (`host_ptr`) point
+  /// into. Shared by the per-operator splits cut from one delta capture;
+  /// must outlive this split's decode.
   std::vector<std::shared_ptr<void>> staging_keepalive;
   /// True when every descriptor is host-backed: the split stages no file
   /// reads and may carry a null datasource.
   bool host_backed_only = false;
-  /// Capture-time partition stats for CONSTANT segment decode (insert delta):
-  /// stand in for DataTable::GetPartitionStats, which touches ClientContext
-  /// and is not safe off the query thread.
+  /// Capture-time partition stats for CONSTANT segment decode; used instead
+  /// of DataTable::GetPartitionStats, which touches ClientContext and is not
+  /// safe off the query thread.
   std::shared_ptr<duckdb::vector<duckdb::PartitionStatistics>> carried_partition_stats;
 
   /// On-disk byte ranges this unit reads, derived from @ref row_groups so they always match the row

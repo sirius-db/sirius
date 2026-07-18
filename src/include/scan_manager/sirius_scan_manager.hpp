@@ -510,9 +510,9 @@ class sirius_scan_manager {
   /// reset() for the prepare-threw case).
   std::vector<mvcc_mask_job_request> _pending_mvcc_mask_jobs;
 
-  /// One insert-delta computation per distinct pinned entry matched this
-  /// query (same dedup/lifecycle as the mask jobs above; later operators
-  /// union their columns into the pending request). The job no-ops when the
+  /// One insert-delta job per distinct pinned entry matched this query, with
+  /// the same dedup and lifecycle as the mask jobs above. Later operators
+  /// union their columns into the pending request. The job no-ops when the
   /// table has no rows beyond the pinned prefix.
   std::vector<insert_delta_job_request> _pending_insert_delta_jobs;
 

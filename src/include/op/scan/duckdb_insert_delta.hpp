@@ -41,25 +41,19 @@ class RowGroup;
 
 namespace sirius::op::scan {
 
-/**
- * @brief One segment's contribution to the insert delta of one row group.
- *
- * The delta is positional — physical rows [n_cache, n_total) — and a segment
- * joins it regardless of its type; only the BYTE PATH branches:
- *  - TRANSIENT (small committed appends): in-memory only. A prepare-time task
- *    pins the segment's buffer and memcpys [copy_src_offset, +bytes_size)
- *    into cuda-pinned staging (slab_offset within the row group's slab); the
- *    decode descriptor gets a host_ptr. Always UNCOMPRESSED (asserted).
- *  - PERSISTENT (bulk appends, optimistically flushed by MergeStorage):
- *    checkpoint-shaped blocks in the .db file, compressed like a checkpoint.
- *    The descriptor keeps block_id/block_offset and rides the decoder's
- *    existing file-read lane; no prepare-time byte work.
- *
- * `segment_start` is rebased to the row group's DELTA slice (absolute rowid
- * `rg.row_group_start + segment_start`); segments never straddle the pin
- * boundary (appends start exactly at the persistent tail), so only the tail
- * clamp against the n_total snapshot ever shortens one.
- */
+/// One segment's contribution to a row group's insert delta.
+///
+/// Only the byte path depends on the segment type. Transient segments live in
+/// memory and must be uncompressed; a prepare task copies
+/// [copy_src_offset, +bytes_size) into cuda-pinned staging at slab_offset and
+/// the decoder reads that host pointer. Persistent segments are bulk appends
+/// that MergeStorage optimistically flushed as checkpoint-shaped blocks; the
+/// decoder reads them from the .db file by block_id/block_offset and nothing
+/// is staged.
+///
+/// segment_start is relative to the row group's delta slice. Appends begin at
+/// the persistent tail, so a segment never straddles the pin boundary; only
+/// the clamp to the n_total snapshot can shorten one.
 struct insert_delta_segment {
   duckdb::ColumnSegment* segment{nullptr};  ///< Pin target for the transient copy task
   bool is_transient{false};
@@ -76,7 +70,7 @@ struct insert_delta_segment {
   std::size_t slab_offset{0};      ///< transient: byte offset within the row group's staging slab
 };
 
-/// Per-column delta segments, mirroring duckdb_column_metadata's data/validity split.
+/// One column's delta segments, split into data and validity.
 struct insert_delta_column {
   duckdb::idx_t column_id{0};
   bool is_varchar{false};
@@ -84,21 +78,17 @@ struct insert_delta_column {
   std::vector<insert_delta_segment> validity_segments;
 };
 
-/**
- * @brief One row group's slice of the insert delta.
- *
- * `k_offset` is the number of this row group's rows below n_cache. With
- * current DuckDB append semantics it is always 0 — post-checkpoint appends
- * open a FRESH row group (RowGroupAppendMode::REQUIRE_NEW), and pins start
- * checkpoint-clean, so n_cache lands on a row-group boundary. The k > 0
- * handling (boundary-vector intersection in the visibility walk, rebased
- * segment math) is kept as defensive generality against tail-growing append
- * variants.
- */
+/// One row group's slice of the insert delta.
+///
+/// k_offset counts this row group's rows below n_cache. It is always 0 today:
+/// pins start checkpoint-clean and post-checkpoint appends open a fresh row
+/// group (RowGroupAppendMode::REQUIRE_NEW), so n_cache lands on a row-group
+/// boundary. The k > 0 handling stays in case an append path ever grows an
+/// existing row group's tail.
 struct insert_delta_row_group {
   duckdb::RowGroup* row_group{nullptr};  ///< tree-owned; stable while pinned (no checkpoints)
   duckdb::idx_t row_group_index{0};
-  std::size_t row_group_start{0};  ///< absolute rowid of the FIRST DELTA row (rg start + k_offset)
+  std::size_t row_group_start{0};  ///< absolute rowid of the first delta row
   std::size_t k_offset{0};
   std::size_t row_count{0};  ///< delta rows covered (tail-clamped to the n_total snapshot)
   bool has_version_state{false};
@@ -108,15 +98,13 @@ struct insert_delta_row_group {
   std::size_t transient_staging_bytes{0};          ///< pinned slab bytes this row group needs
 };
 
-/**
- * @brief Serial capture of everything the insert-delta job needs for one
- *        pinned entry: the query transaction, the n_total snapshot, and the
- *        per-row-group segment plan over [n_cache, n_total).
- *
- * Holds tree-owned pointers (RowGroup / ColumnSegment) — stable for the
- * query's prepare window because checkpoints are suppressed while pinned and
- * committed segments are never rewritten in place.
- */
+/// Everything the insert-delta job needs for one pinned entry: the query
+/// transaction, the n_total snapshot, and the per-row-group segment plan for
+/// physical rows [n_cache, n_total).
+///
+/// Holds tree-owned RowGroup and ColumnSegment pointers. They stay valid for
+/// the prepare window because checkpoints are suppressed while pinned and
+/// committed segments are never rewritten in place.
 struct insert_delta_plan {
   duckdb::TransactionData transaction{
     duckdb::TransactionData(duckdb::transaction_t{0}, duckdb::transaction_t{0})};
@@ -133,21 +121,19 @@ struct insert_delta_plan {
 };
 
 /**
- * @brief Build the insert-delta plan for one pinned duckdb table. SERIAL —
- *        prepare/query thread only (ClientContext discipline; takes segment
- *        tree locks while walking).
+ * Build the insert-delta plan for one pinned duckdb table. Serial: call from
+ * the prepare/query thread only, since it uses the ClientContext and takes
+ * segment tree locks.
  *
- * Walks the row groups overlapping [n_cache, GetTotalRows()), branching per
- * SEGMENT on segment_type (see insert_delta_segment). Throws on states the
- * plan-time guards should have excluded or that violate the pin contract:
- * a compressed TRANSIENT segment (a checkpoint ran while pinned), a varchar
- * segment at/over the overflow-block limit, an unsupported persistent codec,
- * an ARRAY column (declined at plan time in v1), or non-StandardColumnData
- * storage.
+ * Walks the row groups overlapping [n_cache, GetTotalRows()). Throws on
+ * states the plan-time guards should have excluded or that break the pin
+ * contract: a compressed transient segment, a varchar segment at the
+ * overflow-block limit, an unsupported persistent codec, an ARRAY column, or
+ * non-StandardColumnData storage.
  *
- * @param storage_column_indices The union of the querying operators' storage
- *        columns (superset staging; per-operator splits are cut later).
- * @param column_types Parallel to @p storage_column_indices.
+ * @param storage_column_indices Union of the querying operators' storage
+ *        columns; per-operator splits are cut from it later.
+ * @param column_types Parallel to storage_column_indices.
  */
 insert_delta_plan capture_insert_delta_plan(
   duckdb::DataTable& storage,
@@ -157,15 +143,14 @@ insert_delta_plan capture_insert_delta_plan(
   std::span<sirius::logical_type const> column_types);
 
 /**
- * @brief Visibility counting pass for one delta row group — task-safe
- *        (GetSelVector serializes on the row group's own version lock).
+ * Count one delta row group's visible rows, setting one bit per visible row
+ * at mask_bit_offset + (row - first delta row). Task-safe: GetSelVector
+ * serializes on the row group's version lock.
  *
- * Sets one bit per VISIBLE delta row into @p mask_words at
- * @p mask_bit_offset + (row - first delta row); the caller pre-zeroes the
- * words (single writer per bundle mask, so no alignment constraints beyond
- * not sharing words across concurrent bundles).
+ * The caller pre-zeroes mask_words. Concurrent callers must not share mask
+ * words.
  *
- * @return the number of visible delta rows.
+ * @return Number of visible delta rows.
  */
 std::size_t count_visible_delta_rows(insert_delta_row_group const& rg,
                                      duckdb::TransactionData transaction,
@@ -173,11 +158,10 @@ std::size_t count_visible_delta_rows(insert_delta_row_group const& rg,
                                      std::size_t mask_bit_offset);
 
 /**
- * @brief Copy one delta row group's TRANSIENT segment bytes into its staging
- *        slab — task-safe. Pins each segment's buffer just long enough to
- *        memcpy [copy_src_offset, +bytes_size) to slab_base + slab_offset;
- *        no DuckDB handle outlives the call. Persistent segments need no
- *        byte work (the decoder's file lane reads them at materialize).
+ * Copy one delta row group's transient segment bytes into its staging slab.
+ * Task-safe. Each segment's buffer is pinned only for the memcpy; no DuckDB
+ * handle outlives the call. Persistent segments are skipped; the decoder
+ * reads them from the file.
  */
 void copy_delta_row_group(insert_delta_row_group const& rg,
                           duckdb::BufferManager& buffer_manager,

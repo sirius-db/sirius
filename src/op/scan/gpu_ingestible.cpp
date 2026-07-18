@@ -35,9 +35,9 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     split.prefetch(io::cache::prefetching_stage::disposable);
     auto materialized = materialize_metadata_to_table(split.get_scan_info(), *mem_space, stream);
     if (split.mvcc_keep_mask.has_mask()) {
-      // Insert-delta splits carry a per-split visibility mask; disk-walk
-      // splits never do. Same apply-and-await discipline as the resident
-      // branch below.
+      // Only insert-delta splits carry a visibility mask here; disk-walk
+      // splits never do. Sync before returning for the same reason as the
+      // cached branch below.
       auto const& mask = split.mvcc_keep_mask;
       auto view        = materialized.table.view();
       if (mask.row_count != static_cast<std::size_t>(view.num_rows())) {

@@ -14,12 +14,10 @@
  * limitations under the License.
  */
 
-// Gates for the insert-delta capture and its task bodies: the positional
-// boundary math (n_cache mid-row-group and mid-vector), the per-SEGMENT lane
-// branch (transient -> staging copy, bulk-flushed persistent -> block refs),
-// the n_total snapshot clamp, visibility counting against the SQL rowid
-// oracle, and byte-exact transient staging. CPU-only: real file-backed
-// DuckDB databases, no GPU.
+// Unit tests for the insert-delta capture and its task bodies: boundary math,
+// transient vs bulk-flushed persistent segment lanes, snapshot visibility
+// counting, and byte-exact staging. CPU-only, against real file-backed DuckDB
+// databases. End-to-end coverage lives in test_pin_table_mvcc_insert.cpp.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -91,20 +89,16 @@ duckdb::DataTable& resolve_storage(duckdb::Connection& con, const std::string& t
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
 
-/// k INTEGER, v BIGINT, s VARCHAR — 130,000 checkpointed rows (n_cache) in
-/// row groups {122880, 7120}, then 5,000 committed small-append rows
-/// [130000, 135000). Post-checkpoint appends open a FRESH row group
-/// (RowGroupAppendMode::REQUIRE_NEW), so the delta is row group #2 with
-/// k_offset == 0: with checkpoint-clean pins, n_cache always lands on a
-/// row-group boundary. The k>0 math stays defensive generality.
+/// build_appended_table layout: 130,000 checkpointed rows (n_cache) in row
+/// groups {122880, 7120}, plus 5,000 committed small-append rows. The append
+/// opens a fresh row group, so the delta is row group #2 with k_offset == 0.
 constexpr std::size_t kBase  = 130000;
 constexpr std::size_t kDelta = 5000;
 
 void build_appended_table(duckdb::Connection& con)
 {
-  // Single-threaded build: parallel CTAS splits rows into per-thread batches
-  // with data-dependent row-group boundaries; the assertions below hardcode
-  // the sequential {122880, 7120} layout.
+  // Single-threaded CTAS keeps the row-group layout deterministic; the
+  // assertions hardcode the sequential {122880, 7120} split.
   exec_ok(con, "SET threads TO 1");
   exec_ok(con,
           "CREATE TABLE t AS SELECT range::INTEGER AS k, (range*10)::BIGINT AS v, "
@@ -166,8 +160,7 @@ TEST_CASE("insert delta: capture boundary math and transient segment lanes",
   REQUIRE(col_v.data_segments.size() == 1);
   REQUIRE(col_v.data_segments[0].bytes_size == kDelta * sizeof(int64_t));
 
-  // Varchar: whole used extent staged; the per-segment stat backstop filled
-  // max_string_length.
+  // Varchar: the whole used extent is staged and max_string_length is filled.
   auto const& col_s = rg.columns[2];
   REQUIRE_FALSE(col_s.data_segments.empty());
   for (auto const& s : col_s.data_segments) {
@@ -218,9 +211,8 @@ TEST_CASE("insert delta: an older snapshot cannot see newer committed rows",
   delta_test_db env;
   build_appended_table(*env.con);
 
-  // Open the snapshot FIRST, then commit more rows from a second connection.
-  // The per-database DuckTransaction spawns lazily on first access, so the
-  // snapshot is only pinned by actually touching the table.
+  // Open the snapshot first, then commit more rows from a second connection.
+  // The transaction spawns lazily, so touch the table to pin the snapshot.
   exec_ok(*env.con, "BEGIN TRANSACTION");
   exec_ok(*env.con, "SELECT count(*) FROM t");
   duckdb::Connection con2(*env.db);
@@ -229,7 +221,7 @@ TEST_CASE("insert delta: an older snapshot cannot see newer committed rows",
   auto& storage = resolve_storage(*env.con, "t");
   auto types    = all_types();
   auto plan     = capture_insert_delta_plan(storage, *env.con->context, kBase, kAllCols, types);
-  // The snapshot walk still SEES the newer physical rows...
+  // The snapshot walk still sees the newer physical rows...
   REQUIRE(plan.n_total == kBase + kDelta + 1000);
 
   std::size_t total_visible = 0;
@@ -295,8 +287,8 @@ TEST_CASE("insert delta: bulk-flushed appends keep persistent block references",
   delta_test_db env;
   exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
   exec_ok(*env.con, "CHECKPOINT");
-  // >= one row group in a single commit: optimistically flushed by
-  // MergeStorage as PERSISTENT (checkpoint-shaped) row groups.
+  // A single commit of at least one full row group: MergeStorage flushes it as
+  // persistent, checkpoint-shaped row groups.
   exec_ok(*env.con, "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(130000)");
   // And a small committed append on top: transient, in its own row group.
   exec_ok(*env.con, "INSERT INTO t VALUES (140000)");

@@ -37,10 +37,10 @@
 namespace sirius::scan_manager {
 
 struct databatch_provider {
-  /// One cached chunk OR one insert-delta split, plus its (optional)
-  /// per-query MVCC keep-mask. A batch carries EITHER @ref data (resident
-  /// cached chunk) or @ref scan_info (metadata-flavor delta split, yielded
-  /// after the resident chunks); both null means end-of-stream.
+  /// One cached chunk or one insert-delta split, plus its (optional)
+  /// per-query MVCC keep-mask. A batch carries either @ref data (resident
+  /// cached chunk) or @ref scan_info (delta split, yielded after the
+  /// resident chunks); both null means end-of-stream.
   struct batch {
     std::shared_ptr<cucascade::data_batch> data;
     mvcc_chunk_mask mvcc_keep_mask;  ///< default = all rows visible

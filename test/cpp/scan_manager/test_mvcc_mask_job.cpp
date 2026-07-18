@@ -277,9 +277,8 @@ TEST_CASE("run_mvcc_mask_jobs fills checkpoint-grown chunks through a single tas
   auto& e = env();
   job_test_db tdb;
   // Checkpoint, append, checkpoint again: the append keeps its own row group,
-  // so its slice starts at bit offset 50000 — not a mask-word multiple — and
-  // the job must serialize this chunk's fill instead of slicing it across
-  // tasks.
+  // so its slice starts at unaligned bit offset 50000 and the job must fill
+  // this chunk in a single task instead of slicing it across tasks.
   exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000)");
   exec_ok(*tdb.con, "CHECKPOINT");
   exec_ok(*tdb.con, "INSERT INTO t SELECT range::INTEGER + 50000 FROM range(100)");

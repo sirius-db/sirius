@@ -54,19 +54,17 @@ class topology_index;
 namespace sirius::scan_manager {
 
 /**
- * @brief One finished, batch-sized unit of the insert delta: a run of the
- *        plan's row groups, its visibility mask, and the pinned staging the
- *        transient copies landed in. Per-operator splits are cut from these
- *        (sharing the staging and mask storage) at provider handoff.
+ * One batch-sized unit of the insert delta: a run of the plan's row groups,
+ * their visibility mask, and the staging the transient copies landed in.
+ * Per-operator splits are cut from these and share the same storage.
  */
 struct insert_delta_bundle {
   std::vector<std::size_t> rg_indices;  ///< indexes into the request plan's row_groups
   std::size_t total_rows{0};
-  /// Empty (default) when every covered row is visible — the split then skips
-  /// the mask upload + apply entirely.
+  /// Empty when every covered row is visible; the split then skips the mask
+  /// upload and apply entirely.
   mvcc_chunk_mask mask;
-  /// Owner of the transient staging bytes descriptors point into (pinned
-  /// {reservation, blocks} bundle or the pageable fallback).
+  /// Owns the staging bytes the descriptors point into, pinned or pageable.
   std::shared_ptr<void> staging;
   std::uint8_t* slab_base{nullptr};        ///< contiguous staging base (null if none)
   std::vector<std::size_t> rg_slab_base;   ///< parallel to rg_indices
@@ -75,30 +73,28 @@ struct insert_delta_bundle {
 };
 
 /**
- * @brief One pending per-pinned-entry insert-delta computation, recorded by
- *        the cache-match pass (deduped by entry — a self-join queues ONE
- *        request, accumulating the union of the operators' columns) and
- *        executed before serving starts.
+ * One pending insert-delta computation for a pinned entry, recorded by the
+ * cache-match pass and run before serving starts. Deduped per entry: a
+ * self-join queues one request holding the union of the operators' columns.
  */
 struct insert_delta_job_request {
   duckdb::DataTable* storage{nullptr};
   duckdb::ClientContext* context{nullptr};
   std::size_t n_cache{0};
-  /// Union of the requesting operators' storage columns (superset staging;
-  /// per-operator splits select their subset at cut time).
+  /// Union of the requesting operators' storage columns; each operator's
+  /// splits select their subset at cut time.
   std::vector<duckdb::storage_t> union_cols;
   std::vector<sirius::logical_type> union_types;  ///< parallel to union_cols
   std::size_t approximate_batch_size{sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE};
   std::string entry_name;
 
-  /// OUT — filled by the job: the capture (owns segment refs the bundles
-  /// index into) and the finished bundles.
+  /// Filled by the job. The plan owns the segment refs the bundles index into.
   op::scan::insert_delta_plan plan;
   std::vector<insert_delta_bundle> bundles;
 };
 
-/// Internal per-bundle fill bookkeeping; address-stable behind unique_ptr so
-/// tasks can hold pointers.
+/// Per-bundle fill bookkeeping. Held behind unique_ptr so tasks can keep
+/// stable pointers to it.
 struct insert_delta_work {
   insert_delta_job_request* request{nullptr};
   std::size_t bundle_index{0};
@@ -106,10 +102,9 @@ struct insert_delta_work {
 };
 
 /**
- * @brief Everything prepare stages and the later steps consume: per-bundle
- *        works and the ready-to-dispatch fill tasks (one per bundle — a
- *        bundle's mask is single-writer, so its bit offsets need no word
- *        alignment).
+ * Output of prepare_insert_delta_tasks: per-bundle works and the fill tasks
+ * ready to dispatch. One task per bundle, so each mask has a single writer
+ * and bit offsets need no word alignment.
  */
 struct insert_delta_workset {
   std::vector<std::unique_ptr<insert_delta_work>> works;
@@ -117,23 +112,21 @@ struct insert_delta_workset {
 };
 
 /**
- * @brief Stage every pending request's delta work, dispatch-free: serial
- *        captures (prepare thread — ClientContext discipline), bundle
- *        planning, staging + mask carve, and fill-task construction.
+ * Build the workset for every pending request: capture serially (ClientContext
+ * is not thread-safe), plan bundles, carve staging and masks, build fill
+ * tasks. Nothing is dispatched here.
  *
- * Bundle planning walks the captured row groups in order and closes a bundle
- * when adding the next row group would (a) exceed approximate_batch_size by
- * decoded-byte budget, (b) push any varchar column past the cudf int32 chars
- * threshold, or (c) leave the bundle's cumulative row count off a byte
- * boundary (row_count % 8 != 0) — staged validity runs require byte-aligned
- * row offsets, so such a row group always ends its bundle.
+ * A bundle closes when the next row group would exceed the
+ * approximate_batch_size byte budget, push a varchar column past the cudf
+ * int32 chars threshold, or leave the cumulative row count off a byte
+ * boundary. Staged validity needs byte-aligned row offsets, so a row group
+ * with row_count % 8 != 0 always ends its bundle.
  *
- * Staging + mask storage per bundle: one pinned staging block when the
- * combined bytes fit (reservation-first, on the bundle's preferred GPU's NUMA
- * node), else a pageable fallback (only the async-DMA benefit is lost). Mask
- * words are zero-initialized; fill tasks set visible bits only.
+ * Each bundle gets one pinned staging block on its GPU's NUMA node when the
+ * bytes fit, else pageable memory. Mask words start zeroed; fill tasks set
+ * visible bits only.
  *
- * @throws std::runtime_error on capture/validation or reservation failures.
+ * @throws std::runtime_error on capture, validation, or reservation failure.
  */
 [[nodiscard]] insert_delta_workset prepare_insert_delta_tasks(
   std::span<insert_delta_job_request> requests,
@@ -142,20 +135,18 @@ struct insert_delta_workset {
   std::span<int const> gpu_ids);
 
 /**
- * @brief Drop all-invisible bundles and reset all-visible bundles' masks to
- *        the default (unmasked fast path). Call only after every fill task
- *        ran.
+ * Drop all-invisible bundles and clear all-visible bundles' masks so they
+ * serve unmasked. Call only after every fill task has run.
  */
 void finalize_insert_delta_jobs(insert_delta_workset& workset);
 
 /**
- * @brief Compute every pending request's delta bundles; blocks in prepare so
- *        serving starts with finished staging and masks. The composition:
- *        @ref prepare_insert_delta_tasks → fan_out_and_join →
- *        @ref finalize_insert_delta_jobs.
+ * Compute every pending request's delta bundles: prepare_insert_delta_tasks,
+ * fan_out_and_join, then finalize_insert_delta_jobs. Blocks so serving starts
+ * with finished staging and masks.
  *
- * @throws std::runtime_error — loud by design (past the plan-time CPU
- *         fallback gate; see run_mvcc_mask_jobs for the rationale).
+ * @throws std::runtime_error on failure; the plan-time CPU fallback gate has
+ *         already passed, as in run_mvcc_mask_jobs.
  */
 void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
                            exec::scoped_dispatcher& dispatcher,
@@ -163,9 +154,8 @@ void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
                            sirius::memory::topology_index const& topology,
                            std::span<int const> gpu_ids);
 
-/// One per-operator split cut from a bundle: the scan_info (metadata-flavor,
-/// decoded through the existing file/host lanes) plus the mask and placement
-/// the drain attaches to the outgoing scan_operator_input.
+/// One per-operator split cut from a bundle: the scan info plus the mask and
+/// placement to attach to the outgoing scan_operator_input.
 struct insert_delta_split {
   std::unique_ptr<op::scan::duckdb_native_scan_info> info;
   mvcc_chunk_mask mask;
@@ -173,13 +163,13 @@ struct insert_delta_split {
 };
 
 /**
- * @brief Cut one operator's splits from @p request's finished bundles.
+ * Cut one operator's splits from @p request's finished bundles.
  *
- * Columns are emitted in @p op_projected_cols order (each resolved into the
- * request's union by storage index — a rowid projection throws, the pin
- * declines those at plan time). Splits share the bundles' staging and mask
- * storage via their owning pointers; @p datasource / @p block_manager feed
- * the persistent segments' file reads and prefetch hints.
+ * Columns are emitted in @p op_projected_cols order, resolved into the
+ * request's union by storage index. Rowid projections throw; the pin declines
+ * those at plan time. Splits share the bundles' staging and mask storage.
+ * @p datasource and @p block_manager serve the persistent segments' file
+ * reads.
  */
 std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,

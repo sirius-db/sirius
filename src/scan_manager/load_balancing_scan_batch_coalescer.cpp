@@ -184,11 +184,10 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
         continue;
       }
       if (next.scan_info) {
-        // Insert-delta split: metadata-flavor, decoded through the existing
-        // file/host lanes. No row_filter_pending — scan_info splits fold
-        // filter costs into their own estimates. Mirror the walk path's
-        // fadvise + opportunistic prefetch for its file ranges (persistent
-        // delta segments; host-backed splits hint nothing).
+        // Insert-delta split. row_filter_pending stays false: scan_info
+        // splits fold filter costs into their own estimates. Same fadvise +
+        // opportunistic prefetch as the walk path; host-backed splits have
+        // no file ranges, so the hints no-op.
         auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.scan_info));
         split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
         std::optional<int> device;

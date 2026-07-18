@@ -329,8 +329,8 @@ void append_segment_file_ranges(duckdb::SingleFileBlockManager const& bm,
                                 duckdb_segment_descriptor const& seg,
                                 std::vector<cudf::io::text::byte_range_info>& out)
 {
-  // Main payload. CONSTANT/blockless segments have bytes_size == 0; host-backed
-  // (insert-delta) segments have bytes_size > 0 but no block — both read no file.
+  // Main payload. CONSTANT/blockless segments (bytes_size == 0) and
+  // host-backed segments (payload but no block) read no file.
   if (seg.bytes_size > 0 && seg.block_id >= 0) {
     auto const off =
       duckdb_block_payload_offset(bm, seg.block_id) + static_cast<std::size_t>(seg.block_offset);
@@ -425,9 +425,8 @@ staged_column stage_one_fixed_width_column(
       ss.compression = seg.compression;
 
       if (seg.host_ptr != nullptr) {
-        // Host-backed segment (insert-delta staging): the bytes already sit in
-        // host memory owned by the enclosing scan_info; ride the CONSTANT/
-        // ROARING host-copy lane instead of a file read.
+        // Host-backed segment: the bytes sit in host memory owned by the
+        // enclosing scan_info, so stage a host copy instead of a file read.
         stage_host_copy(s, {{}, seg.host_ptr, seg.bytes_size}, ss);
       } else if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
         auto const& stats = constant_stats_for(
@@ -850,10 +849,9 @@ void submit_and_await(rmm::device_buffer& device_buf,
   }
 }
 
-/// @brief H2D for a split with no file reads (every segment host-backed or
-/// CPU-produced): no io, no pinned staging blocks, no SiriusContext — just the
-/// direct host->device copies, synced so the caller may drop the source
-/// buffers' owners afterwards (same discipline as submit_and_await).
+/// H2D for a split with no file reads: no io, no pinned staging blocks, no
+/// SiriusContext. Synchronizes before returning so the caller may drop the
+/// source buffers' owners, same as submit_and_await.
 void submit_host_only_and_await(rmm::device_buffer& device_buf,
                                 staging_state const& s,
                                 rmm::cuda_stream_view stream)
@@ -1102,8 +1100,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
                      coalesce_max_gap,
                      stream);
   } else if (!staging.host_copies.empty()) {
-    // All-host split (insert-delta transient bytes / CONSTANT-only): no file
-    // io, no host staging blocks, no SiriusContext dependency.
+    // All-host split: no file io, no staging blocks, no SiriusContext needed.
     submit_host_only_and_await(device_buf, staging, stream);
   }
 

@@ -14,15 +14,10 @@
  * limitations under the License.
  */
 
-// MVCC insert end-to-end: a duckdb-pinned table keeps serving GPU queries
-// while INSERTs land — the prepare-time insert delta stages rows beyond the
-// pinned prefix (transient small appends AND bulk MergeStorage row groups)
-// and masks them to each query's snapshot, so every result equals DuckDB CPU
-// at that snapshot. States the delta cannot represent — transaction-local
-// appends, ARRAY projections, big-string deltas, rowid-only scans — decline
-// at plan time into a clean transparent CPU fallback with correct results.
-// The basic served/declined flips live beside the delete matrix in
-// test_pin_table_mvcc_delete.cpp; this file covers the wider insert matrix.
+// End-to-end MVCC INSERT tests for duckdb-pinned tables: post-pin rows serve
+// through the insert delta with snapshot-correct results, and shapes the delta
+// cannot represent decline into the transparent CPU fallback. The basic
+// served/declined flips live in test_pin_table_mvcc_delete.cpp.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -37,9 +32,8 @@ using PinMvccInsertFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
 
-/// Run @p query under gpu_execution=true expecting the plan-time guard to
-/// decline (transparent CPU fallback: {0 rebinds, 1 fallback, 0 executions})
-/// and the results to match a plain CPU run.
+/// Runs @p query expecting a plan-time decline into the transparent CPU
+/// fallback, then checks the results against a plain CPU run.
 void expect_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx, const std::string& query)
 {
   fx.con->Query("SET gpu_execution = true;");
@@ -64,8 +58,7 @@ void expect_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx, const st
   REQUIRE(gpu_rows == cpu_rows);
 }
 
-/// A second connection to the same database instance (concurrent-writer /
-/// older-snapshot roles).
+/// Opens a second connection to the same database (concurrent writer / older snapshot).
 std::unique_ptr<duckdb::Connection> second_connection(sirius::test::GpuExecutionFixture& fx)
 {
   if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
@@ -83,8 +76,7 @@ void run_ok_on(duckdb::Connection& con, const std::string& sql)
   REQUIRE_FALSE(result->HasError());
 }
 
-/// GPU-vs-CPU comparison on an arbitrary connection (no counter assertions —
-/// used where the interesting connection is not the fixture's own).
+/// Compares GPU vs CPU results on the given connection (no counter assertions).
 void compare_gpu_vs_cpu_on(duckdb::Connection& con, const std::string& query)
 {
   run_ok_on(con, "SET gpu_execution = true;");
@@ -173,10 +165,10 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
-  // >= one row group in a single commit: optimistically flushed by
-  // MergeStorage as compressed PERSISTENT row groups — the delta's file lane.
+  // A single commit of at least one full row group: MergeStorage flushes it as
+  // persistent row groups, the delta's file lane.
   run_ok("INSERT INTO t SELECT range::INTEGER + 50000 FROM range(130000);");
-  // Plus a small transient append on top: both lanes in one delta.
+  // Plus a small transient append: both lanes in one delta.
   run_ok("INSERT INTO t VALUES (180000);");
 
   compare_gpu_vs_cpu("SELECT count(*), max(k), sum(k) FROM t;");
@@ -297,8 +289,8 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
 
   run_ok("INSERT INTO t VALUES (1000000), (1000001);");
 
-  // The pushed filter prunes every cached chunk by zone map; only the delta
-  // rows match — they must still arrive.
+  // The pushed filter zone-map-prunes every cached chunk; only the delta rows
+  // match and must still arrive.
   compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t WHERE k >= 500000;");
   run_ok("CALL unpin_table('t');");
 }
@@ -311,10 +303,9 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
-  // The overflow-length string lives only in the delta; the table-level stat
-  // (merged on append) makes the plan-time varchar probe decline the scan.
-  // The projection must include the string column — without it the scan
-  // legitimately serves from cache + delta.
+  // The overflow string lives only in the delta, but the table-level stat
+  // (merged on append) makes the plan-time varchar probe decline. The query
+  // must project the string column; without it the scan legitimately serves.
   run_ok("INSERT INTO t VALUES (20000, repeat('x', 5000));");
   expect_fallback_matches_cpu(*this, "SELECT count(*), max(k), max(strlen(s)) FROM t;");
   run_ok("CALL unpin_table('t');");
@@ -329,8 +320,8 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
   run_ok("INSERT INTO t VALUES (30000);");
-  // Bare count(*) binds only rowid — never cached, so the column-mismatch
-  // guard declines it; the CPU fallback must still count the delta row.
+  // Bare count(*) binds only rowid, which is never cached, so the
+  // column-mismatch guard declines; the fallback must still count the delta row.
   expect_fallback_matches_cpu(*this, "SELECT count(*) FROM t;");
   run_ok("CALL unpin_table('t');");
 }
@@ -347,10 +338,10 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
 
   run_ok("INSERT INTO t VALUES (20000, CAST([9, 9, 9] AS INTEGER[3]));");
 
-  // Projecting the ARRAY column with rows beyond the prefix declines (v1
-  // scope) — correct rows via the fallback.
+  // Projecting the ARRAY column with delta rows present declines; the fallback
+  // must still return correct rows.
   expect_fallback_matches_cpu(*this, "SELECT k, a FROM t WHERE k >= 19998 ORDER BY k;");
-  // Projecting only the scalar column serves cache + delta as usual.
+  // Projecting only the scalar column serves from cache + delta as usual.
   compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
   run_ok("CALL unpin_table('t');");
 }

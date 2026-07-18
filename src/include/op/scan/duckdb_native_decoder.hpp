@@ -57,15 +57,13 @@ std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
 ///            varchar data (UNCOMPRESSED / DICTIONARY / FSST / DICT_FSST),
 ///            validity (UNCOMPRESSED / EMPTY / CONSTANT / ROARING),
 ///            rowid synthesis,
-///            host-backed segments (descriptor `host_ptr` set — insert-delta staging).
-/// @param datasource Read handle for the .db file. May be null only when no
-///        segment stages a file read (every descriptor host-backed); a split
-///        that stages reads with a null datasource throws.
+///            host-backed segments (`host_ptr` set; insert-delta staging).
+/// @param datasource Read handle for the .db file; may be null only when
+///        every segment is host-backed (no file reads to stage).
 /// @param carried_partition_stats Capture-time stats for CONSTANT segment
-///        decode. When null, the stats are fetched via
-///        DataTable::GetPartitionStats — which touches ClientContext and must
-///        not run off the query thread; splits built off-thread (insert delta)
-///        carry them instead.
+///        decode. When null they are fetched via DataTable::GetPartitionStats,
+///        which touches ClientContext and must not run off the query thread;
+///        off-thread decodes (insert delta) must carry them.
 /// @throws std::runtime_error on any codec the walker accepted but this decoder does not implement.
 std::unique_ptr<cudf::table> decode_duckdb_native_split(
   std::vector<duckdb_row_group_metadata> const& row_groups,

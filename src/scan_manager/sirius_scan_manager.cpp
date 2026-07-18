@@ -93,8 +93,8 @@ struct cached_databatch_provider : public databatch_provider {
   databatch_provider::batch get_next_batch() override
   {
     // The atomic cursor walks survivor positions, each mapping to a chunk
-    // index; positions past the survivors yield the insert-delta splits
-    // (each consumed exactly once — the cursor hands out unique positions).
+    // index; positions past the survivors yield the insert-delta splits.
+    // The cursor hands out unique positions, so each split is moved out once.
     auto const cursor = _index.fetch_add(1);
     if (cursor >= _plan.survivor_chunk_indices.size()) {
       auto const delta_idx = cursor - _plan.survivor_chunk_indices.size();
@@ -417,9 +417,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     run_mvcc_mask_jobs(
       _pending_mvcc_mask_jobs, *_dispatcher, _reservation_manager, *_topology_index);
   }
-  // Insert-delta jobs run in the same block-in-prepare window: staging and
-  // masks are finished plain buffers before serving starts. No-ops when no
-  // pinned table has rows beyond its prefix.
+  // Insert-delta jobs block in prepare for the same reason: staging and
+  // masks must be finished before serving starts. No-op when no pinned
+  // table has rows beyond its prefix.
   if (!_pending_insert_delta_jobs.empty()) {
     std::vector<int> const delta_gpu_ids(gpu_ids.begin(), gpu_ids.end());
     run_insert_delta_jobs(_pending_insert_delta_jobs,
@@ -1290,12 +1290,11 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
           _pending_mvcc_mask_jobs.push_back(std::move(request));
         }
 
-        // One insert-delta job per entry per query, same dedup: queued
-        // unconditionally for mvcc entries (the job no-ops when the table has
-        // no rows beyond the pinned prefix — this closes the plan→prepare
-        // insert race now that the plan-time insert guard is gone). Later
-        // operators union their columns in so the staging covers every
-        // requester; per-operator splits are cut at handoff.
+        // One insert-delta job per entry per query, deduped like the mask
+        // jobs. The job no-ops when no rows are beyond the pinned prefix, so
+        // queuing unconditionally is safe. Later operators union their
+        // columns in so the staging covers every requester; per-operator
+        // splits are cut at handoff.
         auto delta_request = std::ranges::find_if(
           _pending_insert_delta_jobs,
           [&](insert_delta_job_request const& r) { return r.entry_name == pinned_name; });

@@ -101,14 +101,14 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
 /**
  * @brief Fill the keep-mask bits for @p slices (all belonging to ONE chunk).
  *
- * Worker-safe with plain stores when concurrent callers never share a mask
- * word: the mask job slices parallel tasks only on word-aligned slice
- * offsets and fills chunks with unaligned offsets (checkpoint-grown tables)
- * through a single task. Writes exactly bits [chunk_offset, chunk_offset +
- * row_count) per slice, 1 = keep — bit-exact at word edges, preserving
- * neighbouring slices' bits (the words are zero-initialized at carve time);
- * a slice without version state bulk-sets ones with no MVCC calls or locks,
- * otherwise each 2048-row vector goes through RowGroup::GetSelVector.
+ * Worker-safe with plain stores as long as concurrent callers never share a
+ * mask word: the mask job slices parallel tasks only on word-aligned slice
+ * offsets and fills unaligned chunks through a single task. Writes exactly
+ * bits [chunk_offset, chunk_offset + row_count) per slice, 1 = keep;
+ * read-modify-write at word edges preserves neighbouring slices' bits (the
+ * words start zeroed). A slice without version state bulk-sets ones with no
+ * MVCC calls or locks; otherwise each 2048-row vector goes through
+ * RowGroup::GetSelVector.
  *
  * @return true when any row in the covered range was dropped.
  */
@@ -130,14 +130,13 @@ bool any_update_chains(duckdb::DataTable& storage,
                        std::size_t row_prefix);
 
 /**
- * @brief True when any row group carries TRANSIENT (in-memory, uncheckpointed)
- *        segments on any of @p storage_column_indices.
+ * True when any row group carries TRANSIENT (in-memory, uncheckpointed)
+ * segments on any of @p storage_column_indices.
  *
- * Committed small appends land as transient segments the pin's disk-image
- * walk cannot stage; pin_table refuses such tables deliberately (CHECKPOINT
- * folds them into the persistent image). Bulk-flushed appends (MergeStorage
- * after a >= row-group-sized insert) are PERSISTENT-uncheckpointed and
- * checkpoint-shaped — indistinguishable from checkpointed data, deliberately
+ * Small committed appends land as transient segments the pin's disk-image
+ * walk cannot stage, so pin_table refuses such tables; CHECKPOINT folds them
+ * into the persistent image. Bulk-flushed appends (MergeStorage after a
+ * row-group-sized insert) are persistent and checkpoint-shaped, so they are
  * not detected here. SERIAL — may lazily load column data.
  */
 bool any_uncheckpointed_appends(duckdb::DataTable& storage,

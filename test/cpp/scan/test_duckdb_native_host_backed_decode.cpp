@@ -14,13 +14,9 @@
  * limitations under the License.
  */
 
-// Gates for the decoder's host-backed segment lane (insert-delta staging):
-// a split whose descriptors carry `host_ptr` must decode from those bytes
-// alone — no file reads, no datasource, no SiriusContext — and produce
-// exactly what SQL returns for the same rows. The byte source is the real
-// checkpointed table, checkpointed with force_compression='uncompressed' so
-// the segment payloads are byte-identical to the in-memory transient shape
-// the insert-delta job stages.
+// Tests for the decoder's host-backed segment lane (insert-delta staging):
+// splits whose descriptors carry host_ptr must decode from those bytes alone,
+// with no file reads and no datasource, and match SQL for the same rows.
 
 #include "test_utils.hpp"
 
@@ -68,8 +64,7 @@ void exec_ok(duckdb::Connection& con, const std::string& q)
   }
 }
 
-/// File-backed database: the byte source is real checkpointed segments, and
-/// the decoder requires a SingleFileBlockManager.
+/// File-backed database; the decoder requires a SingleFileBlockManager.
 struct host_backed_test_db {
   std::string path;
   std::unique_ptr<duckdb::DuckDB> db;
@@ -128,10 +123,8 @@ std::vector<duckdb_row_group_metadata> walk_all(duckdb::DataTable& storage,
   return std::move(range.row_groups);
 }
 
-/// Pin every block-backed segment, copy its payload bytes into test-owned host
-/// buffers, and point the descriptor's `host_ptr` at the copy — the exact move
-/// the insert-delta staging task performs. `clear_block_ids` additionally
-/// erases the block reference (the true delta descriptor shape).
+/// Copies each block-backed segment's payload to a host buffer and points
+/// host_ptr at it; clear_block_ids additionally erases the block reference.
 void host_back_segments(duckdb::ClientContext& ctx,
                         duckdb::DataTable& storage,
                         std::vector<duckdb_row_group_metadata>& row_groups,
@@ -149,7 +142,7 @@ void host_back_segments(duckdb::ClientContext& ctx,
     std::memcpy(owned->data(), pin.Ptr() + desc.block_offset, desc.bytes_size);
     desc.host_ptr = owned->data();
     if (clear_block_ids) {
-      desc.block_id     = INVALID_BLOCK;  // macro from duckdb/storage/storage_info.hpp
+      desc.block_id     = INVALID_BLOCK;
       desc.block_offset = 0;
     }
     keepalive.push_back(std::move(owned));
@@ -262,6 +255,8 @@ void require_matches_expected(cudf::table const& t,
 /// column, empty strings, and NULLs every 5th row in `opt`.
 void build_table(duckdb::Connection& con)
 {
+  // Uncompressed checkpoint keeps segment payloads byte-identical to the
+  // transient shape the insert-delta job stages.
   exec_ok(con, "SET force_compression='uncompressed'");
   exec_ok(con, "CREATE TABLE t(id INTEGER, value BIGINT, price DOUBLE, name VARCHAR, opt INTEGER)");
   exec_ok(con,
@@ -324,7 +319,7 @@ TEST_CASE("host-backed decode matches SQL with zero file reads",
 
   SECTION("host_ptr takes precedence over a still-valid block_id")
   {
-    // With a null datasource, any fall-through to the file lane would throw —
+    // With a null datasource any fall-through to the file lane would throw, so
     // decoding successfully proves host_ptr wins.
     host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/false);
     auto table =
@@ -358,7 +353,7 @@ TEST_CASE("file reads staged without a datasource throw loudly",
 
   auto cols  = all_cols();
   auto types = all_types();
-  auto md    = walk_all(storage, *env.con->context, cols, types);  // block-backed, NOT host-backed
+  auto md    = walk_all(storage, *env.con->context, cols, types);  // block-backed, not host-backed
 
   duckdb_native_ingestible_table_info info;
   info.storage         = &storage;

@@ -184,19 +184,19 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             table.name);
         }
         // (b) transaction-local appends: rows in this transaction's
-        // LocalStorage live outside the table's segment trees, so neither
-        // the cache nor the insert delta can serve them. Committed rows
-        // beyond the pinned prefix ARE served: the prepare-time insert-delta
-        // job stages them, masked to this snapshot's visibility.
+        // LocalStorage live outside the table's segment trees, so neither the
+        // cache nor the insert delta can serve them. Committed rows beyond
+        // the pinned prefix are served by the prepare-time insert-delta job,
+        // masked to this snapshot's visibility.
         if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
             "transaction-local inserts are not served from the cache",
             table.name);
         }
-        // (b') v1 scope: the insert delta does not serve ARRAY columns —
-        // decline while rows beyond the pinned prefix exist (the capture's
-        // own ARRAY check backstops the plan→prepare insert race, loudly).
+        // (b') the insert delta does not serve ARRAY columns, so decline
+        // while rows beyond the pinned prefix exist. Rows inserted after
+        // this check are caught by the capture's own ARRAY check.
         if (static_cast<std::size_t>(storage.GetTotalRows()) > n_cache) {
           for (auto const& col_idx : column_ids) {
             if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() ||
