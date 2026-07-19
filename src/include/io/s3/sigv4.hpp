@@ -105,6 +105,16 @@ sigv4_signed_request sign_request(
  *                      Passed explicitly so tests are deterministic.
  * @param ttl           Validity window. Becomes the @c X-Amz-Expires query
  *                      parameter (in seconds).
+ * @param extra_canonical_query  Additional request query parameters, already
+ *                      RFC3986-encoded, `&`-joined, and in SigV4 canonical
+ *                      (byte-sorted) order (e.g.
+ *                      @c "list-type=2&max-keys=1000&prefix=p%2F" for a
+ *                      ListObjectsV2 request). Empty for plain object GET/HEAD.
+ *                      These are merged with the @c X-Amz-* parameters and the
+ *                      whole set is re-sorted before signing, so they
+ *                      participate in the signature (required for S3 to accept
+ *                      a presigned LIST). Each element is taken verbatim — pass
+ *                      it pre-encoded, not raw.
  *
  * @throw std::invalid_argument on empty credentials / region / service /
  *                              method / scheme / host, or non-positive @p ttl.
@@ -115,7 +125,8 @@ std::string presign_url(std::string_view method,
                         std::string_view canonical_uri,
                         sigv4_signer_config const& creds,
                         std::time_t timestamp_utc,
-                        std::chrono::seconds ttl);
+                        std::chrono::seconds ttl,
+                        std::string_view extra_canonical_query = {});
 
 /// Hex-encoded SHA256 digest of @p data. Thin wrapper around OpenSSL SHA256.
 std::string sha256_hex(std::string_view data);

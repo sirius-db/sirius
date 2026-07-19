@@ -151,6 +151,12 @@ struct rest_perf_snapshot {
   // over every completed curl attempt incl. retries / partial / failed bodies.
   // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
   std::uint64_t payload_bytes_read_total{0};
+  // perf_instrumentation-gated. Blocking host GETs remain part of chunk_get_*
+  // and are also attributed to blocking_host_get_*. Stash hits issue no GET and
+  // increment neither.
+  std::uint64_t blocking_host_get_count{0};
+  std::uint64_t blocking_host_get_wall_ns_total{0};
+  std::uint64_t blocking_host_get_wall_ns_max{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -225,7 +231,8 @@ class rest_reactor {
 
   static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
                                                const io_object_type& file,
-                                               const io_object_segment& segment);
+                                               const io_object_segment& segment,
+                                               bool perf_blocking_host_get = false);
 
   static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
                                                 const io_object_type& file,
@@ -275,6 +282,17 @@ class rest_reactor {
   /// body, missing / unsatisfied Content-Range) @c bytes is null so the caller
   /// falls back to a HEAD.  @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
+
+  /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML
+  /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
+  /// request query (no auth params — authorization is added via
+  /// @c authorize_list).  @p prefix is only for retry-log / error text.
+  /// Control-plane op: retries/terminals are counted (and retries WARN-logged)
+  /// like every retry loop here, but the XML body never touches the
+  /// chunk-GET / payload byte counters.
+  std::string list_page(std::string_view bucket,
+                        std::string_view prefix,
+                        std::string_view canonical_query);
 
   /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
   /// loads); safe to call while the reactor is running.
@@ -347,6 +365,9 @@ class rest_reactor {
     std::atomic<std::uint64_t> terminal_failures_total{0};
     std::atomic<std::uint64_t> device_stream_sync_total{0};
     std::atomic<std::uint64_t> payload_bytes_read_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_count{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
   };
   perf_counters _perf;
 

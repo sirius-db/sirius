@@ -76,6 +76,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -96,7 +97,7 @@ extern "C" int cudaProfilerStop();
 // Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
 // transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
 // macro that collides with the BLOCK_SIZE static member in
-// <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
+// <blockingconcurrentqueue.h> (used by pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
 #include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
@@ -116,22 +117,6 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
-
-// Read the per-session `enable_duckdb_fallback` setting (default true).  Mirrors
-// how `gpu_execution` is read via ClientContext::TryGetCurrentSetting, so a
-// `SET enable_duckdb_fallback = false` stays scoped to the connection that
-// issued it instead of leaking through a process-global to every other
-// connection (and, across a test binary, to every later test case).  The
-// AddExtensionOption registration already stores the value per-context; only the
-// read had been going through the global static.
-bool duckdb_fallback_enabled(ClientContext& context)
-{
-  Value setting;
-  if (context.TryGetCurrentSetting("enable_duckdb_fallback", setting) && !setting.IsNull()) {
-    return setting.GetValue<bool>();
-  }
-  return true;
-}
 
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
@@ -260,9 +245,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-    // STATISTICS_PROPAGATION is now enabled: cpu_source_task handles the
-    // COLUMN_DATA_SCAN / EXPRESSION_GET / DUMMY_SCAN sources that this
-    // optimizer produces (e.g. folding count(*), MIN, MAX to constants).
+    // STATISTICS_PROPAGATION is now enabled: the GPU_VALUES source operator
+    // handles the COLUMN_DATA_SCAN / EXPRESSION_GET / DUMMY_SCAN sources that
+    // this optimizer produces (e.g. folding count(*), MIN, MAX to constants).
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -643,9 +628,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   if (!data.res) {
     auto start = std::chrono::high_resolution_clock::now();
     if (data.plan_error) {
-      printf(
-        "=============================================\nError in SiriusExecuteQuery, fallback to "
-        "DuckDB\n=============================================\n");
+      print_cpu_fallback_banner();
       data.res = run_internal_cpu_fallback_query(
         context, *data.conn, data.cpu_fallback_query, data.plan_error_message);
     } else {
@@ -654,9 +637,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       if (data.res->HasError()) {
         if (duckdb_fallback_enabled(context)) {
           SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
-          printf(
-            "=============================================\nError in SiriusExecuteQuery, fallback "
-            "to DuckDB\n=============================================\n");
+          print_cpu_fallback_banner();
           data.res = run_internal_cpu_fallback_query(
             context, *data.conn, data.cpu_fallback_query, data.res->GetError());
         } else {
@@ -869,7 +850,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   sirius::scan_manager::sirius_scan_manager& scan_mgr,
   std::vector<std::string> const& file_paths,
   std::optional<std::vector<std::string>> const& cols,
-  std::size_t batch_size)
+  std::size_t batch_size,
+  vector<LogicalType>& pinned_column_types)
 {
   using sirius::op::scan::parquet_ingestible_table_info;
   auto desc = scan_mgr.describe_parquet(file_paths.front());
@@ -883,6 +865,11 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   info->names               = desc.names;                                  // full schema
   for (auto idx : keep) {
     info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(idx)));
+    // Pin-time DuckDB type of each pinned column, in column_ids (batch-column)
+    // order. Taken from the native DuckDB schema rather than round-tripped
+    // through sirius::logical_type: the zone-map capture keys its type
+    // allowlist on exact LogicalType identity (e.g. timestamp units).
+    pinned_column_types.push_back(desc.return_types[idx]);
   }
   if (is_subset) {
     // Non-empty projection_ids forces scan_plan::is_projected() so the cudf reader
@@ -925,7 +912,8 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   std::string const& table_ref,
   std::string const& schema_override,
   std::optional<std::vector<std::string>> const& cols,
-  std::size_t batch_size)
+  std::size_t batch_size,
+  vector<LogicalType>& pinned_column_types)
 {
   using sirius::op::scan::duckdb_native_ingestible_table_info;
 
@@ -952,6 +940,21 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   auto keep            = resolve_pin_kept_indices(schema_names, cols);
   auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
 
+  // Update chains version values in place, invisibly to the DELETE
+  // keep-masks — a pin would serve stale values to every query until the
+  // chains are folded away. Refuse loudly (the transient-rows case already
+  // fails the same way); CHECKPOINT folds the chains into the base data.
+  {
+    std::vector<duckdb::storage_t> pinned_storage_cols(keep.begin(), keep.end());
+    if (sirius::op::scan::any_update_chains(
+          storage, pinned_storage_cols, static_cast<std::size_t>(storage.GetTotalRows()))) {
+      throw InvalidInputException(
+        "pin_table: table '%s' has in-memory update chains on a pinned column; run CHECKPOINT "
+        "before pinning",
+        table_ref);
+    }
+  }
+
   auto info     = std::make_unique<duckdb_native_ingestible_table_info>();
   info->storage = &storage;
   info->context = &context;
@@ -968,6 +971,8 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   info->returned_types = sirius::from_duckdb_vec(schema_types);
   for (auto col : keep) {
     info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(col)));
+    // Exact pin-time DuckDB type per pinned column (see build_parquet_pin_info).
+    pinned_column_types.push_back(schema_types[col]);
     sirius::op::scan::projected_column pc;
     pc.is_rowid    = false;
     pc.storage_idx = duckdb::StorageIndex(static_cast<duckdb::idx_t>(col));
@@ -1142,13 +1147,16 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // duckdb-native has no standalone reader, so both formats go through their
   // gpu_ingestible — one read path.
   std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
+  // Pin-time DuckDB types of the pinned columns, in column_ids (batch-column)
+  // order — the zone-map capture keys its type allowlist on these exact types.
+  vector<LogicalType> pinned_column_types;
   // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
   // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
   transaction_t duckdb_pin_v_base = 0;
 
   if (data.args.format == "duckdb") {
-    auto info =
-      build_duckdb_pin_info(context, data.args.name, data.args.schema, data.args.cols, batch_size);
+    auto info = build_duckdb_pin_info(
+      context, data.args.name, data.args.schema, data.args.cols, batch_size, pinned_column_types);
     // After the catalog resolution (so a bad table name fails without side
     // effects) but before make_ingestible snapshots the on-disk row groups.
     suppress_auto_checkpoint_for_pin(context);
@@ -1170,8 +1178,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
-    auto info  = build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size);
+    auto info =
+      build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  }
+
+  if (!sirius_ctx->get_config().get_operator_params().enable_pinned_zone_map_pruning) {
+    pinned_column_types.clear();
   }
 
   // Build the cache descriptor (table identity + column layout) from the
@@ -1186,7 +1199,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // whole table never needs to fit in GPU memory. On multi-GPU the chunks land round-robin
     // across NUMA nodes; the cached-serve path then reads each chunk back on a NUMA-local GPU.
     auto mat = sirius::materialize_pin_to_host(
-      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx());
+      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx(), pinned_column_types);
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
@@ -1194,7 +1207,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     scan_mgr.insert_pinned_entry_host(data.args.name,
                                       std::move(cache_info),
                                       std::move(mat.host_chunks),
-                                      *representative_host_space);
+                                      *representative_host_space,
+                                      std::move(pinned_column_types),
+                                      std::move(mat.chunk_stats));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1204,12 +1219,15 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   } else {
     // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
     // placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
+    auto mat = sirius::materialize_all_batches(
+      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pinned_column_types);
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),
                                  std::move(mat.tables),
-                                 std::move(mat.chunk_memory_spaces));
+                                 std::move(mat.chunk_memory_spaces),
+                                 std::move(pinned_column_types),
+                                 std::move(mat.chunk_stats));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1548,15 +1566,6 @@ static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, 
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
-static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  params->default_scan_task_varchar_size = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_VARCHAR_SIZE to {}",
-                   params->default_scan_task_varchar_size);
-}
-
 static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1606,24 +1615,44 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
 }
 
+static void SetLogBackend(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto backend = StringValue::Get(parameter);
+  if (backend != "duckdb" && backend != "spdlog" && backend != "noop") {
+    throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
+                                backend);
+  }
+  Config::LOG_BACKEND = std::move(backend);
+  install_configured_log_sink(context.db.get());
+  SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
+}
+
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
-  SetGlobalLogLevel(Config::LOG_LEVEL);
+  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
+  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
+  sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
+  if (!parsed_level) {
+    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  // log_dir only affects the spdlog backend; rebuild it when that one is active.
+  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
-  SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
+  // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
+  // the spdlog backend uses it).
+  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
@@ -1700,6 +1729,15 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
   params->dynamic_filter_keep_threshold = threshold;
   SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_KEEP_THRESHOLD to {}",
                    params->dynamic_filter_keep_threshold);
+}
+
+static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_pinned_zone_map_pruning = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_PINNED_ZONE_MAP_PRUNING to {}",
+                   params->enable_pinned_zone_map_pruning);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
@@ -1789,6 +1827,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
+  // TEST ONLY: when non-empty, transparent GPU execution fails at runtime with that
+  // message after plan generation succeeds, to exercise the CPU fallback path. No
+  // setter — the value is read via TryGetCurrentSetting in PhysicalSiriusExecution.
+  config.AddExtensionOption(
+    "sirius_test_inject_transparent_gpu_error",
+    "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
+    LogicalType::VARCHAR,
+    Value(""));
+
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(
     "enable_regex_jit_impl",
@@ -1811,13 +1858,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.scan_task_batch_size),
                             SetDefaultScanTaskBatchSize);
-  // Default varchar size for estimating rows per batch
-  config.AddExtensionOption(
-    "default_scan_task_varchar_size",
-    "The default varchar size for estimating rows per batch in a duckdb scan task",
-    LogicalType::UBIGINT,
-    Value::UBIGINT(sirius::operator_params{}.default_scan_task_varchar_size),
-    SetDefaultScanTaskVarcharSize);
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
@@ -1834,6 +1874,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
+  config.AddExtensionOption("sirius_log_backend",
+                            "Logging backend for Sirius (duckdb, spdlog, noop)",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_BACKEND),
+                            SetLogBackend);
   config.AddExtensionOption("sirius_log_level",
                             "Log level for Sirius (trace, debug, info, warn, error, critical, off)",
                             LogicalType::VARCHAR,
@@ -1894,17 +1939,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",
     "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
-    "runtime membership filter (IN-list / Bloom, chosen by L2-cache fit) into the probe-side scan "
-    "to drop non-matching rows before the join (on by default)",
+    "runtime membership filter (raw IN-list for 1-12 supported build rows; otherwise a hash "
+    "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
+    "non-matching rows before the join (on by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
     SetEnableDynamicFilterPushdown);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",
-    "Additionally emit a runtime zone-map (build-key min/max) for read-time row-group pruning at "
-    "the "
-    "probe scan; requires enable_dynamic_filter_pushdown (off by default)",
+    "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
+    "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
+    "requires enable_dynamic_filter_pushdown (off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);
@@ -1925,6 +1971,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::DOUBLE,
     Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
+
+  config.AddExtensionOption(
+    "enable_pinned_zone_map_pruning",
+    "Skip pinned-table chunks whose pin-time min/max statistics prove the scan's pushed-down "
+    "filter matches no rows; also gates the statistics capture during CALL pin_table, so a table "
+    "pinned while off carries no zone maps until re-pinned with the flag on",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
+    SetEnablePinnedZoneMapPruning);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -1936,6 +1991,12 @@ static void LoadInternal(ExtensionLoader& loader)
   auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
   auto* callback_ptr = callback.get();
   config.GetCallbackManager().Register(std::move(callback));
+
+  // The ctor already installed the db-independent backend; reinstall now that the
+  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
+  // unknown backend name is reported here rather than swallowed by the ctor.
+  install_configured_log_sink(&db);
+
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);

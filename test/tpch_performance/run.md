@@ -209,7 +209,6 @@ sirius:
       num_threads: 6
   operator_params:
     scan_task_batch_size: 5368709120       # 5 GB
-    default_scan_task_varchar_size: 256
     max_sort_partition_bytes: 0            # 0 = auto (33% GPU memory)
     hash_partition_bytes: 5368709120       # 5 GB
     concat_batch_bytes: 5368709120         # 5 GB

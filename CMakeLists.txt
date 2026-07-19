@@ -202,6 +202,7 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 
 # ROCm: roctx (nvtx3-equivalent profiling-range API). The library is libroctx64,
 # shipped in the roctracer / rocprofiler-developer-tools package. Resolved with
@@ -385,12 +386,9 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
-    src/helper/list_offset_fixup.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
-    src/data/host_parquet_representation.cpp
-    src/data/host_parquet_representation_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
     src/expression/ast/node.cpp
@@ -429,11 +427,17 @@ set(EXTENSION_SOURCES
     src/io/rest/curl_handle.cpp
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
+    src/io/s3/s3_list_parser.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_httpfs.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
+    src/log/duckdb_sink.cpp
+    src/log/level.cpp
+    src/log/logging.cpp
+    src/log/noop_sink.cpp
+    src/log/spdlog_owning_sink.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -443,11 +447,12 @@ set(EXTENSION_SOURCES
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
+    src/op/scan/duckdb_mvcc_visibility.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
-    src/op/scan/hive_partition.cpp
     src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
+    src/op/scan/host_keep_mask.cpp
     src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
@@ -461,14 +466,14 @@ set(EXTENSION_SOURCES
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
-    src/op/sirius_physical_cpu_source.cpp
+    src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
-    src/op/sirius_physical_duckdb_scan.cpp
     src/op/sirius_physical_dummy_scan.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
+    src/op/sirius_physical_gpu_values.cpp
     src/op/sirius_physical_grouped_aggregate.cpp
     src/op/sirius_physical_grouped_aggregate_merge.cpp
     src/op/sirius_physical_hash_join.cpp
@@ -478,7 +483,6 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_operator.cpp
     src/op/sirius_physical_operator_type.cpp
     src/op/sirius_physical_order.cpp
-    src/op/sirius_physical_parquet_scan.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
     src/op/sirius_physical_projection.cpp
@@ -499,6 +503,7 @@ set(EXTENSION_SOURCES
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
+    src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
@@ -520,6 +525,8 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
+    src/scan_manager/mvcc_mask_job.cpp
+    src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
@@ -545,13 +552,16 @@ set(EXTENSION_SOURCES
 
 # Deleting src/legacy/ cleanly removes legacy build support.
 #
-# The 9 scan-decode kernels are cudf/rmm/cub-only and portable across backends.
-# The 3 dynamic-filter kernels depend on cuco (bloom_filter / static_set) and
-# cuCascade (memory_space + replica transfer); they are only compiled when their
-# SIRIUS_ENABLE_* gates are ON. On ROCm both gates default OFF, so these TUs are
-# dropped and the dynamic-filter feature is unavailable (queries degrade to the
-# CPU fallback). See PORTING.md.
+# The scan-decode kernels plus crc32_partition_hash are cudf/rmm/cub-only and
+# portable across backends. The 4 dynamic-filter kernels depend on cuCascade
+# (memory_space + replica transfer) and, for the set-backed variants, cuco
+# (bloom_filter / static_set); they are only compiled when their SIRIUS_ENABLE_*
+# gates are ON. On ROCm both gates default OFF, so these TUs are dropped and the
+# dynamic-filter feature is unavailable (queries degrade to the CPU fallback).
+# See PORTING.md.
 set(CUDA_SOURCES
+    # Portable (cudf/rmm/cub only) — compiled on every backend.
+    src/op/partition/crc32_partition_hash.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -561,9 +571,13 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/dictionary.cu
     src/cuda/scan/strings/fsst.cu
     src/cuda/scan/strings/uncompressed.cu)
+# cuCascade-dependent, cuco-independent: the replica transfer and the small
+# in-list filter (uses a raw device_buffer, not a cuco set — see its source).
 if(SIRIUS_ENABLE_CUCASCADE)
-  list(APPEND CUDA_SOURCES src/cuda/dynamic_filter_replica_transfer.cu)
+  list(APPEND CUDA_SOURCES src/cuda/dynamic_filter_replica_transfer.cu
+         src/cuda/sirius_dynamic_small_in_list_filter.cu)
 endif()
+# cuco-backed set filters: bloom_filter and the (cuco::static_set) in-list.
 if(SIRIUS_ENABLE_CUCO AND SIRIUS_ENABLE_CUCASCADE)
   list(APPEND CUDA_SOURCES src/cuda/sirius_dynamic_bloom_filter.cu
          src/cuda/sirius_dynamic_in_list_filter.cu)
@@ -834,6 +848,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_semi_future.cpp
@@ -854,6 +869,7 @@ set(TEST_SOURCES
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
+    test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -861,8 +877,11 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
+    test/cpp/integration/test_pin_table_mvcc_delete.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
+    test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
+    test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
@@ -871,10 +890,13 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/log/test_duckdb_sink.cpp
+    test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
-    test/cpp/scan_manager/test_pin_table_duckdb_native_cache.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
+    test/cpp/scan_manager/test_mvcc_mask_job.cpp
+    test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -886,6 +908,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
+    test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
@@ -898,14 +921,17 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_physical_streaming_source.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
+    test/cpp/operator/test_dynamic_filter_publisher.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
+    test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
@@ -919,6 +945,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
+    test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
@@ -926,13 +953,16 @@ set(TEST_SOURCES
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
+    test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
+    test/cpp/scan/test_duckdb_native_dynamic_filter_remap.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
     test/cpp/scan/test_gpu_decode_strings.cpp
+    test/cpp/scan/test_host_keep_mask.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
@@ -961,7 +991,8 @@ if(SIRIUS_BUILD_S3_TESTS)
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
-    test/cpp/integration/test_s3_sql_surface.cpp)
+    test/cpp/integration/test_s3_sql_surface.cpp
+    test/cpp/integration/test_s3_tpch.cpp)
 endif()
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
@@ -1008,7 +1039,7 @@ if(ENABLE_ROCM)
     ${SIRIUS_ROCM_COMPAT_DIR} ${SIRIUS_ROCM_CUCASCADE_DIR})
 endif()
 
-target_link_libraries(sirius_unittest sirius_extension duckdb_static)
+target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
 link_extension_libraries(sirius_unittest "")
 
 # ROCm: the nvtx3 shim (on the include path above) #includes <roctracer/roctx.h>,

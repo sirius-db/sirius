@@ -137,6 +137,14 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) = 0;
 
+  /**
+   * @brief Whether this ingestible holds a row-filter expression that
+   *        @ref post_filter_and_project applies to splits not already
+   *        row-filtered. Drives the working-set estimate of resident
+   *        (pinned-cache) splits, which always reach post-filter unfiltered.
+   */
+  [[nodiscard]] virtual bool has_row_filter() const noexcept { return false; }
+
   [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
 
   /// Column primary (storage) indices in the exact order @ref materialize_table emits

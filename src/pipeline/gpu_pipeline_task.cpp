@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -211,7 +212,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
   auto peak_bytes        = allocator ? allocator->get_peak_allocated_bytes(stream) : 0;
-  std::string extra_info = fmt::format(
+  std::string extra_info = std::format(
     "execution time: {:.2f} ms, "
     "peak allocated: {} bytes ({:.2f} MB)",
     duration.count() / 1000.0,
@@ -224,6 +225,37 @@ std::unique_ptr<op::operator_data> run_one_operator(
 }
 
 }  // namespace
+
+std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input(
+  const cucascade::memory::memory_space* target_space) const
+{
+  if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
+      scan_input && scan_input->is_resident()) {
+    // Cached scan inputs can still reside in HOST and require an upload before execution.
+    auto batch = scan_input->get_cached_batch();
+    if (!batch) { return 0; }
+
+    auto ro          = batch->to_read_only();
+    auto const* data = ro.get_data();
+    if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
+    return data->get_uncompressed_data_size_in_bytes();
+  }
+
+  std::size_t input_size   = 0;
+  auto* pipelineable_input = dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
+  if (pipelineable_input) {
+    for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
+      if (!ro.get_data()) { continue; }
+      const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
+      const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
+                               ro.get_memory_space()->get_id() != target_space->get_id();
+      if (non_gpu || cross_space) {
+        input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
+      }
+    }
+  }
+  return input_size;
+}
 
 gpu_pipeline_task::gpu_pipeline_task(
   uint64_t task_id,
@@ -307,7 +339,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
     auto& op = operators[i].get();
     try {
       this->telemetry_handle().computing({
-        .instance_name       = fmt::format("{}({})", op.get_name(), op.get_operator_id()),
+        .instance_name       = std::format("{}({})", op.get_name(), op.get_operator_id()),
         .current_operator_id = static_cast<uint32_t>(
           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
         .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),
@@ -447,7 +479,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   }
   telemetry_handle().preparing({
     .instance_name               = "",
+    .origin_tier                 = local_state._input_data->get_origin_tiers(),
     .target_tier                 = "GPU",
+    .input_bytes                 = local_state._input_data->get_estimated_size_in_bytes(),
     .executor_thread_resource_id = executor_thread_resource_id,
   });
   try {
@@ -565,7 +599,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
   const bool input_resident = ls._input_data && ls._input_data->is_resident();
   auto working_set_bytes    = input_basis;
-  if (input_type == op::operator_data_type::GPU_SCAN && !input_resident && ls._input_data) {
+  // Resident (cached) scan inputs report mask/filter copy peaks through their
+  // working-set estimate too — it seeds the cold-start guess below via
+  // input_stats, so do not gate this on residency.
+  if (input_type == op::operator_data_type::GPU_SCAN && ls._input_data) {
     working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
@@ -576,6 +613,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
 
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
+    // Non-resident scans keep the per-split decode floor even with history;
+    // resident (cached) scans trust the learned peak — their mask/filter
+    // model only seeds the cold start, and a warm undershoot is repaired by
+    // record_on_failure + retry.
     if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }

@@ -21,8 +21,6 @@
 #include "telemetry-bridge/gen/channel.rs.h"
 #include "telemetry-bridge/gen/memory.rs.h"
 
-#include <spdlog/fmt/fmt.h>
-
 #include <functional>
 #include <unordered_map>
 

@@ -16,14 +16,18 @@
 
 #pragma once
 
+#include "duckdb/planner/table_filter.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
+#include "io/s3/s3_list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
+#include "scan_manager/mvcc_mask_job.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -36,14 +40,18 @@
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
+#include <duckdb/storage/statistics/base_statistics.hpp>
 #include <io/types.hpp>
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -78,6 +86,10 @@ namespace sirius::planner {
 class query;
 }  // namespace sirius::planner
 
+namespace sirius::telemetry {
+struct batch_telemetry_info;
+}  // namespace sirius::telemetry
+
 namespace sirius::scan_manager {
 
 /// Lightweight descriptor of a pinned table's cache identity + column layout,
@@ -85,7 +97,7 @@ namespace sirius::scan_manager {
 /// Captures only what serving needs — the table's identity (parquet file set OR
 /// duckdb catalog/schema/table name), the cached columns (by primary/storage
 /// index), and their names (aligned with @c column_ids) for the GPU gather — and
-/// owns the match logic that @ref sirius_scan_manager::try_assign_cached_entries consults.
+/// owns the match logic that @ref sirius_scan_manager::try_match_cached_entry consults.
 class cache_entry_info {
  public:
   std::vector<std::string> resolved_file_paths;    ///< parquet identity (file set)
@@ -107,6 +119,21 @@ class cache_entry_info {
   /// serve @p other (different format, identity, or a missing column).
   [[nodiscard]] std::vector<std::size_t> can_serve_with_columns(
     const op::scan::ingestible_table_info& other) const;
+
+  /// Duckdb-identity check shared by can_serve_with_columns and the plan-time
+  /// MVCC guards — one matcher, so the probe and prepare can never drift.
+  /// False for parquet entries (empty table_name).
+  [[nodiscard]] bool matches_duckdb_table(std::string_view catalog,
+                                          std::string_view schema,
+                                          std::string_view table) const;
+
+  /// Column-superset gather over @p requested_ids (requested order): for each
+  /// requested column, its position within the cached @c column_ids. Empty
+  /// when the cache cannot serve — a requested rowid/virtual/empty/
+  /// field-identifier column (never cached), or a primary index absent from
+  /// the cached set.
+  [[nodiscard]] std::vector<std::size_t> column_projection_for(
+    duckdb::vector<duckdb::ColumnIndex> const& requested_ids) const;
 
   /// Column names in @c column_ids order — the keys @c data_batches_by_column uses.
   [[nodiscard]] const std::vector<std::string>& column_names() const { return names; }
@@ -149,6 +176,11 @@ struct pinned_entry {
   /// to decide whether a re-insert merges into the existing entry (same row
   /// count → add unique columns) or replaces it (different row count).
   std::size_t num_rows{0};
+  /// Zone-map sidecar: pin-time DuckDB types + per-chunk min/max statistics,
+  /// positional with cache_info.column_ids. Absent (never prunes) when the
+  /// capture was statless or degraded; see @ref pinned_zone_maps for the
+  /// invariant and merge semantics.
+  pinned_zone_maps zone_maps;
   /// MVCC snapshot metadata for duckdb-native pins, attached by
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
@@ -166,10 +198,44 @@ struct pinned_entry {
 /// Serve-time defense against malformed entries: the cached serving loop reads
 /// a nullptr batch as end-of-stream, so a column with fewer chunks (or a null
 /// chunk) would silently end the scan early — fewer rows than requested, no
-/// error. @ref sirius_scan_manager::try_assign_cached_entries calls this before
-/// attaching the provider and converts a throw into a disk-read fallback.
+/// error. @ref sirius_scan_manager::try_match_cached_entry calls this before
+/// recording the assignment and converts a throw into a disk-read fallback.
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
+
+/**
+ * @brief Cache-serve-time survivor plan for one cached scan.
+ */
+struct cached_scan_plan {
+  std::vector<std::size_t> survivor_chunk_indices;  ///< indices of chunks that survived pruning
+  std::size_t pruned{0};
+};
+
+/// Build the cached-serving databatch_provider for @p entry over
+/// @p selected_columns (positions into @c entry.cache_info.column_ids, in the
+/// scan's materialized order). @p plan lists the zone-map survivor chunks the
+/// provider serves (the identity plan when nothing was pruned). @p mvcc_masks
+/// is the provider's own copy of the per-chunk MVCC keep-mask set, paired with
+/// each chunk it yields (slot i masks chunk i; a default slot — or an empty
+/// set, the parquet-pin case — serves the chunk unmasked). Declared here so
+/// the chunk↔mask pairing is unit-testable; the provider type itself stays
+/// internal to the scan manager.
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  cached_scan_plan plan,
+  const telemetry::batch_telemetry_info& telemetry_info,
+  mvcc_chunk_mask_set mvcc_masks = {});
+
+/**
+ * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
+ * @p table_filters applied. A chunk is pruned when any usable filter proves it empty against the
+ * pinned entry's zone-map statistics.
+ */
+[[nodiscard]] cached_scan_plan build_cached_scan_plan(
+  pinned_entry const& entry,
+  duckdb::TableFilterSet const* table_filters,
+  duckdb::vector<duckdb::ColumnIndex> const* requested_column_ids);
 
 /**
  * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
@@ -230,8 +296,13 @@ class sirius_scan_manager {
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
   ///
-  /// @param query        The query whose scan operators must be prepared.
-  void prepare_for_query(const sirius::planner::query& query);
+  /// @param query                           The query whose scan operators must be prepared.
+  /// @param enable_pinned_zone_map_pruning  Per-query snapshot of the serve-side pruning flag (the
+  ///                                        manager's _config is a construction-time copy, so SET
+  ///                                        changes must be forwarded per query by the caller).
+  ///                                        Consulted by try_assign_cached_entries when building
+  ///                                        the survivor plan.
+  void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -262,6 +333,10 @@ class sirius_scan_manager {
   ///   - If row counts differ, the existing entry is dropped and replaced. (An
   ///     n_rows-capped "partial" pin therefore never merges with a full pin of the
   ///     same table, since their row counts differ.)
+  ///   - Zone-map types/statistics mirror the data decisions: kept when a merge
+  ///     drops duplicate columns, appended for new columns that received chunks,
+  ///     and degraded to statless when the union column set cannot stay
+  ///     positionally aligned (data serving is unaffected).
   ///
   /// \param name                  Table name key.
   /// \param cache_info            Cache identity (parquet file set or duckdb
@@ -274,10 +349,17 @@ class sirius_scan_manager {
   /// \param chunk_memory_spaces   Per-chunk memory space placement; size MUST equal
   ///                              data_tables.size() (the value at index i is shared by
   ///                              all columns at chunk i).
-  void insert_pinned_entry(const std::string& name,
-                           cache_entry_info cache_info,
-                           std::vector<std::unique_ptr<cudf::table>> data_tables,
-                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
+  /// \param column_types          Pin-time DuckDB type of each cached column, positional
+  ///                              with @p cache_info's column_ids; empty pins statless.
+  /// \param chunk_stats           Per-chunk zone-map stats (chunk_stats[c][i] = column i
+  ///                              of chunk c, as compute_pinned_chunk_stats emits).
+  void insert_pinned_entry(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<std::unique_ptr<cudf::table>> data_tables,
+    std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
+    duckdb::vector<duckdb::LogicalType> column_types                                 = {},
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
 
   /// \brief Pin the host-tier entry for a table.
   ///
@@ -297,11 +379,17 @@ class sirius_scan_manager {
   /// \param memory_space  Representative host memory space the chunks reside in
   ///                      (metadata only; each chunk carries its own per-GPU
   ///                      NUMA-local memory_space).
+  /// \param column_types  Pin-time DuckDB type of each cached column, positional
+  ///                      with @p cache_info's column_ids; empty pins statless.
+  /// \param chunk_stats   Per-chunk zone-map stats (chunk_stats[c][i] = column i of chunk c, as
+  ///                      compute_pinned_chunk_stats emits).
   void insert_pinned_entry_host(
     const std::string& name,
     cache_entry_info cache_info,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    duckdb::vector<duckdb::LogicalType> column_types                                 = {},
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///
@@ -320,6 +408,14 @@ class sirius_scan_manager {
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
+  /// The pinned entry whose duckdb identity matches catalog.schema.table, or
+  /// nullptr. Non-owning; valid only until the next pin/unpin — the same
+  /// single-threaded query-lifecycle discipline as visit_pinned_entries.
+  /// First match wins if one table was pinned under two names. Read by the
+  /// plan-time MVCC guards.
+  [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
+    std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
+
   parquet_bind_result describe_parquet(std::string const& uri);
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
@@ -330,14 +426,49 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
 
+  /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
+  ///        to @p sink, one call per page; @p sink returns false to stop early.
+  ///        Routes via @ref ioctx_for_path to the object-store backend (throws a
+  ///        clear error when the path does not resolve to one). page_size /
+  ///        early-stop semantics are the backend's (@c rest_ioctx::list_objects_paged).
+  ///        @p max_scanned unset → the backend's configured cap
+  ///        (@c rest.list_max_scanned); a value overrides it.
+  void list_objects_paged(
+    std::string const& s3_prefix_uri,
+    std::size_t page_size,
+    std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+    std::optional<std::size_t> max_scanned = std::nullopt);
+
+  /// \brief The configured glob-match cap (@c rest.list_max_matches) for the
+  ///        backend @p s3_uri routes to — the glob layer bounds its match set
+  ///        with it. Throws a clear error for a non-object-store path.
+  [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
+
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
-  /// \brief Attach a cached batch_provider to @p op if a pinned entry can serve
-  ///        it. Returns true when a cache hit was assigned (the caller then skips
-  ///        the disk-reading split_provider for this operator).
-  bool try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op);
+  /// One matched (scan op ← pinned entry) pairing from the cache-match pass.
+  /// Provider construction is deferred to after run_mvcc_mask_jobs so each
+  /// provider takes its own copy of the entry's completed mask set; the entry
+  /// pointer stays valid for the whole prepare (pin/unpin is
+  /// query-lifecycle-serialized).
+  struct cached_assignment {
+    op::scan::sirius_gpu_scan_operator* op{nullptr};
+    pinned_entry const* entry{nullptr};
+    std::vector<std::size_t> columns;  ///< selected columns, materialized order
+    std::string entry_name;            ///< handoff key into _pending_mvcc_mask_jobs
+    cached_scan_plan plan;             ///< zone-map survivor plan, moved into the provider
+  };
+
+  /// \brief Match @p op against the pinned entries. On a hit, validates the
+  ///        entry for serving, queues the entry's MVCC mask job unless one is
+  ///        already pending (a self-join queues ONE job per entry), and
+  ///        returns the assignment for the post-mask-run provider handoff.
+  ///        Returns nullopt on a miss (the caller then builds the
+  ///        disk-reading split_provider for this operator).
+  [[nodiscard]] std::optional<cached_assignment> try_match_cached_entry(
+    op::scan::sirius_gpu_scan_operator* op);
 
   /// Resolve the ioctx that should serve @p path (normalized internally, so callers
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
@@ -368,6 +499,14 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+  bool _pruning_enabled{true};
+
+  /// One mask computation per distinct pinned entry matched this query
+  /// (recorded by try_match_cached_entry, deduped by entry name); executed
+  /// block-in-prepare by run_mvcc_mask_jobs, after which the provider handoff
+  /// copies each completed set out and the vector is cleared (also cleared in
+  /// reset() for the prepare-threw case).
+  std::vector<mvcc_mask_job_request> _pending_mvcc_mask_jobs;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached

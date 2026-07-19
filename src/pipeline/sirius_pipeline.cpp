@@ -22,11 +22,8 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_physical_cpu_source.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
 
@@ -65,28 +62,39 @@ sirius_pipeline::get_next_ports_after_sink() const
   std::vector<op::sirius_physical_operator::next_port_info> ports;
   if (!sink) { return ports; }
 
-  auto append = [&ports](const std::vector<op::sirius_physical_operator::next_port_info>& src) {
-    ports.insert(ports.end(), src.begin(), src.end());
-  };
-
-  if (sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& right_delim_join = sink->Cast<op::sirius_physical_right_delim_join>();
-    const auto& part_1     = right_delim_join.partition_join->get_next_ports_after_sink();
-    const auto& part_2     = right_delim_join.distinct->get_next_ports_after_sink();
-    ports.reserve(part_1.size() + part_2.size());
-    append(part_1);
-    append(part_2);
-  } else if (sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-    auto& left_delim_join = sink->Cast<op::sirius_physical_left_delim_join>();
-    const auto& part_1    = left_delim_join.column_data_scan->get_next_ports_after_sink();
-    const auto& part_2    = left_delim_join.distinct->get_next_ports_after_sink();
-    ports.reserve(part_1.size() + part_2.size());
-    append(part_1);
-    append(part_2);
-  } else {
-    append(sink->get_next_ports_after_sink());
-  }
+  const auto& sink_ports = sink->get_next_ports_after_sink();
+  ports.insert(ports.end(), sink_ports.begin(), sink_ports.end());
   return ports;
+}
+
+std::vector<sirius_pipeline::port_barrier_info> sirius_pipeline::get_ingress_ports_info() const
+{
+  std::vector<port_barrier_info> result;
+  // Input ports live on operators at the start of the pipeline (and on the sink
+  // for build-side inputs). `operators` contains every operator (source through
+  // sink) after finalize_pipeline_structure(), so walking it collects them all.
+  for (const auto& op_ref : operators) {
+    auto& op = op_ref.get();
+    for (auto port_id : op.get_port_ids()) {
+      auto* p = op.get_port(port_id);
+      if (p == nullptr || !p->src_pipeline) { continue; }
+      result.emplace_back(p->src_pipeline->get_sink().get(), p->type);
+    }
+  }
+  return result;
+}
+
+std::vector<sirius_pipeline::port_barrier_info> sirius_pipeline::get_egress_ports_info() const
+{
+  std::vector<port_barrier_info> result;
+  for (const auto& port_info : get_next_ports_after_sink()) {
+    auto* consumer = port_info.next_operator;
+    if (consumer == nullptr) { continue; }
+    auto* p = consumer->get_port(port_info.next_operator_port_name);
+    if (p == nullptr) { continue; }
+    result.emplace_back(consumer, p->type);
+  }
+  return result;
 }
 
 void sirius_pipeline::reset_sink()

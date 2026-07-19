@@ -54,6 +54,7 @@ extern "C" {
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +65,7 @@ extern "C" {
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace sirius::test {
@@ -213,6 +215,30 @@ fs::path generate_fixtures(fs::path const& out_dir)
     {"python3", script.string(), "--out", out_dir.string(), "--parquet-source", parquet_src});
   if (rc != 0) throw std::runtime_error("generate_fixtures.py failed");
   return out_dir;
+}
+
+void create_special_key_fixtures(fs::path const& fixture_dir)
+{
+  auto const nation = fixture_dir / "parquet" / "nation.parquet";
+  auto const region = fixture_dir / "parquet" / "region.parquet";
+  if (!fs::is_regular_file(nation) || !fs::is_regular_file(region)) {
+    throw std::runtime_error("special-key glob fixtures require nation.parquet and region.parquet");
+  }
+
+  auto const root = fixture_dir / "glob-enc";
+  fs::remove_all(root);
+  std::array<std::pair<fs::path, fs::path>, 6> const fixtures{{
+    {nation, root / "a%2Fb.parquet"},
+    {region, root / "a" / "b.parquet"},
+    {nation, root / "x#1.parquet"},
+    {nation, root / "y?v.parquet"},
+    {nation, root / "100%.parquet"},
+    {nation, root / "t" / "col=a%20b" / "p0.parquet"},
+  }};
+  for (auto const& [source, destination] : fixtures) {
+    fs::create_directories(destination.parent_path());
+    fs::copy_file(source, destination, fs::copy_options::overwrite_existing);
+  }
 }
 
 // ---- host-side SigV4 + libcurl upload --------------------------------------
@@ -426,6 +452,119 @@ void maybe_upload_large_fixture(minio_instance const& http,
   }
 }
 
+void maybe_upload_tpch_sf1_fixture(minio_instance const& http,
+                                   minio_instance const& tls,
+                                   std::optional<fs::path> const& ca,
+                                   fs::path const& work)
+{
+  if (!env_truthy("SIRIUS_TEST_S3_TPCH") && !env_truthy("SIRIUS_BENCH_S3_TPCH")) return;
+
+  constexpr std::array<std::string_view, 8> tables = {
+    "nation", "region", "customer", "orders", "part", "partsupp", "supplier", "lineitem"};
+  fs::path fixture_dir = work / "tpch_sf1";
+
+  auto fixture_complete = [&] {
+    std::error_code ec;
+    for (auto const table : tables) {
+      auto const parquet = fixture_dir / (std::string{table} + ".parquet");
+      if (!fs::exists(parquet, ec) || fs::file_size(parquet, ec) == 0 || ec) return false;
+    }
+    return true;
+  };
+
+  if (!fixture_complete()) {
+    fs::path duckdb_bin =
+      env_or("SIRIUS_TEST_DUCKDB",
+             (fs::path{SIRIUS_PROJECT_ROOT} / "build" / "release" / "duckdb").string());
+    fs::path db          = work / "tpch_sf1.duckdb";
+    fs::path fixture_tmp = work / "tpch_sf1.tmp";
+    std::error_code ec;
+    fs::remove(db, ec);
+    fs::remove_all(fixture_tmp, ec);
+    fs::create_directories(fixture_tmp);
+
+    std::string sql = "INSTALL tpch; LOAD tpch; CALL dbgen(sf=1); ";
+    for (auto const table : tables) {
+      auto const parquet = fixture_tmp / (std::string{table} + ".parquet");
+      sql += "COPY (SELECT * FROM " + std::string{table} + ") TO '" + parquet.string() +
+             "' (FORMAT PARQUET); ";
+    }
+
+    int rc = run_process({duckdb_bin.string(), db.string(), "-c", sql});
+    fs::remove(db, ec);
+    if (rc != 0) {
+      fs::remove_all(fixture_tmp, ec);
+      throw std::runtime_error("failed to generate SF1 TPC-H parquet fixtures via DuckDB CLI (" +
+                               duckdb_bin.string() + ")");
+    }
+
+    fs::remove_all(fixture_dir, ec);
+    fs::rename(fixture_tmp, fixture_dir, ec);
+    if (ec) throw std::runtime_error("failed to finalize SF1 TPC-H fixture cache: " + ec.message());
+    if (!fixture_complete()) {
+      throw std::runtime_error("SF1 TPC-H fixture generation left an incomplete cache");
+    }
+  } else {
+    std::cout << "[s3] reusing cached SF1 TPC-H fixtures at " << fixture_dir << std::endl;
+  }
+
+  std::uintmax_t total_bytes = 0;
+  for (auto const table : tables) {
+    auto const parquet = fixture_dir / (std::string{table} + ".parquet");
+    auto const key     = "tpch/sf1/" + std::string{table} + ".parquet";
+    auto const bytes   = static_cast<std::int64_t>(fs::file_size(parquet));
+    total_bytes += static_cast<std::uintmax_t>(bytes);
+
+    auto upload = [&](minio_instance const& instance,
+                      std::string const& scheme,
+                      std::optional<fs::path> const& ca_bundle) {
+      std::FILE* file = std::fopen(parquet.c_str(), "rb");
+      if (file == nullptr) {
+        throw std::runtime_error("cannot open SF1 TPC-H fixture: " + parquet.string());
+      }
+      auto const code =
+        s3_put(instance, scheme, uri_path_for(kBucket, key), file, bytes, ca_bundle);
+      std::fclose(file);
+      if (!(code == 200 || code == 204)) {
+        throw std::runtime_error("SF1 TPC-H upload failed for '" + key + "' (HTTP " +
+                                 std::to_string(code) + ") at " + instance.endpoint);
+      }
+    };
+
+    upload(http, "http", std::nullopt);
+    upload(tls, "https", ca);
+  }
+
+  setenv("SIRIUS_TEST_S3_TPCH_LOCAL_DIR", fixture_dir.c_str(), /*overwrite=*/1);
+  std::cout << "[s3] uploaded 8 SF1 TPC-H parquet fixtures (" << total_bytes << " bytes) to "
+            << http.endpoint << " and " << tls.endpoint << std::endl;
+}
+
+void maybe_upload_glob_scale_fixture(minio_instance const& http, fs::path const& fixture_dir)
+{
+  if (!env_truthy("SIRIUS_TEST_S3_GLOB_SCALE")) return;
+
+  constexpr std::size_t object_count = 1001;
+  auto const parquet                 = fixture_dir / "parquet" / "nation.parquet";
+  auto const parquet_size            = static_cast<std::int64_t>(fs::file_size(parquet));
+
+  for (std::size_t index = 0; index < object_count; ++index) {
+    auto const key = "glob-scale/part_" + std::to_string(index) + ".parquet";
+    std::FILE* f   = std::fopen(parquet.c_str(), "rb");
+    if (f == nullptr) throw std::runtime_error("cannot open glob-scale parquet fixture");
+    auto const code =
+      s3_put(http, "http", uri_path_for(kBucket, key), f, parquet_size, std::nullopt);
+    std::fclose(f);
+    if (!(code == 200 || code == 204)) {
+      throw std::runtime_error("glob-scale upload failed for '" + key + "' (HTTP " +
+                               std::to_string(code) + ")");
+    }
+  }
+
+  std::cout << "[s3] uploaded " << object_count << " parquet objects under " << http.endpoint << "/"
+            << kBucket << "/glob-scale/" << std::endl;
+}
+
 // ---- orchestration ---------------------------------------------------------
 
 void setenv_kv(char const* k, std::string const& v) { ::setenv(k, v.c_str(), /*overwrite=*/1); }
@@ -441,6 +580,7 @@ bool bring_up()
 
   fs::path ca_bundle = generate_self_signed_cert(certs_dir);
   generate_fixtures(fixture_dir);
+  create_special_key_fixtures(fixture_dir);
 
   // HTTP instance: testcontainers' HTTP wait makes it ready before run returns.
   int http_req = make_minio_request();
@@ -470,6 +610,8 @@ bool bring_up()
   upload_fixtures(http, "http", fixture_dir, std::nullopt);
   upload_fixtures(tls, "https", fixture_dir, ca);
   maybe_upload_large_fixture(http, tls, ca, work);
+  maybe_upload_tpch_sf1_fixture(http, tls, ca, work);
+  maybe_upload_glob_scale_fixture(http, fixture_dir);
 
   // Publish the env contract the [s3] tests consume (mirrors the old env.sh).
   setenv_kv("SIRIUS_TEST_S3_ENDPOINT", http.endpoint);

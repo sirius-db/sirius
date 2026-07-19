@@ -55,7 +55,6 @@ class optimizer_disable_guard {
     auto disabled  = dbconfig.options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-    disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
 #ifdef DEBUG
     disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -166,6 +165,15 @@ std::string convert_query_to_dump(duckdb::Connection& con, const std::string& qu
   std::string dump;
   with_conversion_result(con, query, [&](pipeline::pipeline_conversion_result& result) {
     dump = pipeline::dump_pipeline_conversion_result(result);
+  });
+  return dump;
+}
+
+std::string convert_query_to_raw_schedule(duckdb::Connection& con, const std::string& query)
+{
+  std::string dump;
+  with_conversion_result(con, query, [&](pipeline::pipeline_conversion_result& result) {
+    dump = pipeline::dump_pipeline_schedule_raw(result);
   });
   return dump;
 }

@@ -19,6 +19,7 @@
 // sirius
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
+#include <scan_manager/mvcc_chunk_mask.hpp>
 // cucascade
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -110,6 +111,17 @@ class scan_operator_input : public op::operator_data {
     return *std::get<std::unique_ptr<scan_info>>(materialization_info);
   }
 
+  [[nodiscard]] std::string get_origin_tiers() const override
+  {
+    if (!is_resident()) { return "SOURCE"; }
+    // The batch's tier is only readable through a lock accessor; take the non-blocking
+    // one and fall back to UNKNOWN if the batch is exclusively locked right now.
+    if (auto ro = get_cached_batch()->try_to_read_only()) {
+      return tier_display_name(ro->get_current_tier());
+    }
+    return "UNKNOWN";
+  }
+
   [[nodiscard]] std::shared_ptr<::cucascade::data_batch> get_cached_batch() const
   {
     if (!is_resident()) {
@@ -123,6 +135,17 @@ class scan_operator_input : public op::operator_data {
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
   std::variant<std::monostate, std::unique_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
+  /// Per-query MVCC keep-mask for a resident cached chunk; a default mask =
+  /// every row visible (no upload, no kernel). Attached by
+  /// drain_cached_provider, applied in gpu_ingestible::materialize_table's
+  /// resident branch. Self-contained: the mask's owning words pointer keeps
+  /// the storage alive for the split's lifetime.
+  scan_manager::mvcc_chunk_mask mvcc_keep_mask;
+  /// True when the op's ingestible will run a row-filter expression against
+  /// this split's materialized table (post_filter_and_project filters by
+  /// copy). Stamped by drain_cached_provider on resident splits; scan_info
+  /// splits fold filter costs into their own estimates instead.
+  bool row_filter_pending{false};
 };
 
 }  // namespace sirius::op::scan

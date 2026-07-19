@@ -27,6 +27,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <algorithm>
 #include <functional>
 
 namespace sirius {
@@ -236,40 +237,57 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     }
 
     // 4. Compute number of partitions
+    bool complete_input = false;
+    auto port_ids       = get_port_ids();
+    if (!port_ids.empty()) {
+      auto* port = get_port(port_ids[0]);
+      // Check completion before repository emptiness: once completion is visible,
+      // the upstream pipeline cannot publish another batch.
+      complete_input = port && port->src_pipeline && port->src_pipeline->is_pipeline_finished() &&
+                       port->repo && port->repo->all_empty();
+    }
+
     size_t total_rows      = static_cast<size_t>(merged_sample_view.num_rows());
     size_t avg_batch_bytes = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
     size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
     size_t num_parts          = 1;
-    if (estimated_cardinality == 0 || avg_rows_per_batch == 0) {
+    bool const can_size = complete_input || (estimated_cardinality > 0 && avg_rows_per_batch > 0);
+    if (!can_size) {
       SIRIUS_LOG_WARN(
         "Sort sample: estimated_cardinality={} or avg_rows_per_batch={} is zero, "
         "defaulting to 1 partition",
         estimated_cardinality,
         avg_rows_per_batch);
     } else {
-      size_t total_batch_count =
-        (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
-      size_t estimated_total_bytes = avg_batch_bytes * total_batch_count;
-      size_t available_memory      = space->get_available_memory(stream);
-      size_t max_partition_bytes   = _max_partition_bytes_override > 0
-                                       ? _max_partition_bytes_override
-                                       : static_cast<size_t>(static_cast<double>(available_memory) *
+      size_t total_batch_count = valid_batches.size();
+      size_t bytes_for_sizing  = total_sample_bytes;
+      if (!complete_input) {
+        total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
+        bytes_for_sizing  = avg_batch_bytes * total_batch_count;
+      }
+      size_t available_memory    = space->get_available_memory(stream);
+      size_t max_partition_bytes = _max_partition_bytes_override > 0
+                                     ? _max_partition_bytes_override
+                                     : static_cast<size_t>(static_cast<double>(available_memory) *
                                                            _max_partition_memory_fraction);
 
-      if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
-        num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
+      if (max_partition_bytes > 0 && bytes_for_sizing > max_partition_bytes) {
+        num_parts = (bytes_for_sizing + max_partition_bytes - 1) / max_partition_bytes;
       }
+      num_parts = std::min(num_parts, std::max<size_t>(1, total_rows));
 
       SIRIUS_LOG_DEBUG(
-        "Sort sample: estimated_cardinality={}, total_rows={}, avg_rows_per_batch={}, "
+        "Sort sample: complete_input={}, estimated_cardinality={}, total_rows={}, "
+        "avg_rows_per_batch={}, "
         "avg_batch_bytes={}, total_batch_count={}, "
-        "estimated_total_bytes={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
+        "bytes_for_sizing={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
+        complete_input,
         estimated_cardinality,
         total_rows,
         avg_rows_per_batch,
         avg_batch_bytes,
         total_batch_count,
-        estimated_total_bytes,
+        bytes_for_sizing,
         available_memory,
         max_partition_bytes,
         num_parts);

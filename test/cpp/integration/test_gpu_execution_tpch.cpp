@@ -22,7 +22,10 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/common/enums/optimizer_type.hpp>
+#include <duckdb/main/config.hpp>
 #include <utils/sirius_test_env.hpp>
+#include <utils/tpch_queries.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
@@ -39,6 +42,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -4070,118 +4074,42 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 1",
                  "[integration][gpu_execution][TPC-H][Q1]")
 {
-  RUN_TPCH_MGPU(
-    "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, "
-    "sum(l_extendedprice) as sum_base_price, "
-    "sum(l_extendedprice * (1 - l_discount)) as sum_disc_price, "
-    "sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge, "
-    "avg(l_quantity) as avg_qty, avg(l_extendedprice) as avg_price, "
-    "avg(l_discount) as avg_disc, count(*) as count_order "
-    "from lineitem "
-    "where l_shipdate <= date '1995-08-19' "
-    "group by l_returnflag, l_linestatus "
-    "order by l_returnflag, l_linestatus;",
-    0.00001f);
+  RUN_TPCH_MGPU(sirius::test::kTpchQ1, sirius::test::kTpchQueries[0].float_tolerance);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 1 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q1]")
 {
-  RUN_TPCH_MGPU(
-    "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, "
-    "sum(l_extendedprice) as sum_base_price, "
-    "sum(l_extendedprice * (1 - l_discount)) as sum_disc_price, "
-    "sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge, "
-    "avg(l_quantity) as avg_qty, avg(l_extendedprice) as avg_price, "
-    "avg(l_discount) as avg_disc, count(*) as count_order "
-    "from lineitem "
-    "where l_shipdate <= date '1995-08-19' "
-    "group by l_returnflag, l_linestatus "
-    "order by l_returnflag, l_linestatus;",
-    0.00001f);
+  RUN_TPCH_MGPU(sirius::test::kTpchQ1, sirius::test::kTpchQueries[0].float_tolerance);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 2",
                  "[integration][gpu_execution][TPC-H][Q2]")
 {
-  RUN_TPCH_MGPU(
-    "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, "
-    "s.s_address, s.s_phone, s.s_comment "
-    "from part p, supplier s, partsupp ps, nation n, region r "
-    "where p.p_partkey = ps.ps_partkey and s.s_suppkey = ps.ps_suppkey "
-    "and p.p_size = 41 and p.p_type like '%NICKEL' "
-    "and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
-    "and r.r_name = 'EUROPE' "
-    "and ps.ps_supplycost = ("
-    "  select min(ps.ps_supplycost) "
-    "  from partsupp ps, supplier s, nation n, region r "
-    "  where p.p_partkey = ps.ps_partkey and s.s_suppkey = ps.ps_suppkey "
-    "  and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
-    "  and r.r_name = 'EUROPE'"
-    ") "
-    "order by s.s_acctbal desc, n.n_name, s.s_name, p.p_partkey "
-    "limit 100;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ2);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 2 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q2]")
 {
-  RUN_TPCH_MGPU(
-    "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, "
-    "s.s_address, s.s_phone, s.s_comment "
-    "from part p, supplier s, partsupp ps, nation n, region r "
-    "where p.p_partkey = ps.ps_partkey and s.s_suppkey = ps.ps_suppkey "
-    "and p.p_size = 41 and p.p_type like '%NICKEL' "
-    "and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
-    "and r.r_name = 'EUROPE' "
-    "and ps.ps_supplycost = ("
-    "  select min(ps.ps_supplycost) "
-    "  from partsupp ps, supplier s, nation n, region r "
-    "  where p.p_partkey = ps.ps_partkey and s.s_suppkey = ps.ps_suppkey "
-    "  and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
-    "  and r.r_name = 'EUROPE'"
-    ") "
-    "order by s.s_acctbal desc, n.n_name, s.s_name, p.p_partkey "
-    "limit 100;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ2);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 3",
                  "[integration][gpu_execution][TPC-H][Q3]")
 {
-  RUN_TPCH_MGPU(
-    "select l.l_orderkey, "
-    "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
-    "o.o_orderdate, o.o_shippriority "
-    "from customer c, orders o, lineitem l "
-    "where c.c_mktsegment = 'HOUSEHOLD' and c.c_custkey = o.o_custkey "
-    "and l.l_orderkey = o.o_orderkey "
-    "and o.o_orderdate < date '1995-03-25' "
-    "and l.l_shipdate > date '1995-03-25' "
-    "group by l.l_orderkey, o.o_orderdate, o.o_shippriority "
-    "order by revenue desc, o.o_orderdate "
-    "limit 10;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ3);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 3 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q3]")
 {
-  RUN_TPCH_MGPU(
-    "select l.l_orderkey, "
-    "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
-    "o.o_orderdate, o.o_shippriority "
-    "from customer c, orders o, lineitem l "
-    "where c.c_mktsegment = 'HOUSEHOLD' and c.c_custkey = o.o_custkey "
-    "and l.l_orderkey = o.o_orderkey "
-    "and o.o_orderdate < date '1995-03-25' "
-    "and l.l_shipdate > date '1995-03-25' "
-    "group by l.l_orderkey, o.o_orderdate, o.o_shippriority "
-    "order by revenue desc, o.o_orderdate "
-    "limit 10;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ3);
 }
 
 // TPC-H Q4 parquet has a pre-existing intermittent flake (see ROADMAP Phase 8
@@ -4190,19 +4118,6 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 // on other queries must fail loudly. We wrap the SAME body shape as RUN_TPCH_MGPU
 // but handle any std::exception from compare_gpu_vs_cpu by retrying once with
 // a fresh bind_env.
-static constexpr auto kTpchQ4Body =
-  "select o.o_orderpriority, count(*) as order_count "
-  "from orders o "
-  "where o.o_orderdate >= date '1996-10-01' "
-  "and o.o_orderdate < date '1997-01-01' "
-  "and exists ("
-  "  select * from lineitem l "
-  "  where l.l_orderkey = o.o_orderkey "
-  "  and l.l_commitdate < l.l_receiptdate"
-  ") "
-  "group by o.o_orderpriority "
-  "order by o.o_orderpriority;";
-
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 4",
                  "[integration][gpu_execution][TPC-H][Q4]")
@@ -4210,13 +4125,13 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   auto const num_gpus = GENERATE(1, 2);
   CAPTURE(num_gpus);
   try {
-    if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
+    if (!compare_gpu_vs_cpu_for(num_gpus, sirius::test::kTpchQ4)) { return; }
   } catch (std::exception const& first_err) {
     WARN(
       "tpch_q4 first attempt failed (pre-existing flake per ROADMAP Phase 8 "
       "Success Criterion 2); retrying once: "
       << first_err.what());
-    if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
+    if (!compare_gpu_vs_cpu_for(num_gpus, sirius::test::kTpchQ4)) { return; }
   }
 }
 
@@ -4227,13 +4142,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   auto const num_gpus = GENERATE(1, 2);
   CAPTURE(num_gpus);
   try {
-    if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
+    if (!compare_gpu_vs_cpu_for(num_gpus, sirius::test::kTpchQ4)) { return; }
   } catch (std::exception const& first_err) {
     WARN(
       "tpch_q4 parquet first attempt failed (pre-existing flake per ROADMAP "
       "Phase 8 Success Criterion 2); retrying once: "
       << first_err.what());
-    if (!compare_gpu_vs_cpu_for(num_gpus, kTpchQ4Body)) { return; }
+    if (!compare_gpu_vs_cpu_for(num_gpus, sirius::test::kTpchQ4)) { return; }
   }
 }
 
@@ -4241,768 +4156,252 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 5",
                  "[integration][gpu_execution][TPC-H][Q5]")
 {
-  RUN_TPCH_MGPU(
-    "select n.n_name, "
-    "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue "
-    "from orders o, lineitem l, supplier s, nation n, region r, customer c "
-    "where c.c_custkey = o.o_custkey and l.l_orderkey = o.o_orderkey "
-    "and l.l_suppkey = s.s_suppkey and c.c_nationkey = s.s_nationkey "
-    "and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
-    "and r.r_name = 'EUROPE' "
-    "and o.o_orderdate >= date '1997-01-01' "
-    "and o.o_orderdate < date '1998-01-01' "
-    "group by n.n_name "
-    "order by revenue desc;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ5);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 5 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q5]")
 {
-  RUN_TPCH_MGPU(
-    "select n.n_name, "
-    "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue "
-    "from orders o, lineitem l, supplier s, nation n, region r, customer c "
-    "where c.c_custkey = o.o_custkey and l.l_orderkey = o.o_orderkey "
-    "and l.l_suppkey = s.s_suppkey and c.c_nationkey = s.s_nationkey "
-    "and s.s_nationkey = n.n_nationkey and n.n_regionkey = r.r_regionkey "
-    "and r.r_name = 'EUROPE' "
-    "and o.o_orderdate >= date '1997-01-01' "
-    "and o.o_orderdate < date '1998-01-01' "
-    "group by n.n_name "
-    "order by revenue desc;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ5);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 6",
                  "[integration][gpu_execution][TPC-H][Q6]")
 {
-  RUN_TPCH_MGPU(
-    "select sum(l_extendedprice * l_discount) as revenue "
-    "from lineitem "
-    "where l_shipdate >= date '1997-01-01' "
-    "and l_shipdate < date '1998-01-01' "
-    "and l_discount between 0.03 - 0.01 and 0.03 + 0.01 "
-    "and l_quantity < 24;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ6);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 6 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q6]")
 {
-  RUN_TPCH_MGPU(
-    "select sum(l_extendedprice * l_discount) as revenue "
-    "from lineitem "
-    "where l_shipdate >= date '1997-01-01' "
-    "and l_shipdate < date '1998-01-01' "
-    "and l_discount between 0.03 - 0.01 and 0.03 + 0.01 "
-    "and l_quantity < 24;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ6);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 7",
                  "[integration][gpu_execution][TPC-H][Q7]")
 {
-  RUN_TPCH_MGPU(
-    "select supp_nation, cust_nation, l_year, sum(volume) as revenue "
-    "from ("
-    "  select n1.n_name as supp_nation, n2.n_name as cust_nation, "
-    "  extract(year from l.l_shipdate) as l_year, "
-    "  l.l_extendedprice * (1 - l.l_discount) as volume "
-    "  from supplier s, lineitem l, orders o, customer c, nation n1, nation n2 "
-    "  where s.s_suppkey = l.l_suppkey and o.o_orderkey = l.l_orderkey "
-    "  and c.c_custkey = o.o_custkey and s.s_nationkey = n1.n_nationkey "
-    "  and c.c_nationkey = n2.n_nationkey "
-    "  and ((n1.n_name = 'EGYPT' and n2.n_name = 'UNITED STATES') "
-    "    or (n1.n_name = 'UNITED STATES' and n2.n_name = 'EGYPT')) "
-    "  and l.l_shipdate between date '1995-01-01' and date '1996-12-31'"
-    ") as shipping "
-    "group by supp_nation, cust_nation, l_year "
-    "order by supp_nation, cust_nation, l_year;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ7);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 7 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q7]")
 {
-  RUN_TPCH_MGPU(
-    "select supp_nation, cust_nation, l_year, sum(volume) as revenue "
-    "from ("
-    "  select n1.n_name as supp_nation, n2.n_name as cust_nation, "
-    "  extract(year from l.l_shipdate) as l_year, "
-    "  l.l_extendedprice * (1 - l.l_discount) as volume "
-    "  from supplier s, lineitem l, orders o, customer c, nation n1, nation n2 "
-    "  where s.s_suppkey = l.l_suppkey and o.o_orderkey = l.l_orderkey "
-    "  and c.c_custkey = o.o_custkey and s.s_nationkey = n1.n_nationkey "
-    "  and c.c_nationkey = n2.n_nationkey "
-    "  and ((n1.n_name = 'EGYPT' and n2.n_name = 'UNITED STATES') "
-    "    or (n1.n_name = 'UNITED STATES' and n2.n_name = 'EGYPT')) "
-    "  and l.l_shipdate between date '1995-01-01' and date '1996-12-31'"
-    ") as shipping "
-    "group by supp_nation, cust_nation, l_year "
-    "order by supp_nation, cust_nation, l_year;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ7);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 8",
                  "[integration][gpu_execution][TPC-H][Q8]")
 {
-  RUN_TPCH_MGPU(
-    "select o_year, "
-    "sum(case when nation = 'EGYPT' then volume else 0 end) / sum(volume) as mkt_share "
-    "from ("
-    "  select extract(year from o.o_orderdate) as o_year, "
-    "  l.l_extendedprice * (1 - l.l_discount) as volume, "
-    "  n2.n_name as nation "
-    "  from lineitem l, part p, supplier s, orders o, customer c, "
-    "  nation n1, nation n2, region r "
-    "  where p.p_partkey = l.l_partkey and s.s_suppkey = l.l_suppkey "
-    "  and l.l_orderkey = o.o_orderkey and o.o_custkey = c.c_custkey "
-    "  and c.c_nationkey = n1.n_nationkey and n1.n_regionkey = r.r_regionkey "
-    "  and r.r_name = 'MIDDLE EAST' and s.s_nationkey = n2.n_nationkey "
-    "  and o.o_orderdate between date '1995-01-01' and date '1996-12-31' "
-    "  and p.p_type = 'PROMO BRUSHED COPPER'"
-    ") as all_nations "
-    "group by o_year "
-    "order by o_year;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ8);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 8 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q8]")
 {
-  RUN_TPCH_MGPU(
-    "select o_year, "
-    "sum(case when nation = 'EGYPT' then volume else 0 end) / sum(volume) as mkt_share "
-    "from ("
-    "  select extract(year from o.o_orderdate) as o_year, "
-    "  l.l_extendedprice * (1 - l.l_discount) as volume, "
-    "  n2.n_name as nation "
-    "  from lineitem l, part p, supplier s, orders o, customer c, "
-    "  nation n1, nation n2, region r "
-    "  where p.p_partkey = l.l_partkey and s.s_suppkey = l.l_suppkey "
-    "  and l.l_orderkey = o.o_orderkey and o.o_custkey = c.c_custkey "
-    "  and c.c_nationkey = n1.n_nationkey and n1.n_regionkey = r.r_regionkey "
-    "  and r.r_name = 'MIDDLE EAST' and s.s_nationkey = n2.n_nationkey "
-    "  and o.o_orderdate between date '1995-01-01' and date '1996-12-31' "
-    "  and p.p_type = 'PROMO BRUSHED COPPER'"
-    ") as all_nations "
-    "group by o_year "
-    "order by o_year;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ8);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 9",
                  "[integration][gpu_execution][TPC-H][Q9]")
 {
-  RUN_TPCH_MGPU(
-    "select nation, o_year, sum(amount) as sum_profit "
-    "from ("
-    "  select n.n_name as nation, "
-    "  extract(year from o.o_orderdate) as o_year, "
-    "  l.l_extendedprice * (1 - l.l_discount) - ps.ps_supplycost * l.l_quantity as amount "
-    "  from part p, supplier s, lineitem l, partsupp ps, orders o, nation n "
-    "  where s.s_suppkey = l.l_suppkey and ps.ps_suppkey = l.l_suppkey "
-    "  and ps.ps_partkey = l.l_partkey and p.p_partkey = l.l_partkey "
-    "  and o.o_orderkey = l.l_orderkey and s.s_nationkey = n.n_nationkey "
-    "  and p.p_name like '%yellow%'"
-    ") as profit "
-    "group by nation, o_year "
-    "order by nation, o_year desc;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ9);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 9 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q9]")
 {
-  RUN_TPCH_MGPU(
-    "select nation, o_year, sum(amount) as sum_profit "
-    "from ("
-    "  select n.n_name as nation, "
-    "  extract(year from o.o_orderdate) as o_year, "
-    "  l.l_extendedprice * (1 - l.l_discount) - ps.ps_supplycost * l.l_quantity as amount "
-    "  from part p, supplier s, lineitem l, partsupp ps, orders o, nation n "
-    "  where s.s_suppkey = l.l_suppkey and ps.ps_suppkey = l.l_suppkey "
-    "  and ps.ps_partkey = l.l_partkey and p.p_partkey = l.l_partkey "
-    "  and o.o_orderkey = l.l_orderkey and s.s_nationkey = n.n_nationkey "
-    "  and p.p_name like '%yellow%'"
-    ") as profit "
-    "group by nation, o_year "
-    "order by nation, o_year desc;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ9);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 10",
                  "[integration][gpu_execution][TPC-H][Q10]")
 {
-  RUN_TPCH_MGPU(
-    "select c.c_custkey, c.c_name, "
-    "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
-    "c.c_acctbal, n.n_name, c.c_address, c.c_phone, c.c_comment "
-    "from customer c, orders o, lineitem l, nation n "
-    "where c.c_custkey = o.o_custkey and l.l_orderkey = o.o_orderkey "
-    "and o.o_orderdate >= date '1994-03-01' "
-    "and o.o_orderdate < date '1994-06-01' "
-    "and l.l_returnflag = 'R' "
-    "and c.c_nationkey = n.n_nationkey "
-    "group by c.c_custkey, c.c_name, c.c_acctbal, c.c_phone, "
-    "n.n_name, c.c_address, c.c_comment "
-    "order by revenue desc "
-    "limit 20;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ10);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 10 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q10]")
 {
-  RUN_TPCH_MGPU(
-    "select c.c_custkey, c.c_name, "
-    "sum(l.l_extendedprice * (1 - l.l_discount)) as revenue, "
-    "c.c_acctbal, n.n_name, c.c_address, c.c_phone, c.c_comment "
-    "from customer c, orders o, lineitem l, nation n "
-    "where c.c_custkey = o.o_custkey and l.l_orderkey = o.o_orderkey "
-    "and o.o_orderdate >= date '1994-03-01' "
-    "and o.o_orderdate < date '1994-06-01' "
-    "and l.l_returnflag = 'R' "
-    "and c.c_nationkey = n.n_nationkey "
-    "group by c.c_custkey, c.c_name, c.c_acctbal, c.c_phone, "
-    "n.n_name, c.c_address, c.c_comment "
-    "order by revenue desc "
-    "limit 20;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ10);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 11",
                  "[integration][gpu_execution][TPC-H][Q11]")
 {
-  RUN_TPCH_MGPU(
-    "select ps.ps_partkey, "
-    "sum(ps.ps_supplycost * ps.ps_availqty) as value "
-    "from partsupp ps, supplier s, nation n "
-    "where ps.ps_suppkey = s.s_suppkey "
-    "and s.s_nationkey = n.n_nationkey "
-    "and n.n_name = 'JAPAN' "
-    "group by ps.ps_partkey "
-    "having sum(ps.ps_supplycost * ps.ps_availqty) > ("
-    "  select sum(ps.ps_supplycost * ps.ps_availqty) * 0.0001000000 "
-    "  from partsupp ps, supplier s, nation n "
-    "  where ps.ps_suppkey = s.s_suppkey "
-    "  and s.s_nationkey = n.n_nationkey "
-    "  and n.n_name = 'JAPAN'"
-    ") "
-    "order by value desc;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ11);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 11 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q11]")
 {
-  RUN_TPCH_MGPU(
-    "select ps.ps_partkey, "
-    "sum(ps.ps_supplycost * ps.ps_availqty) as value "
-    "from partsupp ps, supplier s, nation n "
-    "where ps.ps_suppkey = s.s_suppkey "
-    "and s.s_nationkey = n.n_nationkey "
-    "and n.n_name = 'JAPAN' "
-    "group by ps.ps_partkey "
-    "having sum(ps.ps_supplycost * ps.ps_availqty) > ("
-    "  select sum(ps.ps_supplycost * ps.ps_availqty) * 0.0001000000 "
-    "  from partsupp ps, supplier s, nation n "
-    "  where ps.ps_suppkey = s.s_suppkey "
-    "  and s.s_nationkey = n.n_nationkey "
-    "  and n.n_name = 'JAPAN'"
-    ") "
-    "order by value desc;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ11);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 12",
                  "[integration][gpu_execution][TPC-H][Q12]")
 {
-  RUN_TPCH_MGPU(
-    "select l.l_shipmode, "
-    "sum(case when o.o_orderpriority = '1-URGENT' "
-    "  or o.o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, "
-    "sum(case when o.o_orderpriority <> '1-URGENT' "
-    "  and o.o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count "
-    "from orders o, lineitem l "
-    "where o.o_orderkey = l.l_orderkey "
-    "and l.l_shipmode in ('TRUCK', 'REG AIR') "
-    "and l.l_commitdate < l.l_receiptdate "
-    "and l.l_shipdate < l.l_commitdate "
-    "and l.l_receiptdate >= date '1994-01-01' "
-    "and l.l_receiptdate < date '1995-01-01' "
-    "group by l.l_shipmode "
-    "order by l.l_shipmode;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ12);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 12 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q12]")
 {
-  RUN_TPCH_MGPU(
-    "select l.l_shipmode, "
-    "sum(case when o.o_orderpriority = '1-URGENT' "
-    "  or o.o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, "
-    "sum(case when o.o_orderpriority <> '1-URGENT' "
-    "  and o.o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count "
-    "from orders o, lineitem l "
-    "where o.o_orderkey = l.l_orderkey "
-    "and l.l_shipmode in ('TRUCK', 'REG AIR') "
-    "and l.l_commitdate < l.l_receiptdate "
-    "and l.l_shipdate < l.l_commitdate "
-    "and l.l_receiptdate >= date '1994-01-01' "
-    "and l.l_receiptdate < date '1995-01-01' "
-    "group by l.l_shipmode "
-    "order by l.l_shipmode;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ12);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 13",
                  "[integration][gpu_execution][TPC-H][Q13]")
 {
-  RUN_TPCH_MGPU(
-    "select c_count, count(*) as custdist "
-    "from ("
-    "  select c.c_custkey, count(o.o_orderkey) "
-    "  from customer c "
-    "  left outer join orders o "
-    "    on c.c_custkey = o.o_custkey "
-    "    and o.o_comment not like '%special%requests%' "
-    "  group by c.c_custkey"
-    ") as orders (c_custkey, c_count) "
-    "group by c_count "
-    "order by custdist desc, c_count desc;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ13);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 13 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q13]")
 {
-  RUN_TPCH_MGPU(
-    "select c_count, count(*) as custdist "
-    "from ("
-    "  select c.c_custkey, count(o.o_orderkey) "
-    "  from customer c "
-    "  left outer join orders o "
-    "    on c.c_custkey = o.o_custkey "
-    "    and o.o_comment not like '%special%requests%' "
-    "  group by c.c_custkey"
-    ") as orders (c_custkey, c_count) "
-    "group by c_count "
-    "order by custdist desc, c_count desc;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ13);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 14",
                  "[integration][gpu_execution][TPC-H][Q14]")
 {
-  RUN_TPCH_MGPU(
-    "select 100.00 * sum(case when p.p_type like 'PROMO%' "
-    "  then l.l_extendedprice * (1 - l.l_discount) else 0 end) "
-    "  / sum(l.l_extendedprice * (1 - l.l_discount)) as promo_revenue "
-    "from lineitem l, part p "
-    "where l.l_partkey = p.p_partkey "
-    "and l.l_shipdate >= date '1994-08-01' "
-    "and l.l_shipdate < date '1994-09-01';");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ14);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 14 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q14]")
 {
-  RUN_TPCH_MGPU(
-    "select 100.00 * sum(case when p.p_type like 'PROMO%' "
-    "  then l.l_extendedprice * (1 - l.l_discount) else 0 end) "
-    "  / sum(l.l_extendedprice * (1 - l.l_discount)) as promo_revenue "
-    "from lineitem l, part p "
-    "where l.l_partkey = p.p_partkey "
-    "and l.l_shipdate >= date '1994-08-01' "
-    "and l.l_shipdate < date '1994-09-01';");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ14);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 15",
                  "[integration][gpu_execution][TPC-H][Q15]")
 {
-  RUN_TPCH_MGPU(
-    "with revenue_view as ("
-    "  select l_suppkey as supplier_no, "
-    "  sum(l_extendedprice * (1 - l_discount)) as total_revenue "
-    "  from lineitem "
-    "  where l_shipdate >= date '1993-05-01' "
-    "  and l_shipdate < date '1993-08-01' "
-    "  group by l_suppkey"
-    ") "
-    "select s.s_suppkey, s.s_name, s.s_address, s.s_phone, r.total_revenue "
-    "from supplier s, revenue_view r "
-    "where s.s_suppkey = r.supplier_no "
-    "and r.total_revenue = ("
-    "  select max(total_revenue) from revenue_view"
-    ") "
-    "order by s.s_suppkey;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ15);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 15 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q15]")
 {
-  RUN_TPCH_MGPU(
-    "with revenue_view as ("
-    "  select l_suppkey as supplier_no, "
-    "  sum(l_extendedprice * (1 - l_discount)) as total_revenue "
-    "  from lineitem "
-    "  where l_shipdate >= date '1993-05-01' "
-    "  and l_shipdate < date '1993-08-01' "
-    "  group by l_suppkey"
-    ") "
-    "select s.s_suppkey, s.s_name, s.s_address, s.s_phone, r.total_revenue "
-    "from supplier s, revenue_view r "
-    "where s.s_suppkey = r.supplier_no "
-    "and r.total_revenue = ("
-    "  select max(total_revenue) from revenue_view"
-    ") "
-    "order by s.s_suppkey;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ15);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 16",
                  "[integration][gpu_execution][TPC-H][Q16]")
 {
-  RUN_TPCH_MGPU(
-    "select p.p_brand, p.p_type, p.p_size, "
-    "count(distinct ps.ps_suppkey) as supplier_cnt "
-    "from partsupp ps, part p "
-    "where p.p_partkey = ps.ps_partkey "
-    "and p.p_brand <> 'Brand#21' "
-    "and p.p_type not like 'MEDIUM PLATED%' "
-    "and p.p_size in (38, 2, 8, 31, 44, 5, 14, 24) "
-    "and ps.ps_suppkey not in ("
-    "  select s.s_suppkey from supplier s "
-    "  where s.s_comment like '%Customer%Complaints%'"
-    ") "
-    "group by p.p_brand, p.p_type, p.p_size "
-    "order by supplier_cnt desc, p.p_brand, p.p_type, p.p_size;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ16);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 16 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q16]")
 {
-  RUN_TPCH_MGPU(
-    "select p.p_brand, p.p_type, p.p_size, "
-    "count(distinct ps.ps_suppkey) as supplier_cnt "
-    "from partsupp ps, part p "
-    "where p.p_partkey = ps.ps_partkey "
-    "and p.p_brand <> 'Brand#21' "
-    "and p.p_type not like 'MEDIUM PLATED%' "
-    "and p.p_size in (38, 2, 8, 31, 44, 5, 14, 24) "
-    "and ps.ps_suppkey not in ("
-    "  select s.s_suppkey from supplier s "
-    "  where s.s_comment like '%Customer%Complaints%'"
-    ") "
-    "group by p.p_brand, p.p_type, p.p_size "
-    "order by supplier_cnt desc, p.p_brand, p.p_type, p.p_size;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ16);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 17",
                  "[integration][gpu_execution][TPC-H][Q17]")
 {
-  RUN_TPCH_MGPU(
-    "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
-    "from lineitem l, part p "
-    "where p.p_partkey = l.l_partkey "
-    "and p.p_brand = 'Brand#13' "
-    "and p.p_container = 'JUMBO CAN' "
-    "and l.l_quantity < ("
-    "  select 0.2 * avg(l2.l_quantity) "
-    "  from lineitem l2 "
-    "  where l2.l_partkey = p.p_partkey"
-    ");");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ17);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 17 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q17]")
 {
-  RUN_TPCH_MGPU(
-    "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
-    "from lineitem l, part p "
-    "where p.p_partkey = l.l_partkey "
-    "and p.p_brand = 'Brand#13' "
-    "and p.p_container = 'JUMBO CAN' "
-    "and l.l_quantity < ("
-    "  select 0.2 * avg(l2.l_quantity) "
-    "  from lineitem l2 "
-    "  where l2.l_partkey = p.p_partkey"
-    ");");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ17);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 18",
                  "[integration][gpu_execution][TPC-H][Q18]")
 {
-  RUN_TPCH_MGPU(
-    "select c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, "
-    "o.o_totalprice, sum(l.l_quantity) "
-    "from customer c, orders o, lineitem l "
-    "where o.o_orderkey in ("
-    "  select l_orderkey from lineitem "
-    "  group by l_orderkey having sum(l_quantity) > 300"
-    ") "
-    "and c.c_custkey = o.o_custkey "
-    "and o.o_orderkey = l.l_orderkey "
-    "group by c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, o.o_totalprice "
-    "order by o.o_totalprice desc, o.o_orderdate "
-    "limit 100;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ18);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 18 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q18]")
 {
-  RUN_TPCH_MGPU(
-    "select c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, "
-    "o.o_totalprice, sum(l.l_quantity) "
-    "from customer c, orders o, lineitem l "
-    "where o.o_orderkey in ("
-    "  select l_orderkey from lineitem "
-    "  group by l_orderkey having sum(l_quantity) > 300"
-    ") "
-    "and c.c_custkey = o.o_custkey "
-    "and o.o_orderkey = l.l_orderkey "
-    "group by c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, o.o_totalprice "
-    "order by o.o_totalprice desc, o.o_orderdate "
-    "limit 100;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ18);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 19",
                  "[integration][gpu_execution][TPC-H][Q19]")
 {
-  RUN_TPCH_MGPU(
-    "select sum(l.l_extendedprice* (1 - l.l_discount)) as revenue "
-    "from lineitem l, part p "
-    "where ("
-    "  p.p_partkey = l.l_partkey "
-    "  and p.p_brand = 'Brand#41' "
-    "  and p.p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') "
-    "  and l.l_quantity >= 2 and l.l_quantity <= 2 + 10 "
-    "  and p.p_size between 1 and 5 "
-    "  and l.l_shipmode in ('AIR', 'AIR REG') "
-    "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
-    ") or ("
-    "  p.p_partkey = l.l_partkey "
-    "  and p.p_brand = 'Brand#13' "
-    "  and p.p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') "
-    "  and l.l_quantity >= 14 and l.l_quantity <= 14 + 10 "
-    "  and p.p_size between 1 and 10 "
-    "  and l.l_shipmode in ('AIR', 'AIR REG') "
-    "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
-    ") or ("
-    "  p.p_partkey = l.l_partkey "
-    "  and p.p_brand = 'Brand#55' "
-    "  and p.p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') "
-    "  and l.l_quantity >= 23 and l.l_quantity <= 23 + 10 "
-    "  and p.p_size between 1 and 15 "
-    "  and l.l_shipmode in ('AIR', 'AIR REG') "
-    "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
-    ");");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ19);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 19 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q19]")
 {
-  RUN_TPCH_MGPU(
-    "select sum(l.l_extendedprice* (1 - l.l_discount)) as revenue "
-    "from lineitem l, part p "
-    "where ("
-    "  p.p_partkey = l.l_partkey "
-    "  and p.p_brand = 'Brand#41' "
-    "  and p.p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') "
-    "  and l.l_quantity >= 2 and l.l_quantity <= 2 + 10 "
-    "  and p.p_size between 1 and 5 "
-    "  and l.l_shipmode in ('AIR', 'AIR REG') "
-    "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
-    ") or ("
-    "  p.p_partkey = l.l_partkey "
-    "  and p.p_brand = 'Brand#13' "
-    "  and p.p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') "
-    "  and l.l_quantity >= 14 and l.l_quantity <= 14 + 10 "
-    "  and p.p_size between 1 and 10 "
-    "  and l.l_shipmode in ('AIR', 'AIR REG') "
-    "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
-    ") or ("
-    "  p.p_partkey = l.l_partkey "
-    "  and p.p_brand = 'Brand#55' "
-    "  and p.p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') "
-    "  and l.l_quantity >= 23 and l.l_quantity <= 23 + 10 "
-    "  and p.p_size between 1 and 15 "
-    "  and l.l_shipmode in ('AIR', 'AIR REG') "
-    "  and l.l_shipinstruct = 'DELIVER IN PERSON'"
-    ");");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ19);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 20",
                  "[integration][gpu_execution][TPC-H][Q20]")
 {
-  RUN_TPCH_MGPU(
-    "select s.s_name, s.s_address "
-    "from supplier s, nation n "
-    "where s.s_suppkey in ("
-    "  select ps.ps_suppkey from partsupp ps "
-    "  where ps.ps_partkey in ("
-    "    select p.p_partkey from part p where p.p_name like 'antique%'"
-    "  ) "
-    "  and ps.ps_availqty > ("
-    "    select 0.5 * sum(l.l_quantity) "
-    "    from lineitem l "
-    "    where l.l_partkey = ps.ps_partkey "
-    "    and l.l_suppkey = ps.ps_suppkey "
-    "    and l.l_shipdate >= date '1993-01-01' "
-    "    and l.l_shipdate < date '1994-01-01'"
-    "  )"
-    ") "
-    "and s.s_nationkey = n.n_nationkey "
-    "and n.n_name = 'KENYA' "
-    "order by s.s_name;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ20);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 20 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q20]")
 {
-  RUN_TPCH_MGPU(
-    "select s.s_name, s.s_address "
-    "from supplier s, nation n "
-    "where s.s_suppkey in ("
-    "  select ps.ps_suppkey from partsupp ps "
-    "  where ps.ps_partkey in ("
-    "    select p.p_partkey from part p where p.p_name like 'antique%'"
-    "  ) "
-    "  and ps.ps_availqty > ("
-    "    select 0.5 * sum(l.l_quantity) "
-    "    from lineitem l "
-    "    where l.l_partkey = ps.ps_partkey "
-    "    and l.l_suppkey = ps.ps_suppkey "
-    "    and l.l_shipdate >= date '1993-01-01' "
-    "    and l.l_shipdate < date '1994-01-01'"
-    "  )"
-    ") "
-    "and s.s_nationkey = n.n_nationkey "
-    "and n.n_name = 'KENYA' "
-    "order by s.s_name;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ20);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 21",
                  "[integration][gpu_execution][TPC-H][Q21]")
 {
-  RUN_TPCH_MGPU(
-    "select s.s_name, count(*) as numwait "
-    "from supplier s, lineitem l1, orders o, nation n "
-    "where s.s_suppkey = l1.l_suppkey "
-    "and o.o_orderkey = l1.l_orderkey "
-    "and o.o_orderstatus = 'F' "
-    "and l1.l_receiptdate > l1.l_commitdate "
-    "and exists ("
-    "  select * from lineitem l2 "
-    "  where l2.l_orderkey = l1.l_orderkey "
-    "  and l2.l_suppkey <> l1.l_suppkey"
-    ") "
-    "and not exists ("
-    "  select * from lineitem l3 "
-    "  where l3.l_orderkey = l1.l_orderkey "
-    "  and l3.l_suppkey <> l1.l_suppkey "
-    "  and l3.l_receiptdate > l3.l_commitdate"
-    ") "
-    "and s.s_nationkey = n.n_nationkey "
-    "and n.n_name = 'BRAZIL' "
-    "group by s.s_name "
-    "order by numwait desc, s.s_name "
-    "limit 100;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ21);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 21 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q21]")
 {
-  RUN_TPCH_MGPU(
-    "select s.s_name, count(*) as numwait "
-    "from supplier s, lineitem l1, orders o, nation n "
-    "where s.s_suppkey = l1.l_suppkey "
-    "and o.o_orderkey = l1.l_orderkey "
-    "and o.o_orderstatus = 'F' "
-    "and l1.l_receiptdate > l1.l_commitdate "
-    "and exists ("
-    "  select * from lineitem l2 "
-    "  where l2.l_orderkey = l1.l_orderkey "
-    "  and l2.l_suppkey <> l1.l_suppkey"
-    ") "
-    "and not exists ("
-    "  select * from lineitem l3 "
-    "  where l3.l_orderkey = l1.l_orderkey "
-    "  and l3.l_suppkey <> l1.l_suppkey "
-    "  and l3.l_receiptdate > l3.l_commitdate"
-    ") "
-    "and s.s_nationkey = n.n_nationkey "
-    "and n.n_name = 'BRAZIL' "
-    "group by s.s_name "
-    "order by numwait desc, s.s_name "
-    "limit 100;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ21);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 22",
                  "[integration][gpu_execution][TPC-H][Q22]")
 {
-  RUN_TPCH_MGPU(
-    "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal "
-    "from ("
-    "  select substring(c_phone from 1 for 2) as cntrycode, c_acctbal "
-    "  from customer c "
-    "  where substring(c_phone from 1 for 2) in "
-    "    ('24', '31', '11', '16', '21', '20', '34') "
-    "  and c_acctbal > ("
-    "    select avg(c_acctbal) from customer "
-    "    where c_acctbal > 0.00 "
-    "    and substring(c_phone from 1 for 2) in "
-    "      ('24', '31', '11', '16', '21', '20', '34')"
-    "  ) "
-    "  and not exists ("
-    "    select * from orders o where o.o_custkey = c.c_custkey"
-    "  )"
-    ") as custsale "
-    "group by cntrycode "
-    "order by cntrycode;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ22);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 22 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q22]")
 {
-  RUN_TPCH_MGPU(
-    "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal "
-    "from ("
-    "  select substring(c_phone from 1 for 2) as cntrycode, c_acctbal "
-    "  from customer c "
-    "  where substring(c_phone from 1 for 2) in "
-    "    ('24', '31', '11', '16', '21', '20', '34') "
-    "  and c_acctbal > ("
-    "    select avg(c_acctbal) from customer "
-    "    where c_acctbal > 0.00 "
-    "    and substring(c_phone from 1 for 2) in "
-    "      ('24', '31', '11', '16', '21', '20', '34')"
-    "  ) "
-    "  and not exists ("
-    "    select * from orders o where o.o_custkey = c.c_custkey"
-    "  )"
-    ") as custsale "
-    "group by cntrycode "
-    "order by cntrycode;");
+  RUN_TPCH_MGPU(sirius::test::kTpchQ22);
 }
 
 //===----------------------------------------------------------------------===//
@@ -5153,80 +4552,283 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 //===----------------------------------------------------------------------===//
-// cpu_source_task tests — STATISTICS_PROPAGATION / metadata-only queries
+// GPU_VALUES tests — plan-materialized sources
 //
-// When STATISTICS_PROPAGATION is enabled, DuckDB folds ungrouped count(*),
-// MIN, and MAX into constant expressions (EXPRESSION_GET -> DUMMY_SCAN),
-// which the Sirius planner converts to COLUMN_DATA_SCAN -> cpu_source_task.
-// These tests ensure that path works and doesn't regress.
+// The GPU_VALUES source operator serves COLUMN_DATA_SCAN (VALUES clauses,
+// materialized subqueries, STATISTICS_PROPAGATION constant folds), DUMMY_SCAN
+// (constant-only queries), and EMPTY_RESULT (WHERE false). When
+// STATISTICS_PROPAGATION is enabled, DuckDB folds ungrouped count(*), MIN,
+// and MAX into constant expressions (EXPRESSION_GET -> DUMMY_SCAN), which
+// the Sirius planner converts to a GPU_VALUES source. These tests ensure
+// those paths work and don't regress.
 //===----------------------------------------------------------------------===//
+
+struct scan_task_batch_size_guard {
+  duckdb::Connection& con;
+  explicit scan_task_batch_size_guard(duckdb::Connection& con, std::size_t size) : con(con)
+  {
+    con.Query("SET scan_task_batch_size = " + std::to_string(size));
+  }
+  ~scan_task_batch_size_guard() { con.Query("RESET scan_task_batch_size"); }
+};
+
+struct optimizer_disable_guard {
+  duckdb::ClientContext& context;
+  std::set<duckdb::OptimizerType> original_disabled;
+
+  optimizer_disable_guard(duckdb::ClientContext& context, duckdb::OptimizerType optimizer)
+    : context(context),
+      original_disabled(duckdb::DBConfig::GetConfig(context).options.disabled_optimizers)
+  {
+    auto disabled = original_disabled;
+    disabled.insert(optimizer);
+    duckdb::DBConfig::GetConfig(context).options.disabled_optimizers = std::move(disabled);
+  }
+
+  ~optimizer_disable_guard()
+  {
+    duckdb::DBConfig::GetConfig(context).options.disabled_optimizers = std::move(original_disabled);
+  }
+};
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - empty result (WHERE false)",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select n_nationkey from nation where 1=0;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - aggregate over empty result",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select count(*) from nation where 1=0;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - dummy scan (SELECT literal)",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select 42 as x;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values source",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu("select b from (values (1), (2), (3)) t(b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - count over projection-pruned values preserves cardinality",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // Prevent DuckDB from folding the aggregate to a constant: UNUSED_COLUMNS
+  // can then prune the VALUES payload while preserving its three logical rows.
+  // GPU_VALUES must retain those rows even though cuDF cannot represent a
+  // positive-row table with zero columns.
+  optimizer_disable_guard guard(*con->context, duckdb::OptimizerType::STATISTICS_PROPAGATION);
+  compare_gpu_vs_cpu("select count(*) from (values (1), (2), (3)) t(i);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - boolean values",
+                 "[integration][gpu_execution][gpu_values][types]")
+{
+  compare_gpu_vs_cpu("select b from (values (true), (false), (NULL::BOOLEAN)) t(b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - temporal values",
+                 "[integration][gpu_execution][gpu_values][types]")
+{
+  compare_gpu_vs_cpu(
+    "select d, ts from (values "
+    "(DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.123456'), "
+    "(DATE '1999-12-31', TIMESTAMP '1999-12-31 23:59:59.999999'), "
+    "(NULL::DATE, NULL::TIMESTAMP)) t(d, ts);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - DECIMAL32, DECIMAL64, and DECIMAL128 values",
+                 "[integration][gpu_execution][gpu_values][types][decimal]")
+{
+  compare_gpu_vs_cpu(
+    "select d32, d64, d128 from (values "
+    "(CAST('1234567.89' AS DECIMAL(9,2)), "
+    " CAST('12345678901234.5678' AS DECIMAL(18,4)), "
+    " CAST('12345678901234567890123456789012.345678' AS DECIMAL(38,6))), "
+    "(NULL::DECIMAL(9,2), NULL::DECIMAL(18,4), NULL::DECIMAL(38,6))) "
+    "t(d32, d64, d128);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values with varchar and nulls",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  compare_gpu_vs_cpu(
+    "select a, b from (values (1, 'alpha'), (NULL, 'beta'), (3, NULL)) t(a, b) order by a nulls "
+    "first;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values spanning multiple chunks",
+                 "[integration][gpu_execution][gpu_values][large_input]")
+{
+  // > STANDARD_VECTOR_SIZE (2048) rows so the ColumnDataCollection scans
+  // multiple DataChunks through the GPU_VALUES staging path. Disable
+  // statistics propagation so the aggregate cannot be folded before staging.
+  optimizer_disable_guard guard(*con->context, duckdb::OptimizerType::STATISTICS_PROPAGATION);
+  std::string query = "select count(*), min(i), max(i) from (values (0)";
+  for (int i = 1; i < 5000; i++) {
+    query += ", (" + std::to_string(i) + ")";
+  }
+  query += ") t(i);";
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values source fanned out to multiple consumers",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // A VALUES-backed CTE referenced twice fans the GPU_VALUES output out to
+  // multiple downstream data repositories.
+  compare_gpu_vs_cpu(
+    "with t(b) as (values (1), (2), (3)) select a.b, c.b from t a join t c using (b);");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - values joined with base table",
+                 "[integration][gpu_execution][gpu_values]")
+{
+  // GPU_VALUES and GPU_SCAN sources in one plan: exercises kickoff when the
+  // task scheduler only schedules the first scan-like source directly.
+  compare_gpu_vs_cpu(
+    "select n.n_name from nation n join (values (0), (1), (2)) t(k) on n.n_nationkey = t.k order "
+    "by n.n_name;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - oversized values source falls back before GPU materialization",
+                 "[integration][gpu_execution][gpu_values][fallback][large_input]")
+{
+  // GPU_VALUES is intentionally a single-table source. Force a tiny source
+  // cap and verify an oversized collection is refused during planning, where
+  // transparent execution can safely replay it on DuckDB's streaming path.
+  scan_task_batch_size_guard guard(*con, 64);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+
+  std::string const payload(128, 'x');
+  auto result = con->Query("select sum(length(s)) from (values ('" + payload + "'), ('" + payload +
+                           "')) t(s);");
+  REQUIRE(result);
+  if (result->HasError()) {
+    UNSCOPED_INFO("oversized VALUES fallback error: " << result->GetError());
+  }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 256);
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before,
+                                                    after,
+                                                    /*expected_rebind_delta=*/0,
+                                                    /*expected_fallback_delta=*/1,
+                                                    /*expected_execution_delta=*/0);
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - unsupported HUGEINT values fall back",
+                 "[integration][gpu_execution][gpu_values][fallback][types]")
+{
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query(
+    "select x from (values "
+    "(CAST('9223372036854775808' AS HUGEINT)), "
+    "(CAST('-9223372036854775809' AS HUGEINT))) t(x) order by x;");
+
+  REQUIRE(result);
+  if (result->HasError()) {
+    UNSCOPED_INFO("unsupported HUGEINT VALUES fallback error: " << result->GetError());
+  }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->RowCount() == 2);
+  REQUIRE(result->GetValue(0, 0).ToString() == "-9223372036854775809");
+  REQUIRE(result->GetValue(0, 1).ToString() == "9223372036854775808");
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before,
+                                                    after,
+                                                    /*expected_rebind_delta=*/0,
+                                                    /*expected_fallback_delta=*/1,
+                                                    /*expected_execution_delta=*/0);
+}
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped count(*)",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped count(*) parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped min",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped min parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select max(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped min and max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(n_nationkey), max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped min and max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select min(l_orderkey), max(l_orderkey) from lineitem;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - ungrouped count(*) with min and max",
-                 "[integration][gpu_execution][cpu_source]")
+                 "[integration][gpu_execution][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*), min(n_nationkey), max(n_nationkey) from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - ungrouped count(*) with min and max parquet",
-                 "[integration][gpu_execution][parquet][cpu_source]")
+                 "[integration][gpu_execution][parquet][gpu_values]")
 {
   compare_gpu_vs_cpu("select count(*), min(l_orderkey), max(l_orderkey) from lineitem;");
 }

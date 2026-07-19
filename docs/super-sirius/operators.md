@@ -41,17 +41,7 @@ These operators produce data for pipelines. See [Scan](scan.md) for in-depth cov
 ### `sirius_physical_table_scan` — `TABLE_SCAN`
 **File:** `src/include/op/sirius_physical_table_scan.hpp`
 
-Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. During pipeline construction it is converted into a format-specific wrapper (`DUCKDB_SCAN` or `PARQUET_SCAN`) for the CPU / DuckDB-source path; the GPU read path for parquet and DuckDB-native tables is instead rewritten into a `GPU_SCAN` source (see below).
-
-### `sirius_physical_duckdb_scan` — `DUCKDB_SCAN`
-**File:** `src/include/op/sirius_physical_duckdb_scan.hpp`
-
-Sequential scan using DuckDB's execution engine. Accumulates chunks into fixed-size batches via column builders. Tracks an atomic `exhausted` flag for pipeline completion.
-
-### `sirius_physical_parquet_scan` — `PARQUET_SCAN`
-**File:** `src/include/op/sirius_physical_parquet_scan.hpp`
-
-Wrapper for the DuckDB-source parquet path. Reads column-chunk byte ranges and optionally materializes (decompresses) to table format. Tracks `has_more_partitions` atomic flag. Row groups are partitioned by `approximate_batch_size`.
+Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. It exists only as the plan-time carrier: during plan generation it is rewritten into a `GPU_SCAN` source (see below).
 
 ### `sirius_gpu_scan_operator` — `GPU_SCAN`
 **File:** `src/include/op/scan/sirius_gpu_scan_operator.hpp`
@@ -61,6 +51,50 @@ Unified GPU scan source operator for reading table data from storage. It carries
 The pipeline converter rewrites a DuckDB parquet or DuckDB-native table scan into a `GPU_SCAN` source: it lowers the bind data into the appropriate `ingestible_table_info`, builds the `gpu_ingestible`, and inserts the operator at `operators[0]` of the pipeline. Before a query runs, `sirius_scan_manager` prepares scan-side state — matching pinned-cache entries or building a `split_provider` over each operator's ingestible — and drives metadata production, split coalescing, and per-GPU balancing, pushing splits onto each operator's `split_connector`. `execute()` calls `gpu_ingestible::materialize_table` and, when a split carries filter/projection info, `gpu_ingestible::post_filter_and_project`.
 
 See [Scan](scan.md) for the full scan subsystem (scan manager, `gpu_ingestible`, pinned-table caching, and the IO layer).
+
+### `sirius_physical_streaming_source` — `STREAMING_SOURCE`
+**File:** `src/include/op/sirius_physical_streaming_source.hpp`
+
+Source operator that marks the bottom boundary of an intermediate pipeline fragment. It pulls
+`exchange_batch_handle` records (batch-id + size) from a bounded `exec::exchange_channel`, resolves
+each handle via a `cucascade::shared_data_repository`, and publishes the batch into the pipeline
+as a `pipelineable_operator_data`. Used only when a fragment's input arrives from another node
+over exchange; a leaf fragment keeps its normal `GPU_SCAN` source.
+
+Key design invariants:
+- The channel carries **handles**, not `shared_ptr`s — the repository owns the batch so queued
+  items remain spill-visible to the downgrade executor.
+- Engine workers use `try_pop` only (non-blocking); `push`/`pop` are provided for the wrapper/test side.
+- EOS is **close-then-drain**: `close()` forbids new pushes; queued handles stay poppable;
+  `drained()` (= `closed() && empty()`) is the terminal predicate.
+- `execute()` is a pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
+- `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
+
+Hint table:
+
+| Channel state | `get_next_task_hint()` |
+|---|---|
+| non-empty (open or closed) | `READY{this}` |
+| open, empty | `WAITING{nullptr}` — re-armable by the session on push (#839) |
+| closed && drained | `std::nullopt` — EOS |
+
+`all_ports_empty()` is overridden to `_input_channel->drained()`, driving both the task-creation
+loop guard and the port-less source pipeline-finish predicate.
+
+Channel close notifies the pipeline (`update_pipeline_status(false)`, via a weak pipeline
+reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
+pipeline — and re-arms downstream consumers — even when no task is left in flight.
+
+**Producer contract**: register the incoming batch in the input repository (`add_data_batch`) *first*,
+then push the handle. The session (#839) owns edge-triggered re-scheduling; the plan generator (#838)
+owns channel wiring.
+
+**Backpressure (open integration requirement for #839)**: `try_pop()` frees channel item/byte
+capacity at task-creation time, but the popped batches move into the unbounded task-scheduler
+queue — the channel bound therefore does not bound total outstanding data. When #839 wires the
+session, task creation must be gated on in-flight work (e.g. counting via the channel's `on_pop`
+hook and the task-completion path) so a fast producer cannot accumulate an arbitrarily large GPU
+backlog behind a nominally bounded channel.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -309,9 +343,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
-| DUCKDB_SCAN | Scan | DuckDB table function (CPU / DuckDB-source path) |
-| PARQUET_SCAN | Scan | Parquet reading (CPU / DuckDB-source path) |
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
+| STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |

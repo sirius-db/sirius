@@ -35,7 +35,6 @@ sirius:
       monitor_period: 10ms
   operator_params:
     scan_task_batch_size: 536870912
-    default_scan_task_varchar_size: 256
     max_sort_partition_bytes: 0
     hash_partition_bytes: 536870912
     concat_batch_bytes: 536870912

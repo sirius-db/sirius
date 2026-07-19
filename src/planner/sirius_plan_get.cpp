@@ -26,14 +26,19 @@
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius_context.hpp"
 
 #include <memory>
 #include <unordered_set>
@@ -132,18 +137,185 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats) ||
             duckdb::StringStats::MaxStringLength(*stats) >= overflow_limit) {
           throw duckdb::NotImplementedException(
-            "duckdb-native scan: varchar column {} may contain strings at/over the "
-            "overflow-block limit ({} bytes); overflow strings are not GPU-decodable",
-            primary,
-            overflow_limit);
+            "duckdb-native scan: varchar column %llu may contain strings at/over the "
+            "overflow-block limit (%llu bytes); overflow strings are not GPU-decodable",
+            static_cast<unsigned long long>(primary),
+            static_cast<unsigned long long>(overflow_limit));
         }
       }
+
+      // Sentinel columns (rowid/virtual/empty/field) have no storage backing,
+      // which makes a pin unservable for this scan.
+      bool has_unservable_column = false;
+      for (auto const& col_idx : column_ids) {
+        if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() || col_idx.IsVirtualColumn() ||
+            col_idx.IsEmptyColumn()) {
+          has_unservable_column = true;
+          break;
+        }
+      }
+
+      sirius::scan_manager::pinned_entry const* entry = nullptr;
+      if (context.registered_state) {
+        if (auto sirius_state =
+              context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+          entry = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
+            table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+        }
+      }
+      if (entry != nullptr && entry->mvcc != nullptr) {
+        // Cache-or-CPU guards: while this table is MVCC-pinned, a GPU plan
+        // either serves exactly from the pinned cache (DELETE keep-masks) or is
+        // refused HERE, where the throw still becomes a clean CPU fallback. The
+        // disk-native path is MVCC-blind, and the pin's checkpoint suppression
+        // makes its snapshot increasingly stale — so scans the pin cannot serve
+        // never fall through to it.
+        auto const n_cache = entry->mvcc->n_cache();
+        // (a) snapshot-too-old: this transaction opened before the pin, so
+        // the cache's base image is from its future.
+        auto const start_time =
+          duckdb::DuckTransaction::Get(context, table.ParentCatalog()).start_time;
+        if (start_time < entry->mvcc->v_base) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: transaction snapshot (%llu) predates the pinned cache "
+            "snapshot (%llu) for table '%s'",
+            static_cast<unsigned long long>(start_time),
+            static_cast<unsigned long long>(entry->mvcc->v_base),
+            table.name);
+        }
+        // (b) insert-present: committed rows beyond the pinned prefix, or
+        // this transaction's own uncommitted appends (transaction-local
+        // storage) — not served from the cache until the insert-delta
+        // reader lands.
+        if (static_cast<std::size_t>(storage.GetTotalRows()) > n_cache) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' has rows beyond the %llu pinned at pin time; "
+            "post-pin inserts are not served from the cache yet",
+            table.name,
+            static_cast<unsigned long long>(n_cache));
+        }
+        if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
+            "transaction-local inserts are not served from the cache",
+            table.name);
+        }
+        bool pin_serves = !has_unservable_column;
+        if (pin_serves && !column_ids.empty()) {
+          pin_serves = !entry->cache_info.column_projection_for(column_ids).empty();
+        }
+        if (!pin_serves) {
+          // (d) column-mismatch: the scan would fall through to the MVCC-blind
+          // disk-native read, so it always declines. The disabled clean-table
+          // relaxation below lets a table that provably matches its
+          // last-checkpointed image fall through instead (#1160).
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' is MVCC-pinned and the pin cannot serve the "
+            "requested columns",
+            table.name);
+        }
+#if 0
+        // Disabled — these guards walk every row group of the table at plan
+        // time, per query; #1160 tracks running the checks from the scan
+        // manager at execution time instead. With this block off, (d) above
+        // has no clean-table relaxation and (c) is unguarded: post-pin UPDATE
+        // chains serve stale cached values (UPDATE support is #1162; pin_table
+        // still refuses tables that already carry update chains).
+        std::vector<duckdb::storage_t> projected;
+        for (auto const& col_idx : column_ids) {
+          if (col_idx.HasPrimaryIndex() && !col_idx.IsRowIdColumn() &&
+              !col_idx.IsVirtualColumn() && !col_idx.IsEmptyColumn()) {
+            projected.push_back(col_idx.GetPrimaryIndex());
+          }
+        }
+        if (!pin_serves) {
+          // (d) column-mismatch: the scan falls through to the disk-native
+          // read, so it must pass the same exactness check as an unpinned
+          // scan. Guards (a)/(b) already excluded post-pin inserts and
+          // transaction-local appends.
+          auto& txn = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
+          if (sirius::op::scan::check_native_read_mvcc_state(
+                storage, projected, duckdb::TransactionData(txn)) !=
+              sirius::op::scan::native_read_mvcc_state::exact) {
+            throw duckdb::NotImplementedException(
+              "duckdb-native scan: table '%s' is MVCC-pinned, the pin cannot serve the "
+              "requested columns, and the table has diverged from its last-checkpointed "
+              "image",
+              table.name);
+          }
+        } else if (sirius::op::scan::any_update_chains(storage, projected, n_cache)) {
+          // (c) update-present on a column the cache would serve: update
+          // chains version values in place, invisibly to the DELETE
+          // keep-masks — the cached values would be stale.
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
+            "column; updated values are not served from the cache",
+            table.name);
+        }
+#endif
+      }
+#if 0
+      // Disabled — plan-time MVCC guards for duckdb-native scans of unpinned
+      // tables: the exactness walk touches every row group of the table, per
+      // query; #1160 tracks running it from the scan manager at execution
+      // time instead. With this block off, the disk-native read of an
+      // unpinned table is MVCC-blind (#1143): uncheckpointed deletes and
+      // update chains are served silently, and committed-but-uncheckpointed
+      // inserts fail loudly at execution.
+      if (entry == nullptr || entry->mvcc == nullptr) {
+        // No MVCC-pinned cache for this table: the plan is the disk-native
+        // read, which applies no visibility filtering — refuse any state it
+        // would misread HERE, where the throw still becomes a clean CPU
+        // fallback. Residual race: a row committing between this check and
+        // the scan's metadata capture is read unmasked; the prepare-time
+        // keep-masks planned in #1143 close it.
+        std::vector<duckdb::storage_t> projected;
+        for (auto const& col_idx : column_ids) {
+          if (col_idx.HasPrimaryIndex() && !col_idx.IsRowIdColumn() &&
+              !col_idx.IsVirtualColumn() && !col_idx.IsEmptyColumn()) {
+            projected.push_back(col_idx.GetPrimaryIndex());
+          }
+        }
+        if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' has uncommitted appends in this transaction; "
+            "the disk-native read cannot see transaction-local rows",
+            table.name);
+        }
+        auto& txn = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
+        switch (sirius::op::scan::check_native_read_mvcc_state(
+          storage, projected, duckdb::TransactionData(txn))) {
+          case sirius::op::scan::native_read_mvcc_state::has_update_chains:
+            throw duckdb::NotImplementedException(
+              "duckdb-native scan: table '%s' has in-memory update chains on a scanned "
+              "column; the disk-native read would return stale values",
+              table.name);
+          case sirius::op::scan::native_read_mvcc_state::has_invisible_rows:
+            throw duckdb::NotImplementedException(
+              "duckdb-native scan: table '%s' has rows not visible to this transaction "
+              "(uncheckpointed deletes or in-flight inserts); the disk-native read is "
+              "MVCC-blind",
+              table.name);
+          case sirius::op::scan::native_read_mvcc_state::exact: break;
+        }
+      }
+#endif
     }
   }
 
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   if (!op.table_filters.filters.empty()) {
     table_filters = create_table_filter_set(op.table_filters, column_ids);
+    // Predicates pushed into table_filters bypass the LogicalFilter guard —
+    // reject nested columns here too (e.g. `WHERE items IS NULL`).
+    for (auto const& entry : table_filters->filters) {
+      auto const column_id = column_ids[entry.first].GetPrimaryIndex();
+      if (column_id < op.returned_types.size()) {
+        auto const column_name =
+          column_id < op.names.size() ? op.names[column_id] : std::to_string(column_id);
+        reject_nested_column_type(op.returned_types[column_id], column_name, "a filter predicate");
+      }
+    }
   }
 
   if (op.function.dependency) { op.function.dependency(dependencies, op.bind_data.get()); }

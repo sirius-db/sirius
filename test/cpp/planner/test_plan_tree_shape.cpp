@@ -83,7 +83,9 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
-/// Generate a Sirius physical plan from a SQL query string.
+/// Generate a Sirius physical plan from a SQL query string. Throws on any failure (after
+/// rolling back and restoring the optimizer settings) so a planner regression fails the
+/// test instead of silently skipping it.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& con,
                                                                   const std::string& query)
 {
@@ -91,8 +93,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
 
   auto original_disabled = DBConfig::GetConfig(context).options.disabled_optimizers;
   auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
-  // Mirror the transparent-interception disables (SiriusExtension PrepareConnection):
-  // without STATISTICS_PROPAGATION the deliminator keeps the DELIM_JOINs this file asserts.
+  // Keep STATISTICS_PROPAGATION disabled only for this shape-sensitive suite:
+  // disabling it lets the deliminator retain the DELIM_JOINs asserted below.
   disabled.insert(OptimizerType::IN_CLAUSE);
   disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
   disabled.insert(OptimizerType::STATISTICS_PROPAGATION);
@@ -124,10 +126,6 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
 
     sirius::planner::sirius_physical_plan_generator gen(context);
     result = gen.create_plan(std::move(plan));
-  } catch (duckdb::InternalException&) {
-    con.Query("ROLLBACK");
-    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
-    return nullptr;
   } catch (...) {
     con.Query("ROLLBACK");
     DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
@@ -269,10 +267,9 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   auto* hgb = partition->children[0].get();
   REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
 
-  // `distinct` always borrows the subtree bottom; the delim sink runs it inline.
+  // `distinct` always borrows the subtree bottom (the bare DISTINCT).
   REQUIRE(delim.distinct != nullptr);
   CHECK(static_cast<sirius_physical_operator*>(delim.distinct) == hgb);
-  CHECK(delim.distinct->is_owned_by_delim_join());
 
   REQUIRE(delim.join);
   REQUIRE(delim.join->children.size() == 2);
@@ -325,10 +322,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "[plan_tree_shape][isolated_context]")
 {
   auto plan = generate_sirius_plan(*con, "SELECT val FROM big_left WHERE id > 5");
-  if (!plan) {
-    WARN("Plan generation failed (no DuckDB table scan support); skipping");
-    return;
-  }
   INFO(tree_to_string(plan.get()));
 
   CHECK(collect(plan.get(), SiriusPhysicalOperatorType::TABLE_SCAN).empty());
@@ -341,15 +334,32 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - materialized sources are replaced by GPU_VALUES",
+                 "[plan_tree_shape][isolated_context]")
+{
+  auto require_gpu_values_source = [&](const std::string& query) {
+    auto plan = generate_sirius_plan(*con, query);
+    INFO(tree_to_string(plan.get()));
+
+    auto gpu_values = collect(plan.get(), SiriusPhysicalOperatorType::GPU_VALUES);
+    REQUIRE(gpu_values.size() == 1);
+    CHECK(gpu_values.front()->children.empty());
+  };
+
+  // VALUES -> COLUMN_DATA_SCAN holding a materialized collection.
+  require_gpu_values_source("VALUES (1), (2)");
+  // No-table SELECT -> DUMMY_SCAN.
+  require_gpu_values_source("SELECT 40 + 2");
+  // Provably-empty scan -> EMPTY_RESULT.
+  require_gpu_values_source("SELECT val FROM big_left WHERE 1 = 0");
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - join children are wrapped CONCAT -> PARTITION with roles",
                  "[plan_tree_shape][isolated_context]")
 {
   auto plan =
     generate_sirius_plan(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid");
-  if (!plan) {
-    WARN("Plan generation failed; skipping");
-    return;
-  }
   INFO(tree_to_string(plan.get()));
 
   auto* hj = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
@@ -371,10 +381,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("grouped aggregate gains a MERGE_GROUP_BY -> PARTITION fanout")
   {
     auto plan = generate_sirius_plan(*con, "SELECT val, count(*) FROM big_left GROUP BY val");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
@@ -392,10 +398,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
     auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
@@ -412,10 +414,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("order-by becomes MERGE_SORT -> SORT_PARTITION -> SORT_SAMPLE -> ORDER_BY")
   {
     auto plan = generate_sirius_plan(*con, "SELECT * FROM big_left ORDER BY val");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT);
@@ -433,10 +431,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("top-n becomes MERGE_TOP_N -> TOP_N")
   {
     auto plan = generate_sirius_plan(*con, "SELECT * FROM big_left ORDER BY val LIMIT 3");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_TOP_N);
@@ -457,10 +451,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       *con,
       "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
       "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
@@ -492,10 +482,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       *con,
       "SELECT l.id FROM big_left l "
       "WHERE EXISTS (SELECT 1 FROM small_right r WHERE r.rid = l.id AND r.other < l.val)");
-    if (!plan) {
-      WARN("Plan generation failed; skipping");
-      return;
-    }
     INFO(tree_to_string(plan.get()));
 
     auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::LEFT_DELIM_JOIN);
@@ -503,11 +489,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto& delim = node->Cast<sirius::op::sirius_physical_left_delim_join>();
     require_delim_join_common(delim);
 
-    // The cached chunk scan (filled at runtime by the delim sink) is buried under the
-    // internal join's probe-side CONCAT/PARTITION chain and is tagged so its
-    // build_pipelines is a no-op.
+    // The cached chunk scan (filled at runtime by the delim join's fan-out) is buried under
+    // the internal join's probe-side CONCAT/PARTITION chain.
     REQUIRE(delim.column_data_scan != nullptr);
-    CHECK(delim.column_data_scan->is_owned_by_delim_join());
     CHECK(contains(delim.join->children[0].get(), delim.column_data_scan));
   }
 }
@@ -531,10 +515,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     DYNAMIC_SECTION("query: " << query)
     {
       auto plan = generate_sirius_plan(*con, query);
-      if (!plan) {
-        WARN("Plan generation failed; skipping");
-        return;
-      }
       INFO(tree_to_string(plan.get()));
 
       // Root has no parent; every other operator's parent is its tree position, including

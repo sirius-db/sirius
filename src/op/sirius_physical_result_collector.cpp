@@ -59,6 +59,9 @@ sirius_physical_result_collector::sirius_physical_result_collector(
     names(data.prepared->names)
 {
   this->types = sirius::from_duckdb_vec(data.prepared->types);
+  // Full DuckDB types incl. nested children — sirius::logical_type cannot
+  // represent them.
+  this->result_column_types = data.prepared->types;
 }
 
 std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
@@ -96,7 +99,7 @@ sirius_physical_materialized_collector::sirius_physical_materialized_collector(
   ::sirius::sirius_prepared_statement_data& data, duckdb::ClientContext& client_ctx)
   : sirius_physical_result_collector(data),
     result_collection(
-      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, sirius::to_duckdb_vec(types))),
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, result_column_types)),
     _client_ctx(client_ctx)
 {
 }
@@ -109,7 +112,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
   // Return an empty result collection if the result_collection is null (from a move)
   if (!result_collection) {
     result_collection =
-      duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, sirius::to_duckdb_vec(types));
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
   }
 
   return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
@@ -163,13 +166,32 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
 
+      auto host_reservation =
+        const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(
+          data->get_size_in_bytes());
+
       // clone_to: creates new batch with data converted to host_data_representation
-      auto result_batch = ro.clone_to<cucascade::host_data_representation>(
-        registry,
-        next_batch_id,
-        mem_space,
-        stream,
-        telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
+      if (host_reservation == nullptr) {
+        SIRIUS_LOG_WARN(
+          "sirius_physical_materialized_collector: host reservation failed for batch {} ({} "
+          "bytes) — proceeding without reservation, converter may OOM",
+          ro.get_batch_id(),
+          data->get_size_in_bytes());
+      }
+      auto result_batch =
+        host_reservation != nullptr
+          ? ro.clone_to<cucascade::host_data_representation>(
+              registry,
+              next_batch_id,
+              *host_reservation,
+              stream,
+              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id))
+          : ro.clone_to<cucascade::host_data_representation>(
+              registry,
+              next_batch_id,
+              mem_space,
+              stream,
+              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.
@@ -199,7 +221,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] host_table allocation is null (cannot read chunks)");
     }
 
-    host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);
+    host_table_chunk_reader chunk_reader(_client_ctx, host_table, result_column_types);
 
     // Push chunks to result collection
     while (true) {
@@ -214,8 +236,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       std::lock_guard<std::mutex> guard(lock);
       // Initialize result collection if it is null (from a move)
       if (!result_collection) {
-        result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(
-          _client_ctx, sirius::to_duckdb_vec(types));
+        result_collection =
+          duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
       }
       result_collection->Append(chunk);
     }

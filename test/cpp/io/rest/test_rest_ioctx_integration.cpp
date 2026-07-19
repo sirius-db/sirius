@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/s3/s3_list_parser.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
@@ -23,6 +24,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/s3_container.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -30,13 +32,15 @@
 #include <cuda_runtime.h>
 
 #include <arpa/inet.h>
+#include <config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <log/logging.hpp>
 #include <netinet/in.h>
-#include <spdlog/sinks/base_sink.h>
-#include <spdlog/spdlog.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <utils/log_test_utils.hpp>
 
 #include <algorithm>
 #include <array>
@@ -44,6 +48,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -56,6 +61,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -239,13 +245,33 @@ struct range_fault_policy {
   bool fail_all_gets{false};
   std::size_t fail_first_heads{0};
   bool fail_all_heads{false};
+  std::size_t fail_first_lists{0};
+  bool fail_all_lists{false};
   int fail_status{503};
   int fail_head_status{503};
+  int fail_list_status{503};
   std::chrono::milliseconds response_delay{0};
   bool omit_content_range{false};
   bool unknown_content_range_total{false};
   bool ignore_range_with_200{false};
   bool fail_suffix_with_416{false};
+};
+
+struct listed_object {
+  std::string key;
+  std::uint64_t size{0};
+};
+
+struct generated_listing {
+  std::string prefix;
+  std::size_t total{0};
+};
+
+enum class scripted_list_mode {
+  normal,
+  repeated_empty_token,
+  alternating_empty_tokens,
+  truncated_empty_without_token
 };
 
 class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer {
@@ -259,14 +285,24 @@ class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer 
     return {_endpoint + "/" + obj.bucket + "/" + obj.key, {}};
   }
 
+  sirius::io::s3::s3_authorized_request authorize_list(std::string_view bucket,
+                                                       std::string_view canonical_query,
+                                                       std::chrono::seconds /*timeout*/) override
+  {
+    return {_endpoint + "/" + std::string{bucket} + "?" + std::string{canonical_query}, {}};
+  }
+
  private:
   std::string _endpoint;
 };
 
 class range_http_server {
  public:
-  explicit range_http_server(std::vector<std::uint8_t> object, range_fault_policy fault = {})
-    : _object(std::move(object)), _fault(fault)
+  explicit range_http_server(std::vector<std::uint8_t> object,
+                             range_fault_policy fault          = {},
+                             std::vector<listed_object> listed = {},
+                             scripted_list_mode list_mode      = scripted_list_mode::normal)
+    : _object(std::move(object)), _fault(fault), _listed(std::move(listed)), _list_mode(list_mode)
   {
     REQUIRE_FALSE(_object.empty());
 
@@ -316,8 +352,14 @@ class range_http_server {
   [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
   [[nodiscard]] std::size_t head_count() const noexcept { return _head_count.load(); }
   [[nodiscard]] std::size_t get_count() const noexcept { return _get_count.load(); }
+  [[nodiscard]] std::size_t list_count() const noexcept { return _list_count.load(); }
   [[nodiscard]] std::size_t body_bytes_sent() const noexcept { return _body_bytes_sent.load(); }
   [[nodiscard]] int peak_active_gets() const noexcept { return _peak_active_gets.load(); }
+
+  void set_generated_listing(std::string prefix, std::size_t total)
+  {
+    _generated_listing = generated_listing{std::move(prefix), total};
+  }
 
  private:
   struct active_get_guard {
@@ -333,6 +375,97 @@ class range_http_server {
   };
 
   static std::string errno_message() { return std::strerror(errno); }
+
+  static std::string request_target(std::string const& request)
+  {
+    auto first_space = request.find(' ');
+    if (first_space == std::string::npos) { return {}; }
+    auto second_space = request.find(' ', first_space + 1);
+    if (second_space == std::string::npos) { return {}; }
+    return request.substr(first_space + 1, second_space - first_space - 1);
+  }
+
+  static std::string xml_escape(std::string_view value)
+  {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+      switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&apos;"; break;
+        default: out.push_back(c); break;
+      }
+    }
+    return out;
+  }
+
+  static int from_hex(char c)
+  {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+  }
+
+  static std::string percent_decode(std::string_view value)
+  {
+    std::string out;
+    out.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+      if (value[i] == '%' && i + 2 < value.size()) {
+        auto hi = from_hex(value[i + 1]);
+        auto lo = from_hex(value[i + 2]);
+        if (hi >= 0 && lo >= 0) {
+          out.push_back(static_cast<char>((hi << 4) | lo));
+          i += 2;
+          continue;
+        }
+      }
+      out.push_back(value[i]);
+    }
+    return out;
+  }
+
+  static std::string query_value(std::string const& target, std::string_view key)
+  {
+    auto qpos = target.find('?');
+    if (qpos == std::string::npos) { return {}; }
+    auto query      = std::string_view{target}.substr(qpos + 1);
+    auto needle     = std::string{key} + "=";
+    std::size_t pos = 0;
+    while (pos < query.size()) {
+      auto amp = query.find('&', pos);
+      if (amp == std::string_view::npos) { amp = query.size(); }
+      auto part        = query.substr(pos, amp - pos);
+      auto needle_view = std::string_view{needle};
+      if (part.size() >= needle_view.size() && part.substr(0, needle_view.size()) == needle_view) {
+        return percent_decode(part.substr(needle.size()));
+      }
+      pos = amp + 1;
+    }
+    return {};
+  }
+
+  static std::size_t page_start_from_token(std::string const& token)
+  {
+    if (token.empty()) { return 0; }
+    std::string const prefix = "page/";
+    std::string const suffix = "+=";
+    if (token.rfind(prefix, 0) != 0 || token.size() <= prefix.size() + suffix.size() ||
+        token.substr(token.size() - suffix.size()) != suffix) {
+      throw std::runtime_error("unexpected continuation-token: " + token);
+    }
+    return static_cast<std::size_t>(
+      std::stoull(token.substr(prefix.size(), token.size() - prefix.size() - suffix.size())));
+  }
+
+  static std::string continuation_token_for(std::size_t index)
+  {
+    return "page/" + std::to_string(index) + "+=";
+  }
 
   void accept_loop()
   {
@@ -364,6 +497,7 @@ class range_http_server {
 
     bool const is_head = request.rfind("HEAD ", 0) == 0;
     bool const is_get  = request.rfind("GET ", 0) == 0;
+    auto const target  = request_target(request);
     if (is_head) {
       auto const head_idx = _head_count.fetch_add(1, std::memory_order_relaxed);
       if (_fault.fail_all_heads || head_idx < _fault.fail_first_heads) {
@@ -377,6 +511,10 @@ class range_http_server {
         "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
         "\r\nConnection: close\r\n\r\n";
       send_all(fd, response);
+      return;
+    }
+    if (is_get && target.find("list-type=2") != std::string::npos) {
+      handle_list_request(fd, target);
       return;
     }
     if (!is_get) {
@@ -431,6 +569,103 @@ class range_http_server {
                            "\r\nConnection: close\r\n\r\n";
     send_all(fd, response);
     send_body(fd, _object.data(), _object.size());
+  }
+
+  void handle_list_request(int fd, std::string const& target)
+  {
+    auto const list_idx = _list_count.fetch_add(1, std::memory_order_relaxed);
+    if (_fault.fail_all_lists || list_idx < _fault.fail_first_lists) {
+      std::string response =
+        "HTTP/1.1 " + std::to_string(_fault.fail_list_status) +
+        " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      send_all(fd, response);
+      return;
+    }
+    if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
+
+    if (_list_mode != scripted_list_mode::normal) {
+      std::string token_out;
+      if (_list_mode == scripted_list_mode::repeated_empty_token) {
+        token_out = "repeat-token";
+      } else if (_list_mode == scripted_list_mode::alternating_empty_tokens) {
+        token_out = list_idx % 2 == 0 ? "token-A" : "token-B";
+      }
+
+      std::ostringstream xml;
+      xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+             "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+             "<IsTruncated>true</IsTruncated>";
+      if (!token_out.empty()) {
+        xml << "<NextContinuationToken>" << xml_escape(token_out) << "</NextContinuationToken>";
+      }
+      xml << "</ListBucketResult>";
+
+      auto body = xml.str();
+      std::string response =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+      send_all(fd, response);
+      send_all(fd, body);
+      return;
+    }
+
+    auto prefix          = query_value(target, "prefix");
+    auto token           = query_value(target, "continuation-token");
+    std::size_t max_keys = 1000;
+    auto max_keys_text   = query_value(target, "max-keys");
+    if (!max_keys_text.empty()) {
+      max_keys = std::max<std::size_t>(
+        1, std::min<std::size_t>(1000, static_cast<std::size_t>(std::stoull(max_keys_text))));
+    }
+    auto start = page_start_from_token(token);
+
+    std::ostringstream xml;
+    xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+           "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+           "<IsTruncated>";
+
+    auto const emit_contents = [&](std::string_view key, std::uint64_t size) {
+      xml << "<Contents><Key>" << xml_escape(key) << "</Key><Size>" << size << "</Size></Contents>";
+    };
+
+    bool truncated        = false;
+    std::string token_out = {};
+    if (_generated_listing.has_value() && prefix == _generated_listing->prefix) {
+      auto const total = _generated_listing->total;
+      if (start > total) { start = total; }
+      auto const end = std::min(start + max_keys, total);
+      truncated      = end < total;
+      token_out      = truncated ? continuation_token_for(end) : std::string{};
+      xml << (truncated ? "true" : "false") << "</IsTruncated>";
+      for (std::size_t i = start; i < end; ++i) {
+        emit_contents(_generated_listing->prefix + std::to_string(i),
+                      static_cast<std::uint64_t>(i % 4096U));
+      }
+    } else {
+      std::vector<listed_object> matching;
+      for (auto const& object : _listed) {
+        if (object.key.rfind(prefix, 0) == 0) { matching.push_back(object); }
+      }
+
+      if (start > matching.size()) { start = matching.size(); }
+      auto const end = std::min(start + max_keys, matching.size());
+      truncated      = end < matching.size();
+      token_out      = truncated ? continuation_token_for(end) : std::string{};
+      xml << (truncated ? "true" : "false") << "</IsTruncated>";
+      for (auto i = start; i < end; ++i) {
+        emit_contents(matching[i].key, matching[i].size);
+      }
+    }
+    if (truncated) {
+      xml << "<NextContinuationToken>" << xml_escape(token_out) << "</NextContinuationToken>";
+    }
+    xml << "</ListBucketResult>";
+
+    auto body            = xml.str();
+    std::string response = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
+                           std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+    send_all(fd, response);
+    send_all(fd, body);
   }
 
   [[nodiscard]] static bool is_suffix_range(std::string const& request)
@@ -505,9 +740,13 @@ class range_http_server {
   std::uint16_t _port{0};
   std::vector<std::uint8_t> _object;
   range_fault_policy _fault;
+  std::vector<listed_object> _listed;
+  scripted_list_mode _list_mode;
+  std::optional<generated_listing> _generated_listing;
   std::atomic<bool> _stop{false};
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
+  std::atomic<std::size_t> _list_count{0};
   std::atomic<std::size_t> _body_bytes_sent{0};
   std::atomic<int> _active_gets{0};
   std::atomic<int> _peak_active_gets{0};
@@ -529,12 +768,13 @@ sirius::io::rest::config direct_rest_test_config()
 }
 
 std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint,
-                                                   sirius::io::rest::config cfg)
+                                                   sirius::io::rest::config cfg,
+                                                   std::size_t n_reactors = 1)
 {
   auto authorizer = std::make_shared<fixed_url_authorizer>(std::move(endpoint));
   auto ctx        = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
     cfg, std::move(authorizer), nullptr);
-  auto ioctx = std::make_shared<rest_ioctx>(1, std::move(ctx));
+  auto ioctx = std::make_shared<rest_ioctx>(n_reactors, std::move(ctx));
   ioctx->start();
   return ioctx;
 }
@@ -544,63 +784,683 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
   return make_direct_rest_ioctx(std::move(endpoint), direct_rest_test_config());
 }
 
-class capture_sink final : public spdlog::sinks::base_sink<std::mutex> {
- public:
-  struct record {
-    spdlog::level::level_enum level;
-    std::string payload;
-  };
+using capture_sink       = sirius::test::recording_log_sink;
+using scoped_log_capture = sirius::test::scoped_recording_log_sink;
 
-  [[nodiscard]] std::vector<record> records() const
-  {
-    std::lock_guard<std::mutex> lock(_records_mutex);
-    return _records;
-  }
-
- protected:
-  void sink_it_(spdlog::details::log_msg const& msg) override
-  {
-    std::lock_guard<std::mutex> lock(_records_mutex);
-    _records.push_back({msg.level, std::string(msg.payload.data(), msg.payload.size())});
-  }
-
-  void flush_() override {}
-
- private:
-  mutable std::mutex _records_mutex;
-  std::vector<record> _records;
+struct list_watchdog_result {
+  bool timed_out{false};
+  bool exited_normally{false};
+  int exit_code{-1};
 };
 
-class scoped_spdlog_capture {
- public:
-  scoped_spdlog_capture()
-    : _logger(spdlog::default_logger()),
-      _sink(std::make_shared<capture_sink>()),
-      _old_level(_logger->level())
-  {
-    _logger->sinks().push_back(_sink);
-    _logger->set_level(spdlog::level::trace);
+list_watchdog_result run_list_watchdog(range_http_server const& server,
+                                       std::chrono::milliseconds startup_timeout,
+                                       std::chrono::milliseconds operation_timeout)
+{
+  if (sirius::test::g_integration_env != nullptr && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
   }
 
-  ~scoped_spdlog_capture()
-  {
-    auto& sinks = _logger->sinks();
-    sinks.erase(std::remove(sinks.begin(), sinks.end(), _sink), sinks.end());
-    _logger->set_level(_old_level);
+  constexpr char k_endpoint_env[] = "SIRIUS_TEST_REST_LIST_WATCHDOG_ENDPOINT";
+  std::optional<std::string> old_endpoint;
+  if (auto const* current = std::getenv(k_endpoint_env); current != nullptr) {
+    old_endpoint = current;
+  }
+  auto const endpoint = server.endpoint();
+  REQUIRE(::setenv(k_endpoint_env, endpoint.c_str(), 1) == 0);
+
+  auto const pid = ::fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    ::execl("/proc/self/exe",
+            "sirius_unittest",
+            "rest LIST loop watchdog child runner",
+            static_cast<char*>(nullptr));
+    ::_exit(127);
   }
 
-  scoped_spdlog_capture(scoped_spdlog_capture const&)            = delete;
-  scoped_spdlog_capture& operator=(scoped_spdlog_capture const&) = delete;
+  if (old_endpoint.has_value()) {
+    REQUIRE(::setenv(k_endpoint_env, old_endpoint->c_str(), 1) == 0);
+  } else {
+    REQUIRE(::unsetenv(k_endpoint_env) == 0);
+  }
 
-  [[nodiscard]] std::vector<capture_sink::record> records() const { return _sink->records(); }
+  int status        = 0;
+  bool request_seen = false;
+  auto stop         = std::chrono::steady_clock::now() + startup_timeout;
+  while (std::chrono::steady_clock::now() < stop) {
+    if (!request_seen && server.list_count() > 0) {
+      request_seen = true;
+      stop         = std::chrono::steady_clock::now() + operation_timeout;
+    }
+    auto const waited = ::waitpid(pid, &status, WNOHANG);
+    if (waited == pid) {
+      return {.timed_out       = false,
+              .exited_normally = WIFEXITED(status),
+              .exit_code       = WIFEXITED(status) ? WEXITSTATUS(status) : -1};
+    }
+    if (waited < 0) { return {}; }
+    std::this_thread::sleep_for(20ms);
+  }
 
- private:
-  std::shared_ptr<spdlog::logger> _logger;
-  std::shared_ptr<capture_sink> _sink;
-  spdlog::level::level_enum _old_level;
-};
+  (void)::kill(pid, SIGKILL);
+  (void)::waitpid(pid, &status, 0);
+  return {.timed_out = true, .exited_normally = false, .exit_code = -1};
+}
 
 }  // namespace
+
+TEST_CASE("rest_ioctx lists S3 objects with sizes and follows encoded continuation tokens",
+          "[s3][integration][rest][list]")
+{
+  std::vector<listed_object> objects = {{"data/part-000.parquet", 11},
+                                        {"data/year=2024/part-001.parquet", 22},
+                                        {"data/year=2025/part-002.parquet", 0},
+                                        {"other/ignored.parquet", 99}};
+  range_http_server server(deterministic_payload(16), {}, objects);
+  auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+  auto listed = ctx->list_objects("bucket", "data/", /*page_size=*/1);
+
+  REQUIRE(listed.size() == 3);
+  CHECK(listed[0].key == "data/part-000.parquet");
+  CHECK(listed[0].size == 11);
+  CHECK(listed[1].key == "data/year=2024/part-001.parquet");
+  CHECK(listed[1].size == 22);
+  CHECK(listed[2].key == "data/year=2025/part-002.parquet");
+  CHECK(listed[2].size == 0);
+  CHECK(server.list_count() == 3);
+  CHECK(server.get_count() == 0);
+  CHECK(server.head_count() == 0);
+}
+
+TEST_CASE("rest LIST loop watchdog child runner", "[.][rest][list][watchdog_child]")
+{
+  auto const* endpoint = std::getenv("SIRIUS_TEST_REST_LIST_WATCHDOG_ENDPOINT");
+  if (endpoint == nullptr) { return; }
+
+  auto ctx = make_direct_rest_ioctx(endpoint);
+  std::string error;
+  try {
+    (void)ctx->list_objects("bucket", "loop/", /*page_size=*/1);
+  } catch (std::exception const& e) {
+    error = e.what();
+  }
+
+  INFO(error);
+  CHECK((error.find("continuation token did not advance") != std::string::npos ||
+         (error.find("truncated") != std::string::npos &&
+          error.find("no entries") != std::string::npos)));
+}
+
+TEST_CASE("rest_ioctx terminates a repeated-token empty LIST loop", "[s3][integration][rest][list]")
+{
+  range_fault_policy fault;
+  fault.response_delay = 100ms;
+  range_http_server server(
+    deterministic_payload(16), fault, {}, scripted_list_mode::repeated_empty_token);
+
+  auto const result = run_list_watchdog(server, 10s, 1s);
+  INFO("LIST requests=" << server.list_count());
+  CHECK_FALSE(result.timed_out);
+  CHECK(result.exited_normally);
+  CHECK(result.exit_code == 0);
+  CHECK(server.list_count() <= 3);
+}
+
+TEST_CASE("rest_ioctx terminates an alternating-token empty LIST loop",
+          "[s3][integration][rest][list]")
+{
+  range_fault_policy fault;
+  fault.response_delay = 100ms;
+  range_http_server server(
+    deterministic_payload(16), fault, {}, scripted_list_mode::alternating_empty_tokens);
+
+  auto const result = run_list_watchdog(server, 10s, 1s);
+  INFO("LIST requests=" << server.list_count());
+  CHECK_FALSE(result.timed_out);
+  CHECK(result.exited_normally);
+  CHECK(result.exit_code == 0);
+  CHECK(server.list_count() <= 3);
+}
+
+TEST_CASE("rest_ioctx accepts an empty final LIST page and rejects an empty continuation token",
+          "[s3][integration][rest][list]")
+{
+  SECTION("empty final page")
+  {
+    range_http_server server(deterministic_payload(16));
+    auto ctx    = make_direct_rest_ioctx(server.endpoint());
+    auto listed = ctx->list_objects("bucket", "empty/", /*page_size=*/1);
+
+    CHECK(listed.empty());
+    CHECK(server.list_count() == 1);
+  }
+
+  SECTION("truncated page without a continuation token")
+  {
+    range_http_server server(
+      deterministic_payload(16), {}, {}, scripted_list_mode::truncated_empty_without_token);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    CHECK_THROWS_WITH(ctx->list_objects("bucket", "empty/", /*page_size=*/1),
+                      Catch::Contains("without") && Catch::Contains("continuation token"));
+    CHECK(server.list_count() == 1);
+  }
+}
+
+TEST_CASE("rest perf snapshot attributes blocking host reads separately from chunk reads",
+          "[s3][integration][rest][perf]")
+{
+  SECTION("blocking host counters exist and default to zero")
+  {
+    sirius::io::rest::rest_perf_snapshot snapshot{};
+    CHECK(snapshot.blocking_host_get_count == 0);
+    CHECK(snapshot.blocking_host_get_wall_ns_total == 0);
+    CHECK(snapshot.blocking_host_get_wall_ns_max == 0);
+  }
+
+  SECTION("blocking host_read network GETs are counted and pool-aggregated")
+  {
+    auto payload = deterministic_payload(16 * 1024);
+    range_http_server server(payload);
+    auto cfg                  = direct_rest_test_config();
+    cfg.perf_instrumentation  = true;
+    cfg.max_connections       = 1;
+    std::size_t const readers = 2;
+    auto ioctx                = make_direct_rest_ioctx(server.endpoint(), cfg, readers);
+    auto datasource           = ioctx->open_datasource("s3://footer-bucket/native-footer.bin",
+                                             static_cast<std::uint64_t>(payload.size()));
+
+    auto const before = ioctx->perf_snapshot();
+
+    std::array<std::uint8_t, 64> first{};
+    REQUIRE(datasource->host_read(17, first.size(), first.data()) == first.size());
+    require_bytes_equal(first, std::span<std::uint8_t const>(payload.data() + 17, first.size()));
+
+    std::array<std::uint8_t, 32> second{};
+    REQUIRE(datasource->host_read(4096, second.size(), second.data()) == second.size());
+    require_bytes_equal(second,
+                        std::span<std::uint8_t const>(payload.data() + 4096, second.size()));
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count + readers);
+    CHECK(after.blocking_host_get_wall_ns_total > before.blocking_host_get_wall_ns_total);
+    CHECK(after.blocking_host_get_wall_ns_max > 0);
+    CHECK(after.chunk_get_count == before.chunk_get_count + readers);
+    CHECK(server.get_count() == readers);
+  }
+
+  SECTION("stash-served parquet footer reads are not counted as blocking host reads")
+  {
+    auto const parquet    = read_binary_file(committed_parquet_fixture("nation.parquet"));
+    auto const footer_len = static_cast<std::size_t>(parquet_footer_len(parquet));
+    auto const footer_off = parquet.size() - 8 - footer_len;
+    range_http_server server(parquet);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = true;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource          = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+
+    auto const before = ioctx->perf_snapshot();
+
+    std::array<std::uint8_t, 8> trailer{};
+    REQUIRE(datasource->host_read(
+              parquet.size() - trailer.size(), trailer.size(), trailer.data()) == trailer.size());
+    require_bytes_equal(trailer,
+                        std::span<std::uint8_t const>(parquet.data() + parquet.size() - 8, 8));
+
+    std::vector<std::uint8_t> footer(footer_len);
+    REQUIRE(datasource->host_read(footer_off, footer.size(), footer.data()) == footer.size());
+    require_bytes_equal(footer,
+                        std::span<std::uint8_t const>(parquet.data() + footer_off, footer_len));
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
+    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
+    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
+    CHECK(server.get_count() == 1);
+  }
+
+  SECTION("a blocking read outside the footer stash is counted as a blocking network read")
+  {
+    auto payload = deterministic_payload(16 * 1024);
+    range_http_server server(payload);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = true;
+    cfg.footer_probe_bytes   = 8;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource          = ioctx->open_datasource("s3://footer-bucket/outside-stash.bin",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    auto const before        = ioctx->perf_snapshot();
+
+    std::array<std::uint8_t, 32> out{};
+    REQUIRE(datasource->host_read(0, out.size(), out.data()) == out.size());
+    require_bytes_equal(out, std::span<std::uint8_t const>(payload.data(), out.size()));
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count + 1);
+    CHECK(after.chunk_get_count == before.chunk_get_count + 1);
+    CHECK(server.get_count() == 2);
+  }
+
+  SECTION("the one-shot footer probe GET bypasses native counters but remains a chunk GET")
+  {
+    auto payload = deterministic_payload(16 * 1024);
+    range_http_server server(payload);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = true;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto const before        = ioctx->perf_snapshot();
+
+    auto datasource = ioctx->open_datasource("s3://footer-bucket/probe-only.bin",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    REQUIRE(datasource != nullptr);
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
+    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
+    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
+    CHECK(after.chunk_get_count == before.chunk_get_count + 1);
+    CHECK(server.get_count() == 1);
+  }
+
+  SECTION("async chunk reads bump chunk counters without touching blocking host counters")
+  {
+    auto payload = deterministic_payload(64 * 1024);
+    range_http_server server(payload);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = true;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource          = ioctx->open_datasource("s3://footer-bucket/chunk-data.bin",
+                                             static_cast<std::uint64_t>(payload.size()));
+
+    std::vector<std::uint8_t> a(257);
+    std::vector<std::uint8_t> b(1024);
+    std::array<sirius::io::io_object_segment, 2> segments{
+      sirius::io::io_object_segment{17, a.size(), a.data()},
+      sirius::io::io_object_segment{4096, b.size(), b.data()}};
+
+    auto const before = ioctx->perf_snapshot();
+    auto got =
+      std::move(ioctx->host_read_ranges_async_io(datasource->io_object(), segments)).get(5s);
+    auto const after = ioctx->perf_snapshot();
+
+    REQUIRE(got == a.size() + b.size());
+    require_bytes_equal(a, std::span<std::uint8_t const>(payload.data() + 17, a.size()));
+    require_bytes_equal(b, std::span<std::uint8_t const>(payload.data() + 4096, b.size()));
+    CHECK(after.chunk_get_count > before.chunk_get_count);
+    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
+    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
+    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
+  }
+
+  SECTION("blocking host counters are gated off when perf instrumentation is disabled")
+  {
+    auto payload = deterministic_payload(4096);
+    range_http_server server(payload);
+    auto cfg                 = direct_rest_test_config();
+    cfg.perf_instrumentation = false;
+    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource          = ioctx->open_datasource("s3://footer-bucket/perf-off.bin",
+                                             static_cast<std::uint64_t>(payload.size()));
+
+    std::array<std::uint8_t, 128> out{};
+    REQUIRE(datasource->host_read(99, out.size(), out.data()) == out.size());
+    require_bytes_equal(out, std::span<std::uint8_t const>(payload.data() + 99, out.size()));
+
+    auto const after = ioctx->perf_snapshot();
+    CHECK(after.blocking_host_get_count == 0);
+    CHECK(after.blocking_host_get_wall_ns_total == 0);
+    CHECK(after.blocking_host_get_wall_ns_max == 0);
+    CHECK(server.get_count() == 1);
+  }
+}
+
+TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
+          "[s3][integration][rest][list]")
+{
+  std::vector<listed_object> objects = {
+    {"data/a.parquet", 1}, {"data/b.parquet", 2}, {"data/c.parquet", 3}};
+
+  SECTION("sink false stops after one page")
+  {
+    range_http_server server(deterministic_payload(16), {}, objects);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    std::size_t pages = 0;
+    ctx->list_objects_paged("bucket",
+                            "data/",
+                            /*page_size=*/1,
+                            [&](sirius::io::s3::list_objects_v2_page const& page) {
+                              ++pages;
+                              REQUIRE(page.entries.size() == 1);
+                              CHECK(page.entries[0].key == "data/a.parquet");
+                              return false;
+                            });
+
+    CHECK(pages == 1);
+    CHECK(server.list_count() == 1);
+  }
+
+  SECTION("wrapper throws instead of truncating past max_keys")
+  {
+    range_http_server server(deterministic_payload(16), {}, objects);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    CHECK_THROWS_WITH(ctx->list_objects("bucket", "data/", /*page_size=*/1000, /*max_keys=*/2),
+                      Catch::Contains("narrow the glob prefix"));
+
+    auto all = ctx->list_objects("bucket", "data/", /*page_size=*/1000, /*max_keys=*/3);
+    CHECK(all.size() == 3);
+  }
+
+  SECTION("primitive throws instead of scanning unbounded pages")
+  {
+    range_http_server server(deterministic_payload(16), {}, objects);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    CHECK_THROWS_WITH(ctx->list_objects_paged(
+                        "bucket",
+                        "data/",
+                        /*page_size=*/1,
+                        [](sirius::io::s3::list_objects_v2_page const&) { return true; },
+                        /*max_scanned=*/2),
+                      Catch::Contains("narrow the glob prefix"));
+  }
+
+  SECTION("primitive uses configured scanned cap unless an explicit override is passed")
+  {
+    auto cfg             = direct_rest_test_config();
+    cfg.list_max_scanned = 2;
+
+    range_http_server capped_server(deterministic_payload(16), {}, objects);
+    auto capped_ctx = make_direct_rest_ioctx(capped_server.endpoint(), cfg);
+
+    CHECK_THROWS_WITH(capped_ctx->list_objects_paged(
+                        "bucket",
+                        "data/",
+                        /*page_size=*/1,
+                        [](sirius::io::s3::list_objects_v2_page const&) { return true; }),
+                      Catch::Contains("narrow the glob prefix"));
+
+    range_http_server override_server(deterministic_payload(16), {}, objects);
+    auto override_ctx = make_direct_rest_ioctx(override_server.endpoint(), cfg);
+
+    std::size_t pages = 0;
+    override_ctx->list_objects_paged(
+      "bucket",
+      "data/",
+      /*page_size=*/1,
+      [&](sirius::io::s3::list_objects_v2_page const& page) {
+        ++pages;
+        REQUIRE(page.entries.size() == 1);
+        return true;
+      },
+      /*max_scanned=*/3);
+    CHECK(pages == 3);
+    CHECK(override_server.list_count() == 3);
+  }
+
+  SECTION("wrapper uses configured matched cap unless an explicit override is passed")
+  {
+    auto cfg             = direct_rest_test_config();
+    cfg.list_max_matches = 2;
+
+    range_http_server capped_server(deterministic_payload(16), {}, objects);
+    auto capped_ctx = make_direct_rest_ioctx(capped_server.endpoint(), cfg);
+
+    CHECK_THROWS_WITH(capped_ctx->list_objects("bucket", "data/", /*page_size=*/1000),
+                      Catch::Contains("narrow the glob prefix"));
+
+    range_http_server override_server(deterministic_payload(16), {}, objects);
+    auto override_ctx = make_direct_rest_ioctx(override_server.endpoint(), cfg);
+
+    auto all = override_ctx->list_objects("bucket", "data/", /*page_size=*/1000, /*max_keys=*/3);
+    CHECK(all.size() == 3);
+    CHECK(override_server.list_count() == 1);
+  }
+
+  SECTION("empty prefix returns an empty vector")
+  {
+    range_http_server server(deterministic_payload(16), {}, objects);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto none = ctx->list_objects("bucket", "missing/", /*page_size=*/1);
+    CHECK(none.empty());
+    CHECK(server.list_count() == 1);
+  }
+}
+
+TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumulating pages",
+          "[s3][integration][rest][list]")
+{
+  SECTION("scanned cap triggers page-by-page with one page held at a time")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 6000);
+    auto cfg               = direct_rest_test_config();
+    cfg.list_max_scanned   = 5000;
+    auto ctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+
+    bool threw = false;
+    try {
+      ctx->list_objects_paged("bucket",
+                              "big/",
+                              /*page_size=*/1000,
+                              [&](sirius::io::s3::list_objects_v2_page const& page) {
+                                max_seen = std::max(max_seen, page.entries.size());
+                                ++sink_calls;
+                                return true;
+                              });
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("scanned more than 5000") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+
+    CHECK(threw);
+    CHECK(max_seen <= 1000);
+    CHECK(sink_calls == 5);
+    CHECK(server.list_count() == 6);
+  }
+
+  SECTION("matched cap stops the accumulating wrapper")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 600);
+    auto cfg             = direct_rest_test_config();
+    cfg.list_max_matches = 500;
+    auto ctx             = make_direct_rest_ioctx(server.endpoint(), cfg);
+
+    bool threw = false;
+    try {
+      (void)ctx->list_objects("bucket", "big/", /*page_size=*/1000);
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("more than 500") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK(server.list_count() == 1);
+  }
+
+  SECTION("under the default caps succeeds and preserves generated key order")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 500);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    auto listed = ctx->list_objects("bucket", "big/", /*page_size=*/1000);
+
+    REQUIRE(listed.size() == 500);
+    CHECK(listed.front().key == "big/0");
+    CHECK(listed.front().size == 0);
+    CHECK(listed.back().key == "big/499");
+    CHECK(listed.back().size == 499);
+    CHECK(server.list_count() == 1);
+  }
+
+  SECTION("early stop returns after the first generated page even for a large prefix")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 100000);
+    auto ctx               = make_direct_rest_ioctx(server.endpoint());
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+
+    ctx->list_objects_paged("bucket",
+                            "big/",
+                            /*page_size=*/1000,
+                            [&](sirius::io::s3::list_objects_v2_page const& page) {
+                              max_seen = std::max(max_seen, page.entries.size());
+                              ++sink_calls;
+                              return false;
+                            });
+
+    CHECK(max_seen <= 1000);
+    CHECK(sink_calls == 1);
+    CHECK(server.list_count() == 1);
+  }
+}
+
+TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
+          "[.][s3][integration][rest][list][stress]")
+{
+  SECTION("default scanned cap trips at one million entries without retaining pages")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 1000001);
+    auto ctx               = make_direct_rest_ioctx(server.endpoint());
+    std::size_t max_seen   = 0;
+    std::size_t sink_calls = 0;
+
+    bool threw = false;
+    try {
+      ctx->list_objects_paged("bucket",
+                              "big/",
+                              /*page_size=*/1000,
+                              [&](sirius::io::s3::list_objects_v2_page const& page) {
+                                max_seen = std::max(max_seen, page.entries.size());
+                                ++sink_calls;
+                                return true;
+                              });
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("scanned more than 1000000") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+
+    CHECK(threw);
+    CHECK(max_seen <= 1000);
+    CHECK(sink_calls == 1000);
+    CHECK(server.list_count() == 1001);
+  }
+
+  SECTION("default matched cap trips at one hundred thousand accumulated entries")
+  {
+    range_http_server server(deterministic_payload(16));
+    server.set_generated_listing("big/", 100001);
+    auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+    bool threw = false;
+    try {
+      (void)ctx->list_objects("bucket", "big/", /*page_size=*/1000);
+    } catch (std::exception const& e) {
+      threw            = true;
+      auto const error = std::string{e.what()};
+      CHECK(error.find("more than 100000") != std::string::npos);
+      CHECK(error.find("narrow the glob prefix") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK(server.list_count() == 101);
+  }
+}
+
+TEST_CASE("rest LIST retries are observable and isolated from object-read byte counters",
+          "[s3][integration][rest][list][telemetry]")
+{
+  std::vector<listed_object> objects = {{"data/a.parquet", 1}};
+  auto cfg                           = direct_rest_test_config();
+  cfg.perf_instrumentation           = true;
+
+  SECTION("transient LIST failure retries and logs bucket/prefix")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_lists = 1;
+    fault.fail_list_status = 503;
+    range_http_server server(deterministic_payload(16), fault, objects);
+    auto ctx    = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto before = ctx->perf_snapshot();
+    scoped_log_capture logs;
+
+    auto listed = ctx->list_objects("bucket", "data/", /*page_size=*/1000);
+    auto after  = ctx->perf_snapshot();
+
+    REQUIRE(listed.size() == 1);
+    CHECK(after.retries_total - before.retries_total == 1);
+    CHECK(after.terminal_failures_total == before.terminal_failures_total);
+    CHECK(after.chunk_get_count == before.chunk_get_count);
+    CHECK(after.payload_bytes_read_total == before.payload_bytes_read_total);
+    CHECK(server.list_count() == 2);
+
+    auto records = logs.records();
+    CHECK(std::any_of(records.begin(), records.end(), [](capture_sink::record const& record) {
+      return record.level == sirius::log::level::warn &&
+             record.message.find("bucket") != std::string::npos &&
+             record.message.find("data/") != std::string::npos;
+    }));
+  }
+
+  SECTION("clean LIST is telemetry-quiet")
+  {
+    range_http_server server(deterministic_payload(16), {}, objects);
+    auto ctx    = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto before = ctx->perf_snapshot();
+    scoped_log_capture logs;
+
+    auto listed = ctx->list_objects("bucket", "data/", /*page_size=*/1000);
+    auto after  = ctx->perf_snapshot();
+
+    REQUIRE(listed.size() == 1);
+    CHECK(after.retries_total == before.retries_total);
+    CHECK(after.terminal_failures_total == before.terminal_failures_total);
+    CHECK(after.chunk_get_count == before.chunk_get_count);
+    CHECK(after.payload_bytes_read_total == before.payload_bytes_read_total);
+
+    auto records = logs.records();
+    CHECK(std::none_of(records.begin(), records.end(), [](capture_sink::record const& record) {
+      return record.level >= sirius::log::level::warn;
+    }));
+  }
+}
+
+TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
+          "[s3][integration][rest][list][filesystem]")
+{
+  auto payload = deterministic_payload(4096);
+  range_http_server server(payload);
+  auto ctx = make_direct_rest_ioctx(server.endpoint());
+
+  auto datasource =
+    ctx->open_datasource("s3://bucket/list-sized.bin", static_cast<std::uint64_t>(payload.size()));
+  REQUIRE(datasource != nullptr);
+  CHECK(datasource->io_object().size() == payload.size());
+  CHECK(server.head_count() == 0);
+
+  std::vector<std::uint8_t> out(payload.size());
+  auto const got = datasource->host_read(0, out.size(), out.data());
+  CHECK(got == out.size());
+  CHECK(out == payload);
+  CHECK(server.get_count() == 1);
+}
 
 TEST_CASE("rest footer suffix parses Content-Range totals", "[s3][integration][rest][footerbind]")
 {
@@ -888,6 +1748,36 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
+
+  SECTION("missing object fails the footer-probe open after HEAD fallback")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets    = true;
+    fault.fail_all_heads   = true;
+    fault.fail_status      = 404;
+    fault.fail_head_status = 404;
+    range_http_server server(parquet, fault);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint());
+
+    CHECK_THROWS_WITH(ioctx->open_datasource("s3://footer-bucket/missing.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe),
+                      Catch::Matchers::Contains("HTTP 404"));
+  }
+
+  SECTION("forbidden object fails the footer-probe open after HEAD fallback")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets    = true;
+    fault.fail_all_heads   = true;
+    fault.fail_status      = 403;
+    fault.fail_head_status = 403;
+    range_http_server server(parquet, fault);
+    auto ioctx = make_direct_rest_ioctx(server.endpoint());
+
+    CHECK_THROWS_WITH(ioctx->open_datasource("s3://footer-bucket/forbidden.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe),
+                      Catch::Matchers::Contains("HTTP 403"));
+  }
 }
 
 TEST_CASE("footer suffix probe retries transient GET failures",
@@ -1127,14 +2017,14 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "retry-log-warning");
 
-    scoped_spdlog_capture logs;
+    scoped_log_capture logs;
     auto probe = reactor.fetch_footer_suffix("log-bucket", "warn-retry.parquet", 1024);
     REQUIRE(probe.bytes != nullptr);
 
     auto const records = logs.records();
     auto const found   = std::any_of(records.begin(), records.end(), [](auto const& r) {
-      return r.level == spdlog::level::warn &&
-             r.payload.find("warn-retry.parquet") != std::string::npos;
+      return r.level == sirius::log::level::warn &&
+             r.message.find("warn-retry.parquet") != std::string::npos;
     });
     CHECK(found);
   }
@@ -1150,14 +2040,15 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "retry-log-clean");
 
-    scoped_spdlog_capture logs;
+    scoped_log_capture logs;
     auto probe = reactor.fetch_footer_suffix("log-bucket", "clean.parquet", 1024);
     REQUIRE(probe.bytes != nullptr);
     CHECK(reactor.head_object_size("log-bucket", "clean.parquet") == payload.size());
 
     auto const records        = logs.records();
-    auto const warning_or_bad = std::any_of(
-      records.begin(), records.end(), [](auto const& r) { return r.level >= spdlog::level::warn; });
+    auto const warning_or_bad = std::any_of(records.begin(), records.end(), [](auto const& r) {
+      return r.level >= sirius::log::level::warn;
+    });
     CHECK_FALSE(warning_or_bad);
   }
 }

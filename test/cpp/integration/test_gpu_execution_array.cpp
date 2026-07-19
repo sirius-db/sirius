@@ -396,6 +396,16 @@ TEST_CASE_METHOD(ArrayFixture,
   compare_gpu_vs_cpu("SELECT id, a FROM arr_filter WHERE id >= 3;");
 }
 
+TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - array projected while a filter prunes a row group",
+                 "[integration][gpu_execution][array][filter]")
+{
+  run_ok("CREATE TABLE arr_prune (id INTEGER, a INTEGER[3]);");
+  run_ok("INSERT INTO arr_prune SELECT i, [i, i + 1, i + 2] FROM range(200000) t(i);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT id, a FROM arr_prune WHERE id >= 150000;");
+}
+
 //===----------------------------------------------------------------------===//
 // Batching: exceed a single DuckDB vector to span multiple scan batches
 //===----------------------------------------------------------------------===//

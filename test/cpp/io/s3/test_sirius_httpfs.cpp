@@ -9,6 +9,7 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/uri_parser.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
@@ -274,7 +275,48 @@ std::shared_ptr<sirius::io::sirius_datasource> require_rest_datasource(
   return datasource;
 }
 
+duckdb::SiriusContext& require_sirius_context(sirius_httpfs_fixture& fixture)
+{
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  return *sirius_ctx;
+}
+
+class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
+ public:
+  using sirius::io::s3::sirius_httpfs::SupportsOpenFileExtended;
+};
+
 }  // namespace
+
+TEST_CASE("S3 LIST keys survive the URI embedding escape seam", "[s3][filesystem][glob]")
+{
+  for (auto const key : {std::string_view{"a%2Fb.p"},
+                         std::string_view{"x#1.p"},
+                         std::string_view{"y?v.p"},
+                         std::string_view{"100%.p"},
+                         std::string_view{"col=a%20b/p0.p"}}) {
+    DYNAMIC_SECTION("key=" << key)
+    {
+      auto const escaped = sirius::io::s3::escape_s3_key_for_uri(key);
+      auto const parsed  = sirius::io::parse("s3://bkt/" + escaped);
+
+      CHECK(parsed.host == "bkt");
+      CHECK(parsed.path == key);
+    }
+  }
+}
+
+TEST_CASE("S3 LIST key URI escaping preserves ordinary keys byte for byte",
+          "[s3][filesystem][glob]")
+{
+  for (auto const key : {std::string_view{"plain.parquet"},
+                         std::string_view{"year=2026/part 0.parquet"},
+                         std::string_view{"nested/path/file.parquet"}}) {
+    DYNAMIC_SECTION("key=" << key) { CHECK(sirius::io::s3::escape_s3_key_for_uri(key) == key); }
+  }
+}
 
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
 {
@@ -288,19 +330,37 @@ TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
   CHECK(fs.CanSeek());
 }
 
-TEST_CASE("sirius_httpfs rejects glob patterns but accepts exact keys", "[s3][filesystem]")
+TEST_CASE("sirius_httpfs accepts exact keys and gates wildcard expansion on a Sirius opener",
+          "[s3][filesystem]")
 {
-  sirius::io::s3::sirius_httpfs fs;
+  exposed_sirius_httpfs fs;
+  CHECK(fs.SupportsOpenFileExtended());
 
-  CHECK_THROWS_AS(fs.Glob("s3://bucket/prefix/*.parquet"), duckdb::IOException);
-  CHECK_THROWS_AS(fs.Glob("s3://bucket/a?.parquet"), duckdb::IOException);
-  CHECK_THROWS_AS(fs.Glob("s3://bucket/[ab].parquet"), duckdb::IOException);
+  auto wildcard_message = thrown_message([&] { (void)fs.Glob("s3://bucket/prefix/*.parquet"); });
+  REQUIRE_FALSE(wildcard_message.empty());
+  CHECK(wildcard_message.find("no ClientContext") != std::string::npos);
+  CHECK(wildcard_message.find("glob/wildcard patterns are not supported") == std::string::npos);
 
   auto exact = fs.Glob("s3://bucket/key.parquet");
   REQUIRE(exact.size() == 1);
   CHECK(exact[0].path == "s3://bucket/key.parquet");
 
   CHECK(fs.Glob("s3://bucket").empty());
+}
+
+TEST_CASE("sirius_httpfs glob helper throws instead of silently truncating matched files",
+          "[.][s3][integration][filesystem][glob]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  sirius_httpfs_fixture fixture(*env);
+  auto& manager = require_sirius_context(fixture).get_scan_manager();
+
+  CHECK_THROWS_WITH(sirius::io::s3::expand_glob(s3_uri(env->bucket, "glob/multi/nation_*.parquet"),
+                                                manager,
+                                                /*max_matches=*/1),
+                    Catch::Contains("narrow the glob prefix"));
 }
 
 TEST_CASE("sirius_httpfs rejects write opens before opener resolution", "[s3][filesystem]")

@@ -104,26 +104,11 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
    * Counts inputs that are not GPU-resident (host/disk upgrades) and, when @p target_space is
    * given, GPU-resident inputs living in a different memory space — those are cloned into the
    * target space by lock_or_prepare_batch, so their bytes are part of the task's footprint.
+   * Resident scan inputs cached in HOST are also counted, since they require an upload before
+   * execution.
    */
   [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input(
-    const cucascade::memory::memory_space* target_space) const
-  {
-    std::size_t input_size = 0;
-    auto* pipelineable_input =
-      dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
-    if (pipelineable_input) {
-      for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
-        if (!ro.get_data()) { continue; }
-        const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
-        const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
-                                 ro.get_memory_space()->get_id() != target_space->get_id();
-        if (non_gpu || cross_space) {
-          input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
-        }
-      }
-    }
-    return input_size;
-  }
+    const cucascade::memory::memory_space* target_space) const;
 
  private:
   std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality

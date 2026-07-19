@@ -48,7 +48,6 @@ using sirius::test::mgpu::generate_parquet_surface;
 using sirius::test::mgpu::mgpu_env_params;
 using sirius::test::mgpu::parquet_glob;
 using sirius::test::mgpu::require_gpu_matches_cpu;
-using sirius::test::mgpu::scoped_log_dir;
 using sirius::test::mgpu::scoped_mgpu_env;
 using sirius::test::mgpu::write_mgpu_yaml;
 
@@ -153,7 +152,6 @@ TEST_CASE("partition memory-space is enforced across OOM reschedule on multi-GPU
 
   auto surface = build_join_surface(tmp, rows, dim_rows, /*fact_files=*/8);
 
-  scoped_log_dir logs(tmp / "log");
   auto yaml_path = tmp / "part-memspace-mgpu.yaml";
   write_mgpu_yaml(yaml_path, tight_params(/*num_gpus=*/2));
 
@@ -207,7 +205,6 @@ TEST_CASE("partition memory-space repro - single-GPU OOM-reschedule control",
 
   auto surface = build_join_surface(tmp, rows, dim_rows, /*fact_files=*/8);
 
-  scoped_log_dir logs(tmp / "log");
   auto yaml_path = tmp / "part-memspace-1gpu.yaml";
   write_mgpu_yaml(yaml_path, tight_params(/*num_gpus=*/1));
 

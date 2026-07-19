@@ -44,6 +44,10 @@ namespace duckdb {
 class SingleFileBlockManager;
 }
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -59,6 +63,11 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
+  /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
+  /// wired. The ingestible installs the consumer column remap on the channel; the downstream
+  /// dynamic-filter operator applies the filters post-decode (the native scan has no read-time
+  /// dynamic path).
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   duckdb::DataTable* storage     = nullptr;
@@ -109,14 +118,17 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// groups currently held. The scan sequencer fadvises these to prefetch.
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override
   {
-    if (!datasource || block_manager == nullptr) { return {}; }
-    fadvise_entry entry;
-    entry.datasource = datasource;
-    for (auto const& rg : row_groups) {
-      auto ranges = row_group_file_ranges(*block_manager, rg);
-      entry.ranges.insert(entry.ranges.end(), ranges.begin(), ranges.end());
-    }
-    return {std::move(entry)};
+    if (block_manager == nullptr) { return {}; }
+    std::vector<fadvise_entry> entries;
+    append_fadvise_entry(entries, datasource, [this] {
+      std::vector<cudf::io::text::byte_range_info> ranges;
+      for (auto const& rg : row_groups) {
+        auto rg_ranges = row_group_file_ranges(*block_manager, rg);
+        ranges.insert(ranges.end(), rg_ranges.begin(), rg_ranges.end());
+      }
+      return ranges;
+    });
+    return entries;
   }
 
   /// Decoded (GPU) byte budget for this unit; drives memory reservation.
@@ -158,6 +170,11 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
+
+  [[nodiscard]] bool has_row_filter() const noexcept override
+  {
+    return _filter_expression != nullptr;
+  }
 
  private:
   std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> _info;

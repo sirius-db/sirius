@@ -17,6 +17,7 @@
 #pragma once
 
 #include <op/scan/dynamic_filter_gate.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/sirius_dynamic_filter.hpp>
 #include <op/sirius_physical_operator.hpp>
 
@@ -28,16 +29,20 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 // sirius_physical_dynamic_filter
 //===----------------------------------------------------------------------===//
-/// @brief Applies membership dynamic filters to a (parquet) scan's decoded output.
+/// @brief Applies dynamic filters to a GPU scan's decoded output.
 ///
-/// Sits at @c operators[1] of a parquet scan pipeline, directly above the scan: @c operators[0]
-/// reads, decodes, and assembles each batch, then this operator filters it.
+/// Sits directly above the scan in its pipeline: the scan reads, decodes, and assembles each
+/// batch, then this operator filters it. The apply mode matches the scan format's read-time
+/// capabilities: a parquet scan already ran AST-capable filters (zone maps) through the reader's
+/// @c set_filter, so its operator applies membership masks only; a duckdb-native scan has no
+/// read-time dynamic phase, so its operator also evaluates AST-capable filters row-wise
+/// (@c include_ast_row_masks).
 ///
 /// Filters arrive on a @ref sirius_dynamic_filter_set the producing hash-join build publishes into.
 /// The @ref dynamic_filter_gate decides per scan whether filtering earns its cost, and a batch
-/// passes through unchanged when the publication attempt emitted no applicable membership filter,
-/// no device-local replica exists, or the gate declines. A producing join's immediate probe edge is
-/// ordered after build-port publication; this operator can run earlier when its scan is a
+/// passes through unchanged when the publication attempt emitted no filter applicable under the
+/// mode, no device-local replica exists, or the gate declines. A producing join's immediate probe
+/// edge is ordered after build-port publication; this operator can run earlier when its scan is a
 /// transitive target below an intervening join, so each execution uses the filters then visible.
 class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
@@ -47,7 +52,8 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
-    double gate_keep_threshold = dynamic_filter_gate::k_default_keep_threshold);
+    double gate_keep_threshold     = dynamic_filter_gate::k_default_keep_threshold,
+    dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::membership_masks_only);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -66,6 +72,10 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _filters;
   /// Per-scan selectivity + per-filter marginal-keep gate, shared across this scan's split tasks.
   dynamic_filter_gate _gate;
+  /// Which filter capabilities apply post-decode: membership only when AST filters already ran at
+  /// read time (parquet), AST row masks too when the scan has no read-time dynamic phase
+  /// (duckdb-native).
+  dynamic_filter_apply_mode _mode;
 };
 
 }  // namespace sirius::op::scan
