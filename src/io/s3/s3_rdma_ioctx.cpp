@@ -31,35 +31,46 @@ namespace {
 std::runtime_error not_implemented(std::string_view entry_point)
 {
   return std::runtime_error("s3_rdma_ioctx::" + std::string(entry_point) +
-                            ": the S3 RDMA transport is not implemented yet");
+                            ": the S3 RDMA transport does not support this path");
 }
 
 rdma::cuobj_rdma_reactor::config reactor_config_from(const object_store_config& cfg)
 {
-  return rdma::cuobj_rdma_reactor::config{cfg.s3_rdma_max_inflight, cfg.s3_rdma_arena_slot_size};
+  rdma::cuobj_rdma_reactor::config reactor_cfg;
+  reactor_cfg.max_inflight    = cfg.s3_rdma_max_inflight;
+  reactor_cfg.arena_slot_size = cfg.s3_rdma_arena_slot_size;
+  reactor_cfg.queue_cap       = cfg.s3_rdma_queue_cap;
+  return reactor_cfg;
 }
 
 }  // namespace
 
 s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg,
-                             std::shared_ptr<rdma::rdma_client> client,
+                             rdma::rdma_transport_clients clients,
                              rdma::cuda_delivery_ops delivery)
-  // The second argument stays a copy: constructor-argument evaluation order
-  // is unspecified, so a move here could empty `client` before the context
-  // captures it.
   : s3_rdma_ioctx(std::make_shared<rdma::cuobj_rdma_reactor::reactor_context>(
-                    reactor_config_from(cfg), client, std::move(delivery)),
-                  client)
+      reactor_config_from(cfg), std::move(clients), std::move(delivery)))
 {
 }
 
-s3_rdma_ioctx::s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx,
-                             std::shared_ptr<rdma::rdma_client> client)
+s3_rdma_ioctx::s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx)
   : templated_ioctx<rdma::cuobj_rdma_reactor>(
       1, [reactor_ctx] { return std::make_unique<rdma::cuobj_rdma_reactor>(reactor_ctx); }),
-    _client(std::move(client)),
     _reactor_ctx(std::move(reactor_ctx))
 {
+}
+
+void s3_rdma_ioctx::start()
+{
+  const auto& clients = _reactor_ctx->clients();
+  if (!clients.control || !clients.data_sessions || clients.tag_predicate == nullptr) {
+    const char* missing = !clients.control         ? "the control-plane client"
+                          : !clients.data_sessions ? "the data-session factory"
+                                                   : "the completion-tag predicate";
+    throw std::runtime_error(std::string("s3_rdma_ioctx: RDMA transport initialization failed: ") +
+                             missing + " capability is missing");
+  }
+  templated_ioctx<rdma::cuobj_rdma_reactor>::start();
 }
 
 rdma::rdma_perf_snapshot s3_rdma_ioctx::perf_snapshot() const noexcept
@@ -85,41 +96,6 @@ rdma::rdma_perf_snapshot s3_rdma_ioctx::perf_snapshot() const noexcept
   return total;
 }
 
-size_t s3_rdma_ioctx::host_read_io(const sirius_io_object& obj,
-                                   size_t offset,
-                                   size_t size,
-                                   uint8_t* dst)
-{
-  if (!_client) { throw not_implemented("host_read_io"); }
-  return templated_ioctx<rdma::cuobj_rdma_reactor>::host_read_io(obj, offset, size, dst);
-}
-
-exec::semi_future<size_t> s3_rdma_ioctx::host_read_async_io(const sirius_io_object& obj,
-                                                            size_t offset,
-                                                            size_t size,
-                                                            uint8_t* dst) noexcept
-{
-  if (!_client) {
-    return exec::make_semi_future<size_t>(
-      std::make_exception_ptr(not_implemented("host_read_async_io")));
-  }
-  return templated_ioctx<rdma::cuobj_rdma_reactor>::host_read_async_io(obj, offset, size, dst);
-}
-
-exec::semi_future<size_t> s3_rdma_ioctx::device_read_async_io(const sirius_io_object& obj,
-                                                              size_t offset,
-                                                              size_t size,
-                                                              uint8_t* dst,
-                                                              rmm::cuda_stream_view stream) noexcept
-{
-  if (!_client) {
-    return exec::make_semi_future<size_t>(
-      std::make_exception_ptr(not_implemented("device_read_async_io")));
-  }
-  return templated_ioctx<rdma::cuobj_rdma_reactor>::device_read_async_io(
-    obj, offset, size, dst, stream);
-}
-
 exec::semi_future<size_t> s3_rdma_ioctx::host_to_device_read_async_io(
   const sirius_io_object& /*obj*/,
   std::span<io_object_segment> /*slices*/,
@@ -141,8 +117,6 @@ exec::semi_future<size_t> s3_rdma_ioctx::host_read_ranges_async_io(
 
 std::shared_ptr<sirius_io_object> s3_rdma_ioctx::create_io_object(std::string path)
 {
-  if (!_client) { throw not_implemented("create_io_object"); }
-
   auto parsed = parse(path);
   if (parsed.scheme != "s3") {
     throw std::invalid_argument("s3_rdma_ioctx::create_io_object: unsupported scheme '" +
@@ -150,10 +124,19 @@ std::shared_ptr<sirius_io_object> s3_rdma_ioctx::create_io_object(std::string pa
   }
   // The control permit covers the full HEAD: a closed or failed transport
   // refuses new opens with its terminal error instead of touching the wire.
-  auto permit       = _reactor_ctx->gate().acquire_control();
-  const size_t size = _client->head(parsed.host, parsed.path);
+  auto permit = _reactor_ctx->gate().acquire_control();
+  auto const result =
+    _reactor_ctx->clients().control->head(rdma::rx_route{parsed.host, parsed.path});
+  if (!result.outcome.transport_ok()) {
+    throw std::runtime_error("s3_rdma_ioctx::create_io_object: " + path + ": " +
+                             result.outcome.transport_error);
+  }
+  if (result.outcome.http_status != 200) {
+    throw std::runtime_error("s3_rdma_ioctx::create_io_object: " + path + " -> HTTP " +
+                             std::to_string(result.outcome.http_status));
+  }
   return std::make_shared<rdma::cuobj_rdma_io_object>(
-    std::move(path), std::move(parsed.host), std::move(parsed.path), size);
+    std::move(path), std::move(parsed.host), std::move(parsed.path), result.object_size);
 }
 
 }  // namespace sirius::io::s3

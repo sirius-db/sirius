@@ -274,8 +274,8 @@ set(EXTENSION_SOURCES
     src/io/kvikio/kvikio_context.cpp
     src/io/rdma/cuobj_rdma_client.cpp
     src/io/rdma/cuobj_rdma_reactor.cpp
-    src/io/rdma/mock_rdma_client.cpp
     src/io/rdma/rdma_admission_gate.cpp
+    src/io/rdma/rdma_transport_client.cpp
     src/io/rest/curl_handle.cpp
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
@@ -813,7 +813,64 @@ endif()
 # (scripts/check_orphan_tests.py) rather than a configure-time glob — see
 # test/cpp/orphan_test_allowlist.txt.
 
+# Test doubles are test-only sources: they implement production seams for the
+# unit tests and must never ship in the extension artifacts.
+set(SIRIUS_TEST_DOUBLE_SOURCES src/io/rdma/mock_rdma_client.cpp)
+list(APPEND TEST_SOURCES ${SIRIUS_TEST_DOUBLE_SOURCES})
+
 add_executable(sirius_unittest ${TEST_SOURCES})
+
+# Shipped-artifact hygiene gate: configuration fails if a test double leaks into
+# an extension target or goes missing from the unit-test binary.
+foreach(_shipped_target sirius_extension sirius_loadable_extension)
+  if(TARGET ${_shipped_target})
+    get_target_property(_shipped_sources ${_shipped_target} SOURCES)
+    foreach(_test_double ${SIRIUS_TEST_DOUBLE_SOURCES})
+      foreach(_source ${_shipped_sources})
+        string(FIND "${_source}" "${_test_double}" _hit)
+        if(NOT _hit EQUAL -1)
+          message(
+            FATAL_ERROR
+              "test double ${_test_double} is compiled into shipped target ${_shipped_target}"
+          )
+        endif()
+      endforeach()
+    endforeach()
+  endif()
+endforeach()
+get_target_property(_unittest_sources sirius_unittest SOURCES)
+foreach(_test_double ${SIRIUS_TEST_DOUBLE_SOURCES})
+  set(_found FALSE)
+  foreach(_source ${_unittest_sources})
+    string(FIND "${_source}" "${_test_double}" _hit)
+    if(NOT _hit EQUAL -1)
+      set(_found TRUE)
+    endif()
+  endforeach()
+  if(NOT _found)
+    message(
+      FATAL_ERROR
+        "test double ${_test_double} is missing from sirius_unittest sources")
+  endif()
+endforeach()
+
+# TPC-DS integration test fixture, generated at build time (opt-in target). The
+# database is not committed; run `cmake --build . --target tpcds-fixture` once
+# before the TPC-DS integration tests. Requires the duckdb CLI (or python3 with
+# the duckdb module) on PATH; both are provided by the pixi environment.
+set(TPCDS_FIXTURE_DIR ${CMAKE_BINARY_DIR}/test-fixtures)
+set(TPCDS_FIXTURE ${TPCDS_FIXTURE_DIR}/tpcds.duckdb)
+set(TPCDS_FIXTURE_SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/integration/data/duckdb/generate_tpcds_duckdb.sh
+)
+add_custom_command(
+  OUTPUT ${TPCDS_FIXTURE}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${TPCDS_FIXTURE_DIR}
+  COMMAND bash ${TPCDS_FIXTURE_SCRIPT} ${TPCDS_FIXTURE}
+  DEPENDS ${TPCDS_FIXTURE_SCRIPT}
+  COMMENT "Generating TPC-DS test fixture (SF 0.01) at ${TPCDS_FIXTURE}"
+  VERBATIM)
+add_custom_target(tpcds-fixture DEPENDS ${TPCDS_FIXTURE})
 
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)

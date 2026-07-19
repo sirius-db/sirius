@@ -793,7 +793,16 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(st
     if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
   }
   auto io_ctx = _ioctx_registry.make_ioctx(*type);
-  if (!io_ctx) { return nullptr; }
+  if (!io_ctx) {
+    if (*type == sirius::io::io_context_type::rdma) {
+      // Explicit-RDMA routing with nothing built is an error, never a silent
+      // fallback: the caller asked for this transport by configuration.
+      throw std::runtime_error(
+        "sirius_scan_manager: RDMA transport initialization failed for the routed path "
+        "(the backend factory produced no ioctx)");
+    }
+    return nullptr;
+  }
   io_ctx->start();
   if (_config.enable_prefetch_cache && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);

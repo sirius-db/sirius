@@ -20,7 +20,7 @@
 #include "io/details/slot_pool.hpp"
 #include "io/io_request.hpp"
 #include "io/rdma/rdma_admission_gate.hpp"
-#include "io/rdma/rdma_client.hpp"
+#include "io/rdma/rdma_transport_client.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -45,15 +45,15 @@
 namespace sirius::io::rdma {
 
 /// GPUDirect RDMA write-ordering: a flush before the consuming copy is needed
-/// unless the platform orders NIC writes for all devices.  @p writes_ordering
+/// only when the platform does not order NIC writes at all.  @p writes_ordering
 /// is the CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING value
-/// (NONE = 0, OWNER = 100, ALL_DEVICES = 200).  Whether OWNER suffices for
-/// same-device consumers has not been validated on hardware, so OWNER is
-/// treated as requiring the flush.
+/// (NONE = 0, OWNER = 100, ALL_DEVICES = 200).  The consuming D2D copy runs on
+/// the OWNING device, so OWNER-level ordering already covers it; only
+/// NONE requires the explicit flush.
 [[nodiscard]] constexpr bool flush_required(int writes_ordering) noexcept
 {
-  constexpr int k_all_devices_ordered = 200;  // CU_..._ORDERING_ALL_DEVICES
-  return writes_ordering < k_all_devices_ordered;
+  constexpr int k_owner_ordered = 100;  // CU_..._ORDERING_OWNER
+  return writes_ordering < k_owner_ordered;
 }
 
 /// Default @c cuda_delivery_ops::fatal_hook: raw stderr writes, then return
@@ -217,18 +217,17 @@ class cuobj_rdma_reactor {
     std::optional<size_t> queue_cap{};
   };
 
-  /// Shared per-pool state: the sanitized config + the transfer client (may be
-  /// null until the real data path is configured) + the CUDA delivery seam +
-  /// the admission gate (all immutable bindings after construction).  Config
-  /// errors surface here, at construction.
+  /// Shared per-pool state: the sanitized config + the split transport
+  /// clients (control plane + data-session factory + tag predicate) + the
+  /// CUDA delivery seam + the admission gate (all immutable bindings after
+  /// construction).  Config errors surface here, at construction; missing
+  /// capabilities surface at the ioctx's start().
   class reactor_context {
    public:
-    reactor_context(config cfg,
-                    std::shared_ptr<rdma_client> client,
-                    cuda_delivery_ops delivery = {});
+    reactor_context(config cfg, rdma_transport_clients clients, cuda_delivery_ops delivery = {});
 
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
-    [[nodiscard]] const std::shared_ptr<rdma_client>& client() const noexcept { return _client; }
+    [[nodiscard]] const rdma_transport_clients& clients() const noexcept { return _clients; }
     [[nodiscard]] const cuda_delivery_ops& delivery_ops() const noexcept { return _delivery; }
     [[nodiscard]] admission_gate& gate() noexcept { return _gate; }
     [[nodiscard]] const admission_gate& gate() const noexcept { return _gate; }
@@ -241,7 +240,7 @@ class cuobj_rdma_reactor {
 
    private:
     config _config;
-    std::shared_ptr<rdma_client> _client;
+    rdma_transport_clients _clients;
     cuda_delivery_ops _delivery;
     admission_gate _gate;
     bool _flush_before_copy{false};
@@ -299,25 +298,37 @@ class cuobj_rdma_reactor {
   struct arena {
     uint8_t* base{nullptr};
     std::unique_ptr<slot_pool> pool;
-    std::shared_ptr<rdma_client> registrar;  // deregisters base on teardown
-    bool leaked{false};                      // non-freeable flag, set for every arena by the
-                                             // fail-stop marker: the destructor then skips
-                                             // deregister + cudaFree, because touching
-                                             // registered memory under an un-quiesced NIC is
-                                             // a use-after-free.
+    std::unique_ptr<rdma_data_session> registrar;  // its own session; deregisters on teardown
+    bool registered{false};  // base successfully registered with @c registrar; the destructor
+                             // only deregisters when true (a registration that threw must not be
+                             // undone by a deregister of an unregistered base).
+    bool leaked{false};      // non-freeable flag, set for every arena by the fail-stop marker: the
+                             // destructor then skips deregister + cudaFree AND releases (leaks)
+                             // the registrar session so its own destructor cannot tear down the
+                             // registration either — touching registered memory under an
+                             // un-quiesced NIC is a use-after-free.
     ~arena();
   };
 
   void worker_loop();
   /// One chunk end to end: arena/slot resolution, the pre-GET checks, the
-  /// one-shot client GET under the get permit, then the CUDA delivery
-  /// boundary.  A transport failure fail-stops the gate; the failing chunk is
-  /// error-reported before its guard or permit releases.
-  void process_claimed(admission_gate::claimed_chunk claimed_arg);
-  /// Single client GET + exact-completion check.  Sets @p transport_failure
-  /// before rethrowing so the caller can tell an RDMA failure (fail-stop)
-  /// from a CUDA-side one (error-complete only).
-  size_t one_shot_get(const cuobj_chunked_rx_request& chunk, void* dst, bool& transport_failure);
+  /// one-shot GET under the get permit (control plane for host chunks, the
+  /// worker's data session for device chunks), then the CUDA delivery
+  /// boundary.  A data-plane failure fail-stops the gate; a control-plane or
+  /// provably-unsent failure only error-completes its chunk.  The failing
+  /// chunk is error-reported before its guard or permit releases.
+  void process_claimed(admission_gate::claimed_chunk claimed_arg, rdma_data_session& session);
+  /// Host-chunk transfer over the control plane; throws (benign) on any
+  /// HTTP/transport/short outcome.
+  size_t control_transfer(const cuobj_chunked_rx_request& chunk);
+  /// Device-chunk transfer + the three-leg completion authority; sets
+  /// @p fail_stop_failure before throwing when the outcome poisons the
+  /// transport (ambiguous or invalid completion), and leaves it false for a
+  /// provably-unsent error.
+  size_t data_transfer(const cuobj_chunked_rx_request& chunk,
+                       rdma_data_session& session,
+                       void* dst,
+                       bool& fail_stop_failure);
   arena& arena_for_device(int device_id);
   /// The gate's whole-arena marker: flips every arena non-freeable and counts
   /// each, called under the held gate mutex (lock order gate -> arena).
@@ -328,6 +339,9 @@ class cuobj_rdma_reactor {
 
   std::mutex _lifecycle_mtx;
   std::condition_variable _joined_cv;
+  std::condition_variable _startup_cv;
+  size_t _startup_reported{0};
+  std::exception_ptr _startup_error;
   bool _started{false};
   bool _closing{false};
   bool _joined{false};

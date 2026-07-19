@@ -28,22 +28,17 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace sirius::io::rdma {
 
 namespace {
-
-std::runtime_error not_implemented(std::string_view entry_point)
-{
-  return std::runtime_error("cuobj_rdma_reactor::" + std::string(entry_point) +
-                            ": the S3 RDMA transport is not implemented yet (no RDMA client "
-                            "configured)");
-}
 
 std::runtime_error short_read_error(size_t got, size_t expected)
 {
@@ -114,6 +109,17 @@ struct event_guard {
     }
   }
 };
+
+std::string current_exception_message()
+{
+  try {
+    throw;
+  } catch (std::exception const& e) {
+    return e.what();
+  } catch (...) {
+    return "non-standard exception";
+  }
+}
 
 /// Monotonic peak update: plain load/store lets a smaller concurrent value
 /// overwrite a larger one, under-reporting the peak.
@@ -193,10 +199,10 @@ cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg)
 }
 
 cuobj_rdma_reactor::reactor_context::reactor_context(config cfg,
-                                                     std::shared_ptr<rdma_client> client,
+                                                     rdma_transport_clients clients,
                                                      cuda_delivery_ops delivery)
   : _config(sanitized(cfg)),
-    _client(std::move(client)),
+    _clients(std::move(clients)),
     _delivery(std::move(delivery)),
     _gate(*_config.queue_cap)
 {
@@ -205,12 +211,17 @@ cuobj_rdma_reactor::reactor_context::reactor_context(config cfg,
 
 cuobj_rdma_reactor::arena::~arena()
 {
-  if (base == nullptr) { return; }
   if (leaked) {
+    // Deliberately leaked after a fail-stop: deregistering or freeing under
+    // an un-quiesced device is a use-after-free.  Release the registrar
+    // session too, so ITS destructor cannot tear down the registration the
+    // leak is meant to preserve; the base and pool are intentionally not
+    // freed.
+    (void)registrar.release();
     return;
-  }  // deliberately leaked: deregistering or freeing
-     // under an un-quiesced device is a use-after-free
-  if (registrar) { registrar->deregister_memory(base); }
+  }
+  if (base == nullptr) { return; }
+  if (registered && registrar) { registrar->deregister_memory(base); }
   (void)cudaFree(base);
 }
 
@@ -244,12 +255,37 @@ void cuobj_rdma_reactor::mark_arenas_non_freeable(void* opaque) noexcept
 
 void cuobj_rdma_reactor::start()
 {
-  std::lock_guard lk{_lifecycle_mtx};
+  std::unique_lock lk{_lifecycle_mtx};
   if (_started) { return; }
   _started = true;
+  // Startup rendezvous: every worker acquires its own data session ON ITS
+  // OWN THREAD (session state is per-worker by contract) and reports back
+  // before this returns, so a capability failure surfaces synchronously
+  // from start() instead of as a dead pool.
+  _startup_reported = 0;
+  _startup_error    = nullptr;
   _workers.reserve(_config.max_inflight);
   for (size_t i = 0; i < _config.max_inflight; ++i) {
     _workers.emplace_back([this] { worker_loop(); });
+  }
+  _startup_cv.wait(lk, [&] { return _startup_reported == _workers.size(); });
+  if (_startup_error != nullptr) {
+    auto error = _startup_error;
+    lk.unlock();
+    // Failed workers exited; close admission so the successful ones do too.
+    auto batch = _ctx->gate().begin_close();
+    if (batch.has_token()) {
+      batch.error_complete_all(error);
+      _ctx->gate().complete_drain(std::move(batch).take_token());
+    }
+    _ctx->gate().await_closed();
+    for (auto& worker : _workers) {
+      if (worker.joinable()) { worker.join(); }
+    }
+    _workers.clear();
+    lk.lock();
+    _joined = true;
+    std::rethrow_exception(error);
   }
 }
 
@@ -308,47 +344,141 @@ rdma_perf_snapshot cuobj_rdma_reactor::perf_snapshot() const noexcept
   return s;
 }
 
-size_t cuobj_rdma_reactor::one_shot_get(const cuobj_chunked_rx_request& chunk,
-                                        void* dst,
-                                        bool& transport_failure)
+size_t cuobj_rdma_reactor::control_transfer(const cuobj_chunked_rx_request& chunk)
 {
-  auto& client = *_ctx->client();
-  size_t n     = 0;
-  try {
-    n = client.get(chunk.route->bucket, chunk.route->key, chunk.offset, chunk.size, dst);
-  } catch (...) {
-    transport_failure = true;
-    throw;
+  // Host-plane bounded retry (contract §6 frozen v1 policy): the control
+  // service layer above the one-attempt s3_control_client retries transient
+  // failures — a transport fault, HTTP 5xx, or a short read — up to
+  // k_host_max_attempts with a linear backoff.  A 4xx other than 416 is
+  // permanent.  This is the HOST plane only; the device plane never retries,
+  // so retries_total (the device tripwire) is never touched here.
+  constexpr int k_host_max_attempts             = 3;
+  constexpr std::chrono::milliseconds k_backoff = std::chrono::milliseconds{5};
+  std::string last_error;
+  for (int attempt = 1;; ++attempt) {
+    auto result =
+      _ctx->clients().control->range_get(*chunk.route, chunk.offset, chunk.size, chunk.dst);
+    const long status = result.outcome.http_status;
+    bool retriable    = false;
+    if (!result.outcome.transport_ok()) {
+      last_error = "control-plane transfer failed: " + result.outcome.transport_error;
+      retriable  = true;
+    } else if (status == 416) {
+      // The request was clipped to the object's HEAD-reported size, so a
+      // Range-Not-Satisfiable means the object shrank since HEAD — an
+      // append-only (contract §2.6) violation, not a benign empty read.
+      // Permanent; the client seam still reports 416 verbatim, the reactor
+      // treats it as an error here.
+      throw std::runtime_error(
+        "cuobj_rdma_reactor: control-plane transfer -> HTTP 416 (object changed since HEAD; "
+        "keys must be append-only)");
+    } else if (status >= 500) {
+      last_error = "control-plane transfer -> HTTP " + std::to_string(status);
+      retriable  = true;
+    } else if (status != 200 && status != 206) {
+      throw std::runtime_error("cuobj_rdma_reactor: control-plane transfer -> HTTP " +
+                               std::to_string(status));  // 4xx: permanent
+    } else if (result.delivered_bytes != chunk.size) {
+      _short_read_total.fetch_add(1, std::memory_order_relaxed);
+      last_error = "short read: got " + std::to_string(result.delivered_bytes) + " of " +
+                   std::to_string(chunk.size) + " bytes";
+      retriable = true;
+    } else {
+      return result.delivered_bytes;  // exact success
+    }
+    // Do not keep retrying (or sleeping) once admission is closed — a
+    // shutdown or a device fail-stop has begun and this host read should
+    // abort promptly rather than delay teardown.
+    if (!retriable || attempt >= k_host_max_attempts || _ctx->gate().terminal()) {
+      throw std::runtime_error("cuobj_rdma_reactor: " + last_error);
+    }
+    std::this_thread::sleep_for(k_backoff * attempt);
   }
-  if (n != chunk.size) {
-    _short_read_total.fetch_add(1, std::memory_order_relaxed);
-    transport_failure = true;
-    throw short_read_error(n, chunk.size);
+}
+
+size_t cuobj_rdma_reactor::data_transfer(const cuobj_chunked_rx_request& chunk,
+                                         rdma_data_session& session,
+                                         void* dst,
+                                         bool& fail_stop_failure)
+{
+  auto result = session.get(*chunk.route, chunk.offset, chunk.size, dst);
+  switch (result.commit) {
+    case data_commit_state::not_sent:
+      // Provably never left the process: this chunk fails, the transport
+      // does not.  (fail_stop_failure stays false.)
+      throw std::runtime_error(
+        redact_rdma_tokens("cuobj_rdma_reactor: data GET not issued: " + result.transport_error));
+    case data_commit_state::sent_unknown:
+      fail_stop_failure = true;
+      throw std::runtime_error(redact_rdma_tokens("cuobj_rdma_reactor: data GET outcome unknown: " +
+                                                  result.transport_error));
+    case data_commit_state::completed: break;
   }
-  return n;
+  // Completion authority: ALL three legs must hold before the size report.
+  // Status is checked before the byte count so a completed-but-error-status
+  // result is reported as its HTTP status rather than misattributed as a
+  // short read (and its short-read counter left untouched).
+  fail_stop_failure = true;  // any invalid completion poisons the transport
+  if (result.reply_tag.empty() || !_ctx->clients().tag_predicate(result.reply_tag)) {
+    throw std::runtime_error(result.reply_tag.empty()
+                               ? "cuobj_rdma_reactor: data completion reply tag missing"
+                               : "cuobj_rdma_reactor: data completion reply tag rejected");
+  }
+  if (result.http_status != 200 && result.http_status != 206) {
+    throw std::runtime_error(redact_rdma_tokens(
+      "cuobj_rdma_reactor: data completion HTTP status " + std::to_string(result.http_status) +
+      (result.transport_error.empty() ? "" : ": " + result.transport_error)));
+  }
+  if (result.delivered_bytes != chunk.size) {
+    if (result.delivered_bytes < chunk.size) {
+      _short_read_total.fetch_add(1, std::memory_order_relaxed);
+    }
+    throw std::runtime_error(
+      "cuobj_rdma_reactor: short completion: " + std::to_string(result.delivered_bytes) + " of " +
+      std::to_string(chunk.size) + " bytes");
+  }
+  fail_stop_failure = false;
+  return result.delivered_bytes;
 }
 
 void cuobj_rdma_reactor::worker_loop()
 {
+  std::unique_ptr<rdma_data_session> session;
+  {
+    std::exception_ptr acquire_error;
+    try {
+      session = _ctx->clients().data_sessions->acquire();
+      if (!session) { throw std::runtime_error("the data-session factory returned no session"); }
+    } catch (...) {
+      acquire_error = std::make_exception_ptr(std::runtime_error(
+        "cuobj_rdma_reactor: data-session acquisition failed: " + current_exception_message()));
+    }
+    std::lock_guard lk{_lifecycle_mtx};
+    ++_startup_reported;
+    if (acquire_error != nullptr && _startup_error == nullptr) { _startup_error = acquire_error; }
+    _startup_cv.notify_all();
+    if (acquire_error != nullptr) { return; }
+  }
   auto& gate = _ctx->gate();
   for (;;) {
     auto claimed = gate.claim();
     if (!claimed.has_value()) { return; }  // admission closed: the exit signal
     update_peak(_inflight_peak, _inflight.fetch_add(1, std::memory_order_relaxed) + 1);
-    process_claimed(std::move(*claimed));
+    process_claimed(std::move(*claimed), *session);
     _inflight.fetch_sub(1, std::memory_order_relaxed);
   }
 }
 
-void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_arg)
+void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_arg,
+                                         rdma_data_session& session)
 {
   auto& gate = _ctx->gate();
   // Declaration order carries the teardown ordering (members are destroyed
   // in reverse): `claimed` is destroyed FIRST, publishing the request's
   // outcome by dropping the manager reference; then the permit releases its
   // outstanding-work count; the arena slot is released LAST — after a
-  // transport failure's fail_stop, arena marking, and error report have all
-  // run, so a slot whose remote write state is unknown is never handed to
+  // fail-stop's transition, arena marking, and error report have all run,
+  // so a slot whose remote write state is unknown is never handed to
   // another worker mid-transition.
   struct slot_holder {
     cuobj_rdma_reactor* self{nullptr};
@@ -363,12 +493,12 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
   } held_slot;
   std::optional<admission_gate::admission_permit> permit;
   std::optional<admission_gate::claimed_chunk> claimed{std::move(claimed_arg)};
-  bool transport_failure = false;
+  bool fail_stop_failure = false;
   try {
     const auto& chunk = claimed->chunk();
     if (!chunk.is_device) {
       permit.emplace(gate.acquire_get(std::move(*claimed)));
-      const size_t n = one_shot_get(chunk, chunk.dst, transport_failure);
+      const size_t n = control_transfer(chunk);
       _bytes_total.fetch_add(n, std::memory_order_relaxed);
       chunk.manager->chunk_complete(n);
       return;
@@ -413,7 +543,7 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
 
     uint8_t* slot_ptr = ar.base + static_cast<size_t>(slot) * _config.arena_slot_size;
     permit.emplace(gate.acquire_get(std::move(*claimed)));
-    const size_t n = one_shot_get(chunk, slot_ptr, transport_failure);
+    const size_t n = data_transfer(chunk, session, slot_ptr, fail_stop_failure);
 
     // A fatal latched by another worker while our GET was in flight: never
     // start new CUDA work on the dead context.  The owning worker resolves
@@ -453,7 +583,7 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
     // only returning path is an event wait that reports cudaSuccess; every
     // other outcome (error return or exception from the memcpy, the record,
     // or the wait) is process-fatal through invoke_fatal.  No unwinding
-    // runs: the slot_release and event_guard destructors above never fire,
+    // runs: the slot_holder and event_guard destructors above never fire,
     // no future resolves, and the arena is never freed.  Only static
     // literals reach the hook (no throwing formatting on this path).
     try {
@@ -477,14 +607,22 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
   } catch (...) {
     _error_total.fetch_add(1, std::memory_order_relaxed);
     auto error = std::current_exception();
-    if (transport_failure) {
-      // One-shot: an RDMA failure is ambiguous about remote/NIC state, so it
-      // poisons the transport rather than retrying.  The arena marking runs
-      // inside the transition; queued work drains by error right here.
+    if (fail_stop_failure) {
+      // One-shot: an ambiguous or invalid data-plane completion poisons the
+      // transport rather than retrying.  Close admission and mark the arenas
+      // FIRST — before any best-effort diagnostic — so a blocking log sink
+      // cannot delay the cutoff and let another worker take a permit or issue
+      // a GET after the fatal.  The transition marks the arenas; queued work
+      // drains by error right here; the diagnostic is token-redacted already.
       auto batch = gate.fail_stop(error);
       if (batch.has_token()) {
         batch.error_complete_all(error);
         gate.complete_drain(std::move(batch).take_token());
+      }
+      try {
+        SIRIUS_LOG_ERROR("cuobj_rdma_reactor: data-plane fail-stop: {}",
+                         current_exception_message());
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
       }
     }
     // Publication before release: report the failing chunk while the claim
@@ -512,10 +650,17 @@ cuobj_rdma_reactor::arena& cuobj_rdma_reactor::arena_for_device(int device_id)
     cudaMalloc(reinterpret_cast<void**>(&ar->base), _config.max_inflight * _config.arena_slot_size),
     "landing arena allocation failed");
   ar->pool = std::make_unique<slot_pool>(_config.max_inflight);
-  if (const auto& client = _ctx->client()) {
-    client->register_memory(ar->base, _config.max_inflight * _config.arena_slot_size);
-    ar->registrar = client;
+  // The arena owns a dedicated session for its registration lifetime:
+  // worker sessions die when workers exit, but deregistration happens at
+  // arena teardown, after the join.  A factory that yields no session is a
+  // capability failure, not a null dereference.
+  ar->registrar = _ctx->clients().data_sessions->acquire();
+  if (!ar->registrar) {
+    throw std::runtime_error(
+      "cuobj_rdma_reactor: the data-session factory returned no session for arena registration");
   }
+  ar->registrar->register_memory(ar->base, _config.max_inflight * _config.arena_slot_size);
+  ar->registered = true;  // only after register_memory returns (a throw leaves it false)
   return *_arenas.emplace(device_id, std::move(ar)).first->second;
 }
 
@@ -577,9 +722,7 @@ void cuobj_rdma_reactor::enqueue(request_type_ptr req)
   if (chunks.empty()) { return; }
 
   std::exception_ptr failure;
-  if (!_ctx->client()) {
-    failure = std::make_exception_ptr(not_implemented("enqueue"));
-  } else {
+  {
     auto& gate = _ctx->gate();
     try {
       bool admitted = false;
@@ -617,7 +760,6 @@ size_t cuobj_rdma_reactor::host_read(const io_object_type& file,
                                      size_t size,
                                      uint8_t* dst)
 {
-  if (!_ctx->client()) { throw not_implemented("host_read"); }
   const size_t n = clipped_size(file, offset, size);
   if (n == 0) { return 0; }
 

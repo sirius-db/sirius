@@ -16,65 +16,77 @@
 
 #pragma once
 
-#include "io/rdma/rdma_client.hpp"
+#include "io/rdma/rdma_transport_client.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
-#include <utility>
-#include <vector>
 
 namespace sirius::io::rdma {
 
 /**
- * @brief The production @c rdma_client: SigV4 HTTP control plane + cuObject
- *        data plane.
+ * @brief Production control plane: SigV4-signed HTTP over libcurl.
  *
- * The HTTP half (@c head and host-destination @c get: ranged, SigV4-signed
- * via the shared authorizer, libcurl transport) always compiles and needs no
- * RDMA hardware or SDK; it serves the bind-time footer / metadata path.
- *
- * The device half (@c get into a registered landing-arena slot via cuObjGet,
- * plus @c register_memory / @c deregister_memory) requires building with
- * @c SIRIUS_ENABLE_S3_RDMA (cuObject SDK).  Without it, device-destination
- * gets fail loudly with an error naming the flag; registration is a no-op.
- * Destination kind is detected per call (host vs device pointer).
+ * One persistent easy handle per client — connection reuse is client state,
+ * so back-to-back calls do not re-init or re-connect.  Calls are serialized
+ * on an internal mutex (the ioctx makes control calls from one thread at a
+ * time today; the mutex keeps the persistent handle safe if that changes).
+ * Exactly one HTTP attempt per call; HTTP-level failure is a result, never
+ * an exception.
  */
-class cuobj_rdma_client final : public rdma_client {
+class curl_s3_control_client final : public s3_control_client {
  public:
-  /// @p authorizer carries endpoint / region / credentials (the same SigV4
-  /// authorizer the REST backend uses; presigned or header mode).  TLS options
-  /// mirror the REST reactor's.
-  explicit cuobj_rdma_client(std::shared_ptr<s3::s3_request_authorizer> authorizer,
-                             std::string ca_bundle_path = "",
-                             bool tls_verify            = true);
-  ~cuobj_rdma_client() override;
+  curl_s3_control_client(std::shared_ptr<s3::s3_request_authorizer> authorizer,
+                         std::string ca_bundle_path = "",
+                         bool tls_verify            = true);
+  ~curl_s3_control_client() override;
 
-  size_t head(std::string_view bucket, std::string_view key) override;
-  size_t get(
-    std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst) override;
-
-  void register_memory(void* base, size_t bytes) override;
-  void deregister_memory(void* base) noexcept override;
-
-  /// Control-plane GET: SigV4-signed, body discarded, @p extra_headers attached
-  /// verbatim (the cuObject data-plane callback rides on this with the RDMA
-  /// descriptor token; the reply carries status only).  Throws on non-2xx.
-  void control_get(std::string_view bucket,
-                   std::string_view key,
-                   const std::vector<std::pair<std::string, std::string>>& extra_headers);
+  [[nodiscard]] head_result head(const rx_route& route) override;
+  [[nodiscard]] range_get_result range_get(const rx_route& route,
+                                           size_t offset,
+                                           size_t size,
+                                           uint8_t* dst) override;
+  [[nodiscard]] uint64_t attempts_total() const noexcept override
+  {
+    return _attempts_total.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] uint64_t connections_total() const noexcept override
+  {
+    return _connections_total.load(std::memory_order_relaxed);
+  }
 
  private:
-  size_t host_get(
-    std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst);
-  size_t device_get(
-    std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst);
-  void* ensure_cuobj_client();
+  void* ensure_handle();  // CURL*, created once, reset per call
 
   std::shared_ptr<s3::s3_request_authorizer> _authorizer;
   std::string _ca_bundle_path;
   bool _tls_verify;
-  void* _cuobj{nullptr};  // lazily-created cuObjClient (SDK builds only)
+  std::mutex _mtx;
+  void* _handle{nullptr};  // persistent CURL easy handle
+  std::atomic<uint64_t> _attempts_total{0};
+  std::atomic<uint64_t> _connections_total{0};
+};
+
+/**
+ * @brief Production data-plane session factory over the cuObject SDK.
+ *
+ * Sessions are dormant in this increment: the factory constructs and
+ * `acquire` succeeds (so routing and `start()` capability validation are
+ * real), but issuing a GET or registering memory fails loudly until the
+ * gateway wiring lands.  Building without @c SIRIUS_ENABLE_S3_RDMA behaves
+ * identically — the flag gates only the (unreached) SDK calls.
+ */
+class cuobj_rdma_data_session_factory final : public rdma_data_session_factory {
+ public:
+  explicit cuobj_rdma_data_session_factory(
+    std::shared_ptr<s3::s3_request_authorizer> data_authorizer);
+
+  [[nodiscard]] std::unique_ptr<rdma_data_session> acquire() override;
+
+ private:
+  std::shared_ptr<s3::s3_request_authorizer> _data_authorizer;
 };
 
 }  // namespace sirius::io::rdma

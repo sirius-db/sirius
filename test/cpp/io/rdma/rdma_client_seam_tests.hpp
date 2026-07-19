@@ -42,8 +42,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -52,7 +54,9 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <source_location>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -146,6 +150,17 @@ std::string ready_error(std::future<std::size_t>& future, std::chrono::milliseco
   return {};
 }
 
+template <typename Fn>
+std::string thrown_error(Fn&& fn)
+{
+  try {
+    std::forward<Fn>(fn)();
+  } catch (std::exception const& error) {
+    return error.what();
+  }
+  return {};
+}
+
 std::future<std::size_t> issue_device_read(sirius::io::sirius_datasource& datasource,
                                            rmm::device_buffer& destination,
                                            rmm::cuda_stream_view stream)
@@ -165,6 +180,70 @@ bool wait_until(auto&& predicate, std::chrono::milliseconds timeout = 5s)
 }
 
 bool accepts_test_tag(std::string_view tag) noexcept { return tag == "accepted-test-tag"; }
+
+class blocking_error_log_sink final : public sirius::log::sink {
+ public:
+  void set_level(sirius::log::level level) override
+  {
+    _level.store(level, std::memory_order_relaxed);
+  }
+
+  bool should_log(sirius::log::level level) const override
+  {
+    return static_cast<int>(level) >= static_cast<int>(_level.load(std::memory_order_relaxed));
+  }
+
+  void log(sirius::log::level level,
+           const std::source_location& /*loc*/,
+           std::string_view /*message*/) override
+  {
+    if (!should_log(level)) { return; }
+    std::unique_lock lock{_mutex};
+    _entered = true;
+    _cv.notify_all();
+    _cv.wait(lock, [&] { return _released; });
+  }
+
+  bool flush() override { return true; }
+
+  bool wait_until_entered(std::chrono::milliseconds timeout = 5s)
+  {
+    std::unique_lock lock{_mutex};
+    return _cv.wait_for(lock, timeout, [&] { return _entered; });
+  }
+
+  void release()
+  {
+    {
+      std::lock_guard lock{_mutex};
+      _released = true;
+    }
+    _cv.notify_all();
+  }
+
+ private:
+  std::atomic<sirius::log::level> _level{sirius::log::level::off};
+  std::mutex _mutex;
+  std::condition_variable _cv;
+  bool _entered{false};
+  bool _released{false};
+};
+
+class release_log_sink_on_exit {
+ public:
+  explicit release_log_sink_on_exit(std::shared_ptr<blocking_error_log_sink> sink)
+    : _sink(std::move(sink))
+  {
+  }
+
+  ~release_log_sink_on_exit() { _sink->release(); }
+
+  release_log_sink_on_exit(release_log_sink_on_exit const&)            = delete;
+  release_log_sink_on_exit& operator=(release_log_sink_on_exit const&) = delete;
+
+ private:
+  std::shared_ptr<blocking_error_log_sink> _sink;
+};
 
 void require_no_long_fragment(std::string_view text, std::string_view secret)
 {
@@ -434,11 +513,13 @@ TEST_CASE("s3_rdma AC7 data headers are signed and accepted on the wire",
                                                     30s,
                                                     extra_headers);
 
-  auto const authorization = header_value(request.headers, "Authorization");
+  auto const authorization =
+    s3_rdma_client_seam_tests::header_value(request.headers, "Authorization");
   CHECK(authorization.find("range") != std::string::npos);
   CHECK(authorization.find("x-amz-rdma-token") != std::string::npos);
-  CHECK(header_value(request.headers, "Range") == "bytes=0-15");
-  CHECK(header_value(request.headers, "x-amz-rdma-token") == "step5-wire-token");
+  CHECK(s3_rdma_client_seam_tests::header_value(request.headers, "Range") == "bytes=0-15");
+  CHECK(s3_rdma_client_seam_tests::header_value(request.headers, "x-amz-rdma-token") ==
+        "step5-wire-token");
 
   auto const response = perform_get(request);
   CHECK(response.status == 206);
@@ -590,23 +671,246 @@ TEST_CASE("s3_rdma AC6 host reads use only the control plane", "[s3][rdma][clien
   CHECK(std::equal(destination.begin(), destination.end(), payload.begin() + 11));
 }
 
-TEST_CASE("s3_rdma AC6 control failure is nonfatal and the next host read succeeds",
+TEST_CASE("s3_rdma AC6 host retries are bounded and never poison the transport",
           "[s3][rdma][client-seam]")
 {
   using namespace s3_rdma_client_seam_tests;
 
-  auto payload   = pattern_bytes(256);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "host-recovery", payload);
-  auto ctx       = make_started_ioctx(transport);
-  auto ds        = open_ds(ctx, "host-recovery");
-  std::array<std::uint8_t, 32> destination{};
-  transport->control->respond_status(503);
+  SECTION("one transient 503 is retried and succeeds")
+  {
+    auto payload   = pattern_bytes(256);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "host-transient", payload);
+    auto ctx       = make_started_ioctx(transport);
+    auto ds        = open_ds(ctx, "host-transient");
+    std::array<std::uint8_t, 32> destination{};
+    auto const calls_before = transport->control->range_gets_issued();
+    transport->control->fail_next_n_range_gets(1, 503);
 
-  CHECK_THROWS(ds->host_read(0, destination.size(), destination.data()));
-  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
-  CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
-  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
-  CHECK(transport->data->gets_issued() == 0);
+    CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+    CHECK(transport->control->range_gets_issued() - calls_before == 2);
+    CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+    auto const snapshot = ctx->perf_snapshot();
+    CHECK(snapshot.fail_stop_total == 0);
+    CHECK(snapshot.retries_total == 0);
+    CHECK(transport->data->gets_issued() == 0);
+  }
+
+  SECTION("three persistent 503 responses exhaust the retry budget without poisoning")
+  {
+    auto payload   = pattern_bytes(256);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "host-exhaustion", payload);
+    auto ctx       = make_started_ioctx(transport);
+    auto ds        = open_ds(ctx, "host-exhaustion");
+    std::array<std::uint8_t, 32> destination{};
+    auto const calls_before = transport->control->range_gets_issued();
+    transport->control->fail_next_n_range_gets(3, 503);
+
+    CHECK_THROWS(ds->host_read(0, destination.size(), destination.data()));
+    CHECK(transport->control->range_gets_issued() - calls_before == 3);
+    auto snapshot = ctx->perf_snapshot();
+    CHECK(snapshot.fail_stop_total == 0);
+    CHECK(snapshot.retries_total == 0);
+
+    auto const recovery_calls = transport->control->range_gets_issued();
+    CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+    CHECK(transport->control->range_gets_issued() - recovery_calls == 1);
+    CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+    snapshot = ctx->perf_snapshot();
+    CHECK(snapshot.fail_stop_total == 0);
+    CHECK(snapshot.retries_total == 0);
+    CHECK(transport->data->gets_issued() == 0);
+  }
+
+  SECTION("a 404 is permanent and does not poison later reads")
+  {
+    auto payload   = pattern_bytes(256);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "host-permanent", payload);
+    auto ctx       = make_started_ioctx(transport);
+    auto ds        = open_ds(ctx, "host-permanent");
+    std::array<std::uint8_t, 32> destination{};
+    auto const calls_before = transport->control->range_gets_issued();
+    transport->control->fail_next_n_range_gets(1, 404);
+
+    CHECK_THROWS(ds->host_read(0, destination.size(), destination.data()));
+    CHECK(transport->control->range_gets_issued() - calls_before == 1);
+    auto const snapshot = ctx->perf_snapshot();
+    CHECK(snapshot.fail_stop_total == 0);
+    CHECK(snapshot.retries_total == 0);
+    CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+  }
+
+  SECTION("a 416 is a consistency error (append-only violation)")
+  {
+    auto payload   = pattern_bytes(256);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "host-empty", payload);
+    auto ctx       = make_started_ioctx(transport);
+    auto ds        = open_ds(ctx, "host-empty");
+    std::array<std::uint8_t, 32> destination{};
+    auto const calls_before = transport->control->range_gets_issued();
+    transport->control->fail_next_n_range_gets(1, 416);
+
+    CHECK_THROWS(ds->host_read(0, destination.size(), destination.data()));
+    CHECK(transport->control->range_gets_issued() - calls_before == 1);
+    auto const snapshot = ctx->perf_snapshot();
+    CHECK(snapshot.fail_stop_total == 0);
+    CHECK(snapshot.retries_total == 0);
+  }
+}
+
+TEST_CASE("s3_rdma fail-stop closes both planes before diagnostics", "[s3][rdma][client-seam][gpu]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  auto payload   = pattern_bytes(k_slot_size);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "fatal-before-log", payload);
+  transport->data->script_result(
+    data_get_result{data_commit_state::sent_unknown, 0, 0, {}, "completion unknown"});
+  auto ctx = make_started_ioctx(transport);
+  auto ds  = open_ds(ctx, "fatal-before-log");
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(payload.size(), stream);
+  rmm::device_buffer rejected_destination(payload.size(), stream);
+
+  auto blocking_sink = std::make_shared<blocking_error_log_sink>();
+  blocking_sink->set_level(sirius::log::level::error);
+  sirius::test::scoped_recording_log_sink restore_sink;
+  sirius::log::set_sink(blocking_sink);
+  release_log_sink_on_exit unblock{blocking_sink};
+
+  auto failed = issue_device_read(*ds, destination, stream);
+  REQUIRE(blocking_sink->wait_until_entered());
+  CHECK(ctx->perf_snapshot().fail_stop_total == 1);
+
+  auto const control_calls = transport->control->range_gets_issued();
+  std::array<std::uint8_t, 16> host_destination{};
+  CHECK_THROWS(ds->host_read(0, host_destination.size(), host_destination.data()));
+  CHECK(transport->control->range_gets_issued() == control_calls);
+
+  auto const data_calls = transport->data->gets_issued();
+  auto rejected         = issue_device_read(*ds, rejected_destination, stream);
+  CHECK_FALSE(ready_error(rejected).empty());
+  CHECK(transport->data->gets_issued() == data_calls);
+
+  blocking_sink->release();
+  CHECK(ready_error(failed).find("completion unknown") != std::string::npos);
+}
+
+TEST_CASE("s3_rdma arena registrar lifetime follows the teardown outcome",
+          "[s3][rdma][client-seam][gpu]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  SECTION("normal teardown deregisters once and destroys every session")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "registrar-normal", payload);
+    {
+      auto ctx = make_started_ioctx(transport);
+      auto ds  = open_ds(ctx, "registrar-normal");
+      rmm::cuda_stream stream;
+      rmm::device_buffer destination(payload.size(), stream);
+      auto completed = issue_device_read(*ds, destination, stream);
+
+      REQUIRE(completed.wait_for(5s) == std::future_status::ready);
+      CHECK(completed.get() == payload.size());
+      CHECK(ctx->perf_snapshot().arena_leak_total == 0);
+    }
+    CHECK(transport->data->register_count() == 1);
+    CHECK(transport->data->deregister_count() == 1);
+    CHECK(transport->data->live_sessions() == 0);
+  }
+
+  SECTION("fail-stop teardown keeps the registrar and registration alive")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "registrar-leaked", payload);
+    transport->data->script_result(
+      data_get_result{data_commit_state::sent_unknown, 0, 0, {}, "registration may be in use"});
+    {
+      auto ctx = make_started_ioctx(transport);
+      auto ds  = open_ds(ctx, "registrar-leaked");
+      rmm::cuda_stream stream;
+      rmm::device_buffer destination(payload.size(), stream);
+      auto failed = issue_device_read(*ds, destination, stream);
+
+      CHECK(ready_error(failed).find("registration may be in use") != std::string::npos);
+      auto const snapshot = ctx->perf_snapshot();
+      CHECK(snapshot.fail_stop_total == 1);
+      CHECK(snapshot.arena_leak_total >= 1);
+    }
+    CHECK(transport->data->register_count() == 1);
+    CHECK(transport->data->deregister_count() == 0);
+    CHECK(transport->data->live_sessions() > 0);
+  }
+
+  SECTION("registration failure never deregisters an unregistered arena")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "registrar-failure", payload);
+    transport->data->fail_register(1, "injected registration failure");
+    {
+      auto ctx = make_started_ioctx(transport);
+      auto ds  = open_ds(ctx, "registrar-failure");
+      rmm::cuda_stream stream;
+      rmm::device_buffer destination(payload.size(), stream);
+      auto failed = issue_device_read(*ds, destination, stream);
+
+      CHECK(ready_error(failed).find("injected registration failure") != std::string::npos);
+      auto const snapshot = ctx->perf_snapshot();
+      CHECK(snapshot.fail_stop_total == 0);
+      CHECK(snapshot.arena_leak_total == 0);
+    }
+    CHECK(transport->data->register_count() == 1);
+    CHECK(transport->data->deregister_count() == 0);
+    CHECK(transport->data->live_sessions() == 0);
+  }
+}
+
+TEST_CASE("s3_rdma null data sessions surface capability errors", "[s3][rdma][client-seam][gpu]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  SECTION("a null first worker session fails start without crashing")
+  {
+    auto transport = std::make_shared<mock_transport_fixture>();
+    transport->data->null_acquire_after(0);
+    auto ctx = std::make_shared<s3_rdma_ioctx>(
+      mock_config(), transport->clients(), sirius::io::rdma::cuda_delivery_ops{});
+
+    auto const error = thrown_error([&] { ctx->start(); });
+    REQUIRE_FALSE(error.empty());
+    CHECK(error.find("data-session acquisition failed") != std::string::npos);
+    CHECK(error.find("no session") != std::string::npos);
+    CHECK(transport->data->register_count() == 0);
+    CHECK(transport->data->deregister_count() == 0);
+    CHECK(transport->data->live_sessions() == 0);
+  }
+
+  SECTION("a null arena registrar fails the read without poisoning or crashing")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "null-registrar", payload);
+    transport->data->null_acquire_after(1);
+    {
+      auto ctx = make_started_ioctx(transport, mock_config(/*max_inflight=*/1));
+      auto ds  = open_ds(ctx, "null-registrar");
+      rmm::cuda_stream stream;
+      rmm::device_buffer destination(payload.size(), stream);
+      auto failed = issue_device_read(*ds, destination, stream);
+
+      auto const error = ready_error(failed);
+      CHECK(error.find("no session for arena registration") != std::string::npos);
+      auto const snapshot = ctx->perf_snapshot();
+      CHECK(snapshot.fail_stop_total == 0);
+      CHECK(snapshot.arena_leak_total == 0);
+      CHECK(transport->data->register_count() == 0);
+      CHECK(transport->data->deregister_count() == 0);
+    }
+    CHECK(transport->data->live_sessions() == 0);
+  }
 }
 
 TEST_CASE("s3_rdma AC10 token-bearing diagnostics are redacted at publication",

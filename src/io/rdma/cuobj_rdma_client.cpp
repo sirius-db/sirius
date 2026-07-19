@@ -19,20 +19,13 @@
 #include "io/rest/curl_handle.hpp"
 #include "io/s3/s3_object_ref.hpp"
 
-#include <cuda_runtime.h>
-
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
-
-#ifdef SIRIUS_ENABLE_S3_RDMA
-#include <cuobjclient.h>
-
-#include <mutex>
-#endif
 
 namespace sirius::io::rdma {
 
@@ -41,16 +34,27 @@ namespace {
 constexpr std::chrono::seconds k_presign_ttl{300};
 constexpr long k_request_timeout_s = 30;
 
-struct bounded_sink {
+/// One range response: bounded body delivery + the headers we act on
+/// (status line and Content-Range), shared as both the write and header
+/// callback userdata so the write callback can see the live status.
+struct range_response {
   uint8_t* dst;
   size_t capacity;
   size_t written{0};
+  long status{0};             ///< parsed from the status line by @c capture_header
+  std::string content_range;  ///< raw Content-Range value; empty if absent
 };
 
 size_t write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
-  auto* sink         = static_cast<bounded_sink*>(userdata);
+  auto* sink         = static_cast<range_response*>(userdata);
   const size_t bytes = size * nmemb;
+  // An error status carries a diagnostic body (e.g. a 416 / 4xx XML error),
+  // not payload: consume and discard it so the transfer completes and the
+  // HTTP status becomes the result instead of a fabricated write error.  The
+  // over-delivery guard (abort when a success response exceeds the requested
+  // range) applies only to a delivering status.
+  if (sink->status >= 400) { return bytes; }
   if (sink->written + bytes > sink->capacity) { return 0; }  // abort: server over-delivered
   std::memcpy(sink->dst + sink->written, ptr, bytes);
   sink->written += bytes;
@@ -62,25 +66,46 @@ size_t write_discard(char* /*ptr*/, size_t size, size_t nmemb, void* /*userdata*
   return size * nmemb;
 }
 
-bool is_device_pointer(const void* ptr)
+std::string_view trim_header_value(std::string_view value)
 {
-  cudaPointerAttributes attr{};
-  auto err = cudaPointerGetAttributes(&attr, ptr);
-  if (err != cudaSuccess) {
-    (void)cudaGetLastError();
-    return false;
+  while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+    value.remove_prefix(1);
   }
-  return attr.type == cudaMemoryTypeDevice;
+  while (!value.empty() && (value.back() == '\r' || value.back() == '\n' || value.back() == ' ')) {
+    value.remove_suffix(1);
+  }
+  return value;
 }
 
-void apply_common_opts(CURL* h, const std::string& ca_bundle_path, bool tls_verify)
+size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
 {
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, k_request_timeout_s));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, tls_verify ? 1L : 0L));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, tls_verify ? 2L : 0L));
-  if (!ca_bundle_path.empty()) {
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_CAINFO, ca_bundle_path.c_str()));
+  auto* response     = static_cast<range_response*>(userdata);
+  const size_t bytes = size * nitems;
+  std::string_view line{buffer, bytes};
+  // Status line ("HTTP/1.1 206 Partial Content"): the last one wins (a 100
+  // Continue or a redirect precedes the final status).
+  if (line.rfind("HTTP/", 0) == 0) {
+    if (const auto sp = line.find(' '); sp != std::string_view::npos) {
+      long parsed = 0;
+      for (size_t i = sp + 1; i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
+        parsed = parsed * 10 + (line[i] - '0');
+      }
+      response->status = parsed;
+    }
+    return bytes;
   }
+  constexpr std::string_view name{"content-range:"};
+  if (line.size() > name.size()) {
+    bool match = true;
+    for (size_t i = 0; i < name.size(); ++i) {
+      if (static_cast<char>(std::tolower(static_cast<unsigned char>(line[i]))) != name[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) { response->content_range.assign(trim_header_value(line.substr(name.size()))); }
+  }
+  return bytes;
 }
 
 rest::curl_slist_ptr build_headers(const std::vector<std::pair<std::string, std::string>>& headers)
@@ -92,11 +117,6 @@ rest::curl_slist_ptr build_headers(const std::vector<std::pair<std::string, std:
   return rest::curl_slist_ptr{list};
 }
 
-std::string object_label(std::string_view bucket, std::string_view key)
-{
-  return "s3://" + std::string(bucket) + "/" + std::string(key);
-}
-
 std::string range_header_value(size_t offset, size_t size)
 {
   return "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + size - 1);
@@ -104,248 +124,203 @@ std::string range_header_value(size_t offset, size_t size)
 
 }  // namespace
 
-cuobj_rdma_client::cuobj_rdma_client(std::shared_ptr<s3::s3_request_authorizer> authorizer,
-                                     std::string ca_bundle_path,
-                                     bool tls_verify)
+curl_s3_control_client::curl_s3_control_client(
+  std::shared_ptr<s3::s3_request_authorizer> authorizer,
+  std::string ca_bundle_path,
+  bool tls_verify)
   : _authorizer(std::move(authorizer)),
     _ca_bundle_path(std::move(ca_bundle_path)),
     _tls_verify(tls_verify)
 {
-  if (!_authorizer) { throw std::invalid_argument("cuobj_rdma_client: null request authorizer"); }
+  if (!_authorizer) {
+    throw std::invalid_argument("curl_s3_control_client: null request authorizer");
+  }
 }
 
-size_t cuobj_rdma_client::head(std::string_view bucket, std::string_view key)
+curl_s3_control_client::~curl_s3_control_client()
 {
-  s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
-  auto const authd = _authorizer->authorize(obj, s3::s3_request_method::HEAD, k_presign_ttl);
-
-  rest::curl_easy_ptr h{curl_easy_init()};
-  if (!h) { throw std::runtime_error("cuobj_rdma_client::head: curl_easy_init failed"); }
-  rest::configure_easy_handle(h.get(), rest::global_curl_context::instance().share_handle());
-  apply_common_opts(h.get(), _ca_bundle_path, _tls_verify);
-
-  auto hdrs = build_headers(authd.headers);
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_NOBODY, 1L));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_discard));
-
-  CURLcode const rc = curl_easy_perform(h.get());
-  long status       = 0;
-  curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
-
-  if (rc != CURLE_OK) {
-    throw std::runtime_error("cuobj_rdma_client::head: " + object_label(bucket, key) + ": " +
-                             curl_easy_strerror(rc));
-  }
-  if (status != 200) {
-    throw std::runtime_error("cuobj_rdma_client::head: " + object_label(bucket, key) + " -> HTTP " +
-                             std::to_string(status));
-  }
-  curl_off_t content_length = -1;
-  curl_easy_getinfo(h.get(), CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
-  if (content_length < 0) {
-    throw std::runtime_error("cuobj_rdma_client::head: " + object_label(bucket, key) +
-                             ": no Content-Length");
-  }
-  return static_cast<size_t>(content_length);
+  if (_handle != nullptr) { curl_easy_cleanup(static_cast<CURL*>(_handle)); }
 }
 
-size_t cuobj_rdma_client::get(
-  std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst)
+void* curl_s3_control_client::ensure_handle()
 {
-  if (size == 0) { return 0; }
-  if (is_device_pointer(dst)) { return device_get(bucket, key, offset, size, dst); }
-  return host_get(bucket, key, offset, size, dst);
+  if (_handle == nullptr) {
+    _handle = curl_easy_init();
+    if (_handle == nullptr) {
+      throw std::runtime_error("curl_s3_control_client: curl_easy_init failed");
+    }
+    rest::configure_easy_handle(static_cast<CURL*>(_handle),
+                                rest::global_curl_context::instance().share_handle());
+  }
+  // Reset per-call options while KEEPING the handle (and with it the live
+  // connection cache — the whole point of the persistent handle); the shared
+  // DNS/TLS-session context and defaults are re-applied below per call.
+  return _handle;
 }
 
-size_t cuobj_rdma_client::host_get(
-  std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst)
+head_result curl_s3_control_client::head(const rx_route& route)
 {
-  s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
-  auto const authd = _authorizer->authorize(obj, s3::s3_request_method::GET, k_presign_ttl);
+  std::lock_guard lk{_mtx};
+  _attempts_total.fetch_add(1, std::memory_order_relaxed);
+  head_result result;
 
-  rest::curl_easy_ptr h{curl_easy_init()};
-  if (!h) { throw std::runtime_error("cuobj_rdma_client::host_get: curl_easy_init failed"); }
-  rest::configure_easy_handle(h.get(), rest::global_curl_context::instance().share_handle());
-  apply_common_opts(h.get(), _ca_bundle_path, _tls_verify);
+  try {
+    s3::s3_object_ref const obj{route.bucket, route.key};
+    auto const authd = _authorizer->authorize(obj, s3::s3_request_method::HEAD, k_presign_ttl);
 
-  auto headers = authd.headers;
-  headers.emplace_back("Range", range_header_value(offset, size));
-  auto hdrs = build_headers(headers);
+    auto* h = static_cast<CURL*>(ensure_handle());
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, k_request_timeout_s));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, _tls_verify ? 1L : 0L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, _tls_verify ? 2L : 0L));
+    if (!_ca_bundle_path.empty()) {
+      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_CAINFO, _ca_bundle_path.c_str()));
+    }
+    auto hdrs = build_headers(authd.headers);
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_URL, authd.url.c_str()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_NOBODY, 1L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs.get()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &write_discard));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, nullptr));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERDATA, nullptr));
 
-  bounded_sink sink{static_cast<uint8_t*>(dst), size};
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_to_sink));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEDATA, &sink));
-
-  CURLcode const rc = curl_easy_perform(h.get());
-  long status       = 0;
-  curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
-
-  // 416: the whole requested range starts at/after EOF — an empty read, not an
-  // error (the reactor clips sizes, but callers may probe past the end).
-  if (status == 416) { return 0; }
-  if (rc != CURLE_OK) {
-    throw std::runtime_error("cuobj_rdma_client::host_get: " + object_label(bucket, key) + ": " +
-                             curl_easy_strerror(rc));
+    CURLcode const rc = curl_easy_perform(h);
+    long connects     = 0;
+    if (curl_easy_getinfo(h, CURLINFO_NUM_CONNECTS, &connects) == CURLE_OK && connects > 0) {
+      _connections_total.fetch_add(static_cast<uint64_t>(connects), std::memory_order_relaxed);
+    }
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_NOBODY, 0L));  // un-stick for later GETs
+    // Capture the status even on a CURLcode error: a response may have
+    // arrived before the transport failed (operation-specific result).
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    result.outcome.http_status = status;
+    if (status == 200) {
+      curl_off_t content_length = -1;
+      curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
+      if (content_length >= 0) { result.object_size = static_cast<size_t>(content_length); }
+    }
+    if (rc != CURLE_OK) { result.outcome.transport_error = curl_easy_strerror(rc); }
+    return result;
+  } catch (std::exception const& e) {
+    // Authorization/setup failure: nothing reached the wire.
+    result.outcome.transport_error = e.what();
+    return result;
   }
-  if (status != 200 && status != 206) {
-    throw std::runtime_error("cuobj_rdma_client::host_get: " + object_label(bucket, key) +
-                             " -> HTTP " + std::to_string(status));
-  }
-  return sink.written;
 }
 
-void cuobj_rdma_client::control_get(
-  std::string_view bucket,
-  std::string_view key,
-  const std::vector<std::pair<std::string, std::string>>& extra_headers)
+range_get_result curl_s3_control_client::range_get(const rx_route& route,
+                                                   size_t offset,
+                                                   size_t size,
+                                                   uint8_t* dst)
 {
-  s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
-  auto const authd = _authorizer->authorize(obj, s3::s3_request_method::GET, k_presign_ttl);
+  std::lock_guard lk{_mtx};
+  _attempts_total.fetch_add(1, std::memory_order_relaxed);
+  range_get_result result;
+  if (size == 0) { return result; }
 
-  rest::curl_easy_ptr h{curl_easy_init()};
-  if (!h) { throw std::runtime_error("cuobj_rdma_client::control_get: curl_easy_init failed"); }
-  rest::configure_easy_handle(h.get(), rest::global_curl_context::instance().share_handle());
-  apply_common_opts(h.get(), _ca_bundle_path, _tls_verify);
+  try {
+    s3::s3_object_ref const obj{route.bucket, route.key};
+    auto const authd = _authorizer->authorize(obj, s3::s3_request_method::GET, k_presign_ttl);
 
-  auto headers = authd.headers;
-  headers.insert(headers.end(), extra_headers.begin(), extra_headers.end());
-  auto hdrs = build_headers(headers);
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_discard));
+    auto* h = static_cast<CURL*>(ensure_handle());
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, k_request_timeout_s));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, _tls_verify ? 1L : 0L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, _tls_verify ? 2L : 0L));
+    if (!_ca_bundle_path.empty()) {
+      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_CAINFO, _ca_bundle_path.c_str()));
+    }
+    auto headers = authd.headers;
+    headers.emplace_back("Range", range_header_value(offset, size));
+    auto hdrs = build_headers(headers);
 
-  CURLcode const rc = curl_easy_perform(h.get());
-  long status       = 0;
-  curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
-  if (rc != CURLE_OK) {
-    throw std::runtime_error("cuobj_rdma_client::control_get: " + object_label(bucket, key) + ": " +
-                             curl_easy_strerror(rc));
-  }
-  if (status != 200 && status != 206) {
-    throw std::runtime_error("cuobj_rdma_client::control_get: " + object_label(bucket, key) +
-                             " -> HTTP " + std::to_string(status));
+    range_response response{dst, size};
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_URL, authd.url.c_str()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_NOBODY, 0L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs.get()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &write_to_sink));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEDATA, &response));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &capture_header));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERDATA, &response));
+
+    // The persistent handle is reused, so any pointer into this frame's stack
+    // objects must be cleared before returning — even on an early/exception
+    // exit — so a later perform can never see a dangling WRITEDATA/HEADERDATA.
+    struct callback_reset {
+      CURL* h;
+      ~callback_reset()
+      {
+        curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, nullptr);
+        curl_easy_setopt(h, CURLOPT_HEADERDATA, nullptr);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &write_discard);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, nullptr);
+      }
+    } reset{h};
+
+    CURLcode const rc = curl_easy_perform(h);
+    long connects     = 0;
+    if (curl_easy_getinfo(h, CURLINFO_NUM_CONNECTS, &connects) == CURLE_OK && connects > 0) {
+      _connections_total.fetch_add(static_cast<uint64_t>(connects), std::memory_order_relaxed);
+    }
+    // Capture what actually happened BEFORE interpreting the CURLcode: a
+    // response can arrive and then the body transfer fail mid-stream (a
+    // partial 206 then a disconnect), and the result must still carry the
+    // real status, Content-Range, and bytes written (operation-specific
+    // result, contract §4) rather than collapse to status 0.
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    result.outcome.http_status = status;
+    result.delivered_bytes     = (status >= 400) ? 0 : response.written;
+    result.content_range       = std::move(response.content_range);
+    if (rc != CURLE_OK) { result.outcome.transport_error = curl_easy_strerror(rc); }
+    return result;
+  } catch (std::exception const& e) {
+    result.outcome.transport_error = e.what();
+    return result;
   }
 }
-
-#ifdef SIRIUS_ENABLE_S3_RDMA
 
 namespace {
 
-/// Per-request context recovered inside the cuObject get callback.
-struct cuobj_get_context {
-  cuobj_rdma_client* self;
-  std::string bucket;
-  std::string key;
-  std::string range;
+/// Dormant production data session: routing, capability validation, and
+/// worker acquisition are real; touching the wire is not wired up yet, so
+/// every data operation fails loudly instead of guessing at gateway
+/// behavior.
+class dormant_cuobj_session final : public rdma_data_session {
+ public:
+  void register_memory(void* /*base*/, size_t /*bytes*/) override
+  {
+    throw std::runtime_error(
+      "cuobj_rdma_data_session: the RDMA data plane is not wired to a gateway yet; "
+      "device registration is unavailable");
+  }
+  void deregister_memory(void* /*base*/) noexcept override {}
+  data_get_result get(const rx_route& /*route*/,
+                      size_t /*offset*/,
+                      size_t /*size*/,
+                      void* /*dst*/) override
+  {
+    data_get_result result;
+    result.commit = data_commit_state::not_sent;
+    result.transport_error =
+      "cuobj_rdma_data_session: the RDMA data plane is not wired to a gateway yet";
+    return result;
+  }
 };
-
-std::string base64_encode(const char* data, size_t len)
-{
-  static constexpr char table[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  out.reserve((len + 2) / 3 * 4);
-  for (size_t i = 0; i < len; i += 3) {
-    uint32_t chunk = static_cast<uint8_t>(data[i]) << 16;
-    if (i + 1 < len) { chunk |= static_cast<uint8_t>(data[i + 1]) << 8; }
-    if (i + 2 < len) { chunk |= static_cast<uint8_t>(data[i + 2]); }
-    out.push_back(table[(chunk >> 18) & 0x3f]);
-    out.push_back(table[(chunk >> 12) & 0x3f]);
-    out.push_back(i + 1 < len ? table[(chunk >> 6) & 0x3f] : '=');
-    out.push_back(i + 2 < len ? table[chunk & 0x3f] : '=');
-  }
-  return out;
-}
-
-/// cuObject control-plane callback: SigV4-signed HTTP GET carrying the RDMA
-/// descriptor token; the gateway RDMA_WRITEs into the registered destination
-/// and the reply is status-only.  Runs on the cuObjGet caller's thread.
-ssize_t cuobj_get_callback(
-  const void* handle, char* /*ptr*/, size_t size, loff_t /*offset*/, const cufileRDMAInfo_t* rdma)
-{
-  auto* ctx = static_cast<cuobj_get_context*>(cuObjClient::getCtx(handle));
-  if (ctx == nullptr || rdma == nullptr) { return -1; }
-  try {
-    std::vector<std::pair<std::string, std::string>> extra;
-    extra.emplace_back("x-amz-rdma-token", base64_encode(rdma->desc_str, rdma->desc_len));
-    if (!ctx->range.empty()) { extra.emplace_back("Range", ctx->range); }
-    ctx->self->control_get(ctx->bucket, ctx->key, extra);
-    return static_cast<ssize_t>(size);
-  } catch (...) {
-    return -1;
-  }
-}
-
-std::mutex g_cuobj_mtx;
 
 }  // namespace
 
-void* cuobj_rdma_client::ensure_cuobj_client()
+cuobj_rdma_data_session_factory::cuobj_rdma_data_session_factory(
+  std::shared_ptr<s3::s3_request_authorizer> data_authorizer)
+  : _data_authorizer(std::move(data_authorizer))
 {
-  std::lock_guard lk{g_cuobj_mtx};
-  if (_cuobj == nullptr) {
-    static CUObjOps_t ops{};
-    ops.get = &cuobj_get_callback;
-    ops.put = nullptr;
-    _cuobj  = new cuObjClient(ops, CUOBJ_PROTO_RDMA_DC_V1);
-  }
-  return _cuobj;
-}
-
-size_t cuobj_rdma_client::device_get(
-  std::string_view bucket, std::string_view key, size_t offset, size_t size, void* dst)
-{
-  auto* client = static_cast<cuObjClient*>(ensure_cuobj_client());
-  cuobj_get_context ctx{
-    this, std::string(bucket), std::string(key), range_header_value(offset, size)};
-  ssize_t const n = client->cuObjGet(&ctx, dst, size);
-  if (n < 0) {
-    throw std::runtime_error("cuobj_rdma_client::device_get: " + object_label(bucket, key) +
-                             ": cuObjGet failed (rc=" + std::to_string(n) + ")");
-  }
-  return static_cast<size_t>(n);
-}
-
-void cuobj_rdma_client::register_memory(void* base, size_t bytes)
-{
-  auto* client  = static_cast<cuObjClient*>(ensure_cuobj_client());
-  auto const rc = client->cuMemObjGetDescriptor(base, bytes);
-  if (rc != CU_OBJ_SUCCESS) {
-    throw std::runtime_error("cuobj_rdma_client::register_memory: registration failed (rc=" +
-                             std::to_string(static_cast<int>(rc)) + ")");
+  if (!_data_authorizer) {
+    throw std::invalid_argument("cuobj_rdma_data_session_factory: null data-plane authorizer");
   }
 }
 
-void cuobj_rdma_client::deregister_memory(void* base) noexcept
+std::unique_ptr<rdma_data_session> cuobj_rdma_data_session_factory::acquire()
 {
-  try {
-    if (_cuobj != nullptr) { static_cast<cuObjClient*>(_cuobj)->cuMemObjPutDescriptor(base); }
-  } catch (...) {  // NOLINT(bugprone-empty-catch)
-  }
+  return std::make_unique<dormant_cuobj_session>();
 }
-
-cuobj_rdma_client::~cuobj_rdma_client() { delete static_cast<cuObjClient*>(_cuobj); }
-
-#else  // !SIRIUS_ENABLE_S3_RDMA
-
-size_t cuobj_rdma_client::device_get(
-  std::string_view bucket, std::string_view key, size_t /*offset*/, size_t /*size*/, void* /*dst*/)
-{
-  throw std::runtime_error(
-    "cuobj_rdma_client::device_get: " + object_label(bucket, key) +
-    ": device-destination GET requires a build with SIRIUS_ENABLE_S3_RDMA (cuObject SDK)");
-}
-
-void cuobj_rdma_client::register_memory(void* /*base*/, size_t /*bytes*/) {}
-
-void cuobj_rdma_client::deregister_memory(void* /*base*/) noexcept {}
-
-cuobj_rdma_client::~cuobj_rdma_client() = default;
-
-#endif  // SIRIUS_ENABLE_S3_RDMA
 
 }  // namespace sirius::io::rdma

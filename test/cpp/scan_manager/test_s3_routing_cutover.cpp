@@ -881,6 +881,17 @@ TEST_CASE("s3_rdma AC8 rejects presigned signing on the data plane", "[s3][rdma]
                     {"data", "presigned"});
 }
 
+TEST_CASE("s3_rdma rejects an explicit zero queue cap during registry construction",
+          "[s3][rdma][routing][config]")
+{
+  scan_manager_fixture fixture;
+  auto cfg                           = make_rdma_scan_config();
+  cfg.object_store.s3_rdma_queue_cap = 0;
+
+  require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
+                    {"queue_cap", "positive"});
+}
+
 TEST_CASE("s3_rdma AC9 rejects a missing data endpoint during registry construction",
           "[s3][rdma][routing][config]")
 {

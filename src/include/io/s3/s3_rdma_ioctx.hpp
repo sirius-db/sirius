@@ -18,7 +18,7 @@
 
 #include "io/object_store_config.hpp"
 #include "io/rdma/cuobj_rdma_reactor.hpp"
-#include "io/rdma/rdma_client.hpp"
+#include "io/rdma/rdma_transport_client.hpp"
 #include "io/templated_ioctx.hpp"
 
 namespace sirius::io::s3 {
@@ -35,44 +35,32 @@ namespace sirius::io::s3 {
  * deliberately omits the staged host-to-device and vector host-read paths, so
  * the prefetch cache is never built for this backend.
  *
- * Without a configured @c rdma_client every data path fails loudly with a
- * "not implemented" error rather than falling back to another transport; with
- * one, reads are served through the client (the mock in tests, or the
- * cuObject-backed client).
+ * A missing transport capability fails loudly at @c start() rather than
+ * falling back to another transport; host chunks ride the control plane and
+ * device chunks the per-worker data sessions (mocks in tests, the
+ * curl/cuObject-backed clients in production).
  */
 class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
  public:
-  /// @p delivery is the CUDA delivery seam (construction-time only, no
-  /// setter); defaults to the real CUDA runtime.  Throws std::invalid_argument
-  /// when a member was nulled out.
-  explicit s3_rdma_ioctx(object_store_config cfg,
-                         std::shared_ptr<rdma::rdma_client> client = nullptr,
-                         rdma::cuda_delivery_ops delivery          = {});
+  /// @p clients is the split transport bundle (control client + data-session
+  /// factory + tag predicate); @p delivery is the CUDA delivery seam.  Both
+  /// bind at construction only.  Construction never validates capabilities —
+  /// @c start() does, so a misconfigured transport fails loudly on the
+  /// routing path instead of at build time.
+  s3_rdma_ioctx(object_store_config cfg,
+                rdma::rdma_transport_clients clients,
+                rdma::cuda_delivery_ops delivery = {});
+
+  /// Validates the transport capabilities (control client and data-session
+  /// factory present), then starts the reactor pool; a missing capability is
+  /// an RDMA initialization error.
+  void start() override;
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::rdma; }
 
   /// Pool-aggregated transfer counters (single reactor today; summed if the
   /// pool ever grows).
   [[nodiscard]] rdma::rdma_perf_snapshot perf_snapshot() const noexcept;
-
-  /// Fail-fast without a client: these three intercept before the base builds
-  /// any request, so no transfer machinery (and no backend-typed io_object
-  /// access) is reached until the transport exists.
-  size_t host_read_io(const sirius_io_object& obj,
-                      size_t offset,
-                      size_t size,
-                      uint8_t* dst) override;
-
-  exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
-                                               size_t offset,
-                                               size_t size,
-                                               uint8_t* dst) noexcept override;
-
-  exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 uint8_t* dst,
-                                                 rmm::cuda_stream_view stream) noexcept override;
 
   /// The two staged paths are structurally unsupported for this backend; keep
   /// the transport-selection error shape ("RDMA ... not implemented") instead
@@ -89,18 +77,17 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept override;
 
  protected:
-  /// Parse s3://bucket/key, HEAD it through the client for the size, and build
-  /// the io_object.  Throws a "not implemented" error when no client is
-  /// configured; propagates HEAD failures (missing object) otherwise.
+  /// Parse s3://bucket/key, HEAD it through the control client for the size,
+  /// and build the io_object.  A transport failure or a non-200 status
+  /// (missing object) throws.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 
  private:
   /// Retained so the ioctx reaches the admission gate (control permits, the
-  /// terminal error) through the same context the reactor holds.
-  s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx,
-                std::shared_ptr<rdma::rdma_client> client);
+  /// terminal error) and the transport bundle through the same context the
+  /// reactor holds.
+  explicit s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx);
 
-  std::shared_ptr<rdma::rdma_client> _client;
   std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> _reactor_ctx;
 };
 

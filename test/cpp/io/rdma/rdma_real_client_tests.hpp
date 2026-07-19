@@ -172,15 +172,15 @@ std::string signing_name(signing_case signing)
 
 TEST_CASE("mock RDMA data sessions expose registration lifetime", "[s3][rdma][client]")
 {
-  sirius::io::rdma::mock_rdma_data_session_factory factory;
-  auto session = factory.acquire();
+  auto factory = std::make_shared<sirius::io::rdma::mock_rdma_data_session_factory>();
+  auto session = factory->acquire();
   REQUIRE(session != nullptr);
   std::array<std::uint8_t, 16> host{};
 
   CHECK_NOTHROW(session->register_memory(host.data(), host.size()));
   CHECK_NOTHROW(session->deregister_memory(host.data()));
-  CHECK(factory.register_count() == 1);
-  CHECK(factory.deregister_count() == 1);
+  CHECK(factory->register_count() == 1);
+  CHECK(factory->deregister_count() == 1);
 }
 
 TEST_CASE("cuobj_rdma_reactor flush decision matches GPUDirect ordering classes",
@@ -343,5 +343,5 @@ TEST_CASE("s3_rdma_ioctx start rejects a missing data-session factory", "[s3][rd
     std::make_shared<sirius::io::rdma::mock_s3_control_client>(), nullptr};
   s3_rdma_ioctx ctx{std::move(cfg), std::move(clients)};
 
-  CHECK_THROWS_WITH(ctx.start(), Catch::Contains("RDMA initialization"));
+  CHECK_THROWS_WITH(ctx.start(), Catch::Contains("RDMA") && Catch::Contains("initialization"));
 }

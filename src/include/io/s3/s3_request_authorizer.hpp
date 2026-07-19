@@ -103,6 +103,22 @@ class s3_request_authorizer {
                                                         std::chrono::seconds timeout) = 0;
 
   /**
+   * @brief Authorize with caller-supplied headers INSIDE the signature.
+   *
+   * Data-plane requests carry per-request headers (the RDMA descriptor token,
+   * @c Range) that the store verifies as part of SignedHeaders, so they must
+   * be signed rather than attached after the fact.  Only header-signing
+   * authorizers can honor this; the default (and the presigned form) throws
+   * @c credential_error — a signing form that cannot bind extra headers must
+   * be rejected before reaching a data-plane call site.
+   */
+  virtual s3_authorized_request authorize_with_headers(
+    s3_object_ref const& obj,
+    s3_request_method method,
+    std::chrono::seconds timeout,
+    std::vector<std::pair<std::string, std::string>> const& extra_headers);
+
+  /**
    * @brief Authorize a bucket-level ListObjectsV2 GET.
    *
    * @param bucket           Bucket name (no scheme / slashes).

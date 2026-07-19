@@ -265,6 +265,47 @@ s3_authorized_request sirius_sigv4_header_authorizer::authorize(s3_object_ref co
   }
 }
 
+s3_authorized_request s3_request_authorizer::authorize_with_headers(
+  s3_object_ref const& /*obj*/,
+  s3_request_method /*method*/,
+  std::chrono::seconds /*timeout*/,
+  std::vector<std::pair<std::string, std::string>> const& /*extra_headers*/)
+{
+  throw credential_error(
+    "s3_request_authorizer: this signing form cannot bind extra signed headers");
+}
+
+s3_authorized_request sirius_sigv4_header_authorizer::authorize_with_headers(
+  s3_object_ref const& obj,
+  s3_request_method method,
+  std::chrono::seconds /*timeout*/,
+  std::vector<std::pair<std::string, std::string>> const& extra_headers)
+{
+  auto const canonical_uri = make_canonical_uri(obj);
+  auto const signer        = make_signer(_creds, _region);
+
+  try {
+    // Same shape as authorize(), except the caller's headers join the signed
+    // set: sign_request folds them into SignedHeaders and returns them with
+    // the Authorization header, so the store verifies token and Range as
+    // part of the signature.
+    auto signed_req = sign_request(method_to_str(method),
+                                   _host,
+                                   canonical_uri,
+                                   /*canonical_query=*/"",
+                                   sha256_hex(""),
+                                   extra_headers,
+                                   signer,
+                                   std::time(nullptr));
+    std::string url = _scheme + "://" + _host + canonical_uri;
+    return s3_authorized_request{std::move(url), std::move(signed_req.headers)};
+  } catch (credential_error const&) {
+    throw;
+  } catch (std::exception const& e) {
+    throw credential_error(std::string("sirius_sigv4_header_authorizer: ") + e.what());
+  }
+}
+
 s3_authorized_request sirius_sigv4_header_authorizer::authorize_list(
   std::string_view bucket, std::string_view canonical_query, std::chrono::seconds /*timeout*/)
 {
