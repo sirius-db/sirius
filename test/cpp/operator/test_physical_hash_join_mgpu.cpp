@@ -53,6 +53,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -62,10 +63,8 @@ namespace {
 using sirius::test::mgpu::generate_parquet_surface;
 using sirius::test::mgpu::mgpu_env_params;
 using sirius::test::mgpu::parquet_glob;
-using sirius::test::mgpu::parse_audit_log;
 using sirius::test::mgpu::require_gpu_matches_cpu;
 using sirius::test::mgpu::require_two_gpus;
-using sirius::test::mgpu::scoped_log_dir;
 using sirius::test::mgpu::scoped_mgpu_env;
 using sirius::test::mgpu::write_mgpu_yaml;
 
@@ -130,8 +129,6 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
   generate_small_build_side(build_dir);
   generate_large_probe_side(probe_dir);
 
-  scoped_log_dir logs(tmp / "log");
-
   mgpu_env_params params{};
   params.cache                    = "none";
   params.hash_partition_bytes     = 1'000'000;
@@ -158,36 +155,23 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
     "ORDER BY probe.k, probe.v "
     "LIMIT 100";
 
+  std::map<int, size_t> tasks_per_gpu;
   {
     auto con = env.make_connection();
     require_gpu_matches_cpu(con, inner_query);
+    auto& scheduler = env.get_task_scheduler(con);
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  // SF100 Q11 hits this same BUILD_PROBE shape; reading the log after the
-  // connection has closed lets us detect whether the race fires: when it
-  // does, the query fails with the "invalid hash table build state 2"
-  // warning and a batch-lock retry-exhaustion error before ever returning
-  // results. require_gpu_matches_cpu above would have failed in that case;
-  // we still parse the log for both-GPU visibility as a secondary signal.
-  auto counts = parse_audit_log(logs.path());
-  INFO("per-GPU audit counts: " << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
-                                << ", scan=" << counts[0].scan_ids.size() << "} "
-                                << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
-                                << ", scan=" << counts[1].scan_ids.size() << "}");
-
-  // Both GPUs saw SOME pipeline work — under the PARQUET_METADATA_SCAN
-  // → GPU_SCAN pipeline architecture, parquet reads dispatch as
-  // gpu_pipeline_task entries (logged via [mgpu-audit] pipeline_task
-  // dispatched) rather than scan_executor scan_batch entries (which are
-  // reserved for the duckdb_scan_task / cpu_source_task / legacy
-  // PARQUET_SCAN path through duckdb_scan_executor::select_target_gpu).
-  // BUILD_PROBE pins post-partition probe tasks to one GPU via SCHED-00,
-  // but the metadata + GPU_SCAN pipelines upstream of the join
-  // are not partition-pinned and distribute across both GPUs, so
-  // pipeline_ids >= 1 on both GPUs is the correct cross-GPU signal —
-  // the same metric MIXED_JOIN below uses.
-  REQUIRE(counts[0].pipeline_ids.size() >= 1);
-  REQUIRE(counts[1].pipeline_ids.size() >= 1);
+  // Both GPUs saw SOME pipeline work.
+  INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
 
   fs::remove_all(tmp, ec);
 }
@@ -215,8 +199,6 @@ TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes parti
   generate_large_probe_side(left_dir);
   generate_large_probe_side(right_dir);
 
-  scoped_log_dir logs(tmp / "log");
-
   mgpu_env_params params{};
   params.cache                = "none";
   params.hash_partition_bytes = 1'000'000;
@@ -243,22 +225,23 @@ TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes parti
     "ORDER BY l.k "
     "LIMIT 50";
 
+  std::map<int, size_t> tasks_per_gpu;
   {
     auto con = env.make_connection();
     require_gpu_matches_cpu(con, inner_query);
+    auto& scheduler = env.get_task_scheduler(con);
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  auto counts = parse_audit_log(logs.path());
-  INFO("per-GPU audit counts: " << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
-                                << ", scan=" << counts[0].scan_ids.size() << "} "
-                                << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
-                                << ", scan=" << counts[1].scan_ids.size() << "}");
-
-  // MIXED_JOIN with >=2 partitions (enforced by the num_gpus floor in
-  // sirius_physical_partition::determine_num_partitions) must schedule
-  // pipeline work on BOTH GPUs — that's the reason the floor exists.
-  REQUIRE(counts[0].pipeline_ids.size() >= 1);
-  REQUIRE(counts[1].pipeline_ids.size() >= 1);
+  // MIXED_JOIN with >=2 partitions must schedule pipeline work on BOTH GPUs.
+  INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
 
   fs::remove_all(tmp, ec);
 }
@@ -283,8 +266,6 @@ TEST_CASE("physical_hash_join - repeated BUILD_PROBE queries don't wedge on left
   auto probe_dir = tmp / "probe";
   generate_small_build_side(build_dir);
   generate_large_probe_side(probe_dir);
-
-  scoped_log_dir logs(tmp / "log");
 
   mgpu_env_params params{};
   params.cache                    = "none";
@@ -346,11 +327,9 @@ struct bisect_surface {
   fs::path s_dir;
   fs::path n_dir;
   fs::path yaml_path;
-  fs::path log_dir;
   std::string glob_ps;
   std::string glob_s;
   std::string glob_n;
-  std::unique_ptr<scoped_log_dir> logs;
   std::unique_ptr<scoped_mgpu_env> env;
 };
 
@@ -390,9 +369,6 @@ bisect_surface make_bisect_surface(std::string const& tag, std::string const& ca
     "                                 ELSE concat('N', CAST(range AS VARCHAR)) END AS n_name "
     "FROM range(25)",
     /*num_files=*/1);
-
-  s.log_dir = s.tmp / "log";
-  s.logs    = std::make_unique<scoped_log_dir>(s.log_dir);
 
   mgpu_env_params params{};
   params.cache                      = cache;
@@ -440,7 +416,6 @@ TEST_CASE("hash_join bisect 1 - simple JOIN+GROUP BY+ORDER BY, cache=none",
     require_gpu_matches_cpu(con, q);
   }
   s.env.reset();
-  s.logs.reset();
   std::error_code ec;
   fs::remove_all(s.tmp, ec);
 }
@@ -471,7 +446,6 @@ TEST_CASE("hash_join bisect 2 - simple JOIN+GROUP BY+ORDER BY, cache=table_gpu",
     require_gpu_matches_cpu(con, q);
   }
   s.env.reset();
-  s.logs.reset();
   std::error_code ec;
   fs::remove_all(s.tmp, ec);
 }
@@ -515,7 +489,6 @@ TEST_CASE("hash_join bisect 3 - Q11 shape with HAVING subquery, cache=none",
     require_gpu_matches_cpu(con, q);
   }
   s.env.reset();
-  s.logs.reset();
   std::error_code ec;
   fs::remove_all(s.tmp, ec);
 }
@@ -584,8 +557,6 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
     "FROM range(25)",
     /*num_files=*/1);
 
-  scoped_log_dir logs(tmp / "log");
-
   mgpu_env_params params{};
   params.cache                      = "table_gpu";
   params.hash_partition_bytes       = 10'000'000;
@@ -640,25 +611,25 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
   // during cold or stale-cache hazard during warm should surface in this
   // matrix.
   constexpr int kIterations = 3;
+  std::map<int, size_t> tasks_per_gpu;
   {
     auto con = env.make_connection();
     for (int i = 0; i < kIterations; ++i) {
       INFO("iteration " << i);
       require_gpu_matches_cpu(con, inner_query);
     }
+    auto& scheduler = env.get_task_scheduler(con);
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  auto counts = parse_audit_log(logs.path());
-  INFO("per-GPU audit counts: " << "GPU0{pipeline=" << counts[0].pipeline_ids.size()
-                                << ", scan=" << counts[0].scan_ids.size() << "} "
-                                << "GPU1{pipeline=" << counts[1].pipeline_ids.size()
-                                << ", scan=" << counts[1].scan_ids.size() << "}");
-  // Use pipeline_ids: scan reads dispatch as gpu_pipeline_task under the
-  // PARQUET_METADATA_SCAN → GPU_SCAN architecture, not as
-  // scan_executor scan_batch entries. cache=table_gpu also collapses
-  // scan_executor traffic on warm iterations. See BUILD_PROBE comment above.
-  REQUIRE(counts[0].pipeline_ids.size() >= 1);
-  REQUIRE(counts[1].pipeline_ids.size() >= 1);
+  INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
 
   fs::remove_all(tmp, ec);
 }

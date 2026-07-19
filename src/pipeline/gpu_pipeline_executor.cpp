@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -72,7 +73,7 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
     telemetry::thread_local_executor_thread_telemtry_init(
       *telemetry_context,
-      fmt::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
+      std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
       telemetry_context->executor_thread_group_id(device_id));
 
     // Per-thread init runs on a worker thread just spawned by the
@@ -83,9 +84,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
     // check instead.
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
-      spdlog::error("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
-                    device_id,
-                    cudaGetErrorString(err));
+      SIRIUS_LOG_ERROR("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
+                       device_id,
+                       cudaGetErrorString(err));
     }
     sirius::util::enable_log_on_default_stream();
   };
@@ -95,7 +96,7 @@ void gpu_pipeline_executor::manager_loop()
 {
   telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
     *_telemetry_context,
-    fmt::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
+    std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
     _telemetry_context->manager_thread_group_id(_memory_space->get_device_id())};
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
@@ -114,11 +115,16 @@ void gpu_pipeline_executor::manager_loop()
     auto ready       = std::make_unique<task_request>();
     ready->kind      = task_request_kind::device_ready;
     ready->device_id = _memory_space->get_device_id();
-    if (!_task_request_publisher.send(std::move(ready))) {
-      SIRIUS_LOG_INFO("GPU Pipeline Executor: task_request channel closed, stopping manager loop");
-      break;
+
+    std::unique_ptr<parallel::itask> pipeline_task = nullptr;
+    {
+      if (!_task_request_publisher.send(std::move(ready))) {
+        SIRIUS_LOG_INFO(
+          "GPU Pipeline Executor: task_request channel closed, stopping manager loop");
+        break;
+      }
+      pipeline_task = _task_queue.pop();  // block till a task is available
     }
-    auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;
@@ -301,6 +307,7 @@ void gpu_pipeline_executor::manager_loop()
        pipeline]() mutable {
         try {
           task->execute(exc_stream);
+          _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (oom_reschedule_exception& oom) {
           if (_completion_handler && _completion_handler->has_error()) {
             // If the completion handler is already in an error state, then we can just return and
@@ -475,6 +482,11 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
 }
 
 bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }
+
+executor_metrics gpu_pipeline_executor::get_metrics() const noexcept
+{
+  return {_tasks_executed.load(std::memory_order_relaxed)};
+}
 
 void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
 {

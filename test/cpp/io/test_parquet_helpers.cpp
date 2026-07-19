@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -41,6 +42,12 @@ fs::path fresh_tmp_dir(std::string const& tag)
   fs::remove_all(dir, ec);
   fs::create_directories(dir);
   return dir;
+}
+
+fs::path parquet_fixture(std::string_view file_name)
+{
+  return fs::path{SIRIUS_PROJECT_ROOT} / "test" / "cpp" / "integration" / "data" / "parquet" /
+         file_name;
 }
 
 fs::path write_parquet(duckdb::Connection& con,
@@ -88,6 +95,17 @@ std::vector<duckdb::LogicalType> expected_flat_types()
           duckdb::LogicalType::DOUBLE,
           duckdb::LogicalType::BOOLEAN,
           duckdb::LogicalType::VARCHAR};
+}
+
+void require_struct_child(duckdb::LogicalType const& type,
+                          duckdb::idx_t index,
+                          std::string const& name,
+                          duckdb::LogicalType const& child_type)
+{
+  REQUIRE(type.id() == duckdb::LogicalTypeId::STRUCT);
+  REQUIRE(duckdb::StructType::GetChildCount(type) > index);
+  CHECK(duckdb::StructType::GetChildName(type, index) == name);
+  CHECK(duckdb::StructType::GetChildType(type, index) == child_type);
 }
 
 }  // namespace
@@ -141,18 +159,69 @@ TEST_CASE("parquet_helpers extract_schema maps decimal date and timestamp annota
   CHECK(info.types[2] == duckdb::LogicalType::TIMESTAMP);
 }
 
-TEST_CASE("parquet_helpers extract_schema rejects nested top-level columns cleanly",
-          "[parquet_helpers][schema]")
+TEST_CASE("parquet_helpers extract_schema maps top-level struct columns",
+          "[parquet_helpers][schema][nested]")
 {
-  auto const dir       = fresh_tmp_dir("nested");
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
-  auto const path      = write_parquet(con,
-                                  dir,
-                                  "nested_types",
-                                  "CREATE TABLE nested_types AS SELECT "
-                                       "struct_pack(child := 7) AS payload");
+  auto meta = read_metadata(parquet_fixture("nested_struct.parquet"));
+  auto info = sirius::io::parquet_helpers::extract_schema(meta);
 
-  auto meta = read_metadata(path);
-  REQUIRE_THROWS_WITH(sirius::io::parquet_helpers::extract_schema(meta),
-                      Catch::Contains("nested parquet types not yet supported"));
+  REQUIRE(info.names == std::vector<std::string>{"id", "payload"});
+  REQUIRE(info.types.size() == 2);
+  CHECK(info.types[0] == duckdb::LogicalType::INTEGER);
+  REQUIRE(info.types[1].id() == duckdb::LogicalTypeId::STRUCT);
+  REQUIRE(duckdb::StructType::GetChildCount(info.types[1]) == 2);
+  require_struct_child(info.types[1], 0, "a", duckdb::LogicalType::INTEGER);
+  require_struct_child(info.types[1], 1, "b", duckdb::LogicalType::VARCHAR);
+}
+
+TEST_CASE("parquet_helpers extract_schema maps top-level list columns",
+          "[parquet_helpers][schema][nested]")
+{
+  auto meta = read_metadata(parquet_fixture("nested_list.parquet"));
+  auto info = sirius::io::parquet_helpers::extract_schema(meta);
+
+  REQUIRE(info.names == std::vector<std::string>{"id", "items"});
+  REQUIRE(info.types.size() == 2);
+  CHECK(info.types[0] == duckdb::LogicalType::INTEGER);
+  REQUIRE(info.types[1].id() == duckdb::LogicalTypeId::LIST);
+  CHECK(duckdb::ListType::GetChildType(info.types[1]) == duckdb::LogicalType::BIGINT);
+}
+
+TEST_CASE("parquet_helpers extract_schema maps parquet map columns to DuckDB MAP",
+          "[parquet_helpers][schema][nested]")
+{
+  auto meta = read_metadata(parquet_fixture("nested_map.parquet"));
+  auto info = sirius::io::parquet_helpers::extract_schema(meta);
+
+  REQUIRE(info.names == std::vector<std::string>{"id", "attrs"});
+  REQUIRE(info.types.size() == 2);
+  CHECK(info.types[0] == duckdb::LogicalType::INTEGER);
+  REQUIRE(info.types[1].id() == duckdb::LogicalTypeId::MAP);
+  CHECK(duckdb::MapType::KeyType(info.types[1]) == duckdb::LogicalType::VARCHAR);
+  CHECK(duckdb::MapType::ValueType(info.types[1]) == duckdb::LogicalType::INTEGER);
+}
+
+TEST_CASE("parquet_helpers extract_schema maps deep nested columns and resumes at next scalar",
+          "[parquet_helpers][schema][nested]")
+{
+  auto meta = read_metadata(parquet_fixture("nested_deep.parquet"));
+  auto info = sirius::io::parquet_helpers::extract_schema(meta);
+
+  REQUIRE(info.names == std::vector<std::string>{"id", "struct_of_list", "list_of_struct", "tail"});
+  REQUIRE(info.types.size() == 4);
+  CHECK(info.types[0] == duckdb::LogicalType::INTEGER);
+  CHECK(info.types[3] == duckdb::LogicalType::INTEGER);
+
+  REQUIRE(info.types[1].id() == duckdb::LogicalTypeId::STRUCT);
+  REQUIRE(duckdb::StructType::GetChildCount(info.types[1]) == 1);
+  CHECK(duckdb::StructType::GetChildName(info.types[1], 0) == "s");
+  auto const& struct_list_child = duckdb::StructType::GetChildType(info.types[1], 0);
+  REQUIRE(struct_list_child.id() == duckdb::LogicalTypeId::LIST);
+  CHECK(duckdb::ListType::GetChildType(struct_list_child) == duckdb::LogicalType::INTEGER);
+
+  REQUIRE(info.types[2].id() == duckdb::LogicalTypeId::LIST);
+  auto const& list_struct_child = duckdb::ListType::GetChildType(info.types[2]);
+  REQUIRE(list_struct_child.id() == duckdb::LogicalTypeId::STRUCT);
+  REQUIRE(duckdb::StructType::GetChildCount(list_struct_child) == 1);
+  require_struct_child(list_struct_child, 0, "x", duckdb::LogicalType::DOUBLE);
 }

@@ -87,9 +87,9 @@ void downgrade_executor::start()
       // across contexts. Lambda is noexcept, so check inline.
       cudaError_t err = cudaSetDevice(device_id);
       if (err != cudaSuccess) {
-        spdlog::error("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
-                      device_id,
-                      cudaGetErrorString(err));
+        SIRIUS_LOG_ERROR("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
+                         device_id,
+                         cudaGetErrorString(err));
       }
     };
   }

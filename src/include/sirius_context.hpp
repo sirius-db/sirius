@@ -67,6 +67,10 @@ class SiriusContext : public ClientContextState {
     uint64_t successful_rebinds = 0;
     uint64_t fallbacks          = 0;
     uint64_t executions         = 0;
+    // GPU execution was attempted and failed at runtime, and the query completed
+    // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
+    // counts plan-time (create_plan) fallbacks that never reached the GPU.
+    uint64_t runtime_fallbacks = 0;
   };
 
   SiriusContext();
@@ -301,6 +305,10 @@ class SiriusContext : public ClientContextState {
   /// \brief Record that a transparently rebound query actually executed through Sirius.
   void record_transparent_execution() noexcept;
 
+  /// \brief Record that a GPU execution failed at runtime and the query completed
+  /// via DuckDB CPU fallback (same transaction).
+  void record_transparent_runtime_fallback() noexcept;
+
  private:
   void throw_if_not_initialized() const;
   void acquire_query_lifecycle_slot();
@@ -370,7 +378,16 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
+  std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
 };
+
+/// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
+///
+/// `spdlog` and `noop` install unconditionally; `duckdb` needs `db` and, given a
+/// null `db`, defers (leaves the current sink) so a caller without one yet can
+/// still select it. An unknown backend throws only when `db` is non-null, so the
+/// null (best-effort) path never throws.
+void install_configured_log_sink(DatabaseInstance* db);
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions
@@ -402,5 +419,18 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   sirius::sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };
+
+/// \brief Read the per-session `enable_duckdb_fallback` setting (default true).
+///
+/// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
+/// connection via `SET enable_duckdb_fallback = ...`.
+bool duckdb_fallback_enabled(ClientContext& context);
+
+/// \brief Print the "GPU execution failed, falling back to DuckDB" banner.
+///
+/// Written to stdout in red (ANSI) when stdout is a TTY, plain text otherwise so
+/// piped/redirected output is not corrupted. Shared by the transparent runtime
+/// fallback and the legacy gpu_execution() CALL path so the message stays in sync.
+void print_cpu_fallback_banner();
 
 }  // namespace duckdb

@@ -62,11 +62,12 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb.hpp>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
 #include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -78,9 +79,7 @@ namespace {
 using sirius::test::mgpu::generate_parquet_surface;
 using sirius::test::mgpu::mgpu_env_params;
 using sirius::test::mgpu::parquet_glob;
-using sirius::test::mgpu::parse_audit_log;
 using sirius::test::mgpu::require_two_gpus;
-using sirius::test::mgpu::scoped_log_dir;
 using sirius::test::mgpu::scoped_mgpu_env;
 using sirius::test::mgpu::write_mgpu_yaml;
 
@@ -217,19 +216,9 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
   auto yaml_path              = tmp / "pin_mgpu_route.yaml";
   write_mgpu_yaml(yaml_path, params);
 
-  // Construct scoped_log_dir BEFORE scoped_mgpu_env so SIRIUS_LOG_DIR /
-  // SIRIUS_LOG_LEVEL are in place when the extension callback creates the
-  // SiriusContext (mgpu_test_utils.hpp:298 — "Construct BEFORE
-  // scoped_mgpu_env"). spdlog's file sink is flushed when shared_test_env
-  // is destroyed (SiriusContext::shutdown drops the sinks).
-  scoped_log_dir logs(tmp / "log");
-  // env is held in unique_ptr so we can DESTROY it BEFORE parse_audit_log
-  // runs. test_gpu_execution_tpch_mgpu_audit.cpp uses env->pause() for the
-  // same effect; scoped_mgpu_env doesn't expose pause/resume so we
-  // explicitly reset() to flush spdlog. Mirrors the canonical pattern at
-  // test_gpu_execution_tpch_mgpu_audit.cpp:166-235.
   auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
 
+  std::map<int, size_t> tasks_per_gpu;
   auto glob = parquet_glob(tmp);
   {
     auto con = env->make_connection();
@@ -262,72 +251,20 @@ TEST_CASE("pin_table - PIN-MGPU-01 routing via [mgpu-audit]",
     auto unpin = con.Query("CALL unpin_table('multi_chunk');");
     REQUIRE(unpin);
     REQUIRE_FALSE(unpin->HasError());
+    auto& scheduler = env->get_task_scheduler(con);
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  // Force-flush spdlog's file sink BEFORE tearing down the env. The default
-  // log flush is every 3s (Config::LOG_FLUSH_SECONDS) and the SF1 query
-  // completes well under that, so without an explicit flush the [mgpu-audit]
-  // emissions in src/pipeline/task_scheduler.cpp:275 stay in spdlog's
-  // buffer and never reach disk before parse_audit_log() reads it.
-  if (auto logger = spdlog::default_logger()) { logger->flush(); }
-
-  // Tear down the SiriusContext + DuckDB. Verbatim equivalent of
-  // env->pause() in test_gpu_execution_tpch_mgpu_audit.cpp:233 —
-  // destruction triggers ~basic_file_sink which closes the FD.
   env.reset();
 
-  auto counts = parse_audit_log(logs.path());
-
-  std::string diag = "per-GPU audit counts from " + logs.path().string() + ": ";
-  for (auto const& [gpu, c] : counts) {
-    diag += "GPU" + std::to_string(gpu) + "{pipeline=" + std::to_string(c.pipeline_ids.size()) +
-            ", scan=" + std::to_string(c.scan_ids.size()) + "} ";
-  }
-  INFO(diag);
-
-  // Both GPUs must have keys in the map (dispatch records exist for each).
-  REQUIRE(counts.count(0) == 1);
-  REQUIRE(counts.count(1) == 1);
-
-  // Load-bearing routing assertion: at least 1 task ran on EACH of the 2
-  // GPU executors when SELECT-ing from a pinned multi-file table (Plan
-  // 22-05 must_have).
-  //
-  // [mgpu-audit] has two emission sites in the codebase:
-  //   - task_scheduler.cpp:275 emits "pipeline_task dispatched to GPU N
-  //     task_id=K" — fires for EVERY pipeline_task dispatched. The
-  //     scan_cached_operator_data emitted per chunk by cached_split_provider
-  //     drives a pipeline_task on the chunk's home GPU, so this is the
-  //     correct emission for the cached-pin routing gate.
-  //   - duckdb_scan_executor.cpp:264 emits "scan_batch assigned to GPU N
-  //     batch_id=K" — fires ONLY for the DuckDB-attach scan path
-  //     (cpu_source_task / duckdb_scan_task). The pinned-parquet path goes
-  //     through sirius_gpu_parquet_scan_operator + pipeline_task, NOT
-  //     through duckdb_scan_executor, so scan_ids is empty under this
-  //     fixture by design.
-  //
-  // The plan-spec grep gate ("scan_ids" pattern) is documentation drift —
-  // the audit emission shape was discovered at runtime to be pipeline_ids
-  // for this code path. pipeline_ids per-GPU >= 1 IS the routing
-  // correctness contract for PIN-MGPU-01 (Rule 1 deviation — see SUMMARY).
-  //
-  // With a 4-file pin on num_gpus=2, the per-file round-robin places
-  // 2 files on each GPU; each GPU therefore drives at least one cached
-  // scan pipeline_task, which is what the [mgpu-audit] line records.
-  REQUIRE(counts.at(0).pipeline_ids.size() >= 1u);
-  REQUIRE(counts.at(1).pipeline_ids.size() >= 1u);
-
-  // Combined per-GPU work signal: pipeline_ids OR scan_ids per GPU >= 1.
-  // The [mgpu-audit] emission shape on the cached-parquet path is
-  // pipeline_ids today (task_scheduler.cpp:275) — duckdb_scan_executor's
-  // scan_batch emission (the legacy scan_ids source) only fires on the
-  // DuckDB-attach scan path. This combined assertion is robust to a
-  // future emission-shape pivot where cached pins also produce scan_batch
-  // records: when that lands, scan_ids will start populating and these
-  // REQUIREs will continue to pass without test churn.
-  REQUIRE(counts.at(0).pipeline_ids.size() + counts.at(0).scan_ids.size() >= 1u);
-  REQUIRE(counts.at(1).pipeline_ids.size() + counts.at(1).scan_ids.size() >= 1u);
-
+  INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
   fs::remove_all(tmp, ec);
 }
 
@@ -644,12 +581,9 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
   auto yaml_path              = tmp / "pin_mgpu_host_dispatch.yaml";
   write_mgpu_yaml(yaml_path, params);
 
-  // Construct scoped_log_dir BEFORE the env so SIRIUS_LOG_DIR is in place when
-  // the SiriusContext initializes. env is held in a unique_ptr so we can reset()
-  // it (flushing spdlog's file sink) before parse_audit_log reads the file.
-  scoped_log_dir logs(tmp / "log");
   auto env = std::make_unique<scoped_mgpu_env>(yaml_path);
 
+  std::map<int, size_t> tasks_per_gpu2;
   auto glob = parquet_glob(tmp);
   {
     auto con = env->make_connection();
@@ -675,29 +609,20 @@ TEST_CASE("pin_table - host-tier cached scan dispatches on both GPUs (multi-GPU)
     auto unpin = con.Query("CALL unpin_table('host_dispatch');");
     REQUIRE(unpin);
     REQUIRE_FALSE(unpin->HasError());
+    auto& scheduler = env->get_task_scheduler(con);
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu2[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  // Flush spdlog and tear down the env so the audit file is complete on disk
-  // before parse_audit_log reads it.
-  if (auto logger = spdlog::default_logger()) { logger->flush(); }
   env.reset();
 
-  auto counts      = parse_audit_log(logs.path());
-  std::string diag = "per-GPU audit counts from " + logs.path().string() + ": ";
-  for (auto const& [gpu, c] : counts) {
-    diag +=
-      "GPU" + std::to_string(gpu) + "{pipeline=" + std::to_string(c.pipeline_ids.size()) + "} ";
-  }
-  INFO(diag);
-
-  // Load-bearing assertion: the cached host scan dispatched pipeline tasks on
-  // BOTH GPUs. This is the topology-independent proof that host serving uses
-  // both GPUs (true on single- and multi-NUMA hosts alike).
-  REQUIRE(counts.count(0) == 1);
-  REQUIRE(counts.count(1) == 1);
-  REQUIRE(counts.at(0).pipeline_ids.size() >= 1u);
-  REQUIRE(counts.at(1).pipeline_ids.size() >= 1u);
-
+  INFO("gpu0 tasks=" << tasks_per_gpu2[0] << " gpu1 tasks=" << tasks_per_gpu2[1]);
+  REQUIRE(tasks_per_gpu2.count(0));
+  REQUIRE(tasks_per_gpu2.count(1));
+  REQUIRE(tasks_per_gpu2.at(0) >= 1);
+  REQUIRE(tasks_per_gpu2.at(1) >= 1);
   fs::remove_all(tmp, ec);
 }
 

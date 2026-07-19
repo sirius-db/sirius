@@ -60,17 +60,8 @@ class sirius_physical_column_data_scan : public sirius_physical_operator {
  public:
   bool is_source() const override { return true; }
 
-  //! True when this scan is the cached chunk scan of a LEFT_DELIM_JOIN (set at plan-gen
-  //! time). The delim join's sink executes it inline, so it never carries pipeline data
-  //! of its own; `build_pipelines` short-circuits when set.
-  [[nodiscard]] bool is_owned_by_delim_join() const noexcept { return _owned_by_delim_join; }
-  void set_owned_by_delim_join(bool value) noexcept { _owned_by_delim_join = value; }
-
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
-
- protected:
-  bool _owned_by_delim_join = false;
 };
 
 }  // namespace op
