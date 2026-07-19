@@ -815,7 +815,7 @@ endif()
 
 # Test doubles are test-only sources: they implement production seams for the
 # unit tests and must never ship in the extension artifacts.
-set(SIRIUS_TEST_DOUBLE_SOURCES src/io/rdma/mock_rdma_client.cpp)
+set(SIRIUS_TEST_DOUBLE_SOURCES test/cpp/io/rdma/mock_rdma_client.cpp)
 list(APPEND TEST_SOURCES ${SIRIUS_TEST_DOUBLE_SOURCES})
 
 add_executable(sirius_unittest ${TEST_SOURCES})
