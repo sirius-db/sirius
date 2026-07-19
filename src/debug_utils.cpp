@@ -28,7 +28,24 @@
 #include <algorithm>
 #include <cstdlib>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
+
+// Check the return value of cudaMemcpyAsync before synchronizing + reading the
+// destination host buffer. On copy failure the host buffer is uninitialized
+// (garbage), so reading it after sync silently produces wrong debug output.
+// The op/ files wrap these in CUDF_CUDA_TRY/RMM_CUDA_TRY; debug_utils has no
+// such macro, so check + throw here for a clear failure mode.
+#define SIRIUS_CHECK_CUDA_MEMCPY(call, what)                                  \
+  do {                                                                        \
+    cudaError_t const _err = (call);                                          \
+    if (_err != cudaSuccess) {                                                \
+      throw std::runtime_error(                                               \
+        std::string("sirius::debug_utils: " what " cudaMemcpyAsync failed: ") +\
+        cudaGetErrorString(_err));                                            \
+    }                                                                         \
+  } while (0)
 
 namespace sirius {
 
@@ -55,11 +72,13 @@ host_column_nulls copy_null_mask_to_host(cudf::column_view const& col, rmm::cuda
   auto const word_count =
     cudf::bitmask_allocation_size_bytes(col.size()) / sizeof(cudf::bitmask_type);
   result.mask.resize(word_count);
-  cudaMemcpyAsync(result.mask.data(),
-                  col.null_mask(),
-                  word_count * sizeof(cudf::bitmask_type),
-                  cudaMemcpyDeviceToHost,
-                  stream.value());
+  SIRIUS_CHECK_CUDA_MEMCPY(
+    cudaMemcpyAsync(result.mask.data(),
+                    col.null_mask(),
+                    word_count * sizeof(cudf::bitmask_type),
+                    cudaMemcpyDeviceToHost,
+                    stream.value()),
+    "host_column_nulls null_mask");
   stream.synchronize();
   return result;
 }
@@ -387,11 +406,13 @@ void format_rows_to_output(std::string& output,
     // Helper lambda: copy typed data from GPU, format each value.
     auto extract_numeric = [&]<typename T>() {
       std::vector<T> host_vals(num_rows);
-      cudaMemcpyAsync(host_vals.data(),
-                      col.data<T>(),
-                      sizeof(T) * num_rows,
-                      cudaMemcpyDeviceToHost,
-                      stream.value());
+      SIRIUS_CHECK_CUDA_MEMCPY(
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<T>(),
+                        sizeof(T) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value()),
+        "extract_numeric");
       stream.synchronize();
       for (cudf::size_type r = 0; r < num_rows; ++r) {
         if (nulls.is_null(col.offset() + r)) {
@@ -411,11 +432,13 @@ void format_rows_to_output(std::string& output,
     // BOOL8 special handling (stored as int8_t, display as true/false)
     auto extract_bool = [&]() {
       std::vector<int8_t> host_vals(num_rows);
-      cudaMemcpyAsync(host_vals.data(),
-                      col.data<int8_t>(),
-                      sizeof(int8_t) * num_rows,
-                      cudaMemcpyDeviceToHost,
-                      stream.value());
+      SIRIUS_CHECK_CUDA_MEMCPY(
+        cudaMemcpyAsync(host_vals.data(),
+                        col.data<int8_t>(),
+                        sizeof(int8_t) * num_rows,
+                        cudaMemcpyDeviceToHost,
+                        stream.value()),
+        "extract_bool");
       stream.synchronize();
       for (cudf::size_type r = 0; r < num_rows; ++r) {
         if (nulls.is_null(col.offset() + r)) {
@@ -443,22 +466,26 @@ void format_rows_to_output(std::string& output,
         cudf::strings_column_view scv(col);
         int64_t const num_offsets = static_cast<int64_t>(num_rows) + 1;
         std::vector<int32_t> host_offsets(num_offsets);
-        cudaMemcpyAsync(host_offsets.data(),
-                        scv.offsets().data<int32_t>() + col.offset(),
-                        num_offsets * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_offsets.data(),
+                          scv.offsets().data<int32_t>() + col.offset(),
+                          num_offsets * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "STRING offsets");
         stream.synchronize();
         auto const chars_start = host_offsets[0];
         auto const chars_end   = host_offsets[num_rows];
         auto const chars_bytes = chars_end - chars_start;
         std::vector<char> host_chars(chars_bytes);
         if (chars_bytes > 0) {
-          cudaMemcpyAsync(host_chars.data(),
-                          scv.chars_begin(stream) + chars_start,
-                          chars_bytes,
-                          cudaMemcpyDeviceToHost,
-                          stream.value());
+          SIRIUS_CHECK_CUDA_MEMCPY(
+            cudaMemcpyAsync(host_chars.data(),
+                            scv.chars_begin(stream) + chars_start,
+                            chars_bytes,
+                            cudaMemcpyDeviceToHost,
+                            stream.value()),
+            "STRING chars");
           stream.synchronize();
         }
         for (cudf::size_type r = 0; r < num_rows; ++r) {
@@ -482,11 +509,13 @@ void format_rows_to_output(std::string& output,
         int32_t scale = col.type().scale();
         int abs_scale = std::abs(scale);
         std::vector<int32_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<int32_t>(),
-                        sizeof(int32_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int32_t>(),
+                          sizeof(int32_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "DECIMAL32");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -501,11 +530,13 @@ void format_rows_to_output(std::string& output,
         int32_t scale = col.type().scale();
         int abs_scale = std::abs(scale);
         std::vector<int64_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<int64_t>(),
-                        sizeof(int64_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "DECIMAL64");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -520,11 +551,13 @@ void format_rows_to_output(std::string& output,
         int32_t scale = col.type().scale();
         int abs_scale = std::abs(scale);
         std::vector<__int128_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<__int128_t>(),
-                        sizeof(__int128_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<__int128_t>(),
+                          sizeof(__int128_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "DECIMAL128");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -538,11 +571,13 @@ void format_rows_to_output(std::string& output,
 
       case cudf::type_id::TIMESTAMP_SECONDS: {
         std::vector<int64_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<int64_t>(),
-                        sizeof(int64_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "TIMESTAMP_SECONDS");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -555,11 +590,13 @@ void format_rows_to_output(std::string& output,
       }
       case cudf::type_id::TIMESTAMP_MILLISECONDS: {
         std::vector<int64_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<int64_t>(),
-                        sizeof(int64_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "TIMESTAMP_MILLISECONDS");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -572,11 +609,13 @@ void format_rows_to_output(std::string& output,
       }
       case cudf::type_id::TIMESTAMP_MICROSECONDS: {
         std::vector<int64_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<int64_t>(),
-                        sizeof(int64_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "TIMESTAMP_MICROSECONDS");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -589,11 +628,13 @@ void format_rows_to_output(std::string& output,
       }
       case cudf::type_id::TIMESTAMP_NANOSECONDS: {
         std::vector<int64_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<int64_t>(),
-                        sizeof(int64_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int64_t>(),
+                          sizeof(int64_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "TIMESTAMP_NANOSECONDS");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -607,11 +648,13 @@ void format_rows_to_output(std::string& output,
 
       case cudf::type_id::TIMESTAMP_DAYS: {
         std::vector<int32_t> host_vals(num_rows);
-        cudaMemcpyAsync(host_vals.data(),
-                        col.data<int32_t>(),
-                        sizeof(int32_t) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_vals.data(),
+                          col.data<int32_t>(),
+                          sizeof(int32_t) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "TIMESTAMP_DAYS");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -1120,16 +1163,20 @@ void debug_diff(cucascade::data_batch& batch_a,
       auto compare_numeric = [&]<typename T>() {
         std::vector<T> host_a(num_rows);
         std::vector<T> host_b(num_rows);
-        cudaMemcpyAsync(host_a.data(),
-                        col_a.data<T>(),
-                        sizeof(T) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
-        cudaMemcpyAsync(host_b.data(),
-                        col_b.data<T>(),
-                        sizeof(T) * num_rows,
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_a.data(),
+                          col_a.data<T>(),
+                          sizeof(T) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "compare_numeric host_a");
+        SIRIUS_CHECK_CUDA_MEMCPY(
+          cudaMemcpyAsync(host_b.data(),
+                          col_b.data<T>(),
+                          sizeof(T) * num_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()),
+          "compare_numeric host_b");
         stream.synchronize();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           bool null_a = nulls_a.is_null(col_a.offset() + r);
@@ -1174,22 +1221,26 @@ void debug_diff(cucascade::data_batch& batch_a,
             std::vector<std::string> result(num_rows);
             int64_t const num_offsets = static_cast<int64_t>(num_rows) + 1;
             std::vector<int32_t> host_offsets(num_offsets);
-            cudaMemcpyAsync(host_offsets.data(),
-                            scv.offsets().data<int32_t>() + col.offset(),
-                            num_offsets * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost,
-                            stream.value());
+            SIRIUS_CHECK_CUDA_MEMCPY(
+              cudaMemcpyAsync(host_offsets.data(),
+                              scv.offsets().data<int32_t>() + col.offset(),
+                              num_offsets * sizeof(int32_t),
+                              cudaMemcpyDeviceToHost,
+                              stream.value()),
+              "extract_strings offsets");
             stream.synchronize();
             auto const chars_start = host_offsets[0];
             auto const chars_end   = host_offsets[num_rows];
             auto const chars_bytes = chars_end - chars_start;
             std::vector<char> host_chars(chars_bytes);
             if (chars_bytes > 0) {
-              cudaMemcpyAsync(host_chars.data(),
-                              scv.chars_begin(stream) + chars_start,
-                              chars_bytes,
-                              cudaMemcpyDeviceToHost,
-                              stream.value());
+              SIRIUS_CHECK_CUDA_MEMCPY(
+                cudaMemcpyAsync(host_chars.data(),
+                                scv.chars_begin(stream) + chars_start,
+                                chars_bytes,
+                                cudaMemcpyDeviceToHost,
+                                stream.value()),
+                "extract_strings chars");
               stream.synchronize();
             }
             for (cudf::size_type r = 0; r < num_rows; ++r) {
