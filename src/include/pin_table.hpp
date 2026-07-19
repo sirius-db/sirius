@@ -62,6 +62,7 @@ void clear_recorded_unpin_calls();
 
 namespace cudf {
 class table;
+class column;
 }  // namespace cudf
 
 namespace cucascade {
@@ -171,15 +172,25 @@ struct compression_pin_config {
   int column_threads{1};
 };
 
-/// Result of driving a GPU-tier pin with optional Simpatico compression.
-/// When every batch compresses successfully, @c compressed_chunks is non-empty
-/// and @c tables is empty; otherwise the uncompressed GPU tables (with their
-/// per-chunk placement) land in @c tables / @c chunk_memory_spaces for the plain
-/// insert_pinned_entry path.
+/// One GPU-tier chunk of a compression-enabled pin, in emission order. Exactly
+/// one form is populated: a batch that qualified for compression carries
+/// @c compressed (a compressed_device_representation holding every pinned column);
+/// a batch pinned uncompressed carries @c columns (one device column per pinned
+/// column, positional with the pin's column_ids) plus the @c memory_space it
+/// resides in. Serving dispatches per chunk on which form is set, so a single
+/// pin may freely interleave the two — mirrors the host-tier host_chunks design.
+struct device_pin_chunk {
+  std::shared_ptr<sirius::compressed_device_representation> compressed;
+  std::vector<std::shared_ptr<cudf::column>> columns;
+  cucascade::memory::memory_space* memory_space{nullptr};
+};
+
+/// Result of driving a GPU-tier pin with optional Simpatico compression. Each
+/// emitted batch becomes one @ref device_pin_chunk in emission order — compressed
+/// when it qualified, uncompressed otherwise — so compressed and uncompressed
+/// chunks may be interleaved within a single pin.
 struct device_pin_result {
-  std::vector<std::unique_ptr<cudf::table>> tables;
-  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
-  std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks;
+  std::vector<device_pin_chunk> chunks;
   /// Row count of each materialized batch, in emission order (covers compressed
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
@@ -197,9 +208,9 @@ host_pin_result materialize_pin_to_host_with_compression(
 
 /// Drive @p ingestible to completion like @ref materialize_all_batches, optionally
 /// compressing each batch with Simpatico and keeping the compressed payload in GPU
-/// (device) memory. When compression is disabled or a batch does not qualify, the
-/// uncompressed GPU table is retained instead (in @c device_pin_result::tables), so
-/// the caller can fall back to the plain GPU pin.
+/// (device) memory. A batch that does not qualify (below the size threshold, or it
+/// fails to compress usefully) is kept as an uncompressed device chunk instead, so
+/// @c device_pin_result::chunks may interleave the two forms in emission order.
 device_pin_result materialize_pin_to_device_with_compression(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,

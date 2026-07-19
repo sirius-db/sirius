@@ -113,14 +113,38 @@ struct cached_databatch_provider : public databatch_provider {
 
   std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
   {
-    // GPU-tier compressed: hand out the projected compressed chunk; the batch is
-    // decompressed on demand by scan_operator_input::prepare_for_processing.
-    if (!_entry.compressed_device_chunks.empty()) {
-      if (index >= _entry.compressed_device_chunks.size()) { return nullptr; }
-      const auto& chunk = _entry.compressed_device_chunks.at(index);
-      if (!chunk) { return nullptr; }
-      auto projected = chunk->select_columns(_column_indices);
-      return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
+    // GPU-tier compression-enabled pin: one device_pin_chunk per batch, in
+    // emission order. Dispatch per chunk on the populated form — a single pin may
+    // interleave compressed and uncompressed chunks.
+    if (!_entry.device_chunks.empty()) {
+      if (index >= _entry.device_chunks.size()) { return nullptr; }
+      const auto& chunk = _entry.device_chunks.at(index);
+      if (chunk.compressed) {
+        // Hand out the projected compressed chunk; decompressed on demand by
+        // scan_operator_input::prepare_for_processing.
+        auto projected = chunk.compressed->select_columns(_column_indices);
+        return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
+      }
+      // Uncompressed chunk: project the requested columns (positions into the
+      // pinned column set) and serve directly as a gpu_table_representation.
+      std::vector<std::shared_ptr<cudf::column>> columns;
+      std::vector<cudf::column_view> column_views;
+      std::size_t alloc_size = 0;
+      for (auto const& col_idx : _column_indices) {
+        if (col_idx >= chunk.columns.size() || !chunk.columns[col_idx]) { return nullptr; }
+        columns.push_back(chunk.columns[col_idx]);
+        column_views.emplace_back(columns.back()->view());
+        alloc_size += columns.back()->alloc_size();
+      }
+      cudf::table_view view(column_views);
+      auto* chunk_space = chunk.memory_space ? chunk.memory_space : _entry.memory_space;
+      auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
+        view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
+      const auto batch_id = ::sirius::get_next_batch_id();
+      return ::cucascade::data_batch::make(
+        batch_id,
+        std::move(gpu_repr),
+        telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
     }
     if (index >= _entry.chunk_memory_spaces.size()) { return nullptr; }
     std::vector<std::shared_ptr<cudf::column>> columns;
@@ -856,29 +880,31 @@ void sirius_scan_manager::insert_pinned_entry_host(
   _pinned_entries[name] = std::move(entry);
 }
 
-void sirius_scan_manager::insert_pinned_entry_device_compressed(
-  const std::string& name,
-  cache_entry_info cache_info,
-  std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks,
-  cucascade::memory::memory_space& memory_space)
+void sirius_scan_manager::insert_pinned_entry_device(const std::string& name,
+                                                     cache_entry_info cache_info,
+                                                     std::vector<sirius::device_pin_chunk> chunks,
+                                                     cucascade::memory::memory_space& memory_space)
 {
   std::size_t new_num_rows = 0;
-  for (auto const& chunk : compressed_chunks) {
-    if (chunk) { new_num_rows += static_cast<std::size_t>(chunk->num_rows()); }
+  for (auto const& chunk : chunks) {
+    if (chunk.compressed) {
+      new_num_rows += static_cast<std::size_t>(chunk.compressed->num_rows());
+    } else if (!chunk.columns.empty() && chunk.columns.front()) {
+      new_num_rows += static_cast<std::size_t>(chunk.columns.front()->size());
+    }
   }
 
   pinned_entry entry;
-  entry.cache_info               = std::move(cache_info);
-  entry.tier                     = cucascade::memory::Tier::GPU;
-  entry.memory_space             = &memory_space;
-  entry.num_rows                 = new_num_rows;
-  entry.compressed_device_chunks = std::move(compressed_chunks);
+  entry.cache_info    = std::move(cache_info);
+  entry.tier          = cucascade::memory::Tier::GPU;
+  entry.memory_space  = &memory_space;
+  entry.num_rows      = new_num_rows;
+  entry.device_chunks = std::move(chunks);
 
-  SIRIUS_LOG_DEBUG(
-    "[sirius_scan_manager::insert_pinned_entry_device_compressed] '{}' chunks={} rows={}",
-    name,
-    entry.compressed_device_chunks.size(),
-    new_num_rows);
+  SIRIUS_LOG_DEBUG("[sirius_scan_manager::insert_pinned_entry_device] '{}' chunks={} rows={}",
+                   name,
+                   entry.device_chunks.size(),
+                   new_num_rows);
 
   _pinned_entries[name] = std::move(entry);
 }
@@ -912,6 +938,22 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   auto const& entry_column_names = entry.cache_info.column_names();
 
   if (entry.tier == cucascade::memory::Tier::GPU) {
+    // Compression-enabled pin: one device_pin_chunk per batch, each holding every
+    // pinned column. A compressed chunk projects all columns internally; an
+    // uncompressed chunk must carry every selected column as a non-null device
+    // column (the serving loop reads a nullptr batch as end-of-stream).
+    if (!entry.device_chunks.empty()) {
+      for (auto const& chunk : entry.device_chunks) {
+        if (chunk.compressed) { continue; }
+        for (auto idx : selected_columns) {
+          if (idx >= chunk.columns.size() || !chunk.columns[idx]) {
+            throw std::runtime_error("pinned device chunk is missing selected column " +
+                                     std::to_string(idx));
+          }
+        }
+      }
+      return;
+    }
     if (entry.data_batches_by_column.empty()) { return; }  // legitimate zero-chunk entry
     auto const n_chunks = entry.data_batches_by_column.begin()->second.size();
     if (entry.chunk_memory_spaces.size() != n_chunks) {
@@ -951,9 +993,16 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
 {
   std::size_t n_chunks = 0;
   if (entry.tier == cucascade::memory::Tier::GPU) {
-    n_chunks = entry.data_batches_by_column.empty()
-                 ? 0
-                 : entry.data_batches_by_column.begin()->second.size();
+    // A compression-enabled pin serves from device_chunks (one per batch); a plain
+    // GPU pin serves the column-major data_batches_by_column. device_chunks takes
+    // priority, matching the serving provider.
+    if (!entry.device_chunks.empty()) {
+      n_chunks = entry.device_chunks.size();
+    } else {
+      n_chunks = entry.data_batches_by_column.empty()
+                   ? 0
+                   : entry.data_batches_by_column.begin()->second.size();
+    }
   } else if (entry.tier == cucascade::memory::Tier::HOST) {
     n_chunks = entry.host_chunks.size();
   }

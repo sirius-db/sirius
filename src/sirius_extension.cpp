@@ -875,8 +875,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   auto info                 = std::make_unique<parquet_ingestible_table_info>();
   info->resolved_file_paths = file_paths;
   sirius::op::scan::canonicalize_scan_file_paths(info->resolved_file_paths);
-  info->returned_types      = sirius::from_duckdb_vec(desc.return_types);  // full schema
-  info->names               = desc.names;                                  // full schema
+  info->returned_types = sirius::from_duckdb_vec(desc.return_types);  // full schema
+  info->names          = desc.names;                                  // full schema
   for (auto idx : keep) {
     info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(idx)));
     // Pin-time DuckDB type of each pinned column, in column_ids (batch-column)
@@ -1283,27 +1283,15 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
   } else if (pin_comp.enabled) {
-    // GPU tier, compressed: materialize each batch, compress it, and keep the
-    // compressed payload in device memory. Falls back to a plain GPU pin if no
-    // chunk qualified for compression.
+    // GPU tier, compression enabled: materialize each batch and compress it when it
+    // qualifies, keeping the compressed payload in device memory; batches that do
+    // not qualify are pinned uncompressed. Both forms land in one ordered chunk
+    // vector, so a table that mixes them pins without special-casing.
     auto dev_result = sirius::materialize_pin_to_device_with_compression(
       *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
 
-    if (!dev_result.compressed_chunks.empty() && !dev_result.tables.empty()) {
-      throw std::runtime_error(
-        "pin_table: unexpected result: both compressed and uncompressed device chunks present");
-    }
-    if (!dev_result.compressed_chunks.empty() && dev_result.tables.empty()) {
-      scan_mgr.insert_pinned_entry_device_compressed(data.args.name,
-                                                     std::move(cache_info),
-                                                     std::move(dev_result.compressed_chunks),
-                                                     *gpu_spaces_mut[0]);
-    } else {
-      scan_mgr.insert_pinned_entry(data.args.name,
-                                   std::move(cache_info),
-                                   std::move(dev_result.tables),
-                                   std::move(dev_result.chunk_memory_spaces));
-    }
+    scan_mgr.insert_pinned_entry_device(
+      data.args.name, std::move(cache_info), std::move(dev_result.chunks), *gpu_spaces_mut[0]);
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;

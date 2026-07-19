@@ -22,6 +22,7 @@
 #include "io/datasource_factory.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "pin_table.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
@@ -148,11 +149,15 @@ struct pinned_entry {
   /// uncompressed form, select_columns() for the compressed form). Populated by
   /// @ref insert_pinned_entry_host.
   std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks;
-  /// GPU-tier compressed storage: one compressed_device_representation per chunk,
-  /// each holding all pinned columns compressed in device memory. Populated by
-  /// @ref insert_pinned_entry_device_compressed. Takes priority over
-  /// data_batches_by_column when non-empty.
-  std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_device_chunks;
+  /// GPU-tier compression-enabled storage: one @ref device_pin_chunk per emitted
+  /// batch, in emission order. Each chunk is either Simpatico-compressed (served
+  /// as a compressed_device_representation, decompressed on demand) or
+  /// uncompressed (served directly as a gpu_table_representation) — a single pin
+  /// may interleave the two, since compression is decided per chunk. The cached
+  /// provider dispatches on the populated form per chunk. Populated by
+  /// @ref insert_pinned_entry_device. Takes priority over data_batches_by_column
+  /// (the plain, non-compression GPU pin path) when non-empty.
+  std::vector<sirius::device_pin_chunk> device_chunks;
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which cached_split_provider variant @ref create_provider_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
@@ -367,22 +372,24 @@ class sirius_scan_manager {
     duckdb::vector<duckdb::LogicalType> column_types                                 = {},
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
 
-  /// \brief Pin the entry for a table on the GPU tier using Simpatico-compressed chunks.
+  /// \brief Pin the entry for a table on the GPU tier from a compression-enabled pin.
   ///
-  /// Each entry in @p compressed_chunks holds all pinned columns compressed in device
-  /// memory. The cached provider prefers this over @c data_batches_by_column when
-  /// non-empty; the batch is decompressed on demand by prepare_for_processing.
+  /// Each entry in @p chunks is one emitted batch, in emission order, holding all
+  /// pinned columns — either Simpatico-compressed (decompressed on demand at scan
+  /// time) or uncompressed (served directly); a single pin may interleave the two.
+  /// The cached provider prefers @c device_chunks over @c data_batches_by_column
+  /// when non-empty. Always REPLACES any existing entry for @p name — there is no
+  /// per-column merge analog (each chunk already holds every column).
   ///
-  /// \param name                Table name key.
-  /// \param cache_info          Cache identity plus the cached columns and their
-  ///                            @c column_ids-aligned names.
-  /// \param compressed_chunks   One compressed_device_representation per batch.
-  /// \param memory_space        Representative GPU memory space (metadata only).
-  void insert_pinned_entry_device_compressed(
-    const std::string& name,
-    cache_entry_info cache_info,
-    std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks,
-    cucascade::memory::memory_space& memory_space);
+  /// \param name          Table name key.
+  /// \param cache_info    Cache identity plus the cached columns and their
+  ///                      @c column_ids-aligned names.
+  /// \param chunks        One @ref device_pin_chunk per batch (compressed or not).
+  /// \param memory_space  Representative GPU memory space (metadata only).
+  void insert_pinned_entry_device(const std::string& name,
+                                  cache_entry_info cache_info,
+                                  std::vector<sirius::device_pin_chunk> chunks,
+                                  cucascade::memory::memory_space& memory_space);
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///

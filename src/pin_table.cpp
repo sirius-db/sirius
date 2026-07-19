@@ -437,7 +437,7 @@ device_pin_result materialize_pin_to_device_with_compression(
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
-      bool compressed_this_chunk = false;
+      std::shared_ptr<sirius::compressed_device_representation> compressed_chunk;
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
 
       if (compression.enabled && !compression_failed && tbl && tbl->num_columns() > 0 &&
@@ -513,15 +513,13 @@ device_pin_result materialize_pin_to_device_with_compression(
               blob->payload       = std::move(payload);
               blob->payload_bytes = payload_bytes;
 
-              out.compressed_chunks.emplace_back(
-                std::make_shared<sirius::compressed_device_representation>(
-                  *src_space,
-                  std::move(blob),
-                  compression.column_names,
-                  static_cast<std::size_t>(payload_bytes),
-                  uncompressed_bytes,
-                  static_cast<int64_t>(tbl->num_rows())));
-              compressed_this_chunk = true;
+              compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
+                *src_space,
+                std::move(blob),
+                compression.column_names,
+                static_cast<std::size_t>(payload_bytes),
+                uncompressed_bytes,
+                static_cast<int64_t>(tbl->num_rows()));
             }
           }
         } catch (const std::exception& e) {
@@ -533,13 +531,24 @@ device_pin_result materialize_pin_to_device_with_compression(
         }
       }
 
-      if (!compressed_this_chunk) {
+      if (compressed_chunk) {
+        out.chunks.push_back(device_pin_chunk{
+          .compressed = std::move(compressed_chunk), .columns = {}, .memory_space = src_space});
+      } else {
         // Retain the uncompressed GPU table in place (device pin holds all
         // chunks on the GPU by definition). Sync so the table is fully resident
-        // before it is stored (its writer stream is not tracked downstream).
+        // before it is stored (its writer stream is not tracked downstream), then
+        // split it into per-column device columns so a mixed pin stores every
+        // chunk — compressed or not — in one ordered vector.
         stream.synchronize();
-        out.tables.emplace_back(std::move(tbl));
-        out.chunk_memory_spaces.push_back(src_space);
+        auto cols = tbl->release();
+        std::vector<std::shared_ptr<cudf::column>> shared_cols;
+        shared_cols.reserve(cols.size());
+        for (auto& col : cols) {
+          shared_cols.emplace_back(std::move(col));
+        }
+        out.chunks.push_back(device_pin_chunk{
+          .compressed = nullptr, .columns = std::move(shared_cols), .memory_space = src_space});
       }
     });
 
