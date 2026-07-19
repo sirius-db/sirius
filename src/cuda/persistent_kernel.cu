@@ -28,8 +28,10 @@
 
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstddef>
+#include <limits>
 
 namespace sirius::cuda {
 
@@ -243,7 +245,18 @@ void launch_persistent_scan_filter_agg(
   if (num_rows == 0) return;
 
   uint32_t const block_dim = 256;
-  uint32_t const grid_dim = (num_rows + block_dim - 1) / block_dim;
+  // Compute the grid in 64-bit to avoid uint32 overflow: for num_rows near
+  // UINT32_MAX, `(num_rows + block_dim - 1)` wraps and grid_dim can land at 0
+  // (launching no blocks) or a small value (processing only a fraction). Cast
+  // back to the launch's int after clamping to a sane per-call block cap.
+  uint64_t const grid_dim_64 =
+    (static_cast<uint64_t>(num_rows) + block_dim - 1) / block_dim;
+  // The kernel indexes rows as desc.column_data + row*stride with row derived
+  // from blockIdx.x*blockDim.x+threadIdx.x; cap grid_dim so the largest row
+  // index stays within int32 (cudf columns are int32-sized anyway, and the
+  // caller's num_rows is uint32 but real columns are far smaller).
+  int const grid_dim = static_cast<int>(std::min<uint64_t>(grid_dim_64,
+                                    static_cast<uint64_t>(std::numeric_limits<int>::max())));
 
   persistent_kernel_desc desc;
   desc.column_data  = column_data;

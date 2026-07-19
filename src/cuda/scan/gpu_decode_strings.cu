@@ -103,9 +103,16 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
 {
   uint32_t const total_rows = col.total_rows;
   if (total_rows == 0) { return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}); }
-  if (total_rows > static_cast<uint32_t>(std::numeric_limits<cudf::size_type>::max())) {
+  // Reject total_rows >= cudf::size_type max, not just >. cudf strings columns
+  // carry `total_rows + 1` offsets (one per row plus a trailing offset), so
+  // total_rows == INT32_MAX makes `total_rows + 1` overflow: the exclusive-sum
+  // scan_n at the +1 site wraps to a negative int32 (UB), and the offsets
+  // column size `total_rows + 1u` wraps to 0. The tight bound
+  // (total_rows < cudf::size_type max) leaves room for the trailing offset.
+  if (total_rows >= static_cast<uint32_t>(std::numeric_limits<cudf::size_type>::max())) {
     throw std::runtime_error("gpu_decode_strings_column: total_rows (" +
-                             std::to_string(total_rows) + ") > cudf::size_type max");
+                             std::to_string(total_rows) + ") >= cudf::size_type max "
+                             "(no room for the trailing offsets row)");
   }
 
   prepared_uncomp prep_uncomp;
