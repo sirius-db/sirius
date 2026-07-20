@@ -24,9 +24,9 @@
 
 using Metric = cuvs::distance::DistanceType;
 
-TEST_CASE("enn_distance_type_from_metric maps l2sq to the unexpanded form", "[vss]")
+TEST_CASE("enn_distance_type_from_metric maps l2 to the unexpanded form", "[vss]")
 {
-  REQUIRE(sirius::vss::enn_distance_type_from_metric("l2sq") == Metric::L2SqrtUnexpanded);
+  REQUIRE(sirius::vss::enn_distance_type_from_metric("l2") == Metric::L2SqrtUnexpanded);
   REQUIRE(sirius::vss::enn_distance_type_from_metric("cosine") == Metric::CosineExpanded);
   REQUIRE_THROWS_AS(sirius::vss::enn_distance_type_from_metric("dot"), std::invalid_argument);
   REQUIRE_THROWS_AS(sirius::vss::enn_distance_type_from_metric(""), std::invalid_argument);

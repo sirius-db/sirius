@@ -161,7 +161,7 @@ TEST_CASE("compute_enn_top_k returns nearest passthrough rows plus distance", "[
     ids[i]            = i;
   }
 
-  EnnHarness h(dim, "l2sq", std::vector<float>(dim, 0.0f));
+  EnnHarness h(dim, "l2", std::vector<float>(dim, 0.0f));
   raft::device_resources res{h.stream};
 
   SECTION("top-k in nearest-first order with the trailing distance column")
@@ -223,7 +223,7 @@ TEST_CASE("compute_enn_top_k compacts null and sliced vector rows before search"
     ids[i]            = i;
   }
 
-  EnnHarness h(dim, "l2sq", std::vector<float>(dim, 0.0f));
+  EnnHarness h(dim, "l2", std::vector<float>(dim, 0.0f));
   raft::device_resources res{h.stream};
 
   SECTION("a null vector row is dropped and never returned")
@@ -266,7 +266,7 @@ TEST_CASE("compute_enn_top_k compacts null and sliced vector rows before search"
 
 TEST_CASE("merge_enn_top_k keeps the globally nearest rows sorted by distance", "[vss]")
 {
-  EnnHarness h(/*dim=*/3, "l2sq", std::vector<float>(3, 0.0f));
+  EnnHarness h(/*dim=*/3, "l2", std::vector<float>(3, 0.0f));
 
   // Two per-chunk candidate tables [id, distance], each already sorted ascending
   // by distance (as cuVS select_k returns them). Global order across both chunks:

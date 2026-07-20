@@ -1671,7 +1671,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   req.query       = vector_search_query_floats(input.inputs[2]);
 
   // Optional params' default values
-  req.metric              = "l2sq";
+  req.metric              = "l2";
   req.k                   = 10;
   std::string schema_name = "main";
   for (auto& kv : input.named_parameters) {
@@ -1692,8 +1692,8 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
     }
   }
   if (req.k <= 0) { throw BinderException("sirius_knn_search: k must be >= 1"); }
-  if (req.metric != "l2sq" && req.metric != "cosine") {
-    throw BinderException("sirius_knn_search: metric must be one of 'l2sq', 'cosine', got '" +
+  if (req.metric != "l2" && req.metric != "cosine") {
+    throw BinderException("sirius_knn_search: metric must be one of 'l2', 'cosine', got '" +
                           req.metric + "'");
   }
 
