@@ -73,6 +73,20 @@ only in a later PR.
 - Numeric rollout thresholds are recorded in the checked-in benchmark specification before R2
   performance data is examined.
 
+Known pre-existing defects to fix in R1 while these seams are open:
+
+- **TODO (R1):** the domain-coverage gate is inert on the live path.
+  [trace_binding_to_get](../../src/planner/sirius_plan_comparison_join.cpp#L284) matches
+  <code>BOUND_COLUMN_REF</code>, which never occurs after <code>ColumnBindingResolver</code>
+  rewrites conditions to <code>BOUND_REF</code>, so <code>build_key_domain_cardinalities</code> is
+  always zero and <code>dynamic_filter_domain_coverage_threshold</code> never gates. Recompute
+  domain cardinality from the carried pre-materialization classification (or positional ordinals)
+  and add a regression in which a domain-covering build actually skips publication.
+- **TODO (R1):** delete the dead nested-loop-join pushdown keep-alive: the
+  <code>JoinFilterPushdownInfo</code> constructor overload has no callers and nothing reads the
+  NLJ's stored <code>filter_pushdown</code>
+  ([ctor](../../src/include/op/sirius_physical_nested_loop_join.hpp#L60)).
+
 ### R2 — single-GPU vertical slice
 
 - The final data flow is exactly
@@ -326,6 +340,13 @@ The first measurement still computes a mask and gathers rows before the keep rat
 the gate as a local cost heuristic and instrument it; do not add coordination, hysteresis, or row
 provenance in R2/R3.
 
+**TODO (R3):** the gate instrumentation must record two known amplifiers: per-filter keep ratios
+are recorded once ([emplace-once](../../src/op/scan/dynamic_filter_merge.cpp#L178)), so a filter
+measured before later channel growth keeps a stale ratio forever, and AST/zone-map filters bypass
+per-filter gating entirely. Capture both in telemetry; change the behavior only if R3 measurements
+show material cost, and before any recurring producer (which republishes into a growing channel)
+ships.
+
 The current no-history override returns one input footprint in
 [sirius_physical_dynamic_filter.hpp](../../src/include/op/scan/sirius_physical_dynamic_filter.hpp#L63),
 while application can co-hold the input, BOOL mask, and near-input-sized gathered output. R2 removes
@@ -469,6 +490,13 @@ safe pass-throughs.
 
 The DuckDB LIMIT/TOP-N candidate-walk pin update (duckdb#22963) remains tracked by #1123 and blocks
 none of R0–R4.
+
+**TODO (Top-N follow-up):** Sirius carries DuckDB's <code>LogicalTopN::dynamic_filter</code> but
+never populates or consumes it ([carry](../../src/planner/sirius_plan_top_n.cpp#L36)), and on the
+transparent path it is null anyway — <code>LogicalOperator::Copy</code> drops it and the
+preservation shim handles only GET and COMPARISON_JOIN. Harmless today because the filter is
+optional, but the Top-N recurring-filter follow-up must either populate it from the GPU Top-N or
+route natively through a Sirius channel and strip the dead carry.
 
 ## PR and rollback policy
 
