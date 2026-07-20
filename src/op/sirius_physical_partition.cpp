@@ -320,7 +320,10 @@ std::size_t sirius_physical_partition::slot_for_device(int device_id) const
   for (std::size_t i = 0; i < _active_gpu_ids.size(); ++i) {
     if (_active_gpu_ids[i] == device_id) { return i; }
   }
-  return 0;  // fallback: keep the batch on a valid slot if the device is unexpectedly absent
+  SIRIUS_LOG_WARN(
+    "slot_for_device: device_id {} not found in active GPU list, falling back to slot 0",
+    device_id);
+  return 0;
 }
 
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
@@ -411,9 +414,35 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       // (non-right, non-mixed, folds to one build batch); right/mixed joins reject it and fall back
       // to the normal count. Only the build side can drive broadcast (sizing_partition._is_build).
       // See make_broadcast_partition_decision for the pure, unit-tested decision.
-      auto const num_gpus = _active_gpu_ids.size();
-      auto const decision = make_broadcast_partition_decision(
-        sizing_partition._is_build, num_gpus, total_bytes, _small_table_bytes, num_parts);
+      auto const num_gpus  = _active_gpu_ids.size();
+      bool const mark_join = hash_join.is_mark_join();
+
+      // MARK joins cannot be hash-partitioned across batches because build_has_null must be
+      // consistent across all build data. Enforce single partition on 1 GPU; force broadcast on
+      // multi-GPU regardless of table size (bypassing the normal small_table_bytes size gate).
+      broadcast_partition_decision decision;
+      if (mark_join && num_gpus > 1) {
+        // Force broadcast: replicate to every GPU unconditionally.
+        if (total_bytes >= _small_table_bytes) {
+          SIRIUS_LOG_WARN(
+            "sirius_physical_partition id {}: forcing broadcast for MARK join with build side "
+            "{} bytes (exceeds standard broadcast limit of {} bytes)",
+            this->get_operator_id(),
+            total_bytes,
+            _small_table_bytes);
+        }
+        decision = broadcast_partition_decision{/*candidate=*/true,
+                                                /*proposed=*/static_cast<int>(num_gpus),
+                                                /*natural=*/num_parts};
+      } else if (mark_join) {
+        // Single GPU: clamp to one partition.
+        decision = broadcast_partition_decision{/*candidate=*/false,
+                                                /*proposed=*/1,
+                                                /*natural=*/1};
+      } else {
+        decision = make_broadcast_partition_decision(
+          sizing_partition._is_build, num_gpus, total_bytes, _small_table_bytes, num_parts);
+      }
 
       if (sizing_partition._is_build) {
         hash_join.update_join_exec_mode(

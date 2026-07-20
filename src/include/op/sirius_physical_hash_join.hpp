@@ -246,6 +246,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
   [[nodiscard]] bool is_build_probe_mode();
 
+  /// @brief True when this is a MARK join. Used by the partition operator to enforce
+  ///        single-partition (1 GPU) or forced-broadcast (multi-GPU) sizing.
+  [[nodiscard]] bool is_mark_join() const { return join_type == duckdb::JoinType::MARK; }
+
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -289,6 +293,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
 
+  // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
+  // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)
+  // because MARK joins are forced to a single partition / broadcast, so all build batches agree.
+  std::atomic<int> _build_has_null{-1};
+
   // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
   // that lives entirely on one GPU . A partition is built once — its
   // single SCHEDULED build task release-stores BUILT — and then probed by many streamed probe tasks
@@ -300,9 +309,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     std::unique_ptr<cudf::distinct_hash_join>
       distinct_hash_table;  // used instead of hash_table when build keys are proven unique
     std::unique_ptr<cudf::filtered_join>
-      filtered_table;             // reusable build-on-right object for MARK/SEMI/ANTI joins
-    bool build_has_null = false;  // whether the build/right side has a NULL in any join key column;
-                                  // needed for MARK three-valued logic at probe time
+      filtered_table;  // reusable build-on-right object for MARK/SEMI/ANTI joins
     std::optional<::cucascade::read_only_data_batch>
       build_table;  // owned build table, to materialize build-side results at probe time
     std::vector<std::unique_ptr<cudf::column>>

@@ -1020,6 +1020,27 @@ static bool table_has_any_null(cudf::table_view const& keys)
   return std::ranges::any_of(keys, [](auto const& col) { return col.null_count() > 0; });
 }
 
+/// @brief Thread-safe check-and-set for the join-wide _build_has_null sentinel.
+///
+/// Sentinel encoding: -1 = unset, 0 = false, 1 = true.
+/// On first call: CAS from -1 to the new value.
+/// On subsequent calls: verify the existing value matches; throw if it does not (indicates
+/// inconsistent build batches, which should never happen for MARK joins that are forced to a
+/// single partition or broadcast).
+static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
+{
+  int const new_val = has_null ? 1 : 0;
+  int expected      = -1;
+  if (!atomic_flag.compare_exchange_strong(expected, new_val, std::memory_order_acq_rel)) {
+    // Already set — expected now holds the actual current value.
+    if (expected != new_val) {
+      throw std::runtime_error(
+        "sirius_physical_hash_join: build_has_null inconsistency across build batches for MARK "
+        "join — this should not happen when the join is forced to a single partition or broadcast");
+    }
+  }
+}
+
 /// @brief the MARK join output from the semi_join matching row indices.
 ///
 /// Copies all left output columns (all rows pass through, no gather), then creates a BOOL8 mark
@@ -1189,7 +1210,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           slot.filtered_table = make_right_filtered_join_ptr(build_keys, stream);
           // Record whether the build keys contain a NULL; MARK three-valued logic needs it at probe
           // time, but the build keys are not retained beyond this scope.
-          slot.build_has_null = table_has_any_null(build_keys);
+          set_build_has_null(_build_has_null, table_has_any_null(build_keys));
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
                            duckdb::JoinTypeToString(join_type));
@@ -1230,7 +1251,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                         left_full,
                                         lhs_output_columns.col_idxs,
                                         probe_keys,
-                                        slot.build_has_null,
+                                        _build_has_null.load(std::memory_order_acquire) > 0,
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -1338,11 +1359,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                      pred->back(),
                                                      cudf::null_equality::UNEQUAL,
                                                      stream);
+      set_build_has_null(_build_has_null, table_has_any_null(right_eq));
       return resolve_mark_join_result(*semi_indices,
                                       left_full,
                                       lhs_output_columns.col_idxs,
                                       left_eq,
-                                      table_has_any_null(right_eq),
+                                      _build_has_null.load(std::memory_order_acquire) > 0,
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
@@ -1540,22 +1562,24 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           right_full.num_rows());
         auto mark_join_object = make_left_mark_join(left_keys, stream);
         auto semi_indices     = mark_join_object.semi_join(right_keys, stream);
+        set_build_has_null(_build_has_null, table_has_any_null(right_keys));
         return resolve_mark_join_result(*semi_indices,
                                         left_full,
                                         lhs_output_columns.col_idxs,
                                         left_keys,
-                                        table_has_any_null(right_keys),
+                                        _build_has_null.load(std::memory_order_acquire) > 0,
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
       }
       auto filtered_join_object = make_right_filtered_join(right_keys, stream);
       auto semi_indices         = filtered_join_object.semi_join(left_keys, stream);
+      set_build_has_null(_build_has_null, table_has_any_null(right_keys));
       return resolve_mark_join_result(*semi_indices,
                                       left_full,
                                       lhs_output_columns.col_idxs,
                                       left_keys,
-                                      table_has_any_null(right_keys),
+                                      _build_has_null.load(std::memory_order_acquire) > 0,
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
