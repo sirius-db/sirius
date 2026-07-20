@@ -23,7 +23,7 @@ namespace sirius::vss {
 
 cuvs::distance::DistanceType enn_distance_type_from_metric(std::string_view metric)
 {
-  if (metric == "l2sq") { return cuvs::distance::DistanceType::L2SqrtUnexpanded; }
+  if (metric == "l2") { return cuvs::distance::DistanceType::L2SqrtUnexpanded; }
   if (metric == "cosine") { return cuvs::distance::DistanceType::CosineExpanded; }
   throw std::invalid_argument("enn_distance_type_from_metric: unsupported metric '" +
                               std::string(metric) + "'");
