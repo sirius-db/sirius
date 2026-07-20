@@ -78,8 +78,7 @@ bool split_connector::is_closed() const
   return !_splits.empty();
 }
 
-std::vector<std::shared_ptr<::cucascade::data_batch>> split_connector::peek_resident_batches()
-  const
+std::vector<std::shared_ptr<::cucascade::data_batch>> split_connector::peek_resident_batches() const
 {
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
   std::lock_guard<std::mutex> lock(_mutex);

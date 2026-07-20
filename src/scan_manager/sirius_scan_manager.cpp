@@ -54,8 +54,8 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -452,13 +452,12 @@ void sirius_scan_manager::maybe_start_scan_prefetcher()
   // to the wrong space would strand data cross-device.
   auto gpu_spaces = _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.size() != 1) {
-    SIRIUS_LOG_WARN(
-      "[scan_prefetcher] disabled: prototype supports exactly 1 GPU space (found {})",
-      gpu_spaces.size());
+    SIRIUS_LOG_WARN("[scan_prefetcher] disabled: prototype supports exactly 1 GPU space (found {})",
+                    gpu_spaces.size());
     return;
   }
-  auto* gpu_space = _reservation_manager.get_memory_space(
-    cucascade::memory::Tier::GPU, gpu_spaces.front()->get_device_id());
+  auto* gpu_space = _reservation_manager.get_memory_space(cucascade::memory::Tier::GPU,
+                                                          gpu_spaces.front()->get_device_id());
   if (gpu_space == nullptr) { return; }
 
   std::vector<std::shared_ptr<split_connector>> connectors;

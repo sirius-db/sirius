@@ -19,9 +19,10 @@
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
 
+#include <rmm/error.hpp>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <rmm/error.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -48,11 +49,10 @@ scan_prefetcher::scan_prefetcher(config cfg,
   for (std::size_t i = 0; i < _config.num_threads; ++i) {
     _workers.emplace_back([this] { worker_loop(); });
   }
-  SIRIUS_LOG_INFO(
-    "[scan_prefetcher] started: {} threads, {} connectors, min_free_fraction={:.2f}",
-    _config.num_threads,
-    _connectors.size(),
-    _config.min_free_fraction);
+  SIRIUS_LOG_INFO("[scan_prefetcher] started: {} threads, {} connectors, min_free_fraction={:.2f}",
+                  _config.num_threads,
+                  _connectors.size(),
+                  _config.min_free_fraction);
 }
 
 scan_prefetcher::~scan_prefetcher() { stop(); }
@@ -130,8 +130,7 @@ std::size_t scan_prefetcher::sweep(rmm::cuda_stream_view stream)
         return true;
       }
       const auto last = _last_pop_time_ms[ci].load(std::memory_order_relaxed);
-      return last != 0 &&
-             now_ms - last < static_cast<std::int64_t>(_config.drain_quiet_ms);
+      return last != 0 && now_ms - last < static_cast<std::int64_t>(_config.drain_quiet_ms);
     };
     if (is_draining()) { continue; }
 
@@ -145,8 +144,7 @@ std::size_t scan_prefetcher::sweep(rmm::cuda_stream_view stream)
       std::size_t batch_bytes = 0;
       {
         auto ro = batch->to_read_only();
-        if (ro.get_data() == nullptr ||
-            ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+        if (ro.get_data() == nullptr || ro.get_current_tier() == cucascade::memory::Tier::GPU) {
           continue;
         }
         batch_bytes = ro.get_data()->get_size_in_bytes();
@@ -165,8 +163,7 @@ std::size_t scan_prefetcher::sweep(rmm::cuda_stream_view stream)
       // its own prepare_for_processing does the upload).
       auto mut = batch->try_to_mutable();
       if (!mut) { continue; }
-      if (mut->get_data() == nullptr ||
-          mut->get_current_tier() == cucascade::memory::Tier::GPU) {
+      if (mut->get_data() == nullptr || mut->get_current_tier() == cucascade::memory::Tier::GPU) {
         continue;
       }
 

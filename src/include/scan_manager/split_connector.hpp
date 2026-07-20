@@ -93,8 +93,7 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// tier ahead of task creation. Fresh-read splits (scan metadata) are skipped.
   /// The returned shared_ptrs are copies; the batch state machine arbitrates any
   /// race with a consumer that pops the split concurrently.
-  [[nodiscard]] std::vector<std::shared_ptr<::cucascade::data_batch>> peek_resident_batches()
-    const;
+  [[nodiscard]] std::vector<std::shared_ptr<::cucascade::data_batch>> peek_resident_batches() const;
 
   /// \brief Number of splits ever popped via get_next_split(). Monotonic.
   ///
