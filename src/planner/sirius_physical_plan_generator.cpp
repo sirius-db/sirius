@@ -357,12 +357,15 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
       duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
                                                                hgb_ptr->estimated_cardinality,
                                                                /*key_source=*/hgb_ptr,
-                                                               /*is_build=*/false,
-                                                               op_params.hash_partition_bytes);
+                                                               /*is_build=*/false);
+    auto* partition_ptr = partition.get();
     partition->children.push_back(std::move(hgb_op));
 
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>());
+      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
+      op_params.hash_partition_bytes);
+    // The partition's downstream sizing consumer is the merge (key_source hgb only supplies keys).
+    partition_ptr->set_downstream_consumer_op(merge.get());
     merge->children.push_back(std::move(partition));
     return merge;
   });
@@ -483,8 +486,7 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
         duckdb::make_uniq<sirius::op::sirius_physical_partition>(std::move(child_types),
                                                                  est_card,
                                                                  /*key_source=*/join_op_ptr,
-                                                                 is_build,
-                                                                 op_params.hash_partition_bytes);
+                                                                 is_build);
       partition->children.push_back(std::move(child_orig));
       concat->children.push_back(std::move(partition));
       return concat;
@@ -526,12 +528,14 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
     duckdb::make_uniq<sirius::op::sirius_physical_partition>(original->types,
                                                              original->estimated_cardinality,
                                                              /*key_source=*/original.get(),
-                                                             /*is_build=*/false,
-                                                             op_params.hash_partition_bytes);
+                                                             /*is_build=*/false);
+  auto* partition_ptr = partition.get();
   partition->children.push_back(std::move(original));
 
-  auto merge =
-    duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(original_agg_ptr);
+  auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
+    original_agg_ptr, op_params.hash_partition_bytes);
+  // The partition's downstream sizing consumer is the merge (key_source only supplies keys).
+  partition_ptr->set_downstream_consumer_op(merge.get());
   merge->children.push_back(std::move(partition));
 
   // Tag the chain top with the owning DELIM_JOIN so the tree-parent wiring redirects its

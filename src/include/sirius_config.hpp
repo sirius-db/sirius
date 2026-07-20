@@ -39,6 +39,11 @@ constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  /
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
 
+/// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
+/// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
+/// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
+constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
+
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 

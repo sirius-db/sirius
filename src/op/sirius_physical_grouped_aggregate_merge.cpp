@@ -52,7 +52,7 @@ convert_grouping_functions(const duckdb::vector<duckdb::vector<std::size_t>>& sr
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  sirius_physical_grouped_aggregate* grouped_aggregate)
+  sirius_physical_grouped_aggregate* grouped_aggregate, uint64_t hash_partition_bytes)
   : sirius_physical_grouped_aggregate_merge(grouped_aggregate->types,
                                             grouped_aggregate->group_idx,
                                             grouped_aggregate->cudf_aggregates,
@@ -63,7 +63,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
                                             grouped_aggregate->has_count_distinct,
                                             grouped_aggregate->estimated_cardinality)
 {
-  child_op = grouped_aggregate;
+  child_op              = grouped_aggregate;
+  _hash_partition_bytes = hash_partition_bytes;
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
@@ -133,6 +134,25 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+}
+
+partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
+  const partition_sizing_input& in)
+{
+  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
+  // Pre-size this merge's single input repository so every partition slot exists before batches
+  // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
+  // repository's set_num_partitions contract.
+  if (natural > 1) {
+    std::lock_guard<std::mutex> lg(lock);
+    if (!ports.empty()) {
+      auto& repo = ports.begin()->second->repo;
+      if (repo != nullptr && static_cast<std::size_t>(natural) > repo->num_partitions()) {
+        repo->set_num_partitions(static_cast<std::size_t>(natural));
+      }
+    }
+  }
+  return {natural, /*broadcast=*/false, /*build_probe=*/false};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()

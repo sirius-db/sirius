@@ -97,28 +97,30 @@ struct build_probe_decision {
 [[nodiscard]] build_probe_decision select_build_probe_action(
   std::vector<build_probe_slot_view> const& slots);
 
-/// Whether a join is eligible to run in BUILD_PROBE mode. Mirrors the gate in
-/// update_join_exec_mode: at most one partition per GPU, each GPU's hash table fits a single hash
-/// table, the build side folds to one batch per partition, and the join is not a right-family,
-/// mixed, or full-outer join.
+/// Pure decision for how a PARTITION operator should partition its input for a hash join, folding
+/// the natural-count, broadcast-candidacy, and BUILD_PROBE-eligibility logic into one place.
 ///
-/// `is_broadcast` selects how the build size is charged: a broadcast join replicates the ENTIRE
-/// build to every GPU, so each GPU's hash table is the full `build_side_bytes`; a hash-partitioned
-/// build splits across partitions, so the per-partition average applies.
+/// Only the build side drives broadcast / build-probe, so when `is_build_side` is false (right-
+/// family joins are probe-driven) the result is the plain STANDARD-mode natural count.
 ///
-/// `is_full_outer` (OUTER) is excluded: BUILD_PROBE streams probe batches and calls `full_join`
-/// per batch, emitting unmatched build rows on every batch (and, under broadcast/partitioning, on
-/// every GPU) with no global accumulation — so it over-emits build-side rows. Full outer joins run
-/// on the STANDARD path instead.
-[[nodiscard]] bool build_probe_mode_eligible(int num_partitions,
-                                             uint64_t build_side_bytes,
-                                             bool build_foldable_to_single_batch,
-                                             bool is_right_family,
-                                             bool is_mixed_join,
-                                             int num_gpus,
-                                             uint64_t max_build_hash_table_bytes,
-                                             bool is_full_outer = false,
-                                             bool is_broadcast  = false);
+/// MARK joins cannot be hash-partitioned across batches (build_has_null must be globally
+/// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
+/// multi-GPU.
+///
+/// BUILD_PROBE eligibility requires: at most one partition per GPU, the per-GPU hash table fits
+/// within `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
+/// hash-partitioned build charges the per-partition average), the build folds to one batch, and the
+/// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
+/// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
+[[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
+  uint64_t total_bytes,
+  bool is_build_side,
+  bool build_foldable,
+  int num_gpus,
+  uint64_t hash_partition_bytes,
+  uint64_t max_build_hash_table_bytes,
+  duckdb::JoinType join_type,
+  HASH_JOIN_MODE join_mode);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
@@ -151,7 +153,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     std::size_t estimated_cardinality,
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    dynamic_filter_publish_plan dynamic_filter_plan = {});
+    dynamic_filter_publish_plan dynamic_filter_plan = {},
+    uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES);
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -160,7 +163,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::vector<sirius::join_condition> cond,
     duckdb::JoinType join_type,
     std::size_t estimated_cardinality,
-    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES);
 
   duckdb::vector<sirius::join_condition> conditions;
   //! Scans where we should push generated filters into (if any)
@@ -216,34 +220,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
-  /// @brief This is called by the partition operator to inform the hash join of the number of
-  /// partitions that will be produced by the partition operator, which can be used to make
-  /// decisions about the join execution strategy (e.g., whether to switch to a build-probe strategy
-  /// for small datasets).
-  /// @param num_partitions
-  /// @param build_side_bytes
-  /// @param build_foldable_to_single_batch True when the upstream pipeline can guarantee the
-  ///        build side will arrive as exactly one batch (typically because a downstream
-  ///        build-side CONCAT was configured with concat_all). BUILD_PROBE mode requires
-  ///        the build side to fold into a single batch — when this guarantee is absent the
-  ///        runtime-side build-batch invariant in get_next_task_input_data_for_build_probe
-  ///        would throw on otherwise-valid small-build joins that are still split into
-  ///        multiple batches, so BUILD_PROBE is not entered.
-  /// @param is_broadcast_candidate True when the partition operator intends to replicate the whole
-  ///        (small) build table to every GPU. The build size is then charged in full against
-  ///        max_build_hash_table_bytes (each GPU builds the entire table), not per-partition.
-  void update_join_exec_mode(int num_partitions,
-                             uint64_t build_side_bytes,
-                             bool build_foldable_to_single_batch,
-                             bool is_broadcast_candidate = false);
-
-  /// @brief Inform the join how many GPUs the query runs on. Set at plan time.
-  void set_num_gpus(int num_gpus) { _num_gpus = num_gpus; }
+  /// @brief Called by the upstream PARTITION operator to decide how it should partition its input
+  /// for this join. Computes the partition count / broadcast flag (via
+  /// compute_hash_join_partition_strategy), then applies the join-side side effects atomically
+  /// under op_state_mutex: switching to BUILD_PROBE mode (allocating the per-partition build
+  /// states), marking broadcast, and pre-sizing the build/probe input repositories. Returns the
+  /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
+  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
   /// @brief Mark this join as a broadcast (small-build-table) BUILD_PROBE join. Set at runtime.
   void set_broadcast(bool broadcast) { _broadcast = broadcast; }
 
-  /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
+  /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
 
   /// @brief True when this is a MARK join. Used by the partition operator to enforce
@@ -285,9 +273,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
-
-  // Number of GPUs the query runs on (set at plan time via set_num_gpus).
-  int _num_gpus = 1;
+  // _num_gpus lives on sirius_physical_partition_consumer_operator (set via set_num_gpus).
 
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
   // the probe side is streamed unpartitioned.
@@ -316,7 +302,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
       built_table_cast_columns;  // scope holder for columns cast for the build table's lifetime
     int device_id = -1;          // GPU this slot's table was built on; guards teardown frees
   };
-  // Sized to num_partitions when BUILD_PROBE is entered (see update_join_exec_mode). Elements are
+  // Sized to num_partitions when BUILD_PROBE is entered (see get_partition_strategy). Elements are
   // non-movable (atomic member), so the vector is default-constructed at the target size and only
   // ever whole-move-assigned — never resized or push_back'd — so element moves are never required.
   std::vector<per_partition_build_state> _partition_build_states;

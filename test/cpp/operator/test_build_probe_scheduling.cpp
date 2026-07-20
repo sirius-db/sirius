@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
-// Unit tests for the pure BUILD_PROBE scheduling helpers that drive the
-// multi-partition (one-hash-table-per-GPU) join path:
-//   - build_probe_mode_eligible(): the eligibility gate used by
-//     update_join_exec_mode to admit BUILD_PROBE for up to one partition per GPU.
+// Unit tests for the pure decision helpers that drive the multi-partition
+// (one-hash-table-per-GPU) join path:
+//   - compute_hash_join_partition_strategy(): the combined natural-count /
+//     broadcast / BUILD_PROBE-eligibility decision a PARTITION operator asks the
+//     hash join for (folds the former make_broadcast_partition_decision and
+//     build_probe_mode_eligible helpers into one).
 //   - select_build_probe_action(): the per-partition state-machine decision used
 //     by get_next_task_hint / get_next_task_input_data_for_build_probe.
 //
@@ -35,9 +37,10 @@
 using sirius::op::broadcast_slots_to_discard;
 using sirius::op::BUILD_HASH_TABLE_STATE;
 using sirius::op::build_probe_action;
-using sirius::op::build_probe_mode_eligible;
 using sirius::op::build_probe_slot_view;
-using sirius::op::make_broadcast_partition_decision;
+using sirius::op::compute_hash_join_partition_strategy;
+using sirius::op::HASH_JOIN_MODE;
+using sirius::op::partition_strategy;
 using sirius::op::select_build_probe_action;
 
 namespace {
@@ -58,118 +61,199 @@ build_probe_slot_view slot(BUILD_HASH_TABLE_STATE state, bool has_build, bool ha
 }  // namespace
 
 //===----------------------------------------------------------------------===//
-// build_probe_mode_eligible
+// compute_hash_join_partition_strategy
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("build_probe_mode_eligible - single GPU keeps the historical single-partition rule",
-          "[hash_join][build_probe][unit]")
-{
-  // 1 partition on 1 GPU, small foldable build, plain inner join -> eligible.
-  REQUIRE(build_probe_mode_eligible(/*num_partitions=*/1,
-                                    /*build_side_bytes=*/k100MB,
-                                    /*build_foldable_to_single_batch=*/true,
-                                    /*is_right_family=*/false,
-                                    /*is_mixed_join=*/false,
-                                    /*num_gpus=*/1,
-                                    kMaxBuildBytes));
+namespace {
 
-  // On a single GPU, more than one partition is never eligible (num_partitions > num_gpus).
-  REQUIRE_FALSE(build_probe_mode_eligible(2, k100MB, true, false, false, 1, kMaxBuildBytes));
+// A large hash_partition_bytes so the natural count is 1 unless a test deliberately makes the input
+// exceed it; keeps the "small input" cases at a single natural partition.
+constexpr uint64_t kBigPartitionBytes = 512ull * 1024 * 1024;  // 512 MB
+
+partition_strategy strategy(uint64_t total_bytes,
+                            bool is_build_side,
+                            bool build_foldable,
+                            int num_gpus,
+                            duckdb::JoinType join_type,
+                            HASH_JOIN_MODE join_mode            = HASH_JOIN_MODE::STANDARD,
+                            uint64_t hash_partition_bytes       = kBigPartitionBytes,
+                            uint64_t max_build_hash_table_bytes = kMaxBuildBytes)
+{
+  return compute_hash_join_partition_strategy(total_bytes,
+                                              is_build_side,
+                                              build_foldable,
+                                              num_gpus,
+                                              hash_partition_bytes,
+                                              max_build_hash_table_bytes,
+                                              join_type,
+                                              join_mode);
 }
 
-TEST_CASE("build_probe_mode_eligible - multi-GPU admits up to one partition per GPU",
+}  // namespace
+
+TEST_CASE("compute_hash_join_partition_strategy - single-GPU small foldable inner is BUILD_PROBE",
           "[hash_join][build_probe][unit]")
 {
-  // 4 partitions on 4 GPUs, each partition's average build side under the cap -> eligible.
-  REQUIRE(build_probe_mode_eligible(/*num_partitions=*/4,
-                                    /*build_side_bytes=*/4 * k100MB,  // 400 MB total, 100 MB/part
-                                    /*build_foldable_to_single_batch=*/true,
-                                    /*is_right_family=*/false,
-                                    /*is_mixed_join=*/false,
-                                    /*num_gpus=*/4,
-                                    kMaxBuildBytes));
-
-  // More partitions than GPUs -> not eligible (a partition would share a GPU / large joins stay
-  // in STANDARD mode).
-  REQUIRE_FALSE(build_probe_mode_eligible(5, 5 * k100MB, true, false, false, 4, kMaxBuildBytes));
+  auto const s = strategy(
+    k100MB, /*is_build_side=*/true, /*foldable=*/true, /*num_gpus=*/1, duckdb::JoinType::INNER);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
 }
 
-TEST_CASE("build_probe_mode_eligible - the size cap is per-partition, not total",
+TEST_CASE("compute_hash_join_partition_strategy - single-GPU large build splits and stays STANDARD",
           "[hash_join][build_probe][unit]")
 {
-  // Total build side is 4x the cap, but split across 4 partitions each partition is under it.
-  uint64_t const total = 4 * (kMaxBuildBytes - 1);
-  REQUIRE(build_probe_mode_eligible(4, total, true, false, false, 4, kMaxBuildBytes));
-
-  // A single partition holding that same total exceeds the cap -> not eligible.
-  REQUIRE_FALSE(build_probe_mode_eligible(1, total, true, false, false, 4, kMaxBuildBytes));
-
-  // Per-partition average at or above the cap -> not eligible.
-  REQUIRE_FALSE(
-    build_probe_mode_eligible(2, 2 * kMaxBuildBytes, true, false, false, 2, kMaxBuildBytes));
-}
-
-TEST_CASE("build_probe_mode_eligible - excluded join shapes and unfoldable builds",
-          "[hash_join][build_probe][unit]")
-{
-  // Right-family joins are excluded (they emit build-side output).
-  REQUIRE_FALSE(
-    build_probe_mode_eligible(1, k100MB, true, /*is_right_family=*/true, false, 1, kMaxBuildBytes));
-  // Mixed joins never use BUILD_PROBE.
-  REQUIRE_FALSE(
-    build_probe_mode_eligible(1, k100MB, true, false, /*is_mixed_join=*/true, 1, kMaxBuildBytes));
-  // Build side that cannot fold to a single batch per partition.
-  REQUIRE_FALSE(build_probe_mode_eligible(
-    1, k100MB, /*build_foldable=*/false, false, false, 1, kMaxBuildBytes));
-  // Full outer joins are excluded: streamed full_join over-emits unmatched build rows per batch.
-  REQUIRE_FALSE(build_probe_mode_eligible(1,
-                                          k100MB,
-                                          true,
-                                          false,
-                                          false,
-                                          1,
-                                          kMaxBuildBytes,
-                                          /*is_full_outer=*/true));
-  // The exclusion holds under multi-partition too (one partition per GPU).
-  REQUIRE_FALSE(build_probe_mode_eligible(
-    4, 4 * k100MB, true, false, false, 4, kMaxBuildBytes, /*is_full_outer=*/true));
+  // 400 MB / 100 MB per partition -> 4 natural partitions; on 1 GPU that exceeds num_gpus so
+  // BUILD_PROBE is refused, and the natural count is reported.
+  auto const s = strategy(4 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE_FALSE(s.build_probe);
 }
 
 TEST_CASE(
-  "build_probe_mode_eligible - broadcast charges the FULL build size, not a partition slice",
-  "[hash_join][build_probe][unit][broadcast]")
+  "compute_hash_join_partition_strategy - single-GPU build over the per-GPU cap is STANDARD",
+  "[hash_join][build_probe][unit]")
 {
-  // 4 GPUs, 400 MB build. Per-partition average is 100 MB; the full replicated build is 400 MB.
-  // With a 150 MB cap, a hash-partitioned build (100 MB/partition) fits, but a broadcast build
-  // (400 MB on every GPU) does not.
-  uint64_t const cap   = 150 * k100MB / 100;  // 150 MB
-  uint64_t const total = 4 * k100MB;          // 400 MB
-  REQUIRE(build_probe_mode_eligible(
-    4, total, true, false, false, 4, cap, /*is_full_outer=*/false, /*is_broadcast=*/false));
-  REQUIRE_FALSE(build_probe_mode_eligible(
-    4, total, true, false, false, 4, cap, /*is_full_outer=*/false, /*is_broadcast=*/true));
-
-  // A genuinely small broadcast build (full size under the cap) stays eligible.
-  REQUIRE(build_probe_mode_eligible(2,
-                                    k100MB,
-                                    true,
-                                    false,
-                                    false,
-                                    2,
-                                    kMaxBuildBytes,
-                                    /*is_full_outer=*/false,
-                                    /*is_broadcast=*/true));
+  // One natural partition (huge hash_partition_bytes), but the full build exceeds the cap.
+  auto const s = strategy(/*total=*/6 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/1024ull * 1024 * 1024,
+                          /*max_build_hash_table_bytes=*/kMaxBuildBytes);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.build_probe);
 }
 
-TEST_CASE("build_probe_mode_eligible - degenerate counts are precondition violations that throw",
+TEST_CASE(
+  "compute_hash_join_partition_strategy - multi-GPU medium build is one-per-GPU BUILD_PROBE",
+  "[hash_join][build_probe][unit]")
+{
+  // 400 MB on 4 GPUs, 100 MB per partition: not small enough to broadcast, but each GPU's slice
+  // fits the cap -> hash-partitioned BUILD_PROBE, one partition per GPU, no broadcast.
+  auto const s = strategy(4 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - multi-GPU small build broadcasts to every GPU",
+          "[hash_join][build_probe][unit][broadcast]")
+{
+  // 10 MB build on 4 GPUs is below the small-table threshold (4 * 16 MB) -> replicate to every GPU.
+  auto const s = strategy(10ull * 1024 * 1024, true, true, /*num_gpus=*/4, duckdb::JoinType::INNER);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - right-family joins never broadcast/build-probe",
           "[hash_join][build_probe][unit]")
 {
-  // num_partitions and num_gpus are >= 1 by construction (determine_num_partitions clamps to 1;
-  // _num_gpus defaults to 1). A value < 1 is a programming error, not a "not eligible" case, so the
-  // gate throws rather than silently returning false (and would otherwise divide by zero).
-  REQUIRE_THROWS_AS(build_probe_mode_eligible(0, k100MB, true, false, false, 1, kMaxBuildBytes),
-                    std::invalid_argument);
-  REQUIRE_THROWS_AS(build_probe_mode_eligible(1, k100MB, true, false, false, 0, kMaxBuildBytes),
+  // Probe-driven right-family sizing: is_build_side is false -> plain natural count.
+  auto const probe_driven = strategy(10ull * 1024 * 1024,
+                                     /*is_build_side=*/false,
+                                     true,
+                                     /*num_gpus=*/4,
+                                     duckdb::JoinType::RIGHT);
+  REQUIRE(probe_driven.num_partitions == 1);
+  REQUIRE_FALSE(probe_driven.broadcast);
+  REQUIRE_FALSE(probe_driven.build_probe);
+
+  // Even if the build side drives sizing, RIGHT is excluded from BUILD_PROBE, so a small build
+  // falls back to the natural count instead of broadcasting.
+  auto const build_driven = strategy(10ull * 1024 * 1024,
+                                     /*is_build_side=*/true,
+                                     true,
+                                     /*num_gpus=*/4,
+                                     duckdb::JoinType::RIGHT);
+  REQUIRE(build_driven.num_partitions == 1);
+  REQUIRE_FALSE(build_driven.broadcast);
+  REQUIRE_FALSE(build_driven.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - MARK single-GPU clamps to one partition",
+          "[hash_join][build_probe][unit]")
+{
+  // Small foldable MARK build: clamped to a single partition, still BUILD_PROBE by size.
+  auto const small = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::MARK);
+  REQUIRE(small.num_partitions == 1);
+  REQUIRE_FALSE(small.broadcast);
+  REQUIRE(small.build_probe);
+
+  // A large MARK build is still clamped to one partition, but is too big for the cap -> STANDARD.
+  auto const large = strategy(8 * k100MB,
+                              true,
+                              true,
+                              /*num_gpus=*/1,
+                              duckdb::JoinType::MARK,
+                              HASH_JOIN_MODE::STANDARD,
+                              /*hash_partition_bytes=*/k100MB);
+  REQUIRE(large.num_partitions == 1);
+  REQUIRE_FALSE(large.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - MARK multi-GPU forces broadcast",
+          "[hash_join][build_probe][unit][broadcast]")
+{
+  // MARK cannot be hash-partitioned across batches, so multi-GPU forces broadcast when it fits.
+  auto const s = strategy(k100MB, true, true, /*num_gpus=*/4, duckdb::JoinType::MARK);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE(s.broadcast);
+  REQUIRE(s.build_probe);
+
+  // A MARK build too large for the (full-size) broadcast cap cannot broadcast and falls back to the
+  // natural hash-partitioned count in STANDARD mode.
+  auto const big = strategy(6 * k100MB,
+                            true,
+                            true,
+                            /*num_gpus=*/4,
+                            duckdb::JoinType::MARK,
+                            HASH_JOIN_MODE::STANDARD,
+                            /*hash_partition_bytes=*/k100MB);
+  REQUIRE(big.num_partitions == 6);
+  REQUIRE_FALSE(big.broadcast);
+  REQUIRE_FALSE(big.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - mixed / full-outer / unfoldable stay STANDARD",
+          "[hash_join][build_probe][unit]")
+{
+  // Mixed join (equality + inequality) never uses BUILD_PROBE.
+  auto const mixed = strategy(
+    k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN);
+  REQUIRE_FALSE(mixed.build_probe);
+
+  // Full outer over-emits unmatched build rows on the streamed path -> excluded.
+  auto const outer = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::OUTER);
+  REQUIRE_FALSE(outer.build_probe);
+
+  // Build side that cannot fold to a single batch -> excluded.
+  auto const unfoldable =
+    strategy(k100MB, true, /*foldable=*/false, /*num_gpus=*/1, duckdb::JoinType::INNER);
+  REQUIRE_FALSE(unfoldable.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - num_gpus < 1 is a precondition violation",
+          "[hash_join][build_probe][unit]")
+{
+  REQUIRE_THROWS_AS(strategy(k100MB, true, true, /*num_gpus=*/0, duckdb::JoinType::INNER),
                     std::invalid_argument);
 }
 
@@ -335,79 +419,4 @@ TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[
     },
     /*probe_finished=*/true);
   REQUIRE(d == std::vector<std::size_t>{1});
-}
-
-//===----------------------------------------------------------------------===//
-// make_broadcast_partition_decision — the pure, two-phase broadcast decision that drives
-// sirius_physical_partition::get_next_task_input_data.
-//===----------------------------------------------------------------------===//
-
-TEST_CASE("make_broadcast_partition_decision - small build on multi-GPU is a broadcast candidate",
-          "[build_probe][broadcast]")
-{
-  // build side, 4 GPUs, 1 KiB build < 32 MiB threshold -> candidate, propose one partition per GPU.
-  auto const d = make_broadcast_partition_decision(/*is_build_side=*/true,
-                                                   /*num_gpus=*/4,
-                                                   /*total_bytes=*/1024,
-                                                   /*small_table_bytes=*/32u * 1024 * 1024,
-                                                   /*natural_num_partitions=*/1);
-  REQUIRE(d.candidate);
-  REQUIRE(d.proposed_parts == 4);
-  REQUIRE(d.natural_parts == 1);
-}
-
-TEST_CASE("make_broadcast_partition_decision - non-candidates keep the natural partition count",
-          "[build_probe][broadcast]")
-{
-  uint64_t const small = 32u * 1024 * 1024;
-
-  SECTION("probe side never drives broadcast")
-  {
-    auto const d = make_broadcast_partition_decision(/*is_build_side=*/false, 4, 1024, small, 3);
-    REQUIRE_FALSE(d.candidate);
-    REQUIRE(d.proposed_parts == 3);
-  }
-  SECTION("single GPU is never a broadcast candidate")
-  {
-    auto const d = make_broadcast_partition_decision(/*is_build_side=*/true, 1, 1024, small, 1);
-    REQUIRE_FALSE(d.candidate);
-    REQUIRE(d.proposed_parts == 1);
-  }
-  SECTION("a build at or above the threshold is not small enough")
-  {
-    // Strict less-than: total == small_table_bytes is NOT a candidate.
-    auto const d = make_broadcast_partition_decision(/*is_build_side=*/true, 4, small, small, 2);
-    REQUIRE_FALSE(d.candidate);
-    REQUIRE(d.proposed_parts == 2);
-  }
-}
-
-TEST_CASE("make_broadcast_partition_decision - broadcast is finalized against join eligibility",
-          "[build_probe][broadcast]")
-{
-  auto const cand =
-    make_broadcast_partition_decision(/*is_build_side=*/true, 4, 1024, 32u * 1024 * 1024, 1);
-  REQUIRE(cand.candidate);
-
-  SECTION("candidate + join accepted BUILD_PROBE -> broadcast across num_gpus")
-  {
-    REQUIRE(cand.broadcast(/*is_build_probe=*/true));
-    REQUIRE(cand.num_partitions(/*is_build_probe=*/true, /*num_gpus=*/4) == 4);
-  }
-  SECTION("candidate + join rejected BUILD_PROBE (right/mixed) -> fall back to natural count")
-  {
-    REQUIRE_FALSE(cand.broadcast(/*is_build_probe=*/false));
-    REQUIRE(cand.num_partitions(/*is_build_probe=*/false, /*num_gpus=*/4) == 1);
-  }
-
-  SECTION("non-candidate never broadcasts even when BUILD_PROBE is accepted")
-  {
-    auto const non_cand = make_broadcast_partition_decision(/*is_build_side=*/true,
-                                                            4,
-                                                            64u * 1024 * 1024,
-                                                            /*small_table_bytes=*/32u * 1024 * 1024,
-                                                            /*natural_num_partitions=*/2);
-    REQUIRE_FALSE(non_cand.broadcast(/*is_build_probe=*/true));
-    REQUIRE(non_cand.num_partitions(/*is_build_probe=*/true, /*num_gpus=*/4) == 2);
-  }
 }

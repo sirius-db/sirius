@@ -43,45 +43,6 @@ inline std::string partition_type_to_string(PartitionType type)
   return "UNKNOWN";
 }
 
-/// The broadcast-partitioning decision for a build/probe sibling pair, split into the two phases
-/// the runtime needs. Pure/unit-testable counterpart of the decision block in
-/// sirius_physical_partition::get_next_task_input_data.
-///
-/// A broadcast join replicates a *small* build table to every GPU (one hash table per GPU) instead
-/// of routing the whole build to a single GPU. The decision is two-phase because the partition
-/// count fed to update_join_exec_mode() must be chosen *before* the join reports whether it accepts
-/// BUILD_PROBE, and the final broadcast flag depends on that acceptance:
-///   1. `candidate` / `proposed_parts` are known up front (small build, multi-GPU, build side).
-///   2. `broadcast()` / `num_partitions()` finalize once `is_build_probe` is known.
-struct broadcast_partition_decision {
-  bool candidate;      ///< small build on multi-GPU, replicate-worthy before join eligibility
-  int proposed_parts;  ///< partition count to propose to update_join_exec_mode() (num_gpus if
-                       ///< candidate, else the natural count)
-  int natural_parts;   ///< the non-broadcast partition count (used when broadcast is not taken)
-
-  /// Broadcast is taken only when the candidate condition holds AND the join accepted BUILD_PROBE
-  /// for `proposed_parts` (right-family / mixed joins reject it, falling back to the natural
-  /// count).
-  [[nodiscard]] bool broadcast(bool is_build_probe) const { return candidate && is_build_probe; }
-
-  /// Final partition count: num_gpus when broadcasting, otherwise the natural count.
-  [[nodiscard]] int num_partitions(bool is_build_probe, std::size_t num_gpus) const
-  {
-    return broadcast(is_build_probe) ? static_cast<int>(num_gpus) : natural_parts;
-  }
-};
-
-/// Compute the up-front (phase 1) broadcast decision. `is_build_side` is whether the sizing
-/// partition drives the build side; only the build side can drive broadcast. A build smaller than
-/// `small_table_bytes` on more than one GPU is a broadcast candidate, in which case we propose one
-/// partition per GPU; otherwise we keep `natural_num_partitions`.
-[[nodiscard]] broadcast_partition_decision make_broadcast_partition_decision(
-  bool is_build_side,
-  std::size_t num_gpus,
-  uint64_t total_bytes,
-  uint64_t small_table_bytes,
-  int natural_num_partitions);
-
 class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
@@ -89,12 +50,10 @@ class sirius_physical_partition : public sirius_physical_operator {
   //! `key_source` is the downstream consumer whose keys determine partitioning (HJ join
   //! conditions, HGB/MERGE_GROUP_BY grouping columns). Captured at construction, never
   //! stored — the tree parent is `_parent_op`, stamped later by `set_parent_ops`.
-  explicit sirius_physical_partition(
-    duckdb::vector<sirius::logical_type> types,
-    std::size_t estimated_cardinality,
-    sirius_physical_operator* key_source,
-    bool is_build                 = false,
-    uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES);
+  explicit sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
+                                     std::size_t estimated_cardinality,
+                                     sirius_physical_operator* key_source,
+                                     bool is_build = false);
 
   std::string get_name() const override;
 
@@ -135,15 +94,18 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void set_num_partitions(int num_partitions);
 
-  /// Set a floor for num_partitions. The partition-consumer downstream (hash
-  /// join, merge_group_by) pins each partition to partition_idx % num_gpus,
-  /// so we need at least num_gpus partitions for all GPUs to see work on big
-  /// inputs. Small inputs fall below `small_table_bytes` and stay at one
-  /// partition (runs on a single GPU).
-  void set_min_num_partitions(int min_num_partitions, uint64_t small_table_bytes)
+  /// The downstream consumer that decides this partition's count / broadcast strategy (the
+  /// HASH_JOIN / NESTED_LOOP_JOIN this partition feeds, or the MERGE_GROUP_BY above a group-by
+  /// partition). Distinct from `key_source` (which only supplies partition keys) and from the batch
+  /// receiver in `next_port_after_sink` (a CONCAT, for joins). Set at plan time.
+  void set_downstream_consumer_op(sirius_physical_operator* consumer)
   {
-    _min_num_partitions = min_num_partitions;
-    _small_table_bytes  = small_table_bytes;
+    _downstream_consumer_op = consumer;
+  }
+
+  [[nodiscard]] sirius_physical_operator* get_downstream_consumer_op() const
+  {
+    return _downstream_consumer_op;
   }
 
   /// The sorted, deduped device ids of the GPUs the query runs on — identical to the list
@@ -160,22 +122,19 @@ class sirius_physical_partition : public sirius_physical_operator {
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Looks at the amount of data waiting on the input port and determines the number of partitions
-  /// to create. Returns a pair of (num_partitions, total_bytes).
-  std::pair<int, uint64_t> determine_num_partitions();
-
-  /// Grow the downstream hash-join input repository for this partition's side to
-  /// `num_partitions`. No-op when this partition does not feed a hash join.
-  void resize_join_input_repo(int num_partitions);
+  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
+  /// consumer's get_partition_strategy, which turns it into a partition count.
+  uint64_t compute_total_bytes();
 
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
   /// safe fallback that keeps the batch on some valid slot).
   [[nodiscard]] std::size_t slot_for_device(int device_id) const;
   sirius_physical_operator* _sibling_partition_op = nullptr;
-  sirius_physical_operator* _hash_join_op =
-    nullptr;  // hash join operator that this partition operator feeds into (optional: for
-              // hash_joins only)
+  //! The downstream consumer that decides this partition's count / broadcast (see
+  //! set_downstream_consumer_op). Always a partition-sizing consumer (HASH_JOIN / NESTED_LOOP_JOIN
+  //! / MERGE_GROUP_BY).
+  sirius_physical_operator* _downstream_consumer_op = nullptr;
   std::vector<int> _partition_keys;
   /// One entry per partition key. type_id::EMPTY means "hash as-is"; any other id means
   /// cast the key column to this type before hashing.  Used to align hash values when the
@@ -186,9 +145,6 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool _drives_partition_count{false};
   bool _has_sibling_partition_op;
   PartitionType _partition_type;
-  uint64_t s_partition_size;
-  int _min_num_partitions{1};
-  uint64_t _small_table_bytes{0};
   /// Sorted, deduped active GPU device ids (see set_active_gpu_ids). Empty when unset / single-GPU.
   std::vector<int> _active_gpu_ids;
   /// Broadcast mode: the build table is small enough to replicate to every GPU instead of
