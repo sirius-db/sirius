@@ -26,9 +26,38 @@
 - **Suspected area:** GPU `concat` scalar function.
 - **Test:** `test_gpu_execution_filter_nulls.cpp` → "concat NULL-handling [known divergence]".
 
-## Confirmed correct on GPU (no divergence)
-`IS [NOT] NULL`, three-valued comparison filtering (`= <> < <= > >=`), `IS [NOT] DISTINCT FROM`,
-three-valued `AND` / `NOT`, `BETWEEN`, `IN`, `NOT IN` (with NULL probe), `COALESCE` / `NULLIF` /
-`CASE`, and NULL propagation through arithmetic, `CAST`, `length`, `substring`, and date functions.
+### 3. Aggregates over a wholly-NULL column read sentinel values
+- **Symptom:** A column that is entirely NULL loses its validity mask in the GPU native scan and
+  is read as sentinel `INT_MAX`, so aggregates see fake data. `SUM(allnull)` returns `8*INT_MAX`
+  (`17179869176`) and `COUNT(allnull)` returns the row count (`8`) instead of NULL / 0.
+- **Repro:** `SELECT SUM(allnull), COUNT(allnull) FROM agg_n` (column `allnull` is all NULL).
+- **Scope:** Only *wholly-NULL columns*. All-NULL *groups* of a normally-nullable column are
+  correct (the `GROUP BY g` case with all-NULL group `g=3` passes).
+- **Suspected area:** GPU DuckDB-native scan — validity mask dropped for all-null column segments.
+- **Test:** `test_gpu_execution_aggregate_nulls.cpp` → "aggregates over a wholly-NULL column [known divergence]".
 
-<!-- Append commit 3 (aggregate nulls) and commit 4 (join nulls) findings below as they surface. -->
+### 4. Ungrouped `AVG` divides by row count, not non-null count
+- **Symptom:** Ungrouped `AVG` over a column with NULLs uses the total row count as the
+  denominator. `AVG(v)` returns `335/8 = 41.875` instead of `335/5 = 67`. `SUM` and `COUNT` are
+  individually correct; **grouped** `AVG` is correct — bug is isolated to the ungrouped aggregate.
+- **Repro:** `SELECT AVG(v) FROM agg_n`.
+- **Suspected area:** ungrouped aggregate operator (`sirius_physical_ungrouped_aggregate`).
+- **Test:** `test_gpu_execution_aggregate_nulls.cpp` → "ungrouped AVG denominator counts NULL rows [known divergence]".
+
+### 5. `COUNT(DISTINCT)` runtime-falls-back to CPU
+- **Symptom:** `COUNT(DISTINCT ...)` errors on the GPU and falls back to DuckDB CPU at runtime
+  (`runtime_fallbacks` increments) — it does not execute on-device. Result is correct via fallback.
+- **Repro:** `SELECT COUNT(DISTINCT v) FROM agg_n`.
+- **Suspected area:** GPU count-distinct aggregate path (possibly NULL-input specific).
+- **Test:** `test_gpu_execution_aggregate_nulls.cpp` → "COUNT(DISTINCT) runtime-falls-back to CPU [known divergence]".
+
+## Confirmed correct on GPU (no divergence)
+- **Filters/expressions:** `IS [NOT] NULL`, three-valued comparison filtering (`= <> < <= > >=`),
+  `IS [NOT] DISTINCT FROM`, three-valued `AND` / `NOT`, `BETWEEN`, `IN`, `NOT IN` (with NULL probe),
+  `COALESCE` / `NULLIF` / `CASE`, and NULL propagation through arithmetic, `CAST`, `length`,
+  `substring`, and date functions.
+- **Aggregates:** `COUNT(*)` and `COUNT(col)` (partially-null column), ungrouped `SUM`/`MIN`/`MAX`
+  skipping NULLs, `GROUP BY` on a NULL key (groups NULLs together), all-NULL *groups* of a
+  nullable column (→ NULL), and grouped `SUM`/`AVG`.
+
+<!-- Append commit 4 (join nulls) findings below as they surface. -->
