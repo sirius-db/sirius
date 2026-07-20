@@ -39,8 +39,16 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
   // `downstream_join` (the HJ/NLJ this CONCAT feeds — not the tree parent) picks
   // `_concat_all` and is stashed for the legacy converter's destination lookup.
   _downstream_join = downstream_join;
+  if (!downstream_join) {
+    throw std::runtime_error("sirius_physical_concat: downstream_join is null");
+  }
   if (downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(downstream_join);
+    if (!hash_join) {
+      throw std::runtime_error(
+        "sirius_physical_concat: downstream_join type is HASH_JOIN but "
+        "dynamic_cast<sirius_physical_hash_join*> failed");
+    }
     if (hash_join->join_type == duckdb::JoinType::LEFT ||
         hash_join->join_type == duckdb::JoinType::ANTI ||
         hash_join->join_type == duckdb::JoinType::SEMI) {
@@ -86,7 +94,13 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
     }
     return std::nullopt;
   } else if (_concat_all) {
-    // if we need to concat all then we need to wait for the pipeline to be finished
+    // if we need to concat all then we need to wait for the pipeline to be finished.
+    // src_pipeline can be null here (not yet wired) — the pipeline_finished
+    // check above guards it in that branch, but this branch deref'd it
+    // unconditionally (null deref crash). Throw a clear error instead.
+    if (!port_ptr->src_pipeline) {
+      throw std::runtime_error("sirius_physical_concat: null src_pipeline in _concat_all WAITING hint");
+    }
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
                               &(port_ptr->src_pipeline->get_operators()[0].get())};
   }

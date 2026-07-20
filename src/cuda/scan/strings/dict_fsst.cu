@@ -556,7 +556,10 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
   // Phase 2: validate, compute per-segment region offsets + cumulative
   // base_off into the global byte/decoded_offsets arrays.
   std::vector<dict_fsst_pre_desc> pre(num_segs);
-  uint32_t total_dict_entries = 0;  // sum of (dict_count + 1) for valid segs
+  // Use size_t (not uint32_t) for the cross-segment accumulator: with many
+  // dictionary segments, the uint32_t sum of (dict_count + 1) wraps past
+  // UINT32_MAX, producing undersized device/host buffers and OOB writes.
+  size_t total_dict_entries = 0;
   for (uint32_t i = 0; i < num_segs; ++i) {
     auto const& seg = run.segments[i];
     auto& p         = pre[i];
@@ -582,7 +585,7 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
     p.dict_count           = hdr.dict_count;
     p.mode                 = hdr.mode;
     p.string_lengths_width = hdr.string_lengths_width;
-    p.base_off             = total_dict_entries;
+    p.base_off             = static_cast<uint32_t>(total_dict_entries);
     p.valid                = 1;
     total_dict_entries += hdr.dict_count + 1u;
   }

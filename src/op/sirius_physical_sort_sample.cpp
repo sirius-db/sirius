@@ -262,8 +262,18 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       size_t total_batch_count = valid_batches.size();
       size_t bytes_for_sizing  = total_sample_bytes;
       if (!complete_input) {
-        total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
-        bytes_for_sizing  = avg_batch_bytes * total_batch_count;
+        // Overflow-safe ceil-div: (estimated_cardinality + avg_rows_per_batch - 1)
+        // can overflow size_t when estimated_cardinality is near SIZE_MAX.
+        // Use the identity (a + b - 1) / b == 1 + (a - 1) / b (safe when a > 0).
+        total_batch_count = avg_rows_per_batch > 0 && estimated_cardinality > 0
+                              ? 1 + (estimated_cardinality - 1) / avg_rows_per_batch
+                              : 1;
+        // Overflow-safe bytes_for_sizing: avg_batch_bytes * total_batch_count
+        // can overflow. Cap at SIZE_MAX so the partition count derivation below
+        // (which only needs bytes_for_sizing > max_partition_bytes) stays sane.
+        bytes_for_sizing  = total_batch_count > SIZE_MAX / avg_batch_bytes
+                              ? SIZE_MAX
+                              : avg_batch_bytes * total_batch_count;
       }
       size_t available_memory    = space->get_available_memory(stream);
       size_t max_partition_bytes = _max_partition_bytes_override > 0

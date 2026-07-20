@@ -41,6 +41,28 @@ cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 #     builds end-to-end on AMD today.
 option(ENABLE_ROCM "Build Sirius against the AMD ROCm/HIP backend (hipDF + hipMM) instead of NVIDIA CUDA" OFF)
 
+# --- Build speed optimizations ------------------------------------------------
+# ccache: auto-detect and wire as the CXX/HIP compiler launcher. Dramatically
+# speeds up incremental rebuilds (2-3x typical). Install with `apt install
+# ccache`. No-op if ccache is not found.
+option(SIRIUS_ENABLE_CCACHE "Use ccache for faster incremental rebuilds" ON)
+if(SIRIUS_ENABLE_CCACHE)
+  find_program(CCACHE_PROGRAM ccache)
+  if(CCACHE_PROGRAM)
+    message(STATUS "Sirius: ccache found at ${CCACHE_PROGRAM}, enabling as compiler launcher")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_HIP_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+  else()
+    message(STATUS "Sirius: ccache not found (install with 'apt install ccache' for faster rebuilds)")
+  endif()
+endif()
+
+# Unity build: concatenates all source files in a target into a single TU before
+# compiling. Reduces redundant header parsing — can cut a cold build by 30-50%.
+# Off by default (can cause subtle ODR issues with anonymous-namespace code);
+# enable via -DSIRIUS_UNITY_BUILD=ON for iterative development.
+option(SIRIUS_UNITY_BUILD "Enable unity builds for faster compilation (may reveal ODR issues)" OFF)
+
 # When ENABLE_ROCM, fetch the cuda2rocm compatibility shims from GitHub
 # instead of vendoring them. This makes cuda2rocm a proper dependency and
 # prevents the two copies from drifting. The shims provide cuda_runtime.h,
@@ -660,6 +682,14 @@ foreach(_target sirius_extension sirius_loadable_extension)
                  CUDA_STANDARD_REQUIRED ON
                  CUDA_SEPARABLE_COMPILATION ON
                  CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
+
+  # Unity build: when SIRIUS_UNITY_BUILD=ON, concatenate all sources in this
+  # target into one TU before compiling. Cuts redundant header parsing on cold
+  # builds. Applied per-target so it can be toggled independently for the
+  # extension vs tests.
+  if(SIRIUS_UNITY_BUILD)
+    set_target_properties(${_target} PROPERTIES UNITY_BUILD ON)
   endif()
 
   # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own

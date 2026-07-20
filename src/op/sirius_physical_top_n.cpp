@@ -254,13 +254,21 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   }
 
   // R1 — read-only accessors held in a vector for the duration of cudf::concatenate
-  // so the underlying table_views remain valid.
+  // so the underlying table_views remain valid. The old code declared ro_views
+  // and reserved capacity but never populated it — the loop only pushed to
+  // concat_views. The table_views stayed valid only because input_batches (a
+  // const&) kept the owning batches alive; if ownership ever changes (e.g.
+  // batches released before concatenate completes), the views dangle.
+  // Populate ro_views alongside concat_views so the read-only accessors pin
+  // the data for concatenate's lifetime.
   std::vector<cucascade::read_only_data_batch> ro_views;
   ro_views.reserve(input_batches.size());
   std::vector<cudf::table_view> concat_views;
   for (auto const& batch : input_batches) {
+    auto ro = batch.to_read_only();
     concat_views.push_back(
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+      ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    ro_views.push_back(std::move(ro));
   }
 
   if (concat_views.empty()) {

@@ -969,11 +969,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       // plan = create_plan(op.Cast<duckdb::LogicalCreateSecret>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_EXPLAIN:
-      // Sirius has no GPU EXPLAIN operator. Leave plan null so the no-plan guard
-      // below fires and the transparent-execution layer falls back to DuckDB's
-      // native EXPLAIN (EXPLAIN is metadata-only, no GPU work to accelerate).
-      // plan = create_plan(op.Cast<duckdb::LogicalExplain>());
-      break;
+      // Sirius has no GPU EXPLAIN operator. EXPLAIN is metadata-only (no GPU
+      // work to accelerate), so return nullptr here — BEFORE the no-plan guard
+      // below throws InternalException — and let DuckDB's transparent-execution
+      // layer fall back to its native EXPLAIN, which prints the logical +
+      // physical plan as text. The old code left `plan` null and relied on the
+      // guard to "fire," but the guard throws InternalException, not a fallback.
+      return nullptr;
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
       throw duckdb::NotImplementedException("Distinct not supported");
       // plan = create_plan(op.Cast<duckdb::LogicalDistinct>());

@@ -17,6 +17,7 @@
 #include "op/sirius_physical_partition.hpp"
 
 #include "config.hpp"
+#include "cuda/gpu_config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -263,27 +264,17 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
       total_bytes / s_partition_size + static_cast<uint64_t>(total_bytes % s_partition_size != 0)));
   }
 
-  // VRAM-aware partition cap: if the total data exceeds 40% of available VRAM,
-  // increase partition count so each partition fits in ~30% of VRAM. This
-  // prevents OOM on small-VRAM GPUs (e.g. 8GB consumer cards running TPC-H
-  // Q21 with a 3-table join). On large-VRAM GPUs (MI300), the data typically
-  // fits in 40% of VRAM, so this doesn't trigger and partitions stay at 1.
-  //
-  // Note: budgets are derived from FREE VRAM, not total VRAM. A GPU whose VRAM
-  // is already partially consumed (other processes, RMM pool, live batches)
-  // must size partitions against what is actually available, otherwise the
-  // "fits in 30% of VRAM" assumption underestimates pressure and causes OOM.
+  // VRAM-aware partition cap: delegate to the gpu_config singleton, which
+  // queries free VRAM (cudaMemGetInfo) and derives a partition count so each
+  // partition fits in ~30% of available VRAM. On large-VRAM GPUs (MI300), the
+  // data typically fits in 1/3 of VRAM, so this returns 1 and partitions stay
+  // at the s_partition_size-derived count. On small-VRAM GPUs (8GB consumer
+  // cards running TPC-H Q21 with a 3-table join), it increases the partition
+  // count to prevent OOM. The singleton caches the hardware query and applies
+  // the SIRIUS_ENABLE_SPILLING / SIRIUS_HASH_JOIN_MAX_PARTITIONS env overrides.
   {
-    size_t free_vram = 0, total_vram = 0;
-    if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_vram > 0) {
-      size_t const vram_40pct = free_vram * 2 / 5;  // 40% of free VRAM
-      if (total_bytes > vram_40pct) {
-        size_t const per_partition_budget = std::max(free_vram * 3 / 10, size_t{128 * 1024 * 1024});
-        int vram_partitions = static_cast<int>(
-          (total_bytes + per_partition_budget - 1) / per_partition_budget);
-        num_partitions = std::max(num_partitions, vram_partitions);
-      }
-    }
+    int vram_partitions = sirius::cuda::gpu_config::instance().hash_join_partitions(total_bytes);
+    num_partitions = std::max(num_partitions, vram_partitions);
   }
 
   // Cap at 32 partitions (safety). This applies to ALL partition-count paths

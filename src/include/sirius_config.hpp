@@ -123,6 +123,15 @@ struct operator_params {
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
 
+  /// Per-query GPU memory budget (bytes). 0 = unlimited (no per-query cap).
+  /// When non-zero, the GPU pipeline executor checks the cumulative GPU memory
+  /// consumed by a query's tasks against this budget; exceeding it triggers OOM
+  /// reschedule (the same path as a real OOM) instead of letting one query
+  /// starve concurrent queries or exhaust the RMM pool. Set via
+  /// `SET sirius.per_query_memory_budget = '4GB'`. Useful on multi-tenant or
+  /// shared-GPU deployments; leave 0 for single-query TPC-H.
+  uint64_t per_query_memory_budget = 0;
+
   /// Initialize tuning parameters adaptively based on the current GPU's VRAM.
   /// Called once at engine startup. On ROCm, queries hipMemGetInfo; on NVIDIA,
   /// queries cudaMemGetInfo. All values can still be overridden by the .yaml

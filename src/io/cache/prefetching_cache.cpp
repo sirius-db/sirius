@@ -572,9 +572,14 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
                                  cudaMemcpyHostToDevice,
                                  stream);
       if (err != cudaSuccess) {
-        fprintf(stderr,
-                "prefetching_cache: cudaMemcpyAsync failed: %s\n",
-                cudaGetErrorString(err));
+        // Propagate the error: the old code only fprintf'd and continued,
+        // returning a successful future reporting `size` bytes. The caller
+        // then read stale/uninitialized device memory (silent data
+        // corruption). Throw so the future resolves with an exception and
+        // the caller's error path fires.
+        throw std::runtime_error(
+          std::string("prefetching_cache: cudaMemcpyAsync (cached chunk H2D) failed: ") +
+          cudaGetErrorString(err));
       }
     }
 
@@ -604,21 +609,27 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
         bool ok = !res.has_exception();
 
         rmm::cuda_set_device_raii guard(device_id);
-        std::unique_ptr<cucascade::cuda::cuda_event> event;
-        if (ok) {
-          event = std::make_unique<cucascade::cuda::cuda_event>();
-          event->record(stream);
-        }
+        // ALWAYS record + sync the stream before releasing read pins, even on
+        // the failure path. The case-(1) cudaMemcpyAsync copies (cached chunk
+        // H2D) were issued on `stream` before the IO future was awaited; if
+        // host_to_device_read_async_io failed, those copies may still be
+        // in-flight. The old code only created/synced the event when `ok`,
+        // so on failure it called release_read() on every read_pinned chunk
+        // while the in-flight memcpy still read from their host buffers —
+        // releasing the read pin makes the chunk evictable, and the evictor
+        // can free the host buffer out from under the in-flight copy
+        // (use-after-free). Sync unconditionally so the copies complete (or
+        // fail) before any pin is released.
+        std::unique_ptr<cucascade::cuda::cuda_event> event = std::make_unique<cucascade::cuda::cuda_event>();
+        event->record(stream);
 
         _io_cb_dispatcher.enqueue([read_pinned = std::move(read_pinned),
                                    loading     = std::move(loading),
                                    event       = std::move(event),
                                    ok          = ok]() mutable {
-          if (event) {
-            SIRIUS_TRY_AND_LOG_EXCEPTION(
-              event->synchronize(),
-              "prefetching_cache: failed to synchronize CUDA stream after host-to-device copies");
-          }
+          SIRIUS_TRY_AND_LOG_EXCEPTION(
+            event->synchronize(),
+            "prefetching_cache: failed to synchronize CUDA stream after host-to-device copies");
 
           std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
           auto transition = ok ? &entry_state::mark_cached : &entry_state::mark_load_failed;

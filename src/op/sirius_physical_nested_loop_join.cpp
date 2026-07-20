@@ -280,7 +280,16 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
     for (size_t i = 0; i < default_port->repo->num_partitions(); i++) {
       left_batch_ids.push_back(default_port->repo->get_batch_ids(i));
       right_batch_ids.push_back(build_port->repo->get_batch_ids(i));
-      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+      // Overflow-safe accumulation: left * right can overflow size_t when both
+      // sides have many batches. The wrapped total would make
+      // current_partition_index >= num_batches_to_process true prematurely,
+      // silently dropping join output rows. Cap at SIZE_MAX.
+      size_t left_n  = left_batch_ids[i].size();
+      size_t right_n = right_batch_ids[i].size();
+      size_t product = left_n > SIZE_MAX / right_n ? SIZE_MAX : left_n * right_n;
+      num_batches_to_process = num_batches_to_process > SIZE_MAX - product
+                                 ? SIZE_MAX
+                                 : num_batches_to_process + product;
     }
   }
 
