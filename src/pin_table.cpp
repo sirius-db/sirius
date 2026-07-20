@@ -292,6 +292,7 @@ host_pin_result materialize_pin_to_host_with_compression(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx,
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression)
 {
   auto& registry = converter_registry::get();
@@ -302,14 +303,15 @@ host_pin_result materialize_pin_to_host_with_compression(
     ingestible,
     gpu_spaces,
     io_ctx,
-    {},
+    pinned_column_types,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       auto* target_host_space    = host_space_by_gpu.at(src_space->get_device_id());
       bool compressed_this_chunk = false;
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
+      if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
 
       if (compression.enabled && !compression_failed && tbl && tbl->num_columns() > 0 &&
           !compression.plan_dsl.empty()) {

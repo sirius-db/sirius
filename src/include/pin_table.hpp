@@ -153,6 +153,12 @@ struct host_pin_result {
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// Per-chunk zone-map capture (taken on the GPU table before host conversion /
+  /// compression); chunk_stats[c][i] = stats of batch column i of chunk c (null =
+  /// none). Parallel to @c chunks when capture ran; empty when capture was skipped
+  /// (no pinned column types). Fed with the pin-time column types into
+  /// @c sirius_scan_manager::insert_pinned_entry_host to drive zone-map pruning.
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
 };
 
 /// Optional compression settings for @ref materialize_pin_to_host_with_compression
@@ -199,11 +205,18 @@ struct device_pin_result {
 
 /// Drive @p ingestible to completion, streaming each emitted batch to pinned host memory
 /// (peak GPU residency ~one batch), optionally compressing each batch with Simpatico first.
+///
+/// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
+///                            (column_ids) order — drives the per-chunk zone-map capture,
+///                            which runs on the decode GPU before host conversion /
+///                            compression (so compressed and uncompressed pins alike get
+///                            zone maps). Empty skips capture (statless pin).
 host_pin_result materialize_pin_to_host_with_compression(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx,
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression);
 
 /// Drive @p ingestible to completion like @ref materialize_all_batches, optionally

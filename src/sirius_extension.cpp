@@ -1264,8 +1264,12 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   if (data.args.tier == "host") {
-    auto host_result = sirius::materialize_pin_to_host_with_compression(
-      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx(), pin_comp);
+    auto host_result = sirius::materialize_pin_to_host_with_compression(*ingestible,
+                                                                        gpu_spaces_mut,
+                                                                        host_space_by_gpu,
+                                                                        *scan_mgr.io_ctx(),
+                                                                        pinned_column_types,
+                                                                        pin_comp);
 
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
@@ -1275,7 +1279,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     scan_mgr.insert_pinned_entry_host(data.args.name,
                                       std::move(cache_info),
                                       std::move(host_result.chunks),
-                                      *representative_host_space);
+                                      *representative_host_space,
+                                      std::move(pinned_column_types),
+                                      std::move(host_result.chunk_stats));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
