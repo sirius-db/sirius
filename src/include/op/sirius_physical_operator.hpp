@@ -403,9 +403,8 @@ class sirius_physical_operator {
   //! label, NOT a globally-unique id. Use `operator_uuid` when a stable entity id is required.
   size_t operator_id;
 
-  //! A globally-unique, lifetime-stable id for this operator, used as its quent entity id so
-  //! declaration and per-operator `Computing` telemetry events agree. Mirrors the port
-  //! `source_port_uuid` pattern; unlike `operator_id` it does not reset per query.
+  //! A globally-unique, lifetime-stable id for this operator, used as the operator's quent
+  //! entity id; unlike `operator_id` it does not reset per query.
   uuid::UUID operator_uuid{uuid::now_v7()};
 
   //! Lock for concurrent access to operator state
@@ -428,7 +427,7 @@ class sirius_physical_operator {
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }
 
-  //! Get this operator's stable, globally-unique UUID (its quent entity id).
+  //! Get this operator's stable, globally-unique UUID.
   const uuid::UUID& get_operator_uuid() const { return operator_uuid; }
 
   //! Bundle this operator's telemetry attribution (context + producing pipeline)

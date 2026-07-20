@@ -16,7 +16,6 @@
 
 #pragma once
 
-// standard library
 #include <string>
 
 namespace sirius::ast {

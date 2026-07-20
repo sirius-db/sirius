@@ -16,17 +16,13 @@
 
 #include "expression/ast/to_string.hpp"
 
-// sirius
+#include "duckdb/common/types/value.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"
 #include "expression/value.hpp"
 
-// duckdb
-#include "duckdb/common/types/value.hpp"
-
-// standard library
 #include <memory>
 #include <string>
 #include <string_view>

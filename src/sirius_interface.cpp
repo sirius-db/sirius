@@ -28,6 +28,8 @@
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <optional>
 
 namespace sirius {
@@ -42,6 +44,26 @@ void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement
 sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
                                    std::optional<std::string> query_label)
   : client_context(client_context), query_label(std::move(query_label)) {};
+
+std::optional<std::string> sirius_interface::query_label_from_sql(const std::string& sql)
+{
+  constexpr size_t MAX_QUERY_LABEL_CHARS = 120;
+  std::string label;
+  label.reserve(std::min(sql.size(), MAX_QUERY_LABEL_CHARS + 3));
+  bool last_was_space = false;
+  for (const char c : sql) {
+    const bool is_space = std::isspace(static_cast<unsigned char>(c)) != 0;
+    if (is_space && (last_was_space || label.empty())) { continue; }
+    label.push_back(is_space ? ' ' : c);
+    last_was_space = is_space;
+    if (label.size() >= MAX_QUERY_LABEL_CHARS) {
+      label += "...";
+      break;
+    }
+  }
+  if (label.empty()) { return std::nullopt; }
+  return label;
+}
 
 void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
                                             const duckdb::string& query) const

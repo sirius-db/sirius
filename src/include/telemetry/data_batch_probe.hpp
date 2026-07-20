@@ -200,8 +200,11 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
    * data's current memory tier.
    *
    * @param ctx The telemetry context providing instrumentation and memory UUIDs.
-   * @param producer_pipeline_uuid UUID of the pipeline that produced this batch.
-   * @param producer_operator_uuid Stable UUID of the physical operator that produced this batch.
+   * @param producer_pipeline_uuid UUID of the pipeline whose execution emitted this batch.
+   * @param producer_operator_uuid Stable UUID of the physical operator within that pipeline
+   *        whose execute() actually produced the batch. Both attribute the same event at
+   *        different granularities: the pipeline is the schedulable unit (a node in the root
+   *        plan's DAG), the operator is the step inside it (a node in the derived plan's DAG).
    */
   quent_data_batch_probe(const telemetry_context& ctx,
                          const uint64_t batch_id,
