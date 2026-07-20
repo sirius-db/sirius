@@ -45,6 +45,16 @@ The central invariant is:
 > A dynamic filter must accept every probe row that could match P. False positives are allowed;
 > false negatives are not. P's hash probe remains authoritative.
 
+Stated generally, so later producer kinds slot in without re-litigating the architecture: a visible
+filter must accept, at every observation instant, every row its authoritative producer could keep.
+A producer can satisfy that in two ways. **Complete-at-once** producers — a finished hash-join
+build, a completed aggregation's distinct set, post-sort min/max — publish once because their input
+is complete. **Monotone-tightening** producers — a Top-N threshold — may publish repeatedly because
+every published snapshot stays valid forever. Only a filter that could loosen would need retraction
+or versioning, and no such producer is planned. This design implements one member of the first
+class — the hash-join build; the substrate (append-only channel, per-batch consumer snapshots,
+count-aware gate) already tolerates the second.
+
 The initial producer/key scope is:
 
 - P is INNER or left-SEMI;
@@ -105,6 +115,13 @@ The planner records eligible build keys and their endpoint-local probe coordinat
 Sirius-owned metadata. DuckDB may continue to supply existing scan targets, but the direct route and
 runtime publisher do not depend on optional DuckDB scan-pushdown metadata.
 
+That boundary is the ownership end-state: DuckDB's join-filter metadata is a planning-time
+discovery input for scan endpoints only, and every structure consumed at runtime is Sirius-owned.
+The DuckDB coupling that remains is exactly three things — the scan-target discovery walk, the
+<code>DynamicTableFilterSet*</code> channel route key, and the transparent-path
+metadata-preservation shim that keeps both alive across plan copies. They retire as one unit in the
+unified-routing follow-up; nothing in this design grows a new DuckDB dependency in the meantime.
+
 After P's build completes, it constructs and finalizes every planned device representation, then
 publishes the immutable filter or records a terminal no-op/failure. Consumer channel and gate state
 is endpoint-local; P's publication state is producer-local. Both are fresh for each query execution.
@@ -160,21 +177,38 @@ PR boundaries, tests, telemetry, thresholds, and rollback procedure belong to th
 
 - **Scan-reachable edge backstop:** consider only if measurements show that late scan publication
   leaves substantial selective work and the recovered benefit exceeds redundant application cost.
-- **Unified Sirius scan routing:** replace the DuckDB scan-target dependency only when the
-  independence and coverage justify a dedicated routing pass.
-- **Alternative endpoint placement:** introduce lineage or a different partitioning seam only when
-  measurements show material work or transfer savings.
+- **Unified Sirius scan routing:** replace the DuckDB scan-target dependency when route-class
+  telemetry shows admitted keys taking the direct route while a scan sits below them in the probe
+  subtree, or when preservation-shim bail-outs are observed in practice. When built, run discovery
+  before DuckDB's <code>ColumnBindingResolver</code> on the logical plan — in
+  <code>ColumnBinding</code> space, keyed by stable <code>LogicalGet</code> identity — rather than
+  tracing the post-fold positional tree. Retiring the dependency removes the
+  <code>DynamicTableFilterSet*</code> route key and the preservation shim with it.
+- **Alternative endpoint placement:** deeper placement in the probe subtree would let intervening
+  operators also skip doomed rows but requires tracing the key's coordinates through those
+  operators; post-partition placement requires a partition-preserving operator-data contract.
+  Introduce either only when measurements show material work or transfer savings.
 - **STANDARD/partitioned producers:** requires a complete global or correctly routed partition
   predicate before visibility.
-- **CTE, DELIM, and shared-DAG paths:** requires an explicit publication-dominance design.
-- **Recurring producers such as Sort/TopN:** owns generation, replacement, invalidation, and
-  retention as one feature.
+- **CTE, DELIM, and shared-DAG paths:** these create pipeline-level fan-out (one repository edge
+  per CTE/DELIM scan consumer, delim cycles broken heuristically), which is exactly where the
+  build-before-probe ordering guarantee is unproven. Supporting them requires an explicit
+  publication-dominance design — a prove-it-later fence, not an impossibility.
+- **Recurring producers (Top-N threshold):** deferred as an independent producer-axis feature, not
+  for architectural reasons. The substrate already tolerates growing filter sets, and a
+  monotonically tightening snapshot never becomes wrong. The missing pieces are publication cadence
+  and re-execution reset on the producer side, plus a consumer-side supersession rule so endpoints
+  apply only the tightest generation (today a superseded filter keeps running — per-filter keep
+  ratios are recorded once, and zone maps bypass per-filter gating). Post-sort min/max is a
+  one-shot producer of the existing shape and needs none of this.
 - **Wider keys, casts, and strings:** expand only with representation and correctness support.
 - **Late scan re-pruning or alternative apply kernels:** driven by measured I/O or application
   bottlenecks.
 
 Ordered activation is not planned: the direct endpoint is already ordered, and all other misses are
-safe pass-throughs.
+safe pass-throughs. A Top-N-style producer confirms the boundary — its consumers sit in its own
+input subtree, so producer and consumer are concurrent by construction and opportunistic
+consumption is the terminal mode there.
 
 ## Prior art
 

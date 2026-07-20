@@ -84,6 +84,8 @@ only in a later PR.
 - Empty/no-filter/policy-skip/intentional-target-unavailable paths pass through.
 - Invalid mapping or incomplete/wrong-device publication never filters rows.
 - The reservation covers a wide keep-nearly-all batch.
+- The direct endpoint takes a fresh channel snapshot per batch and caches no merged filter state
+  across batches, so a future recurring producer requires no endpoint correctness changes.
 - Disabling <code>enable_dynamic_filter_sip</code> restores the Phase-1 topology.
 
 ### R3 — supported breadth and hardening
@@ -197,7 +199,11 @@ Current migration seams:
 - [comparison-join planning](../../src/planner/sirius_plan_comparison_join.cpp#L530) creates targets
   only inside the optional hint.
 
-R1 removes those runtime dependencies without replacing the scan router.
+R1 removes those runtime dependencies without replacing the scan router. After R1 the remaining
+DuckDB coupling is exactly three things — scan-target discovery, the
+<code>DynamicTableFilterSet*</code> channel key, and the transparent-path preservation shim in
+[sirius_optimizer_extension.cpp](../../src/transparent/sirius_optimizer_extension.cpp#L45) — which
+the unified-routing follow-up retires together.
 
 ### Scheduling and publication
 
@@ -292,8 +298,10 @@ landed in the same PR. R3 validates cascade, wide-row, multi-GPU, and OOM/admiss
 - Publication is visible only after every planned usable device representation is ready; consumers
   select the representation matching the batch device.
 - The transparent execution path rebuilds a fresh Sirius plan per execution.
-- R3 verifies whether explicit <code>gpu_execution</code> rebinds per execution; if it reuses a
-  stored plan, it adopts the same fresh-rebuild boundary.
+- R3 confirms the explicit <code>gpu_execution</code> path: it builds the Sirius plan once at bind
+  and caches it in bind data, but the result/finished state lives in the same bind data, so a
+  cached plan is never re-executed against fresh state. R3 records that evidence and adds a
+  regression guard; if reuse ever appears, the path adopts the same fresh-rebuild boundary.
 
 <code>dynamic_filter_replica_space</code> contains non-owning memory-space references. Preserve that
 model if the owner graph is proven:
@@ -349,7 +357,7 @@ must not silently pass as a successful filter.
 
 | Decision supported | Required measurements |
 |---|---|
-| Opportunity and routing | Producer considered/admitted/rejected with stable reason; route class selected scan/direct/none; key and target counts |
+| Opportunity and routing | Producer considered/admitted/rejected with stable reason; route class selected scan/direct/none; key and target counts; direct-route selections whose probe subtree contains a scan (unified-routing coverage signal); transparent-path preservation bail-outs (a silent bail strips all dynamic filters) |
 | Publication | Claim and terminal outcome; filter kind, build rows, construction/replication latency, replica bytes |
 | Application | Batches/rows with a visible filter, attempted, kept, and removed; gate decision and observation count; mask/gather/apply time |
 | Resources and rollout | Transient/resident bytes, admitted bound, denial/failure, query wall time, feature state, GPU topology |
@@ -384,11 +392,11 @@ Open follow-ups only when their trigger is observed:
 | Follow-up | Trigger |
 |---|---|
 | Scan-reachable direct backstop | Transitive scan races leave substantial selective work, and measured recovered benefit exceeds duplicate application cost |
-| Unified Sirius scan routing | Dependence on DuckDB scan targets materially limits coverage or maintainability |
+| Unified Sirius scan routing | Route-class telemetry shows direct-route keys with a scan below them, or preservation bail-outs in practice; build discovery pre-resolver in ColumnBinding space (see design doc) |
 | Alternative endpoint placement | Deeper or post-partition placement saves material work/transfer and repays lineage or a partition-preserving contract |
 | STANDARD/partitioned producers | Opportunity analysis shows most useful producers are not BUILD_PROBE |
 | CTE/DELIM/shared-DAG support | A workload needs the path and a publication-dominance design exists |
-| Sort/TopN recurring filters | A real recurring producer owns generation, replacement, invalidation, and retention |
+| Top-N recurring filters | A measured Top-N workload appears; needs producer cadence, consumer supersession, and re-execution reset — the substrate already tolerates growing filter sets (see design doc) |
 | Wider key types, strings, or casts | Workload coverage justifies their representation and semantic support |
 | Late scan re-pruning | Clustered-key I/O savings justify revisiting prefetched assignments |
 | Alternative apply kernel | Existing cascade profiling isolates a material mask/gather bottleneck |
