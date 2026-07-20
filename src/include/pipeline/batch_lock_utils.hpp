@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "cudf/list_offset_fixup.hpp"
 #include "log/logging.hpp"
 #include "telemetry/batch_telemetry.hpp"
 
@@ -144,7 +143,6 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
         return clone->to_read_only();
       }
       mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
-      normalize_gpu_list_offsets(mut_accessor, target_space, stream);
       telemetry::batch_telemetry_registry::instance().on_tier_change(
         mut_accessor.get_batch_id(),
         target_space->get_tier(),

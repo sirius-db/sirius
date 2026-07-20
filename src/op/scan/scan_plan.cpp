@@ -157,8 +157,12 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
     } else {
       auto const& pcol = plan.partition_columns.at(entry.idx);
       auto const& pval = partition_values.at(entry.idx);
-      auto duckdb_val  = duckdb::Value(pval).DefaultCastAs(sirius::to_duckdb(pcol.type));
-      auto scalar      = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
+      // Hive path segments are URL-encoded (DuckDB's own partitioned writer emits
+      // e.g. col=a%20b for the value "a b"); decode once before the cast to match
+      // DuckDB's CPU value materialization (hive_partitioning.cpp Value(Unescape(...))).
+      auto duckdb_val = duckdb::Value(duckdb::HivePartitioning::Unescape(pval))
+                          .DefaultCastAs(sirius::to_duckdb(pcol.type));
+      auto scalar = sirius::value_to_cudf_scalar(duckdb_val, pcol.type, stream);
       out_cols.push_back(cudf::make_column_from_scalar(*scalar, num_rows, stream));
     }
   }

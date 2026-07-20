@@ -394,6 +394,12 @@ std::size_t estimate_decoded_bytes_budget(duckdb::idx_t row_count,
       // String payload bytes require segment-level max-string stats. At prepare
       // time we can only account for offsets; this counter is diagnostic.
       budget += static_cast<std::size_t>(row_count) * sizeof(std::uint32_t);
+    } else if (projected_types[ci].is_array()) {
+      // ARRAY: offsets (int32) + child values (array_size × child_width × row_count).
+      auto const array_size  = projected_types[ci].array_size();
+      auto const child_width = projected_types[ci].array_child().fixed_width_byte_size();
+      budget +=
+        static_cast<std::size_t>(row_count) * (sizeof(std::int32_t) + array_size * child_width);
     } else {
       budget += static_cast<std::size_t>(row_count) * projected_types[ci].fixed_width_byte_size();
     }

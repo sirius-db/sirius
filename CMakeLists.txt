@@ -206,7 +206,6 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
-    src/helper/list_offset_fixup.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
@@ -324,6 +323,7 @@ set(EXTENSION_SOURCES
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
+    src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
@@ -660,6 +660,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
+    test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
