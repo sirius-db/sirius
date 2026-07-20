@@ -20,25 +20,3 @@ edition = "2024"
 cxx = "1"
 cxx-build = "1"
 sirius-sys = { path = "crates/sirius-sys" }
-
-# TEMPORARY (batch data-flow telemetry development): override the pinned quent
-# git revs with the fork branch carrying the new distribution-timeline
-# protocol (rapidsai/quent#393). Once it lands on quent main, bump the pinned
-# revs in the telemetry crates and remove this patch section.
-[patch."https://github.com/rapidsai/quent.git"]
-quent-analyzer = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-attributes = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-build-info = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-codegen = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-collector = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-events = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-io = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-model = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-query-engine-analyzer = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-query-engine-model = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-query-engine-server = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-query-engine-ui = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-simulator-ui = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-stdlib = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-time = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }
-quent-ui = { git = "https://github.com/felipeblazing/quent.git", branch = "claude/dag-data-flow-timeline-d6f6e4" }

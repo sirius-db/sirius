@@ -196,13 +196,15 @@ fn fixture(with_batches: bool) -> Fixture {
         events.push(Event::new(
             op_id,
             EPOCH + 6,
-            SiriusEvent::Operator(operator::OperatorEvent::Declaration(operator::Declaration {
-                plan_id: Ref::new(plan_id),
-                parent_operator_ids: vec![],
-                instance_name: name.to_string(),
-                type_name: "scan".to_string(),
-                custom_attributes: Default::default(),
-            })),
+            SiriusEvent::Operator(operator::OperatorEvent::Declaration(
+                operator::Declaration {
+                    plan_id: Ref::new(plan_id),
+                    parent_operator_ids: vec![],
+                    instance_name: name.to_string(),
+                    type_name: "scan".to_string(),
+                    custom_attributes: Default::default(),
+                },
+            )),
         ));
     }
 
@@ -372,7 +374,9 @@ fn add_working_space_task(fixture: &mut Fixture) {
             3,
             TaskTransition::Preparing(Preparing {
                 instance_name: "task 1".to_string(),
+                origin_tier: "GPU".to_string(),
                 target_tier: "GPU".to_string(),
+                input_bytes: 1000,
                 executor_thread: None,
                 reservation: tier_usage(fixture.gpu_id, 2048),
             }),
@@ -468,7 +472,12 @@ fn data_flow_timeline_bins() {
         .map(|k| k.key.as_str())
         .collect();
     assert_eq!(keys, ["GPU", "HOST", "DISK"]);
-    let measures: Vec<&str> = binned.decl.measures.iter().map(|m| m.name.as_str()).collect();
+    let measures: Vec<&str> = binned
+        .decl
+        .measures
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
     assert_eq!(measures, ["count", "bytes"]);
 
     // Only op1 has batches within the query; the foreign-pipeline batch is
@@ -545,7 +554,9 @@ fn data_flow_timeline_task_working_space() {
     let bytes = &series.values["bytes"];
     assert_eq!(
         bytes["task_working_space"]["GPU"],
-        [0.0, 0.0, 0.0, 0.0, 2048.0, 2048.0, 2048.0, 2048.0, 2048.0, 0.0]
+        [
+            0.0, 0.0, 0.0, 0.0, 2048.0, 2048.0, 2048.0, 2048.0, 2048.0, 0.0
+        ]
     );
 
     // The batch lifecycle series coexist, unchanged from the batch-only run.
@@ -586,7 +597,12 @@ fn data_flow_timeline_measures_filter() {
     let binned = analyzer
         .data_flow_timeline(request(fixture.query_id, &["bytes"]))
         .expect("data flow timeline");
-    let measures: Vec<&str> = binned.decl.measures.iter().map(|m| m.name.as_str()).collect();
+    let measures: Vec<&str> = binned
+        .decl
+        .measures
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
     assert_eq!(measures, ["bytes"]);
     let series = &binned.operators[&fixture.op1_id];
     assert!(series.values.contains_key("bytes"));
@@ -706,7 +722,9 @@ fn plain_timeline_over_memory_tier_resource_includes_batches() {
     // The GPU residency of batch A: queued [0, 300) + processing [800, 1000).
     assert_eq!(
         binned.capacities_values["capacity_bytes"],
-        [1000.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0]
+        [
+            1000.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0
+        ]
     );
 }
 
