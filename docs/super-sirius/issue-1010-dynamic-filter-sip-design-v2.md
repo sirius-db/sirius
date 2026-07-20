@@ -2,7 +2,8 @@
 
 **Targets:** [#1010](https://github.com/sirius-db/sirius/issues/1010),
 [#1014](https://github.com/sirius-db/sirius/issues/1014) (complete). **Status:** design.
-**Supersedes:** [the v1 SIP design](issue-1010-dynamic-filter-sip-design.md).
+**Supersedes:** the v1 SIP design (PR [#1179](https://github.com/sirius-db/sirius/pull/1179),
+unmerged; implementation attempt PR [#1193](https://github.com/sirius-db/sirius/pull/1193)).
 **Delivery:** [issue-1010-github-delivery-plan-v2.md](issue-1010-github-delivery-plan-v2.md).
 
 ## Context and goal
@@ -66,7 +67,10 @@ The initial producer/key scope is:
 
 LEFT, FULL/OUTER, ANTI, MARK, and right-family joins are excluded because their preserved or negated
 probe semantics make early row removal unsafe. Null-equal comparison, casts, computed keys, and
-additional key types remain outside the initial scope.
+additional key types remain outside the initial scope. Key shape (direct, cast, or computed) is
+classified per condition side before the planner materializes computed keys into plain bound
+references; admission consumes that carried classification, because the post-rewrite conditions
+alone cannot distinguish a computed key from a direct one.
 
 Normal optimization misses—no route, no useful filter, empty build, policy skip, or an intentionally
 unavailable target—pass through. Invalid key mapping, partial visibility, or a corrupt/wrong-device
@@ -117,9 +121,11 @@ runtime publisher do not depend on optional DuckDB scan-pushdown metadata.
 
 That boundary is the ownership end-state: DuckDB's join-filter metadata is a planning-time
 discovery input for scan endpoints only, and every structure consumed at runtime is Sirius-owned.
-The DuckDB coupling that remains is exactly three things — the scan-target discovery walk, the
+The DuckDB coupling that remains is exactly four planning-time inputs — the scan-target discovery
+walk, its <code>build_side_has_filter</code> benefit hint (consulted for hinted scan routes only;
+the direct route's benefit evidence is a Sirius-owned filtered-build-subtree check), the
 <code>DynamicTableFilterSet*</code> channel route key, and the transparent-path
-metadata-preservation shim that keeps both alive across plan copies. They retire as one unit in the
+metadata-preservation shim that keeps them alive across plan copies. They retire as one unit in the
 unified-routing follow-up; nothing in this design grows a new DuckDB dependency in the meantime.
 
 After P's build completes, it constructs and finalizes every planned device representation, then
@@ -146,8 +152,9 @@ Non-scan endpoints apply membership filters only. They do not perform scan-speci
 zone-map pruning.
 
 The gate is a local cost heuristic, not coordination between endpoints. Resource admission must
-cover all concurrently live application buffers and replica work. The delivery plan defines the
-concrete estimate, failure tests, telemetry, and benchmark gates.
+cover source-representation construction, all concurrently live application buffers, and replica
+work. The delivery plan defines the concrete estimate, failure tests, telemetry, and benchmark
+gates.
 
 ## Complexity budget
 

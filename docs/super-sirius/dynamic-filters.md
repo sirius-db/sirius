@@ -19,9 +19,9 @@ The framework has four axes of generality. Each phase opens one axis:
 | Axis | Phase 1 | Phase 2 | Phase 3 | Phase 4 |
 |------|---------|---------|---------|---------|
 | Filter kind | zone map + Bloom + IN-list | (reuses Phase 1's filter zoo) | (reuses) | (reuses) |
-| Consumer kind | parquet reader + post-decode scan operator (parquet + duckdb-native) | + hash-join probe | + any operator with a column input | (unchanged) |
+| Consumer kind | parquet reader + post-decode scan operator (parquet + duckdb-native) | + probe-edge dynamic-filter endpoint | + any operator with a column input | (unchanged) |
 | Producer kind | `BUILD_PROBE` hash-join build only | (unchanged) | + agg, sort, filter | (unchanged) |
-| Coordination | single-shot build-port publication; direct probes ordered, transitive scan targets opportunistic | topology-aware coordination for join-probe consumers | (unchanged) | streaming / incremental refinement |
+| Coordination | single-shot build-port publication; direct probes ordered, transitive scan targets opportunistic | ordered direct endpoint at the producing join's probe edge | (unchanged) | streaming / incremental refinement |
 
 Anything implemented in Phase 1 is reused unchanged by later phases. We do not replace DuckDB's static table-filter pushdown — static filters continue to flow through the existing translator path and are AND-merged with dynamic filters at the consumer.
 
@@ -125,7 +125,7 @@ std::unordered_map<
 
 The route key in Phase 1.1 is `const duckdb::DynamicTableFilterSet*` — DuckDB's optimizer creates a `DynamicTableFilterSet` and references it from both the join's `JoinFilterPushdownInfo::probe_info` and the target `LogicalGet`'s `dynamic_filters`. The pointer is the identity that pairs them.
 
-For Phase 2 (SIP) and Phase 3 (other producers), there is no DuckDB-supplied pointer — Sirius creates the pairing itself, and the route key generalizes to a variant covering Sirius-owned producer/consumer ID pairs. The router's logic is unchanged: find or create a channel for a route key, attach to producer, attach to consumer. Only the key set grows.
+Phase 2's direct endpoint needs no router entry at all: the placement helper creates an endpoint-local channel and hands it to producer and endpoint directly, while `DynamicTableFilterSet*` remains the route key for scan targets. For Phase 3 (other producers), where producer and consumer are planned at different sites, the route key would generalize to a variant covering Sirius-owned producer/consumer ID pairs; the router's logic is unchanged — find or create a channel for a route key, attach to producer, attach to consumer. Only the key set grows.
 
 ### Producer / consumer wiring
 
@@ -253,7 +253,7 @@ The dynamic zone-map AST is merged onto the static filter root when the static f
 
 The duckdb-native GPU scan is post-decode only. It has no reader-side filter hook — decode is Sirius's own native path and static filters are evaluated in `post_filter_and_project` — so its `sirius_physical_dynamic_filter` runs in `include_ast_row_masks` mode: an opted-in zone map is evaluated row-wise via `cudf::compute_column` alongside the membership masks, behind the same gate. Row-group stat pruning in the native metadata walk remains static-only. The native ingestible's wiring role is installing the channel's column_ids → output-position remap at construction, before any producer publishes.
 
-This mixing rule is a property of the consumer scan format, not the framework. Other consumers (hash-join probe in Phase 2) have their own merge rules.
+This mixing rule is a property of the consumer scan format, not the framework. Other consumers (the probe-edge endpoint in Phase 2) have their own merge rules.
 
 ```mermaid
 flowchart TB
@@ -398,22 +398,28 @@ A channel may carry both a zone map for the reader and a Bloom for the post-deco
 
 ## Phase 2 — Sideways information passing
 
-**Goal:** generalize the *consumer* axis. The hash-join probe becomes a consumer, allowing a build-side filter to prune the probe input of a *different* join before that join performs its hash-probe work, including inputs that cannot be filtered at a parquet scan.
+**Goal:** generalize the *consumer* axis — apply a build-side filter to probe rows that cannot be
+filtered at a scan.
 
-**Producer:** `BUILD_PROBE` hash-join build (same as Phase 1).
-**Consumer (new):** hash-join probe input.
-**Routing (new):** Sirius-owned `sirius_sip_route` route key.
-**Coordination:** implicit, where the producer's meta-pipeline is upstream of the consumer's; explicit readiness (Phase 4) otherwise.
+**Normative design:** [issue-1010-dynamic-filter-sip-design-v2.md](issue-1010-dynamic-filter-sip-design-v2.md),
+delivered per [issue-1010-github-delivery-plan-v2.md](issue-1010-github-delivery-plan-v2.md). An
+earlier sketch of this section — a `sirius_sip_route` route-key variant plus a new consumer code
+path inside the hash-join probe — was rejected by that design. The v2 shape:
 
-This differs from Phase 1 transitive scan pushdown. Today DuckDB may traverse an intervening join
-while locating a base-scan target, but that join does not consume the filter. Phase 2 would apply
-the filter at another join's probe input before its hash-probe work, including shapes where no
-parquet scan can consume the filter directly.
+- **Producer:** `BUILD_PROBE` hash-join build (same as Phase 1).
+- **Consumer:** the existing `sirius_physical_dynamic_filter` operator, placed at the producing
+  join P's immediate probe edge before PARTITION/CONCAT in `membership_masks_only` mode. The hash
+  join's probe execution path is unchanged.
+- **Routing:** the placement helper wires producer and endpoint directly from Sirius-owned
+  admitted-key metadata; the direct endpoint's channel is endpoint-local and needs no route key.
+  DuckDB's `DynamicTableFilterSet*` remains the route key for scan targets only.
+- **Coordination:** P's synchronous build publication is ordered before its immediate probe
+  producer runs, so the direct endpoint never waits and never races; scan targets remain
+  opportunistic.
 
-What changes:
-
-- **Route key variant.** `dynamic_filter_channels` becomes keyed by a variant including a Sirius-owned `sirius_sip_route`. Plan-gen in `sirius_plan_comparison_join.cpp` extends: a join can register itself as a *consumer* of filters from upstream join builds in addition to its existing producer role. Producer/consumer pairing is Sirius's responsibility — no DuckDB pointer to lean on.
-- **New consumer code path in hash-join probe.** Before hashing, the probe would apply mask-capable filters through `sirius_mask_applicable::compute_mask` and the existing scan helpers. No new filter kinds are required; the parquet-specific AST path is not reused.
+This differs from Phase 1 transitive scan pushdown. There, DuckDB may traverse an intervening join
+while locating a base-scan target, but that join does not consume the filter. Phase 2 filters P's
+probe rows ahead of P itself when no scan can consume the filter.
 
 The filter zoo, the channel type, and the producer side are unchanged.
 

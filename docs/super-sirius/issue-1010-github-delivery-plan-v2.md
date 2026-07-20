@@ -64,7 +64,11 @@ only in a later PR.
 - Runtime hash-join publication no longer dereferences <code>JoinFilterPushdownInfo</code>.
 - Admitted metadata can be built from normalized join conditions and the build/probe schemas when no
   DuckDB pushdown hint exists.
-- Composite, reordered, non-prefix, and partially eligible keys retain correct dense alignment.
+- Key-shape classification (direct, cast, computed) is captured before key materialization and
+  carried on the physical join; admission never re-derives shape from post-materialization
+  conditions.
+- Composite, reordered, non-prefix, and partially eligible keys retain correct key-to-coordinate
+  binding.
 - Existing publication state/race tests remain green.
 - Numeric rollout thresholds are recorded in the checked-in benchmark specification before R2
   performance data is examined.
@@ -164,26 +168,55 @@ is part of R1–R3.
 
 ### Admitted-key metadata
 
-Extend the existing <code>dynamic_filter_publish_plan</code> with a dense immutable representation
-equivalent to:
+Extend the existing <code>dynamic_filter_publish_plan</code> with an immutable representation — a
+dense admitted-key array with sparse per-target bindings — equivalent to:
 
 ~~~text
 admitted_key {
   condition_index
   build_key_ordinal
   storage_type
+  key_shape                // direct | cast | computed, per condition side,
+                           // classified before key materialization
 }
 
 target {
   endpoint_channel
-  consumer_output_ordinal[]  // aligned with admitted_key[]
-  consumer_type[]            // aligned with admitted_key[]
+  route_class              // scan | direct
+  accepted_filter_kinds    // membership-only for direct endpoints
+  key_binding[] {          // sparse: only the keys this target applies
+    admitted_key_index
+    channel_push_ordinal   // in the channel's push-coordinate space (below)
+  }
 }
 ~~~
+
+<code>channel_push_ordinal</code> is expressed in the target channel's push-coordinate space, which
+differs by route class. A scan channel is installed with a <code>column_ids</code>-to-output-position
+remap that <code>push_filter</code> applies at push time, so scan targets keep the
+<code>column_ids</code>-space index DuckDB supplies today; pushing an output ordinal there would
+remap twice and can silently filter a same-typed wrong column. A direct endpoint's channel installs
+no remap, so its push ordinal is P's probe-child output ordinal, stored unchanged. The binding is
+sparse because routes are chosen per key: a producer with one scan-routed and one direct-routed key
+lists each key only under its own route's targets, and the publisher iterates a target's bindings,
+never the full admitted-key array. <code>accepted_filter_kinds</code> keeps scan-only zone maps out
+of membership-only endpoints — waste prevention and gate hygiene; a membership-only apply already
+ignores AST-only filters, so this is not a correctness gate.
 
 The metadata comes from normalized join conditions and child schemas, not from the optional
 <code>JoinFilterPushdownInfo</code>. The latter may identify existing scan targets during planning,
 but the runtime publisher must not retain or dereference it.
+
+One legality input cannot come from the normalized conditions. The comparison-join planner
+materializes computed equality keys and rewrites them to plain bound references backed by an
+injected projection before conditions are wrapped into the physical join
+([materialization](../../src/planner/sirius_plan_comparison_join.cpp#L390)), and projection folding
+can subsequently erase the injected projection. The planner therefore classifies each condition side
+as direct, cast, or computed before that rewrite and carries the immutable classification into the
+physical join alongside the existing <code>key_casts</code> record. The admission helper consumes
+the carried classification for the bound-key-shape check rather than re-deriving it; the
+computed-key negative in the correctness matrix is asserted at the helper with both probe-side and
+build-side computed variants.
 
 Static legality—join semantics, comparison, bound-key shape, and compatible type—belongs in one
 side-effect-free admission helper. Publication rechecks only runtime facts: P's mode, complete build,
@@ -200,10 +233,14 @@ Current migration seams:
   only inside the optional hint.
 
 R1 removes those runtime dependencies without replacing the scan router. After R1 the remaining
-DuckDB coupling is exactly three things — scan-target discovery, the
-<code>DynamicTableFilterSet*</code> channel key, and the transparent-path preservation shim in
+DuckDB coupling is planning-time only and is exactly four inputs — scan-target discovery, its
+<code>build_side_has_filter</code> benefit hint, the <code>DynamicTableFilterSet*</code> channel
+key, and the transparent-path preservation shim in
 [sirius_optimizer_extension.cpp](../../src/transparent/sirius_optimizer_extension.cpp#L45) — which
-the unified-routing follow-up retires together.
+the unified-routing follow-up retires together. The benefit hint gates hinted scan routes exactly as
+today, preserving R1's unchanged-plan-count acceptance; the direct route never reads it and instead
+uses a Sirius-owned filtered-build-subtree check (the <code>IsFiltering</code> equivalent over the
+logical build child, including the delim-get substitution).
 
 ### Scheduling and publication
 
@@ -260,11 +297,16 @@ A filter is pushed to a target only after its successful device-replica transfer
 instant at which every consumer first gains visibility. Direct-edge ordering means the direct
 endpoint runs after that attempt returns.
 
-Destination reservation/copy failure makes that filter unavailable on the affected device; the
-device passes through and the attempt may still finish. Unsupported keys and closed targets are also
-expected skips. Failure to construct the source representation, or an invariant failure that could
-make a filter unsafe, publishes no affected filter and reaches <code>FAILED</code> (or fails the
-query). These outcomes are counters, not new states or a stored ledger.
+Failure policy, matching the implemented per-target behavior for every filter kind: destination-side
+failures during replica materialization — reservation denial, clone, copy enqueue, or completion
+synchronize — are caught, logged, and omit that device's replica; the device passes through and the
+attempt may still reach <code>FINISHED</code>. Unsupported keys and closed targets are likewise
+expected skips. Source-side resource denial or exhaustion during filter construction skips the
+affected filters with a warning and counter; it must not fail the query and must not enter the
+compute OOM-reschedule path. Only pre-publication ordering or synchronization failures, or an
+invariant violation that could make a filter unsafe, publish no affected filter, reach
+<code>FAILED</code>, and fail the producing task. These outcomes are counters, not new states or a
+stored ledger.
 
 ### Endpoint application and memory
 
@@ -290,6 +332,17 @@ while application can co-hold the input, BOOL mask, and near-input-sized gathere
 that override in favor of the conservative base estimate, unless a measured and tested formula is
 landed in the same PR. R3 validates cascade, wide-row, multi-GPU, and OOM/admission peaks.
 
+Source-filter construction is currently outside admission and measurement: the publisher allocates
+source IN-list/Bloom structures through the source space's default allocator, publication runs
+inside build sink delivery after the task's peak history is recorded, and a sink-side OOM surfaces
+as a generic query error rather than an OOM reschedule. R2 therefore admits source construction
+explicitly: before constructing, the publisher computes a per-publication source budget from the
+existing per-kind size estimators over the admitted keys and acquires a scoped reservation against
+the source GPU's replica space on the publication stream; all source construction allocates through
+that reservation. Denial or exhaustion follows the failure policy above — skip plus counter, never
+query failure. R3 verifies that admitted and recorded publication-time peaks include this work,
+exercised on the no-hint shape where publication frequency is highest.
+
 ### Ownership, freshness, and multi-GPU
 
 - Each endpoint owns/co-owns one <code>sirius_dynamic_filter_set</code>, its column coordinate, close
@@ -302,6 +355,16 @@ landed in the same PR. R3 validates cascade, wide-row, multi-GPU, and OOM/admiss
   and caches it in bind data, but the result/finished state lives in the same bind data, so a
   cached plan is never re-executed against fresh state. R3 records that evidence and adds a
   regression guard; if reuse ever appears, the path adopts the same fresh-rebuild boundary.
+- The explicit path's error branch is part of the owner graph: a GPU execution error retains the
+  failed active query — engine, plan, and any channels and replicas they hold — inside bind data
+  until DuckDB destroys it. That is outer-query end for plain materialized queries, but arbitrarily
+  later for held prepared statements and partially drained streaming results, and the CPU fallback
+  runs while that failed state is still resident. R3 lifecycle coverage includes explicit-path
+  success, GPU error with and without CPU fallback, cancellation, early drain, and a
+  held-prepared-statement case, proving release no later than bind-data destruction and pool return
+  to baseline afterward. If any case cannot be proven, the explicit surface is excluded from the
+  initial rollout by a surface gate at its plan-generation call site — the shared plan generator
+  has no surface discriminator, so the R4 planner allowlist cannot express that exclusion.
 
 <code>dynamic_filter_replica_space</code> contains non-owning memory-space references. Preserve that
 model if the owner graph is proven:
@@ -341,13 +404,13 @@ filtering.
 
 | Area | Required coverage |
 |---|---|
-| Producer legality | INNER/left-SEMI equality with direct INT32/INT64 and complete P build positive; LEFT/FULL/ANTI/MARK/right, null-equal, inequality, cast/computed, type mismatch, partial build, and no live target negative |
-| Key mapping | Composite, reordered, non-prefix, and partially eligible keys; P's mode controls publication, not an inner build child's mode |
+| Producer legality | INNER/left-SEMI equality with direct INT32/INT64 and complete P build positive; LEFT/FULL/ANTI/MARK/right, null-equal, inequality, cast/computed, type mismatch, partial build, and no live target negative — computed-key negatives asserted at the admission helper with probe-side and build-side variants |
+| Key mapping | Composite, reordered, non-prefix, and partially eligible keys; P's mode controls publication, not an inner build child's mode; a reordered same-typed scan regression that fails on double remapping; a mixed-route composite producer publishes each key only to its own route's targets |
 | Planning | Scan endpoint when legal; direct endpoint only when uncovered; exact pre-partition shape; idempotent placement; path-local CTE/DELIM/shared skips |
 | Results | Explicit expected bags for nested/bushy, duplicate-heavy INNER, SEMI, null, zero-row, empty-build, wide-payload, and no-hint cases |
-| Lifecycle | Publish/fail/close races, cancellation, early drain, repeated execution, and teardown |
+| Lifecycle | Publish/fail/close races, cancellation, early drain, repeated execution, and teardown; explicit-path success, GPU error with and without CPU fallback, and held-prepared-statement release |
 | Multi-GPU | Non-producer-device consumption, non-contiguous device IDs, intentionally unavailable targets, copy failure, immutable sharing, and no partial visibility |
-| Resources | Mask/gather/cascade overlap, replica bytes, reservation denial, and OOM |
+| Resources | Mask/gather/cascade overlap, replica bytes, reservation denial, and OOM; source-construction reservation denial and publication-time peak inclusion |
 
 Expected optimization omissions pass through. Invalid mapping, incomplete publication, or a
 wrong-device representation presented as usable must suppress the affected publication or fail; it
@@ -358,7 +421,7 @@ must not silently pass as a successful filter.
 | Decision supported | Required measurements |
 |---|---|
 | Opportunity and routing | Producer considered/admitted/rejected with stable reason; route class selected scan/direct/none; key and target counts; direct-route selections whose probe subtree contains a scan (unified-routing coverage signal); transparent-path preservation bail-outs (a silent bail strips all dynamic filters) |
-| Publication | Claim and terminal outcome; filter kind, build rows, construction/replication latency, replica bytes |
+| Publication | Claim and terminal outcome; filter kind, build rows, construction/replication latency, replica bytes; source-reservation denials and skipped filters |
 | Application | Batches/rows with a visible filter, attempted, kept, and removed; gate decision and observation count; mask/gather/apply time |
 | Resources and rollout | Transient/resident bytes, admitted bound, denial/failure, query wall time, feature state, GPU topology |
 

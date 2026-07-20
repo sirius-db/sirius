@@ -25,9 +25,9 @@ copy_if failed on 2nd step: cudaErrorIllegalAddress
 
 The fix gives every filter explicit device identity and records which
 device-local replicas are ready. Consumers select by their memory-space device
-ID; they never dereference remote filter storage. When the filter kind's
-best-effort policy permits a target omission, that GPU skips the optional
-filter; failures outside that policy propagate.
+ID; they never dereference remote filter storage. Per-target replica failures
+are best-effort for every filter kind: that GPU skips the optional filter;
+failures outside per-target replication propagate.
 
 The publication and application contracts are distinct:
 
@@ -41,10 +41,11 @@ The publication and application contracts are distinct:
 - An empty or policy-gated publication and an allocation-unavailable local
   replica are safe pass-through cases; the authoritative join guarantees
   correctness.
-- For IN-list/Bloom replicas, serious CUDA construction, transfer, or
-  synchronization failures propagate and fail the producing task/query. The
-  current zone-map target-clone path instead catches, logs, and omits a failed
-  target replica.
+- For every filter kind, a per-destination-target failure — reservation
+  denial, clone, copy enqueue, or completion synchronize — is caught, logged,
+  and omits that target's replica. Source-side construction failures and
+  pre-publication ordering/synchronization failures propagate and fail the
+  producing task/query.
 
 Probe metadata parsing and prefetch preparation are independent of publication.
 For an immediate probe, the actual `read_parquet`/decode task starts after the
