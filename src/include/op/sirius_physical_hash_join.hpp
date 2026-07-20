@@ -112,6 +112,11 @@ struct build_probe_decision {
 /// hash-partitioned build charges the per-partition average), the build folds to one batch, and the
 /// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
 /// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
+///
+/// Broadcast candidacy: a build is replicate-worthy when it is below the small-table threshold, OR
+/// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
+/// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) — replicating a medium build avoids
+/// shuffling a much larger probe across GPUs.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   bool is_build_side,
@@ -119,8 +124,10 @@ struct build_probe_decision {
   int num_gpus,
   uint64_t hash_partition_bytes,
   uint64_t max_build_hash_table_bytes,
+  uint64_t max_broadcast_join_size,
   duckdb::JoinType join_type,
-  HASH_JOIN_MODE join_mode);
+  HASH_JOIN_MODE join_mode,
+  double estimated_probe_to_build_ratio);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
@@ -154,7 +161,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     dynamic_filter_publish_plan dynamic_filter_plan = {},
-    uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES);
+    uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
+    uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -164,7 +172,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::JoinType join_type,
     std::size_t estimated_cardinality,
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES);
+    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES,
+    uint64_t max_broadcast_join_size    = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
 
   duckdb::vector<sirius::join_condition> conditions;
   //! Scans where we should push generated filters into (if any)
@@ -273,6 +282,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+  // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
+  // operator_params at construction.
+  uint64_t _max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
   // _num_gpus lives on sirius_physical_partition_consumer_operator (set via set_num_gpus).
 
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and

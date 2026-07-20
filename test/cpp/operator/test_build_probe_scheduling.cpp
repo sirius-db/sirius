@@ -70,14 +70,19 @@ namespace {
 // exceed it; keeps the "small input" cases at a single natural partition.
 constexpr uint64_t kBigPartitionBytes = 512ull * 1024 * 1024;  // 512 MB
 
+// Default broadcast size cap (256 MB); some tests override it to exercise the ratio-based path.
+constexpr uint64_t kMaxBroadcastBytes = 256ull * 1024 * 1024;
+
 partition_strategy strategy(uint64_t total_bytes,
                             bool is_build_side,
                             bool build_foldable,
                             int num_gpus,
                             duckdb::JoinType join_type,
-                            HASH_JOIN_MODE join_mode            = HASH_JOIN_MODE::STANDARD,
-                            uint64_t hash_partition_bytes       = kBigPartitionBytes,
-                            uint64_t max_build_hash_table_bytes = kMaxBuildBytes)
+                            HASH_JOIN_MODE join_mode              = HASH_JOIN_MODE::STANDARD,
+                            uint64_t hash_partition_bytes         = kBigPartitionBytes,
+                            uint64_t max_build_hash_table_bytes   = kMaxBuildBytes,
+                            uint64_t max_broadcast_join_size      = kMaxBroadcastBytes,
+                            double estimated_probe_to_build_ratio = 0.0)
 {
   return compute_hash_join_partition_strategy(total_bytes,
                                               is_build_side,
@@ -85,8 +90,10 @@ partition_strategy strategy(uint64_t total_bytes,
                                               num_gpus,
                                               hash_partition_bytes,
                                               max_build_hash_table_bytes,
+                                              max_broadcast_join_size,
                                               join_type,
-                                              join_mode);
+                                              join_mode,
+                                              estimated_probe_to_build_ratio);
 }
 
 }  // namespace
@@ -161,6 +168,102 @@ TEST_CASE("compute_hash_join_partition_strategy - multi-GPU small build broadcas
   REQUIRE(s.num_partitions == 4);
   REQUIRE(s.broadcast);
   REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - medium build broadcasts when the probe dwarfs the build",
+  "[hash_join][build_probe][unit][broadcast]")
+{
+  // 100 MB build on 4 GPUs: above the small-table threshold (64 MB) but below max_broadcast (256
+  // MB), and the probe is 6x the build (>= 4 * 1.25 = 5.0) -> broadcast the medium build.
+  auto const s = strategy(100ull * 1024 * 1024,
+                          /*is_build_side=*/true,
+                          /*foldable=*/true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/6.0);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - medium build hash-partitions when the ratio is too low",
+  "[hash_join][build_probe][unit]")
+{
+  // Same 100 MB build on 4 GPUs, but the probe is only 3x the build (< 5.0) -> no broadcast; it
+  // hash-partitions one-per-GPU instead (still BUILD_PROBE by size).
+  auto const s = strategy(100ull * 1024 * 1024,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/3.0);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - build above max_broadcast_join_size never "
+  "ratio-broadcasts",
+  "[hash_join][build_probe][unit]")
+{
+  // 300 MB build exceeds max_broadcast (256 MB); even a huge probe-to-build ratio cannot broadcast.
+  auto const s = strategy(300ull * 1024 * 1024,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/100.0);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - ratio broadcast threshold scales with num_gpus",
+          "[hash_join][build_probe][unit][broadcast]")
+{
+  // 200 MB build, probe 3x the build. Above the small-table threshold at both GPU counts and below
+  // max_broadcast. The ratio bar is num_gpus * 1.25: 2.5 at 2 GPUs (3.0 clears it -> broadcast),
+  // 10.0 at 8 GPUs (3.0 misses it -> hash-partition).
+  auto const two_gpu = strategy(200ull * 1024 * 1024,
+                                true,
+                                true,
+                                /*num_gpus=*/2,
+                                duckdb::JoinType::INNER,
+                                HASH_JOIN_MODE::STANDARD,
+                                kBigPartitionBytes,
+                                kMaxBuildBytes,
+                                kMaxBroadcastBytes,
+                                /*estimated_probe_to_build_ratio=*/3.0);
+  REQUIRE(two_gpu.num_partitions == 2);
+  REQUIRE(two_gpu.broadcast);
+
+  auto const eight_gpu = strategy(200ull * 1024 * 1024,
+                                  true,
+                                  true,
+                                  /*num_gpus=*/8,
+                                  duckdb::JoinType::INNER,
+                                  HASH_JOIN_MODE::STANDARD,
+                                  kBigPartitionBytes,
+                                  kMaxBuildBytes,
+                                  kMaxBroadcastBytes,
+                                  /*estimated_probe_to_build_ratio=*/3.0);
+  REQUIRE(eight_gpu.num_partitions == 8);
+  REQUIRE_FALSE(eight_gpu.broadcast);
 }
 
 TEST_CASE("compute_hash_join_partition_strategy - right-family joins never broadcast/build-probe",

@@ -34,6 +34,10 @@ struct partition_sizing_input {
   bool is_build_side;    ///< The sizing partition drives the build side (only the build side can
                          ///< drive broadcast / build-probe).
   bool build_foldable;   ///< A downstream build-side CONCAT can concat_all to a single batch.
+  /// DuckDB-planner-estimated probe-to-build cardinality ratio (probe rows / build rows, with a
+  /// build of 0 rows treated as 1). Used by the broadcast decision: a build that is not tiny can
+  /// still be worth replicating when the probe side dwarfs it. 0 when unknown / not a join.
+  double estimated_probe_to_build_ratio = 0.0;
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is

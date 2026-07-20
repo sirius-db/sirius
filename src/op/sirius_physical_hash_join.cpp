@@ -219,7 +219,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p,
   uint64_t max_build_hash_table_bytes,
   dynamic_filter_publish_plan dynamic_filter_plan,
-  uint64_t hash_partition_bytes)
+  uint64_t hash_partition_bytes,
+  uint64_t max_broadcast_join_size)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
@@ -230,6 +231,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 {
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   _hash_partition_bytes       = hash_partition_bytes;
+  _max_broadcast_join_size    = max_broadcast_join_size;
   reorder_join_conditions(conditions);
 
   filter_pushdown = std::move(pushdown_info_p);
@@ -361,7 +363,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::JoinType join_type,
   std::size_t estimated_cardinality,
   uint64_t max_build_hash_table_bytes,
-  uint64_t hash_partition_bytes)
+  uint64_t hash_partition_bytes,
+  uint64_t max_broadcast_join_size)
   : sirius_physical_hash_join(op,
                               std::move(left),
                               std::move(right),
@@ -374,7 +377,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
                               nullptr,
                               max_build_hash_table_bytes,
                               {},
-                              hash_partition_bytes)
+                              hash_partition_bytes,
+                              max_broadcast_join_size)
 {
 }
 
@@ -486,8 +490,10 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         int num_gpus,
                                                         uint64_t hash_partition_bytes,
                                                         uint64_t max_build_hash_table_bytes,
+                                                        uint64_t max_broadcast_join_size,
                                                         duckdb::JoinType join_type,
-                                                        HASH_JOIN_MODE join_mode)
+                                                        HASH_JOIN_MODE join_mode,
+                                                        double estimated_probe_to_build_ratio)
 {
   // Invariant: num_gpus defaults to 1 and is only ever set to a hardware GPU count >= 1. A value
   // < 1 is a programming error (it makes the per-partition division below ill-defined).
@@ -513,7 +519,9 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   // Phase 1 — broadcast candidacy and the partition count we propose to the eligibility check.
   //   MARK multi-GPU: forced broadcast (build_has_null must be globally consistent).
   //   MARK single-GPU: clamped to one partition (may still enter BUILD_PROBE below).
-  //   Otherwise: a small build on multi-GPU is a broadcast candidate (replicate to every GPU).
+  //   Otherwise: a build is a broadcast candidate when it is below the small-table threshold, OR
+  //   below max_broadcast_join_size while the probe side is large relative to the build (so
+  //   replicating the build avoids shuffling a much larger probe across GPUs).
   bool broadcast_candidate = false;
   int proposed             = natural;
   if (is_mark && num_gpus > 1) {
@@ -523,8 +531,10 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
     broadcast_candidate = false;
     proposed            = 1;
   } else {
-    broadcast_candidate = num_gpus > 1 && total_bytes < small;
-    proposed            = broadcast_candidate ? num_gpus : natural;
+    broadcast_candidate = total_bytes < small ||
+                          (total_bytes < max_broadcast_join_size &&
+                           estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25);
+    proposed = broadcast_candidate ? num_gpus : natural;
   }
 
   // Phase 2 — BUILD_PROBE eligibility at `proposed`. MARK/SEMI/ANTI are eligible (persistent
@@ -558,8 +568,10 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              _num_gpus,
                                                              _hash_partition_bytes,
                                                              _max_build_hash_table_bytes,
+                                                             _max_broadcast_join_size,
                                                              join_type,
-                                                             _join_mode);
+                                                             _join_mode,
+                                                             in.estimated_probe_to_build_ratio);
 
   if (is_mark_join() && _num_gpus > 1 && in.is_build_side &&
       in.total_bytes >= partition_small_table_bytes(_num_gpus)) {
