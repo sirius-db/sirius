@@ -237,15 +237,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
-  /// @brief Mark this join as a broadcast (small-build-table) BUILD_PROBE join. Set at runtime.
-  void set_broadcast(bool broadcast) { _broadcast = broadcast; }
-
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
-
-  /// @brief True when this is a MARK join. Used by the partition operator to enforce
-  ///        single-partition (1 GPU) or forced-broadcast (multi-GPU) sizing.
-  [[nodiscard]] bool is_mark_join() const { return join_type == duckdb::JoinType::MARK; }
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;

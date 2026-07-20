@@ -389,19 +389,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto& sizing_partition = _drives_partition_count ? *this : sibling;
-      // DuckDB-planner-estimated probe-to-build cardinality ratio from the two sibling partitions'
-      // estimated_cardinality (rows). A build of 0 estimated rows is treated as 1 to avoid dividing
-      // by zero. Fed to the broadcast decision.
-      auto& build_partition     = _is_build ? *this : sibling;
-      auto& probe_partition     = _is_build ? sibling : *this;
-      uint64_t const build_card = build_partition.estimated_cardinality;
-      uint64_t const probe_card = probe_partition.estimated_cardinality;
-      double const probe_to_build =
-        static_cast<double>(probe_card) / static_cast<double>(build_card == 0 ? 1 : build_card);
       partition_sizing_input const in{sizing_partition.compute_total_bytes(),
                                       sizing_partition._is_build,
-                                      has_build_concat(*this) || has_build_concat(sibling),
-                                      probe_to_build};
+                                      has_build_concat(*this) || has_build_concat(sibling)};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy = consumer->get_partition_strategy(in);

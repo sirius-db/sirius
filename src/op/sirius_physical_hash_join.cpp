@@ -562,6 +562,11 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   const partition_sizing_input& in)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
+  const std::size_t probe_card_est = children.size() > 0 ? children[0]->estimated_cardinality : 0;
+  std::size_t build_card_est       = children.size() > 1 ? children[1]->estimated_cardinality : 0;
+  build_card_est                   = std::max(build_card_est, 1UL);
+  const double estimated_probe_to_build_ratio =
+    static_cast<double>(probe_card_est) / build_card_est;
   auto const strategy = compute_hash_join_partition_strategy(in.total_bytes,
                                                              in.is_build_side,
                                                              in.build_foldable,
@@ -571,9 +576,9 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              _max_broadcast_join_size,
                                                              join_type,
                                                              _join_mode,
-                                                             in.estimated_probe_to_build_ratio);
+                                                             estimated_probe_to_build_ratio);
 
-  if (is_mark_join() && _num_gpus > 1 && in.is_build_side &&
+  if (join_type == duckdb::JoinType::MARK && _num_gpus > 1 && in.is_build_side &&
       in.total_bytes >= partition_small_table_bytes(_num_gpus)) {
     SIRIUS_LOG_WARN(
       "sirius_physical_hash_join id {}: forcing broadcast for MARK join with build side {} bytes "
@@ -605,15 +610,21 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
     }
   }
 
+  const char* join_mode_str = _join_mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
+                              : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
+                                                                         : "STANDARD";
+
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
-    "bytes{}{}",
+    "bytes. Join Mode: {} {}. build_card_est {} probe_card_est {}",
     this->get_operator_id(),
     strategy.num_partitions,
     _num_gpus,
     in.total_bytes,
+    join_mode_str,
     (strategy.broadcast ? " [broadcast]" : ""),
-    (strategy.build_probe ? " [build_probe]" : ""));
+    build_card_est,
+    probe_card_est);
   return strategy;
 }
 
