@@ -1704,7 +1704,9 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   std::string const schema  = !qname.schema.empty() ? qname.schema : schema_name;
   auto& entry_base =
     Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, qname.name);
-  auto& entry             = entry_base.Cast<DuckTableEntry>();
+  auto& entry = entry_base.Cast<DuckTableEntry>();
+  req.catalog             = entry.ParentCatalog().GetName();
+  req.schema              = entry.ParentSchema().name;
   req.table_name          = entry.name;  // catalog-resolved name (matches query-side derivation)
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
