@@ -306,6 +306,8 @@ graph LR
 2. **Pipeline 2**: PARTITION. Repository to MERGE_GROUP_BY uses `FULL` barrier (downstream is not CONCAT — `PARTIAL` is only used when PARTITION feeds directly into CONCAT)
 3. **Pipeline 3**: MERGE_GROUP_BY. Downstream pipelines updated to use MERGE_GROUP_BY as source
 
+> With `fuse_merge_pipelines` (default on), Pipeline 3 is usually not a standalone pipeline: MERGE_GROUP_BY folds into the downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
+
 ### UNGROUPED_AGGREGATE
 
 ```mermaid
@@ -325,6 +327,27 @@ graph LR
 ```
 
 MERGE_TOP_N merges local top-N results.
+
+> With `fuse_merge_pipelines` (default on), Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its own. See [Merge fusion](#merge-fusion) below.
+
+### Merge fusion
+
+By default (`fuse_merge_pipelines = true`) an eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
+
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., HASH_GROUP_BY]"] -->|"FULL"| P2["Pipeline 2<br/>[PARTITION]"]
+    P2 -->|"FULL"| P3["Pipeline 3<br/>[MERGE_GROUP_BY -> sink]"]
+```
+
+Eligibility is decided at plan time by `mark_fusable_merge_pipelines` (`sirius_physical_plan_generator.cpp`), which walks parent pointers from each merge to the first downstream sink. Fusion applies when that path is unary and streaming and the sink accepts a fused input; the merge's own `build_pipelines` override then adds itself to the current pipeline and recurses into its child (which still cuts the upstream boundary). The following are **excluded** and keep the standalone merge boundary:
+
+- **Join / CTE / delim terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `LEFT/RIGHT_DELIM_JOIN`) — multiple inputs or bespoke sink wiring.
+- **Partition sinks** (`PARTITION`, `SORT_PARTITION`) — require complete upstream input in one task.
+- **Delim-owned merges** — the distinct-root merge inside a delim join needs its dedicated sink wiring.
+- **`MERGE_AGGREGATE`** (ungrouped aggregate) — uses a different partial-result handoff.
+
+Total-input structural sinks such as `ORDER_BY`, `TOP_N`, and an outer `GROUP BY` **are** fusable: they already buffer their full input, so folding the merge in does not change when they observe complete data.
 
 ### DELIM_JOIN
 

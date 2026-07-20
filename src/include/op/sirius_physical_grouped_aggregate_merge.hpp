@@ -125,6 +125,13 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   bool sink_order_dependent() const override { return false; }
 
+  //! Allow this merge to join its downstream pipeline.
+  void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
+  [[nodiscard]] bool fuse_into_parent() const noexcept { return _fuse_into_parent; }
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   //! Decide the partition count for the upstream PARTITION operator that feeds this merge
@@ -132,6 +139,9 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+ private:
+  bool _fuse_into_parent = false;
 };
 
 }  // namespace op

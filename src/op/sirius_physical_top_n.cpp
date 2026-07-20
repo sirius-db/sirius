@@ -22,6 +22,8 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/concatenate.hpp>
@@ -198,6 +200,19 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
     std::move(output_data),
     telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
   return std::make_unique<pipelineable_operator_data>(outputs);
+}
+
+void sirius_physical_top_n_merge::build_pipelines(pipeline::sirius_pipeline& current,
+                                                  pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  // The child sink still creates the upstream pipeline boundary.
+  if (_fuse_into_parent) {
+    D_ASSERT(children.size() == 1);
+    meta_pipeline.get_state().add_pipeline_operator(current, *this);
+    children[0]->build_pipelines(current, meta_pipeline);
+    return;
+  }
+  sirius_physical_operator::build_pipelines(current, meta_pipeline);
 }
 
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* top_n)

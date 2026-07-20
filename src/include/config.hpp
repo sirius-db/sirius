@@ -60,6 +60,9 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
+  // Fuse eligible GROUP BY and TOP_N merges into their downstream pipeline.
+  static bool FUSE_MERGE_PIPELINES;
+
   // For duckdb scan task:
   //  - the default batch size
   // TODO: probably want to use sirius config for this value
