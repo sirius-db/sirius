@@ -499,16 +499,20 @@ class HivePartitionDataset {
     hive_dir = fs::temp_directory_path() /
                ("sirius_hive_count_star_" + std::to_string(next_fixture_id.fetch_add(1)));
     fs::remove_all(hive_dir);
-    fs::create_directories(hive_dir / "h/year=2024");
-    fs::create_directories(hive_dir / "h/year=2025");
+    fs::create_directories(hive_dir / "h/year=2024/month=01");
+    fs::create_directories(hive_dir / "h/year=2024/month=02");
+    fs::create_directories(hive_dir / "h/year=2025/month=01");
     fs::create_directories(hive_dir / "flat");
 
-    fs::copy_file(
-      y2024_m01, hive_dir / "h/year=2024/part_01.parquet", fs::copy_options::overwrite_existing);
-    fs::copy_file(
-      y2024_m02, hive_dir / "h/year=2024/part_02.parquet", fs::copy_options::overwrite_existing);
-    fs::copy_file(
-      y2025_m01, hive_dir / "h/year=2025/part_01.parquet", fs::copy_options::overwrite_existing);
+    fs::copy_file(y2024_m01,
+                  hive_dir / "h/year=2024/month=01/data.parquet",
+                  fs::copy_options::overwrite_existing);
+    fs::copy_file(y2024_m02,
+                  hive_dir / "h/year=2024/month=02/data.parquet",
+                  fs::copy_options::overwrite_existing);
+    fs::copy_file(y2025_m01,
+                  hive_dir / "h/year=2025/month=01/data.parquet",
+                  fs::copy_options::overwrite_existing);
 
     fs::copy_file(
       y2024_m01, hive_dir / "flat/part_2024_01.parquet", fs::copy_options::overwrite_existing);
@@ -517,7 +521,7 @@ class HivePartitionDataset {
     fs::copy_file(
       y2025_m01, hive_dir / "flat/part_2025_01.parquet", fs::copy_options::overwrite_existing);
 
-    hive_path   = (hive_dir / "h/year=*/*.parquet").string();
+    hive_path   = (hive_dir / "h/year=*/month=*/*.parquet").string();
     flat_path   = (hive_dir / "flat/*.parquet").string();
     config_path = hive_dir / "watchdog_integration.yaml";
     write_watchdog_config(config_path);
