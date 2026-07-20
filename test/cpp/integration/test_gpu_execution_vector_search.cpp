@@ -68,13 +68,13 @@ void expect_error(duckdb::Connection& con, const std::string& sql, const std::st
 }  // namespace
 
 TEST_CASE_METHOD(VectorSearchFixture,
-                 "sirius_knn_search - ANN (IVF-Flat) l2sq matches exact top-k",
+                 "sirius_knn_search - ANN (IVF-Flat) l2 matches exact top-k",
                  "[integration][gpu_execution][array][vss][vector_search]")
 {
   run_ok("CREATE TABLE vs_l2 AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(5000) t(i);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'vs_l2', tier => 'gpu', format => 'duckdb');");
-  run_ok("SELECT * FROM sirius_create_ann_index('vs_l2', 'vec', metric => 'l2sq', n_lists => 16);");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_l2', 'vec', metric => 'l2', n_lists => 16);");
 
   // Exact reference (gpu off) vs. sirius_knn_search (gpu on), id set, several k.
   auto exact_ids = [&](const std::string& q, int k) {
@@ -117,7 +117,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'vs_probe', tier => 'gpu', format => 'duckdb');");
   run_ok(
-    "SELECT * FROM sirius_create_ann_index('vs_probe', 'vec', metric => 'l2sq', n_lists => 16);");
+    "SELECT * FROM sirius_create_ann_index('vs_probe', 'vec', metric => 'l2', n_lists => 16);");
 
   const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
 
@@ -363,7 +363,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'vs_schema', tier => 'gpu', format => 'duckdb');");
   run_ok(
-    "SELECT * FROM sirius_create_ann_index('vs_schema', 'vec', metric => 'l2sq', n_lists => 4);");
+    "SELECT * FROM sirius_create_ann_index('vs_schema', 'vec', metric => 'l2', n_lists => 4);");
 
   const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
 
@@ -508,7 +508,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
     REQUIRE(it->second.size() > 1);
   }
 
-  run_ok("SELECT * FROM sirius_create_ann_index('vs_mc', 'vec', metric => 'l2sq', n_lists => 16);");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_mc', 'vec', metric => 'l2', n_lists => 16);");
 
   const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
   auto exact_ids           = [&](int k) {
@@ -596,7 +596,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   {
     run_ok("SELECT * FROM pin_table(name => 'idx_err', tier => 'gpu', format => 'duckdb');");
     // default_ivf_n_lists chooses the list count; the build must succeed.
-    run_ok("SELECT * FROM sirius_create_ann_index('idx_err', 'vec', metric => 'l2sq');");
+    run_ok("SELECT * FROM sirius_create_ann_index('idx_err', 'vec', metric => 'l2');");
 
     // n_probes large enough to probe every default list -> exact top-k.
     con->Query("SET gpu_execution = false;");
