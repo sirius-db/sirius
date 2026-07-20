@@ -499,16 +499,20 @@ class HivePartitionDataset {
     hive_dir = fs::temp_directory_path() /
                ("sirius_hive_count_star_" + std::to_string(next_fixture_id.fetch_add(1)));
     fs::remove_all(hive_dir);
-    fs::create_directories(hive_dir / "h/year=2024");
-    fs::create_directories(hive_dir / "h/year=2025");
+    fs::create_directories(hive_dir / "h/year=2024/month=01");
+    fs::create_directories(hive_dir / "h/year=2024/month=02");
+    fs::create_directories(hive_dir / "h/year=2025/month=01");
     fs::create_directories(hive_dir / "flat");
 
-    fs::copy_file(
-      y2024_m01, hive_dir / "h/year=2024/part_01.parquet", fs::copy_options::overwrite_existing);
-    fs::copy_file(
-      y2024_m02, hive_dir / "h/year=2024/part_02.parquet", fs::copy_options::overwrite_existing);
-    fs::copy_file(
-      y2025_m01, hive_dir / "h/year=2025/part_01.parquet", fs::copy_options::overwrite_existing);
+    fs::copy_file(y2024_m01,
+                  hive_dir / "h/year=2024/month=01/data.parquet",
+                  fs::copy_options::overwrite_existing);
+    fs::copy_file(y2024_m02,
+                  hive_dir / "h/year=2024/month=02/data.parquet",
+                  fs::copy_options::overwrite_existing);
+    fs::copy_file(y2025_m01,
+                  hive_dir / "h/year=2025/month=01/data.parquet",
+                  fs::copy_options::overwrite_existing);
 
     fs::copy_file(
       y2024_m01, hive_dir / "flat/part_2024_01.parquet", fs::copy_options::overwrite_existing);
@@ -517,7 +521,7 @@ class HivePartitionDataset {
     fs::copy_file(
       y2025_m01, hive_dir / "flat/part_2025_01.parquet", fs::copy_options::overwrite_existing);
 
-    hive_path   = (hive_dir / "h/year=*/*.parquet").string();
+    hive_path   = (hive_dir / "h/year=*/month=*/*.parquet").string();
     flat_path   = (hive_dir / "flat/*.parquet").string();
     config_path = hive_dir / "watchdog_integration.yaml";
     write_watchdog_config(config_path);
@@ -690,8 +694,51 @@ class HivePartitionDataset {
   bool is_hive_available = false;  // No extension is needed for DuckDB hive partition discovery.
 };
 
+class EscapedHivePartitionDataset {
+ public:
+  EscapedHivePartitionDataset()
+  {
+    auto const source =
+      get_project_root() /
+      "test/cpp/integration/data/hive_partitioned/year=2024/month=01/data.parquet";
+    REQUIRE(fs::exists(source));
+
+    static std::atomic<std::uint64_t> next_fixture_id{0};
+    hive_dir = fs::temp_directory_path() /
+               ("sirius_hive_unescape_" + std::to_string(next_fixture_id.fetch_add(1)));
+    fs::remove_all(hive_dir);
+
+    copy_partition(source, hive_dir / "space/city=New%20York/data.parquet");
+    copy_partition(source, hive_dir / "slash/city=Path%2FTeam/data.parquet");
+    copy_partition(source, hive_dir / "percent/city=100%25/data.parquet");
+    copy_partition(source, hive_dir / "multiple/city=Los%20Angeles%2FWest/data.parquet");
+    copy_partition(source, hive_dir / "two_columns/city=New%20York/dept=R%26D/data.parquet");
+    copy_partition(source, hive_dir / "plain/city=Boston/data.parquet");
+  }
+
+  ~EscapedHivePartitionDataset() { fs::remove_all(hive_dir); }
+
+  std::string partition_scan(fs::path const& relative_glob) const
+  {
+    return "read_parquet(" + sql_string_literal((hive_dir / relative_glob).string()) +
+           ", hive_partitioning=true)";
+  }
+
+ private:
+  static void copy_partition(fs::path const& source, fs::path const& target)
+  {
+    fs::create_directories(target.parent_path());
+    fs::copy_file(source, target, fs::copy_options::overwrite_existing);
+  }
+
+  fs::path hive_dir;
+};
+
 class GPUExecutionHivePartitionFixture : public MultiFormatFixtureBase,
                                          public HivePartitionDataset {};
+
+class GPUExecutionEscapedHivePartitionFixture : public MultiFormatFixtureBase,
+                                                public EscapedHivePartitionDataset {};
 
 TEST_CASE("gpu_execution hive partition watchdog child runner",
           "[.][gpu_execution][hive_partition][watchdog_child]")
@@ -777,6 +824,47 @@ TEST_CASE_METHOD(HivePartitionDataset,
   {
     require_gpu_rows("SELECT year FROM " + hive_scan() + " ORDER BY year",
                      {{"2024"}, {"2024"}, {"2025"}});
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionEscapedHivePartitionFixture,
+                 "gpu_execution hive partition - unescapes varchar partition values",
+                 "[integration][gpu_execution][hive_partition][unescape]")
+{
+  SECTION("projects a space-escaped partition column")
+  {
+    compare_gpu_vs_cpu("SELECT city FROM " + partition_scan("space/city=*/*.parquet"));
+  }
+
+  SECTION("projects data and a space-escaped partition column")
+  {
+    compare_gpu_vs_cpu("SELECT id, city FROM " + partition_scan("space/city=*/*.parquet"));
+  }
+
+  SECTION("unescapes a slash")
+  {
+    compare_gpu_vs_cpu("SELECT city FROM " + partition_scan("slash/city=*/*.parquet"));
+  }
+
+  SECTION("unescapes a percent sign")
+  {
+    compare_gpu_vs_cpu("SELECT city FROM " + partition_scan("percent/city=*/*.parquet"));
+  }
+
+  SECTION("unescapes multiple sequences in one value")
+  {
+    compare_gpu_vs_cpu("SELECT city FROM " + partition_scan("multiple/city=*/*.parquet"));
+  }
+
+  SECTION("unescapes every partition column")
+  {
+    compare_gpu_vs_cpu("SELECT id, city, dept FROM " +
+                       partition_scan("two_columns/city=*/dept=*/*.parquet"));
+  }
+
+  SECTION("preserves an unescaped partition value")
+  {
+    compare_gpu_vs_cpu("SELECT id, city FROM " + partition_scan("plain/city=*/*.parquet"));
   }
 }
 
