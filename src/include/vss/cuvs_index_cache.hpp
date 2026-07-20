@@ -147,13 +147,13 @@ class cuvs_index_cache {
   /// @c reservation->get_memory_resource() set as the current device resource,
   /// then move the same reservation into @ref insert to pin it.
   ///
-  /// Delegates to @c memory_reservation_manager::request_reservation, which
-  /// blocks until the GPU tier can satisfy the request (it does not return null);
-  /// the returned reservation is therefore always valid.
+  /// Non-blocking, and pinned to @p preferred_gpu: the index must be reserved on
+  /// the same GPU that holds the table's pinned data.
   ///
   /// \param bytes         Estimated GPU footprint of the index to build
-  /// \param preferred_gpu Device id to prefer (>= 0), or -1 for any GPU in the tier
-  /// \returns The non-null GPU reservation
+  /// \param preferred_gpu Device id that holds the table's data (>= 0); null is
+  ///                      returned for a negative id or an unknown device
+  /// \returns The GPU reservation on @p preferred_gpu, or null if it cannot satisfy @p bytes
   [[nodiscard]] std::unique_ptr<cucascade::memory::reservation> reserve_index_memory(
     std::size_t bytes, int preferred_gpu = -1);
 
@@ -172,17 +172,13 @@ class cuvs_index_cache {
   /// Find a pinned index by its auto-routing identity, i.e., the first entry whose
   /// metadata matches (@p table, @p column, @p metric). This is the lookup a
   /// search recognizer uses to decide whether a query can use ANN. Returns
-  /// nullptr if no pinned index covers that column under that metric. Metrics
-  /// are compared up to canonicalization: L2SqrtExpanded/L2SqrtUnexpanded fold
-  /// together, so a query's unexpanded metric still matches an index built expanded.
+  /// nullptr if no pinned index covers that column under that metric.
   [[nodiscard]] const pinned_index_entry* find_by_column(std::string_view table,
                                                          std::string_view column,
                                                          cuvs::distance::DistanceType metric) const;
 
   /// Remove every entry whose auto-routing identity matches (@p table, @p column,
-  /// @p metric), freeing each index and releasing its reservation. Metrics are
-  /// compared up to canonicalization, matching @ref find_by_column. Returns the
-  /// number of entries removed.
+  /// @p metric), freeing each index and releasing its reservation.
   std::size_t erase_by_column(std::string_view table,
                               std::string_view column,
                               cuvs::distance::DistanceType metric);

@@ -60,12 +60,11 @@ std::unique_ptr<cucascade::memory::reservation> cuvs_index_cache::reserve_index_
 {
   using namespace cucascade::memory;
   if (preferred_gpu >= 0) {
-    any_memory_space_in_tier_with_preference strategy(Tier::GPU,
-                                                      static_cast<std::size_t>(preferred_gpu));
-    return _reservation_manager.request_reservation(strategy, bytes);
+    if (auto* space = _reservation_manager.get_memory_space(Tier::GPU, preferred_gpu)) {
+      return space->make_reservation_or_null(bytes);
+    }
   }
-  any_memory_space_in_tier strategy(Tier::GPU);
-  return _reservation_manager.request_reservation(strategy, bytes);
+  return nullptr;
 }
 
 void cuvs_index_cache::insert(std::string name,
