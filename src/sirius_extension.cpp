@@ -1374,7 +1374,7 @@ struct CreateAnnIndexData : public TableFunctionData {
   std::string column_name;
   std::string index_name;                ///< management name (for a future drop_ann_index)
   std::string index_type  = "ivf_flat";  ///< lowercased; only "ivf_flat" supported today
-  std::string metric      = "l2sq";      ///< lowercased; one of l2sq / cosine
+  std::string metric      = "l2";        ///< lowercased; one of l2 / cosine
   std::string schema_name = "main";
   int64_t n_lists         = 0;  ///< IVF-Flat list count; 0 = choose a default at build time
   bool finished           = false;
@@ -1417,8 +1417,8 @@ static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
     throw BinderException("sirius_create_ann_index: unsupported index_type '" + result->index_type +
                           "'; only 'ivf_flat' is supported");
   }
-  if (result->metric != "l2sq" && result->metric != "cosine") {
-    throw BinderException("sirius_create_ann_index: metric must be one of 'l2sq', 'cosine', got '" +
+  if (result->metric != "l2" && result->metric != "cosine") {
+    throw BinderException("sirius_create_ann_index: metric must be one of 'l2', 'cosine', got '" +
                           result->metric + "'");
   }
   if (result->n_lists < 0) {
@@ -1474,6 +1474,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   std::string const& table  = qname.name;
   auto& entry_base = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
   auto& entry      = entry_base.Cast<DuckTableEntry>();
+  auto& entry_catalog     = entry.ParentCatalog().GetName();
+  auto& entry_schema      = entry.ParentSchema().name;
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
   auto const schema_types = columns.GetColumnTypes();
@@ -1508,8 +1510,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   int const target_gpu = target_space->get_device_id();
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu}};
 
-  auto& scan_mgr  = sirius_ctx->get_scan_manager();
-  const auto* pin = scan_mgr.find_pinned_entry(entry.name);
+  auto& scan_mgr = sirius_ctx->get_scan_manager();
+  const auto* pin =
+    scan_mgr.find_pinned_entry_for_duckdb_table(entry_catalog, entry_schema, entry.name);
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
                                 "' must be pinned on the GPU tier before building an index");
