@@ -32,6 +32,8 @@ class host_data_representation;
 namespace sirius::vss {
 
 struct vector_search_request {
+  std::string catalog;                      ///< Resolved catalog of the pinned table.
+  std::string schema;                       ///< Resolved schema of the pinned table.
   std::string table_name;                   ///< GPU-pinned base table to search.
   std::string column_name;                  ///< FLOAT[dim] vector column.
   std::string metric;                       ///< Distance metric.
