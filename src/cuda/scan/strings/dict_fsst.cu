@@ -54,6 +54,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius::cuda::scan {
@@ -585,6 +587,14 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
     p.dict_count           = hdr.dict_count;
     p.mode                 = hdr.mode;
     p.string_lengths_width = hdr.string_lengths_width;
+    // The device struct (dict_fsst_pre_desc) uses uint32_t base_off, so the
+    // cross-segment cumulative offset must fit in 32 bits. If it doesn't,
+    // the static_cast would silently truncate, making the kernel write at
+    // wrong offsets in the (correctly-sized) buffer. Throw instead.
+    if (total_dict_entries > std::numeric_limits<uint32_t>::max()) {
+      throw std::runtime_error(
+        "dict_fsst: total_dict_entries exceeds UINT32_MAX (device struct base_off is 32-bit)");
+    }
     p.base_off             = static_cast<uint32_t>(total_dict_entries);
     p.valid                = 1;
     total_dict_entries += hdr.dict_count + 1u;
