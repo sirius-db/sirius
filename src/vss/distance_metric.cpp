@@ -31,7 +31,7 @@ cuvs::distance::DistanceType enn_distance_type_from_metric(std::string_view metr
 
 cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metric)
 {
-  if (metric == "l2sq") { return cuvs::distance::DistanceType::L2SqrtExpanded; }
+  if (metric == "l2") { return cuvs::distance::DistanceType::L2SqrtExpanded; }
   if (metric == "cosine") { return cuvs::distance::DistanceType::CosineExpanded; }
   throw std::invalid_argument("ann_distance_type_from_metric: unsupported metric '" +
                               std::string(metric) + "'");
