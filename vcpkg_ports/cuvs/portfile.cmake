@@ -50,7 +50,8 @@ vcpkg_from_github(
   HEAD_REF
   main)
 
-# cutlass 4.1.0 pinned via cpp/cmake/patches/cutlass_override.json (header-only).
+# cutlass 4.1.0 pinned via cpp/cmake/patches/cutlass_override.json
+# (header-only).
 vcpkg_from_github(
   OUT_SOURCE_PATH
   CUTLASS_PATH
@@ -63,7 +64,8 @@ vcpkg_from_github(
   HEAD_REF
   main)
 
-# cuco: rapids-cmake always_download forces a clone. Same pin as vcpkg_ports/cudf.
+# cuco: rapids-cmake always_download forces a clone. Same pin as
+# vcpkg_ports/cudf.
 vcpkg_from_github(
   OUT_SOURCE_PATH
   CUCO_PATH
@@ -106,8 +108,7 @@ vcpkg_cmake_configure(
   -DCUDA_STATIC_RUNTIME=ON
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
   "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include"
-  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include"
-)
+  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include")
 
 vcpkg_cmake_install()
 
