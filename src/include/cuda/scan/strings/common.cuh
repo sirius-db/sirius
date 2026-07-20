@@ -25,13 +25,13 @@
 #pragma once
 
 #include "cuda/scan/detail/warp.cuh"
+#include "cuda/gpu_config.hpp"
 
 #include <rmm/detail/error.hpp>
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -150,7 +150,10 @@ struct prepared_fsst {
   std::vector<fsst_chunk_desc> gather_chunks;   ///< pass-1 phase-C + pass-2 (per chunk)
   std::vector<fsst_decoder_compact> decoders;   ///< symbol tables (per segment)
   std::vector<uint32_t> row_starts;             ///< prefix sum of FSST row counts
-  uint32_t total_fsst_row_count = 0;
+  // size_t (not uint32_t): the cross-segment sum of row_count can exceed
+  // UINT32_MAX on large tables, which would wrap and undersize the device
+  // buffers (d_comp_offsets at gpu_decode_strings.cu:203).
+  size_t total_fsst_row_count = 0;
 };
 
 struct prepared_dict_fsst {
@@ -169,36 +172,19 @@ struct prepared_dict_fsst {
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
 //! @brief Target CTA count for chunking segments: two full device waves at
-//! STRINGS_BLOCK_DIM threads. Cached per device. Uses the adaptive gpu_config
-//! singleton which queries hardware capabilities once and derives the CTA
-//! count from the number of compute units and per-SM occupancy.
+//! STRINGS_BLOCK_DIM threads. Delegates to the gpu_config singleton, which
+//! queries hardware capabilities ONCE at startup (cudaGetDeviceProperties) and
+//! derives the CTA count from the number of compute units and per-SM occupancy.
+//! The SIRIUS_TARGET_CTAS env override is applied inside the singleton, so this
+//! function just returns the cached value.
 inline uint32_t get_target_ctas()
 {
-  int device = 0;
-  RMM_CUDA_TRY(cudaGetDevice(&device));
-  static std::atomic<int> cached_device{-1};
-  static std::atomic<uint32_t> cached{0};
-  // Acquire-load both: the writer publishes cached before cached_device (see
-  // below), so if we observe a matching device we are guaranteed to also
-  // observe the published CTA count.
-  if (cached_device.load(std::memory_order_acquire) == device)
-    return cached.load(std::memory_order_acquire);
-  cudaDeviceProp prop;
-  RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
-  int occupancy_blocks = std::max(prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM, 1);
-
-  // Check for SIRIUS_TARGET_CTAS env override; otherwise use 2x SM occupancy.
-  uint32_t target = static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
-  if (auto* env = std::getenv("SIRIUS_TARGET_CTAS")) {
-    int v = std::atoi(env);
-    if (v > 0) target = static_cast<uint32_t>(v);
-  }
-  // Publish the computed value BEFORE the device id so a concurrent caller
-  // never observes cached_device matching its device while cached is still 0
-  // (which would yield a stale/uninitialized CTA count).
-  cached.store(target, std::memory_order_release);
-  cached_device.store(device, std::memory_order_release);
-  return cached.load();
+  // The singleton is thread-safe after initialization (static local in
+  // instance()). It caches the hardware query and the env override, so this
+  // is a plain read — no per-call cudaGetDeviceProperties, no per-call env
+  // parse. The old code did both redundantly on every call (plus its own
+  // device-matched cache, which the singleton supersedes).
+  return sirius::cuda::gpu_config::instance().target_ctas();
 }
 
 //! @brief Expand segment descriptors into smaller chunks.

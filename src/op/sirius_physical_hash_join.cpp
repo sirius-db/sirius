@@ -500,16 +500,25 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return task_creation_hint{TaskCreationHint::READY, this};
       } else if (build_size == 0) {
         // No build batch available yet, hint to wait for build input data.
+        if (!build_port->src_pipeline) {
+          throw std::runtime_error("hash_join: null build src_pipeline in WAITING hint");
+        }
         auto* producer = &build_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       } else {
         // Build batch is available but no probe batch yet, hint to wait for probe input data.
+        if (!probe_port->src_pipeline) {
+          throw std::runtime_error("hash_join: null probe src_pipeline in WAITING hint");
+        }
         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
     } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULING ||
                _hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
       // Hash table is currently being built, hint to wait for it to be ready.
+      if (!probe_port->src_pipeline) {
+        throw std::runtime_error("hash_join: null probe src_pipeline in SCHEDULING hint");
+      }
       auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
@@ -624,7 +633,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
       left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
       right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
-      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+      // Overflow-safe accumulation: left * right can overflow size_t when both
+      // sides have many batches. The wrapped total would make
+      // current_partition_index >= num_batches_to_process true prematurely,
+      // silently dropping join output rows. Cap at SIZE_MAX.
+      size_t left_n  = left_batch_ids[i].size();
+      size_t right_n = right_batch_ids[i].size();
+      size_t product = left_n > SIZE_MAX / right_n ? SIZE_MAX : left_n * right_n;
+      num_batches_to_process = num_batches_to_process > SIZE_MAX - product
+                                 ? SIZE_MAX
+                                 : num_batches_to_process + product;
     }
   }
 

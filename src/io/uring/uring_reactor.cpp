@@ -1082,15 +1082,31 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     std::for_each(copying_slots.begin(), copying_slots.end(), [&](auto& s) {
       int si     = s.slot_index();
       auto& slot = slots[si];
+      bool copy_ok = false;
       if (slot.event) {
-        SIRIUS_TRY_AND_LOG_EXCEPTION(slot.event->synchronize(),
-                                     "uring_reactor: failed to synchronize copy event for slot {}",
-                                     si);
+        try {
+          slot.event->synchronize();
+          copy_ok = true;
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_ERROR("uring_reactor: failed to synchronize copy event for slot {}: {}",
+                           si, e.what());
+        }
       }
-      // The synchronize above waited for the H2D copy to finish, so the device
-      // memory is now valid — credit the chunk whose completion was deferred
-      // from reap_cqes (poll_copy_completions is not called during shutdown).
-      slot.on_complete(slot.bytes_read);
+      if (copy_ok) {
+        // The synchronize above waited for the H2D copy to finish, so the
+        // device memory is now valid — credit the chunk whose completion was
+        // deferred from reap_cqes (poll_copy_completions is not called during
+        // shutdown).
+        slot.on_complete(slot.bytes_read);
+      } else {
+        // The H2D copy failed (synchronize threw) or no event was recorded.
+        // The old code fell through to on_complete regardless, crediting the
+        // chunk as if the copy succeeded — the caller then consumed invalid
+        // device memory (silent data corruption). Report the error instead so
+        // the chunk's manager handles the failure, matching the rest_reactor
+        // shutdown drain path which calls report_error on the same failure.
+        slot.on_error(std::make_error_code(std::errc::io_error));
+      }
     });
 
     // Mark all pending requests as canceled so their managers don't wait indefinitely for

@@ -370,8 +370,16 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           if (spec.kind == aggregate_kind::AVG) {
-            auto count_scalar = make_numeric_scalar_with_value<int64_t>(
-              cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+            // The COUNT partial for AVG must count NON-NULL values, matching
+            // the SUM partial (cudf::reduce excludes nulls). The old code used
+            // view.num_rows() (total rows including nulls), so make_avg_column
+            // divided SUM(excluding nulls) / COUNT(including nulls) —
+            // incorrectly small for any AVG(col) over a nullable column with
+            // nulls. Use cudf::make_count_aggregation (excludes nulls, same
+            // as the standalone COUNT path above) for symmetry.
+            auto count_agg = cudf::make_count_aggregation<cudf::reduce_aggregation>();
+            auto count_scalar =
+              cudf::reduce(col, *count_agg, cudf::data_type(cudf::type_id::INT64), std::nullopt, stream);
             cols.push_back(cudf::make_column_from_scalar(*count_scalar, 1, stream));
           }
           break;

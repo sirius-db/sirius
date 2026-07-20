@@ -67,15 +67,17 @@ bool env_bool(char const* name, bool default_val) {
 
 }  // namespace
 
-// NOTE: gpu_config::instance() and the gpu_config singleton are useful
-// infrastructure for runtime hardware detection and adaptive tuning, but they
-// are NOT yet wired into the live execution paths. The engine still derives
-// tuning parameters through the legacy hardcoded/env-var code paths (e.g.
-// get_target_ctas in cuda/scan/strings/common.cuh, the partition sizing in
-// sirius_physical_partition). Do not assume that constructing or consulting
-// gpu_config has any effect on query execution today. This is kept as
-// forward-looking plumbing; when it is wired in, the legacy paths should be
-// migrated to read from this singleton instead.
+// gpu_config::instance() is wired into the live execution paths:
+//   - operator_params::init_adaptive() (sirius_config.cpp) reads hw info from
+//     the singleton instead of calling cudaMemGetInfo/cudaGetDeviceProperties
+//     directly.
+//   - get_target_ctas() (cuda/scan/strings/common.cuh) delegates to
+//     gpu_config::instance().target_ctas().
+//   - sirius_physical_partition::determine_num_partitions() delegates to
+//     gpu_config::instance().hash_join_partitions().
+// The singleton queries hardware ONCE at first use and caches the result, so
+// the engine makes a single cudaMemGetInfo + cudaGetDeviceProperties pair at
+// startup instead of N redundant calls across the hot paths.
 gpu_config const& gpu_config::instance() {
   static gpu_config inst;
   return inst;

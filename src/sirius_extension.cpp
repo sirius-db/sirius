@@ -1740,6 +1740,51 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetPerQueryMemoryBudget(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  // Accept either a raw byte count (BIGINT) or a human-readable string like
+  // "4GB" parsed by DuckDB's VARCHAR-to-BIGINT. 0 = unlimited.
+  uint64_t budget = 0;
+  if (parameter.type().id() == LogicalTypeId::VARCHAR) {
+    auto const str = parameter.GetValue<std::string>();
+    if (!str.empty()) {
+      // Parse with suffix support (K/M/G) — reuse the same convention as
+      // SIRIUS_MAX_BATCH_BYTES. A plain number is bytes.
+      char* end = nullptr;
+      double n = std::strtod(str.c_str(), &end);
+      if (end == str.c_str()) {
+        throw InvalidInputException("per_query_memory_budget: cannot parse '%s'", str);
+      }
+      if (end && *end) {
+        switch (*end) {
+          case 'k': case 'K': n *= 1024; break;
+          case 'm': case 'M': n *= 1024 * 1024; break;
+          case 'g': case 'G': n *= 1024ULL * 1024 * 1024; break;
+          default: break;
+        }
+      }
+      budget = static_cast<uint64_t>(n);
+    }
+  } else {
+    budget = parameter.GetValue<int64_t>();
+  }
+  params->per_query_memory_budget = budget;
+  // Also set the env var so the GPU pipeline executor (which does not have
+  // direct access to operator_params) can read the budget via getenv. This
+  // bridges the SET command to the executor's proactive budget check.
+  if (budget > 0) {
+    // setenv with a stringified value (bytes). The executor parses K/M/G
+    // suffixes, but a raw byte count is also accepted.
+    auto budget_str = std::to_string(budget);
+    ::setenv("SIRIUS_PER_QUERY_MEMORY_BUDGET", budget_str.c_str(), 1);
+  } else {
+    ::unsetenv("SIRIUS_PER_QUERY_MEMORY_BUDGET");
+  }
+  SIRIUS_LOG_DEBUG("Updated config PER_QUERY_MEMORY_BUDGET to {} bytes", budget);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1980,6 +2025,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
     SetEnablePinnedZoneMapPruning);
+
+  config.AddExtensionOption(
+    "per_query_memory_budget",
+    "Per-query GPU memory budget in bytes (0 = unlimited). When non-zero, a query whose cumulative "
+    "GPU memory exceeds this triggers OOM reschedule instead of exhausting the pool. Accepts "
+    "suffixes K/M/G, e.g. '4G'",
+    LogicalType::VARCHAR,
+    Value("0"),
+    SetPerQueryMemoryBudget);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

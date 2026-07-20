@@ -157,6 +157,17 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
       }
       case duckdb::CompressionType::COMPRESSION_DICT_FSST: {
         auto p                    = prepare_dict_fsst(run, stream, mr);
+        // The device struct (dict_fsst_desc) uses uint32_t offset bases, so
+        // the cross-run cumulative sizes must fit in 32 bits. If they don't,
+        // the static_cast<uint32_t> would silently truncate, pointing the
+        // kernel at the wrong cross-run prefix (wrong dictionary entries /
+        // decoders → silent wrong string data). Throw instead.
+        if (prep_dict_fsst.byte_offsets.size() > std::numeric_limits<uint32_t>::max() ||
+            prep_dict_fsst.decoders.size() > std::numeric_limits<uint32_t>::max()) {
+          throw std::runtime_error(
+            "gpu_decode_strings: dict_fsst cross-run offset base exceeds UINT32_MAX "
+            "(too many dictionary entries across runs)");
+        }
         auto const bo_base        = static_cast<uint32_t>(prep_dict_fsst.byte_offsets.size());
         auto const dec_base       = static_cast<uint32_t>(prep_dict_fsst.decoders.size());
         auto const predecode_base = prep_dict_fsst.total_predecode_bytes;

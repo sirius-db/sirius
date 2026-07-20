@@ -16,6 +16,7 @@
 
 #include "sirius_config.hpp"
 
+#include "cuda/gpu_config.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "yaml_reader.hpp"
@@ -192,6 +193,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
              opt.dynamic_filter_domain_coverage_threshold);
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
+  r.optional("per_query_memory_budget", yaml::bytes(opt.per_query_memory_budget));
   r.reject_unknown();
 }
 
@@ -377,18 +379,22 @@ void read_yaml_vec(const YAML::Node& node, std::vector<T>& out)
 // ================ operator_params::init_adaptive ================= //
 
 void sirius::operator_params::init_adaptive() {
-  // Query total VRAM via the CUDA/HIP runtime (shimmed on ROCm).
-  // On NVIDIA: cudaMemGetInfo. On ROCm: hipMemGetInfo (via shim).
-  std::size_t free_bytes = 0, total_bytes = 0;
-  auto err = cudaMemGetInfo(&free_bytes, &total_bytes);
-  if (err != cudaSuccess || total_bytes == 0) {
+  // Delegate hardware detection to the gpu_config singleton — it queries
+  // cudaMemGetInfo + cudaGetDeviceProperties ONCE at first use and caches
+  // the result. The old code called cudaMemGetInfo + cudaGetDeviceProperties
+  // directly here, and get_target_ctas() / determine_num_partitions() made
+  // their own redundant calls. Now all paths read from the singleton.
+  auto const& cfg = sirius::cuda::gpu_config::instance();
+  auto const& hw = cfg.hardware();
+
+  std::size_t const vram = hw.total_vram;
+  if (vram == 0) {
     // No GPU available or query failed — keep defaults.
     return;
   }
 
   std::size_t const MB = 1024 * 1024;
   std::size_t const GB = 1024ULL * 1024 * 1024;
-  std::size_t const vram = total_bytes;
 
   // Helper: clamp a value to [min, max]
   auto clamp = [](std::size_t v, std::size_t lo, std::size_t hi) {
@@ -400,13 +406,7 @@ void sirius::operator_params::init_adaptive() {
   // Target: min(10% of VRAM, 4x L2 cache). On MI300 (256MB L2): min(19GB,
   // 1GB) = 1GB. On 8GB consumer (64MB L2): min(800MB, 256MB) = 256MB.
   // Clamped to [128MB, 4GB].
-  int device = 0;
-  cudaDeviceProp prop;
-  std::size_t l2_cache = 0;
-  if (cudaGetDevice(&device) == cudaSuccess &&
-      cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
-    l2_cache = static_cast<std::size_t>(prop.l2CacheSize);
-  }
+  std::size_t l2_cache = hw.l2_cache_size;
   std::size_t l2_aware_batch = l2_cache > 0 ? l2_cache * 4 : vram / 10;
   scan_task_batch_size = clamp(std::min(vram / 10, l2_aware_batch), 128 * MB, 4 * GB);
 

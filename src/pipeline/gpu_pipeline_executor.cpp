@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <format>
 #include <memory>
@@ -183,6 +184,45 @@ void gpu_pipeline_executor::manager_loop()
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
+    // Per-query GPU memory budget (proactive single-task guard): when
+    // SIRIUS_PER_QUERY_MEMORY_BUDGET is set (bytes, supports K/M/G suffixes)
+    // and this task's estimated reservation exceeds it, throw
+    // oom_reschedule_exception BEFORE attempting the reservation. This catches
+    // a single giant task (e.g. a huge hash-join build) before it exhausts the
+    // RMM pool and starves concurrent queries. 0 / unset = unlimited.
+    // The SET command (sirius.per_query_memory_budget) is the user-facing
+    // knob; this env-var read is the executor-side enforcement (the executor
+    // does not have direct access to operator_params, so the SET handler
+    // also sets this env var to bridge the two).
+    if (bytes_needs > 0) {
+      static uint64_t const budget = []() -> uint64_t {
+        char const* env = std::getenv("SIRIUS_PER_QUERY_MEMORY_BUDGET");
+        if (!env || !*env) return 0;
+        char* end = nullptr;
+        double n = std::strtod(env, &end);
+        if (end == env) return 0;
+        if (end && *end) {
+          switch (*end) {
+            case 'k': case 'K': n *= 1024; break;
+            case 'm': case 'M': n *= 1024 * 1024; break;
+            case 'g': case 'G': n *= 1024ULL * 1024 * 1024; break;
+            default: break;
+          }
+        }
+        return static_cast<uint64_t>(n);
+      }();
+      if (budget > 0 && bytes_needs > budget) {
+        SIRIUS_LOG_WARN(
+          "GPU Pipeline Executor: task {} reservation estimate {} bytes exceeds "
+          "per-query memory budget {} bytes — triggering OOM reschedule",
+          gpu_task->get_task_id(), bytes_needs, budget);
+        throw oom_reschedule_exception(
+          nullptr,
+          gpu_task->get_resume_operator_index(),
+          "per-query memory budget exceeded");
+      }
+    }
+
     auto reservation = _memory_space->make_reservation(bytes_needs);
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",

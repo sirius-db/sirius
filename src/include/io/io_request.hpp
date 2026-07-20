@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <source_location>
 #include <stdexcept>
 #include <string>
@@ -67,12 +68,23 @@ class request_manager {
 
   ~request_manager()
   {
-    if (has_error()) {
-      promise.set_exception(first_exception);
+    // Acquire the mutex so the report_error() write to first_exception is
+    // visible (happens-before) here. The old code read first_exception without
+    // synchronization — the reactor's clean_up_and_shutdown calls report_error
+    // on the worker thread while the last shared_ptr<request_manager> can be
+    // destroyed on the consumer thread, a data race (UB) that could read a
+    // half-constructed exception_ptr or set the promise twice.
+    std::exception_ptr exc;
+    {
+      std::lock_guard<std::mutex> lk(exception_mutex_);
+      if (has_error()) { exc = first_exception; }
+    }
+    if (exc) {
+      promise.set_exception(exc);
     } else {
-      assert(bytes_read >= bytes_requested &&
+      assert(bytes_read.load(std::memory_order_acquire) >= bytes_requested &&
              "All chunks completed but fewer bytes were read than requested");
-      assert(chunks_completed == total_chunks &&
+      assert(chunks_completed.load(std::memory_order_acquire) == total_chunks &&
              "All chunks completed but total chunks completed does not match expected");
       promise.set_value(bytes_requested);
     }
@@ -87,6 +99,7 @@ class request_manager {
   void report_error(const error_type& e, std::source_location loc = std::source_location::current())
   {
     if (!error_reported.exchange(true, std::memory_order_acq_rel)) {
+      std::lock_guard<std::mutex> lk(exception_mutex_);
       first_exception = to_exception_ptr(e, loc);
     }
   }
@@ -126,6 +139,7 @@ class request_manager {
   std::atomic<std::size_t> bytes_read{0};
   std::atomic<std::size_t> chunks_completed{0};
   std::atomic<bool> error_reported{false};
+  std::mutex exception_mutex_;  // guards first_exception (written in report_error, read in ~dtor)
   std::exception_ptr first_exception{nullptr};
   exec::promise<size_t> promise;
 };
