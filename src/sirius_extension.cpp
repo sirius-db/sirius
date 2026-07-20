@@ -97,6 +97,7 @@ extern "C" int cudaProfilerStop();
 #include "vss/distance_metric.hpp"
 #include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/vector_join.hpp"
 #include "vss/vector_search.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
@@ -1581,7 +1582,7 @@ struct SiriusVectorSearchBindData : public TableFunctionData {
   duckdb::vector<sirius::logical_type> reader_types;
 };
 
-struct SiriusVectorSearchGlobalState : public GlobalTableFunctionState {
+struct SiriusStreamedResultGlobalStat : public GlobalTableFunctionState {
   std::unique_ptr<cucascade::host_data_representation> host_repr;
   std::unique_ptr<sirius::op::result::host_table_chunk_reader> reader;
 };
@@ -1726,7 +1727,7 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
     throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
   }
 
-  auto state       = make_uniq<SiriusVectorSearchGlobalState>();
+  auto state       = make_uniq<SiriusStreamedResultGlobalStat>();
   state->host_repr = sirius::vss::run_vector_search(*sirius_ctx, bind_data.req);
   state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(
     context, *state->host_repr, bind_data.reader_types);
@@ -1737,7 +1738,164 @@ static void SiriusVectorSearchFunction(ClientContext& context,
                                        TableFunctionInput& data_p,
                                        DataChunk& output)
 {
-  auto& state = data_p.global_state->Cast<SiriusVectorSearchGlobalState>();
+  auto& state = data_p.global_state->Cast<SiriusStreamedResultGlobalStat>();
+  state.reader->get_next_chunk(output);
+}
+
+struct SiriusVectorJoinBindData : public TableFunctionData {
+  sirius::vss::vector_join_request req;
+  // Output column types + trailing distance, for the host_table_chunk_reader.
+  duckdb::vector<sirius::logical_type> reader_types;
+};
+
+static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
+                                                     TableFunctionBindInput& input,
+                                                     vector<LogicalType>& return_types,
+                                                     vector<string>& names)
+{
+  auto result = make_uniq<SiriusVectorJoinBindData>();
+  auto& req   = result->req;
+
+  // Required params
+  if (input.inputs.size() < 4 || input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
+      input.inputs[2].IsNull() || input.inputs[3].IsNull()) {
+    throw BinderException(
+      "sirius_knn_join requires four non-NULL positional arguments: "
+      "probe_table, probe_vector_column, corpus_table, corpus_vector_column");
+  }
+  req.probe_table          = input.inputs[0].ToString();
+  req.probe_vector_column  = input.inputs[1].ToString();
+  req.corpus_table         = input.inputs[2].ToString();
+  req.corpus_vector_column = input.inputs[3].ToString();
+
+  // Optional params' default values
+  req.metric              = "l2sq";
+  req.k                   = 10;
+  std::string schema_name = "main";
+  std::vector<std::string> probe_out_arg, corpus_out_arg;
+  for (auto& kv : input.named_parameters) {
+    auto const key = StringUtil::Lower(kv.first);
+    if (kv.second.IsNull()) {
+      throw BinderException("sirius_knn_join: named parameter '" + kv.first + "' cannot be NULL");
+    }
+    if (key == "k") {
+      req.k = kv.second.GetValue<int64_t>();
+    } else if (key == "metric") {
+      req.metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "schema_name") {
+      schema_name = kv.second.ToString();
+    } else if (key == "probe_output_columns") {
+      for (auto const& col : ListValue::GetChildren(kv.second)) {
+        probe_out_arg.push_back(col.ToString());
+      }
+    } else if (key == "corpus_output_columns") {
+      for (auto const& col : ListValue::GetChildren(kv.second)) {
+        corpus_out_arg.push_back(col.ToString());
+      }
+    }
+  }
+  if (req.k <= 0) { throw BinderException("sirius_knn_join: k must be >= 1"); }
+  if (req.metric != "l2sq" && req.metric != "cosine") {
+    throw BinderException("sirius_knn_join: metric must be one of 'l2sq', 'cosine', got '" +
+                          req.metric + "'");
+  }
+
+  // Resolve a table's catalog entry, verify the FLOAT[dim] vector column, default
+  // its output columns to every base-table column, and emit those columns into
+  // the return schema as `<resolved_table>.<col>`.
+  auto resolve_and_emit = [&](const std::string& raw_table,
+                              const std::string& vec_col,
+                              const std::vector<std::string>& out_arg,
+                              std::string& resolved_name,
+                              int64_t& dim,
+                              std::vector<std::string>& out_req) {
+    auto const qname          = QualifiedName::Parse(raw_table);
+    std::string const catalog = qname.catalog;
+    std::string const schema  = !qname.schema.empty() ? qname.schema : schema_name;
+    auto& entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, qname.name)
+                    .Cast<DuckTableEntry>();
+    resolved_name           = entry.name;
+    auto const& columns     = entry.GetColumns();
+    auto const schema_names = columns.GetColumnNames();
+    auto const schema_types = columns.GetColumnTypes();
+
+    auto type_of = [&](const std::string& col) -> const LogicalType& {
+      for (std::size_t i = 0; i < schema_names.size(); ++i) {
+        if (schema_names[i] == col) { return schema_types[i]; }
+      }
+      throw BinderException("sirius_knn_join: column '" + col + "' not found in table '" +
+                            resolved_name + "'");
+    };
+
+    auto const& vec_type = type_of(vec_col);
+    if (vec_type.id() != LogicalTypeId::ARRAY ||
+        ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
+      throw BinderException("sirius_knn_join: column '" + vec_col +
+                            "' must be a FLOAT[N] array column");
+    }
+    dim = static_cast<int64_t>(ArrayType::GetSize(vec_type));
+
+    // Default to all columns if not provided
+    out_req = out_arg.empty() ? std::vector<std::string>(schema_names.begin(), schema_names.end())
+                              : out_arg;
+    for (auto const& col : out_req) {
+      return_types.push_back(type_of(col));
+      names.push_back(resolved_name + "." + col);
+    }
+  };
+
+  int64_t probe_dim = 0, corpus_dim = 0;
+  resolve_and_emit(req.probe_table,
+                   req.probe_vector_column,
+                   probe_out_arg,
+                   req.probe_table,
+                   probe_dim,
+                   req.probe_output_columns);
+  resolve_and_emit(req.corpus_table,
+                   req.corpus_vector_column,
+                   corpus_out_arg,
+                   req.corpus_table,
+                   corpus_dim,
+                   req.corpus_output_columns);
+
+  if (probe_dim != corpus_dim) {
+    throw BinderException("sirius_knn_join: probe column '" + req.probe_vector_column +
+                          "' is FLOAT[" + std::to_string(probe_dim) + "] but corpus column '" +
+                          req.corpus_vector_column + "' is FLOAT[" + std::to_string(corpus_dim) +
+                          "]");
+  }
+  req.dim = probe_dim;
+
+  return_types.push_back(LogicalType::FLOAT);
+  names.push_back("distance");
+
+  result->reader_types = sirius::from_duckdb_vec(return_types);
+  return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> SiriusVectorJoinInit(ClientContext& context,
+                                                                 TableFunctionInitInput& input)
+{
+  nvtx3::scoped_range nvtx_range{"SiriusVectorJoinInit"};
+  auto& bind_data = input.bind_data->Cast<SiriusVectorJoinBindData>();
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("sirius_knn_join requires the Sirius context to be initialized");
+  }
+
+  auto state       = make_uniq<SiriusStreamedResultGlobalStat>();
+  state->host_repr = sirius::vss::run_vector_join(*sirius_ctx, bind_data.req);
+  state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(
+    context, *state->host_repr, bind_data.reader_types);
+  return std::move(state);
+}
+
+static void SiriusVectorJoinFunction(ClientContext& context,
+                                     TableFunctionInput& data_p,
+                                     DataChunk& output)
+{
+  auto& state = data_p.global_state->Cast<SiriusStreamedResultGlobalStat>();
   state.reader->get_next_chunk(output);
 }
 
@@ -1853,6 +2011,22 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_search.named_parameters["schema_name"]    = LogicalType::VARCHAR;
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);
+
+  // sirius_knn_join(probe_table, probe_col, corpus_table, corpus_col, k =>, metric =>,
+  // probe_output_columns =>, corpus_output_columns =>, schema_name =>)
+  TableFunction vector_join(
+    "sirius_knn_join",
+    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+    SiriusVectorJoinFunction,
+    SiriusVectorJoinBind,
+    SiriusVectorJoinInit);
+  vector_join.named_parameters["k"]                     = LogicalType::BIGINT;
+  vector_join.named_parameters["metric"]                = LogicalType::VARCHAR;
+  vector_join.named_parameters["probe_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);
+  vector_join.named_parameters["corpus_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
+  vector_join.named_parameters["schema_name"]           = LogicalType::VARCHAR;
+  CreateTableFunctionInfo vector_join_info(vector_join);
+  catalog.CreateTableFunction(transaction, vector_join_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
