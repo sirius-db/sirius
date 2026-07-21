@@ -18,6 +18,7 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 
@@ -44,17 +45,24 @@ class pipeline_build_context {
   //!        merge_group_by) get at least num_gpus partitions to spread work.
   explicit pipeline_build_context(
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
-    bool preserve_insertion_order = true,
-    int num_gpus                  = 1)
+    bool preserve_insertion_order   = true,
+    int num_gpus                    = 1,
+    std::vector<int> active_gpu_ids = {})
     : _telemetry_context(std::move(telemetry_context)),
       _preserve_insertion_order(preserve_insertion_order),
-      _num_gpus(num_gpus)
+      _num_gpus(num_gpus),
+      _active_gpu_ids(std::move(active_gpu_ids))
   {
   }
 
   [[nodiscard]] bool preserve_insertion_order() const { return _preserve_insertion_order; }
 
   [[nodiscard]] int num_gpus() const { return _num_gpus; }
+
+  //! Sorted, deduped device ids of the GPUs the query runs on — the same list task_creator routes
+  //! partitions across. Used by broadcast join partitioning to map a probe batch's residence GPU
+  //! back to its partition slot. Empty when built without an engine (tests / single-GPU).
+  [[nodiscard]] const std::vector<int>& active_gpu_ids() const { return _active_gpu_ids; }
 
   [[nodiscard]] const std::shared_ptr<const telemetry::telemetry_context>& telemetry_context() const
   {
@@ -65,6 +73,7 @@ class pipeline_build_context {
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   bool _preserve_insertion_order = true;
   int _num_gpus                  = 1;
+  std::vector<int> _active_gpu_ids;
 };
 
 }  // namespace pipeline

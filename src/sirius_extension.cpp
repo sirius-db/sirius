@@ -1665,6 +1665,14 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
                    params->max_build_hash_table_bytes);
 }
 
+static void SetMaxBroadcastJoinSize(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->max_broadcast_join_size = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MAX_BROADCAST_JOIN_SIZE to {}", params->max_broadcast_join_size);
+}
+
 static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1920,6 +1928,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  config.AddExtensionOption("max_broadcast_join_size",
+                            "Maximum build-side size in bytes for a broadcast join, where the "
+                            "(small) build table is replicated to every GPU instead of "
+                            "hash-partitioned across GPUs",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(sirius::operator_params{}.max_broadcast_join_size),
+                            SetMaxBroadcastJoinSize);
 
   config.AddExtensionOption(
     "mark_join_build_switch_ratio",

@@ -37,6 +37,12 @@ constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  /
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
+constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MB
+
+/// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
+/// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
+/// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
+constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
 
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
@@ -104,6 +110,11 @@ struct operator_params {
   /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
+  /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
+  /// large relative to the build side. See compute_hash_join_partition_strategy.
+  uint64_t max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
 
   /// For STANDARD-mode MARK joins: build the hash table on the left/output side via
   /// cudf::mark_join (instead of on the right side via filtered_join) when the right (probe)

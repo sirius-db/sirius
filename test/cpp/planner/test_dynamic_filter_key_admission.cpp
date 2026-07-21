@@ -533,6 +533,8 @@ hash_join_shapes_fixture make_hash_join_with_shapes(
     /*estimated_cardinality=*/1000,
     sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     sirius::op::dynamic_filter_publish_plan{},
+    sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+    sirius::config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
     std::move(shapes));
   return fixture;
 }

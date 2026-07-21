@@ -61,6 +61,82 @@ class sirius_dynamic_filter_set;
 enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
 enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
 
+//===----------------------------------------------------------------------===//
+// BUILD_PROBE scheduling helpers - BUILD_PROBE keeps one hash table per partition.
+//===----------------------------------------------------------------------===//
+
+/// The action the BUILD_PROBE state machine should take next.
+enum class build_probe_action {
+  schedule_build,  ///< Build the hash table for `partition` (and probe its first batch).
+  schedule_probe,  ///< Probe an already-built `partition` with its next probe batch.
+  wait_for_build,  ///< No schedulable work; a partition is still awaiting its build batch.
+  wait_for_probe,  ///< No schedulable work; awaiting probe batches (or the op is draining).
+  none             ///< No partitions exist / all are destroyed.
+};
+
+/// A single partition's observable state for the scheduling decision.
+struct build_probe_slot_view {
+  BUILD_HASH_TABLE_STATE state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
+  bool has_build_batch         = false;  ///< The build repo holds this partition's build batch.
+  bool has_probe_batch         = false;  ///< The probe repo holds >=1 batch for this partition.
+};
+
+struct build_probe_decision {
+  build_probe_action action = build_probe_action::none;
+  // Set only for schedule_build / schedule_probe — the partition to act on. nullopt for
+  // wait_for_build / wait_for_probe / none, which name no partition (the caller waits on the port's
+  // single upstream producer, shared by every partition).
+  std::optional<std::size_t> partition;
+};
+
+/// Decide the next BUILD_PROBE action from a per-partition snapshot. Prefers scheduling a build for
+/// the first NOT_BUILT partition that has both its build and a probe batch, then probing the first
+/// BUILT partition with probe data; otherwise reports whether it is waiting on build or probe
+/// input.
+[[nodiscard]] build_probe_decision select_build_probe_action(
+  std::vector<build_probe_slot_view> const& slots);
+
+/// Pure decision for how a PARTITION operator should partition its input for a hash join, folding
+/// the natural-count, broadcast-candidacy, and BUILD_PROBE-eligibility logic into one place.
+///
+/// Only the build side drives broadcast / build-probe, so when `is_build_side` is false (right-
+/// family joins are probe-driven) the result is the plain STANDARD-mode natural count.
+///
+/// MARK joins cannot be hash-partitioned across batches (build_has_null must be globally
+/// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
+/// multi-GPU.
+///
+/// BUILD_PROBE eligibility requires: at most one partition per GPU, the per-GPU hash table fits
+/// within `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
+/// hash-partitioned build charges the per-partition average), the build folds to one batch, and the
+/// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
+/// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
+///
+/// Broadcast candidacy: a build is replicate-worthy when it is below the small-table threshold, OR
+/// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
+/// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) — replicating a medium build avoids
+/// shuffling a much larger probe across GPUs.
+[[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
+  uint64_t total_bytes,
+  bool is_build_side,
+  bool build_foldable,
+  int num_gpus,
+  uint64_t hash_partition_bytes,
+  uint64_t max_build_hash_table_bytes,
+  uint64_t max_broadcast_join_size,
+  duckdb::JoinType join_type,
+  HASH_JOIN_MODE join_mode,
+  double estimated_probe_to_build_ratio);
+
+/// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
+/// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
+/// data. Once the probe upstream is finished (`probe_finished`), any slot that is still NOT_BUILT
+/// with a build batch but no probe batch will never be probed and is returned for discard. Returns
+/// empty while the probe side may still deliver data. Pure/unit-testable counterpart of
+/// discard_build_only_slots_if_probe_complete.
+[[nodiscard]] std::vector<std::size_t> broadcast_slots_to_discard(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished);
+
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
@@ -83,6 +159,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     std::size_t estimated_cardinality,
     uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     dynamic_filter_publish_plan dynamic_filter_plan = {},
+    uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
+    uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
     std::vector<dynamic_filter_condition_shape> condition_key_shapes = {});
 
   sirius_physical_hash_join(
@@ -92,7 +170,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     duckdb::vector<sirius::join_condition> cond,
     duckdb::JoinType join_type,
     std::size_t estimated_cardinality,
-    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
+    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES,
+    uint64_t max_broadcast_join_size    = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
 
   duckdb::vector<sirius::join_condition> conditions;
   /**
@@ -175,28 +255,29 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
-  /// @brief This is called by the partition operator to inform the hash join of the number of
-  /// partitions that will be produced by the partition operator, which can be used to make
-  /// decisions about the join execution strategy (e.g., whether to switch to a build-probe strategy
-  /// for small datasets).
-  /// @param num_partitions
-  /// @param build_side_bytes
-  /// @param build_foldable_to_single_batch True when the upstream pipeline can guarantee the
-  ///        build side will arrive as exactly one batch (typically because a downstream
-  ///        build-side CONCAT was configured with concat_all). BUILD_PROBE mode requires
-  ///        the build side to fold into a single batch — when this guarantee is absent the
-  ///        runtime-side build-batch invariant in get_next_task_input_data_for_build_probe
-  ///        would throw on otherwise-valid small-build joins that are still split into
-  ///        multiple batches, so BUILD_PROBE is not entered.
-  void update_join_exec_mode(int num_partitions,
-                             uint64_t build_side_bytes,
-                             bool build_foldable_to_single_batch);
+  /// @brief Called by the upstream PARTITION operator to decide how it should partition its input
+  /// for this join. Computes the partition count / broadcast flag (via
+  /// compute_hash_join_partition_strategy), then applies the join-side side effects atomically
+  /// under op_state_mutex: switching to BUILD_PROBE mode (allocating the per-partition build
+  /// states), marking broadcast, and pre-sizing the build/probe input repositories. Returns the
+  /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
+  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
-  /// @brief True when this join runs in build-then-probe mode (see `update_join_exec_mode`).
+  /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  /// Snapshot each partition's build state and per-partition data availability for the BUILD_PROBE
+  /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
+  std::vector<build_probe_slot_view> snapshot_build_probe_slots();
+
+  /// Broadcast-mode cleanup: once the probe upstream is finished, any NOT_BUILT slot that holds a
+  /// (replicated) build batch but never received probe data is discarded — its build batch is freed
+  /// on its own GPU and the slot is marked DESTROYED so the operator can complete. No-op unless
+  /// `_broadcast`. Must be called with `op_state_mutex` held.
+  void discard_build_only_slots_if_probe_complete();
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -218,21 +299,44 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   bool is_all_inequality_join = true;
 
-  HASH_JOIN_MODE _join_mode                      = HASH_JOIN_MODE::STANDARD;
-  BUILD_HASH_TABLE_STATE _hash_table_build_state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
-  uint64_t _max_build_hash_table_bytes           = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
-  std::unique_ptr<cudf::hash_join> _hash_table;  // hash object to be used in BUILD_PROBE mode
-  std::unique_ptr<cudf::distinct_hash_join>
-    _distinct_hash_table;  // used instead of _hash_table when build keys are proven unique
-  std::unique_ptr<cudf::filtered_join>
-    _filtered_table;  // reusable build-on-right semi-join object for MARK joins in BUILD_PROBE mode
-  bool _build_has_null = false;  // whether the build/right side has a NULL in any join key column;
-                                 // needed for MARK three-valued logic in BUILD_PROBE mode
-  std::optional<::cucascade::read_only_data_batch>
-    _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
-  std::vector<std::unique_ptr<cudf::column>>
-    _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the
-                                // build table
+  HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
+  uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+  // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
+  // operator_params at construction.
+  uint64_t _max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
+  // _num_gpus lives on sirius_physical_partition_consumer_operator (set via set_num_gpus).
+
+  // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
+  // the probe side is streamed unpartitioned.
+  bool _broadcast = false;
+
+  // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
+  // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)
+  // because MARK joins are forced to a single partition / broadcast, so all build batches agree.
+  std::atomic<int> _build_has_null{-1};
+
+  // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
+  // that lives entirely on one GPU . A partition is built once — its
+  // single SCHEDULED build task release-stores BUILT — and then probed by many streamed probe tasks
+  // that only read the table. `build_state` is atomic so get_next_task_hint can observe a slot's
+  // progress without holding op_state_mutex while execute() flips it.
+  struct per_partition_build_state {
+    std::atomic<BUILD_HASH_TABLE_STATE> build_state{BUILD_HASH_TABLE_STATE::NOT_BUILT};
+    std::unique_ptr<cudf::hash_join> hash_table;  // general path (INNER/LEFT/OUTER)
+    std::unique_ptr<cudf::distinct_hash_join>
+      distinct_hash_table;  // used instead of hash_table when build keys are proven unique
+    std::unique_ptr<cudf::filtered_join>
+      filtered_table;  // reusable build-on-right object for MARK/SEMI/ANTI joins
+    std::optional<::cucascade::read_only_data_batch>
+      build_table;  // owned build table, to materialize build-side results at probe time
+    std::vector<std::unique_ptr<cudf::column>>
+      built_table_cast_columns;  // scope holder for columns cast for the build table's lifetime
+    int device_id = -1;          // GPU this slot's table was built on; guards teardown frees
+  };
+  // Sized to num_partitions when BUILD_PROBE is entered (see get_partition_strategy). Elements are
+  // non-movable (atomic member), so the vector is default-constructed at the target size and only
+  // ever whole-move-assigned — never resized or push_back'd — so element moves are never required.
+  std::vector<per_partition_build_state> _partition_build_states;
   //
   // Number of equality conditions after reordering; inequality conditions follow at higher indices.
   std::size_t num_equality_conditions = 0;

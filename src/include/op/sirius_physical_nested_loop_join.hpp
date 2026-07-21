@@ -129,6 +129,10 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
+  //! A nested-loop join always runs on a single partition (its build side is not hash-partitioned),
+  //! so it never broadcasts or enters build-probe.
+  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
