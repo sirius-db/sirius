@@ -25,7 +25,7 @@ model! {
         task::TaskQueue,
         task::TaskManagerLoopThread,
         task::ExecutorThread,
-        batch::Batch,
+        batch::BatchPlacement,
         batch::MemoryTier,
     },
     analyzer: "sirius-telemetry-analyzer",

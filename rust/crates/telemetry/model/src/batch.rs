@@ -1,6 +1,7 @@
 //! Batch placement telemetry.
 //!
-//! A Batch entity tracks one *placement* of a physical data batch: the
+//! A BatchPlacement entity tracks one *placement* of a physical data batch
+//! (a `data_batch` entity, keyed by the shared `batch_id` attribute): the
 //! lifecycle of a batch published to one consuming pipeline's input port.
 //! Fan-out (the same physical batch pushed to multiple consumer ports)
 //! produces one placement per consumer; all placements share the engine's
@@ -89,7 +90,7 @@ state! {
 }
 
 fsm! {
-    Batch {
+    BatchPlacement {
         states: {
             batch_registered: BatchRegistered,
             batch_queued: BatchQueued,

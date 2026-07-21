@@ -50,14 +50,14 @@ use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanose
 use uuid::Uuid;
 
 use crate::{
-    batch::{Batch, BatchExt},
+    batch_placement::{BatchPlacement, BatchPlacementExt},
     data_batch::{DataBatch, DataBatchExt},
     model::{MEMORY_TIER_TYPE_NAME, SiriusModel, SiriusModelBuilder},
     task::{Task, TaskExt},
     view::SiriusModelQueryView,
 };
 
-pub mod batch;
+pub mod batch_placement;
 pub mod data_batch;
 pub mod model;
 pub mod task;
@@ -67,8 +67,8 @@ pub mod view;
 
 const TASK_TYPE_NAME: &str = "task";
 const DATA_BATCH_TYPE_NAME: &str = "data_batch";
-const BATCH_TYPE_NAME: &str = "batch";
-/// The Batch FSM's entry state: instantaneous bookkeeping (queued/packaged
+const BATCH_PLACEMENT_TYPE_NAME: &str = "batch_placement";
+/// The BatchPlacement FSM's entry state: instantaneous bookkeeping (queued/packaged
 /// follow microseconds later), omitted from every aggregated series.
 const BATCH_REGISTERED_STATE: &str = "batch_registered";
 /// Synthetic data-flow series: the processing space (memory reservation) tasks
@@ -156,12 +156,12 @@ impl FsmCollection for DataBatchCollection<'_> {
 
 /// Adapts the model's batch-placement map to the [`FsmCollection`] contract
 /// that [`entities::list_entities`] ranks and pages over.
-struct BatchCollection<'a>(&'a HashMap<Uuid, Batch>);
+struct BatchPlacementCollection<'a>(&'a HashMap<Uuid, BatchPlacement>);
 
-impl FsmCollection for BatchCollection<'_> {
-    type Fsm = Batch;
+impl FsmCollection for BatchPlacementCollection<'_> {
+    type Fsm = BatchPlacement;
 
-    fn fsms(&self) -> impl Iterator<Item = &Batch> {
+    fn fsms(&self) -> impl Iterator<Item = &BatchPlacement> {
         self.0.values()
     }
 }
@@ -200,7 +200,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             resource_group_types = model.resource_group_types.len(),
             tasks = model.tasks.len(),
             data_batches = model.data_batches.len(),
-            batches = model.batches.len(),
+            batches = model.batch_placements.len(),
         );
 
         Ok(Self { model })
@@ -288,7 +288,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         let task_decl = Task::fsm_type_declaration();
         let data_batch_decl = DataBatch::fsm_type_declaration();
-        let batch_decl = Batch::fsm_type_declaration();
+        let batch_decl = BatchPlacement::fsm_type_declaration();
         let fsm_types = [
             (task_decl.name.clone(), task_decl),
             (data_batch_decl.name.clone(), data_batch_decl),
@@ -403,8 +403,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 },
                 query,
             ),
-            Some(BATCH_TYPE_NAME) => entities::list_entities(
-                &BatchCollection(&self.model.batches),
+            Some(BATCH_PLACEMENT_TYPE_NAME) => entities::list_entities(
+                &BatchPlacementCollection(&self.model.batch_placements),
                 |batch| {
                     batch
                         .pipeline_uuid()
@@ -488,7 +488,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                 None,
                             )?;
                         }
-                        Some(BATCH_TYPE_NAME) => {
+                        Some(BATCH_PLACEMENT_TYPE_NAME) => {
                             self.populate_keyed_builder(
                                 &mut builder,
                                 self.filtered_batches(
@@ -621,7 +621,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                 None,
                             )?;
                         }
-                        Some(BATCH_TYPE_NAME) => {
+                        Some(BATCH_PLACEMENT_TYPE_NAME) => {
                             self.populate_keyed_builder(
                                 &mut builder,
                                 self.filtered_batches(
@@ -862,7 +862,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             }
         }
 
-        for batch in view.batches() {
+        for batch in view.batch_placements() {
             for usage in batch.usages() {
                 let resource_id = usage.resource_id();
                 if let Some(builder_indices) = plain_index.get(&resource_id) {
@@ -883,7 +883,9 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 if let Some(builder_indices) = per_state_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
                         let builder = &mut per_state_builders[builder_idx];
-                        if builder.4 == BATCH_TYPE_NAME && batch.matches_filter(&builder.3) {
+                        if builder.4 == BATCH_PLACEMENT_TYPE_NAME
+                            && batch.matches_filter(&builder.3)
+                        {
                             builder.1.try_push(state_name, &usage)?;
                         }
                     }
@@ -1064,7 +1066,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             }
         }
 
-        for batch in view.batches() {
+        for batch in view.batch_placements() {
             for usage in batch.usages() {
                 let resource_id = usage.resource_id();
                 if let Some(builder_indices) = plain_index.get(&resource_id) {
@@ -1084,7 +1086,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 if let Some(builder_indices) = per_state_index.get(&resource_id) {
                     for &builder_idx in builder_indices {
                         let slot = &mut per_state_builders[builder_idx];
-                        if slot.entity_type_name == BATCH_TYPE_NAME
+                        if slot.entity_type_name == BATCH_PLACEMENT_TYPE_NAME
                             && batch.matches_filter(&slot.op_filter)
                         {
                             slot.builder.try_push(state_name, &usage)?;
@@ -1150,8 +1152,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         &self,
         request: CategoricalTimelineRequest<QueryFilter>,
     ) -> AnalyzerResult<DataFlowTimelineBinned> {
-        // Datasets recorded before Batch instrumentation existed: HTTP 501.
-        if self.model.batches.is_empty() {
+        // Datasets recorded before BatchPlacement instrumentation existed: HTTP 501.
+        if self.model.batch_placements.is_empty() {
             return Err(AnalyzerError::Unsupported);
         }
 
@@ -1186,7 +1188,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .collect();
 
         let mut builder = CategoricalTimelineBuilder::new(config);
-        for batch in view.batches() {
+        for batch in view.batch_placements() {
             let Some(operator_id) = batch.pipeline_uuid() else {
                 continue;
             };
@@ -1347,7 +1349,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         if want_bytes {
             measures.push(MeasureDecl {
                 name: MEASURE_BYTES.to_owned(),
-                display_name: "Batch bytes".to_owned(),
+                display_name: "BatchPlacement bytes".to_owned(),
                 quantity: "capacity_bytes".to_owned(),
                 kind: CapacityKind::Occupancy,
             });
@@ -1356,7 +1358,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         Ok(DataFlowTimelineBinned {
             config: config.try_to_secs_relative(epoch)?,
             decl: CategoricalDecl {
-                entity_type_name: Batch::fsm_type_declaration().name,
+                entity_type_name: BatchPlacement::fsm_type_declaration().name,
                 dimension_name: "Memory Tier".to_owned(),
                 dimension_keys,
                 measures,
@@ -1420,16 +1422,16 @@ impl SiriusUiAnalyzer {
         entity_filter: EntityFilter,
         filter: &OperatorFilter,
         time_window: SpanNanoSec,
-    ) -> AnalyzerResult<Vec<&'a Batch>> {
+    ) -> AnalyzerResult<Vec<&'a BatchPlacement>> {
         if let Some(entity_type_name) = entity_filter.entity_type_name
-            && entity_type_name != BATCH_TYPE_NAME
+            && entity_type_name != BATCH_PLACEMENT_TYPE_NAME
         {
             return Err(AnalyzerError::InvalidArgument(format!(
                 "{entity_type_name} is not a known entity type in this model"
             )));
         }
         Ok(view
-            .batches()
+            .batch_placements()
             .filter(|batch| batch.span().is_ok_and(|s| s.intersects(&time_window)))
             .filter(|batch| batch.matches_filter(filter))
             .collect())
@@ -1523,7 +1525,7 @@ impl SiriusUiAnalyzer {
                     Some(db.try_to_ui_fsm(epoch))
                 } else {
                     self.model
-                        .batches
+                        .batch_placements
                         .get(&id)
                         .map(|batch| batch.try_to_ui_fsm(epoch))
                 }

@@ -18,7 +18,7 @@
 
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "telemetry-bridge/gen/batch.rs.h"
+#include "telemetry-bridge/gen/batch_placement.rs.h"
 #include "telemetry-bridge/gen/memory_tier.rs.h"
 #include "telemetry/telemetry_context.hpp"
 
@@ -84,7 +84,7 @@ struct batch_telemetry_registry::impl {
   enum class placement_state { queued, packaged, processing };
 
   struct placement {
-    rust::Box<quent::batch::BatchHandle> handle;
+    rust::Box<quent::batch_placement::BatchPlacementHandle> handle;
     uuid::UUID pipeline_uuid;
     uuid::UUID task_uuid;  // nil until packaged
     placement_state state;
@@ -292,16 +292,17 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
 
   auto& shard = impl_->shard_of(snap->batch_id);
   std::lock_guard lock(shard.mutex);
-  auto handle = quent::batch::create(impl_->context->context(),
-                                     {
-                                       .instance_name    = std::format("batch-{}", snap->batch_id),
-                                       .batch_id         = snap->batch_id,
-                                       .pipeline_uuid    = port.pipeline_uuid,
-                                       .port_uuid        = port.port_uuid,
-                                       .origin           = std::string(origin),
-                                       .tier_resource_id = tier_resource_id,
-                                       .tier_capacity_bytes = snap->bytes,
-                                     });
+  auto handle =
+    quent::batch_placement::create(impl_->context->context(),
+                                   {
+                                     .instance_name       = std::format("batch-{}", snap->batch_id),
+                                     .batch_id            = snap->batch_id,
+                                     .pipeline_uuid       = port.pipeline_uuid,
+                                     .port_uuid           = port.port_uuid,
+                                     .origin              = std::string(origin),
+                                     .tier_resource_id    = tier_resource_id,
+                                     .tier_capacity_bytes = snap->bytes,
+                                   });
   handle->batch_queued({
     .tier_resource_id    = tier_resource_id,
     .tier_capacity_bytes = snap->bytes,
@@ -350,16 +351,17 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
   if (target == nullptr) {
     // First sighting (OOM-reschedule intermediates or otherwise outside the
     // port model): register lazily, then package below.
-    auto handle = quent::batch::create(impl_->context->context(),
-                                       {
-                                         .instance_name = std::format("batch-{}", snap->batch_id),
-                                         .batch_id      = snap->batch_id,
-                                         .pipeline_uuid = consumer_pipeline_uuid,
-                                         .port_uuid     = uuid::new_nil(),
-                                         .origin        = "reschedule_intermediate",
-                                         .tier_resource_id    = tier_resource_id,
-                                         .tier_capacity_bytes = snap->bytes,
-                                       });
+    auto handle =
+      quent::batch_placement::create(impl_->context->context(),
+                                     {
+                                       .instance_name    = std::format("batch-{}", snap->batch_id),
+                                       .batch_id         = snap->batch_id,
+                                       .pipeline_uuid    = consumer_pipeline_uuid,
+                                       .port_uuid        = uuid::new_nil(),
+                                       .origin           = "reschedule_intermediate",
+                                       .tier_resource_id = tier_resource_id,
+                                       .tier_capacity_bytes = snap->bytes,
+                                     });
     placements.push_back(impl::placement{
       .handle           = std::move(handle),
       .pipeline_uuid    = consumer_pipeline_uuid,

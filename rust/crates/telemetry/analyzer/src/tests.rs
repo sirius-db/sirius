@@ -5,8 +5,8 @@
 
 use instrumentation_model::SiriusEvent;
 use instrumentation_model::batch::{
-    BatchConsumed, BatchPackaged, BatchProcessing, BatchQueued, BatchRegistered, BatchTransition,
-    MemoryTier, MemoryTierFinalizing, MemoryTierInitializing, MemoryTierOperating,
+    BatchConsumed, BatchPackaged, BatchPlacementTransition, BatchProcessing, BatchQueued,
+    BatchRegistered, MemoryTier, MemoryTierFinalizing, MemoryTierInitializing, MemoryTierOperating,
     MemoryTierTransition,
 };
 use instrumentation_model::task::{
@@ -32,7 +32,7 @@ use quent_ui::timeline::{
 };
 use uuid::Uuid;
 
-use crate::{SiriusUiAnalyzer, batch::BatchExt};
+use crate::{SiriusUiAnalyzer, batch_placement::BatchPlacementExt};
 
 /// Nanoseconds; also the timestamp of the query's first transition, so the
 /// query epoch. All batch timestamps below are relative to this.
@@ -60,8 +60,8 @@ fn tier_usage(resource_id: Uuid, bytes: u64) -> Option<Usage<MemoryTier>> {
     })
 }
 
-fn batch_event(id: Uuid, ts: u64, seq: u64, state: BatchTransition) -> Event<SiriusEvent> {
-    Event::new(id, ts, SiriusEvent::Batch(FsmEvent { seq, state }))
+fn batch_event(id: Uuid, ts: u64, seq: u64, state: BatchPlacementTransition) -> Event<SiriusEvent> {
+    Event::new(id, ts, SiriusEvent::BatchPlacement(FsmEvent { seq, state }))
 }
 
 fn memory_tier_events(id: Uuid, parent: Uuid, name: &str, bytes: u64) -> Vec<Event<SiriusEvent>> {
@@ -215,7 +215,7 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_a_id,
                 EPOCH,
                 0,
-                BatchTransition::BatchRegistered(BatchRegistered {
+                BatchPlacementTransition::BatchRegistered(BatchRegistered {
                     instance_name: "batch 7".to_string(),
                     batch_id: 7,
                     pipeline_uuid: op1_id,
@@ -228,7 +228,7 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_a_id,
                 EPOCH + 100,
                 1,
-                BatchTransition::BatchQueued(BatchQueued {
+                BatchPlacementTransition::BatchQueued(BatchQueued {
                     tier: tier_usage(gpu_id, 1000),
                 }),
             ),
@@ -237,7 +237,7 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_a_id,
                 EPOCH + 300,
                 2,
-                BatchTransition::BatchQueued(BatchQueued {
+                BatchPlacementTransition::BatchQueued(BatchQueued {
                     tier: tier_usage(host_id, 1000),
                 }),
             ),
@@ -245,7 +245,7 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_a_id,
                 EPOCH + 500,
                 3,
-                BatchTransition::BatchPackaged(BatchPackaged {
+                BatchPlacementTransition::BatchPackaged(BatchPackaged {
                     instance_name: "batch 7".to_string(),
                     task_uuid: task_1_id,
                     tier: tier_usage(host_id, 1000),
@@ -255,7 +255,7 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_a_id,
                 EPOCH + 800,
                 4,
-                BatchTransition::BatchProcessing(BatchProcessing {
+                BatchPlacementTransition::BatchProcessing(BatchProcessing {
                     instance_name: "batch 7".to_string(),
                     task_uuid: task_1_id,
                     tier: tier_usage(gpu_id, 1000),
@@ -265,12 +265,12 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_a_id,
                 EPOCH + 1000,
                 5,
-                BatchTransition::BatchConsumed(BatchConsumed {
+                BatchPlacementTransition::BatchConsumed(BatchConsumed {
                     instance_name: "batch 7".to_string(),
                     reason: "processed".to_string(),
                 }),
             ),
-            batch_event(batch_a_id, EPOCH + 1000, 6, BatchTransition::Exit),
+            batch_event(batch_a_id, EPOCH + 1000, 6, BatchPlacementTransition::Exit),
         ]);
 
         // A batch on a pipeline outside the query.
@@ -280,7 +280,7 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_b_id,
                 EPOCH,
                 0,
-                BatchTransition::BatchRegistered(BatchRegistered {
+                BatchPlacementTransition::BatchRegistered(BatchRegistered {
                     instance_name: "batch 8".to_string(),
                     batch_id: 8,
                     pipeline_uuid: foreign_pipeline,
@@ -293,7 +293,7 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_b_id,
                 EPOCH,
                 1,
-                BatchTransition::BatchQueued(BatchQueued {
+                BatchPlacementTransition::BatchQueued(BatchQueued {
                     tier: tier_usage(disk_id, 500),
                 }),
             ),
@@ -301,12 +301,12 @@ fn fixture(with_batches: bool) -> Fixture {
                 batch_b_id,
                 EPOCH + 900,
                 2,
-                BatchTransition::BatchConsumed(BatchConsumed {
+                BatchPlacementTransition::BatchConsumed(BatchConsumed {
                     instance_name: "batch 8".to_string(),
                     reason: "query_end".to_string(),
                 }),
             ),
-            batch_event(batch_b_id, EPOCH + 900, 3, BatchTransition::Exit),
+            batch_event(batch_b_id, EPOCH + 900, 3, BatchPlacementTransition::Exit),
         ]);
     }
 
@@ -430,8 +430,8 @@ fn ingests_batches_and_memory_tiers() {
     let analyzer = analyzer(&mut fixture);
     let model = &analyzer.model;
 
-    assert_eq!(model.batches.len(), 2);
-    let batch_a = &model.batches[&fixture.batch_a_id];
+    assert_eq!(model.batch_placements.len(), 2);
+    let batch_a = &model.batch_placements[&fixture.batch_a_id];
     assert_eq!(batch_a.batch_id(), Some(7));
     assert_eq!(batch_a.pipeline_uuid(), Some(fixture.op1_id));
     assert_eq!(batch_a.task_uuid(), Some(fixture.task_1_id));
@@ -450,7 +450,7 @@ fn ingests_batches_and_memory_tiers() {
     assert!(
         model.arbitrary_resources.resource_types["memory_tier"]
             .used_by
-            .contains("batch")
+            .contains("batch_placement")
     );
 }
 
@@ -463,7 +463,7 @@ fn data_flow_timeline_bins() {
         .data_flow_timeline(request(fixture.query_id, &[]))
         .expect("data flow timeline");
 
-    assert_eq!(binned.decl.entity_type_name, "batch");
+    assert_eq!(binned.decl.entity_type_name, "batch_placement");
     assert_eq!(binned.decl.dimension_name, "Memory Tier");
     let keys: Vec<&str> = binned
         .decl
@@ -656,7 +656,7 @@ fn batch_keyed_timeline_over_memory_tier_resource() {
         .single_resource_timeline(single_timeline_request(
             fixture.query_id,
             fixture.gpu_id,
-            Some("batch"),
+            Some("batch_placement"),
         ))
         .expect("batch keyed timeline over a memory_tier resource");
     let UiResourceTimeline::BinnedByState(by_state) = response.data else {

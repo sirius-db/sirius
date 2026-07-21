@@ -35,7 +35,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    batch::{Batch, BatchBuilder},
+    batch_placement::{BatchPlacement, BatchPlacementBuilder},
     data_batch::{DataBatch, DataBatchBuilder, DataBatchExt},
     task::{Task, TaskBuilder, TaskExt},
     view::SiriusModelQueryView,
@@ -111,7 +111,7 @@ pub struct SiriusModel {
     pub(crate) arbitrary_resources: InMemoryResources,
     pub(crate) tasks: HashMap<Uuid, Task>,
     pub(crate) data_batches: HashMap<Uuid, DataBatch>,
-    pub(crate) batches: HashMap<Uuid, Batch>,
+    pub(crate) batch_placements: HashMap<Uuid, BatchPlacement>,
     pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
 }
 
@@ -282,7 +282,7 @@ pub struct SiriusModelBuilder {
     arbitrary_resources: InMemoryResourcesBuilder,
     tasks: HashMap<Uuid, TaskBuilder>,
     data_batches: HashMap<Uuid, DataBatchBuilder>,
-    batches: HashMap<Uuid, BatchBuilder>,
+    batch_placements: HashMap<Uuid, BatchPlacementBuilder>,
 }
 
 impl SiriusModelBuilder {
@@ -292,7 +292,7 @@ impl SiriusModelBuilder {
             arbitrary_resources: InMemoryResourcesBuilder::default(),
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
-            batches: HashMap::default(),
+            batch_placements: HashMap::default(),
         })
     }
 
@@ -375,11 +375,11 @@ impl SiriusModelBuilder {
                 data_batch_builder.push(Event::new(id, timestamp, d));
                 Ok(())
             }
-            SiriusEvent::Batch(b) => {
+            SiriusEvent::BatchPlacement(b) => {
                 let batch_builder = self
-                    .batches
+                    .batch_placements
                     .entry(id)
-                    .or_insert_with(|| BatchBuilder::try_new(id).unwrap());
+                    .or_insert_with(|| BatchPlacementBuilder::try_new(id).unwrap());
                 batch_builder.push(Event::new(id, timestamp, b));
                 Ok(())
             }
@@ -685,8 +685,8 @@ impl SiriusModelBuilder {
             }
         }
 
-        let mut batches = HashMap::default();
-        for (batch_id, batch_builder) in self.batches.into_iter() {
+        let mut batch_placements = HashMap::default();
+        for (batch_id, batch_builder) in self.batch_placements.into_iter() {
             let batch = batch_builder.try_build()?;
             for usage in batch.usages() {
                 let resource_type_name = resources
@@ -702,7 +702,7 @@ impl SiriusModelBuilder {
                     set.insert(batch.type_name().to_owned());
                 }
             }
-            batches.insert(batch_id, batch);
+            batch_placements.insert(batch_id, batch);
         }
 
         // Construct the model without group type decls being populated yet, we
@@ -712,7 +712,7 @@ impl SiriusModelBuilder {
             arbitrary_resources: resources,
             tasks,
             data_batches,
-            batches,
+            batch_placements,
             resource_group_types: HashMap::default(),
         };
         let mut resource_group_types = derive_resource_group_types(&temp_model)?;
@@ -737,7 +737,7 @@ impl SiriusModelBuilder {
             arbitrary_resources: temp_model.arbitrary_resources,
             tasks: temp_model.tasks,
             data_batches: temp_model.data_batches,
-            batches: temp_model.batches,
+            batch_placements: temp_model.batch_placements,
             resource_group_types,
         })
     }

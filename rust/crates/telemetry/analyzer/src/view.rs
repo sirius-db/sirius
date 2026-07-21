@@ -26,7 +26,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use uuid::Uuid;
 
 use crate::{
-    batch::{Batch, BatchExt},
+    batch_placement::{BatchPlacement, BatchPlacementExt},
     data_batch::{DataBatch, DataBatchExt},
     model::SiriusModel,
     task::{Task, TaskExt},
@@ -45,7 +45,7 @@ pub(crate) struct SiriusModelQueryView<'a> {
     resource_groups: HashMap<Uuid, &'a RtResourceGroup>,
     tasks: HashMap<Uuid, &'a Task>,
     data_batches: HashMap<Uuid, &'a DataBatch>,
-    batches: HashMap<Uuid, &'a Batch>,
+    batch_placements: HashMap<Uuid, &'a BatchPlacement>,
 }
 
 impl<'a> SiriusModelQueryView<'a> {
@@ -90,7 +90,7 @@ impl<'a> SiriusModelQueryView<'a> {
             resources,
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
-            batches: HashMap::default(),
+            batch_placements: HashMap::default(),
         };
 
         let pipeline_ids = result
@@ -119,8 +119,8 @@ impl<'a> SiriusModelQueryView<'a> {
             .map(|data_batch| (data_batch.id(), data_batch))
             .collect();
 
-        result.batches = model
-            .batches
+        result.batch_placements = model
+            .batch_placements
             .values()
             .filter(|batch| {
                 batch
@@ -177,8 +177,8 @@ impl<'a> SiriusModelQueryView<'a> {
         self.data_batches.values().copied()
     }
 
-    pub(crate) fn batches(&self) -> impl Iterator<Item = &'a Batch> + '_ {
-        self.batches.values().copied()
+    pub(crate) fn batch_placements(&self) -> impl Iterator<Item = &'a BatchPlacement> + '_ {
+        self.batch_placements.values().copied()
     }
 
     pub(crate) fn runtime_resources(&self) -> impl Iterator<Item = &'a RtResource> + '_ {

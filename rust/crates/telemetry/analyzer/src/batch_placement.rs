@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Batch FSM analysis types.
+//! BatchPlacement FSM analysis types.
 //!
 //! Mirrors `task.rs`: with `FsmEvents<T>` providing all generic trait impls
 //! (`Entity`, `Fsm`, `FsmUsages`, `Using`, `FsmTypeDeclaration`), the batch
 //! analyzer is just type aliases plus application-specific helper methods.
 
-use instrumentation_model::batch::BatchTransition as ModelBatchTransition;
+use instrumentation_model::batch::BatchPlacementTransition as ModelBatchPlacementTransition;
 use quent_analyzer::{
     AnalyzerResult, Entity,
     fsm::{
@@ -20,15 +20,15 @@ use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_rela
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
 use uuid::Uuid;
 
-/// The reconstructed Batch FSM: one placement of a physical data batch on a
+/// The reconstructed BatchPlacement FSM: one placement of a physical data batch on a
 /// consuming pipeline's input port.
-pub type Batch = FsmEvents<ModelBatchTransition>;
+pub type BatchPlacement = FsmEvents<ModelBatchPlacementTransition>;
 
-/// Builder for Batch FSMs.
-pub type BatchBuilder = FsmEventsBuilder<ModelBatchTransition>;
+/// Builder for BatchPlacement FSMs.
+pub type BatchPlacementBuilder = FsmEventsBuilder<ModelBatchPlacementTransition>;
 
-/// Application-specific methods on the Batch FSM.
-pub trait BatchExt {
+/// Application-specific methods on the BatchPlacement FSM.
+pub trait BatchPlacementExt {
     /// The engine's process-unique batch id, shared by all placements and
     /// re-packagings of one physical batch.
     fn batch_id(&self) -> Option<u64>;
@@ -41,17 +41,17 @@ pub trait BatchExt {
     fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine>;
 }
 
-impl BatchExt for Batch {
+impl BatchPlacementExt for BatchPlacement {
     fn batch_id(&self) -> Option<u64> {
         self.first_data().and_then(|t| match t {
-            ModelBatchTransition::BatchRegistered(data) => Some(data.batch_id),
+            ModelBatchPlacementTransition::BatchRegistered(data) => Some(data.batch_id),
             _ => None,
         })
     }
 
     fn pipeline_uuid(&self) -> Option<Uuid> {
         self.first_data().and_then(|t| match t {
-            ModelBatchTransition::BatchRegistered(data) => Some(data.pipeline_uuid),
+            ModelBatchPlacementTransition::BatchRegistered(data) => Some(data.pipeline_uuid),
             _ => None,
         })
     }
@@ -61,8 +61,8 @@ impl BatchExt for Batch {
             .iter()
             .rev()
             .find_map(|transition| match &transition.data {
-                ModelBatchTransition::BatchPackaged(data) => Some(data.task_uuid),
-                ModelBatchTransition::BatchProcessing(data) => Some(data.task_uuid),
+                ModelBatchPlacementTransition::BatchPackaged(data) => Some(data.task_uuid),
+                ModelBatchPlacementTransition::BatchProcessing(data) => Some(data.task_uuid),
                 _ => None,
             })
     }
