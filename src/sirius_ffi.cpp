@@ -70,7 +70,7 @@ struct Context::Impl {
     // Substrait scalar/aggregate bindings. Only explicitly configured local extensions opt into
     // unsigned loading; absent both variables, the default trust boundary is unchanged.
     duckdb::DBConfig db_config;
-    const char* parquet_ext = std::getenv("SIRIUS_DUCKDB_PARQUET_EXTENSION");
+    const char* parquet_ext        = std::getenv("SIRIUS_DUCKDB_PARQUET_EXTENSION");
     const char* core_functions_ext = std::getenv("SIRIUS_DUCKDB_CORE_FUNCTIONS_EXTENSION");
     if (parquet_ext != nullptr || core_functions_ext != nullptr) {
       db_config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(true));
