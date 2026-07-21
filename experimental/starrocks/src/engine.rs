@@ -54,7 +54,6 @@ impl SiriusEngine {
     /// failure surfaces here, before any RPC is served. `config` is the optional Sirius YAML path
     /// (built-in defaults when `None`).
     pub fn start(config: Option<PathBuf>) -> Result<Self, String> {
-        Self::configure_duckdb_extensions()?;
         let (request_tx, request_rx) = channel::<ExecuteRequest>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
@@ -69,42 +68,6 @@ impl SiriusEngine {
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
         }
-    }
-
-    /// Points the embedded DuckDB context at the locally built extensions used by Substrait.
-    fn configure_duckdb_extensions() -> Result<(), String> {
-        let build_dir = std::env::var_os("SIRIUS_BUILD_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../..")
-                    .join("build/release")
-            });
-        let extensions = [
-            (
-                "SIRIUS_DUCKDB_PARQUET_EXTENSION",
-                build_dir.join("extension/parquet/parquet.duckdb_extension"),
-            ),
-            (
-                "SIRIUS_DUCKDB_CORE_FUNCTIONS_EXTENSION",
-                build_dir.join("extension/core_functions/core_functions.duckdb_extension"),
-            ),
-        ];
-        for (variable, path) in extensions {
-            if std::env::var_os(variable).is_some() {
-                continue;
-            }
-            if !path.is_file() {
-                return Err(format!(
-                    "DuckDB extension for {variable} is missing at {}",
-                    path.display()
-                ));
-            }
-            // SAFETY: this runs before the engine thread and RPC servers start, so no concurrent
-            // code reads or writes these process environment variables.
-            unsafe { std::env::set_var(variable, &path) };
-        }
-        Ok(())
     }
 }
 
@@ -314,22 +277,10 @@ mod tests {
 
     /// End-to-end: drive a `local_files` parquet plan through the engine actor and read the rows
     /// back. Exercises the dedicated-thread bring-up, the channel round-trip, and GPU execution.
-    /// Requires a GPU and `LD_LIBRARY_PATH` to the built engine (like the `sirius` crate's context
-    /// test); the parquet extension path is set from `SIRIUS_BUILD_DIR` (default mirrors sirius-sys).
+    /// Requires a GPU and `LD_LIBRARY_PATH` to the built engine, like the `sirius` crate's context
+    /// test.
     #[test]
     fn engine_executes_local_files_plan() {
-        // Point the embedded DuckDB at the locally-built parquet extension so it can bind
-        // `parquet_scan`. This is the only context-constructing test in the crate, so no other
-        // thread reads the environment concurrently.
-        if std::env::var_os("SIRIUS_DUCKDB_PARQUET_EXTENSION").is_none() {
-            let manifest = env!("CARGO_MANIFEST_DIR");
-            let build_dir = std::env::var("SIRIUS_BUILD_DIR")
-                .unwrap_or_else(|_| format!("{manifest}/../../build/release"));
-            let parquet = format!("{build_dir}/extension/parquet/parquet.duckdb_extension");
-            // SAFETY: set before the engine thread brings up the context; no other thread reads it.
-            unsafe { std::env::set_var("SIRIUS_DUCKDB_PARQUET_EXTENSION", parquet) };
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rows.parquet");
         let schema = Arc::new(Schema::new(vec![
