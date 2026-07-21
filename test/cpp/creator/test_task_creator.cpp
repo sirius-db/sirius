@@ -256,7 +256,7 @@ class test_fixture {
   duckdb::DuckDB db;
   duckdb::Connection con;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
-  pipeline::pipeline_build_context build_ctx{true};
+  pipeline::pipeline_build_context build_ctx{nullptr, true};
   task_scheduler pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
 };
@@ -615,7 +615,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   auto data_repo = std::make_unique<cucascade::shared_data_repository>();
 
 //   // Add data to the repository so it's not empty
-//   auto batch = std::make_shared<cucascade::data_batch>(1, nullptr);
+//   auto batch = cucascade::data_batch::make(1, nullptr);
 //   data_repo->add_data_batch(batch);
 
 //   mock_pipeline_builder::setup_operator_with_pipeline_port(
@@ -635,8 +635,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   auto data_repo2 = std::make_unique<cucascade::shared_data_repository>();
 
 //   // Add data to both repositories
-//   data_repo1->add_data_batch(std::make_shared<cucascade::data_batch>(1, nullptr));
-//   data_repo2->add_data_batch(std::make_shared<cucascade::data_batch>(1, nullptr));
+//   data_repo1->add_data_batch(cucascade::data_batch::make(1, nullptr));
+//   data_repo2->add_data_batch(cucascade::data_batch::make(1, nullptr));
 
 //   mock_pipeline_builder::setup_operator_with_pipeline_port(
 //     op, "input1", MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
@@ -658,7 +658,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   auto data_repo2 = std::make_unique<cucascade::shared_data_repository>();
 
 //   // Add data only to first repository
-//   data_repo1->add_data_batch(std::make_shared<cucascade::data_batch>(1, nullptr));
+//   data_repo1->add_data_batch(cucascade::data_batch::make(1, nullptr));
 //   // data_repo2 is empty
 
 //   mock_pipeline_builder::setup_operator_with_pipeline_port(
@@ -827,7 +827,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   auto data_repo2 = std::make_unique<cucascade::shared_data_repository>();
 
 //   // Add data to PIPELINE port's repo
-//   data_repo1->add_data_batch(std::make_shared<cucascade::data_batch>(1, nullptr));
+//   data_repo1->add_data_batch(cucascade::data_batch::make(1, nullptr));
 
 //   // Create a mock pipeline that is finished for FULL barrier
 //   auto mock_pipeline = fixture.create_mock_pipeline();
@@ -855,7 +855,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   auto data_repo2 = std::make_unique<cucascade::shared_data_repository>();
 
 //   // Add data to PIPELINE port's repo
-//   data_repo1->add_data_batch(std::make_shared<cucascade::data_batch>(1, nullptr));
+//   data_repo1->add_data_batch(cucascade::data_batch::make(1, nullptr));
 
 //   // Create a mock pipeline that is NOT finished for FULL barrier
 //   auto mock_pipeline = fixture.create_mock_pipeline();

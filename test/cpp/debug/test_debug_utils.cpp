@@ -32,8 +32,8 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -69,7 +69,8 @@ TEST_CASE("debug_schema produces output without throwing", "[debug_utils]")
   columns.push_back(std::move(col_b));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_schema(*batch, stream, {"col_a", "col_b"}));
@@ -101,7 +102,8 @@ TEST_CASE("debug_schema with no column names uses defaults", "[debug_utils]")
   columns.push_back(std::move(col_b));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // No col_names argument -- uses default "col[N]" naming
@@ -134,7 +136,8 @@ TEST_CASE("debug_nulls produces output without throwing", "[debug_utils]")
   columns.push_back(std::move(col_b));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_nulls(*batch, stream, {"col_a", "col_b"}));
@@ -164,7 +167,8 @@ TEST_CASE("debug_schema handles empty batch (0 rows)", "[debug_utils]")
   columns.push_back(std::move(col_b));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_schema(*batch, stream));
@@ -217,7 +221,8 @@ TEST_CASE("debug_nulls reports correct null counts for columns with nulls", "[de
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // debug_nulls should not throw and should report 2 nulls in its log output
@@ -357,7 +362,8 @@ TEST_CASE("debug_head on multi-type numeric batch (ALIGNED)", "[debug_utils]")
   columns.push_back(std::move(col_f64));
   columns.push_back(std::move(col_bool));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_head(
@@ -385,7 +391,8 @@ TEST_CASE("debug_head CSV format produces output without throwing", "[debug_util
   columns.push_back(std::move(col_a));
   columns.push_back(std::move(col_b));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(
@@ -410,7 +417,8 @@ TEST_CASE("debug_head clamps N to row count without throwing", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // N=100 but only 3 rows -- should clamp silently (D-12)
@@ -435,7 +443,8 @@ TEST_CASE("debug_head on empty batch prints note without throwing", "[debug_util
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_head(*batch, 10, stream));
@@ -478,7 +487,8 @@ TEST_CASE("debug_head shows NULL for null positions", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_head(*batch, 5, stream, sirius::DebugFormat::ALIGNED, {"val"}));
@@ -521,7 +531,8 @@ TEST_CASE("debug_stats on numeric columns produces output without throwing", "[d
   columns.push_back(std::move(col_f32));
   columns.push_back(std::move(col_f64));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_stats(*batch, stream, {"i32", "i64", "f32", "f64"}));
@@ -548,7 +559,8 @@ TEST_CASE("debug_stats skips BOOL column as non-numeric", "[debug_utils]")
   columns.push_back(std::move(col_i32));
   columns.push_back(std::move(col_bool));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_stats(*batch, stream, {"nums", "flags"}));
@@ -573,7 +585,8 @@ TEST_CASE("debug_stats on all-NULL numeric column shows NULL", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // All 5 rows are null -- min, max, sum should all display as "NULL" (D-10)
@@ -598,7 +611,8 @@ TEST_CASE("debug_stats on empty batch prints note without throwing", "[debug_uti
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_stats(*batch, stream));
@@ -637,7 +651,8 @@ TEST_CASE("debug_head on STRING column shows string values", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"str_col"}));
@@ -662,7 +677,8 @@ TEST_CASE("debug_head on STRING column truncates with max_string_len", "[debug_u
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // max_string_len=10 will truncate the long string
@@ -689,7 +705,8 @@ TEST_CASE("debug_head on DECIMAL64 column shows scaled values", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"price"}));
@@ -717,7 +734,8 @@ TEST_CASE("debug_head on TIMESTAMP_MICROSECONDS column shows calendar format", "
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"ts"}));
@@ -745,7 +763,8 @@ TEST_CASE("debug_head on DATE column shows date format", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_head(*batch, 3, stream, sirius::DebugFormat::ALIGNED, {"dt"}));
@@ -785,7 +804,8 @@ TEST_CASE("debug_head on mixed batch with all supported types", "[debug_utils]")
   columns.push_back(std::move(col_ts));
   columns.push_back(std::move(col_dt));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_head(
@@ -826,7 +846,8 @@ TEST_CASE("debug_head on STRING column with nulls shows NULL", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(
@@ -851,7 +872,8 @@ TEST_CASE("debug_checksum on numeric column produces output without throwing", "
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_checksum(*batch, stream, {"nums"}));
@@ -883,7 +905,8 @@ TEST_CASE("debug_checksum on multi-type batch produces per-column output", "[deb
   columns.push_back(std::move(col_str));
   columns.push_back(std::move(col_dec));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_checksum(*batch, stream, {"i32", "str", "dec"}));
@@ -907,7 +930,8 @@ TEST_CASE("debug_checksum on empty batch prints note without throwing", "[debug_
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_checksum(*batch, stream));
@@ -933,7 +957,8 @@ TEST_CASE("debug_checksum on all-NULL column produces zero checksum", "[debug_ut
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   REQUIRE_NOTHROW(sirius::debug_checksum(*batch, stream, {"all_null"}));
@@ -975,7 +1000,8 @@ TEST_CASE("debug_diff identical batches reports no diffs", "[debug_utils]")
     columns.push_back(std::move(col_a));
     columns.push_back(std::move(col_b));
     auto table = std::make_unique<cudf::table>(std::move(columns));
-    return sirius::make_data_batch(std::move(table), *space, stream);
+    return sirius::make_data_batch(
+      std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   };
 
   auto batch_a = make_batch();
@@ -1007,7 +1033,8 @@ TEST_CASE("debug_diff column count mismatch logs schema mismatch", "[debug_utils
   cols_a.push_back(std::move(col_a1));
   cols_a.push_back(std::move(col_a2));
   auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
-  auto batch_a = sirius::make_data_batch(std::move(table_a), *space, stream);
+  auto batch_a = sirius::make_data_batch(
+    std::move(table_a), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   // batch_b: 1 column (INT32)
   auto col_b1 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1015,7 +1042,8 @@ TEST_CASE("debug_diff column count mismatch logs schema mismatch", "[debug_utils
   std::vector<std::unique_ptr<cudf::column>> cols_b;
   cols_b.push_back(std::move(col_b1));
   auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
-  auto batch_b = sirius::make_data_batch(std::move(table_b), *space, stream);
+  auto batch_b = sirius::make_data_batch(
+    std::move(table_b), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   REQUIRE(batch_a != nullptr);
   REQUIRE(batch_b != nullptr);
@@ -1042,7 +1070,8 @@ TEST_CASE("debug_diff column type mismatch logs schema mismatch", "[debug_utils]
   std::vector<std::unique_ptr<cudf::column>> cols_a;
   cols_a.push_back(std::move(col_a));
   auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
-  auto batch_a = sirius::make_data_batch(std::move(table_a), *space, stream);
+  auto batch_a = sirius::make_data_batch(
+    std::move(table_a), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   // batch_b: 1 column (INT64, values {1,2,3})
   auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int64_t>>(
@@ -1050,7 +1079,8 @@ TEST_CASE("debug_diff column type mismatch logs schema mismatch", "[debug_utils]
   std::vector<std::unique_ptr<cudf::column>> cols_b;
   cols_b.push_back(std::move(col_b));
   auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
-  auto batch_b = sirius::make_data_batch(std::move(table_b), *space, stream);
+  auto batch_b = sirius::make_data_batch(
+    std::move(table_b), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   REQUIRE(batch_a != nullptr);
   REQUIRE(batch_b != nullptr);
@@ -1077,7 +1107,8 @@ TEST_CASE("debug_diff row count mismatch logs row count mismatch", "[debug_utils
   std::vector<std::unique_ptr<cudf::column>> cols_a;
   cols_a.push_back(std::move(col_a));
   auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
-  auto batch_a = sirius::make_data_batch(std::move(table_a), *space, stream);
+  auto batch_a = sirius::make_data_batch(
+    std::move(table_a), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   // batch_b: 1 column (INT32, 5 rows)
   auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1085,7 +1116,8 @@ TEST_CASE("debug_diff row count mismatch logs row count mismatch", "[debug_utils
   std::vector<std::unique_ptr<cudf::column>> cols_b;
   cols_b.push_back(std::move(col_b));
   auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
-  auto batch_b = sirius::make_data_batch(std::move(table_b), *space, stream);
+  auto batch_b = sirius::make_data_batch(
+    std::move(table_b), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   REQUIRE(batch_a != nullptr);
   REQUIRE(batch_b != nullptr);
@@ -1112,7 +1144,8 @@ TEST_CASE("debug_diff value differences reports per-column diff counts", "[debug
   std::vector<std::unique_ptr<cudf::column>> cols_a;
   cols_a.push_back(std::move(col_a));
   auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
-  auto batch_a = sirius::make_data_batch(std::move(table_a), *space, stream);
+  auto batch_a = sirius::make_data_batch(
+    std::move(table_a), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   // batch_b: 1 column (INT32, 5 rows: {1, 99, 3, 4, 99})
   auto col_b = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1120,7 +1153,8 @@ TEST_CASE("debug_diff value differences reports per-column diff counts", "[debug
   std::vector<std::unique_ptr<cudf::column>> cols_b;
   cols_b.push_back(std::move(col_b));
   auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
-  auto batch_b = sirius::make_data_batch(std::move(table_b), *space, stream);
+  auto batch_b = sirius::make_data_batch(
+    std::move(table_b), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   REQUIRE(batch_a != nullptr);
   REQUIRE(batch_b != nullptr);
@@ -1190,12 +1224,14 @@ TEST_CASE("debug_diff with null differences detects null position diffs", "[debu
   std::vector<std::unique_ptr<cudf::column>> cols_a;
   cols_a.push_back(std::move(col_a));
   auto table_a = std::make_unique<cudf::table>(std::move(cols_a));
-  auto batch_a = sirius::make_data_batch(std::move(table_a), *space, stream);
+  auto batch_a = sirius::make_data_batch(
+    std::move(table_a), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   std::vector<std::unique_ptr<cudf::column>> cols_b;
   cols_b.push_back(std::move(col_b));
   auto table_b = std::make_unique<cudf::table>(std::move(cols_b));
-  auto batch_b = sirius::make_data_batch(std::move(table_b), *space, stream);
+  auto batch_b = sirius::make_data_batch(
+    std::move(table_b), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   REQUIRE(batch_a != nullptr);
   REQUIRE(batch_b != nullptr);
@@ -1223,7 +1259,8 @@ TEST_CASE("debug_diff row limit guard skips comparison for large batches", "[deb
     std::vector<std::unique_ptr<cudf::column>> columns;
     columns.push_back(std::move(col));
     auto table = std::make_unique<cudf::table>(std::move(columns));
-    return sirius::make_data_batch(std::move(table), *space, stream);
+    return sirius::make_data_batch(
+      std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   };
 
   auto batch_a = make_batch();
@@ -1255,7 +1292,8 @@ TEST_CASE("debug_diff empty batches handles gracefully", "[debug_utils]")
     std::vector<std::unique_ptr<cudf::column>> columns;
     columns.push_back(std::move(col));
     auto table = std::make_unique<cudf::table>(std::move(columns));
-    return sirius::make_data_batch(std::move(table), *space, stream);
+    return sirius::make_data_batch(
+      std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   };
 
   auto batch_a = make_empty_batch();
@@ -1292,7 +1330,8 @@ TEST_CASE("debug_sample basic operation with named columns", "[debug_utils]")
   columns.push_back(std::move(col_a));
   columns.push_back(std::move(col_b));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // Sample 3 rows with seed=42 and named columns
@@ -1323,7 +1362,8 @@ TEST_CASE("debug_sample with fixed seed is reproducible", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // Call twice with seed=12345 -- both should succeed without crash
@@ -1352,7 +1392,8 @@ TEST_CASE("debug_sample N > num_rows clamps silently", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // N=100 but only 3 rows -- clamped to 3, no crash
@@ -1382,7 +1423,8 @@ TEST_CASE("debug_sample CSV format produces output without throwing", "[debug_ut
   columns.push_back(std::move(col_a));
   columns.push_back(std::move(col_b));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // CSV format with seed=42
@@ -1409,7 +1451,8 @@ TEST_CASE("debug_sample empty batch handles gracefully", "[debug_utils]")
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // Empty batch -- should log empty message, no crash
@@ -1436,7 +1479,8 @@ TEST_CASE("debug_sample with STRING columns extracts values correctly", "[debug_
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(columns));
-  auto batch = sirius::make_data_batch(std::move(table), *space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
   REQUIRE(batch != nullptr);
 
   // Sample 3 rows with seed=42

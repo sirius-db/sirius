@@ -24,6 +24,7 @@
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -35,6 +36,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -50,7 +52,10 @@ constexpr std::size_t kReservationSize = 50ULL * 1024 * 1024;    // 50 MB
 //------------------------------------------------------------------------------
 class oom_test_global_state : public sirius::pipeline::sirius_pipeline_task_global_state {
  public:
-  oom_test_global_state() : sirius_pipeline_task_global_state(nullptr) {}
+  oom_test_global_state()
+    : sirius_pipeline_task_global_state(nullptr, sirius::test::make_test_telemetry_context())
+  {
+  }
 
   void add_error(std::string message)
   {
@@ -105,7 +110,11 @@ struct oom_test_fixture {
     config.thread_name_prefix = thread_name_prefix;
 
     executor = std::make_unique<sirius::pipeline::gpu_pipeline_executor>(
-      config, mem_space, std::move(request_publisher));
+      config,
+      mem_space,
+      std::move(request_publisher),
+      nullptr,
+      sirius::test::make_test_telemetry_context());
     executor->set_completion_handler(&completion);
     return true;
   }
@@ -134,7 +143,8 @@ class oom_test_task_base : public sirius::pipeline::gpu_pipeline_task {
 
   void publish_output(sirius::op::operator_data&, rmm::cuda_stream_view) override {}
 
-  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info() const override
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* /*target_space*/) const override
   {
     sirius::pipeline::reservation_size_info info;
     info.reservation_size = kReservationSize;

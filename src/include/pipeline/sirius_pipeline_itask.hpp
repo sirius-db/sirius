@@ -19,6 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "telemetry-bridge/gen/task.rs.h"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -47,7 +48,7 @@ class sirius_pipeline_itask : public parallel::itask {
   /**
    * @brief Destructor for proper cleanup of derived classes.
    */
-  ~sirius_pipeline_itask() override = default;
+  ~sirius_pipeline_itask() override;
 
   /**
    * @brief Compute and return the output data batches for this task.
@@ -81,11 +82,15 @@ class sirius_pipeline_itask : public parallel::itask {
    * reservation, then passes the struct to set_reservation() so execute() can read
    * the components without re-computing them.
    *
+   * @param target_space The memory space the task will execute in, so inputs residing outside it
+   *                     (host/disk tiers, or GPU data on a different device that prepare will
+   *                     clone) are counted in bytes_to_materialize_input. nullptr means no single
+   *                     target space is known; only non-GPU-tier inputs are counted.
    * @return reservation_size_info with input_basis, bytes_to_materialize_input,
    *         peak_memory_estimate, reservation_size, and had_history populated.
    */
-  [[nodiscard]] virtual pipeline::reservation_size_info get_estimated_reservation_size_info()
-    const = 0;
+  [[nodiscard]] virtual pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* target_space) const = 0;
 
   /// @brief Get the output consumer operators for this task.
   virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;
@@ -102,6 +107,9 @@ class sirius_pipeline_itask : public parallel::itask {
     return _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline_id();
   }
 
+  [[nodiscard]] quent::task::TaskHandle& telemetry_handle() noexcept;
+  void set_telemetry_finalized() noexcept { _telemetry_finalized = true; }
+
  protected:
   /**
    * @brief Protected constructor for derived classes.
@@ -112,10 +120,11 @@ class sirius_pipeline_itask : public parallel::itask {
    */
   sirius_pipeline_itask(uint64_t task_id,
                         std::unique_ptr<sirius_pipeline_task_local_state> local_state,
-                        std::shared_ptr<sirius_pipeline_task_global_state> global_state)
-    : itask(task_id, std::move(local_state), std::move(global_state))
-  {
-  }
+                        std::shared_ptr<sirius_pipeline_task_global_state> global_state);
+
+ private:
+  rust::Box<quent::task::TaskHandle> _telemetry_task_handle;
+  bool _telemetry_finalized{false};
 };
 
 }  // namespace pipeline

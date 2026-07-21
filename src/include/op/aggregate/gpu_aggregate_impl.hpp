@@ -16,8 +16,11 @@
 
 #pragma once
 
+#include "telemetry/data_batch_probe.hpp"
+
 #include <cudf/cudf_utils.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -25,6 +28,11 @@
 #include <vector>
 
 namespace sirius {
+
+namespace telemetry {
+class telemetry_context;
+}  // namespace telemetry
+
 namespace op {
 
 /**
@@ -54,7 +62,8 @@ class gpu_aggregate_impl {
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /**
    * @brief Perform local grouped aggregate on the input data batch.
@@ -80,7 +89,8 @@ class gpu_aggregate_impl {
     const std::vector<int>& aggregate_idx,
     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 };
 
 }  // namespace op

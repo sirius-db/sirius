@@ -23,10 +23,10 @@
 #include <cuda_runtime.h>
 
 #include <cucascade/data/data_batch.hpp>
-#include <spdlog/fmt/fmt.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <format>
 #include <random>
 #include <type_traits>
 
@@ -131,43 +131,43 @@ std::string scalar_to_string(cudf::scalar const& s,
   switch (dt.id()) {
     case cudf::type_id::INT8: {
       auto val = static_cast<cudf::numeric_scalar<int8_t> const&>(s).value(stream);
-      return fmt::format("{}", static_cast<int>(val));
+      return std::format("{}", static_cast<int>(val));
     }
     case cudf::type_id::INT16: {
       auto val = static_cast<cudf::numeric_scalar<int16_t> const&>(s).value(stream);
-      return fmt::format("{}", val);
+      return std::format("{}", val);
     }
     case cudf::type_id::INT32: {
       auto val = static_cast<cudf::numeric_scalar<int32_t> const&>(s).value(stream);
-      return fmt::format("{}", val);
+      return std::format("{}", val);
     }
     case cudf::type_id::INT64: {
       auto val = static_cast<cudf::numeric_scalar<int64_t> const&>(s).value(stream);
-      return fmt::format("{}", val);
+      return std::format("{}", val);
     }
     case cudf::type_id::UINT8: {
       auto val = static_cast<cudf::numeric_scalar<uint8_t> const&>(s).value(stream);
-      return fmt::format("{}", val);
+      return std::format("{}", val);
     }
     case cudf::type_id::UINT16: {
       auto val = static_cast<cudf::numeric_scalar<uint16_t> const&>(s).value(stream);
-      return fmt::format("{}", val);
+      return std::format("{}", val);
     }
     case cudf::type_id::UINT32: {
       auto val = static_cast<cudf::numeric_scalar<uint32_t> const&>(s).value(stream);
-      return fmt::format("{}", val);
+      return std::format("{}", val);
     }
     case cudf::type_id::UINT64: {
       auto val = static_cast<cudf::numeric_scalar<uint64_t> const&>(s).value(stream);
-      return fmt::format("{}", val);
+      return std::format("{}", val);
     }
     case cudf::type_id::FLOAT32: {
       auto val = static_cast<cudf::numeric_scalar<float> const&>(s).value(stream);
-      return fmt::format("{:g}", val);
+      return std::format("{:g}", val);
     }
     case cudf::type_id::FLOAT64: {
       auto val = static_cast<cudf::numeric_scalar<double> const&>(s).value(stream);
-      return fmt::format("{:g}", val);
+      return std::format("{:g}", val);
     }
     default: return "?";
   }
@@ -182,12 +182,12 @@ std::string scalar_to_string(cudf::scalar const& s,
 template <typename T>
 std::string format_decimal_value(T raw, int abs_scale)
 {
-  if (abs_scale == 0) { return fmt::format("{}", raw); }
+  if (abs_scale == 0) { return std::format("{}", raw); }
   bool negative = raw < 0;
   // Cast to unsigned BEFORE negation to avoid UB on MIN values
   using U            = std::make_unsigned_t<T>;
   U magnitude        = negative ? static_cast<U>(0) - static_cast<U>(raw) : static_cast<U>(raw);
-  std::string digits = fmt::format("{}", magnitude);
+  std::string digits = std::format("{}", magnitude);
   // Pad with leading zeros if digit count <= abs_scale (e.g. 5 with scale=2 -> "0.05")
   while (digits.size() <= static_cast<std::size_t>(abs_scale)) {
     digits.insert(digits.begin(), '0');
@@ -269,7 +269,7 @@ std::string format_timestamp_s(int64_t raw_s)
   int hh             = seconds_in_day / 3600;
   int mm             = (seconds_in_day % 3600) / 60;
   int ss             = seconds_in_day % 60;
-  return fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
+  return std::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
 }
 
 // Format TIMESTAMP_MILLISECONDS (int64_t milliseconds since epoch)
@@ -287,9 +287,9 @@ std::string format_timestamp_ms(int64_t raw_ms)
   int ss             = seconds_in_day % 60;
 
   std::string result =
-    fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm_t, ss);
+    std::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm_t, ss);
   if (frac_ms != 0) {
-    std::string frac = fmt::format(".{:03d}", frac_ms);
+    std::string frac = std::format(".{:03d}", frac_ms);
     // Trim trailing zeros from fractional part
     while (frac.back() == '0') {
       frac.pop_back();
@@ -314,9 +314,9 @@ std::string format_timestamp_us(int64_t raw_us)
   int ss             = seconds_in_day % 60;
 
   std::string result =
-    fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
+    std::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
   if (frac_us != 0) {
-    std::string frac = fmt::format(".{:06d}", frac_us);
+    std::string frac = std::format(".{:06d}", frac_us);
     // Trim trailing zeros from fractional part
     while (frac.back() == '0') {
       frac.pop_back();
@@ -342,9 +342,9 @@ std::string format_timestamp_ns(int64_t raw_ns)
   int ss             = seconds_in_day % 60;
 
   std::string result =
-    fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
+    std::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", y, m, d, hh, mm, ss);
   if (frac_ns != 0) {
-    std::string frac = fmt::format(".{:09d}", frac_ns);
+    std::string frac = std::format(".{:09d}", frac_ns);
     // Trim trailing zeros from fractional part
     while (frac.back() == '0') {
       frac.pop_back();
@@ -358,7 +358,7 @@ std::string format_timestamp_ns(int64_t raw_ns)
 std::string format_date_days(int32_t raw_days)
 {
   auto [y, m, d] = civil_from_days(raw_days);
-  return fmt::format("{:04d}-{:02d}-{:02d}", y, m, d);
+  return std::format("{:04d}-{:02d}-{:02d}", y, m, d);
 }
 
 // ---------------------------------------------------------------------------
@@ -398,11 +398,11 @@ void format_rows_to_output(std::string& output,
           cells[c][r] = "NULL";
         } else {
           if constexpr (std::is_floating_point_v<T>) {
-            cells[c][r] = fmt::format("{:g}", host_vals[r]);
+            cells[c][r] = std::format("{:g}", host_vals[r]);
           } else if constexpr (std::is_same_v<T, int8_t>) {
-            cells[c][r] = fmt::format("{}", static_cast<int>(host_vals[r]));
+            cells[c][r] = std::format("{}", static_cast<int>(host_vals[r]));
           } else {
-            cells[c][r] = fmt::format("{}", host_vals[r]);
+            cells[c][r] = std::format("{}", host_vals[r]);
           }
         }
       }
@@ -661,7 +661,7 @@ void format_rows_to_output(std::string& output,
     // Header row
     output += "[SIRIUS_DIAG]   ";
     for (cudf::size_type c = 0; c < num_cols; ++c) {
-      output += fmt::format("{:<{}s}", names[c], widths[c]);
+      output += std::format("{:<{}s}", names[c], widths[c]);
     }
     output += "\n";
 
@@ -676,7 +676,7 @@ void format_rows_to_output(std::string& output,
     for (cudf::size_type r = 0; r < num_rows; ++r) {
       output += "[SIRIUS_DIAG]   ";
       for (cudf::size_type c = 0; c < num_cols; ++c) {
-        output += fmt::format("{:<{}s}", cells[c][r], widths[c]);
+        output += std::format("{:<{}s}", cells[c][r], widths[c]);
       }
       output += "\n";
     }
@@ -700,28 +700,28 @@ void debug_schema(cucascade::data_batch& batch,
     stream.synchronize();
 
     std::string output;
-    output += fmt::format("[SIRIUS_DIAG] schema: batch_id={} rows={} cols={}\n",
+    output += std::format("[SIRIUS_DIAG] schema: batch_id={} rows={} cols={}\n",
                           batch.get_batch_id(),
                           tv.num_rows(),
                           tv.num_columns());
-    output += fmt::format("[SIRIUS_DIAG]   {:<6s} {:<20s} {:<15s} {:>8s} {:>8s}\n",
+    output += std::format("[SIRIUS_DIAG]   {:<6s} {:<20s} {:<15s} {:>8s} {:>8s}\n",
                           "idx",
                           "name",
                           "type",
                           "nulls",
                           "null%");
-    output += fmt::format(
+    output += std::format(
       "[SIRIUS_DIAG]   {:-<6s} {:-<20s} {:-<15s} {:->8s} {:->8s}\n", "", "", "", "", "");
 
     for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
       auto const& col  = tv.column(c);
       std::string name = (static_cast<std::size_t>(c) < col_names.size())
                            ? col_names[static_cast<std::size_t>(c)]
-                           : fmt::format("col[{}]", c);
+                           : std::format("col[{}]", c);
       auto nc          = col.null_count();
       if (nc < 0) { nc = 0; }
       double pct = (col.size() > 0) ? 100.0 * nc / col.size() : 0.0;
-      output += fmt::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>8d} {:>7.1f}%\n",
+      output += std::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>8d} {:>7.1f}%\n",
                             static_cast<int>(c),
                             name,
                             cudf::type_to_name(col.type()),
@@ -753,23 +753,23 @@ void debug_nulls(cucascade::data_batch& batch,
     stream.synchronize();
 
     std::string output;
-    output += fmt::format("[SIRIUS_DIAG] nulls: batch_id={} rows={} cols={}\n",
+    output += std::format("[SIRIUS_DIAG] nulls: batch_id={} rows={} cols={}\n",
                           batch.get_batch_id(),
                           tv.num_rows(),
                           tv.num_columns());
-    output += fmt::format(
+    output += std::format(
       "[SIRIUS_DIAG]   {:<6s} {:<20s} {:>8s} {:>8s}\n", "idx", "name", "nulls", "null%");
-    output += fmt::format("[SIRIUS_DIAG]   {:-<6s} {:-<20s} {:->8s} {:->8s}\n", "", "", "", "");
+    output += std::format("[SIRIUS_DIAG]   {:-<6s} {:-<20s} {:->8s} {:->8s}\n", "", "", "", "");
 
     for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
       auto const& col  = tv.column(c);
       std::string name = (static_cast<std::size_t>(c) < col_names.size())
                            ? col_names[static_cast<std::size_t>(c)]
-                           : fmt::format("col[{}]", c);
+                           : std::format("col[{}]", c);
       auto nc          = col.null_count();
       if (nc < 0) { nc = 0; }
       double pct = (col.size() > 0) ? 100.0 * nc / col.size() : 0.0;
-      output += fmt::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:>8d} {:>7.1f}%\n",
+      output += std::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:>8d} {:>7.1f}%\n",
                             static_cast<int>(c),
                             name,
                             static_cast<int>(nc),
@@ -806,7 +806,7 @@ void debug_head(cucascade::data_batch& batch,
     // Empty batch handling
     if (tv.num_rows() == 0) {
       std::string output;
-      output += fmt::format(
+      output += std::format(
         "[SIRIUS_DIAG] head: batch_id={} rows=0 cols={}\n", batch.get_batch_id(), num_cols);
       output += "[SIRIUS_DIAG]   (empty batch)\n";
       SIRIUS_LOG_DEBUG("{}", output);
@@ -828,12 +828,12 @@ void debug_head(cucascade::data_batch& batch,
     for (cudf::size_type c = 0; c < num_cols; ++c) {
       names[c] = (static_cast<std::size_t>(c) < col_names.size())
                    ? col_names[static_cast<std::size_t>(c)]
-                   : fmt::format("col[{}]", c);
+                   : std::format("col[{}]", c);
     }
 
     // Build output via shared formatting helper
     std::string output;
-    output += fmt::format("[SIRIUS_DIAG] head: batch_id={} rows={} cols={} showing={}\n",
+    output += std::format("[SIRIUS_DIAG] head: batch_id={} rows={} cols={} showing={}\n",
                           batch.get_batch_id(),
                           tv.num_rows(),
                           num_cols,
@@ -865,7 +865,7 @@ void debug_stats(cucascade::data_batch& batch,
     auto num_cols = tv.num_columns();
 
     std::string output;
-    output += fmt::format("[SIRIUS_DIAG] stats: batch_id={} rows={} cols={}\n",
+    output += std::format("[SIRIUS_DIAG] stats: batch_id={} rows={} cols={}\n",
                           batch.get_batch_id(),
                           tv.num_rows(),
                           num_cols);
@@ -878,14 +878,14 @@ void debug_stats(cucascade::data_batch& batch,
     }
 
     // Summary table format consistent with debug_schema
-    output += fmt::format("[SIRIUS_DIAG]   {:<6s} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
+    output += std::format("[SIRIUS_DIAG]   {:<6s} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
                           "idx",
                           "name",
                           "type",
                           "min",
                           "max",
                           "sum");
-    output += fmt::format("[SIRIUS_DIAG]   {:-<6s} {:-<20s} {:-<15s} {:->15s} {:->15s} {:->15s}\n",
+    output += std::format("[SIRIUS_DIAG]   {:-<6s} {:-<20s} {:-<15s} {:->15s} {:->15s} {:->15s}\n",
                           "",
                           "",
                           "",
@@ -897,12 +897,12 @@ void debug_stats(cucascade::data_batch& batch,
       auto const& col  = tv.column(c);
       std::string name = (static_cast<std::size_t>(c) < col_names.size())
                            ? col_names[static_cast<std::size_t>(c)]
-                           : fmt::format("col[{}]", c);
+                           : std::format("col[{}]", c);
       auto type_name   = cudf::type_to_name(col.type());
 
       if (!is_stats_numeric(col.type().id())) {
         // Non-numeric columns skipped
-        output += fmt::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
+        output += std::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
                               static_cast<int>(c),
                               name,
                               type_name,
@@ -925,7 +925,7 @@ void debug_stats(cucascade::data_batch& batch,
       std::string max_str = scalar_to_string(*max_scalar, col.type(), stream);
       std::string sum_str = scalar_to_string(*sum_scalar, sum_type, stream);
 
-      output += fmt::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
+      output += std::format("[SIRIUS_DIAG]   {:<6d} {:<20s} {:<15s} {:>15s} {:>15s} {:>15s}\n",
                             static_cast<int>(c),
                             name,
                             type_name,
@@ -960,7 +960,7 @@ void debug_checksum(cucascade::data_batch& batch,
     auto num_cols = tv.num_columns();
 
     std::string output;
-    output += fmt::format("[SIRIUS_DIAG] checksum: batch_id={} rows={} cols={}\n",
+    output += std::format("[SIRIUS_DIAG] checksum: batch_id={} rows={} cols={}\n",
                           batch.get_batch_id(),
                           tv.num_rows(),
                           num_cols);
@@ -976,14 +976,14 @@ void debug_checksum(cucascade::data_batch& batch,
       auto const& col  = tv.column(c);
       std::string name = (static_cast<std::size_t>(c) < col_names.size())
                            ? col_names[static_cast<std::size_t>(c)]
-                           : fmt::format("col[{}]", c);
+                           : std::format("col[{}]", c);
 
       auto nc = col.null_count();
       if (nc < 0) { nc = 0; }
 
       // Empty or all-NULL column
       if (col.size() == 0 || nc == col.size()) {
-        output += fmt::format("[SIRIUS_DIAG]   {} checksum: 0x{:016X} nulls={}\n",
+        output += std::format("[SIRIUS_DIAG]   {} checksum: 0x{:016X} nulls={}\n",
                               name,
                               uint64_t{0},
                               static_cast<int>(nc));
@@ -1004,7 +1004,7 @@ void debug_checksum(cucascade::data_batch& batch,
       uint64_t checksum = scalar.is_valid(stream) ? scalar.value(stream) : 0;
 
       // D-11: Output format with null count
-      output += fmt::format(
+      output += std::format(
         "[SIRIUS_DIAG]   {} checksum: 0x{:016X} nulls={}\n", name, checksum, static_cast<int>(nc));
     }
 
@@ -1037,7 +1037,7 @@ void debug_diff(cucascade::data_batch& batch_a,
     stream.synchronize();
 
     std::string output;
-    output += fmt::format(
+    output += std::format(
       "[SIRIUS_DIAG] diff: batch_a_id={} batch_b_id={} cols_a={} cols_b={} rows_a={} rows_b={}\n",
       batch_a.get_batch_id(),
       batch_b.get_batch_id(),
@@ -1049,7 +1049,7 @@ void debug_diff(cucascade::data_batch& batch_a,
     // Schema mismatch check — column count
     if (tv_a.num_columns() != tv_b.num_columns()) {
       output +=
-        fmt::format("[SIRIUS_DIAG]   schema mismatch: batch_a has {} cols, batch_b has {} cols\n",
+        std::format("[SIRIUS_DIAG]   schema mismatch: batch_a has {} cols, batch_b has {} cols\n",
                     tv_a.num_columns(),
                     tv_b.num_columns());
       SIRIUS_LOG_DEBUG("{}", output);
@@ -1064,8 +1064,8 @@ void debug_diff(cucascade::data_batch& batch_a,
       if (tv_a.column(c).type() != tv_b.column(c).type()) {
         std::string name = (static_cast<std::size_t>(c) < col_names.size())
                              ? col_names[static_cast<std::size_t>(c)]
-                             : fmt::format("col[{}]", c);
-        output += fmt::format("[SIRIUS_DIAG]   schema mismatch: {} type {} vs {}\n",
+                             : std::format("col[{}]", c);
+        output += std::format("[SIRIUS_DIAG]   schema mismatch: {} type {} vs {}\n",
                               name,
                               cudf::type_to_name(tv_a.column(c).type()),
                               cudf::type_to_name(tv_b.column(c).type()));
@@ -1079,7 +1079,7 @@ void debug_diff(cucascade::data_batch& batch_a,
 
     // Row count mismatch
     if (tv_a.num_rows() != tv_b.num_rows()) {
-      output += fmt::format(
+      output += std::format(
         "[SIRIUS_DIAG]   row count mismatch: batch_a has {} rows, batch_b has {} rows\n",
         tv_a.num_rows(),
         tv_b.num_rows());
@@ -1092,7 +1092,7 @@ void debug_diff(cucascade::data_batch& batch_a,
     // Row limit guard to prevent OOM
     if (num_rows > max_rows) {
       output +=
-        fmt::format("[SIRIUS_DIAG]   row count {} exceeds limit {}, skipping value comparison\n",
+        std::format("[SIRIUS_DIAG]   row count {} exceeds limit {}, skipping value comparison\n",
                     num_rows,
                     max_rows);
       SIRIUS_LOG_DEBUG("{}", output);
@@ -1109,7 +1109,7 @@ void debug_diff(cucascade::data_batch& batch_a,
 
       std::string name = (static_cast<std::size_t>(c) < col_names.size())
                            ? col_names[static_cast<std::size_t>(c)]
-                           : fmt::format("col[{}]", c);
+                           : std::format("col[{}]", c);
 
       cudf::size_type diff_count = 0;
       std::vector<cudf::size_type> diff_indices;
@@ -1243,7 +1243,7 @@ void debug_diff(cucascade::data_batch& batch_a,
 
         default:
           // Unsupported type — skip comparison for this column
-          output += fmt::format("[SIRIUS_DIAG]   {} (unsupported type, skipped)\n", name);
+          output += std::format("[SIRIUS_DIAG]   {} (unsupported type, skipped)\n", name);
           continue;
       }
 
@@ -1253,9 +1253,9 @@ void debug_diff(cucascade::data_batch& batch_a,
         std::string idx_list;
         for (std::size_t i = 0; i < diff_indices.size(); ++i) {
           if (i > 0) { idx_list += ", "; }
-          idx_list += fmt::format("{}", diff_indices[i]);
+          idx_list += std::format("{}", diff_indices[i]);
         }
-        output += fmt::format(
+        output += std::format(
           "[SIRIUS_DIAG]   {} diffs: {}/{} rows [idx: {}]\n", name, diff_count, num_rows, idx_list);
       }
     }
@@ -1293,7 +1293,7 @@ void debug_sample(cucascade::data_batch& batch,
     // Empty batch handling
     if (tv.num_rows() == 0) {
       std::string output;
-      output += fmt::format(
+      output += std::format(
         "[SIRIUS_DIAG] sample: batch_id={} rows=0 cols={}\n", batch.get_batch_id(), num_cols);
       output += "[SIRIUS_DIAG]   (empty batch)\n";
       SIRIUS_LOG_DEBUG("{}", output);
@@ -1309,11 +1309,11 @@ void debug_sample(cucascade::data_batch& batch,
     for (cudf::size_type c = 0; c < num_cols; ++c) {
       names[c] = (static_cast<std::size_t>(c) < col_names.size())
                    ? col_names[static_cast<std::size_t>(c)]
-                   : fmt::format("col[{}]", c);
+                   : std::format("col[{}]", c);
     }
 
     std::string output;
-    output += fmt::format("[SIRIUS_DIAG] sample: batch_id={} rows={} cols={} sampled={}\n",
+    output += std::format("[SIRIUS_DIAG] sample: batch_id={} rows={} cols={} sampled={}\n",
                           batch.get_batch_id(),
                           tv.num_rows(),
                           num_cols,

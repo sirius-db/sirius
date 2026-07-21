@@ -28,16 +28,13 @@ sirius:
   executor:
     pipeline:
       num_threads: 8
-    duckdb_scan:
-      num_threads: 4
     task_creator:
       num_threads: 4
     downgrade:
       num_threads: 2
-      monitor_period_ms: 10
+      monitor_period: 10ms
   operator_params:
     scan_task_batch_size: 536870912
-    default_scan_task_varchar_size: 256
     max_sort_partition_bytes: 0
     hash_partition_bytes: 536870912
     concat_batch_bytes: 536870912

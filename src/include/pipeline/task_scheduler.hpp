@@ -22,6 +22,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
 
@@ -29,12 +30,18 @@
 
 #include <atomic>
 #include <future>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 
 namespace sirius::parallel {
 class downgrade_executor;
 }  // namespace sirius::parallel
+
+namespace sirius::telemetry {
+class telemetry_context;
+struct TaskQueueHandleWrapper;
+}  // namespace sirius::telemetry
 
 namespace sirius {
 
@@ -43,8 +50,6 @@ class task_creator;
 }
 
 namespace pipeline {
-
-class gpu_pipeline_executor;
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
@@ -60,11 +65,13 @@ class task_scheduler {
    *
    * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
    * @param mem_mgr Reference to the memory reservation manager
+   * @param telemetry_context Shared pointer to the telemetry context
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
   explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                          std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
                             downgrade_executors = nullptr);
@@ -124,13 +131,26 @@ class task_scheduler {
   }
 
   /**
-   * @brief Set the priority scan operators
+   * @brief Call @p fn(device_id, executor) for each GPU executor, in ascending device_id order.
    *
-   * Sets the scan operators that should be executed with priority.
-   * First element in vector will be first out of the queue.
-   * Also prepares the scan executor cache for these operators.
+   * Safe to call after a query completes (quiescent executors). Useful for
+   * collecting per-GPU metrics without exposing the internal executor map.
+   */
+  template <typename Fn>
+  void visit_executors(Fn&& fn) const
+  {
+    for (auto const& [device_id, exec] : _gpu_executors) {
+      fn(device_id, *exec);
+    }
+  }
+
+  /**
+   * @brief Prepare scheduler state for a query.
    *
-   * @param scans Vector of scan operators (first in vector = first out of queue)
+   * Drains tasks left by the previous query, installs the new query and completion handler,
+   * and resets per-query scheduler state.
+   *
+   * @param query Query whose tasks will be scheduled
    */
   void prepare_for_query(duckdb::shared_ptr<planner::query> query);
 
@@ -223,6 +243,8 @@ class task_scheduler {
 
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<completion_handler> _completion_handler;
+  std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
+  std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
 
 }  // namespace pipeline

@@ -1,4 +1,4 @@
-#include "io/prefetching_cache.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "io/uring/uring_ioctx.hpp"
@@ -21,8 +21,8 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
 #include <glob.h>
-#include <spdlog/common.h>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
+#include <log/spdlog_owning_sink.hpp>
 #include <unistd.h>
 
 #include <algorithm>
@@ -134,7 +134,11 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  spdlog::set_level(spdlog::level::info);  // show per-read trace
+  // Per-read trace goes to log/sirius.log (no backend is installed until the
+  // logger is initialized; without this every log statement is dropped).
+  auto log_sink = sirius::log::make_spdlog_owning_sink({"log", std::nullopt});
+  log_sink->set_level(sirius::log::level::info);
+  sirius::log::set_sink(std::move(log_sink));
 
   std::cout << "Source : " << argv[2] << "\n"
             << "Files  : " << paths.size() << "\n";
@@ -152,7 +156,11 @@ int main(int argc, char** argv)
   cudaFree(nullptr);
 
   rmm::mr::cuda_async_memory_resource async_mr;
-  rmm::mr::set_current_device_resource(&async_mr);
+  // set_current_device_resource now takes an owning any_resource by value; wrap
+  // a non-owning ref to our stack resource (kept alive for the run) so we don't
+  // hand over ownership.
+  rmm::mr::set_current_device_resource(
+    cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::device_async_resource_ref{async_mr}});
 
   auto time_ms = [](auto fn) -> double {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -284,31 +292,33 @@ int main(int argc, char** argv)
     // Size the buffer pool to fit the working set, plus headroom.
     constexpr uint32_t POOL_MAX_SLABS       = 20;
     constexpr size_t INFLIGHT_BUDGET_CHUNKS = 2048;
-    constexpr size_t POOL_CAPACITY          = static_cast<size_t>(POOL_MAX_SLABS) *
-                                     static_cast<size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB) *
-                                     sirius::io::CHUNK_SIZE;
+    constexpr size_t CHUNKS_PER_SLAB =
+      cucascade::memory::fixed_size_host_memory_resource::default_pool_size;
+    constexpr size_t POOL_CAPACITY =
+      static_cast<size_t>(POOL_MAX_SLABS) * CHUNKS_PER_SLAB * (1 << 20);
 
     cucascade::memory::numa_region_pinned_host_memory_resource upstream(0, /*make_portable=*/true);
-    cucascade::memory::fixed_size_host_memory_resource host_mr(
-      0,                                                              // device_id
-      upstream,                                                       // upstream allocator
-      POOL_CAPACITY,                                                  // mem_limit
-      POOL_CAPACITY,                                                  // capacity
-      sirius::io::CHUNK_SIZE,                                         // block_size = 1 MiB
-      static_cast<size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB),  // pool_size
-      1);                                                             // initial_pools
+    cucascade::memory::fixed_size_host_memory_resource host_mr(0,              // device_id
+                                                               upstream,       // upstream allocator
+                                                               POOL_CAPACITY,  // mem_limit
+                                                               POOL_CAPACITY,  // capacity
+                                                               1 << 20,        // block_size = 1 MiB
+                                                               CHUNKS_PER_SLAB,  // pool_size
+                                                               1);               // initial_pools
 
-    sirius::io::buffer_pool pool(host_mr, POOL_MAX_SLABS);
-
+    auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
+      sirius::io::uring::uring_reactor::reactor_config_type{.bounce_size =
+                                                              host_mr.get_block_size()},
+      &host_mr);
     auto io_ctx =
-      std::make_shared<sirius::io::uring_ioctx>(n_reactors, 2 * sirius::io::NUM_CHUNKS, host_mr);
+      std::make_shared<sirius::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
+    io_ctx->start();
     // io_ctx->initialize_cache(pool, INFLIGHT_BUDGET_CHUNKS);
 
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     sources.reserve(paths.size());
     for (auto const& path : paths) {
-      auto io_obj = io_ctx->create_io_object(path);
-      sources.push_back(std::make_unique<sirius::io::sirius_datasource>(io_ctx, io_obj));
+      sources.push_back(io_ctx->open_datasource(path));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 

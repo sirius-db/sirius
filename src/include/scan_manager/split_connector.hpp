@@ -47,7 +47,7 @@ class split_provider;
  * close() and the consumer-side methods remain public so the scan manager
  * (driver loop) and the scan operator can drive the lifecycle.
  */
-class split_connector {
+class split_connector : public std::enable_shared_from_this<split_connector> {
  public:
   split_connector();
   ~split_connector();
@@ -80,7 +80,7 @@ class split_connector {
   [[nodiscard]] bool has_more_splits() const;
 
  private:
-  friend class split_provider;
+  friend class load_balancing_scan_batch_coalescer;
 
   /// \brief Enqueue a ready split. Producer side. Wakes a waiting consumer.
   ///        Reachable only via @ref split_provider::push_to_connector so all

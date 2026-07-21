@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "io/io_errors.hpp"
+#include "io/s3/s3_object_ref.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -31,18 +34,6 @@ namespace sirius::io::s3 {
 /// Sirius needs only read-only S3 operations; PUT / DELETE etc. are
 /// intentionally absent.
 enum class s3_request_method : std::uint8_t { GET, HEAD };
-
-/**
- * @brief Object reference passed to @c s3_request_authorizer::authorize.
- *
- * @c bucket carries the object-store bucket name (no scheme, no trailing
- * slashes). @c key carries the object key, RFC3986-decoded — the authorizer
- * re-encodes for canonical URI construction.
- */
-struct s3_object_ref {
-  std::string bucket;
-  std::string key;
-};
 
 /// Result of authorizing one S3 request: the URL to fetch plus headers to
 /// attach verbatim. Presigned authorizers put auth in the URL query and
@@ -110,6 +101,38 @@ class s3_request_authorizer {
   [[nodiscard]] virtual s3_authorized_request authorize(s3_object_ref const& obj,
                                                         s3_request_method method,
                                                         std::chrono::seconds timeout) = 0;
+
+  /**
+   * @brief Authorize a bucket-level ListObjectsV2 GET.
+   *
+   * @param bucket           Bucket name (no scheme / slashes).
+   * @param canonical_query  The request query string, already percent-encoded,
+   *                          `&`-joined, and **sorted by encoded key** (SigV4
+   *                          canonical order), WITHOUT any auth params — e.g.
+   *                          @c "list-type=2&max-keys=1000&prefix=a%2Fb" (with
+   *                          @c "continuation-token=..." sorted in first). The
+   *                          header-signing path signs this string verbatim, so
+   *                          an unsorted query would be signed but rejected by
+   *                          S3; the presigned path re-sorts when merging the
+   *                          @c X-Amz-* params, but callers should pass sorted
+   *                          regardless. Must not contain any @c X-Amz-* key —
+   *                          implementations reject those so callers cannot
+   *                          smuggle / override signing parameters.
+   * @param timeout          Per-call URL lifetime (presigned @c X-Amz-Expires);
+   *                          ignored by header-signing authorizers.
+   *
+   * Default: throws — LIST is opt-in, so a pluggable authorizer that only knows
+   * how to sign object GET/HEAD need not implement it.
+   *
+   * @throw sirius::io::credential_error when unsupported, or on signing failure.
+   */
+  [[nodiscard]] virtual s3_authorized_request authorize_list(std::string_view /*bucket*/,
+                                                             std::string_view /*canonical_query*/,
+                                                             std::chrono::seconds /*timeout*/)
+  {
+    throw sirius::io::credential_error(
+      "s3_request_authorizer: ListObjectsV2 is not supported by this authorizer");
+  }
 };
 
 }  // namespace sirius::io::s3

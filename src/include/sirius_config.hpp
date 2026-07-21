@@ -17,10 +17,9 @@
 #pragma once
 
 #include "config.hpp"
+#include "creator/config.hpp"
 #include "exec/config.hpp"
-#include "io/object_store_config.hpp"
-#include "op/scan/config.hpp"
-#include "scan_manager/sirius_scan_manager.hpp"
+#include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -33,7 +32,6 @@ namespace sirius {
 namespace config {
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE     = 256LL;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
@@ -66,9 +64,6 @@ struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
-  /// Default size estimate (bytes) for VARCHAR columns when computing rows per batch.
-  uint64_t default_scan_task_varchar_size = config::DEFAULT_SCAN_TASK_VARCHAR_SIZE;
-
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
 
@@ -95,6 +90,35 @@ struct operator_params {
   /// L4 in the issue #510 microbenchmark, defaulted higher to stay conservative). Set to 0 to
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
+  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
+  /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
+  /// probe-GPU L2, or a Bloom, into the probe-side scan. The scan applies membership post-decode to
+  /// drop non-matching rows before the join. On by default; the master switch for the feature.
+  bool enable_dynamic_filter_pushdown = true;
+
+  /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
+  /// for READ-time row-group pruning on parquet scans; duckdb-native scans apply it row-wise
+  /// post-decode instead. Off by default and requires enable_dynamic_filter_pushdown: on
+  /// TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes
+  /// range-derivable builds, and scattered keys prune nothing, so the zone-map only pays off on
+  /// clustered-keyset joins whose narrow key range is runtime-determined.
+  bool enable_dynamic_zone_map_filter = false;
+
+  /// Skip publishing a key's dynamic filters when the build covers at least this fraction of the
+  /// key's domain (rows gate and zone-map range gate). Values >= 1.0 effectively disable the gate.
+  double dynamic_filter_domain_coverage_threshold = 0.9;
+
+  /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split
+  /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
+  /// [0, 1]; 1.0 keeps filtering always on.
+  double dynamic_filter_keep_threshold = 0.9;
+
+  /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
+  /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
+  /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
+  /// off carries no zone maps and cannot prune until re-pinned with the flag on.
+  bool enable_pinned_zone_map_pruning = true;
 };
 
 struct telemetry_config {
@@ -118,36 +142,19 @@ struct sirius_config {
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_task_creator_config() const noexcept;
+  [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
-  /// Overwrite the stored scan_manager_config. SiriusContext::initialize() uses
-  /// this to persist the S3 backend it materialized from object_store_config,
-  /// so a later get_config() reflects the actual scan_manager wiring.
+  /// Overwrite the stored scan_manager_config. Allows callers (e.g.
+  /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
+  /// get_scan_manager_config() reflects the actual scan_manager state.
   void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
-
-  [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
-
-  [[nodiscard]] bool is_scan_caching_enabled() const noexcept
-  {
-    return _scan_executor_config.cache != op::scan::cache_level::NONE;
-  }
-
-  [[nodiscard]] op::scan::cache_level get_cache_level() const noexcept
-  {
-    return _scan_executor_config.cache;
-  }
-
-  void set_cache_level(op::scan::cache_level level) noexcept
-  {
-    _scan_executor_config.cache = level;
-  }
 
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
@@ -161,14 +168,6 @@ struct sirius_config {
     return _telemetry_config;
   }
 
-  /// Object-store backend credentials + endpoint. Empty fields disable the
-  /// S3 backend; SiriusContext::initialize() reads this to populate
-  /// scan_manager_config::s3_config before constructing the scan_manager.
-  /// Direct member access (no getter/setter) to keep the test fixture and
-  /// future SET-handler wiring simple — both sides write into this struct
-  /// and SiriusContext consumes it at initialize() time.
-  sirius::io::object_store_config object_store_config{};
-
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
   /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
@@ -178,13 +177,11 @@ struct sirius_config {
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
-  exec::thread_pool_config _task_creator_config{.num_threads        = 2,
-                                                .thread_name_prefix = "task_creator"};
+  creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
-  op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
 };

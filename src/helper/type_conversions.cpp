@@ -16,7 +16,10 @@
 
 #include "helper/type_conversions.hpp"
 
+#include "duckdb/common/optional_idx.hpp"
+
 #include <duckdb/common/exception.hpp>
+#include <duckdb/common/types.hpp>
 #include <duckdb/common/types/decimal.hpp>
 
 namespace sirius {
@@ -45,8 +48,16 @@ logical_type from_duckdb(const duckdb::LogicalType& t)
     case LogicalTypeId::TIMESTAMP: return logical_type::make(type_id::TIMESTAMP);
     case LogicalTypeId::TIMESTAMP_NS: return logical_type::make(type_id::TIMESTAMP_NS);
     case LogicalTypeId::VARCHAR: return logical_type::make(type_id::VARCHAR);
+    // sirius::logical_type is flat for nested types; the real nested type travels
+    // separately (result collector). A DuckDB MAP is physically LIST<STRUCT<key,value>>.
     case LogicalTypeId::STRUCT: return logical_type::make(type_id::STRUCT);
     case LogicalTypeId::LIST: return logical_type::make(type_id::LIST);
+    case LogicalTypeId::MAP: return logical_type::make(type_id::LIST);
+    case LogicalTypeId::ARRAY: {
+      const auto& child_type = duckdb::ArrayType::GetChildType(t);
+      const auto array_size  = duckdb::ArrayType::GetSize(t);
+      return logical_type::make_array(from_duckdb(child_type), static_cast<uint32_t>(array_size));
+    }
     case LogicalTypeId::DECIMAL:
       return logical_type::make_decimal(duckdb::DecimalType::GetWidth(t),
                                         duckdb::DecimalType::GetScale(t));
@@ -79,6 +90,12 @@ duckdb::LogicalType to_duckdb(const logical_type& t)
     case type_id::TIMESTAMP: return LogicalType::TIMESTAMP;
     case type_id::TIMESTAMP_NS: return LogicalType::TIMESTAMP_NS;
     case type_id::VARCHAR: return LogicalType::VARCHAR;
+    case type_id::ARRAY:
+      if (!t.has_child()) {
+        throw duckdb::InvalidInputException(
+          "to_duckdb: ARRAY type missing child metadata (use logical_type::make_array)");
+      }
+      return LogicalType::ARRAY(to_duckdb(t.array_child()), duckdb::optional_idx(t.array_size()));
     case type_id::STRUCT: return LogicalType::STRUCT({});
     case type_id::LIST:
       throw duckdb::InvalidInputException(

@@ -67,6 +67,10 @@ class SiriusContext : public ClientContextState {
     uint64_t successful_rebinds = 0;
     uint64_t fallbacks          = 0;
     uint64_t executions         = 0;
+    // GPU execution was attempted and failed at runtime, and the query completed
+    // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
+    // counts plan-time (create_plan) fallbacks that never reached the GPU.
+    uint64_t runtime_fallbacks = 0;
   };
 
   SiriusContext();
@@ -103,13 +107,20 @@ class SiriusContext : public ClientContextState {
                                     PreparedStatementData& prepared_statement,
                                     PreparedStatementMode mode) final;
 
+  /// \brief Called on each execute of a reusable prepared statement. Requests a
+  /// rebind for Sirius-backed plans so GPU eligibility is re-decided with current
+  /// stats.
+  RebindQueryInfo OnExecutePrepared(ClientContext& context,
+                                    PreparedStatementCallbackInfo& info,
+                                    RebindQueryInfo current_rebind) final;
+
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::sirius_config& config);
 
   /**
    * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
    *
-   * Some code paths (e.g. iceberg metadata lookup) must open a second DuckDB
+   * Some code paths (e.g. internal metadata lookups) must open a second DuckDB
    * Connection to the same database.  Because OnConnectionOpened registers the
    * SAME SiriusContext on every connection, the new connection's query lifecycle
    * callbacks would fire QueryBegin (resetting next_operator_id and resetting
@@ -143,6 +154,38 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] bool is_internal_query_active() const noexcept
   {
     return _internal_query_depth.load(std::memory_order_relaxed) > 0;
+  }
+
+  /**
+   * @brief RAII guard marking a CPU-fallback replay of a failed GPU query.
+   *
+   * Narrower than InternalQueryGuard: it fires ONLY around
+   * run_internal_cpu_fallback_query, and is read ONLY by the sirius_httpfs
+   * s3:// open guard, which must refuse serving s3:// data to a CPU plan. A
+   * legitimate internal s3:// read (e.g. a future table-format metadata read) runs under
+   * InternalQueryGuard but NOT this one, so it is not blocked.
+   */
+  struct CpuFallbackGuard {
+    explicit CpuFallbackGuard(SiriusContext& ctx) noexcept : ctx_(ctx)
+    {
+      ctx_.enter_cpu_fallback();
+    }
+    ~CpuFallbackGuard() noexcept { ctx_.exit_cpu_fallback(); }
+    CpuFallbackGuard(const CpuFallbackGuard&)            = delete;
+    CpuFallbackGuard& operator=(const CpuFallbackGuard&) = delete;
+
+   private:
+    SiriusContext& ctx_;
+  };
+
+  void enter_cpu_fallback() noexcept
+  {
+    _cpu_fallback_depth.fetch_add(1, std::memory_order_relaxed);
+  }
+  void exit_cpu_fallback() noexcept { _cpu_fallback_depth.fetch_sub(1, std::memory_order_relaxed); }
+  [[nodiscard]] bool is_cpu_fallback_active() const noexcept
+  {
+    return _cpu_fallback_depth.load(std::memory_order_relaxed) > 0;
   }
 
   /// \brief Terminate the Sirius context, releasing all resources.
@@ -202,7 +245,8 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
-  [[nodiscard]] const sirius::telemetry::telemetry_context& get_telemetry_context() const;
+  [[nodiscard]] std::shared_ptr<const sirius::telemetry::telemetry_context> get_telemetry_context()
+    const;
 
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
@@ -261,6 +305,10 @@ class SiriusContext : public ClientContextState {
   /// \brief Record that a transparently rebound query actually executed through Sirius.
   void record_transparent_execution() noexcept;
 
+  /// \brief Record that a GPU execution failed at runtime and the query completed
+  /// via DuckDB CPU fallback (same transaction).
+  void record_transparent_runtime_fallback() noexcept;
+
  private:
   void throw_if_not_initialized() const;
   void acquire_query_lifecycle_slot();
@@ -268,6 +316,7 @@ class SiriusContext : public ClientContextState {
 
   mutable std::mutex mutex_;
   std::atomic<int> _internal_query_depth{0};
+  std::atomic<int> _cpu_fallback_depth{0};
   // The current Super Sirius runtime is shared across connections, so query
   // lifecycle callbacks and engine execution must be serialized to avoid
   // cross-connection state corruption. Held for the duration of
@@ -306,7 +355,7 @@ class SiriusContext : public ClientContextState {
   // allocator are destroyed to prevent dangling references.
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
-  std::unique_ptr<sirius::telemetry::telemetry_context> telemetry_context_;
+  std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
@@ -329,7 +378,16 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
+  std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
 };
+
+/// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
+///
+/// `spdlog` and `noop` install unconditionally; `duckdb` needs `db` and, given a
+/// null `db`, defers (leaves the current sink) so a caller without one yet can
+/// still select it. An unknown backend throws only when `db` is non-null, so the
+/// null (best-effort) path never throws.
+void install_configured_log_sink(DatabaseInstance* db);
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions
@@ -361,5 +419,18 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   sirius::sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };
+
+/// \brief Read the per-session `enable_duckdb_fallback` setting (default true).
+///
+/// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
+/// connection via `SET enable_duckdb_fallback = ...`.
+bool duckdb_fallback_enabled(ClientContext& context);
+
+/// \brief Print the "GPU execution failed, falling back to DuckDB" banner.
+///
+/// Written to stdout in red (ANSI) when stdout is a TTY, plain text otherwise so
+/// piped/redirected output is not corrupted. Shared by the transparent runtime
+/// fallback and the legacy gpu_execution() CALL path so the message stays in sync.
+void print_cpu_fallback_banner();
 
 }  // namespace duckdb

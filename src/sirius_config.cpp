@@ -81,31 +81,19 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
+static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
 {
-  yaml::reader r(node, "scan_manager");
+  yaml::reader r(node, "task_creator");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("use_sirius_datasource", opt.use_sirius_datasource);
-  // Reserved knobs: parsed and validated for forward compatibility, but not
-  // currently wired to the production uring_ioctx (SiriusContext scales the
-  // reactor pool with GPU count and hardcodes ring_entries=64). See
-  // scan_manager_config for details.
-  r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
-  r.optional("uring_ring_entries", opt.uring_ring_entries, yaml::greater_than<unsigned>{0});
-  r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
-  r.optional("prefetch_buffer_pool_bytes", yaml::bytes(opt.prefetch_buffer_pool_bytes));
-  r.optional("prefetch_inflight_budget_chunks",
-             opt.prefetch_inflight_budget_chunks,
-             yaml::greater_than<std::size_t>{0});
-  r.optional("enable_chunk_prewarm", opt.enable_chunk_prewarm);
+  r.optional("strategy", opt.strategy);
   r.reject_unknown();
 }
 
 static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
 {
-  yaml::reader r(node, "object_store_config");
+  yaml::reader r(node, "object_store");
   r.optional("endpoint", opt.endpoint);
   r.optional("region", opt.region);
   r.optional("access_key", opt.access_key);
@@ -115,7 +103,70 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.optional("signing_mode", opt.s3_signing_mode);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);
-  r.optional("s3_use_async_backend", opt.s3_use_async_backend);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
+{
+  yaml::reader r(node, "rest");
+  r.optional("request_timeout_s", opt.request_timeout_s);
+  r.optional("ca_bundle_path", opt.ca_bundle_path);
+  r.optional("tls_verify", opt.tls_verify);
+  r.optional("max_connections", opt.max_connections);
+  r.optional("chunk_size", yaml::bytes(opt.chunk_size));
+  r.optional("max_n_chunks", opt.max_n_chunks);
+  r.optional("max_read_split", opt.max_read_split);
+  r.optional("bounce_block_size", yaml::bytes(opt.bounce_block_size));
+  r.optional("upkeep_interval_ms", opt.upkeep_interval);
+  r.optional("conn_max_age_s", opt.conn_max_age);
+  r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
+  r.optional("retry_jitter_ms", opt.retry_jitter);
+  r.optional("max_retry_attempts", opt.max_retry_attempts);
+  r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
+  r.optional("honor_retry_after", opt.honor_retry_after);
+  r.optional("perf_instrumentation", opt.perf_instrumentation);
+  r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
+  r.optional("list_max_matches", opt.list_max_matches);
+  r.optional("list_max_scanned", opt.list_max_scanned);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
+{
+  yaml::reader r(node, "local");
+  r.optional("use_odirect", opt.use_odirect);
+  r.optional("max_n_chunks", opt.max_n_chunks);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
+{
+  yaml::reader r(node, "cache");
+  r.optional(
+    "inflight_io_chunk_budget", opt.inflight_io_chunk_budget, yaml::greater_than<std::size_t>{0});
+  r.optional("dispose_after_use", opt.dispose_after_use);
+  r.optional("min_prefetching_budget_fraction",
+             opt.min_prefetching_budget_fraction,
+             yaml::fraction<double>{});
+  r.optional(
+    "eviction_threshold_fraction", opt.eviction_threshold_fraction, yaml::fraction<double>{});
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
+{
+  yaml::reader r(node, "scan_manager");
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
+  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
+  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("use_sirius_datasource", opt.use_sirius_datasource);
+  r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
+  r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
+  r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
+  if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
+  if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
+  if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
+  if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   r.reject_unknown();
 }
 
@@ -123,7 +174,6 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
-  r.optional("default_scan_task_varchar_size", yaml::bytes(opt.default_scan_task_varchar_size));
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
@@ -133,6 +183,12 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
+  r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
+  r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
+  r.optional("dynamic_filter_domain_coverage_threshold",
+             opt.dynamic_filter_domain_coverage_threshold);
+  r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
+  r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.reject_unknown();
 }
 
@@ -145,23 +201,13 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, op::scan::scan_executor_config& opt)
-{
-  yaml::reader r(node, "duckdb_scan");
-  r.optional("cache", opt.cache);
-  r.optional("num_threads", opt.thread_pool_config.num_threads, yaml::greater_than<int>{0});
-  r.optional("thread_name_prefix", opt.thread_pool_config.thread_name_prefix);
-  r.optional("cpu_affinity", opt.thread_pool_config.cpu_affinity_list);
-  r.reject_unknown();
-}
-
 static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& opt)
 {
   yaml::reader r(node, "downgrade");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("monitor_period_ms", opt.monitor_period_ms);
+  r.optional("monitor_period", opt.monitor_period);
   r.reject_unknown();
 }
 
@@ -229,7 +275,7 @@ struct gpu_mem_config {
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_gpu(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_fraction_per_gpu(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_gpu(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_gpu(downgrade_trigger_fraction, downgrade_stop_fraction);
     builder.track_reservation_per_stream(track_per_stream_reservation);
@@ -275,10 +321,17 @@ struct host_mem_config {
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_fraction_per_host(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_host(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_host(downgrade_trigger_fraction, downgrade_stop_fraction);
     builder.set_per_host_capacity(numa_region_capacity_bytes);
+    // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
+    // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
+    // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see
+    // reservation_manager_configurator::build()). Passing our {block_size, pool_size,
+    // initial_number_pools} positionally therefore lands each value in the correctly-named
+    // cucascade config field — the names line up with the resulting config struct, not with the
+    // setter's parameter names.
     builder.set_host_pool_features(block_size, pool_size, initial_number_pools);
   }
 };
@@ -384,17 +437,11 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
-      if (auto n = er.optional_node("duckdb_scan")) sirius::from_yaml(*n, _scan_executor_config);
       er.reject_unknown();
     }
 
     // Operator params
     if (auto n = r.optional_node("operator_params")) { sirius::from_yaml(*n, _operator_params); }
-
-    // Object store (S3) config — endpoint / credentials for the s3:// datasource.
-    if (auto n = r.optional_node("object_store_config")) {
-      sirius::from_yaml(*n, object_store_config);
-    }
 
     // Telemetry
     if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, _telemetry_config); }
@@ -481,7 +528,7 @@ const exec::downgrade_executor_config& sirius_config::get_downgrade_executor_con
   return _downgrade_executor_config;
 }
 
-const exec::thread_pool_config& sirius_config::get_task_creator_config() const noexcept
+const creator::task_creator_config& sirius_config::get_task_creator_config() const noexcept
 {
   return _task_creator_config;
 }
@@ -494,11 +541,6 @@ const scan_manager::scan_manager_config& sirius_config::get_scan_manager_config(
 void sirius_config::set_scan_manager_config(scan_manager::scan_manager_config config) noexcept
 {
   _scan_manager_config = std::move(config);
-}
-
-const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept
-{
-  return _scan_executor_config.thread_pool_config;
 }
 
 }  // namespace sirius

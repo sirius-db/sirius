@@ -16,7 +16,6 @@
 
 #include "creator/task_creator.hpp"
 
-#include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -25,6 +24,7 @@
 #include "planner/query.hpp"
 #include "sirius_context.hpp"
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
@@ -32,8 +32,10 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 
 namespace sirius::creator {
 
@@ -41,10 +43,13 @@ namespace sirius::creator {
 // task_creator
 //------------------------------------------------------------------------------
 
-task_creator::task_creator(exec::thread_pool_config config,
+task_creator::task_creator(task_creator_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
                            const cucascade::memory::system_topology_info* sys_topology)
-  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _sys_topology(sys_topology)
+  : _running(false),
+    _config(std::move(config)),
+    _mem_res_mgr(mem_res_mgr),
+    _sys_topology(sys_topology)
 {
   // Normalize numa_node=-1 (Linux convention for non-NUMA / single-NUMA
   // hosts) to 0 so it matches the host memory space, which is built with
@@ -60,6 +65,16 @@ task_creator::task_creator(exec::thread_pool_config config,
       _numa_to_gpu[normalized_numa].push_back(static_cast<int>(_sys_topology->gpus[i].id));
     }
   }
+
+  // Device ids that actually have a GPU executor (memory-manager GPU spaces);
+  // partition affinity indexes this, not the physical topology, so the pin
+  // resolves to a real executor when num_gpus < physical GPU count.
+  for (auto const* space : _mem_res_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (space) { _active_gpu_ids.push_back(space->get_device_id()); }
+  }
+  std::sort(_active_gpu_ids.begin(), _active_gpu_ids.end());
+  _active_gpu_ids.erase(std::unique(_active_gpu_ids.begin(), _active_gpu_ids.end()),
+                        _active_gpu_ids.end());
 }
 
 task_creator::~task_creator() { stop(); }
@@ -86,6 +101,12 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   _gpu_operator_global_state_map.clear();
 
   const auto& pipelines = query.get_pipelines();
+
+  auto* sirius_ctx =
+    _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
+    sirius_ctx->get_telemetry_context();
+
   for (const auto& pipeline : pipelines) {
     pipeline->set_task_creator(this);
     auto source_operator = pipeline->get_source();
@@ -94,8 +115,20 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       continue;
     }
     size_t operator_id = source_operator->get_operator_id();
-    auto gs            = std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
+    auto gs =
+      std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
     _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
+  }
+
+  std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);
+  _lookahead_queue.clear();
+  auto scan_operators      = query.get_scan_operators();
+  _index_of_next_lookahead = 0;
+  if (!scan_operators.empty()) {
+    auto begin = scan_operators.begin() + 1;
+    for (auto it = begin; it != scan_operators.end(); ++it) {
+      _lookahead_queue.push_back(*it);
+    }
   }
 }
 
@@ -114,15 +147,29 @@ void task_creator::drain_pending_tasks()
   // caller as "Operation not permitted" and breaking otherwise-successful
   // multi-file SF1000 scans.
   if (_bounded_pool) { _bounded_pool->wait_all(); }
+  // Clear lookahead state so any schedule_lookahead() call from the
+  // management_eventloop that races with QueryEnd (after query_.reset() destroys
+  // operators but before task_creator_->reset() clears the queue) finds an
+  // empty queue and exits cleanly instead of dereferencing dangling pointers.
+  {
+    std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);
+    _lookahead_queue.clear();
+    _index_of_next_lookahead = 0;
+  }
   _task_creation_queue.reactivate();
 }
 
-void task_creator::reset(bool /*keep_parquet_metadata*/)
+void task_creator::reset()
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _gpu_operator_global_state_map.clear();
   _thread_context.reset();
   _execution_context.reset();
+  {
+    std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);
+    _lookahead_queue.clear();
+    _index_of_next_lookahead = 0;
+  }
 }
 
 op::sirius_physical_operator* task_creator::get_operator_for_next_task(
@@ -131,16 +178,16 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
   if (node == nullptr) { return nullptr; }
 
   auto hint = node->get_next_task_hint();
+  if (!hint.has_value()) { return nullptr; }
 
-  if (hint.has_value() && hint.value().hint == op::TaskCreationHint::READY) {
+  if (hint.value().hint == op::TaskCreationHint::READY) {
     if (hint.value().producer == nullptr) {
       throw std::runtime_error(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
     // WSM TODO: how do we handle other ports that are not default?
     return hint.value().producer;
-  } else if (hint.has_value() &&
-             hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
+  } else if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
     return get_operator_for_next_task(hint.value().producer);
   }
   return nullptr;
@@ -163,8 +210,10 @@ void task_creator::start_thread_pool()
   // a paired reactivate() here, subsequent schedule() pushes silently no-op
   // and the next query's manager_loop sees an empty/inactive queue forever.
   _task_creation_queue.reactivate();
-  _bounded_pool = std::make_unique<exec::bounded_thread_pool>(
-    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
+  _bounded_pool =
+    std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
+                                                _config.thread_pool.thread_name_prefix,
+                                                _config.thread_pool.cpu_affinity_list);
   _manager_thread = std::thread(&task_creator::manager_loop, this);
 }
 
@@ -193,6 +242,32 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   _task_creation_queue.push(std::move(request));
 }
 
+void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
+{
+  if (_config.strategy != request_type::lookahead) { return; }
+  std::lock_guard lock(_lookahead_mutex);
+  for (; _index_of_next_lookahead < _lookahead_queue.size(); ++_index_of_next_lookahead) {
+    auto* node = _lookahead_queue[_index_of_next_lookahead];
+    if (node == nullptr) { continue; }
+    auto hint = node->get_next_task_hint();
+    if (!hint.has_value()) {
+      if (!node->get_pipeline()->is_pipeline_finished()) { return; }
+      continue;
+    }
+    if (hint.value().hint == op::TaskCreationHint::READY) {
+      SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
+                       node->get_name(),
+                       node->get_operator_id());
+      auto request  = std::make_unique<task_creation_request>();
+      request->node = node;
+      request->type = request_type::lookahead;
+      _task_creation_queue.push(std::move(request));
+      ++_index_of_next_lookahead;
+      return;
+    }
+  }
+}
+
 void task_creator::manager_loop()
 {
   while (_running.load()) {
@@ -207,15 +282,17 @@ void task_creator::manager_loop()
       continue;
     }
 
-    auto node = request->node;
+    auto node         = request->node;
+    auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    auto* source = node;
+    node         = get_operator_for_next_task(node);
 
     if (node == nullptr) { continue; }
 
     // Dispatch the task creation work to the pool
-    _bounded_pool->dispatch(std::move(slot), [this, node]() mutable {
+    _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {
       try {
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();
@@ -226,12 +303,6 @@ void task_creator::manager_loop()
             port_info.next_operator->get_port(port_info.next_operator_port_name)->repo);
         }
 
-        // Create all possible tasks until all ports are empty
-        // TODO(amin) : do this based on the operator hint
-        // auto is_gpu_parquet_scan = node->type ==
-        // op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN; std::size_t count =
-        // is_gpu_parquet_scan ? 1 : std::numeric_limits<std::size_t>::max(); need to exhaust
-        // input batches until all ports are empty
         while (!node->all_ports_empty()) {
           auto task_lock  = pipeline->get_task_creation_lock();
           auto input_data = node->get_next_task_input_data();
@@ -272,11 +343,12 @@ void task_creator::manager_loop()
             // partitions across GPUs.
             if (auto* partitioned =
                   dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
-                !preferred_device_id.has_value() && partitioned && _sys_topology &&
-                !_sys_topology->gpus.empty()) {
-              auto n_gpus         = _sys_topology->gpus.size();
-              auto idx            = partitioned->get_partition_idx() % n_gpus;
-              preferred_device_id = static_cast<int>(_sys_topology->gpus[idx].id);
+                !preferred_device_id.has_value() && partitioned && !_active_gpu_ids.empty()) {
+              // Index the active executor set so every task of a partition lands
+              // on the same real GPU (required for cuco tables); the physical
+              // topology would yield phantom pins when num_gpus < physical count.
+              auto idx            = partitioned->get_partition_idx() % _active_gpu_ids.size();
+              preferred_device_id = _active_gpu_ids[idx];
             }
             if (!preferred_device_id.has_value() && pipelineable_input &&
                 !pipelineable_input->get_data_batches().empty()) {
@@ -344,10 +416,10 @@ void task_creator::manager_loop()
             // (cached_parquet_gpu_ingestible pins each chunk_memory_space
             // into the gpu_table_representation), so we just read it here.
             if (!preferred_device_id.has_value()) {
-              if (auto* cached = dynamic_cast<op::scan::scan_operator_with_pinned_table_input*>(
-                    local_state->_input_data.get())) {
-                if (cached->batch) {
-                  auto ro     = cached->batch->to_read_only();
+              if (auto* cached =
+                    dynamic_cast<op::scan::scan_operator_input*>(local_state->_input_data.get())) {
+                if (cached->is_resident()) {
+                  auto ro     = cached->get_cached_batch()->to_read_only();
                   auto* space = ro.get_memory_space();
                   if (space) {
                     if (space->get_tier() == cucascade::memory::Tier::GPU) {
@@ -389,7 +461,15 @@ void task_creator::manager_loop()
                                                                     gpu_pipeline_task_global_state);
           task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
+          if (request_kind == request_type::lookahead) { break; }
         }
+        // Unconditional re-evaluation at every creation exit: with the
+        // source-exhaustion finish guard, "last task completed at T1,
+        // connector closed at T2>T1" has no later mark_task_completed() to
+        // re-check the pipeline — this call, observing the now-exhausted
+        // source, is the paired re-evaluation. Without it, normal fast-GPU
+        // queries would hang.
+        pipeline->update_pipeline_status(false);
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
         _task_scheduler->terminate_query(std::current_exception());

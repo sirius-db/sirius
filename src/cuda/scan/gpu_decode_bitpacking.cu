@@ -41,14 +41,16 @@
 // count, not the parsed metadata).
 //===----------------------------------------------------------------------===//
 
+#include "cub/util_arch.cuh"
+#include "cuda/scan/detail/decode_common.cuh"
+#include "cuda/scan/detail/shared_staging.cuh"
+#include "cuda/scan/detail/vectorized_store.cuh"
 #include "cuda/scan/gpu_decode_bitpacking.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
 #include <rmm/detail/error.hpp>
 #include <rmm/device_uvector.hpp>
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/memcpy_async.h>
 #include <cub/warp/warp_scan.cuh>
 #include <cuda/std/numeric>
 #include <cuda_runtime.h>
@@ -62,37 +64,23 @@ namespace sirius::cuda::scan {
 
 namespace {
 
-constexpr uint32_t BLOCK_DIM = 256;
-
-/// VPT (= Values Per Thread) for the FOR / DELTA_FOR loop. With BLOCK_DIM=256 this
-/// covers BP_META_GROUP_SIZE (2048) in one pass without tail iterations.
-constexpr uint32_t VPT = BP_META_GROUP_SIZE / BLOCK_DIM;
-static_assert(BLOCK_DIM * VPT == BP_META_GROUP_SIZE,
-              "BLOCK_DIM and VPT must tile the metadata group exactly");
-static_assert(BLOCK_DIM % 32 == 0,
-              "BLOCK_DIM must be a multiple of warpSize for the DELTA_FOR "
+constexpr uint32_t BITPACK_BLOCK_DIM = 256;
+constexpr uint32_t VALUES_PER_THREAD = BP_META_GROUP_SIZE / BITPACK_BLOCK_DIM;
+static_assert(BITPACK_BLOCK_DIM * VALUES_PER_THREAD == BP_META_GROUP_SIZE,
+              "BITPACK_BLOCK_DIM and VALUES_PER_THREAD must tile the metadata group exactly");
+static_assert(BITPACK_BLOCK_DIM % cub::detail::warp_threads == 0,
+              "BITPACK_BLOCK_DIM must be a multiple of warpSize for the DELTA_FOR "
               "warp-aggregate scan");
 
-/// One CTA's unit of work: one metadata group within one segment.
-struct bp_group_desc {
-  uint8_t const* d_segment;    ///< Device pointer to the segment's first byte.
-  uint32_t segment_bytes;      ///< Size of the staged segment buffer.
-  uint32_t group_idx;          ///< Metadata-group index within the segment.
-  uint32_t group_row_count;    ///< Rows in this group (last group may be < 2048).
-  uint32_t global_row_offset;  ///< Output offset, in rows, for this group.
-};
-
 //===----------------------------------------------------------------------===//
-// Batched decode kernel.
+// Batched decode kernel. One CTA decodes one metadata group (a detail::cta_block_desc).
 //===----------------------------------------------------------------------===//
 template <typename T, int SHMEM_BYTES>
-__global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs,
+__global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restrict__ descs,
                                          T* __restrict__ d_output,
-                                         uint32_t num_groups)
+                                         int num_groups)
 {
-  namespace cg              = cooperative_groups;
   using vec_t               = int4;
-  auto constexpr VEC_BYTES  = sizeof(vec_t);
   auto constexpr WORD_BYTES = sizeof(uint32_t);
   auto constexpr WORD_BITS  = ::cuda::std::numeric_limits<uint32_t>::digits;
 
@@ -108,14 +96,12 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   auto const* seg_base = desc.d_segment;
   auto const seg_bytes = desc.segment_bytes;
 
-  // `d_output` is 256B-aligned by CUDA, but `out` is only 16B-aligned when
-  // `global_row_offset * sizeof(T)` is a multiple of `sizeof(vec_t)`. That
-  // holds for the first segment in a column and any stacked segment whose
-  // prior-segment row count was a multiple of `sizeof(vec_t) / sizeof(T)` —
-  // not in general. CONSTANT and CONSTANT_DELTA branch on this and use
-  // scalar stores when unaligned (FOR / DELTA_FOR already store scalar).
-  auto* out                  = d_output + desc.global_row_offset;
-  bool const out_vec_aligned = (reinterpret_cast<::cuda::std::uintptr_t>(out) % sizeof(vec_t)) == 0;
+  // `d_output` is 256B-aligned by CUDA; `out` is only 16B-aligned when
+  // `global_row_offset * sizeof(T)` is a multiple of `sizeof(int4)`, which does
+  // not hold for a stacked segment whose row offset is not a multiple of
+  // `sizeof(int4) / sizeof(T)`. `vec_fill` (CONSTANT / CONSTANT_DELTA) handles
+  // that itself by peeling a scalar prologue to the next 16B boundary.
+  auto* out = d_output + desc.global_row_offset;
 
   // Shared metadata — written by thread 0, read by all after the barrier.
   // `sm_aux` is overloaded by mode:
@@ -145,17 +131,17 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
     // metadata_end; entry K (0-based) lives at metadata_end - (K+1) * 4.
     // The trailer must fit *and* lie inside the segment buffer.
     bool metadata_ok =
-      metadata_end >= sizeof(uint64_t) + (uint64_t{desc.group_idx} + 1) * sizeof(uint32_t) &&
+      metadata_end >= sizeof(uint64_t) + (uint64_t{desc.block_idx} + 1) * sizeof(uint32_t) &&
       metadata_end <= seg_bytes;
 
     if (metadata_ok) {
-      auto const* entry_addr = seg_base + metadata_end - (desc.group_idx + 1) * sizeof(uint32_t);
+      auto const* entry_addr = seg_base + metadata_end - (desc.block_idx + 1) * sizeof(uint32_t);
       uint32_t encoded       = 0;
       memcpy(&encoded, entry_addr, sizeof(uint32_t));
 
       auto const data_off    = encoded & 0x00FFFFFFu;
       auto const parsed_mode = (encoded >> 24) & 0xFFu;
-      sm_row_count           = desc.group_row_count;
+      sm_row_count           = desc.block_row_count;
 
       // `data_off` is a within-segment offset; the kernel reads v0 and v1
       // unconditionally (2*sizeof(T)) for every mode below, then reads a
@@ -234,28 +220,8 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // CONSTANT — broadcast `sm_aux` to every row.
   //===--------------------------------------------------------------------===//
   if (mode == BitpackingMode::CONSTANT) {
-    auto const val         = sm_aux;
-    uint32_t constexpr TPV = sizeof(vec_t) / sizeof(T);
-    if (out_vec_aligned) {
-      auto const vec_count = rc / TPV;
-      auto* out4           = reinterpret_cast<vec_t*>(out);
-      vec_t packed;
-      auto* lanes = reinterpret_cast<T*>(&packed);
-#pragma unroll
-      for (uint32_t i = 0; i < TPV; ++i)
-        lanes[i] = val;
-      for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
-        __stcs(out4 + v, packed);
-      }
-      uint32_t tail_start = vec_count * TPV;
-      for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
-        __stcs(out + i, val);
-      }
-    } else {
-      for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
-        __stcs(out + i, val);
-      }
-    }
+    auto const val = sm_aux;
+    detail::vec_fill<T>(out, rc, threadIdx.x, blockDim.x, [val](int) { return val; });
     return;
   }
 
@@ -263,31 +229,11 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // CONSTANT_DELTA — out[i] = frame + i*delta.
   //===--------------------------------------------------------------------===//
   if (mode == BitpackingMode::CONSTANT_DELTA) {
-    auto const frame       = sm_frame;
-    auto const delta       = sm_aux;
-    uint32_t constexpr TPV = sizeof(vec_t) / sizeof(T);
-    if (out_vec_aligned) {
-      auto const vec_count = rc / TPV;
-      auto* out4           = reinterpret_cast<vec_t*>(out);
-      for (uint32_t v = threadIdx.x; v < vec_count; v += blockDim.x) {
-        vec_t packed;
-        auto* lanes       = reinterpret_cast<T*>(&packed);
-        auto const base_v = v * TPV;
-#pragma unroll
-        for (uint32_t i = 0; i < TPV; ++i) {
-          lanes[i] = static_cast<T>(frame + static_cast<T>(base_v + i) * delta);
-        }
-        __stcs(out4 + v, packed);
-      }
-      auto const tail_start = vec_count * TPV;
-      for (uint32_t i = tail_start + threadIdx.x; i < rc; i += blockDim.x) {
-        __stcs(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
-      }
-    } else {
-      for (uint32_t i = threadIdx.x; i < rc; i += blockDim.x) {
-        __stcs(out + i, static_cast<T>(frame + static_cast<T>(i) * delta));
-      }
-    }
+    auto const frame = sm_frame;
+    auto const delta = sm_aux;
+    detail::vec_fill<T>(out, rc, threadIdx.x, blockDim.x, [frame, delta](int i) {
+      return static_cast<T>(frame + static_cast<T>(i) * delta);
+    });
     return;
   }
 
@@ -298,10 +244,8 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // Anything other than FOR / DELTA_FOR is INVALID metadata or an unknown
   // mode: zero-fill the descriptor's row range.
   if (mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) {
-    auto const fill_rows = desc.group_row_count;
-    for (uint32_t i = threadIdx.x; i < fill_rows; i += blockDim.x) {
-      __stcs(out + i, T(0));
-    }
+    detail::vec_fill<T>(
+      out, desc.block_row_count, threadIdx.x, blockDim.x, [](int) { return T(0); });
     return;
   }
 
@@ -312,15 +256,10 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   alignas(TARGET_ALIGNMENT_BYTES) __shared__ uint32_t shmem[SHMEM_BYTES / WORD_BYTES];
   auto const* packed_bytes  = seg_base + sm_data_offset;
   auto const n_packed_words = ::cuda::ceil_div(rc * width, WORD_BITS);
-  auto const block          = cg::this_thread_block();
 
-  // Async copy the packed bytes into shared memory.
-  cg::memcpy_async(
-    block, reinterpret_cast<uint8_t*>(shmem), packed_bytes, n_packed_words * WORD_BYTES);
-
-  // Guard word — set after async-copy issue; wait below covers both.
-  if (threadIdx.x == 0) shmem[n_packed_words] = 0;
-  cg::wait(block);
+  // Stage the packed bytes into shared memory; one guard word covers unpack_value's straddle read.
+  detail::stage_packed_to_shmem<BITPACK_BLOCK_DIM>(
+    shmem, packed_bytes, n_packed_words, /*guard_words=*/1);
 
   //===--------------------------------------------------------------------===//
   // FOR -- frame + value.
@@ -329,10 +268,11 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   if (mode == BitpackingMode::FOR) {
     // Striped fill
 #pragma unroll
-    for (uint32_t v = 0; v < VPT; ++v) {
+    for (int v = 0; v < VALUES_PER_THREAD; ++v) {
       auto const idx = v * blockDim.x + threadIdx.x;
       if (idx >= rc) break;
-      __stcs(out + idx, frame + unpack_value<T>(shmem, idx, width));
+      cub::ThreadStore<cub::STORE_CS>(out + idx,
+                                      static_cast<T>(frame + unpack_value<T>(shmem, idx, width)));
     }
     return;
   }
@@ -340,35 +280,31 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   //===--------------------------------------------------------------------===//
   // DELTA_FOR — frame + per-row delta, prefix-sum, then add delta_offset.
   //===--------------------------------------------------------------------===//
-  // Two-stage scan in blocked layout The block-wide prefix-sum is built from per-warp
-  // `cub::WarpScan` plus a single shmem exchange of the per-warp totals; one thread serially scans
-  // those 8 totals and broadcasts back. Final values are exchanged through shmem
-  // into striped layout for coalesced global stores.
-  //
-  // Used instead of `cub::BlockScan<T, 256>` to reduce register pressure and SMEM usage for
-  // improved occupancy.
+  // Two-stage block-wide prefix sum: a per-warp `cub::WarpScan`, then one thread
+  // serially scans the per-warp totals and broadcasts them back. Final values are
+  // exchanged through shmem into striped layout for coalesced global stores.
 
-  T thread_data[VPT];
+  T thread_data[VALUES_PER_THREAD];
 #pragma unroll
-  for (uint32_t v = 0; v < VPT; ++v) {
-    auto const idx = threadIdx.x * VPT + v;
+  for (int v = 0; v < VALUES_PER_THREAD; ++v) {
+    auto const idx = threadIdx.x * VALUES_PER_THREAD + v;
     thread_data[v] = (idx < rc) ? static_cast<T>(frame + unpack_value<T>(shmem, idx, width)) : T(0);
   }
 #pragma unroll
-  for (uint32_t v = 1; v < VPT; ++v) {
+  for (int v = 1; v < VALUES_PER_THREAD; ++v) {
     thread_data[v] = static_cast<T>(thread_data[v] + thread_data[v - 1]);
   }
 
   // Stage 1 — per-warp inclusive scan of thread aggregates.
   using WarpScanT          = cub::WarpScan<T>;
-  auto constexpr NUM_WARPS = BLOCK_DIM / 32;
+  auto constexpr NUM_WARPS = BITPACK_BLOCK_DIM / cub::detail::warp_threads;
   __shared__ typename WarpScanT::TempStorage warp_scan_temp[NUM_WARPS];
   __shared__ T warp_aggregates[NUM_WARPS];
 
-  auto const warp_id = threadIdx.x / 32;
-  auto const lane_id = threadIdx.x % 32;
+  auto const warp_id = threadIdx.x / cub::detail::warp_threads;
+  auto const lane_id = threadIdx.x % cub::detail::warp_threads;
 
-  T thread_agg = thread_data[VPT - 1];
+  T thread_agg = thread_data[VALUES_PER_THREAD - 1];
   T warp_inclusive;
   T warp_total;
   WarpScanT(warp_scan_temp[warp_id]).InclusiveSum(thread_agg, warp_inclusive, warp_total);
@@ -379,7 +315,7 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   if (warp_id == 0 && lane_id == 0) {
     T running = T(0);
 #pragma unroll
-    for (uint32_t w = 0; w < NUM_WARPS; ++w) {
+    for (int w = 0; w < NUM_WARPS; ++w) {
       auto const t       = warp_aggregates[w];
       warp_aggregates[w] = running;
       running            = static_cast<T>(running + t);
@@ -400,15 +336,15 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
   // no longer read after the unpack loop) for coalesced stores.
   auto* shmem_t = reinterpret_cast<T*>(shmem);
 #pragma unroll
-  for (uint32_t v = 0; v < VPT; ++v) {
-    auto const idx = threadIdx.x * VPT + v;
+  for (int v = 0; v < VALUES_PER_THREAD; ++v) {
+    auto const idx = threadIdx.x * VALUES_PER_THREAD + v;
     if (idx < rc) shmem_t[idx] = static_cast<T>(thread_data[v] + prefix);
   }
   __syncthreads();
 #pragma unroll
-  for (uint32_t v = 0; v < VPT; ++v) {
+  for (int v = 0; v < VALUES_PER_THREAD; ++v) {
     auto const idx = v * blockDim.x + threadIdx.x;
-    if (idx < rc) __stcs(out + idx, shmem_t[idx]);
+    if (idx < rc) cub::ThreadStore<cub::STORE_CS>(out + idx, shmem_t[idx]);
   }
 }
 
@@ -416,28 +352,8 @@ __global__ void kernel_decode_bitpacking(bp_group_desc const* __restrict__ descs
 // Type-erased dispatch.
 //===----------------------------------------------------------------------===//
 
-/// Build per-group descriptors covering every metadata group across every
-/// segment of `run`. Returns a host-side vector ready to be uploaded.
-std::vector<bp_group_desc> build_group_descs(gpu_codec_run const& run)
-{
-  std::vector<bp_group_desc> descs;
-  // Each segment contributes ceil(row_count / BP_META_GROUP_SIZE) groups;
-  for (auto const& seg : run.segments) {
-    if (seg.row_count == 0) continue;
-    auto const num_groups = ::cuda::ceil_div(seg.row_count, BP_META_GROUP_SIZE);
-    for (uint32_t g = 0; g < num_groups; ++g) {
-      // If it's the last group, ceiling the number of rows based on the segment row count
-      auto const group_rows =
-        (g + 1u < num_groups) ? BP_META_GROUP_SIZE : seg.row_count - g * BP_META_GROUP_SIZE;
-      descs.push_back(
-        {seg.d_bytes, seg.bytes_size, g, group_rows, seg.row_offset + g * BP_META_GROUP_SIZE});
-    }
-  }
-  return descs;
-}
-
 template <typename T>
-void launch_typed(bp_group_desc const* h_descs,
+void launch_typed(detail::cta_block_desc const* h_descs,
                   size_t num_groups,
                   T* d_output,
                   rmm::cuda_stream_view stream,
@@ -452,15 +368,15 @@ void launch_typed(bp_group_desc const* h_descs,
 
   if (num_groups == 0) return;
 
-  rmm::device_uvector<bp_group_desc> d_descs(num_groups, stream, mr);
+  rmm::device_uvector<detail::cta_block_desc> d_descs(num_groups, stream, mr);
   RMM_CUDA_TRY(cudaMemcpyAsync(d_descs.data(),
                                h_descs,
-                               num_groups * sizeof(bp_group_desc),
+                               num_groups * sizeof(detail::cta_block_desc),
                                cudaMemcpyHostToDevice,
                                stream.value()));
 
   kernel_decode_bitpacking<T, SHMEM_BYTES>
-    <<<static_cast<uint32_t>(num_groups), BLOCK_DIM, 0, stream.value()>>>(
+    <<<static_cast<uint32_t>(num_groups), BITPACK_BLOCK_DIM, 0, stream.value()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_groups));
 }
 
@@ -482,7 +398,7 @@ void decode_bitpacking_data(gpu_codec_run const& run,
                             rmm::cuda_stream_view stream,
                             rmm::device_async_resource_ref mr)
 {
-  auto descs = build_group_descs(run);
+  auto descs = detail::build_block_descs<BP_META_GROUP_SIZE>(run);
   if (descs.empty()) return;
 
   switch (type_size) {

@@ -16,9 +16,12 @@
 
 #pragma once
 
+#include "telemetry/data_batch_probe.hpp"
+
 #include <cudf/cudf_utils.hpp>
 #include <cudf/types.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -27,6 +30,11 @@
 #include <vector>
 
 namespace sirius {
+
+namespace telemetry {
+class telemetry_context;
+}  // namespace telemetry
+
 namespace op {
 
 /**
@@ -54,7 +62,8 @@ class gpu_merge_impl {
   static std::shared_ptr<cucascade::data_batch> concat(
     const std::vector<cucascade::read_only_data_batch>& input,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /**
    * @brief Perform ungrouped merge aggregate on multiple data batches.
@@ -73,7 +82,8 @@ class gpu_merge_impl {
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /**
    * @brief Perform grouped merge aggregate on multiple data batches.
@@ -94,7 +104,8 @@ class gpu_merge_impl {
     int num_group_cols,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /**
    * @brief Perform merge order-by on multiple data batches.
@@ -116,7 +127,8 @@ class gpu_merge_impl {
     const std::vector<cudf::order>& column_order,
     const std::vector<cudf::null_order>& null_precedence,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 };
 
 }  // namespace op

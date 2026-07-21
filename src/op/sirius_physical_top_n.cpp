@@ -33,7 +33,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -192,8 +192,11 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
   auto output_repr =
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
-  outputs.push_back(
-    std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
+  auto const batch_id                                          = ::sirius::get_next_batch_id();
+  outputs.push_back(cucascade::data_batch::make(
+    batch_id,
+    std::move(output_data),
+    telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 
@@ -291,8 +294,11 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   auto output_repr =
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(output_repr);
-  outputs.push_back(
-    std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
+  auto const batch_id                                          = ::sirius::get_next_batch_id();
+  outputs.push_back(cucascade::data_batch::make(
+    batch_id,
+    std::move(output_data),
+    telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
   return std::make_unique<pipelineable_operator_data>(outputs);
 }
 

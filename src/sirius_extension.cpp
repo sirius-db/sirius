@@ -21,7 +21,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
-#include "expression_executor/expression_executor_strategy.hpp"
+#include "expression_evaluator/expression_evaluator_strategy.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
@@ -29,9 +29,9 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -39,21 +39,32 @@
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
 #include "data/sirius_converter_registry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
@@ -63,7 +74,12 @@ extern "C" int cudaProfilerStop();
 #include "gpu_physical_plan_generator.hpp"
 #endif
 #include "duckdb/main/connection_manager.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_mvcc_visibility.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -81,9 +97,10 @@ extern "C" int cudaProfilerStop();
 // Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
 // transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
 // macro that collides with the BLOCK_SIZE static member in
-// <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
+// <blockingconcurrentqueue.h> (used by pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
+#include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
@@ -100,6 +117,7 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
+
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
                                                         const string& query,
@@ -121,7 +139,12 @@ unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return connection.Query(query); }
 
+  // CpuFallbackGuard marks this replay so sirius_httpfs refuses to serve s3://
+  // data reached indirectly (e.g. through a view) to the CPU plan — the
+  // string-level references_sirius_owned_s3_parquet check above only catches a
+  // literal read_parquet('s3://') in the query text.
   duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+  duckdb::SiriusContext::CpuFallbackGuard cpu_fallback_guard(*sirius_ctx);
   return connection.Query(query);
 }
 
@@ -222,9 +245,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-    // STATISTICS_PROPAGATION is now enabled: cpu_source_task handles the
-    // COLUMN_DATA_SCAN / EXPRESSION_GET / DUMMY_SCAN sources that this
-    // optimizer produces (e.g. folding count(*), MIN, MAX to constants).
+    // STATISTICS_PROPAGATION is now enabled: the GPU_VALUES source operator
+    // handles the COLUMN_DATA_SCAN / EXPRESSION_GET / DUMMY_SCAN sources that
+    // this optimizer produces (e.g. folding count(*), MIN, MAX to constants).
 #ifdef DEBUG
     disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 #endif
@@ -576,7 +599,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   } catch (std::exception& e) {
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
-    if (Config::ENABLE_DUCKDB_FALLBACK) {
+    if (duckdb_fallback_enabled(context)) {
       result->plan_error         = true;
       result->plan_error_message = error.RawMessage();
     } else {
@@ -605,20 +628,16 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   if (!data.res) {
     auto start = std::chrono::high_resolution_clock::now();
     if (data.plan_error) {
-      printf(
-        "=============================================\nError in SiriusExecuteQuery, fallback to "
-        "DuckDB\n=============================================\n");
+      print_cpu_fallback_banner();
       data.res = run_internal_cpu_fallback_query(
         context, *data.conn, data.cpu_fallback_query, data.plan_error_message);
     } else {
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
-        if (Config::ENABLE_DUCKDB_FALLBACK) {
+        if (duckdb_fallback_enabled(context)) {
           SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
-          printf(
-            "=============================================\nError in SiriusExecuteQuery, fallback "
-            "to DuckDB\n=============================================\n");
+          print_cpu_fallback_banner();
           data.res = run_internal_cpu_fallback_query(
             context, *data.conn, data.cpu_fallback_query, data.res->GetError());
         } else {
@@ -642,9 +661,9 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   return;
 }
 
-static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
-                                                Planner& planner,
-                                                Connection& new_conn)
+[[maybe_unused]] static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
+                                                                 Planner& planner,
+                                                                 Connection& new_conn)
 {
   unique_ptr<LogicalOperator> plan;
   plan = std::move(planner.plan);
@@ -791,6 +810,182 @@ struct PinTableFunctionData : public TableFunctionData {
   bool finished = false;
 };
 
+namespace {
+
+// Resolve the kept-column logical indices for a pin: the positions of the
+// user-requested @p cols within @p schema_names (preserving requested order), or
+// identity over all columns when @p cols is absent/empty.
+std::vector<std::size_t> resolve_pin_kept_indices(
+  std::vector<std::string> const& schema_names, std::optional<std::vector<std::string>> const& cols)
+{
+  std::vector<std::size_t> keep;
+  if (cols && !cols->empty()) {
+    std::unordered_map<std::string, std::size_t> pos;
+    pos.reserve(schema_names.size());
+    for (std::size_t i = 0; i < schema_names.size(); ++i) {
+      pos.emplace(schema_names[i], i);
+    }
+    for (auto const& c : *cols) {
+      auto it = pos.find(c);
+      if (it == pos.end()) {
+        throw InvalidInputException("pin_table: column '" + c + "' not found in table schema");
+      }
+      keep.push_back(it->second);
+    }
+  } else {
+    keep.resize(schema_names.size());
+    for (std::size_t i = 0; i < schema_names.size(); ++i) {
+      keep[i] = i;
+    }
+  }
+  return keep;
+}
+
+// Build the table_info for a parquet pin. It drives the ingestible read and is the
+// source cache_entry_info::from reads to build the pinned entry's cache descriptor:
+// it carries the FULL schema in names/returned_types (build_scan_plan indexes them
+// by primary index) plus projection_ids when a column subset is pinned, from which
+// cache_entry_info::from derives the column_ids-aligned names the gather needs.
+std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_pin_info(
+  sirius::scan_manager::sirius_scan_manager& scan_mgr,
+  std::vector<std::string> const& file_paths,
+  std::optional<std::vector<std::string>> const& cols,
+  std::size_t batch_size,
+  vector<LogicalType>& pinned_column_types)
+{
+  using sirius::op::scan::parquet_ingestible_table_info;
+  auto desc = scan_mgr.describe_parquet(file_paths.front());
+  std::vector<std::string> schema_names(desc.names.begin(), desc.names.end());
+  auto keep            = resolve_pin_kept_indices(schema_names, cols);
+  bool const is_subset = cols && !cols->empty();
+
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->resolved_file_paths = file_paths;
+  info->returned_types      = sirius::from_duckdb_vec(desc.return_types);  // full schema
+  info->names               = desc.names;                                  // full schema
+  for (auto idx : keep) {
+    info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(idx)));
+    // Pin-time DuckDB type of each pinned column, in column_ids (batch-column)
+    // order. Taken from the native DuckDB schema rather than round-tripped
+    // through sirius::logical_type: the zone-map capture keys its type
+    // allowlist on exact LogicalType identity (e.g. timestamp units).
+    pinned_column_types.push_back(desc.return_types[idx]);
+  }
+  if (is_subset) {
+    // Non-empty projection_ids forces scan_plan::is_projected() so the cudf reader
+    // projects to exactly the pinned columns (identity into column_ids).
+    for (std::size_t k = 0; k < keep.size(); ++k) {
+      info->projection_ids.push_back(static_cast<duckdb::idx_t>(k));
+    }
+  }
+  info->scan_output_arity      = keep.size();
+  info->approximate_batch_size = batch_size;
+  return info;
+}
+
+// A duckdb-native pin is a positional snapshot of the table's last-checkpointed
+// disk image: a later checkpoint would compact tombstoned rows and flush transient
+// appends, silently shifting rowids out from under the cache (and compressing the
+// in-memory transient segments the query-time insert delta reads). Suppress both
+// WAL auto-checkpoint triggers — the size threshold and the entry count — before
+// the pin's metadata walk snapshots the on-disk row groups. The DBConfig is shared
+// by every attached database, so this covers them all. Idempotent, and deliberately
+// not restored on unpin (or when a later pin step fails): a restore would need pin
+// refcounting to be safe against other pins taken meanwhile. Manual CHECKPOINT —
+// and DETACH of the pinned database, whose close runs a shutdown checkpoint —
+// while pinned are outside the supported contract.
+void suppress_auto_checkpoint_for_pin(ClientContext& context)
+{
+  auto& config                       = DBConfig::GetConfig(context);
+  config.options.checkpoint_wal_size = NumericLimits<idx_t>::Maximum();
+  config.SetOptionByName("wal_autocheckpoint_entries", Value::UBIGINT(0));
+}
+
+// Resolve an attached duckdb table from the catalog and build its table_info for a
+// pin. The .db must be ATTACHed. The pin captures the table's (catalog, schema,
+// table) name from the resolved DuckTableEntry; that name tuple must match what a
+// later query's scan derives, because it is the cache identity
+// (cache_entry_info::can_serve_with_columns) — not the DataTable* pointer. A single
+// info serves both the read and the cached entry.
+std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duckdb_pin_info(
+  ClientContext& context,
+  std::string const& table_ref,
+  std::string const& schema_override,
+  std::optional<std::vector<std::string>> const& cols,
+  std::size_t batch_size,
+  vector<LogicalType>& pinned_column_types)
+{
+  using sirius::op::scan::duckdb_native_ingestible_table_info;
+
+  // 'table_ref' is the (optionally schema/catalog-qualified) table name. Resolve it
+  // through the catalog honoring the client's search path — so a bare name picks up
+  // the current/USE'd database — yielding the same DataTable* a query-time scan binds.
+  auto const qname          = duckdb::QualifiedName::Parse(table_ref);
+  std::string const catalog = qname.catalog;  // empty => search path
+  std::string const schema  = !qname.schema.empty() ? qname.schema : schema_override;
+  std::string const& table  = qname.name;
+
+  // Non-template catalog lookup + Cast (mirroring the pipeline converter). The
+  // templated Catalog::GetEntry<DuckTableEntry> would ODR-use DuckTableEntry::Name
+  // (a static constexpr inherited from TableCatalogEntry), emitting a duplicate
+  // symbol against libduckdb_static at link time.
+  auto& entry_base =
+    duckdb::Catalog::GetEntry(context, duckdb::CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry         = entry_base.Cast<duckdb::DuckTableEntry>();
+  auto& storage       = entry.GetStorage();
+  auto const& columns = entry.GetColumns();
+  auto schema_names   = columns.GetColumnNames();  // logical order
+  auto schema_types   = columns.GetColumnTypes();  // logical order
+
+  auto keep            = resolve_pin_kept_indices(schema_names, cols);
+  auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
+
+  // Update chains version values in place, invisibly to the DELETE
+  // keep-masks — a pin would serve stale values to every query until the
+  // chains are folded away. Refuse loudly (the transient-rows case already
+  // fails the same way); CHECKPOINT folds the chains into the base data.
+  {
+    std::vector<duckdb::storage_t> pinned_storage_cols(keep.begin(), keep.end());
+    if (sirius::op::scan::any_update_chains(
+          storage, pinned_storage_cols, static_cast<std::size_t>(storage.GetTotalRows()))) {
+      throw InvalidInputException(
+        "pin_table: table '%s' has in-memory update chains on a pinned column; run CHECKPOINT "
+        "before pinning",
+        table_ref);
+    }
+  }
+
+  auto info     = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage = &storage;
+  info->context = &context;
+  info->db_path = canonical;
+  // Qualified-name identity for the pin cache — derived from the resolved
+  // DuckTableEntry so it matches the query-side derivation (the pipeline converter).
+  info->catalog_name           = entry.ParentCatalog().GetName();
+  info->schema_name            = entry.ParentSchema().name;
+  info->table_name             = entry.name;
+  info->approximate_batch_size = batch_size;
+  // Full-schema names (logical order) so column_names() can derive the
+  // column_ids-aligned view; the decoder itself ignores names.
+  info->names.assign(schema_names.begin(), schema_names.end());
+  info->returned_types = sirius::from_duckdb_vec(schema_types);
+  for (auto col : keep) {
+    info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(col)));
+    // Exact pin-time DuckDB type per pinned column (see build_parquet_pin_info).
+    pinned_column_types.push_back(schema_types[col]);
+    sirius::op::scan::projected_column pc;
+    pc.is_rowid    = false;
+    pc.storage_idx = duckdb::StorageIndex(static_cast<duckdb::idx_t>(col));
+    info->projected_cols.push_back(pc);
+    auto t = sirius::from_duckdb(schema_types[col]);
+    info->projected_types.push_back(t);
+    info->output_types.push_back(t);
+  }
+  return info;
+}
+
+}  // namespace
+
 unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
                                                        TableFunctionBindInput& input,
                                                        vector<LogicalType>& return_types,
@@ -798,10 +993,11 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
 {
   auto result = make_uniq<PinTableFunctionData>();
 
-  if (input.inputs.empty() || input.inputs[0].IsNull()) {
-    throw BinderException("pin_table requires a non-null path argument");
+  // The positional path is optional: parquet uses it (file/glob); duckdb takes no
+  // positional (its table is named by 'name' and resolved from the catalog).
+  if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+    result->args.path = input.inputs[0].ToString();
   }
-  result->args.path = input.inputs[0].ToString();
 
   auto tier_it = input.named_parameters.find("tier");
   if (tier_it == input.named_parameters.end() || tier_it->second.IsNull()) {
@@ -831,9 +1027,49 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.cols = std::move(cols);
   }
 
-  auto n_rows_it = input.named_parameters.find("n_rows");
-  if (n_rows_it != input.named_parameters.end() && !n_rows_it->second.IsNull()) {
-    result->args.n_rows = n_rows_it->second.GetValue<int64_t>();
+  // Resolve the source format: an explicit 'format' parameter, else inferred from
+  // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
+  auto to_lower = [](std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s;
+  };
+  auto ends_with = [](std::string const& s, std::string_view suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
+  auto format_it = input.named_parameters.find("format");
+  if (format_it != input.named_parameters.end() && !format_it->second.IsNull()) {
+    result->args.format = to_lower(format_it->second.ToString());
+    if (result->args.format != "parquet" && result->args.format != "duckdb") {
+      throw BinderException("pin_table 'format' must be 'parquet' or 'duckdb', got '" +
+                            result->args.format + "'");
+    }
+  } else if (!result->args.path.empty()) {
+    auto lowered = to_lower(result->args.path);
+    if (ends_with(lowered, ".parquet")) {
+      result->args.format = "parquet";
+    } else if (ends_with(lowered, ".db") || ends_with(lowered, ".duckdb")) {
+      result->args.format = "duckdb";
+    } else {
+      throw BinderException("pin_table: cannot infer format from path '" + result->args.path +
+                            "'; pass format => 'parquet' or 'duckdb'");
+    }
+  } else {
+    throw BinderException("pin_table: provide a positional path (parquet) or format => 'duckdb'");
+  }
+
+  if (result->args.format == "parquet") {
+    if (result->args.path.empty()) {
+      throw BinderException("pin_table: format 'parquet' requires a positional path argument");
+    }
+  } else {
+    // duckdb: 'name' is the (optionally qualified) table to pin, resolved from the
+    // catalog — no path needed. 'schema' is a SQL reserved word, so the optional
+    // schema override is the 'schema_name' parameter.
+    auto schema_it = input.named_parameters.find("schema_name");
+    if (schema_it != input.named_parameters.end() && !schema_it->second.IsNull()) {
+      result->args.schema = schema_it->second.ToString();
+    }
   }
 
   return_types.emplace_back(LogicalType::BOOLEAN);
@@ -853,13 +1089,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
-  // The cudf reader places parquet chunks on whichever GPU is current at
-  // read_chunk() time; round-robin the file reads across all GPU memory spaces
-  // so multi-file pin_table calls distribute their chunks evenly. Each file's
-  // chunks all bind to the same GPU (per-file binding — see comment at
-  // chunk_idx increment below). For tier='host' we additionally convert each
-  // table to a host_data_representation (via the GPU↔HOST converter) so the
-  // pinned data lives in pinned host memory.
+  // The read is driven by sirius::materialize_all_batches (pin_table.cpp), which
+  // round-robins the materialized batches across all GPU memory spaces so a pin
+  // distributes its chunks evenly. For tier='host' each materialized GPU table is
+  // then converted to a host_data_representation (via the GPU<->HOST converter) so
+  // the pinned data lives in pinned host memory.
   auto& memory_manager = sirius_ctx->get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
@@ -897,166 +1131,109 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     }
   }
 
-  // Glob the user-supplied path into concrete files.
-  auto& fs   = FileSystem::GetFileSystem(context);
-  auto files = fs.GlobFiles(data.args.path);
-  std::vector<std::string> file_paths;
-  file_paths.reserve(files.size());
-  for (auto& f : files) {
-    file_paths.push_back(f.path);
-  }
-
-  // Only parquet files are supported. Validate by extension before reading.
-  auto has_parquet_ext = [](std::string const& p) {
-    constexpr std::string_view kExt = ".parquet";
-    if (p.size() < kExt.size()) { return false; }
-    auto tail = p.substr(p.size() - kExt.size());
-    std::transform(
-      tail.begin(), tail.end(), tail.begin(), [](unsigned char c) { return std::tolower(c); });
-    return tail == kExt;
-  };
-  for (auto const& path : file_paths) {
-    if (!has_parquet_ext(path)) {
-      throw InvalidInputException("pin_table only supports parquet files, got non-parquet path: " +
-                                  path);
-    }
-  }
-
-  std::vector<std::string> cols =
-    data.args.cols.has_value() ? *data.args.cols : std::vector<std::string>{};
-
-  // Chunk read limit (target bytes per emitted batch) comes from operator_params.
-  std::size_t const chunk_read_limit =
+  auto& scan_mgr = sirius_ctx->get_scan_manager();
+  std::size_t const batch_size =
     sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
 
-  // Read each file via cudf::chunked_parquet_reader so each emitted batch stays within
-  // chunk_read_limit bytes. The optional n_rows budget caps the cumulative row count
-  // across files; once exhausted, stop early.
-  std::vector<std::unique_ptr<cudf::table>> tables;
-  // Parallel vector to tables — chunk_memory_spaces[i] is the memory_space*
-  // for the i-th cudf::table in tables. Consumed by insert_pinned_entry's
-  // precondition check (size==data_tables.size).
-  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
-  // HOST-tier storage: one host_data_representation per chunk.
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
-  std::vector<std::string> read_column_names;  // captured from parquet metadata
-  int64_t remaining_rows = data.args.n_rows.value_or(-1);
-  // Per-call local counter (NOT std::atomic, NOT global). PinTableFunction is
-  // single-threaded; new pin_table calls restart at chunk 0 → GPU 0 for
-  // reproducibility.
-  std::size_t chunk_idx = 0;
-
-  // For tier='host' the full table may not fit in GPU memory, so each batch is downgraded
-  // to a pinned host_data_representation immediately and the GPU buffers are released
-  // before the next read_chunk(). The GPU↔HOST converter uses cudaMemcpyBatchAsync which
-  // requires a real, non-default stream. Streams are constructed lazily inside the
-  // per-file loop under the device guard so each cuda_stream binds to its target GPU's
-  // context — a single pre-created stream binds to whichever device was current when
-  // emplaced and would route D2H copies through the wrong device for round-robin files
-  // that land on GPU 1+.
-  cucascade::representation_converter_registry* registry_ptr = nullptr;
-  std::unordered_map<int, rmm::cuda_stream> pin_streams_by_gpu;
-  if (data.args.tier == "host") { registry_ptr = &sirius::converter_registry::get(); }
-
-  for (auto const& path : file_paths) {
-    if (data.args.n_rows.has_value() && remaining_rows <= 0) { break; }
-
-    // Bind device BEFORE constructing chunked_parquet_reader so the cudf
-    // allocator places footer + decompress + column buffers on the intended
-    // GPU.
-    auto* target_space =
-      const_cast<cucascade::memory::memory_space*>(gpu_spaces[chunk_idx % gpu_spaces.size()]);
-    int target_gpu_id = target_space->get_device_id();
-    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu_id}};
-
-    // Route the chunked_parquet_reader through the per-GPU sirius_ioctx
-    // instead of cudf's bundled file_source factory (kvikio). The string-form
-    // source_info routes reads through libkvikio's FileHandle which binds a
-    // single CUDA context per file, breaking multi-GPU residency (the columns
-    // end up on the wrong GPU under sanitizer races). Use of sirius_ioctx is
-    // mandatory whenever more than one GPU is configured — enforced upstream
-    // by sirius_config::enforce_sirius_datasource_for_multi_gpu().
-    auto& scan_mgr  = sirius_ctx->get_scan_manager();
-    auto datasource = scan_mgr.create_datasource(path);
-    if (!datasource) {
-      throw InvalidInputException("pin_table: no IO backend supports path: " + path);
-    }
-
-    auto file_opts =
-      cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
-    if (!cols.empty()) { file_opts.set_column_names(cols); }
-    if (data.args.n_rows.has_value()) { file_opts.set_num_rows(remaining_rows); }
-
-    cudf::io::chunked_parquet_reader reader(chunk_read_limit, file_opts);
-    int64_t file_rows_read = 0;
-    while (reader.has_next()) {
-      auto chunk      = reader.read_chunk();
-      auto chunk_rows = static_cast<int64_t>(chunk.tbl->num_rows());
-      if (chunk_rows == 0) { break; }
-      if (read_column_names.empty()) {
-        read_column_names.reserve(chunk.metadata.schema_info.size());
-        for (auto const& col_info : chunk.metadata.schema_info) {
-          read_column_names.push_back(col_info.name);
-        }
-      }
-      file_rows_read += chunk_rows;
-      if (data.args.tier == "host") {
-        // Per-target-GPU stream + per-target-GPU host space: each round-robin
-        // file's chunks must record their D2H copies on a stream bound to the
-        // target GPU's context, and the destination host pinning should land
-        // on the NUMA-local host memory_space for that GPU.
-        // try_emplace default-constructs the rmm::cuda_stream when the key is
-        // missing. The default ctor calls cudaStreamCreate under whatever
-        // device is current — which is target_gpu_id by virtue of the
-        // surrounding device_guard.
-        auto [stream_it, inserted] = pin_streams_by_gpu.try_emplace(target_gpu_id);
-        (void)inserted;
-        rmm::cuda_stream_view target_stream = stream_it->second.view();
-        auto* target_host_space             = host_space_by_gpu.at(target_gpu_id);
-        cucascade::gpu_table_representation gpu_repr(
-          std::move(chunk.tbl), *target_space, target_stream);
-        auto host_repr = registry_ptr->convert<cucascade::host_data_representation>(
-          gpu_repr, target_host_space, target_stream);
-        // Sync before gpu_repr leaves scope so the async D2H copies finish before its
-        // device buffers are freed.
-        target_stream.synchronize();
-        host_chunks.emplace_back(std::move(host_repr));
-      } else {
-        tables.emplace_back(std::move(chunk.tbl));
-        chunk_memory_spaces.push_back(target_space);  // parallel to tables
-      }
-    }
-    if (data.args.n_rows.has_value()) { remaining_rows -= file_rows_read; }
-    // Per-call local counter, increments per file. All chunks within a single
-    // chunked_parquet_reader stay on the same GPU (chunks-at-index-i
-    // invariant). Cross-file alternation produces the round-robin.
-    ++chunk_idx;
+  // materialize_all_batches round-robins reads across these GPUs and reports the
+  // per-batch placement; insert_pinned_entry wants non-const memory_space*.
+  std::vector<cucascade::memory::memory_space*> gpu_spaces_mut;
+  gpu_spaces_mut.reserve(gpu_spaces.size());
+  for (auto const* s : gpu_spaces) {
+    gpu_spaces_mut.push_back(const_cast<cucascade::memory::memory_space*>(s));
   }
 
-  // A user-supplied n_rows budget caps row capture below the full file content.
-  // The scan_manager must refuse cached reuse of such partial entries — see
-  // pinned_entry::is_partial.
-  bool const is_partial_pin = data.args.n_rows.has_value();
+  // Build the ingestible (drives the metadata walk + decode) from one table_info.
+  // duckdb-native has no standalone reader, so both formats go through their
+  // gpu_ingestible — one read path.
+  std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
+  // Pin-time DuckDB types of the pinned columns, in column_ids (batch-column)
+  // order — the zone-map capture keys its type allowlist on these exact types.
+  vector<LogicalType> pinned_column_types;
+  // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
+  // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
+  transaction_t duckdb_pin_v_base = 0;
+
+  if (data.args.format == "duckdb") {
+    auto info = build_duckdb_pin_info(
+      context, data.args.name, data.args.schema, data.args.cols, batch_size, pinned_column_types);
+    // After the catalog resolution (so a bad table name fails without side
+    // effects) but before make_ingestible snapshots the on-disk row groups.
+    suppress_auto_checkpoint_for_pin(context);
+    // Not the default database's counter: each AttachedDatabase has its own MVCC
+    // start_time domain, and pins usually target an ATTACHed .db (the catalog
+    // resolved by build_duckdb_pin_info), so read the fence off that catalog's
+    // DuckTransaction.
+    auto& pinned_catalog = Catalog::GetCatalog(context, info->catalog_name);
+    duckdb_pin_v_base    = DuckTransaction::Get(context, pinned_catalog).start_time;
+    ingestible           = sirius::op::scan::make_ingestible(std::move(info));
+  } else {  // parquet
+    auto& fs   = FileSystem::GetFileSystem(context);
+    auto files = fs.GlobFiles(data.args.path);
+    std::vector<std::string> file_paths;
+    file_paths.reserve(files.size());
+    for (auto& f : files) {
+      file_paths.push_back(f.path);
+    }
+    if (file_paths.empty()) {
+      throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
+    }
+    auto info =
+      build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
+    ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  }
+
+  if (!sirius_ctx->get_config().get_operator_params().enable_pinned_zone_map_pruning) {
+    pinned_column_types.clear();
+  }
+
+  // Build the cache descriptor (table identity + column layout) from the
+  // ingestible; it is stored on the pinned entry in place of the heavyweight
+  // ingestible_table_info and drives later cache-hit matching + the gather.
+  auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
+
   if (data.args.tier == "host") {
-    // entry.memory_space is metadata only; each host_chunk carries its own
-    // per-GPU NUMA-local memory_space inside its host_data_representation.
-    // Pass a representative (the first round-robin GPU's host space) so the
-    // entry still has a non-null memory_space for diagnostics.
-    int const first_gpu_id          = gpu_spaces[0]->get_device_id();
+    // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
+    // to a pinned host_data_representation on that GPU's NUMA-local host space, then free the
+    // GPU table before materializing the next. Peak GPU residency stays at ~one batch, so the
+    // whole table never needs to fit in GPU memory. On multi-GPU the chunks land round-robin
+    // across NUMA nodes; the cached-serve path then reads each chunk back on a NUMA-local GPU.
+    auto mat = sirius::materialize_pin_to_host(
+      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx(), pinned_column_types);
+    // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
+    // NUMA-local memory_space. Pass a representative (the first GPU's host space).
+    int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
-    sirius_ctx->get_scan_manager().insert_pinned_entry_host(data.args.name,
-                                                            std::move(read_column_names),
-                                                            std::move(file_paths),
-                                                            std::move(host_chunks),
-                                                            *representative_host_space,
-                                                            is_partial_pin);
+    scan_mgr.insert_pinned_entry_host(data.args.name,
+                                      std::move(cache_info),
+                                      std::move(mat.host_chunks),
+                                      *representative_host_space,
+                                      std::move(pinned_column_types),
+                                      std::move(mat.chunk_stats));
+    if (data.args.format == "duckdb") {
+      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
+      mvcc.v_base                   = duckdb_pin_v_base;
+      mvcc.base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
+      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+    }
   } else {
-    sirius_ctx->get_scan_manager().insert_pinned_entry(data.args.name,
-                                                       std::move(read_column_names),
-                                                       std::move(file_paths),
-                                                       std::move(tables),
-                                                       std::move(chunk_memory_spaces),
-                                                       is_partial_pin);
+    // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
+    // placement) and pin them in place.
+    auto mat = sirius::materialize_all_batches(
+      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pinned_column_types);
+    auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
+    scan_mgr.insert_pinned_entry(data.args.name,
+                                 std::move(cache_info),
+                                 std::move(mat.tables),
+                                 std::move(mat.chunk_memory_spaces),
+                                 std::move(pinned_column_types),
+                                 std::move(mat.chunk_stats));
+    if (data.args.format == "duckdb") {
+      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
+      mvcc.v_base                   = duckdb_pin_v_base;
+      mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
+      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+    }
   }
 
   output.SetCardinality(1);
@@ -1210,7 +1387,10 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                     {LogicalType::VARCHAR},
                                     SiriusReadParquetFunction,
                                     SiriusReadParquetBind);
-  sirius_read_parquet.cardinality = SiriusReadParquetCardinality;
+  sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.projection_pushdown = true;
+  sirius_read_parquet.filter_pushdown     = true;
+  sirius_read_parquet.filter_prune        = true;
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
@@ -1232,12 +1412,22 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo profiler_stop_info(profiler_stop);
   catalog.CreateTableFunction(transaction, profiler_stop_info);
 
-  TableFunction pin_table("pin_table", {LogicalType::VARCHAR}, PinTableFunction, PinTableBind);
-  pin_table.named_parameters["tier"]   = LogicalType::VARCHAR;
-  pin_table.named_parameters["name"]   = LogicalType::VARCHAR;
-  pin_table.named_parameters["cols"]   = LogicalType::LIST(LogicalType::VARCHAR);
-  pin_table.named_parameters["n_rows"] = LogicalType::BIGINT;
-  CreateTableFunctionInfo pin_table_info(pin_table);
+  // pin_table takes either a positional path (parquet) or no positional (duckdb,
+  // where 'name' is the catalog table reference) — register both arities as a set.
+  TableFunctionSet pin_table_set("pin_table");
+  auto add_pin_table_overload = [&](vector<LogicalType> positional_args) {
+    TableFunction pin_table(
+      "pin_table", std::move(positional_args), PinTableFunction, PinTableBind);
+    pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
+    pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
+    pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
+    pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
+    pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
+    pin_table_set.AddFunction(std::move(pin_table));
+  };
+  add_pin_table_overload({LogicalType::VARCHAR});
+  add_pin_table_overload({});
+  CreateTableFunctionInfo pin_table_info(pin_table_set);
   catalog.CreateTableFunction(transaction, pin_table_info);
 
   TableFunction unpin_table(
@@ -1265,19 +1455,35 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
 
-static void SetExpressionExecutorStrategy(ClientContext& context, SetScope scope, Value& parameter)
+static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 {
-  auto value = StringValue::Get(parameter);
-  sirius::expression_executor_strategy parsed;
+  sirius::expression_evaluator_strategy parsed;
   if (!sirius::string_to_strategy(value, parsed)) {
     throw InvalidInputException(
-      "Invalid expression_executor_strategy '{}'. Valid values: materialize, ast_interpret, "
+      "Invalid expression_evaluator_strategy '{}'. Valid values: materialize, ast_interpret, "
       "ast_jit",
       value);
   }
-  Config::EXPRESSION_EXECUTOR_STRATEGY = parsed;
-  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EXECUTOR_STRATEGY to {}",
-                   sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY));
+  Config::EXPRESSION_EVALUATOR_STRATEGY = parsed;
+  SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EVALUATOR_STRATEGY to {}",
+                   sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY));
+}
+
+static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scope, Value& parameter)
+{
+  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
+}
+
+// Deprecated alias for `expression_evaluator_strategy`. Kept so existing
+// `SET expression_executor_strategy=...` statements keep working; remove in a future release.
+static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
+{
+  SIRIUS_LOG_WARN(
+    "The 'expression_executor_strategy' setting is deprecated; use "
+    "'expression_evaluator_strategy' instead.");
+  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
@@ -1319,10 +1525,15 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
 
-static void SetEnableDuckdbFallback(ClientContext& context, SetScope scope, Value& parameter)
+static void SetEnableDuckdbFallback(ClientContext& /*context*/,
+                                    SetScope /*scope*/,
+                                    Value& /*parameter*/)
 {
-  Config::ENABLE_DUCKDB_FALLBACK = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DUCKDB_FALLBACK to {}", Config::ENABLE_DUCKDB_FALLBACK);
+  // No process-global mirror is kept.  DuckDB stores the value per-context and it
+  // is read via duckdb_fallback_enabled() -> ClientContext::TryGetCurrentSetting,
+  // so `SET enable_duckdb_fallback = ...` on one connection stays scoped to that
+  // connection instead of leaking to every other connection (and, across the test
+  // binary, to later test cases that create their own database).
 }
 
 static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value& parameter)
@@ -1335,25 +1546,6 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
 {
   Config::MODIFIED_PIPELINE = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
-}
-
-static void SetCacheScanLevel(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (sirius_ctx == nullptr) {
-    SIRIUS_LOG_DEBUG("SiriusContext not available; cache_scan_level SET ignored");
-    return;
-  }
-  auto level_str = StringValue::Get(parameter);
-  sirius::op::scan::cache_level level;
-  if (!sirius::op::scan::string_to_enum(level_str, level)) {
-    throw InvalidInputException(
-      "Invalid cache_scan_level '{}'. Valid values: none, table_gpu, table_host, parquet",
-      level_str);
-  }
-  auto& cfg = sirius_ctx->get_config();
-  cfg.set_cache_level(level);
-  SIRIUS_LOG_DEBUG("Updated config cache_scan_level to {}", level_str);
 }
 
 static sirius::operator_params* get_operator_params(ClientContext& context)
@@ -1372,15 +1564,6 @@ static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, 
   if (!params) { return; }
   params->scan_task_batch_size = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
-}
-
-static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  params->default_scan_task_varchar_size = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_VARCHAR_SIZE to {}",
-                   params->default_scan_task_varchar_size);
 }
 
 static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -1432,24 +1615,44 @@ static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
 }
 
+static void SetLogBackend(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto backend = StringValue::Get(parameter);
+  if (backend != "duckdb" && backend != "spdlog" && backend != "noop") {
+    throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
+                                backend);
+  }
+  Config::LOG_BACKEND = std::move(backend);
+  install_configured_log_sink(context.db.get());
+  SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
+}
+
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
-  SetGlobalLogLevel(Config::LOG_LEVEL);
+  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
+  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
+  sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
+  if (!parsed_level) {
+    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_DIR = StringValue::Get(parameter);
-  InitGlobalLogger(Config::LOG_LEVEL, Config::LOG_DIR, Config::LOG_FLUSH_SECONDS);
+  // log_dir only affects the spdlog backend; rebuild it when that one is active.
+  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
-  SetGlobalLogFlush(Config::LOG_FLUSH_SECONDS);
+  // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
+  // the spdlog backend uses it).
+  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
@@ -1480,6 +1683,63 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
+static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_dynamic_filter_pushdown = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_PUSHDOWN to {}",
+                   params->enable_dynamic_filter_pushdown);
+}
+
+static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_dynamic_zone_map_filter = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_ZONE_MAP_FILTER to {}",
+                   params->enable_dynamic_zone_map_filter);
+}
+
+static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double threshold = parameter.GetValue<double>();
+  if (threshold <= 0.0) {
+    throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
+                                threshold);
+  }
+  params->dynamic_filter_domain_coverage_threshold = threshold;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_DOMAIN_COVERAGE_THRESHOLD to {}",
+                   params->dynamic_filter_domain_coverage_threshold);
+}
+
+static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  const double threshold = parameter.GetValue<double>();
+  if (threshold < 0.0 || threshold > 1.0) {
+    throw InvalidInputException("dynamic_filter_keep_threshold must be in [0.0, 1.0], got %f",
+                                threshold);
+  }
+  params->dynamic_filter_keep_threshold = threshold;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_KEEP_THRESHOLD to {}",
+                   params->dynamic_filter_keep_threshold);
+}
+
+static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_pinned_zone_map_pruning = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_PINNED_ZONE_MAP_PRUNING to {}",
+                   params->enable_pinned_zone_map_pruning);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1504,12 +1764,21 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             SetUseCudfExpr);
 
   config.AddExtensionOption(
-    "expression_executor_strategy",
-    "Strategy for the gpu_expression_executor: 'materialize', 'ast_interpret', or "
+    "expression_evaluator_strategy",
+    "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
     "'ast_jit'",
     LogicalType::VARCHAR,
-    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EXECUTOR_STRATEGY))),
-    SetExpressionExecutorStrategy);
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
+    SetExpressionEvaluatorStrategy);
+
+  // Deprecated alias for `expression_evaluator_strategy`; remove in a future release.
+  config.AddExtensionOption(
+    "expression_executor_strategy",
+    "[DEPRECATED - use expression_evaluator_strategy] Strategy for the expression_evaluator: "
+    "'materialize', 'ast_interpret', or 'ast_jit'",
+    LogicalType::VARCHAR,
+    Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
+    SetExpressionExecutorStrategyDeprecated);
 
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",
@@ -1553,8 +1822,19 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "enable_duckdb_fallback",
     "Whether to enable fallback to duckdb execution after an error is detected",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_DUCKDB_FALLBACK),
+    Value::BOOLEAN(true),  // literal default: never seed from a process-global that a
+                           // prior connection's SET may have mutated (that leaked the
+                           // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
+
+  // TEST ONLY: when non-empty, transparent GPU execution fails at runtime with that
+  // message after plan generation succeeds, to exercise the CPU fallback path. No
+  // setter — the value is read via TryGetCurrentSetting in PhysicalSiriusExecution.
+  config.AddExtensionOption(
+    "sirius_test_inject_transparent_gpu_error",
+    "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
+    LogicalType::VARCHAR,
+    Value(""));
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(
@@ -1578,13 +1858,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.scan_task_batch_size),
                             SetDefaultScanTaskBatchSize);
-  // Default varchar size for estimating rows per batch
-  config.AddExtensionOption(
-    "default_scan_task_varchar_size",
-    "The default varchar size for estimating rows per batch in a duckdb scan task",
-    LogicalType::UBIGINT,
-    Value::UBIGINT(sirius::operator_params{}.default_scan_task_varchar_size),
-    SetDefaultScanTaskVarcharSize);
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
@@ -1601,6 +1874,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
+  config.AddExtensionOption("sirius_log_backend",
+                            "Logging backend for Sirius (duckdb, spdlog, noop)",
+                            LogicalType::VARCHAR,
+                            Value(Config::LOG_BACKEND),
+                            SetLogBackend);
   config.AddExtensionOption("sirius_log_level",
                             "Log level for Sirius (trace, debug, info, warn, error, critical, off)",
                             LogicalType::VARCHAR,
@@ -1635,12 +1913,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             Value::UBIGINT(sirius::operator_params{}.sort_sample_bytes),
                             SetSortSampleBytes);
 
-  config.AddExtensionOption("scan_cache_level",
-                            "Scan result caching level: none, table_gpu, table_host, parquet",
-                            LogicalType::VARCHAR,
-                            Value("none"),
-                            SetCacheScanLevel);
-
   config.AddExtensionOption("max_build_hash_table_bytes",
                             "Maximum size a build-side table can be where it will create a "
                             "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
@@ -1663,6 +1935,51 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
+
+  config.AddExtensionOption(
+    "enable_dynamic_filter_pushdown",
+    "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
+    "runtime membership filter (raw IN-list for 1-12 supported build rows; otherwise a hash "
+    "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
+    "non-matching rows before the join (on by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
+    SetEnableDynamicFilterPushdown);
+
+  config.AddExtensionOption(
+    "enable_dynamic_zone_map_filter",
+    "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
+    "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
+    "requires enable_dynamic_filter_pushdown (off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
+    SetEnableDynamicZoneMapFilter);
+
+  config.AddExtensionOption(
+    "dynamic_filter_domain_coverage_threshold",
+    "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
+    "fraction of the key's domain; >= 1.0 effectively disables the gate",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_domain_coverage_threshold),
+    SetDynamicFilterDomainCoverageThreshold);
+
+  config.AddExtensionOption(
+    "dynamic_filter_keep_threshold",
+    "Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than "
+    "this fraction of its rows (too unselective to repay the mask kernel); in [0.0, 1.0], 1.0 "
+    "keeps filtering always on",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
+    SetDynamicFilterKeepThreshold);
+
+  config.AddExtensionOption(
+    "enable_pinned_zone_map_pruning",
+    "Skip pinned-table chunks whose pin-time min/max statistics prove the scan's pushed-down "
+    "filter matches no rows; also gates the statistics capture during CALL pin_table, so a table "
+    "pinned while off carries no zone maps until re-pinned with the flag on",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
+    SetEnablePinnedZoneMapPruning);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
@@ -1674,16 +1991,24 @@ static void LoadInternal(ExtensionLoader& loader)
   auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
   auto* callback_ptr = callback.get();
   config.GetCallbackManager().Register(std::move(callback));
+
+  // The ctor already installed the db-independent backend; reinstall now that the
+  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
+  // unknown backend name is reported here rather than swallowed by the ctor.
+  install_configured_log_sink(&db);
+
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
 
-  // S3 CPU fallback is not supported: there is no DuckDB CPU FileSystem for
-  // s3://. S3 parquet is read only on the GPU path (read_parquet('s3://…') is
-  // rewritten to sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx).
-  // A query that reads s3:// and fails on GPU surfaces a clear "S3 CPU fallback
-  // is not supported" error (see run_internal_cpu_fallback_query); local reads
-  // still fall back to DuckDB's CPU execution.
+  // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
+  // by reading the parquet footer through Sirius's routed REST ioctx. This makes
+  // the transparent form work — SET gpu_execution=true; SELECT ... FROM
+  // read_parquet('s3://...') — with the captured scan run on GPU. sirius_httpfs
+  // is read-only and GPU-only: it serves the bind-time footer read, never a CPU
+  // data path (a query that reads s3:// and fails on GPU still surfaces a clear
+  // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
+  db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
   // Register optimizer extension for transparent GPU execution.
   // Pre-hook disables incompatible optimizers; post-hook captures the plan.

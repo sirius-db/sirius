@@ -40,16 +40,14 @@
 
 namespace sirius::op::scan {
 
-/// Synthetic rowid columns carry no `storage_idx`.
 struct projected_column {
+  /// @note Synthetic rowid columns carry no `storage_idx`.
   duckdb::StorageIndex storage_idx;
   bool is_rowid = false;
 };
 
-/// Mirrors `duckdb::ColumnSegmentInfo` with the compression string resolved
-/// to the enum.
 struct duckdb_segment_descriptor {
-  /// -1 for blockless layouts (e.g. Constant segments).
+  /// -1 for blockless layouts (e.g. CONSTANT segments).
   duckdb::block_id_t block_id;
   /// Overflow blocks for variable-width payloads (FSST tables, etc.).
   std::vector<duckdb::block_id_t> additional_blocks;
@@ -58,15 +56,21 @@ struct duckdb_segment_descriptor {
   duckdb::idx_t segment_start;
   duckdb::idx_t segment_count;
   duckdb::CompressionType compression;
-  /// Parsed from `ColumnSegmentInfo::segment_stats`. nullopt on validity
-  /// and non-VARCHAR segments. Every VARCHAR segment in a viable walk
-  /// carries Some; Some(0) is the legal all-empty-row-group case.
+  /// nullopt on validity and non-VARCHAR segments. Every VARCHAR segment in a viable walk carries
+  /// Some; Some(0) is the legal all-empty-row-group case.
   std::optional<std::uint32_t> max_string_length;
   /// Byte size of this segment's main-block payload. Excludes
   /// `additional_blocks`; 0 when `block_id < 0`.
   std::size_t bytes_size = 0;
 };
 
+/// Side note of metadata for ARRAY type
+/// data_segments:                 holds array-level validity segments (path [col, 0])
+/// validity_segments:             unused for ARRAY
+/// array_child_data_segments:     holds ARRAY child data segments (path [col, 1])
+///                                empty for non-ARRAY columns
+/// array_child_validity_segments: holds ARRAY child validity segments (path [col, 1, 0])
+///                                empty for non-ARRAY columns
 struct duckdb_column_metadata {
   duckdb::idx_t column_id;
   /// Sorted by `segment_start` ascending. Empty when `is_rowid`.
@@ -74,7 +78,10 @@ struct duckdb_column_metadata {
   /// Sorted by `segment_start` ascending. Empty when there is no validity
   /// column or when `is_rowid`.
   std::vector<duckdb_segment_descriptor> validity_segments;
+  std::vector<duckdb_segment_descriptor> array_child_data_segments;
+  std::vector<duckdb_segment_descriptor> array_child_validity_segments;
   bool is_rowid = false;
+  bool is_array = false;
 };
 
 struct duckdb_row_group_metadata {
@@ -91,20 +98,11 @@ struct duckdb_row_group_metadata {
   std::vector<std::size_t> varchar_bytes_per_col;
 };
 
-/// Default-mode cudf strings columns use int32 offsets;
-/// `make_offsets_child_column` throws `std::overflow_error` ("Size of output
-/// exceeds the column size limit") when total chars per strings column
-/// `>= std::numeric_limits<cudf::size_type>::max()` unless
-/// `LIBCUDF_LARGE_STRINGS_ENABLED` is set. Sirius does not opt in and its
-/// strings-decode kernels (`gpu_decode_strings.cu`) are hard-coded to
-/// int32 offsets, so the walker refuses any row group whose per-column
-/// varchar upper bound hits this threshold.
+/// cuDF strings columns offset limit.
 constexpr std::size_t kCudfInt32StringsThreshold =
   static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
 
-/// Exposed for direct unit-testing of the codec-rejection logic without
-/// going through DuckDB's codec selection (which is hard to drive into
-/// unsupported codecs in a test).
+/// Exposed for direct unit-testing of the codec-rejection logic
 bool is_supported_data_compression(duckdb::CompressionType c);
 bool is_supported_validity_compression(duckdb::CompressionType c);
 
@@ -156,12 +154,13 @@ struct duckdb_native_walk_plan {
   std::size_t pruned_decoded_bytes = 0;
 
   //===----------Error Handling----------===//
-  // `viable == false` (with reason) for:
-  //  - unsupported projected types, or
-  //  - an invalid partition `row_start`.
+  /// `viable == false` (with reason) for:
+  ///  - unsupported projected types, or
+  ///  - an invalid partition `row_start`.
   bool viable = false;
   std::string viability_failure_reason;
 };
+
 duckdb_native_walk_plan prepare_duckdb_native_walk(
   duckdb::DataTable& storage,
   duckdb::ClientContext& context,
@@ -189,14 +188,19 @@ struct duckdb_native_row_group_range {
   std::size_t pruned_decoded_bytes = 0;  ///< Diagnostic decoded-byte estimate for skipped groups.
 
   //===----------Error Handling----------===//
-  //`viable == false` (with reason) on the first
-  //  - unsupported segment compression, or
-  //  - absent/over-threshold varchar stat.
-  // `row_groups` is then partial and must not be consumed.
+  /// `viable == false` (with reason) on the first
+  ///  - unsupported segment compression, or
+  ///  - absent/over-threshold varchar stat.
+  /// `row_groups` is then partial and must not be consumed.
   bool viable = true;
   std::string viability_failure_reason;
 };
 duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   const duckdb_native_walk_plan& plan, std::size_t rg_begin, std::size_t rg_end);
+
+/// @brief Row groups per parallel-walk task unit (env `SIRIUS_METADATA_PARSE_CHUNK`,
+/// default 8). Shared by the metadata parse fan-out and the MVCC mask job so both
+/// slice row-group work into the same task granularity.
+std::size_t metadata_parse_chunk();
 
 }  // namespace sirius::op::scan

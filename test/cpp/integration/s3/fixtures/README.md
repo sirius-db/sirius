@@ -1,6 +1,6 @@
 # S3 Perf Benchmark Fixture
 
-The hidden `[!benchmark][perf][bench]` Catch2 benchmark uses an SF=10 `lineitem`
+The hidden `[.][s3][bench]` Catch2 benchmark uses an SF=10 `lineitem`
 Parquet fixture. It is now generated and uploaded **by the test binary itself**
 (`test/cpp/utils/s3_container.*`) when `SIRIUS_TEST_S3_LARGE=1`, which:
 
@@ -19,9 +19,10 @@ For local MinIO, just run:
 make s3-bench
 ```
 
-`make s3-bench` sets `SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1` for the
-default MinIO backend, so MinIO is auto-managed and the SF10 fixture is prepared
-in-process — no separate fixture/up step.
+`make s3-bench` sets `SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1
+SIRIUS_TEST_S3_STRICT=1` for the default MinIO backend, so MinIO is
+auto-managed, the SF10 fixture is prepared in-process, and any bring-up failure
+is loud — no separate fixture/up step.
 
 AWS portability uses the same benchmark test with the MinIO auto-path off:
 

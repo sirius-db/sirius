@@ -18,6 +18,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <chrono>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
@@ -123,6 +124,66 @@ inline std::uint64_t parse_bytes(std::string_view sv)
   return static_cast<std::uint64_t>(number * static_cast<double>(multiplier));
 }
 
+// ================ Time-suffix parsing ================= //
+
+/// Parse a string with a time-unit suffix into a std::chrono::nanoseconds count.
+///
+/// Supported suffixes (case-insensitive):
+///   ns / nsec           -> nanoseconds
+///   us / usec           -> microseconds
+///   ms / msec           -> milliseconds
+///   s  / sec / seconds  -> seconds
+///   m  / min / minutes  -> minutes
+///   h  / hr  / hours    -> hours
+///
+/// A unit suffix is required: bare numbers are rejected because the intended
+/// unit would be ambiguous. Fractional values are allowed (e.g. "1.5s").
+inline std::chrono::nanoseconds parse_duration(std::string_view sv)
+{
+  using namespace std::chrono_literals;
+
+  if (sv.empty()) { throw std::runtime_error("empty time value"); }
+
+  // Find where the numeric part ends
+  size_t pos = 0;
+  while (pos < sv.size() &&
+         (std::isdigit(static_cast<unsigned char>(sv[pos])) || sv[pos] == '.' || sv[pos] == '-')) {
+    ++pos;
+  }
+
+  if (pos == 0) { throw std::runtime_error("invalid time value: '" + std::string(sv) + "'"); }
+
+  double number = std::stod(std::string(sv.substr(0, pos)));
+  auto suffix   = sv.substr(pos);
+
+  // Strip leading whitespace from suffix
+  while (!suffix.empty() && suffix[0] == ' ') {
+    suffix.remove_prefix(1);
+  }
+
+  // Normalize the suffix to lowercase for case-insensitive matching.
+  std::string unit;
+  unit.reserve(suffix.size());
+  for (char c : suffix) {
+    unit.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+
+  // Scale the (possibly fractional) count by the chrono literal for the unit,
+  // then round down to whole nanoseconds.
+  auto scale = [number](auto literal_unit) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(number * literal_unit);
+  };
+
+  if (unit == "ns" || unit == "nsec") { return scale(1ns); }
+  if (unit == "us" || unit == "usec") { return scale(1us); }
+  if (unit == "ms" || unit == "msec") { return scale(1ms); }
+  if (unit == "s" || unit == "sec" || unit == "seconds") { return scale(1s); }
+  if (unit == "m" || unit == "min" || unit == "minutes") { return scale(1min); }
+  if (unit == "h" || unit == "hr" || unit == "hours") { return scale(1h); }
+
+  throw std::runtime_error("unknown or missing time suffix: '" + std::string(suffix) + "'");
+}
+
 // ================ read_yaml — type-dispatched YAML→C++ ================= //
 
 /// Read a YAML scalar into a C++ value. Overloaded for each supported type.
@@ -198,6 +259,23 @@ void read_yaml(const YAML::Node& node, optional_bytes_value<T>& out)
     val = static_cast<T>(parse_bytes(node.as<std::string>()));
   }
   out.ref = val;
+}
+
+/// Read a YAML scalar into a std::chrono::duration.
+///
+/// Accepts either a bare number — interpreted in the duration's native unit
+/// (milliseconds for std::chrono::milliseconds, seconds for std::chrono::seconds,
+/// etc.) — or a string with a time-unit suffix (e.g. "10ms", "1.5s", "500us"),
+/// which is parsed via parse_duration and cast to the field's resolution.
+template <typename Rep, typename Period>
+void read_yaml(const YAML::Node& node, std::chrono::duration<Rep, Period>& out)
+{
+  using target = std::chrono::duration<Rep, Period>;
+  try {
+    out = target{node.as<Rep>()};
+  } catch (const YAML::BadConversion&) {
+    out = std::chrono::duration_cast<target>(parse_duration(node.as<std::string>()));
+  }
 }
 
 template <StringEnum T>

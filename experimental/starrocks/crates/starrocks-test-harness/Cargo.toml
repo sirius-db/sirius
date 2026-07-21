@@ -8,7 +8,7 @@ publish = false
 anyhow.workspace = true
 libc.workspace = true
 mysql_async.workspace = true
-sirius-starrocks-cn = { path = "../.." }
+sirius-starrocks-cn = { path = "../..", default-features = false }
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true

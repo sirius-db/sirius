@@ -21,9 +21,9 @@ get_operator_for_next_task(operator) — follows hint chain
     ↓
 operator->get_next_task_hint() → READY or WAITING_FOR_INPUT_DATA
     ↓
-Create task (duckdb_scan_task, parquet_scan_task, or gpu_pipeline_task)
+Create task (gpu_pipeline_task)
     ↓
-Dispatch to executor (scan_executor or task_scheduler)
+Dispatch to executor (task_scheduler)
 ```
 
 ## Global State Maps
@@ -32,9 +32,7 @@ Initialized during `prepare_for_query()`, cleared during `reset()`:
 
 | Map | Key | Value | Purpose |
 |-----|-----|-------|---------|
-| `_scan_operator_global_state_map` | operator ID | `duckdb_scan_task_global_state` | DuckDB scan batching state |
-| `_parquet_scan_operator_global_state_map` | operator ID | `parquet_scan_task_global_state` | Parquet metadata, row group partitions (preserved across warm runs) |
-| `_gpu_operator_global_state_map` | operator ID | `gpu_pipeline_task_global_state` | Shared pipeline state |
+| `_gpu_operator_global_state_map` | operator ID | `gpu_pipeline_task_global_state` | Shared per-operator pipeline state |
 
 All map access is protected by `_global_state_mutex`.
 
@@ -60,19 +58,11 @@ struct task_creation_hint {
 
 ```
 function get_operator_for_next_task(node):
-    // Special case: PARQUET_SCAN checks partition availability
-    if node is PARQUET_SCAN:
-        if parquet_global_state->has_more_partitions(): return node
-        else: return nullptr
-
     hint = node->get_next_task_hint()
     if hint is READY:
         return hint.producer  // create task from this operator
     if hint is WAITING_FOR_INPUT_DATA:
         producer = hint.producer
-        // Special case: DUCKDB_SCAN already drained
-        if producer is DUCKDB_SCAN and (drained or !can_create_more_tasks):
-            return nullptr
         return get_operator_for_next_task(producer)  // recurse upstream
     if no hint:
         return nullptr  // nothing to do
@@ -110,18 +100,6 @@ Returns `nullptr` if no batches are available.
 
 The core of the task creator's behavior comes from operator-specific overrides:
 
-### DUCKDB_SCAN / PARQUET_SCAN
-
-| Method | Behavior |
-|--------|----------|
-| `get_next_task_hint()` | Returns `READY` if scan is not exhausted (atomic flag) |
-| `get_next_task_input_data()` | N/A — task creator creates scan tasks directly |
-| Why custom | Sources don't have ports; the task creator handles them specially |
-
-For PARQUET_SCAN, the task creator loops through `parquet_global_state->acquire_next_rg_partition_index()` to create one task per row group partition.
-
-For DUCKDB_SCAN, one task is created per invocation. The scan task self-schedules its continuation internally.
-
 ### HASH_JOIN (BUILD_PROBE mode)
 
 | Method | Behavior |
@@ -145,9 +123,9 @@ Uses base class for both `get_next_task_hint()` and `get_next_task_input_data()`
 
 | Method | Behavior |
 |--------|----------|
-| `get_next_task_hint()` | If probe-side with no `_num_partitions` and has sibling: delegates to build sibling's hint. Otherwise: base class. |
-| `get_next_task_input_data()` | Mutex-locked with sibling to atomically determine partition count on first call via `determine_num_partitions()`. Notifies hash join of partition count. Then delegates to base class. |
-| Why custom | Sibling pair coordination: probe must wait for build to determine partition count |
+| `get_next_task_hint()` | If the non-driving side has no `_num_partitions`, delegates to the sizing sibling's hint. Otherwise: base class. |
+| `get_next_task_input_data()` | Mutex-locked with sibling to atomically determine partition count from the designated sizing side on first call. Notifies the hash join when build-side sizing can select an execution mode. Then delegates to base class. |
+| Why custom | Sibling pair coordination: build normally sizes both sides; RIGHT-family joins other than `RIGHT_DELIM_JOIN` size both from the retained probe side. |
 
 Deadlock prevention: both this and sibling partition locks are acquired in a fixed order using `std::scoped_lock`.
 
@@ -194,12 +172,9 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 
 | Operator | `get_next_task_hint()` | `get_next_task_input_data()` | Why Custom |
 |----------|------------------------|------------------------------|------------|
-| DUCKDB_SCAN | READY if not exhausted | N/A (task creator handles) | Source, no ports |
-| PARQUET_SCAN | READY if partitions remain | N/A (task creator handles) | Source, no ports |
-| ICEBERG_SCAN | Inherits from PARQUET_SCAN | N/A (task creator handles) | Source, no ports |
 | HASH_JOIN (BUILD_PROBE) | Build state machine | Build+probe or probe only | Build/probe asymmetry |
 | HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
-| PARTITION | Delegates to build sibling | Mutex-locked count determination | Sibling coordination |
+| PARTITION | Delegates to sizing sibling | Mutex-locked count determination | Sibling coordination |
 | CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
 | SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
 | MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |
@@ -222,27 +197,36 @@ while running:
     3. node = get_operator_for_next_task(request.node)  -- follow hint chain
     4. if node is nullptr: continue
 
-    5. Schedule work on thread pool:
-       For DUCKDB_SCAN:
-           - Create one duckdb_scan_task
-           - pipeline.mark_task_created()
-           - Dispatch to scan executor
-
-       For PARQUET_SCAN:
-           - Loop: acquire next row group partition
-           - Create one parquet_scan_task per partition
-           - pipeline.mark_task_created() for each
-           - Dispatch to scan executor
-
-       For GPU operators:
+    5. Schedule work on the thread pool. Every source — a GPU_SCAN scan or any
+       GPU operator with buffered input — drives the same loop:
            - Loop while (!node.all_ports_empty()):
              - pipeline.mark_task_created()  // BEFORE popping data
-             - data = node.get_next_task_input_data()
-             - If data: create gpu_pipeline_task, dispatch to task_scheduler
+             - data = node.get_next_task_input_data()  // a GPU_SCAN blocks on its split_connector
+             - If data: create a gpu_pipeline_task, dispatch to task_scheduler
              - If no data: pipeline.mark_task_completed()
 ```
 
 The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
+
+## Device Assignment for GPU Tasks
+
+**File:** `src/creator/task_creator.cpp`
+
+When the manager loop builds a `gpu_pipeline_task`, it also chooses the task's `preferred_device_id` (which GPU executor the scheduler should route it to). The choice is resolved in priority order: an upstream scan split's stamped device, then a **partition device pin**, then data-locality by input bytes, then NUMA-affinity. The full locality math lives in [`multi-gpu-architecture.md`](multi-gpu-architecture.md); the partition pin is described here because it is owned by the task creator and is a correctness requirement.
+
+### Partition device pin
+
+Partitioned operators — BUILD_PROBE hash join, `grouped_aggregate_merge`, and the other partition-keyed operators above — build a per-partition cuco hash table that is valid only on the GPU it was built on. Touching it from a stream bound to another device trips `cudaErrorInvalidValue`. So when a task's input is a `partitioned_operator_data`, the task creator pins it to a fixed device:
+
+```
+preferred_device_id = _active_gpu_ids[ partition_idx % _active_gpu_ids.size() ]
+```
+
+This keeps every task of a given partition (build + all probes) on one GPU while spreading partitions across GPUs.
+
+`_active_gpu_ids` is built once in the `task_creator` constructor from the memory manager's `Tier::GPU` memory spaces — i.e. the device ids that actually have a GPU executor, which is the same set `task_scheduler` keys executors on. The pin indexes this active set rather than the physical hardware topology: when the configured GPU count is smaller than the physical count, a physical-topology modulo could name a device with no executor, which the scheduler treats as "no preference" and round-robins — scattering a partition across GPUs.
+
+The pin is reapplied on the OOM-reschedule path (`gpu_pipeline_executor`): when a task is rebuilt with a fresh local state, its per-task `preferred_device_id` is carried forward so a rescheduled probe doesn't lose its pin and scatter.
 
 ## `can_create_more_tasks()` and `has_processed_all_tasks()`
 

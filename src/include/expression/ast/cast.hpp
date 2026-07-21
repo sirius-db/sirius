@@ -37,6 +37,9 @@ struct cast {
   sirius::logical_type target_type;
   bool try_cast{false};
 
+  /// A cast's result type is its target type.
+  [[nodiscard]] sirius::logical_type const& return_type() const noexcept { return target_type; }
+
   std::size_t cudf_ast_op_count() const;
 };
 

@@ -94,8 +94,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::fetch_result_internal(
   D_ASSERT(sirius_active_query);
   D_ASSERT(sirius_active_query->is_open_result(pending));
   D_ASSERT(sirius_active_query->sirius_prepared->prepared);
-  auto& engine   = get_sirius_engine();
-  auto& prepared = *sirius_active_query->sirius_prepared->prepared;
+  auto& engine = get_sirius_engine();
   duckdb::unique_ptr<duckdb::QueryResult> result;
   D_ASSERT(engine.has_result_collector());
   SIRIUS_LOG_DEBUG("Fetching result from GPU executor");
@@ -137,7 +136,6 @@ sirius_interface::sirius_pending_statement_or_prepared_statement(
 {
   begin_query_internal(query);
 
-  bool invalidate_query = true;
   duckdb::unique_ptr<duckdb::PendingQueryResult> pending =
     sirius_pending_statement_internal(context, statement_p, parameters);
 
@@ -172,7 +170,9 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
       duckdb::ErrorData("Error in sirius_pending_statement_internal"));
   }
   D_ASSERT(sirius_collector->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
-  auto types = sirius::to_duckdb_vec(sirius_collector->get_types());
+  // sirius::logical_type drops STRUCT/LIST/MAP children (and throws for LIST),
+  // so use the full DuckDB result types.
+  auto types = sirius_collector->result_column_types;
   D_ASSERT(types == statement.types);
   engine.initialize(std::move(sirius_collector));
 

@@ -56,7 +56,6 @@ namespace {
  *
  * Keep aligned with integration-2gpu.yaml except for the two knobs
  * that actually drive the hazard:
- *   - executor.duckdb_scan.cache: table_gpu (warm preload path)
  *   - operator_params.hash_partition_bytes: 1 MiB (force partitioning
  *     of the ~64 MiB self-join working set so sirius_physical_partition's
  *     MGPU floor of `num_gpus` partitions kicks in).
@@ -79,17 +78,13 @@ void write_config(fs::path const& yaml_path)
        "  executor:\n"
        "    pipeline:\n"
        "      num_threads: 4\n"
-       "    duckdb_scan:\n"
-       "      num_threads: 2\n"
-       "      cache: table_gpu\n"
        "    task_creator:\n"
        "      num_threads: 2\n"
        "    downgrade:\n"
        "      num_threads: 1\n"
-       "      monitor_period_ms: 10\n"
+       "      monitor_period: 10ms\n"
        "  operator_params:\n"
        "    scan_task_batch_size: 100000000\n"
-       "    default_scan_task_varchar_size: 256\n"
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: 1000000\n"
        "    concat_batch_bytes: 100000000\n"

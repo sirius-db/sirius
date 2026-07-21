@@ -35,6 +35,9 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUTPUT_BASE="${OUTPUT_BASE:-$PROJECT_DIR/reports}"
 LABEL=""
 SF=""
+PARQUET_DIR=""
+DATA_SOURCE="parquet"
+DUCKDB_FILE=""
 PROFILE_DIR=""
 COMPARE_DIR=""
 ITERATIONS="${ITERATIONS:-2}"
@@ -50,13 +53,16 @@ usage() {
     echo ""
     echo "Options:"
     echo "  --sf SF              Scale factor for profiling (e.g., 300_rg2m, 100)"
+    echo "  --parquet-dir DIR    Override parquet directory (default: \$PROJECT_DIR/test_datasets/tpch_parquet_sf<SF>)"
+    echo "  --data-source SRC    Input source: parquet (default) or duckdb"
+    echo "  --duckdb-file FILE   DuckDB database file (implies --data-source duckdb;"
+    echo "                       default: \$PROJECT_DIR/test_datasets/tpch_sf<SF>.duckdb)"
     echo "  --profile-dir DIR    Use existing profiles (skip profiling)"
     echo "  --output-dir DIR     Base directory for reports (default: ./reports)"
     echo "  --label LABEL        Custom label (default: sirius_sf<SF>)"
     echo "  --compare DIR        Compare against a previous report directory"
     echo "  --iterations N       Iterations per query (default: 2)"
     echo "  --query-timeout N    Per-query timeout in seconds (default: 90)"
-    echo "  --cache-level LEVEL  Scan cache level: none, table_gpu, table_host, parquet (default: none)"
     echo "  -h, --help           Show this help"
     echo ""
     echo "Either --sf or --profile-dir is required."
@@ -66,18 +72,41 @@ usage() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --sf)           SF="$2"; shift 2 ;;
+        --parquet-dir)  PARQUET_DIR="$2"; shift 2 ;;
+        --data-source)  DATA_SOURCE="$2"; shift 2 ;;
+        --duckdb-file)  DUCKDB_FILE="$2"; DATA_SOURCE="duckdb"; shift 2 ;;
         --profile-dir)  PROFILE_DIR="$2"; shift 2 ;;
         --output-dir)   OUTPUT_BASE="$2"; shift 2 ;;
         --label)        LABEL="$2"; shift 2 ;;
         --compare)      COMPARE_DIR="$2"; shift 2 ;;
         --iterations)   ITERATIONS="$2"; shift 2 ;;
         --query-timeout) QUERY_TIMEOUT="$2"; shift 2 ;;
-        --cache-level)  SCAN_CACHE_LEVEL="$2"; shift 2 ;;
         -h|--help)      usage ;;
         -*)             echo "ERROR: Unknown option: $1" >&2; usage ;;
         *)              QUERIES+=("$1"); shift ;;
     esac
 done
+
+if [ "$DATA_SOURCE" != "parquet" ] && [ "$DATA_SOURCE" != "duckdb" ]; then
+    echo "ERROR: --data-source must be 'parquet' or 'duckdb', got: $DATA_SOURCE" >&2
+    usage
+fi
+
+# Resolve the profiling input for the chosen source (used when profiling, i.e. not
+# --profile-dir). parquet -> a directory (default test_datasets/tpch_parquet_sf<SF>);
+# duckdb -> a single .duckdb file (default test_datasets/tpch_sf<SF>.duckdb).
+INPUT=""
+if [ "$DATA_SOURCE" = "duckdb" ]; then
+    INPUT="$DUCKDB_FILE"
+    if [ -z "$INPUT" ] && [ -n "$SF" ]; then
+        INPUT="$PROJECT_DIR/test_datasets/tpch_sf${SF}.duckdb"
+    fi
+else
+    INPUT="$PARQUET_DIR"
+    if [ -z "$INPUT" ] && [ -n "$SF" ]; then
+        INPUT="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+    fi
+fi
 
 if [ -z "$SF" ] && [ -z "$PROFILE_DIR" ]; then
     echo "ERROR: Either --sf or --profile-dir is required" >&2
@@ -143,19 +172,68 @@ if [ -n "$PROFILE_DIR" ]; then
     echo "  Copied $(ls "$REPORT_DIR/profiles/"*.sqlite 2>/dev/null | wc -l) SQLite files"
     echo ""
 else
-    echo "[Phase 2] Running nsys profiling (sf=$SF, iterations=$ITERATIONS)..."
-    export OUTPUT_DIR="$REPORT_DIR/profiles"
-    export ITERATIONS
-    export QUERY_TIMEOUT
-    export SCAN_CACHE_LEVEL="${SCAN_CACHE_LEVEL:-}"
-    if bash "$PROJECT_DIR/test/tpch_performance/profile_tpch_nsys.sh" "$SF" "${QUERIES[@]+"${QUERIES[@]}"}"; then
-        echo ""
+    echo "[Phase 2] Running nsys profiling via performance_test.py"
+    echo "  sf=$SF, iterations=$ITERATIONS, source=$DATA_SOURCE, input=$INPUT"
+    if [ "$DATA_SOURCE" = "duckdb" ]; then
+        if [ ! -f "$INPUT" ]; then
+            echo "ERROR: DuckDB file not found: $INPUT" >&2
+            echo "  Pass --duckdb-file or generate it with generate_tpch_data.sh --format duckdb" >&2
+            exit 1
+        fi
+    elif [ ! -d "$INPUT" ]; then
+        echo "ERROR: Parquet directory not found: $INPUT" >&2
+        echo "  Pass --parquet-dir or generate data with generate_tpch_data.sh" >&2
+        exit 1
+    fi
+
+    QUERIES_CSV=""
+    if [ ${#QUERIES[@]} -gt 0 ]; then
+        QUERIES_CSV=$(IFS=,; echo "${QUERIES[*]}")
+    fi
+
+    PY_CMD=(
+        pixi run python "$PROJECT_DIR/test/tpch_performance/performance_test.py"
+        --mode nsys-profile
+        --input "$INPUT"
+        --data-source "$DATA_SOURCE"
+        --engine gpu
+        --iterations "$ITERATIONS"
+        --output "$REPORT_DIR"
+        --name profiles_tree
+        --query-timeout "$QUERY_TIMEOUT"
+    )
+    if [ -n "$QUERIES_CSV" ]; then
+        PY_CMD+=(--queries "$QUERIES_CSV")
+    fi
+
+    if "${PY_CMD[@]}"; then
         echo "  Profiling complete."
     else
-        echo ""
         echo "  WARNING: Profiling finished with errors (some queries may have failed)"
     fi
     echo ""
+
+    # Flatten <REPORT_DIR>/<bench>_profiles_tree/sirius/q<N>/ → <REPORT_DIR>/profiles/q<N>.<ext>
+    # so nsys_analyze.sh and Phase 4 metric extraction (which read flat
+    # profiles/q<N>.sqlite + q<N>_timings.csv) continue to work unchanged.
+    # performance_test.py prefixes --name with tpch_<ts>_<mode>_<engine>_iter<N>_, so the
+    # per-query tree is `<REPORT_DIR>/*profiles_tree/sirius`, not a bare `profiles_tree/`.
+    PROFILES_TREE=""
+    for _d in "$REPORT_DIR"/*profiles_tree/sirius; do
+        [ -d "$_d" ] && PROFILES_TREE="$_d" && break
+    done
+    if [ -n "$PROFILES_TREE" ] && [ -d "$PROFILES_TREE" ]; then
+        echo "[Phase 2] Flattening per-query outputs into $REPORT_DIR/profiles/"
+        for qdir in "$PROFILES_TREE"/q*/; do
+            [ -d "$qdir" ] || continue
+            q=$(basename "$qdir")  # q<N>
+            [ -f "$qdir/nsys.sqlite" ]     && cp "$qdir/nsys.sqlite"     "$REPORT_DIR/profiles/${q}.sqlite"
+            [ -f "$qdir/nsys.nsys-rep" ]   && cp "$qdir/nsys.nsys-rep"   "$REPORT_DIR/profiles/${q}.nsys-rep"
+            [ -f "$qdir/timings.csv" ]     && cp "$qdir/timings.csv"     "$REPORT_DIR/profiles/${q}_timings.csv"
+            [ -f "$qdir/nsys_stdout.txt" ] && cp "$qdir/nsys_stdout.txt" "$REPORT_DIR/profiles/${q}_result.txt"
+        done
+        echo ""
+    fi
 fi
 
 # Verify we have SQLite files
@@ -286,12 +364,19 @@ SELECT
     COALESCE((SELECT ROUND(SUM(end-start)/1e9, 4) FROM NVTX_EVENTS WHERE domainId=0 AND eventType=59 AND end>start), 0),
     COALESCE((SELECT ROUND(SUM(end-start)/1e9, 4) FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION), 0),
     COALESCE((SELECT ROUND(SUM(bytes)/1048576.0, 2) FROM CUPTI_ACTIVITY_KIND_MEMSET), 0),
-    COALESCE((SELECT COUNT(DISTINCT deviceId) FROM CUPTI_ACTIVITY_KIND_KERNEL), 0)
+    COALESCE((SELECT COUNT(DISTINCT deviceId) FROM CUPTI_ACTIVITY_KIND_KERNEL), 0),
+    COALESCE((SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId = s.id
+              WHERE s.value LIKE 'cudaMalloc%' AND s.value NOT LIKE 'cudaMallocHost%'), 0),
+    COALESCE((SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId = s.id
+              WHERE s.value LIKE 'cudaMalloc%' AND s.value NOT LIKE 'cudaMallocHost%'
+                AND r.start >= (SELECT MIN(start) FROM NVTX_EVENTS WHERE domainId = 0 AND eventType = 59 AND end > start)
+                AND r.start <  (SELECT MAX(end)   FROM NVTX_EVENTS WHERE domainId = 0 AND eventType = 59 AND end > start)), 0)
 FROM ANALYSIS_DETAILS d;
 " 2>/dev/null)
 
     IFS='|' read -r trace_s kernels gpu_s streams h2d_gb d2h_gb d2d_gb \
-                    memcpy_s ops ops_s sync_s memset_mb gpus_used <<< "$metrics"
+                    memcpy_s ops ops_s sync_s memset_mb gpus_used \
+                    cuda_malloc_total cuda_malloc_during_query <<< "$metrics"
 
     # Parse timing CSV for cold/hot
     local timing_file="${db%.sqlite}_timings.csv"
@@ -330,6 +415,8 @@ FROM ANALYSIS_DETAILS d;
         --argjson ops "${ops:-0}" \
         --argjson ops_time "${ops_s:-0}" \
         --argjson sync_time "${sync_s:-0}" \
+        --argjson cuda_malloc_total "${cuda_malloc_total:-0}" \
+        --argjson cuda_malloc_during_query "${cuda_malloc_during_query:-0}" \
         --argjson cold "$cold_s" \
         --argjson hot "$hot_s" \
         --argjson all_hot "$all_hot_json" \
@@ -337,7 +424,7 @@ FROM ANALYSIS_DETAILS d;
             query: $q, status: "OK",
             timing: { cold_s: $cold, hot_s: $hot, all_hot_s: $all_hot, trace_duration_s: $trace },
             gpu: { total_kernels: $kernels, gpu_time_s: $gpu, streams_used: $streams, gpus_used: $gpus },
-            memory: { h2d_gb: $h2d, d2h_gb: $d2h, d2d_gb: $d2d, memcpy_time_s: $memcpy_time, memset_mb: $memset_mb },
+            memory: { h2d_gb: $h2d, d2h_gb: $d2h, d2d_gb: $d2d, memcpy_time_s: $memcpy_time, memset_mb: $memset_mb, cuda_malloc_total: $cuda_malloc_total, cuda_malloc_during_query: $cuda_malloc_during_query },
             operators: { count: $ops, total_time_s: $ops_time },
             sync_time_s: $sync_time
         }'
@@ -371,6 +458,7 @@ jq --slurpfile meta "$REPORT_DIR/metadata.json" \
            total_d2d_gb: ([.[] | select(.status == "OK") | .memory.d2d_gb] | add // 0),
            total_memcpy_time_s: ([.[] | select(.status == "OK") | .memory.memcpy_time_s] | add // 0),
            total_sync_time_s: ([.[] | select(.status == "OK") | .sync_time_s] | add // 0),
+           total_cuda_malloc_during_query: ([.[] | select(.status == "OK") | .memory.cuda_malloc_during_query] | add // 0),
            avg_hot_s: ([.[] | select(.status == "OK" and .timing.hot_s != null) | .timing.hot_s] | if length > 0 then add/length else null end),
            total_hot_s: ([.[] | select(.status == "OK" and .timing.hot_s != null) | .timing.hot_s] | add),
            total_cold_s: ([.[] | select(.status == "OK" and .timing.cold_s != null) | .timing.cold_s] | add)

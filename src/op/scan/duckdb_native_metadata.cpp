@@ -28,9 +28,11 @@
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/block_manager.hpp>
+#include <duckdb/storage/segment/uncompressed.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
 #include <duckdb/storage/storage_manager.hpp>
+#include <duckdb/storage/table/array_column_data.hpp>
 #include <duckdb/storage/table/column_data.hpp>
 #include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/row_group.hpp>
@@ -41,18 +43,27 @@
 
 #include <algorithm>
 #include <cassert>
-#include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
-#include <string_view>
-#include <system_error>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace sirius::op::scan {
+
+std::size_t metadata_parse_chunk()
+{
+  constexpr std::size_t kDefaultParseChunk = 8;
+  if (const char* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
+    try {
+      if (const auto v = std::stoull(env); v > 0) return static_cast<std::size_t>(v);
+    } catch (...) { /* fall through to default */
+    }
+  }
+  return kDefaultParseChunk;
+}
 
 namespace {
 
@@ -79,6 +90,24 @@ bool is_supported_logical_type(const sirius::logical_type& type, std::string& re
       reason_out =
         "type " + type.to_string() + " is a nested type; sirius decode does not support it";
       return false;
+    case sirius::type_id::ARRAY: {
+      if (!type.has_child()) {
+        reason_out = "type " + type.to_string() + " is an ARRAY without child type metadata";
+        return false;
+      }
+      auto const& child = type.array_child();
+      // Only fixed-width child for now (no VARCHAR or nested ARRAY/LIST/STRUCT element)
+      if (!child.is_fixed_width()) {
+        reason_out = "type " + type.to_string() + " has a non-fixed-width ARRAY element";
+        return false;
+      }
+      std::string child_reason;
+      if (!is_supported_logical_type(child, child_reason)) {
+        reason_out = "type " + type.to_string() + " has unsupported ARRAY element: " + child_reason;
+        return false;
+      }
+      return true;
+    }
     case sirius::type_id::INVALID:
     case sirius::type_id::SQLNULL:
       reason_out = "type " + type.to_string() + " is a sentinel; not a valid scan column type";
@@ -140,13 +169,116 @@ duckdb_segment_descriptor fill_segment_descriptor(duckdb::ColumnSegment& segment
   return desc;
 }
 
-// Walks the segment trees of a projected column, collecting metadata about its data and validity
-// segments. Returns a viability-failure reason, or nullopt on success.
-std::optional<std::string> walk_typed_column(duckdb::ColumnData& col_data,
-                                             bool is_varchar,
+// Grants access to ArrayColumnData's protected child/validity members. C++
+// permits a derived class to reach a protected base member through a reference
+// of its own type; static_cast'ing the existing ArrayColumnData object to this
+// (layout-identical, member-less) subclass is well-defined and avoids the
+// fragile offset/padding assumptions a reinterpret_cast would require.
+struct array_column_access : duckdb::ArrayColumnData {
+  static duckdb::ColumnData* get_child(duckdb::ArrayColumnData& a)
+  {
+    return static_cast<array_column_access&>(a).child_column.get();
+  }
+  static duckdb::ValidityColumnData* get_validity(duckdb::ArrayColumnData& a)
+  {
+    return static_cast<array_column_access&>(a).validity.get();
+  }
+};
+
+// Walks an ARRAY column's segment trees. DuckDB lays out a fixed-size ARRAY as:
+// array-level validity (path [col,0]) + a child column of count * array_size
+// contiguous values (child data [col,1], child validity [col,1,0]). The decoder
+// reads array-level validity from data_segments, so it lands there. Returns a
+// viability-failure reason, or nullopt on success.
+std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
                                              duckdb::idx_t column_id,
                                              std::size_t rg_idx,
                                              duckdb_column_metadata& col_md)
+{
+  // Walk a fixed-width data segment tree into out
+  auto walk_data = [&](duckdb::ColumnSegmentTree& tree,
+                       std::vector<duckdb_segment_descriptor>& out,
+                       const char* label) -> std::optional<std::string> {
+    // Tree order is row-start order; the caller re-sorts anyway
+    for (auto& node : tree.SegmentNodes()) {
+      auto& segment          = node.GetNode();
+      auto const compression = segment.GetCompressionFunction().type;
+      if (!is_supported_data_compression(compression)) {
+        return std::string(label) + " segment on column " + std::to_string(column_id) +
+               " row group " + std::to_string(rg_idx) + ": unsupported compression " +
+               duckdb::CompressionTypeToString(compression);
+      }
+      out.push_back(fill_segment_descriptor(segment, node.GetRowStart()));
+    }
+    return std::nullopt;
+  };
+
+  // Walk a validity segment tree into out
+  auto walk_validity = [&](duckdb::ColumnSegmentTree& tree,
+                           std::vector<duckdb_segment_descriptor>& out,
+                           const char* label) -> std::optional<std::string> {
+    for (auto& node : tree.SegmentNodes()) {
+      auto& segment          = node.GetNode();
+      auto const compression = segment.GetCompressionFunction().type;
+      if (!is_supported_validity_compression(compression)) {
+        return std::string(label) + " segment on column " + std::to_string(column_id) +
+               " row group " + std::to_string(rg_idx) + ": unsupported compression " +
+               duckdb::CompressionTypeToString(compression);
+      }
+      out.push_back(fill_segment_descriptor(segment, node.GetRowStart()));
+    }
+    return std::nullopt;
+  };
+
+  col_md.is_array = true;
+  auto* array_col = dynamic_cast<duckdb::ArrayColumnData*>(&col_data);
+  if (!array_col) {
+    return "ARRAY column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
+           ": expected ArrayColumnData but got " + col_data.GetType().ToString();
+  }
+
+  // Array-level validity to data_segments
+  auto* array_validity = array_column_access::get_validity(*array_col);
+  if (!array_validity) {
+    return "ARRAY column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
+           ": no array validity column";
+  }
+  if (auto reason =
+        walk_validity(array_validity->GetSegmentTree(), col_md.data_segments, "array validity")) {
+    return reason;
+  }
+
+  // Child column. The decode path supports a fixed-width child only; its
+  // storage is StandardColumnData.
+  auto* child = array_column_access::get_child(*array_col);
+  if (!child) {
+    return "ARRAY column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
+           ": no child column found";
+  }
+  auto* child_std = dynamic_cast<duckdb::StandardColumnData*>(child);
+  if (!child_std) {
+    return "ARRAY child on column " + std::to_string(column_id) + " row group " +
+           std::to_string(rg_idx) + ": child storage is not StandardColumnData";
+  }
+  if (auto reason = walk_data(
+        child_std->GetSegmentTree(), col_md.array_child_data_segments, "ARRAY child data")) {
+    return reason;
+  }
+  if (auto reason = walk_validity(child_std->GetValidityData().GetSegmentTree(),
+                                  col_md.array_child_validity_segments,
+                                  "ARRAY child validity")) {
+    return reason;
+  }
+  return std::nullopt;
+}
+
+// Walks the segment trees of a projected column, collecting metadata about its data and validity
+// segments. Returns a viability-failure reason, or nullopt on success.
+std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
+                                                bool is_varchar,
+                                                duckdb::idx_t column_id,
+                                                std::size_t rg_idx,
+                                                duckdb_column_metadata& col_md)
 {
   auto* std_col = dynamic_cast<duckdb::StandardColumnData*>(&col_data);
   if (!std_col) {
@@ -178,6 +310,15 @@ std::optional<std::string> walk_typed_column(duckdb::ColumnData& col_data,
                std::to_string(rg_idx) + ": Max String Length stat absent from segment stats";
       }
       desc.max_string_length = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+      // Stats-drift guard: a marker-bearing segment must never reach the GPU string
+      // decoder. Mirrors the refusal in prepare_duckdb_native_walk (see rationale there).
+      if (*desc.max_string_length >=
+          duckdb::StringUncompressed::GetStringBlockLimit(segment.GetBlockSize())) {
+        return "varchar segment on column " + std::to_string(column_id) + " row group " +
+               std::to_string(rg_idx) +
+               ": max string length reaches the overflow-block limit; overflow strings are not "
+               "GPU-decodable";
+      }
     }
     col_md.data_segments.push_back(std::move(desc));
   }
@@ -211,6 +352,10 @@ void compute_segment_bytes_size(std::vector<duckdb_row_group_metadata>& row_grou
         if (s.block_id >= 0) refs.push_back(&s);
       for (auto& s : col.validity_segments)
         if (s.block_id >= 0) refs.push_back(&s);
+      for (auto& s : col.array_child_data_segments)
+        if (s.block_id >= 0) refs.push_back(&s);
+      for (auto& s : col.array_child_validity_segments)
+        if (s.block_id >= 0) refs.push_back(&s);
     }
   }
   std::sort(refs.begin(), refs.end(), [](const auto* a, const auto* b) {
@@ -228,9 +373,10 @@ void compute_segment_bytes_size(std::vector<duckdb_row_group_metadata>& row_grou
 
 /// @brief Check if the filter can be applied to row-group pruning.
 ///
-/// The only filter type we must exclude from statistics pruning is DYNAMIC_FILTER:
-/// its bounds come from a runtime source (e.g. a hash-join build) and are not
-/// currently populated at metadata-walk time.
+/// This DuckDB-native statistics walker only consumes the static payloads represented directly by
+/// DuckDB @c TableFilter nodes. @c DYNAMIC_FILTER is a routing placeholder, while Sirius runtime
+/// join filters use their own publication channel and scan-consumer paths, so it is not translated
+/// by this walker.
 bool filter_is_prunable(duckdb::TableFilterType t)
 {
   return t != duckdb::TableFilterType::DYNAMIC_FILTER;
@@ -248,6 +394,12 @@ std::size_t estimate_decoded_bytes_budget(duckdb::idx_t row_count,
       // String payload bytes require segment-level max-string stats. At prepare
       // time we can only account for offsets; this counter is diagnostic.
       budget += static_cast<std::size_t>(row_count) * sizeof(std::uint32_t);
+    } else if (projected_types[ci].is_array()) {
+      // ARRAY: offsets (int32) + child values (array_size × child_width × row_count).
+      auto const array_size  = projected_types[ci].array_size();
+      auto const child_width = projected_types[ci].array_child().fixed_width_byte_size();
+      budget +=
+        static_cast<std::size_t>(row_count) * (sizeof(std::int32_t) + array_size * child_width);
     } else {
       budget += static_cast<std::size_t>(row_count) * projected_types[ci].fixed_width_byte_size();
     }
@@ -407,6 +559,11 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   plan.partition_row_groups.assign(plan.n_row_groups, nullptr);
   plan.row_group_pruned_by_stats.assign(plan.n_row_groups, false);
   plan.pruned_decoded_bytes_by_row_group.assign(plan.n_row_groups, 0);
+  // PartitionStatistics is expected to carry one entry per row group; a larger
+  // count means the DuckDB layout assumption below (index i == row group i) has
+  // drifted and trailing entries would be silently dropped.
+  assert(partition_stats.size() <= plan.n_row_groups &&
+         "partition_stats count exceeds row group count — DuckDB layout drift");
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
     auto const& ps = partition_stats[i];
     if (!ps.row_start.IsValid()) {
@@ -430,9 +587,49 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
       plan.pruned_row_groups,
       plan.pruned_decoded_bytes);
   }
+  // A fully-pruned table (every row group removed by filter stats) is viable: the
+  // ranges walk yields empty row-group lists, and the coalescer's empty-batch
+  // fallback emits one schema-correct 0-row split so the scan still creates a task
+  // and the pipeline completes (mirrors the parquet all-pruned path). Refusing here
+  // instead throws "duckdb-native scan rejected query" and hangs the query.
   if (plan.n_row_groups > 0 && plan.pruned_row_groups == plan.n_row_groups) {
-    refuse("no row groups in table (empty or fully pruned)");
-    return plan;
+    SIRIUS_LOG_DEBUG(
+      "[duckdb_native_metadata] all {} row groups stats-pruned; scan yields an "
+      "empty result via the coalescer fallback",
+      plan.n_row_groups);
+  }
+
+  // Overflow (big-string) refusal. The UNCOMPRESSED codec stores any single string
+  // at/over StringUncompressed::GetStringBlockLimit in an overflow block, leaving a
+  // BIG_STRING_MARKER the GPU string decoder would silently emit as string content.
+  // The stat is a per-string max, so stat < limit proves a row group marker-free.
+  // Conservative for DICT_FSST, which inlines strings up to 16 KiB
+  // (DictFSSTCompression::STRING_SIZE_LIMIT) without markers — codecs are invisible
+  // in row-group stats, so its limit..16 KiB row groups are refused unnecessarily
+  // (rare in practice).
+  auto const overflow_limit = duckdb::StringUncompressed::GetStringBlockLimit(plan.block_size);
+  for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
+    if (projected_cols[ci].is_rowid || !projected_types[ci].is_varchar()) { continue; }
+    auto const& storage_idx = projected_cols[ci].storage_idx;
+    for (std::size_t rg = 0; rg < plan.n_row_groups; ++rg) {
+      if (plan.row_group_pruned_by_stats[rg]) { continue; }  // pruned -> never decoded
+      if (rg >= plan.partition_row_groups.size() || !plan.partition_row_groups[rg]) { continue; }
+      auto stats = plan.partition_row_groups[rg]->GetColumnStatistics(storage_idx);
+      if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats)) {
+        refuse("row group " + std::to_string(rg) + " varchar column " +
+               std::to_string(storage_idx.GetPrimaryIndex()) +
+               ": max-string-length stat absent; cannot rule out overflow strings");
+        return plan;
+      }
+      auto const max_len = duckdb::StringStats::MaxStringLength(*stats);
+      if (max_len >= overflow_limit) {
+        refuse("row group " + std::to_string(rg) + " varchar column " +
+               std::to_string(storage_idx.GetPrimaryIndex()) + ": max string length " +
+               std::to_string(max_len) + " reaches the overflow-block limit (" +
+               std::to_string(overflow_limit) + "); overflow strings are not GPU-decodable");
+        return plan;
+      }
+    }
   }
 
   plan.viable = true;
@@ -505,11 +702,16 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
       for (std::size_t ci = 0; ci < projected_cols.size(); ++ci) {
         auto const& pc = projected_cols[ci];
         if (pc.is_rowid) { continue; }
-        auto reason = walk_typed_column(row_group->GetRawColumnData(pc.storage_idx),
-                                        projected_types[ci].is_varchar(),
-                                        pc.storage_idx.GetPrimaryIndex(),
-                                        rg,
-                                        rg_md.columns[ci]);
+        auto reason = projected_types[ci].is_array()
+                        ? walk_array_column(row_group->GetRawColumnData(pc.storage_idx),
+                                            pc.storage_idx.GetPrimaryIndex(),
+                                            rg,
+                                            rg_md.columns[ci])
+                        : walk_standard_column(row_group->GetRawColumnData(pc.storage_idx),
+                                               projected_types[ci].is_varchar(),
+                                               pc.storage_idx.GetPrimaryIndex(),
+                                               rg,
+                                               rg_md.columns[ci]);
         if (reason) {
           refuse(std::move(*reason));
           return result;
@@ -526,6 +728,11 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
     for (auto& col_md : rg_md.columns) {
       std::sort(col_md.data_segments.begin(), col_md.data_segments.end(), seg_less);
       std::sort(col_md.validity_segments.begin(), col_md.validity_segments.end(), seg_less);
+      std::sort(
+        col_md.array_child_data_segments.begin(), col_md.array_child_data_segments.end(), seg_less);
+      std::sort(col_md.array_child_validity_segments.begin(),
+                col_md.array_child_validity_segments.end(),
+                seg_less);
     }
   }
 
@@ -576,6 +783,12 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
         }
         rg_md.varchar_bytes_per_col[ci] = chars;
         budget += chars + static_cast<std::size_t>(rg_md.row_count) * sizeof(std::uint32_t);
+      } else if (projected_types[ci].is_array()) {
+        // ARRAY: offsets (int32) + child values (array_size × child_width × row_count)
+        auto const array_size  = projected_types[ci].array_size();
+        auto const child_width = projected_types[ci].array_child().fixed_width_byte_size();
+        budget += static_cast<std::size_t>(rg_md.row_count) *
+                  (sizeof(std::int32_t) + array_size * child_width);
       } else {
         budget +=
           static_cast<std::size_t>(rg_md.row_count) * projected_types[ci].fixed_width_byte_size();

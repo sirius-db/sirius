@@ -27,9 +27,9 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -84,7 +84,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    */
   ~convertible_gpu_pipeline_task() override
   {
-    if (_task) { _queue.push(std::move(_task)); }
+    if (_task) { (void)_queue.push(std::move(_task)); }
   }
 
   /**
@@ -265,10 +265,16 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    *
    * @param space           The memory space to filter by.
    * @param front_to_back   Iteration direction.
+   * @param ignore_subscribed  Unused here: a queued task always subscribes to its own input
+   *                           batches, so honoring this filter would disable task-queue downgrade
+   *                           entirely. The subscriber filter applies to repository batches (see
+   *                           convertible_data_batch_provider), not a task's own held batches.
    * @return A vector of convertible_gpu_pipeline_task wrappers (may be empty).
    */
   std::vector<std::unique_ptr<convertible_data>> get_all_convertible(
-    cucascade::memory::memory_space* space, bool front_to_back) override
+    cucascade::memory::memory_space* space,
+    bool front_to_back,
+    [[maybe_unused]] bool ignore_subscribed = true) override
   {
     std::vector<std::unique_ptr<convertible_data>> results;
     while (true) {

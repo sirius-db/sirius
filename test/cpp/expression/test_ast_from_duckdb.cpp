@@ -139,7 +139,7 @@ TEST_CASE("ast_from_duckdb - BOUND_CONSTANT INTEGER translates to constant node"
   REQUIRE(out);
   REQUIRE(out->holds<constant>());
   auto const& c = out->get<constant>();
-  REQUIRE(c.return_type.id() == sirius::type_id::INTEGER);
+  REQUIRE(c.return_type().id() == sirius::type_id::INTEGER);
   REQUIRE(std::holds_alternative<int32_t>(c.payload));
   REQUIRE(std::get<int32_t>(c.payload) == 42);
 }
@@ -152,7 +152,7 @@ TEST_CASE("ast_from_duckdb - BOUND_CONSTANT VARCHAR translates to constant node"
   REQUIRE(out);
   REQUIRE(out->holds<constant>());
   auto const& c = out->get<constant>();
-  REQUIRE(c.return_type.id() == sirius::type_id::VARCHAR);
+  REQUIRE(c.return_type().id() == sirius::type_id::VARCHAR);
   REQUIRE(std::holds_alternative<std::string>(c.payload));
   REQUIRE(std::get<std::string>(c.payload) == "hi");
 }
@@ -165,7 +165,7 @@ TEST_CASE("ast_from_duckdb - BOUND_CONSTANT NULL of INTEGER preserves type", "[a
   REQUIRE(out);
   REQUIRE(out->holds<constant>());
   auto const& c = out->get<constant>();
-  REQUIRE(c.return_type.id() == sirius::type_id::INTEGER);
+  REQUIRE(c.return_type().id() == sirius::type_id::INTEGER);
   REQUIRE(std::holds_alternative<sirius::null_value>(c.payload));
 }
 

@@ -37,7 +37,6 @@ DUCKDB="${DUCKDB:-$PROJECT_DIR/build/release/duckdb}"
 ITERATIONS=${ITERATIONS:-2}
 # Per-query timeout in seconds (covers both iterations + nsys overhead).
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-90}
-SCAN_CACHE_LEVEL="${SCAN_CACHE_LEVEL:-}"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <scale_factor> [query_numbers...]"
@@ -108,7 +107,6 @@ echo "Timeout      : ${QUERY_TIMEOUT}s per query"
 echo "Queries      : ${QUERIES[*]}"
 echo "Output dir   : $OUTPUT_DIR"
 echo "Config       : ${SIRIUS_CONFIG_FILE:-<not set>}"
-echo "Cache level  : ${SCAN_CACHE_LEVEL:-<default>}"
 echo "nsys version : $(nsys --version 2>&1 | head -1)"
 echo "============================================"
 echo ""
@@ -173,9 +171,6 @@ for q in "${QUERIES[@]}"; do
     printf "INSERT INTO _timings VALUES (0, 'start', current_timestamp);\n" >> "$TEMP_SQL"
 
     printf '%s\n' "$VIEW_SQL" >> "$TEMP_SQL"
-    if [ -n "$SCAN_CACHE_LEVEL" ]; then
-        printf "SET scan_cache_level = '%s';\n" "$SCAN_CACHE_LEVEL" >> "$TEMP_SQL"
-    fi
     printf "INSERT INTO _timings VALUES (1, 'views', current_timestamp);\n" >> "$TEMP_SQL"
 
     for ((i = 1; i <= ITERATIONS; i++)); do

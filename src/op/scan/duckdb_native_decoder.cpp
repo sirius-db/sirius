@@ -21,6 +21,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/io_context.hpp"
+#include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -57,6 +58,7 @@
 #include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/compression/roaring/roaring.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
+#include <duckdb/storage/statistics/array_stats.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
@@ -65,6 +67,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <optional>
@@ -104,7 +107,9 @@ bool is_supported_fixed_width_codec(duckdb::CompressionType c)
     case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
     case duckdb::CompressionType::COMPRESSION_CONSTANT:
     case duckdb::CompressionType::COMPRESSION_RLE:
-    case duckdb::CompressionType::COMPRESSION_BITPACKING: return true;
+    case duckdb::CompressionType::COMPRESSION_BITPACKING:
+    case duckdb::CompressionType::COMPRESSION_ALP:
+    case duckdb::CompressionType::COMPRESSION_ALPRD: return true;
     default: return false;
   }
 }
@@ -254,9 +259,16 @@ struct staged_segment {
 struct staged_column {
   std::vector<staged_segment> data;
   std::vector<staged_segment> validity;
-  bool has_nulls         = false;
-  std::size_t total_rows = 0;
-  bool is_varchar        = false;
+  /// ARRAY child data segments (empty for non-ARRAY columns)
+  std::vector<staged_segment> array_child_data;
+  /// ARRAY child validity segments (empty for non-ARRAY or when child has no nulls)
+  std::vector<staged_segment> array_child_validity;
+  bool has_nulls               = false;
+  bool child_has_nulls         = false;  // ARRAY child validity flag
+  std::size_t total_rows       = 0;
+  std::size_t total_child_rows = 0;  // For ARRAY: total_rows * array_size
+  bool is_varchar              = false;
+  bool is_array                = false;
 };
 
 /// @brief A .db block-payload range to read into device buffer at device_offset.
@@ -310,37 +322,51 @@ void stage_host_copy(staging_state& s, pinned_segment_bytes p, staged_segment& o
   s.pinned_segments.push_back(std::move(p));  // keep pinned memory alive until H2D is synced
 }
 
-/// @brief Add a device_read_job to the staging_state for the given segment, translating block_id +
-/// block_offset into an absolute file offset, and reserving device space for the segment's bytes.
+/// @brief Append the on-disk byte ranges for one segment to @p out, in device-staging order (main
+/// payload, then whole-block overflow). Single source of the block_id -> file offset math, shared
+/// by the prefetch hint (@ref row_group_file_ranges) and the decode reads (@ref stage_device_read).
+void append_segment_file_ranges(duckdb::SingleFileBlockManager const& bm,
+                                duckdb_segment_descriptor const& seg,
+                                std::vector<cudf::io::text::byte_range_info>& out)
+{
+  if (seg.bytes_size > 0) {  // main payload; CONSTANT/blockless => bytes_size == 0, skip
+    auto const off =
+      duckdb_block_payload_offset(bm, seg.block_id) + static_cast<std::size_t>(seg.block_offset);
+    out.emplace_back(static_cast<std::int64_t>(off), static_cast<std::int64_t>(seg.bytes_size));
+  }
+  for (auto add_id : seg.additional_blocks) {  // whole-block overflow payloads
+    out.emplace_back(static_cast<std::int64_t>(duckdb_block_payload_offset(bm, add_id)),
+                     static_cast<std::int64_t>(bm.GetBlockSize()));
+  }
+}
+
+/// @brief Reserve device space for @p seg and queue its reads. File ranges come from
+/// @ref append_segment_file_ranges so decode reads exactly the bytes prefetch warmed; each range
+/// lands contiguously in the device buffer, in order.
 void stage_device_read(staging_state& s,
                        duckdb::SingleFileBlockManager const& bm,
                        duckdb_segment_descriptor const& seg,
                        staged_segment& out_seg)
 {
-  auto const block_size        = bm.GetBlockSize();
-  auto const main_segment_size = seg.bytes_size;
-  // Additional blocks are always whole-block, so their size is block_size even when the main
-  // segment is partial-block.
-  auto const total_size = main_segment_size + seg.additional_blocks.size() * block_size;
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  append_segment_file_ranges(bm, seg, ranges);
+
+  std::size_t total_size = 0;
+  for (auto const& r : ranges) {
+    total_size += static_cast<std::size_t>(r.size());
+  }
 
   out_seg.device_offset = reserve_segment(s, total_size);
   out_seg.bytes         = total_size;
 
-  if (main_segment_size > 0) {
-    auto const file_offset =
-      duckdb_block_payload_offset(bm, seg.block_id) + static_cast<std::size_t>(seg.block_offset);
-    s.reads.push_back({file_offset, main_segment_size, out_seg.device_offset});
-  }
-
-  // Stage the additional blocks as subsequent reads in the device buffer, immediately following the
-  // main segment. Additional blocks do NOT need 16B alignment since they are appended to the main
-  // segment (which IS 16B-aligned) and all alignment requirements are imposed relative to the
-  // segment base.
-  auto dst_offset = main_segment_size;
-  for (auto add_id : seg.additional_blocks) {
-    auto const file_offset = duckdb_block_payload_offset(bm, add_id);
-    s.reads.push_back({file_offset, block_size, out_seg.device_offset + dst_offset});
-    dst_offset += block_size;
+  // Each range lands immediately after the previous one. Overflow blocks need no separate 16B
+  // alignment: they follow the 16B-aligned segment base, and alignment is relative to that base.
+  std::size_t dst_offset = 0;
+  for (auto const& r : ranges) {
+    s.reads.push_back({static_cast<std::size_t>(r.offset()),
+                       static_cast<std::size_t>(r.size()),
+                       out_seg.device_offset + dst_offset});
+    dst_offset += static_cast<std::size_t>(r.size());
   }
 }
 
@@ -501,6 +527,120 @@ staged_column stage_one_varchar_column(staging_state& s,
   return out;
 }
 
+/// @brief Stage the segments for an ARRAY column with a fixed-width child element.
+///
+/// DuckDB stores ARRAY as: array-level validity (path [col,0]) + child data (path [col,1])
+/// + optional child validity (path [col,1,0]). The child segments are in element-units and
+/// DuckDB already emits child segment_start/segment_count in element units, so they drop
+/// straight into staged_segment.
+staged_column stage_one_array_column(
+  staging_state& s,
+  duckdb::DatabaseInstance& db,
+  duckdb::BlockManager& block_manager,
+  duckdb::SingleFileBlockManager const& sf_bm,
+  std::vector<duckdb::PartitionStatistics> const& partition_stats,
+  std::vector<std::unique_ptr<duckdb::BaseStatistics>>& owned_stats_cache,
+  std::vector<duckdb_row_group_metadata> const& row_groups,
+  std::size_t projected_col_idx,
+  sirius::logical_type const& projected_type)
+{
+  staged_column out;
+  out.is_array = true;
+
+  auto const& child_type = projected_type.array_child();
+  auto const array_size  = static_cast<std::size_t>(projected_type.array_size());
+
+  uint32_t row_cursor        = 0;
+  uint32_t child_elem_cursor = 0;
+
+  for (const auto& rg : row_groups) {
+    auto const& col_md = rg.columns.at(projected_col_idx);
+
+    //===----------Array-Level Validity (path [col, 0])----------===//
+    // Walker routes array-level validity to col_md.data_segments for ARRAY
+    // columns, so validity_segments (what column_has_real_nulls inspects) is
+    // empty. Detect real nulls from the validity codec here.
+    for (auto const& vseg : col_md.data_segments) {
+      if (is_constant_or_empty_validity(vseg.compression)) { continue; }
+      out.has_nulls = true;
+      staged_segment vs;
+      vs.row_offset  = row_cursor + static_cast<uint32_t>(vseg.segment_start);
+      vs.row_count   = static_cast<uint32_t>(vseg.segment_count);
+      vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
+
+      if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
+        stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
+      } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+        stage_device_read(s, sf_bm, vseg, vs);
+      } else {
+        throw_unsupported("array validity codec " +
+                          std::to_string(static_cast<int>(vseg.compression)) + " (column " +
+                          std::to_string(col_md.column_id) + ")");
+      }
+      out.validity.push_back(vs);
+    }
+
+    //===----------Child Data (path [col, 1])----------===//
+    for (auto const& seg : col_md.array_child_data_segments) {
+      if (!is_supported_fixed_width_codec(seg.compression)) {
+        throw_unsupported("array child data codec " +
+                          std::to_string(static_cast<int>(seg.compression)) + " (column " +
+                          std::to_string(col_md.column_id) + ")");
+      }
+      staged_segment ss;
+      ss.row_offset  = child_elem_cursor + static_cast<uint32_t>(seg.segment_start);
+      ss.row_count   = static_cast<uint32_t>(seg.segment_count);
+      ss.compression = seg.compression;
+
+      if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+        // GetColumnStatistics on an ARRAY column returns ArrayStats; the child's
+        // numeric min/max (what the CONSTANT value is derived from) lives in the
+        // nested child stats, so unwrap before extracting.
+        auto const& array_stats = constant_stats_for(
+          partition_stats, rg.row_group_index, col_md.column_id, owned_stats_cache);
+        auto const& child_stats = duckdb::ArrayStats::GetChildStats(array_stats);
+        stage_host_copy(s, extract_constant_bytes(child_stats, child_type), ss);
+      } else {
+        stage_device_read(s, sf_bm, seg, ss);
+      }
+      out.array_child_data.push_back(ss);
+    }
+
+    //===----------Child Validity (path [col, 1, 0])----------===//
+    for (auto const& vseg : col_md.array_child_validity_segments) {
+      if (is_constant_or_empty_validity(vseg.compression)) { continue; }
+      out.child_has_nulls = true;
+      staged_segment vs;
+      vs.row_offset  = child_elem_cursor + static_cast<uint32_t>(vseg.segment_start);
+      vs.row_count   = static_cast<uint32_t>(vseg.segment_count);
+      vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
+
+      if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
+        stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
+      } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+        stage_device_read(s, sf_bm, vseg, vs);
+      } else {
+        throw_unsupported("array child validity codec " +
+                          std::to_string(static_cast<int>(vseg.compression)) + " (column " +
+                          std::to_string(col_md.column_id) + ")");
+      }
+      out.array_child_validity.push_back(vs);
+    }
+
+    row_cursor += static_cast<uint32_t>(rg.row_count);
+    auto const advanced = checked_array_child_advance(child_elem_cursor, rg.row_count, array_size);
+    if (!advanced) {
+      throw_unsupported("ARRAY column child-element count exceeds cudf size_type limit (column " +
+                        std::to_string(col_md.column_id) + ")");
+    }
+    child_elem_cursor = *advanced;
+  }
+
+  out.total_rows       = row_cursor;
+  out.total_child_rows = child_elem_cursor;
+  return out;
+}
+
 //===----------------------------------------------------------------------===//
 // Issue staged reads into a pinned host buffer, then copy them to the device.
 //
@@ -554,8 +694,7 @@ void batched_h2d(std::vector<void*> const& dst,
 
 void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
-                      sirius::io::sirius_ioctx& io_ctx,
-                      sirius::io::sirius_io_object& io_obj,
+                      const sirius::io::sirius_datasource& datasource,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       int host_numa_node,
                       std::size_t coalesce_max_gap,
@@ -646,35 +785,24 @@ void submit_and_await(rmm::device_buffer& device_buf,
   auto host_alloc = host_fsmr->allocate_multiple_blocks(host_bytes, reservation.get());
 
   // One coalesced range + contiguous dst span per piece.
-  std::vector<cudf::io::text::byte_range_info> ranges;
-  std::vector<cudf::host_span<std::byte>> dsts;
+  std::vector<io::io_object_segment> ranges;
   ranges.reserve(pieces.size());
-  dsts.reserve(pieces.size());
   std::size_t total_read = 0;
   for (auto const& p : pieces) {
     std::size_t const sz = p.file_end - p.file_off;
-    ranges.emplace_back(static_cast<int64_t>(p.file_off), static_cast<int64_t>(sz));
-    dsts.emplace_back(
-      reinterpret_cast<std::byte*>(host_alloc->at(p.host_block).data()) + p.host_off, sz);
+    ranges.emplace_back(
+      p.file_off,
+      sz,
+      reinterpret_cast<std::uint8_t*>(host_alloc->at(p.host_block).data()) + p.host_off);
     total_read += sz;
   }
 
   // Issue the coalesced reads as one batch and await completion.
   {
     nvtx3::scoped_range nvtx_reads{"native_reads"};
-    std::promise<std::size_t> prom;
-    auto fut = prom.get_future();
-    io_ctx.host_read_ranges_async_io(io_obj,
-                                     ranges,
-                                     std::span<cudf::host_span<std::byte>>(dsts),
-                                     [&prom](std::size_t n, std::exception_ptr e) {
-                                       if (e) {
-                                         prom.set_exception(std::move(e));
-                                       } else {
-                                         prom.set_value(n);
-                                       }
-                                     });
-    std::size_t const got = fut.get();
+    auto io_ctx           = datasource.io_ctx();
+    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
+    std::size_t const got = std::move(fut).get();
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
                                std::to_string(got) + " expected " + std::to_string(total_read));
@@ -790,21 +918,48 @@ std::unique_ptr<cudf::column> build_rowid_column(
 
 }  // namespace
 
+std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
+  duckdb::SingleFileBlockManager const& block_manager, duckdb_row_group_metadata const& row_group)
+{
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  for (auto const& col : row_group.columns) {
+    for (auto const& seg : col.data_segments) {
+      append_segment_file_ranges(block_manager, seg, ranges);
+    }
+    for (auto const& seg : col.validity_segments) {
+      append_segment_file_ranges(block_manager, seg, ranges);
+    }
+  }
+  return ranges;
+}
+
 //===----------------------------------------------------------------------===//
 // Public entry: decode_duckdb_native_split
 //===----------------------------------------------------------------------===//
 
-std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payload const& split,
-                                                        cucascade::memory::memory_space& mem_space,
-                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::table> decode_duckdb_native_split(
+  std::vector<duckdb_row_group_metadata> const& row_groups,
+  duckdb_native_ingestible_table_info const& table_info,
+  sirius::io::sirius_datasource& datasource,
+  cucascade::memory::memory_space& mem_space,
+  rmm::cuda_stream_view stream)
 {
-  if (split.row_groups.empty()) {
-    return std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
+  if (row_groups.empty()) {
+    // Empty / fully-pruned split: emit a schema-correct 0-row table (one empty
+    // column per projected column) rather than a 0-column table, so it flows
+    // through post_filter_and_project and downstream concat like any decoded
+    // batch. Rowid columns decode as INT64 (see the fixed-width path below).
+    std::vector<std::unique_ptr<cudf::column>> empty_cols;
+    empty_cols.reserve(table_info.projected_cols.size());
+    for (std::size_t ci = 0; ci < table_info.projected_cols.size(); ++ci) {
+      auto const dt = table_info.projected_cols[ci].is_rowid
+                        ? cudf::data_type{cudf::type_id::INT64}
+                        : sirius_to_cudf_type(table_info.projected_types[ci]);
+      empty_cols.push_back(cudf::make_empty_column(dt));
+    }
+    return std::make_unique<cudf::table>(std::move(empty_cols));
   }
-  if (split.table_info == nullptr) {
-    throw std::runtime_error(std::string(kTag) + " split.table_info is null");
-  }
-  auto const& scan_info = *split.table_info;
+  auto const& scan_info = table_info;
   auto& storage         = *scan_info.storage;
   auto& context         = *scan_info.context;
 
@@ -813,10 +968,8 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
   auto& block_manager = sm.GetBlockManager();
 
   // sirius_io routing
-  auto* io_ctx      = split.io_ctx.get();
-  auto* io_obj      = split.db_io_object.get();
   auto const* sf_bm = dynamic_cast<duckdb::SingleFileBlockManager const*>(&block_manager);
-  if (!io_ctx || !io_obj || !sf_bm) {
+  if (!sf_bm) {
     throw std::runtime_error(
       std::string(kTag) +
       " missing io_ctx, io_obj, or SingleFileBlockManager for duckdb_native_scan");
@@ -829,10 +982,10 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
 
   auto mr_ref = mem_space.get_default_allocator();
 
-  std::size_t const num_cols = scan_info.projected_cols.size();
+  auto const num_cols = scan_info.projected_cols.size();
 
   std::size_t total_rows = 0;
-  for (auto const& rg : split.row_groups) {
+  for (auto const& rg : row_groups) {
     total_rows += rg.row_count;
   }
   if (total_rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
@@ -855,7 +1008,17 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
     }
     if (scan_info.projected_types[ci].is_varchar()) {
       staged_cols.push_back(
-        stage_one_varchar_column(staging, db, block_manager, *sf_bm, split.row_groups, ci));
+        stage_one_varchar_column(staging, db, block_manager, *sf_bm, row_groups, ci));
+    } else if (scan_info.projected_types[ci].is_array()) {
+      staged_cols.push_back(stage_one_array_column(staging,
+                                                   db,
+                                                   block_manager,
+                                                   *sf_bm,
+                                                   partition_stats,
+                                                   owned_stats_cache,
+                                                   row_groups,
+                                                   ci,
+                                                   scan_info.projected_types[ci]));
     } else {
       staged_cols.push_back(stage_one_fixed_width_column(staging,
                                                          db,
@@ -863,7 +1026,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
                                                          *sf_bm,
                                                          partition_stats,
                                                          owned_stats_cache,
-                                                         split.row_groups,
+                                                         row_groups,
                                                          ci,
                                                          scan_info.projected_types[ci]));
     }
@@ -891,8 +1054,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
     std::size_t const coalesce_max_gap = sf_bm->GetBlockHeaderSize();
     submit_and_await(device_buf,
                      staging,
-                     *io_ctx,
-                     *io_obj,
+                     datasource,
                      sirius_st->get_memory_manager(),
                      host_numa,
                      coalesce_max_gap,
@@ -900,13 +1062,19 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
   }
 
   // Group fixed-width columns for a single gpu_decode_table call; varchar
-  // columns each go through gpu_decode_strings_column separately.
+  // columns each go through gpu_decode_strings_column separately; array
+  // columns decode child data as fixed-width, then wrap into cudf LIST
+  // with offsets child.
   std::vector<gpu_column_decode_input> fw_inputs;
   std::vector<std::size_t> fw_to_final_idx;
   std::vector<gpu_string_column_decode_input> vc_inputs;
   std::vector<std::size_t> vc_to_final_idx;
+  std::vector<gpu_column_decode_input> array_child_inputs;
+  std::vector<std::size_t> array_to_final_idx;
   fw_inputs.reserve(num_cols);
   fw_to_final_idx.reserve(num_cols);
+  array_child_inputs.reserve(num_cols);
+  array_to_final_idx.reserve(num_cols);
 
   for (std::size_t ci = 0; ci < num_cols; ++ci) {
     if (is_rowid_col[ci]) continue;
@@ -919,6 +1087,16 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
       fill_fixed_width_runs(staged.validity, device_buf, input.validity);
       vc_inputs.push_back(std::move(input));
       vc_to_final_idx.push_back(ci);
+    } else if (staged.is_array) {
+      // Decode the child data as a fixed-width column
+      gpu_column_decode_input child_input;
+      child_input.out_type   = sirius_to_cudf_type(scan_info.projected_types[ci].array_child());
+      child_input.total_rows = static_cast<uint32_t>(staged.total_child_rows);
+      child_input.has_nulls  = staged.child_has_nulls;
+      fill_fixed_width_runs(staged.array_child_data, device_buf, child_input.data);
+      fill_fixed_width_runs(staged.array_child_validity, device_buf, child_input.validity);
+      array_child_inputs.push_back(std::move(child_input));
+      array_to_final_idx.push_back(ci);
     } else {
       gpu_column_decode_input input;
       input.out_type   = sirius_to_cudf_type(scan_info.projected_types[ci]);
@@ -943,6 +1121,62 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
     vc_cols.push_back(::sirius::cuda::scan::gpu_decode_strings_column(vc, stream, mr_ref));
   }
 
+  // Decode ARRAY child data as fixed-width columns, then wrap into LIST with offsets
+  std::vector<std::unique_ptr<cudf::column>> array_cols;
+  array_cols.reserve(array_child_inputs.size());
+  if (!array_child_inputs.empty()) {
+    // Decode each child column on its own as different columns might have different array sizes
+    std::vector<std::unique_ptr<cudf::column>> child_cols;
+    child_cols.reserve(array_child_inputs.size());
+    for (auto const& child_input : array_child_inputs) {
+      auto child_table = ::sirius::cuda::scan::gpu_decode_table({child_input}, stream, mr_ref);
+      auto cols        = child_table->release();
+      child_cols.push_back(std::move(cols[0]));
+    }
+
+    for (std::size_t ai = 0; ai < array_to_final_idx.size(); ++ai) {
+      auto const ci         = array_to_final_idx[ai];
+      auto const& staged    = staged_cols[ci];
+      auto const array_size = scan_info.projected_types[ci].array_size();
+      auto const total_rows = static_cast<cudf::size_type>(staged.total_rows);
+
+      // Filling stride offsets
+      auto init_scalar = cudf::numeric_scalar<cudf::size_type>(0, true, stream, mr_ref);
+      auto step_scalar = cudf::numeric_scalar<cudf::size_type>(array_size, true, stream, mr_ref);
+      auto offsets     = cudf::sequence(total_rows + 1, init_scalar, step_scalar, stream, mr_ref);
+
+      // Decode array-level validity from staged.validity segments
+      rmm::device_buffer parent_null_mask(0, stream, mr_ref);
+      cudf::size_type parent_null_count = 0;
+      if (staged.has_nulls && !staged.validity.empty()) {
+        // Temporary decode input for the array validity mask
+        gpu_column_decode_input validity_input;
+        validity_input.out_type   = cudf::data_type{cudf::type_id::BOOL8};  // dummy type
+        validity_input.total_rows = total_rows;
+        validity_input.has_nulls  = true;
+        fill_fixed_width_runs(staged.validity, device_buf, validity_input.validity);
+        // Decode a dummy BOOL8 column to get the null mask
+        // TODO: this wastes a throwaway BOOL8 column just to grab the null mask. If
+        // decode_column_validity() were exposed in gpu_native_decode.cuh, we could
+        // decode the array-level mask directly.
+        auto validity_table =
+          ::sirius::cuda::scan::gpu_decode_table({validity_input}, stream, mr_ref);
+        auto validity_cols = validity_table->release();
+        parent_null_count  = validity_cols[0]->null_count();
+        auto released      = validity_cols[0]->release();
+        parent_null_mask   = std::move(*released.null_mask);
+      }
+
+      // Assemble the LIST column: offsets + child values + array-level null mask
+      auto list_col = cudf::make_lists_column(total_rows,
+                                              std::move(offsets),
+                                              std::move(child_cols[ai]),
+                                              parent_null_count,
+                                              std::move(parent_null_mask));
+      array_cols.push_back(std::move(list_col));
+    }
+  }
+
   std::vector<std::unique_ptr<cudf::column>> final_cols(num_cols);
   for (std::size_t fi = 0; fi < fw_cols.size(); ++fi) {
     final_cols[fw_to_final_idx[fi]] = std::move(fw_cols[fi]);
@@ -950,10 +1184,13 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
   for (std::size_t vi = 0; vi < vc_cols.size(); ++vi) {
     final_cols[vc_to_final_idx[vi]] = std::move(vc_cols[vi]);
   }
+  for (std::size_t ai = 0; ai < array_cols.size(); ++ai) {
+    final_cols[array_to_final_idx[ai]] = std::move(array_cols[ai]);
+  }
   for (std::size_t ci = 0; ci < num_cols; ++ci) {
     if (!is_rowid_col[ci]) continue;
-    final_cols[ci] = build_rowid_column(
-      split.row_groups, static_cast<cudf::size_type>(total_rows), stream, mr_ref);
+    final_cols[ci] =
+      build_rowid_column(row_groups, static_cast<cudf::size_type>(total_rows), stream, mr_ref);
   }
 
   return std::make_unique<cudf::table>(std::move(final_cols));

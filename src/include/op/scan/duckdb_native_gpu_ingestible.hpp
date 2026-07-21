@@ -18,10 +18,9 @@
 
 // sirius
 #include <helper/logical_type.hpp>
-#include <io/gpu_ingestible.hpp>
-#include <op/scan/duckdb_native_decoder.hpp>  // duckdb_native_split_payload
+#include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
-#include <op/sirius_physical_operator.hpp>  // op::operator_data (raw-range carrier base)
+#include <op/scan/gpu_ingestible.hpp>
 #include <sirius_config.hpp>
 
 // duckdb
@@ -36,40 +35,39 @@
 // standard library
 #include <atomic>
 #include <cstddef>
-#include <functional>
 #include <memory>
-#include <optional>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-namespace sirius::scan_manager {
-class sirius_scan_manager;
-class split_connector;
-}  // namespace sirius::scan_manager
+namespace duckdb {
+class SingleFileBlockManager;
+}
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
 
 namespace sirius::op::scan {
-
-class batch_coalescer;
 
 //===----------------------------------------------------------------------===//
 // duckdb_native_ingestible_table_info
 //===----------------------------------------------------------------------===//
 /**
- * @brief DuckDB-native bind-data carrier; factory for
- *        @c duckdb_native_gpu_ingestible.
- *
- * Mirror of the legacy @c duckdb_native_scan_info field set, but rooted in
- * @c io::ingestible_table_info instead of @c op::scan::scan_info.
+ * @brief Bind data for a duckdb-native scan; builds the @c duckdb_native_gpu_ingestible.
  */
-class duckdb_native_ingestible_table_info : public io::ingestible_table_info {
+class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_info {
  public:
   duckdb::vector<sirius::logical_type> returned_types;
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   duckdb::vector<duckdb::idx_t> projection_ids;
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
+  /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
+  /// wired. The ingestible installs the consumer column remap on the channel; the downstream
+  /// dynamic-filter operator applies the filters post-decode (the native scan has no read-time
+  /// dynamic path).
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   duckdb::DataTable* storage     = nullptr;
@@ -78,16 +76,21 @@ class duckdb_native_ingestible_table_info : public io::ingestible_table_info {
   std::vector<sirius::logical_type> projected_types;
   duckdb::vector<sirius::logical_type> output_types;
   std::string db_path;
+  /// Qualified table reference (catalog / schema / table) derived from the resolved
+  /// DuckTableEntry. The pin cache (@c cache_entry_info) keys on these for
+  /// duckdb-native identity instead of the @c storage pointer, so the pin-time and
+  /// query-time derivation MUST use the same DuckTableEntry accessors.
+  std::string catalog_name;
+  std::string schema_name;
+  std::string table_name;
 
   duckdb_native_ingestible_table_info() = default;
 
-  std::shared_ptr<io::gpu_ingestible> make_ingestible(
-    std::unique_ptr<io::ingestible_table_info> self,
-    scan_manager::sirius_scan_manager const& mgr) override;
+  [[nodiscard]] std::span<std::string const> column_names() const override { return names; }
 
-  /// db_path-as-span. The cache match in @c sirius_scan_manager never
-  /// matches duckdb-native ingestibles (pinned-cache key is parquet file
-  /// paths), so this is purely contract-keeping.
+  /// db_path-as-span (contract-keeping for the base interface). duckdb-native
+  /// cache matching keys on the catalog/schema/table name in @c cache_entry_info,
+  /// not on these paths.
   [[nodiscard]] std::span<std::string const> file_paths() const override
   {
     if (db_path.empty()) { return {}; }
@@ -96,23 +99,43 @@ class duckdb_native_ingestible_table_info : public io::ingestible_table_info {
 };
 
 //===----------------------------------------------------------------------===//
-// duckdb_native_split_info
+// duckdb_native_scan_info
 //===----------------------------------------------------------------------===//
 /**
- * @brief Per-split scan metadata for a duckdb-native row-group batch.
- *
- * Owns the @c split_payload built from a contiguous run of the walker's
- * metadata. @c materialize_table forwards the payload to
- * @c decode_duckdb_native_split unchanged.
+ * @brief One unit of duckdb-native scan work. A metadata-scan task emits one per row-group range;
+ * the batch coalescer merges them into decode-batch-sized units the scan operator decodes.
  */
-class duckdb_native_split_info : public io::scan_info {
+class duckdb_native_scan_info : public op::scan::scan_info {
  public:
-  duckdb_native_split_payload payload;
+  /// Row-group metadata for this unit.
+  std::vector<duckdb_row_group_metadata> row_groups;
+  /// Read handle for the .db file; prefetched by the sequencer and decoded by materialize.
+  std::shared_ptr<sirius::io::sirius_datasource> datasource;
+  /// Resolves block ids to file offsets when deriving the on-disk ranges below.
+  duckdb::SingleFileBlockManager const* block_manager = nullptr;
 
+  /// On-disk byte ranges this unit reads, derived from @ref row_groups so they always match the row
+  /// groups currently held. The scan sequencer fadvises these to prefetch.
+  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override
+  {
+    if (block_manager == nullptr) { return {}; }
+    std::vector<fadvise_entry> entries;
+    append_fadvise_entry(entries, datasource, [this] {
+      std::vector<cudf::io::text::byte_range_info> ranges;
+      for (auto const& rg : row_groups) {
+        auto rg_ranges = row_group_file_ranges(*block_manager, rg);
+        ranges.insert(ranges.end(), rg_ranges.begin(), rg_ranges.end());
+      }
+      return ranges;
+    });
+    return entries;
+  }
+
+  /// Decoded (GPU) byte budget for this unit; drives memory reservation.
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
     std::size_t total = 0;
-    for (auto const& rg : payload.row_groups) {
+    for (auto const& rg : row_groups) {
       total += rg.decoded_bytes_budget;
     }
     return total;
@@ -120,102 +143,53 @@ class duckdb_native_split_info : public io::scan_info {
 };
 
 //===----------------------------------------------------------------------===//
-// duckdb_native_post_filter_and_projection_info
-//===----------------------------------------------------------------------===//
-/**
- * @brief Per-split post-decode filter + projection description.
- *
- * Emitted by @c duckdb_native_gpu_ingestible whenever the @c table_filters
- * survived translation OR the scan emitted more columns than
- * @c output_types requested (trailing filter-only columns).
- * @c apply_filter triggers the @c gpu_expression_executor pass against the
- * ingestible's shared filter expression; @c output_arity drives the
- * projection-down step.
- */
-class duckdb_native_post_filter_and_projection_info : public io::post_filter_and_projection_info {
- public:
-  bool apply_filter        = false;
-  std::size_t output_arity = 0;
-};
-
-//===----------------------------------------------------------------------===//
-// duckdb_native_range_input
-//===----------------------------------------------------------------------===//
-/**
- * @brief Carrier for one parsed row-group range.
- *
- * @c consume_next_input feeds the row groups through the @c batch_coalescer to
- * form @c duckdb_native_split_info batches. Holds only the parsed row groups;
- * the ingestible owns the shared bind data and IO handles. Never reaches
- * @c execute().
- */
-class duckdb_native_range_input : public op::operator_data {
- public:
-  std::vector<duckdb_row_group_metadata> row_groups;
-
-  [[nodiscard]] op::operator_data_type get_type() const override
-  {
-    return op::operator_data_type::GPU_SCAN;
-  }
-};
-
-//===----------------------------------------------------------------------===//
 // duckdb_native_gpu_ingestible
 //===----------------------------------------------------------------------===//
-class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
+class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
  public:
-  duckdb_native_gpu_ingestible(std::unique_ptr<io::ingestible_table_info> info,
-                               scan_manager::sirius_scan_manager const& mgr);
+  duckdb_native_gpu_ingestible(std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> info);
 
   ~duckdb_native_gpu_ingestible() override;
 
-  [[nodiscard]] bool has_more_splits() const override;
-  std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
+  std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 
-  io::filtered_table materialize_table(io::scan_info const& info,
-                                       ::cucascade::memory::memory_space const& mem_space,
-                                       rmm::cuda_stream_view stream) override;
+  [[nodiscard]] bool has_processed_all_metadata() const override;
 
-  std::unique_ptr<cudf::table> post_filter_and_project(
-    std::unique_ptr<cudf::table> input,
-    io::post_filter_and_projection_info const& info,
+  metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
+
+  op::scan::filtered_table materialize_metadata_to_table(
+    scan_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;
 
-  // -----------------------------
-  // Consumer-side coalescing
-  // -----------------------------
-  /// Pull row-group ranges off the connector, feed them through @ref _coalescer,
-  /// and return cap-sized batches. Flushes the tail batch once the connector is
-  /// closed and drained.
-  std::unique_ptr<op::operator_data> consume_next_input(
-    scan_manager::split_connector& connector) override;
+  std::unique_ptr<cudf::table> post_filter_and_project(
+    filtered_table&& input,
+    ::cucascade::memory::memory_space const& mem_space,
+    rmm::cuda_stream_view stream) override;
 
-  /// False while @ref _coalescer still holds unserved row groups.
-  [[nodiscard]] bool consumer_drained() const override;
+  [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
+
+  [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
+
+  [[nodiscard]] bool has_row_filter() const noexcept override
+  {
+    return _filter_expression != nullptr;
+  }
 
  private:
-  /// Wrap a batch of row groups into a @c scan_operator_input
-  /// (@c duckdb_native_split_info plus optional filter/projection info).
-  std::unique_ptr<op::operator_data> make_batch(std::vector<duckdb_row_group_metadata> row_groups);
-
-  // ---- Walk plan + range claiming (producer side) ----
+  std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> _info;
   duckdb_native_walk_plan _plan;
-  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
-  std::shared_ptr<sirius::io::sirius_io_object> _db_io_object;
-  /// Pre-built coalesced filter expression. Empty when no translatable
-  /// filters survived. Reused across every emitted split.
   std::shared_ptr<duckdb::Expression> _filter_expression;
-  bool _projection_required = false;
-  std::size_t _output_arity = 0;
+  duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 
-  /// Row groups claimed per range (tunable via SIRIUS_METADATA_PARSE_CHUNK).
-  std::size_t _chunk_row_groups = 1;
-  std::size_t _num_ranges       = 0;
+  //===----------RG Range Slicing----------===//
+  std::size_t _chunk_row_groups =
+    1;  ///< The number of row groups to chunk together for each metadata scan task.
+  std::size_t _num_ranges = 0;
   std::atomic<std::size_t> _next_range_idx{0};
-
-  // ---- Consumer-side coalescer ----
-  std::unique_ptr<batch_coalescer> _coalescer;
 };
+
+std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(
+  std::unique_ptr<duckdb_native_ingestible_table_info> info);
 
 }  // namespace sirius::op::scan

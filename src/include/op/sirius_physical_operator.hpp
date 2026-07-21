@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "config.hpp"
 #include "duckdb/common/common.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
@@ -26,17 +27,24 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 
+#include <array>
 #include <atomic>
 #include <list>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace sirius {
 
+namespace telemetry {
+struct batch_telemetry_info;
+}  // namespace telemetry
+
 namespace op {
 class sirius_physical_operator;
+class sirius_physical_delim_join;
 }  // namespace op
 
 namespace pipeline {
@@ -44,9 +52,25 @@ class sirius_pipeline;
 class sirius_pipeline_build_state;
 class sirius_meta_pipeline;
 }  // namespace pipeline
+namespace planner {
+class sirius_physical_plan_generator;
+}  // namespace planner
 namespace op {
 
 enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
+/**
+ * @brief Display name of a memory tier for telemetry attributes.
+ */
+[[nodiscard]] constexpr const char* tier_display_name(::cucascade::memory::Tier tier)
+{
+  switch (tier) {
+    case ::cucascade::memory::Tier::GPU: return "GPU";
+    case ::cucascade::memory::Tier::HOST: return "HOST";
+    case ::cucascade::memory::Tier::DISK: return "DISK";
+    default: return "UNKNOWN";
+  }
+}
 
 enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 
@@ -67,6 +91,7 @@ enum class operator_data_type : uint8_t {
   PIPELINEABLE,
   PARTITIONED,
   GPU_SCAN,
+  GPU_VALUES,
 };
 
 /**
@@ -147,6 +172,26 @@ class operator_data {
    * represent GPU-resident data should override to return a meaningful estimate.
    */
   [[nodiscard]] virtual std::size_t get_estimated_size_in_bytes() const { return 0; }
+
+  /**
+   * @brief Summarize where this data currently lives, for telemetry.
+   *
+   * Returns a '+'-joined set of memory tiers in tier order (e.g. "GPU+HOST"),
+   * "SOURCE" for fresh reads from a datasource, or "UNKNOWN" when the subclass
+   * cannot tell (the default).
+   */
+  [[nodiscard]] virtual std::string get_origin_tiers() const { return "UNKNOWN"; }
+
+  /**
+   * @brief Estimate the transient working set needed to materialize this data.
+   *
+   * Defaults to the data size. Inputs that materialize additional transient
+   * data can override this without changing the execution-history basis.
+   */
+  [[nodiscard]] virtual std::size_t get_estimated_working_set_size_in_bytes() const
+  {
+    return get_estimated_size_in_bytes();
+  }
 
   /**
    * @brief Record the GPU this data should be processed on.
@@ -249,6 +294,23 @@ class pipelineable_operator_data : public operator_data {
     return total;
   }
 
+  [[nodiscard]] std::string get_origin_tiers() const override
+  {
+    std::array<bool, static_cast<std::size_t>(::cucascade::memory::Tier::SIZE)> present{};
+    for (auto const& ro : get_read_only_batches(false)) {
+      if (!ro.get_data()) { continue; }
+      auto tier = static_cast<std::size_t>(ro.get_current_tier());
+      if (tier < present.size()) { present[tier] = true; }
+    }
+    std::string result;
+    for (std::size_t i = 0; i < present.size(); ++i) {
+      if (!present[i]) { continue; }
+      if (!result.empty()) { result += '+'; }
+      result += tier_display_name(static_cast<::cucascade::memory::Tier>(i));
+    }
+    return result.empty() ? "UNKNOWN" : result;
+  }
+
  private:
   mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
   mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
@@ -300,6 +362,9 @@ struct input_stats {
   /// captured at stats-build time. Used by sirius_gpu_scan_operator's memory
   /// estimate to skip the decode-expansion factor on already-resident inputs.
   bool resident = false;
+  /// Transient working set needed to materialize the input. Defaults to zero
+  /// for callers that only provide the historical byte basis.
+  std::size_t working_set_bytes = 0;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
@@ -323,8 +388,10 @@ class sirius_physical_operator {
   sirius_physical_operator() : operator_id(next_operator_id++) {}
   virtual ~sirius_physical_operator() {}
 
-  //! The physical operator type
-  SiriusPhysicalOperatorType type;
+  //! The physical operator type. Default-initialized to INVALID for the test-only default
+  //! ctor — type-dispatch sites (e.g. the wiring materializer's delim-join routing) read it
+  //! on default-constructed operators, so it must not be indeterminate.
+  SiriusPhysicalOperatorType type = SiriusPhysicalOperatorType::INVALID;
   //! The set of children of the operator (operators that feed data _into_ the current operator)
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
@@ -353,6 +420,28 @@ class sirius_physical_operator {
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }
+
+  //! Bundle this operator's telemetry attribution (context + producing pipeline)
+  //! for passing to the data_batch factories. Returns {nullptr, nil-UUID} if this
+  //! operator has no pipeline set.
+  [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
+
+  //! This operator's parent in the physical plan tree, or nullptr at the root. Stamped by
+  //! `sirius_physical_plan_generator::set_parent_ops` after plan generation completes.
+  [[nodiscard]] sirius_physical_operator* get_parent_op() const noexcept { return _parent_op; }
+
+  //! Non-owning pointer to the DELIM_JOIN that owns this operator's execution (nullptr if
+  //! none). Set on the distinct chain top by `wrap_delim_distinct`; the tree-based wiring
+  //! uses it to route the merge-top into each delim_scan's consumer pipeline.
+  [[nodiscard]] sirius_physical_delim_join* owning_delim_join() const noexcept
+  {
+    return _owning_delim_join;
+  }
+  //! Set by `wrap_delim_distinct` at plan-gen time; not intended to be mutated post-plan-gen.
+  void set_owning_delim_join(sirius_physical_delim_join* delim) noexcept
+  {
+    _owning_delim_join = delim;
+  }
 
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 
@@ -405,7 +494,16 @@ class sirius_physical_operator {
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
-  virtual bool is_sink() const { return false; }
+  //! An operator is a pipeline sink iff its tree parent is a PARTITION or
+  //! RIGHT_DELIM_JOIN — computed from `_parent_op` so it always reflects the final tree.
+  //! Unconditional sinks (HGB, ORDER_BY, MERGE ops, scans) override to `true`; the
+  //! `delim.join` of a RIGHT_DELIM_JOIN overrides to `false`.
+  virtual bool is_sink() const
+  {
+    return _parent_op != nullptr &&
+           (_parent_op->type == SiriusPhysicalOperatorType::PARTITION ||
+            _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+  }
 
   //! Whether or not the sink operator depends on the order of the input chunks
   //! If this is set to true, we cannot do things like caching intermediate vectors
@@ -534,7 +632,7 @@ class sirius_physical_operator {
   //! Get pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
 
-  void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
+  virtual void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
  protected:
   duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;
@@ -546,6 +644,17 @@ class sirius_physical_operator {
   std::list<std::unique_ptr<port>> _ports_list;
   //! The next operators to be executed after this operator when it is used as a sink
   std::vector<sirius_physical_operator::next_port_info> next_port_after_sink;
+  //! The parent of this operator in the plan tree; nullptr at the root or before linking.
+  //! Set only by the plan generator via the private `set_parent_op()` (friend access).
+  sirius_physical_operator* _parent_op = nullptr;
+  //! The DELIM_JOIN that logically owns this operator, or nullptr. See `owning_delim_join()`.
+  sirius_physical_delim_join* _owning_delim_join = nullptr;
+
+ private:
+  //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
+  void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
+
+  friend class ::sirius::planner::sirius_physical_plan_generator;
 };
 
 }  // namespace op

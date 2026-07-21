@@ -98,20 +98,17 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     return _input_data ? _input_data->get_estimated_size_in_bytes() : 0;
   }
 
-  [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input() const
-  {
-    std::size_t input_size = 0;
-    auto* pipelineable_input =
-      dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
-    if (pipelineable_input) {
-      for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
-        if (ro.get_data() && ro.get_current_tier() != cucascade::memory::Tier::GPU) {
-          input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
-        }
-      }
-    }
-    return input_size;
-  }
+  /**
+   * @brief Estimate the bytes prepare_for_processing will allocate in the target space.
+   *
+   * Counts inputs that are not GPU-resident (host/disk upgrades) and, when @p target_space is
+   * given, GPU-resident inputs living in a different memory space — those are cloned into the
+   * target space by lock_or_prepare_batch, so their bytes are part of the task's footprint.
+   * Resident scan inputs cached in HOST are also counted, since they require an upload before
+   * execution.
+   */
+  [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input(
+    const cucascade::memory::memory_space* target_space) const;
 
  private:
   std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality
@@ -202,8 +199,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   std::size_t get_input_size() const;
 
-  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info()
-    const override;
+  [[nodiscard]] pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* target_space) const override;
 
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
@@ -245,8 +242,11 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
  private:
   std::vector<cucascade::shared_data_repository*> _data_repos;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
-  /// Input data_batches held for subscribe/unsubscribe lifecycle
-  std::vector<std::shared_ptr<cucascade::data_batch>> _input_batches;
+  /// Non-owning subscription ledger: the input data_batches this task subscribed to in its
+  /// constructor so that the downgrade_executor can know that the data_baches are in a task.
+  /// weak_ptr so that memory can be released as soon as the last owner drops.
+  /// This is used in the destructor to unsubscribe.
+  std::vector<std::weak_ptr<cucascade::data_batch>> _subscribed_batches;
 };
 
 }  // namespace pipeline

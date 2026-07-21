@@ -23,15 +23,17 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    env:
+      # CPU runner: no GPU/driver, so pixi can't detect `__cuda` to match the
+      # CUDA-pinned platform. Assert it so the (cuda13) environment resolves.
+      CONDA_OVERRIDE_CUDA: "13"
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           cache: false
-          pixi-version: v0.70.2
+          pixi-version: v0.71.1
           global-environments: |
             pre-commit
 
@@ -41,6 +43,10 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
+      # CPU build runners have no GPU/driver; assert `__cuda` so the CUDA-pinned
+      # platform resolves. All environments built here (default, vcpkg,
+      # nightly-runner) target CUDA 13.
+      CONDA_OVERRIDE_CUDA: "13"
     strategy:
       matrix:
         build:
@@ -49,56 +55,43 @@ jobs:
             build-type: release
             environment: default
             cudf-channel: stable
-            variant: super
             run-on-pr: true
           - arch: x64
             compiler: clang
             build-type: debug
             environment: default
             cudf-channel: stable
-            variant: super
             run-on-pr: true
           - arch: arm64
             compiler: gcc
             build-type: release
             environment: default
             cudf-channel: stable
-            variant: super
             run-on-pr: false
           - arch: arm64
             compiler: clang
             build-type: debug
             environment: default
             cudf-channel: stable
-            variant: super
             run-on-pr: false
           - arch: x64
             compiler: gcc
             build-type: release
             environment: vcpkg
             cudf-channel: stable
-            variant: super
             run-on-pr: false
           - arch: arm64
             compiler: gcc
             build-type: release
             environment: default
             cudf-channel: nightly
-            variant: super
-            run-on-pr: false
-          - arch: x64
-            compiler: gcc
-            build-type: release
-            environment: default
-            cudf-channel: stable
-            variant: legacy
             run-on-pr: false
         exclude:
           # On PRs, drop rows marked merge/dev-only; on merge_group/dev, match nothing.
           - build:
               run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
       fail-fast: false
-    name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }}, ${{ matrix.build.variant }})
+    name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }})
     runs-on: >-
       ${{ matrix.build.environment == 'vcpkg'
         && fromJSON('["self-hosted", "ubuntu-24.04", "cpu-xl"]')
@@ -109,18 +102,23 @@ jobs:
     timeout-minutes: ${{ case(matrix.build.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.build.cudf-channel == 'nightly' }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Unshallow vcpkg for version overrides
+      - name: Init build submodules
+        run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+
+      - name: Init vcpkg with full history for version overrides
         if: matrix.build.environment == 'vcpkg'
-        run: git -C vcpkg rev-parse --is-shallow-repository | grep -q true && git -C vcpkg fetch --unshallow || true
+        run: |
+          git submodule update --init vcpkg
+          if [[ "$(git -C vcpkg rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -C vcpkg fetch --unshallow
+          fi
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           cache: false
-          pixi-version: v0.70.2
+          pixi-version: v0.71.1
           activate-environment: ${{ matrix.build.environment != 'vcpkg' && matrix.build.cudf-channel != 'nightly' }}
           environments: >-
             ${{ matrix.build.cudf-channel == 'nightly' && 'nightly-runner'
@@ -141,7 +139,7 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
-      - run: ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ matrix.build.variant == 'legacy' && format('legacy-{0}', matrix.build.build-type) || case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc)
+      - run: ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc)
         if: matrix.build.environment != 'vcpkg'
         env:
           CUDAARCHS: "100"
@@ -157,7 +155,7 @@ jobs:
         if: >-
           matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
           && matrix.build.build-type == 'release' && matrix.build.environment == 'default'
-          && matrix.build.cudf-channel == 'stable' && matrix.build.variant == 'super'
+          && matrix.build.cudf-channel == 'stable'
         run: |
           set -euo pipefail
           pixi run cargo fmt --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --check

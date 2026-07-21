@@ -51,6 +51,7 @@ Options:
 - `--config <path>` — Sirius config file (default: `~/.sirius/sirius.yaml`)
 - `--parquet-dir <path>` — parquet dataset directory (default: `test_datasets/tpch_parquet_sf<SF>`)
 - `--engines <list>` — space-separated engine list (default: `"sirius duckdb"`)
+- `--pinning-mode none|per-query|pinned-hot` — Sirius-only parquet pinning mode. `per-query` pins each query's referenced columns around that query block; `pinned-hot` pins the union of referenced columns once before the single-session run and unpins after all queries.
 
 Each run creates a directory under `runs/<timestamp>_sf<SF>_2iter/` containing:
 - `run_info.txt` — git branch/revision, tree clean/dirty, build freshness, hostname, memory, CPUs, GPUs, filesystem read benchmark
@@ -78,12 +79,95 @@ SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
 # Run specific queries with custom parquet directory
 SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
   ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
+
+# Run Sirius with union-pinned hot cache across the query stream
+SIRIUS_CONFIG_FILE=~/.sirius/sirius.yaml \
+  ./test/tpch_performance/run_tpch_parquet.sh --pinning-mode pinned-hot --iterations 5 sirius 100 $(seq 1 22)
 ```
 
 Environment variables:
 - `SIRIUS_CONFIG_FILE` — path to Sirius config (required for sirius engine; unset automatically for duckdb engine)
 - `TIMING_CSV` — path to write per-query timing CSV (optional)
 - `OUTPUT_DIR` — directory for structured output (set by `benchmark_and_validate.sh`)
+
+### Generating telemetry
+
+Telemetry is controlled by the Sirius YAML config used for the run. Enable Quent
+export and choose the output directory:
+
+```yaml
+sirius:
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data
+    engine_name: siriusDB
+```
+
+`run_tpch_parquet_and_generate_telemetry.sh` runs TPC-H queries in Sirius,
+labels each `(query, iteration)` pair with `sirius_set_query_label`, and writes
+Quent ndjson files to `sirius.telemetry.output_directory`.
+
+```bash
+pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+  --iterations 1 \
+  --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
+  100
+```
+
+The final `100` is the TPC-H scale factor. If no query numbers are provided,
+all 22 queries are run; append query numbers to limit the run, for example
+`100 1 6 9`.
+
+The script uses `test/tpch_performance/tpch_telemetry_sirius.yaml` by default.
+That config only enables telemetry, so pass `--config <path>` when the workload
+also needs custom memory, executor, scan-cache, or operator settings:
+
+```bash
+pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
+  --config ~/.sirius/sirius.yaml \
+  --iterations 1 \
+  --parquet-dir /data/tpch/sf100/p16/zstd-8/ \
+  100 1 6 9
+```
+
+The custom config is used as-is, so it must include
+`sirius.telemetry.enable_quent: true`.
+
+Query labels are optional but make the Quent UI easier to navigate. They can be
+set in either of two ways:
+
+```sql
+-- Applies to the next Sirius query, including transparent plain-SQL execution.
+CALL sirius_set_query_label('tpch_q1_iter1');
+SELECT *
+FROM lineitem
+WHERE l_orderkey < 100;
+
+-- Inline label for an explicit gpu_execution call.
+CALL gpu_execution(
+  'SELECT * FROM lineitem WHERE l_orderkey < 100',
+  query_label = 'tpch_q1_iter1'
+);
+```
+
+The telemetry helper script uses `sirius_set_query_label` so plain SQL queries
+keep the same execution path as the normal TPC-H runner.
+
+Start the Quent analyzer server over the telemetry directory:
+
+```bash
+pixi run quent
+```
+
+The `quent` Pixi task defaults to `telemetry_data` and runs the telemetry server
+with the UI enabled. If the config writes telemetry somewhere else, pass that
+path as the task argument:
+
+```bash
+pixi run quent /path/to/telemetry_data
+```
+
+Open `http://localhost:8080` and select the captured Sirius engine/query.
 
 ## Query Files
 
@@ -95,23 +179,9 @@ The Sirius config file (e.g. `~/.sirius/sirius.yaml`) controls:
 - **GPU memory**: `usage_limit_fraction`, `reservation_limit_fraction`, `downgrade_trigger_fraction`, `downgrade_stop_fraction`
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
-- **Thread pools**: `pipeline`, `duckdb_scan`, `task_creator`, `downgrade` thread counts
-- **Scan cache**: `duckdb_scan.cache` (values: `"none"`, `"parquet"`, `"table_gpu"`, `"table_host"`)
+- **Thread pools**: `pipeline`, `task_creator`, `downgrade` thread counts
 - **Operator params**: `scan_task_batch_size`, `hash_partition_bytes`, `concat_batch_bytes`
 - **Telemetry**: `telemetry.enable_quent`, `telemetry.output_directory`, `telemetry.engine_name`
-
-`run_tpch_parquet_and_generate_telemetry.sh` uses
-`test/tpch_performance/tpch_telemetry_sirius.yaml` by default. Pass
-`--config <path>` to use a full custom Sirius config for telemetry runs:
-
-```bash
-./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
-  --config ~/.sirius/sirius.yaml \
-  100 1 6 9
-```
-
-Custom configs are used as-is and must enable telemetry, for example
-`sirius.telemetry.enable_quent: true`.
 
 ### Example config (GB300, SF1000)
 
@@ -135,14 +205,10 @@ sirius:
       num_threads: 4
     downgrade:
       num_threads: 1
-    duckdb_scan:
-      num_threads: 4
-      cache: "parquet"
     task_creator:
       num_threads: 6
   operator_params:
     scan_task_batch_size: 5368709120       # 5 GB
-    default_scan_task_varchar_size: 256
     max_sort_partition_bytes: 0            # 0 = auto (33% GPU memory)
     hash_partition_bytes: 5368709120       # 5 GB
     concat_batch_bytes: 5368709120         # 5 GB

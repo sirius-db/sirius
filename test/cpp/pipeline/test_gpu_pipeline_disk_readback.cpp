@@ -25,10 +25,10 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <filesystem>
@@ -100,7 +100,8 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
 
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
-  return sirius::make_data_batch(std::move(table), gpu_space, stream);
+  return sirius::make_data_batch(
+    std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 }
 
 }  // namespace

@@ -3,6 +3,8 @@
 #include <cudf/io/text/byte_range_info.hpp>
 
 #include <algorithm>
+#include <cassert>
+#include <cstring>
 #include <span>
 #include <vector>
 

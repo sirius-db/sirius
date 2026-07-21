@@ -24,8 +24,13 @@
 
 #include <memory>
 #include <optional>
+#include <utility>
 
 namespace sirius {
+namespace telemetry {
+class telemetry_context;
+}  // namespace telemetry
+
 namespace pipeline {
 
 /**
@@ -35,8 +40,10 @@ namespace pipeline {
  * set_reservation() so that execute() can access all components without re-computing.
  */
 struct reservation_size_info {
-  std::size_t input_basis                = 0;  ///< Estimation basis (e.g. input data size)
-  std::size_t bytes_to_materialize_input = 0;  ///< Cost to bring non-GPU input to GPU; 0 for scans
+  std::size_t input_basis = 0;  ///< Estimation basis (e.g. input data size)
+  std::size_t bytes_to_materialize_input =
+    0;  ///< Cost to materialize input into the task's target space (host/disk upgrades plus
+        ///< cross-GPU clones); 0 for scans
   std::size_t peak_memory_estimate = 0;  ///< Predicted operator peak; 2*input_basis if no history
   std::size_t reservation_size     = 0;  ///< peak_memory_estimate + bytes_to_materialize_input
   bool had_history                 = false;  ///< True if estimate came from pipeline_memory_history
@@ -56,9 +63,12 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
    * @brief Construct a new sirius_pipeline_task_global_state object
    *
    * @param pipeline Shared pointer to the GPU pipeline to execute
+   * @param telemetry_context SiriusContext-wide telemetry context for task events
    */
-  explicit sirius_pipeline_task_global_state(duckdb::shared_ptr<sirius_pipeline> pipeline)
-    : _pipeline(std::move(pipeline))
+  explicit sirius_pipeline_task_global_state(
+    duckdb::shared_ptr<sirius_pipeline> pipeline,
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+    : _pipeline(std::move(pipeline)), _telemetry_context(std::move(telemetry_context))
   {
   }
 
@@ -74,6 +84,11 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   void set_pipeline(duckdb::shared_ptr<sirius_pipeline> pipeline)
   {
     _pipeline = std::move(pipeline);
+  }
+
+  [[nodiscard]] const telemetry::telemetry_context& get_telemetry_context() const noexcept
+  {
+    return *_telemetry_context;
   }
 
   /**
@@ -106,6 +121,8 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
   pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
   std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
+  std::shared_ptr<const telemetry::telemetry_context>
+    _telemetry_context;  ///< SiriusContext telemetry
 };
 
 /**

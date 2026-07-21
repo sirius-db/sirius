@@ -26,6 +26,8 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 
+#include <atomic>
+#include <memory>
 #include <thread>
 
 namespace sirius::op {
@@ -36,6 +38,10 @@ namespace sirius::parallel {
 class downgrade_executor;
 }  // namespace sirius::parallel
 
+namespace sirius::telemetry {
+class telemetry_context;
+}  // namespace sirius::telemetry
+
 namespace sirius {
 
 namespace creator {
@@ -43,6 +49,10 @@ class task_creator;
 }
 
 namespace pipeline {
+
+struct executor_metrics {
+  size_t tasks_executed{0};
+};
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
@@ -67,7 +77,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     exec::thread_pool_config config,
     cucascade::memory::memory_space* mem_space,
     exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
-    sirius::parallel::downgrade_executor* downgrade_executor = nullptr);
+    sirius::parallel::downgrade_executor* downgrade_executor,
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -85,7 +96,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    *
    * @param task_creator Pointer to the task creator
    */
-  void set_task_creator(sirius::creator::task_creator* task_creator);
+  void set_task_creator(creator::task_creator* task_creator);
 
   /**
    * @brief Check if the internal task queue is empty.
@@ -96,6 +107,11 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    * @return true if the task queue contains no pending tasks.
    */
   [[nodiscard]] bool is_task_queue_empty() const noexcept;
+
+  /**
+   * @brief Return a snapshot of this executor's runtime metrics.
+   */
+  [[nodiscard]] executor_metrics get_metrics() const noexcept;
 
   /**
    * @brief Set the completion handler for query completion signaling
@@ -125,6 +141,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
+  std::atomic<size_t> _tasks_executed{0};
 };
 
 }  // namespace pipeline

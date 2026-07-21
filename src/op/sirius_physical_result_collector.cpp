@@ -18,6 +18,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <config.hpp>
+#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
@@ -27,7 +29,7 @@
 #include <sirius_interface.hpp>
 
 // cucascade
-#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -57,6 +59,9 @@ sirius_physical_result_collector::sirius_physical_result_collector(
     names(data.prepared->names)
 {
   this->types = sirius::from_duckdb_vec(data.prepared->types);
+  // Full DuckDB types incl. nested children — sirius::logical_type cannot
+  // represent them.
+  this->result_column_types = data.prepared->types;
 }
 
 std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
@@ -79,9 +84,11 @@ void sirius_physical_result_collector::build_pipelines(
   // operator is a sink, build a pipeline
   D_ASSERT(children.empty());
 
-  // single operator: the operator becomes the data source of the current pipeline
+  // RESULT_COLLECTOR is both the root of `current` (appended here, operators[0]
+  // post-reverse) and the sink of its own child_meta (pre-populated by
+  // create_child_meta_pipeline).
   auto& state = meta_pipeline.get_state();
-  state.set_pipeline_source(current, *this);
+  state.add_pipeline_operator(current, *this);
 
   // we create a new pipeline starting from the child
   auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -91,9 +98,9 @@ void sirius_physical_result_collector::build_pipelines(
 sirius_physical_materialized_collector::sirius_physical_materialized_collector(
   ::sirius::sirius_prepared_statement_data& data, duckdb::ClientContext& client_ctx)
   : sirius_physical_result_collector(data),
-    _client_ctx(client_ctx),
     result_collection(
-      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, sirius::to_duckdb_vec(types)))
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, result_column_types)),
+    _client_ctx(client_ctx)
 {
 }
 
@@ -105,7 +112,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
   // Return an empty result collection if the result_collection is null (from a move)
   if (!result_collection) {
     result_collection =
-      duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, sirius::to_duckdb_vec(types));
+      duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
   }
 
   return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
@@ -141,23 +148,50 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       // Use clone_to to clone directly into HOST representation
       auto sirius_ctx  = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       auto& memory_mgr = sirius_ctx->get_memory_manager();
-      /// TODO: Find the closest memory space, not just any memory space, in HOST tier
-      auto reservation = memory_mgr.request_reservation(
-        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
-        data->get_size_in_bytes());
-      if (!reservation) {
+
+      auto host_spaces = memory_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      if (host_spaces.empty()) {
         throw internal_exception(
-          "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
+          "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
+          "collection");
       }
+      // Pick the host space with the most available memory.
+      /// TODO: prefer the NUMA-closest host space to the source GPU for locality.
+      auto const* mem_space =
+        *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto const* a, auto const* b) {
+          return a->get_available_memory() < b->get_available_memory();
+        });
 
       auto& registry      = sirius::converter_registry::get();
-      auto& mem_space     = reservation->get_memory_space();
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
 
+      auto host_reservation =
+        const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(
+          data->get_size_in_bytes());
+
       // clone_to: creates new batch with data converted to host_data_representation
-      auto result_batch = ro.clone_to<cucascade::host_data_representation>(
-        registry, next_batch_id, &mem_space, stream);
+      if (host_reservation == nullptr) {
+        SIRIUS_LOG_WARN(
+          "sirius_physical_materialized_collector: host reservation failed for batch {} ({} "
+          "bytes) — proceeding without reservation, converter may OOM",
+          ro.get_batch_id(),
+          data->get_size_in_bytes());
+      }
+      auto result_batch =
+        host_reservation != nullptr
+          ? ro.clone_to<cucascade::host_data_representation>(
+              registry,
+              next_batch_id,
+              *host_reservation,
+              stream,
+              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id))
+          : ro.clone_to<cucascade::host_data_representation>(
+              registry,
+              next_batch_id,
+              mem_space,
+              stream,
+              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.
@@ -170,7 +204,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }
     // Data already in HOST tier -- read directly through the read_only accessor
-    assert(dynamic_cast<cucascade::host_data_representation*>(data) != nullptr);
+    assert(dynamic_cast<const cucascade::host_data_representation*>(data) != nullptr);
 
     using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
     auto const& host_table        = data->cast<cucascade::host_data_representation>();
@@ -187,7 +221,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] host_table allocation is null (cannot read chunks)");
     }
 
-    host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);
+    host_table_chunk_reader chunk_reader(_client_ctx, host_table, result_column_types);
 
     // Push chunks to result collection
     while (true) {
@@ -202,8 +236,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       std::lock_guard<std::mutex> guard(lock);
       // Initialize result collection if it is null (from a move)
       if (!result_collection) {
-        result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(
-          _client_ctx, sirius::to_duckdb_vec(types));
+        result_collection =
+          duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
       }
       result_collection->Append(chunk);
     }

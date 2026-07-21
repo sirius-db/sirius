@@ -16,6 +16,7 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
+#include "planner/duckdb_join_filter_candidate_adapter.hpp"
 #include "sirius_context.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
@@ -23,6 +24,9 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
 #include <log/logging.hpp>
+
+#include <exception>
+#include <utility>
 
 namespace sirius::transparent {
 
@@ -36,6 +40,14 @@ bool gpu_execution_enabled(const duckdb::ClientContext& context)
 }
 
 }  // namespace
+
+duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
+                                                              duckdb::ClientContext& context)
+{
+  auto copy = plan.Copy(context);
+  planner::duckdb_join_filter_candidate_adapter::preserve_dynamic_filter_metadata(plan, *copy);
+  return copy;
+}
 
 void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
@@ -53,10 +65,9 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // plan shapes or source operators the rebind path cannot yet execute.
   disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
   disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-  // STATISTICS_PROPAGATION folds ungrouped MIN/MAX aggregates into constant
-  // expressions using partition statistics, producing EXPRESSION_GET + DUMMY_SCAN.
-  // Transparent execution still falls back on those COLUMN_DATA_SCAN sources.
-  disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
+  // Keep STATISTICS_PROPAGATION enabled. Its constant-folded
+  // EXPRESSION_GET/COLUMN_DATA_SCAN and DUMMY_SCAN sources are handled by
+  // GPU_VALUES. If the user disabled it explicitly, it remains in `disabled`.
   // LATE_MATERIALIZATION rewrites `ORDER BY ... LIMIT N` over a scan into a
   // self-RIGHT_SEMI_JOIN keyed on the parquet virtual columns `file_index` /
   // `file_row_number` (TOP_N picks the N rows, the semi-join re-fetches them
@@ -89,12 +100,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // copy — that's the single source of truth for GPU support. If the plan contains
   // unsupported operators, create_plan() throws and we fall back to CPU.
   try {
-    auto plan_copy = plan->Copy(context);
-    ctx->set_captured_logical_plan(std::move(plan_copy));
+    ctx->set_captured_logical_plan(copy_logical_plan(*plan, context));
   } catch (duckdb::NotImplementedException&) {
     // Plan not serializable — skip GPU.
   } catch (std::exception& e) {
-    spdlog::debug("Transparent execution: failed to copy logical plan: {}", e.what());
+    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}", e.what());
   }
 }
 

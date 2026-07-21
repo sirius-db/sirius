@@ -14,7 +14,6 @@ test/cpp/integration/test_transparent_execution.cpp
 test/cpp/memory/test_host_table_utils.cpp
 test/cpp/pipeline/test_plan_printer.cpp
 test/cpp/scan/test_column_builder.cpp
-test/cpp/scan/test_scan_executor.cpp
 
 # -- Pre-existing orphans (out of the build since before the guard existed;
 #    dates are the last commit that touched each file).
