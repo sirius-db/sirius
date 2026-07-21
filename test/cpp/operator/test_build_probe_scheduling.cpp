@@ -300,7 +300,10 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK single-GPU clamps to one 
   REQUIRE_FALSE(small.broadcast);
   REQUIRE(small.build_probe);
 
-  // A large MARK build is still clamped to one partition, but is too big for the cap -> STANDARD.
+  // A large MARK build stays clamped to one partition and is still forced into BUILD_PROBE even
+  // though it is over the per-GPU hash-table cap: MARK must never fall back to a hash-partitioned
+  // STANDARD join (that would split build rows and corrupt build_has_null). Capacity pressure is
+  // handled by the downgrade/spill path, not by a mode switch.
   auto const large = strategy(8 * k100MB,
                               true,
                               true,
@@ -309,7 +312,8 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK single-GPU clamps to one 
                               HASH_JOIN_MODE::STANDARD,
                               /*hash_partition_bytes=*/k100MB);
   REQUIRE(large.num_partitions == 1);
-  REQUIRE_FALSE(large.build_probe);
+  REQUIRE_FALSE(large.broadcast);
+  REQUIRE(large.build_probe);
 }
 
 TEST_CASE("compute_hash_join_partition_strategy - MARK multi-GPU forces broadcast",
@@ -321,8 +325,9 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK multi-GPU forces broadcas
   REQUIRE(s.broadcast);
   REQUIRE(s.build_probe);
 
-  // A MARK build too large for the (full-size) broadcast cap cannot broadcast and falls back to the
-  // natural hash-partitioned count in STANDARD mode.
+  // A MARK build that is over the per-GPU / broadcast cap still forces broadcast BUILD_PROBE on
+  // multi-GPU: MARK must never hash-partition its build (that would corrupt build_has_null), so it
+  // broadcasts the full build to every GPU regardless of size and relies on downgrade for capacity.
   auto const big = strategy(6 * k100MB,
                             true,
                             true,
@@ -330,9 +335,9 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK multi-GPU forces broadcas
                             duckdb::JoinType::MARK,
                             HASH_JOIN_MODE::STANDARD,
                             /*hash_partition_bytes=*/k100MB);
-  REQUIRE(big.num_partitions == 6);
-  REQUIRE_FALSE(big.broadcast);
-  REQUIRE_FALSE(big.build_probe);
+  REQUIRE(big.num_partitions == 4);
+  REQUIRE(big.broadcast);
+  REQUIRE(big.build_probe);
 }
 
 TEST_CASE("compute_hash_join_partition_strategy - mixed / full-outer / unfoldable stay STANDARD",

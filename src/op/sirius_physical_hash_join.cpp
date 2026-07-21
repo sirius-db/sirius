@@ -566,11 +566,6 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   if (is_mark) { build_probe = true; }
 
   bool const broadcast = broadcast_candidate && build_probe;
-  if (broadcast && !build_probe) {
-    throw std::runtime_error(
-      "sirius_physical_hash_join: a broadcast join must run in BUILD_PROBE mode (broadcast implies "
-      "build_probe)");
-  }
 
   // MARK single-GPU is clamped to one partition regardless of the natural count; every other case
   // takes num_gpus when broadcasting and the natural count otherwise.
