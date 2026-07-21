@@ -351,6 +351,13 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   // Mixed join: has at least one equality condition (for hashing) and at least one inequality
   // condition (for the binary predicate).
   if (!is_all_inequality_join && (num_equality_conditions < conditions.size())) {
+    // A MARK join must run in BUILD_PROBE mode (it needs the full build resident for build_has_null
+    // and per-row marks)
+    if (join_type == duckdb::JoinType::MARK) {
+      throw std::runtime_error(
+        "sirius_physical_hash_join: MARK join with mixed (equality + inequality) conditions is not "
+        "supported");
+    }
     _join_mode = HASH_JOIN_MODE::MIXED_JOIN;
   }
 };
@@ -551,14 +558,20 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                   !is_right_family && !is_mixed && !is_full_outer;
   }
 
-  // Multi-GPU MARK must never hash-partition its build side: build_has_null has to be globally
-  // consistent, which only holds when every GPU sees the whole build. So a multi-GPU MARK join is
-  // forced to broadcast (build replicated to every GPU) even when it is not BUILD_PROBE-eligible —
-  // otherwise a large/non-foldable/mixed build would fall through to the `natural` hash-partitioned
-  // count below and split build rows across GPUs, corrupting the per-GPU null flag. Every other
-  // join broadcasts only when it is also build-probe.
-  bool const force_mark_broadcast = is_mark && num_gpus > 1;
-  bool const broadcast            = force_mark_broadcast || (broadcast_candidate && build_probe);
+  // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
+  // compute the global build_has_null sentinel and the per-probe-row marks, and on multi-GPU it is
+  // always broadcast (build replicated to every GPU). Force BUILD_PROBE on even when the build
+  // exceeds the hash-table budget. MARK is never right-family/full-outer, and MARK + MIXED is
+  // rejected at construction.
+  if (is_mark) { build_probe = true; }
+
+  bool const broadcast = broadcast_candidate && build_probe;
+  if (broadcast && !build_probe) {
+    throw std::runtime_error(
+      "sirius_physical_hash_join: a broadcast join must run in BUILD_PROBE mode (broadcast implies "
+      "build_probe)");
+  }
+
   // MARK single-GPU is clamped to one partition regardless of the natural count; every other case
   // takes num_gpus when broadcasting and the natural count otherwise.
   int const num_partitions = broadcast ? num_gpus : ((is_mark && num_gpus <= 1) ? 1 : natural);
@@ -655,7 +668,6 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   std::vector<build_probe_slot_view> slots(_partition_build_states.size());
   for (std::size_t p = 0; p < _partition_build_states.size(); ++p) {
     slots[p].state = _partition_build_states[p].build_state.load(std::memory_order_acquire);
-    // repo->size(p) safely returns 0 for partitions whose data has not been produced yet.
     slots[p].has_build_batch = build_port->repo->size(p) > 0;
     slots[p].has_probe_batch = probe_port->repo->size(p) > 0;
   }
@@ -1293,7 +1305,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           slot.filtered_table = make_right_filtered_join_ptr(build_keys, stream);
           // Record whether the build keys contain a NULL; MARK three-valued logic needs it at probe
           // time, but the build keys are not retained beyond this scope.
-          set_build_has_null(_build_has_null, table_has_any_null(build_keys));
+          if (join_type == duckdb::JoinType::MARK) {
+            set_build_has_null(_build_has_null, table_has_any_null(build_keys));
+          }
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
                            duckdb::JoinTypeToString(join_type));

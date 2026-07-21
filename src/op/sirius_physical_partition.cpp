@@ -365,12 +365,20 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   };
   // Once BUILD_PROBE is chosen, the build-side CONCAT must be told to fold all build batches into
   // one. Either sibling may run the decision first, so both configure the build-side CONCAT.
+  // Returns whether a build-side CONCAT was found, so the caller can enforce the BUILD_PROBE
+  // invariant: BUILD_PROBE needs exactly one folded build batch at runtime, which only a
+  // concat_all'd build-side CONCAT guarantees.
   auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
+    bool found = false;
     for (auto& next_port : part_op.get_next_ports_after_sink()) {
       if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
       auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
-      if (concat.is_build_concat()) { concat.set_concat_all(true); }
+      if (concat.is_build_concat()) {
+        concat.set_concat_all(true);
+        found = true;
+      }
     }
+    return found;
   };
 
   auto* consumer =
@@ -396,8 +404,17 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy = consumer->get_partition_strategy(in);
       if (strategy.build_probe) {
-        enable_build_concat_all(*this);
-        enable_build_concat_all(sibling);
+        // Configure both siblings' build-side CONCAT (do not short-circuit) and require that at
+        // least one build-side CONCAT exists — BUILD_PROBE cannot run without a concat_all'd build.
+        bool const found_this    = enable_build_concat_all(*this);
+        bool const found_sibling = enable_build_concat_all(sibling);
+        if (!found_this && !found_sibling) {
+          throw std::runtime_error("sirius_physical_partition id " +
+                                   std::to_string(this->get_operator_id()) +
+                                   ": BUILD_PROBE was selected but no build-side CONCAT was found "
+                                   "to fold the build into a "
+                                   "single batch (concat_all)");
+        }
       }
       _broadcast              = strategy.broadcast;
       sibling._broadcast      = strategy.broadcast;
