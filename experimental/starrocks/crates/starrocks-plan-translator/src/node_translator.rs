@@ -76,6 +76,15 @@ impl<'a> PlanContext<'a> {
     fn expr_context<'b>(&'b mut self, row_tuples: &'b [i32]) -> ExprContext<'b> {
         ExprContext::new(self.desc, self.registry, row_tuples)
     }
+
+    /// Creates an expression context with synthetic slot-to-column mappings.
+    fn expr_context_with_slots<'b>(
+        &'b mut self,
+        row_tuples: &'b [i32],
+        slot_overrides: &'b std::collections::HashMap<(i32, i32), usize>,
+    ) -> ExprContext<'b> {
+        ExprContext::with_slot_overrides(self.desc, self.registry, row_tuples, slot_overrides)
+    }
 }
 
 /// Trait implemented by StarRocks plan objects that can become Substrait relations.
@@ -1075,6 +1084,19 @@ fn translate_project_node(
         node.row_tuples.clone()
     };
 
+    let output_tuple = output_tuples[0];
+    let mut input = child;
+    let mut common_slots = std::collections::HashMap::new();
+    for (&slot_id, expr) in project_node.common_slot_map.as_ref().into_iter().flatten() {
+        let expression = {
+            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            expr.translate(&mut expr_ctx)?
+        };
+        let field = input.output_width;
+        input = append_project(input, expression);
+        common_slots.insert((output_tuple, slot_id), field);
+    }
+
     let mut expressions = Vec::new();
     for &tuple_id in &output_tuples {
         for slot_id in ctx.desc.materialized_slot_ids(tuple_id)? {
@@ -1084,12 +1106,12 @@ fn translate_project_node(
                     node.node_id, slot_id
                 ))
             })?;
-            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
             expressions.push(expr.translate(&mut expr_ctx)?);
         }
     }
 
-    Ok(project_rel(child, expressions, output_tuples))
+    Ok(project_rel(input, expressions, output_tuples))
 }
 
 /// Adds a root projection over explicit fragment output expressions.
