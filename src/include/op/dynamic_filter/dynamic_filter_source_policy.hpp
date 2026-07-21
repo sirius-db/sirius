@@ -85,16 +85,31 @@ struct membership_choice_inputs {
  * A build covering most of the key's domain keeps nearly every probe row, so the filter costs more
  * to build and apply than it saves.
  *
+ * The gate fires solely for keys proven unique in the build's base relation. For a proven-unique
+ * key, `build_rows` is the distinct-key count and the base table's rows are the key domain, so the
+ * ratio is true coverage; for a duplicate key the same ratio measures row retention, and a
+ * near-1.0 retention can coexist with a highly selective filter (900k build rows all carrying one
+ * key value must not suppress a one-value membership test).
+ *
+ * A threshold above 1.0 is the explicit disabled state -- the documented rollback lever: the gate
+ * returns false for every input, restoring publish-always behavior through an existing setting.
+ *
  * @param[in] build_rows Rows in the completed build
- * @param[in] domain_cardinality Unfiltered cardinality of the base table the key traces to; 0
+ * @param[in] domain_cardinality Unfiltered row upper bound of the base table the key traces to; 0
  * means untraceable and disables the gate
- * @param[in] threshold Fraction of the domain a build may cover and still publish
+ * @param[in] build_key_proven_unique Whether the key is proven unique in its base relation; false
+ * disables the gate
+ * @param[in] threshold Fraction of the domain a build may cover and still publish; above 1.0 the
+ * gate is disabled outright
  * @return True when the key should be skipped
  */
 [[nodiscard]] constexpr bool domain_coverage_gate_fires(std::size_t build_rows,
                                                         std::size_t domain_cardinality,
+                                                        bool build_key_proven_unique,
                                                         double threshold) noexcept
 {
+  if (threshold > 1.0) { return false; }
+  if (!build_key_proven_unique) { return false; }
   if (domain_cardinality == 0) { return false; }
   return static_cast<double>(build_rows) / static_cast<double>(domain_cardinality) >= threshold;
 }
@@ -104,9 +119,15 @@ struct membership_choice_inputs {
  *
  * A `[min, max]` bound spanning most of the key domain prunes no row group.
  *
+ * Inactive in production: its numerator is a value span, and the only domain evidence available is
+ * a row count -- dimensionally different units, and on sparse integer keys the span dwarfs the row
+ * count and the gate would over-fire in exactly the clustered-key case zone maps exist for. The
+ * publisher therefore passes a domain of 0 (which never fires) until base-column value-range
+ * evidence exists; the arithmetic stays here, tested, for that activation.
+ *
  * @param[in] min_value Lowest build key value
  * @param[in] max_value Highest build key value
- * @param[in] domain_cardinality Unfiltered cardinality of the key's domain; 0 disables the gate
+ * @param[in] domain_cardinality Unfiltered span of the key's domain; 0 disables the gate
  * @param[in] threshold Fraction of the domain the range may span and still publish
  * @return True when the zone map should be skipped
  */

@@ -172,7 +172,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       ++outcome.keys_with_known_domain;
       if (build_rows > key_domain) { ++outcome.keys_build_exceeded_domain; }
     }
-    if (domain_coverage_gate_fires(build_rows, key_domain, plan.domain_coverage_threshold())) {
+    if (domain_coverage_gate_fires(build_rows,
+                                   key_domain,
+                                   admitted_key.build_key_proven_unique,
+                                   plan.domain_coverage_threshold())) {
       SIRIUS_LOG_DEBUG(
         "[sirius_physical_hash_join] publish gate: key {}: build {} rows cover {:.2f} of key "
         "domain (~{} rows) -> skip key.",
@@ -228,13 +231,18 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
         // Range-coverage publication gate (the zone-map analogue of the cardinality gate above):
         // a [min,max] spanning most of the build key's domain prunes nothing, so skip it.
-        bool publish_zone_map = true;
-        if (key_domain > 0) {
+        // Inactive until base-column value-range evidence exists: the key's domain evidence is a
+        // row count, and dividing this gate's value span by it would over-fire on sparse integer
+        // keys, so the gate receives a domain of 0 and never fires.
+        auto const zone_map_range_domain = std::size_t{0};
+        bool publish_zone_map            = true;
+        if (zone_map_range_domain > 0) {
           auto const lo = scalar_to_double(*min_s);
           auto const hi = scalar_to_double(*max_s);
           if (lo && hi) {
-            auto const coverage = (*hi - *lo + 1.0) / static_cast<double>(key_domain);
-            if (zone_map_range_gate_fires(*lo, *hi, key_domain, plan.domain_coverage_threshold())) {
+            auto const coverage = (*hi - *lo + 1.0) / static_cast<double>(zone_map_range_domain);
+            if (zone_map_range_gate_fires(
+                  *lo, *hi, zone_map_range_domain, plan.domain_coverage_threshold())) {
               SIRIUS_LOG_DEBUG(
                 "[sirius_physical_hash_join] zone-map key {}: skipped (range [{},{}] covers {:.2f} "
                 "of key domain ~{}).",
@@ -242,7 +250,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
                 *lo,
                 *hi,
                 coverage,
-                key_domain);
+                zone_map_range_domain);
               publish_zone_map = false;
             }
           }

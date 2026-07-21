@@ -87,13 +87,16 @@ cudf::size_type to_build_key_ordinal(std::uint32_t bound_reference_index)
  * @param[in] shape The condition's carried pre-materialization side shapes
  * @param[in] condition_index The condition's index in original planner order
  * @param[in] domain_cardinality The build key's domain cardinality, or 0 when unknown
+ * @param[in] build_side_unique_column The build child's sole proven-unique output ordinal, when
+ * exactly one column is proven unique
  * @return The admitted key, or nullopt when the condition is not scan-route legal
  */
 std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_key(
   sirius::join_condition const& condition,
   op::dynamic_filter_condition_shape shape,
   std::size_t condition_index,
-  std::size_t domain_cardinality)
+  std::size_t domain_cardinality,
+  std::optional<std::size_t> build_side_unique_column)
 {
   if (condition.comparison != sirius::comparison_type::equal) { return std::nullopt; }
   if (side_blocks_scan_route(shape.probe) || side_blocks_scan_route(shape.build)) {
@@ -113,12 +116,15 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   auto const storage_type = sirius::try_get_cudf_type(build_ref.return_type());
   if (!storage_type.has_value()) { return std::nullopt; }
 
+  auto const build_key_ordinal = to_build_key_ordinal(build_ref.column_index);
   return op::dynamic_filter_publish_plan::admitted_key{
     .planner_condition_index      = condition_index,
-    .build_key_ordinal            = to_build_key_ordinal(build_ref.column_index),
+    .build_key_ordinal            = build_key_ordinal,
     .storage_type                 = *storage_type,
     .key_shape                    = shape,
-    .build_key_domain_cardinality = domain_cardinality};
+    .build_key_domain_cardinality = domain_cardinality,
+    .build_key_proven_unique =
+      build_side_unique_column == std::optional{static_cast<std::size_t>(build_key_ordinal)}};
 }
 
 }  // namespace
@@ -155,7 +161,8 @@ key_admission_result admit_dynamic_filter_keys(
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
   std::optional<std::span<std::size_t const>> hinted_condition_indexes,
   std::vector<dynamic_filter_scan_target_input> const& scan_targets,
-  std::vector<std::size_t> const& condition_domain_cardinalities)
+  std::vector<std::size_t> const& condition_domain_cardinalities,
+  std::optional<std::size_t> build_side_unique_column)
 {
   if (condition_shapes.size() != conditions.size()) {
     throw std::invalid_argument(
@@ -208,7 +215,8 @@ key_admission_result admit_dynamic_filter_keys(
     auto admitted                 = admit_scan_route_key(conditions[condition_index],
                                          condition_shapes[condition_index],
                                          condition_index,
-                                         domain_cardinality);
+                                         domain_cardinality,
+                                         build_side_unique_column);
     if (!admitted.has_value()) { return; }
     admitted_index_by_condition.emplace(condition_index, result.admitted_keys.size());
     result.admitted_keys.push_back(*std::move(admitted));

@@ -143,17 +143,18 @@ TEST_CASE("membership policy chooses nothing when no representation is available
 TEST_CASE("domain-coverage gate fires at and above its threshold",
           "[dynamic_filter][source_policy]")
 {
-  REQUIRE(domain_coverage_gate_fires(50, 100, kThreshold));
-  REQUIRE(domain_coverage_gate_fires(51, 100, kThreshold));
-  REQUIRE_FALSE(domain_coverage_gate_fires(49, 100, kThreshold));
+  REQUIRE(domain_coverage_gate_fires(50, 100, /*build_key_proven_unique=*/true, kThreshold));
+  REQUIRE(domain_coverage_gate_fires(51, 100, /*build_key_proven_unique=*/true, kThreshold));
+  REQUIRE_FALSE(domain_coverage_gate_fires(49, 100, /*build_key_proven_unique=*/true, kThreshold));
 }
 
 TEST_CASE("domain-coverage gate is disabled for an untraceable key domain",
           "[dynamic_filter][source_policy]")
 {
   // A key whose base table could not be traced reports cardinality 0. The gate must stand down
-  // rather than divide by it.
-  REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 0, kThreshold));
+  // rather than divide by it -- even for a proven-unique key.
+  REQUIRE_FALSE(
+    domain_coverage_gate_fires(1'000'000, 0, /*build_key_proven_unique=*/true, kThreshold));
 }
 
 TEST_CASE("zone-map range gate fires at and above its threshold", "[dynamic_filter][source_policy]")

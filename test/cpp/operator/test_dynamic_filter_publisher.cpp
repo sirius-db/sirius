@@ -72,7 +72,8 @@ std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
 }
 
 /// One admitted INT64 key over build column @p build_key_ordinal, tracing to a key domain of @p
-/// domain_cardinality values; 0 leaves the coverage gates disabled for the key.
+/// domain_cardinality values; 0 leaves the membership coverage gate disabled for the key. A key
+/// carrying a domain is marked proven unique, since the gate arms only for proven-unique keys.
 dynamic_filter_publish_plan::admitted_key make_int64_key(std::size_t condition_index,
                                                          cudf::size_type build_key_ordinal,
                                                          std::size_t domain_cardinality = 0)
@@ -82,7 +83,8 @@ dynamic_filter_publish_plan::admitted_key make_int64_key(std::size_t condition_i
     .build_key_ordinal            = build_key_ordinal,
     .storage_type                 = kInt64,
     .key_shape                    = {},
-    .build_key_domain_cardinality = domain_cardinality};
+    .build_key_domain_cardinality = domain_cardinality,
+    .build_key_proven_unique      = domain_cardinality > 0};
 }
 
 /// GPU fixture: memory manager, replica spaces, a construction stream, and INT64 key columns.

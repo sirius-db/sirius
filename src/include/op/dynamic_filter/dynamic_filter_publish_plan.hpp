@@ -162,10 +162,22 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Unfiltered cardinality of the base table this build key traces to
      *
-     * 0 when untraceable, which disables both coverage gates for this key. Carried per key rather
-     * than in a parallel array so a cardinality cannot become misaligned with its key.
+     * 0 when untraceable, which disables the membership coverage gate for this key. Carried per
+     * key rather than in a parallel array so a cardinality cannot become misaligned with its key.
+     * The value is a true upper bound, never an estimate; see
+     * `planner/build_key_domain.hpp` for the evidence contract.
      */
     std::size_t build_key_domain_cardinality = 0;
+    /**
+     * @brief Whether this key is proven unique in the build's base relation
+     *
+     * Set by admission only when the planner's proven-unique column set is exactly the singleton
+     * of this condition's build column. The membership coverage gate fires solely for
+     * proven-unique keys: only then is `build_rows / build_key_domain_cardinality` the coverage
+     * fraction it claims to be -- for duplicate keys the same ratio measures row retention, and a
+     * near-1.0 retention can coexist with a highly selective filter.
+     */
+    bool build_key_proven_unique = false;
 
     [[nodiscard]] bool operator==(admitted_key const&) const = default;
   };

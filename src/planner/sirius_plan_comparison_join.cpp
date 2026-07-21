@@ -20,7 +20,6 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -39,6 +38,7 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
+#include "planner/build_key_domain.hpp"
 #include "planner/duckdb_join_filter_candidate_adapter.hpp"
 #include "planner/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter_scan_routes.hpp"
@@ -278,91 +278,6 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
   }
 }
 
-//===----------------------------------------------------------------------===//
-// Dynamic Filters
-//===----------------------------------------------------------------------===//
-namespace {
-
-/// Resolve @p binding through the logical subtree to the LogicalGet that produces it, or nullptr
-/// when the column is computed (cast, expression, aggregate result) or not from a base scan.
-duckdb::LogicalGet* trace_binding_to_get(duckdb::LogicalOperator& node,
-                                         duckdb::ColumnBinding binding)
-{
-  switch (node.type) {
-    case duckdb::LogicalOperatorType::LOGICAL_GET: {
-      auto& get = node.Cast<duckdb::LogicalGet>();
-      return get.table_index == binding.table_index ? &get : nullptr;
-    }
-    case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
-      auto& proj = node.Cast<duckdb::LogicalProjection>();
-      if (proj.table_index != binding.table_index || node.children.empty() ||
-          binding.column_index >= proj.expressions.size()) {
-        return nullptr;
-      }
-      auto& expr = *proj.expressions[binding.column_index];
-      if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
-        return nullptr;
-      }
-      return trace_binding_to_get(*node.children[0],
-                                  expr.Cast<duckdb::BoundColumnRefExpression>().binding);
-    }
-    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
-      auto& aggr = node.Cast<duckdb::LogicalAggregate>();
-      if (binding.table_index != aggr.group_index || node.children.empty() ||
-          binding.column_index >= aggr.groups.size()) {
-        return nullptr;
-      }
-      auto& expr = *aggr.groups[binding.column_index];
-      if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
-        return nullptr;
-      }
-      return trace_binding_to_get(*node.children[0],
-                                  expr.Cast<duckdb::BoundColumnRefExpression>().binding);
-    }
-    default: {
-      // Table indexes are binder-unique, so recursing into every child finds the owning subtree
-      // (or nothing, for rebinding operators this walk does not model).
-      for (auto& child : node.children) {
-        if (auto* get = trace_binding_to_get(*child, binding)) { return get; }
-      }
-      return nullptr;
-    }
-  }
-}
-
-/// Per join condition (original planner order): the unfiltered cardinality of the base table the
-/// build key traces to, or 0 when untraceable -- the publish coverage gates are then off for that
-/// key and the consumer-side gate is the backstop. Must run before create_plan, which moves data
-/// out of the logical children. The admission helper re-emits these in admitted-key order.
-///
-/// NOTE: the BOUND_COLUMN_REF check below never matches after DuckDB's ColumnBindingResolver has
-/// rewritten condition sides to BOUND_REF, so every cardinality is currently 0 and the coverage
-/// gates are inert. The positional-trace fix is a follow-up unit of issue #1010.
-std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalComparisonJoin& op,
-                                                        duckdb::ClientContext& context)
-{
-  std::vector<std::size_t> domains(op.conditions.size(), 0);
-  for (std::size_t condition_index = 0; condition_index < op.conditions.size(); ++condition_index) {
-    auto& key = *op.conditions[condition_index].right;
-    if (key.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) { continue; }
-    auto* get =
-      trace_binding_to_get(*op.children[1], key.Cast<duckdb::BoundColumnRefExpression>().binding);
-    if (get == nullptr) { continue; }
-    std::size_t card = 0;
-    if (get->function.cardinality) {
-      // The table function's own estimate is pre-filter (the optimizer-adjusted
-      // estimated_cardinality field would undercount the domain for filtered GETs).
-      auto stats = get->function.cardinality(context, get->bind_data.get());
-      if (stats && stats->has_estimated_cardinality) { card = stats->estimated_cardinality; }
-    }
-    domains[condition_index] = card != 0 ? card : get->estimated_cardinality;
-  }
-  return domains;
-}
-
-}  // namespace
-//===----------------------------------------------------------------------===//
-
 /// A join equality-condition side that is a plain column reference (BOUND_REF) or a cast of one
 /// (BOUND_CAST(BOUND_REF)) is already handled directly by the hash-join key extraction and by the
 /// PARTITION operator's cast-alignment logic, so it needs no materialization.
@@ -489,9 +404,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   // Gather per-condition domain evidence BEFORE create_plan, which moves data out of the logical
   // nodes (same constraint as prove_unique_columns below).
-  auto condition_domains = filter_candidate.kind() == duckdb_candidate_kind::admitted
-                             ? build_key_domain_cardinalities(op, context)
-                             : std::vector<std::size_t>{};
+  auto condition_domains =
+    filter_candidate.kind() == duckdb_candidate_kind::admitted
+      ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
+      : std::vector<std::size_t>{};
 
   // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
@@ -635,11 +551,18 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         ? std::optional<std::span<std::size_t const>>{}
         : std::optional<std::span<std::size_t const>>{
             std::span<std::size_t const>{routes.hinted_condition_indexes}};
+    // Only a single-column uniqueness proof arms a key's coverage gate: tuple uniqueness bounds
+    // distinct tuples, not distinct values of one column, so a composite proof passes nothing.
+    auto const build_side_unique_column =
+      build_side_unique_cols.size() == 1
+        ? std::optional<std::size_t>{static_cast<std::size_t>(*build_side_unique_cols.begin())}
+        : std::nullopt;
     auto admission = admit_dynamic_filter_keys(conditions,
                                                condition_key_shapes,
                                                hinted_condition_indexes,
                                                routes.target_inputs,
-                                               condition_domains);
+                                               condition_domains,
+                                               build_side_unique_column);
     // Postcondition of admit_dynamic_filter_keys: one binding list per input target.
     assert(admission.per_target_key_bindings.size() == routes.targets.size());
     for (std::size_t target_index = 0; target_index < routes.targets.size(); ++target_index) {

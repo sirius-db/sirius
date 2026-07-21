@@ -178,6 +178,11 @@ struct key_admission_result {
  * @param[in] condition_domain_cardinalities Per condition index, the build key's domain
  * cardinality (0 = unknown); empty when no domain evidence exists. Recorded onto each admitted
  * key, so the result carries no parallel array.
+ * @param[in] build_side_unique_column The build child's sole proven-unique output ordinal, when
+ * the planner's proven-unique column set is exactly one column; empty otherwise -- a composite
+ * uniqueness proof bounds distinct tuples, not distinct values of one column, and must not arm
+ * any key's coverage gate. An admitted key whose build ordinal equals this value is marked
+ * `build_key_proven_unique`.
  * @return The admitted keys and their per-target bindings. `per_target_key_bindings` always has
  * exactly one entry per element of `scan_targets`.
  */
@@ -186,7 +191,8 @@ struct key_admission_result {
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
   std::optional<std::span<std::size_t const>> hinted_condition_indexes,
   std::vector<dynamic_filter_scan_target_input> const& scan_targets,
-  std::vector<std::size_t> const& condition_domain_cardinalities);
+  std::vector<std::size_t> const& condition_domain_cardinalities,
+  std::optional<std::size_t> build_side_unique_column = std::nullopt);
 
 /**
  * @brief Static legality of one admitted key for a join-edge (direct) endpoint

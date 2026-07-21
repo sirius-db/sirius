@@ -339,6 +339,33 @@ TEST_CASE("admission records zero domains from an empty domain vector",
   REQUIRE(result.admitted_keys[1].build_key_domain_cardinality == 0);
 }
 
+TEST_CASE("admission marks only the key whose build ordinal is the proven-unique column",
+          "[dynamic_filter][key_admission]")
+{
+  // Build ordinals 4 and 7; the planner proved ordinal 7 unique. Only that key arms the gate --
+  // and passing no proof arms nothing.
+  auto const conditions = make_wrapped_equalities_at({{9, 4}, {3, 7}});
+  std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
+
+  SECTION("a singleton proof marks the matching ordinal")
+  {
+    auto const result = admit_dynamic_filter_keys(
+      conditions, shapes, std::nullopt, {}, {}, std::optional<std::size_t>{7});
+
+    REQUIRE(result.admitted_keys.size() == 2);
+    REQUIRE_FALSE(result.admitted_keys[0].build_key_proven_unique);
+    REQUIRE(result.admitted_keys[1].build_key_proven_unique);
+  }
+  SECTION("no proof marks nothing")
+  {
+    auto const result = admit_dynamic_filter_keys(conditions, shapes, std::nullopt, {}, {});
+
+    REQUIRE(result.admitted_keys.size() == 2);
+    REQUIRE_FALSE(result.admitted_keys[0].build_key_proven_unique);
+    REQUIRE_FALSE(result.admitted_keys[1].build_key_proven_unique);
+  }
+}
+
 TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_admission]")
 {
   auto const conditions = make_wrapped_equalities(2);
@@ -480,13 +507,18 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
   {
     // A structured binding fails to compile if a field is added without extending this section,
     // so the check cannot silently fall behind the struct.
-    auto const& [planner_condition_index, build_key_ordinal, storage_type, key_shape, domain] =
-      expected_key(3);
+    auto const& [planner_condition_index,
+                 build_key_ordinal,
+                 storage_type,
+                 key_shape,
+                 domain,
+                 unique] = expected_key(3);
     (void)planner_condition_index;
     (void)build_key_ordinal;
     (void)storage_type;
     (void)key_shape;
     (void)domain;
+    (void)unique;
 
     auto const base = expected_key(3);
     REQUIRE(base == expected_key(3));
@@ -510,6 +542,10 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     auto vary_domain                         = base;
     vary_domain.build_key_domain_cardinality = 1000;
     REQUIRE_FALSE(base == vary_domain);
+
+    auto vary_proven_unique                    = base;
+    vary_proven_unique.build_key_proven_unique = true;
+    REQUIRE_FALSE(base == vary_proven_unique);
   }
 }
 
