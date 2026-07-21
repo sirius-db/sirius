@@ -7,12 +7,14 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use starrocks_plan_translator::TranslatedPlan;
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
 #[derive(Clone, Debug)]
 pub struct FragmentResult {
+    /// Output schema, retained even when execution produces no batches.
+    pub(crate) schema: SchemaRef,
     /// Result batches in fragment output order. Empty for a fragment with no output columns.
     pub(crate) batches: Vec<RecordBatch>,
 }
@@ -20,7 +22,16 @@ pub struct FragmentResult {
 impl FragmentResult {
     /// Builds a result from its output batches (in fragment output order).
     pub fn new(batches: Vec<RecordBatch>) -> Self {
-        Self { batches }
+        let schema = batches
+            .first()
+            .map(RecordBatch::schema)
+            .unwrap_or_else(|| Arc::new(Schema::empty()));
+        Self { schema, batches }
+    }
+
+    /// Builds a result with an explicit schema, including for empty results.
+    pub fn with_schema(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self { schema, batches }
     }
 
     /// The result batches in fragment output order.
@@ -31,9 +42,9 @@ impl FragmentResult {
 
 /// Runs a translated fragment and returns its result batches.
 ///
-/// This is intentionally a synchronous, fully-materializing seam for the single-fragment
-/// milestone: `exec_plan_fragment` runs it to completion before returning, and `fetch_data` then
-/// drains the buffered rows.
+/// This is intentionally a synchronous, fully-materializing seam for single-shot execution.
+/// Each fragment runs to completion, and a local exchange can sequence one fragment's output into
+/// the next before `fetch_data` drains the final buffered rows.
 ///
 /// TODO(starrocks-execute): a real GPU executor should not block dispatch on full materialization.
 /// Evolve this into a streaming contract — dispatch registers a running fragment and returns after
@@ -59,6 +70,7 @@ impl FragmentExecutor for StubExecutor {
         let names = &translated.output_names;
         if names.is_empty() {
             return Ok(FragmentResult {
+                schema: Arc::new(Schema::empty()),
                 batches: Vec::new(),
             });
         }
@@ -73,6 +85,7 @@ impl FragmentExecutor for StubExecutor {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|err| format!("failed to build stub result batch: {err}"))?;
         Ok(FragmentResult {
+            schema: batch.schema(),
             batches: vec![batch],
         })
     }
