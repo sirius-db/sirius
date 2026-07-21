@@ -82,7 +82,7 @@ std::unique_ptr<cucascade::host_data_representation> join_result_d2h(
   return host_repr;
 }
 
-/// Positions of [vec_col, out_cols...] within the pinned column layout on host.
+/// Return the positions of [vec_col, out_cols...] within the pinned column layout on host.
 std::vector<std::size_t> get_pinned_column_indices(const scan_manager::pinned_entry& pin,
                                                    const std::string& vec_col,
                                                    const std::vector<std::string>& out_cols)
@@ -228,8 +228,6 @@ std::unique_ptr<cudf::table> assemble_corpus_h2d(const scan_manager::pinned_entr
                                                  ccm::memory_space& gpu_space,
                                                  const join_context& c)
 {
-  // TODO: skip the intermediate and compute the total row count upfront, allocate one contiguous
-  // target table and upload each chunk directly into it
   std::vector<std::unique_ptr<cudf::table>> uploaded;
   uploaded.reserve(pin.host_chunks.size());
   for (auto const& chunk : pin.host_chunks) {
@@ -265,22 +263,30 @@ std::unique_ptr<cudf::table> filter_by_threshold(std::unique_ptr<cudf::table> ta
 }
 
 /// Reduce per-row candidates to the @p k pairs with globally smallest distance.
+/// Uses a partial top-k selection (O(N), not a full O(N log N) sort), then orders
+/// just those k rows by distance so the result is ranked nearest-first.
 std::unique_ptr<cudf::table> take_global_top_k(std::unique_ptr<cudf::table> table,
                                                std::int64_t k,
                                                const join_context& c)
 {
-  auto const view      = table->view();
-  auto const& dist_col = view.column(view.num_columns() - 1);
-  auto order           = cudf::sorted_order(cudf::table_view{{dist_col}},
-                                            {cudf::order::ASCENDING},
-                                            {cudf::null_order::AFTER},
+  auto const view = table->view();
+  auto const n    = static_cast<cudf::size_type>(std::min<std::int64_t>(k, view.num_rows()));
+  if (n <= 0) { return table; }
+
+  // Gather the k smallest distances without sorting the whole table.
+  auto top_idx = cudf::top_k_order(
+    view.column(view.num_columns() - 1), n, cudf::order::ASCENDING, c.stream, c.mr);
+  auto top =
+    cudf::gather(view, top_idx->view(), cudf::out_of_bounds_policy::DONT_CHECK, c.stream, c.mr);
+
+  // Order those k rows by distance (top_k_order does not guarantee sorted output).
+  auto order = cudf::sorted_order(cudf::table_view{{top->view().column(top->num_columns() - 1)}},
+                                  {cudf::order::ASCENDING},
+                                  {cudf::null_order::AFTER},
                                   c.stream,
                                   c.mr);
-  auto sorted =
-    cudf::gather(view, order->view(), cudf::out_of_bounds_policy::DONT_CHECK, c.stream, c.mr);
-  auto const n   = static_cast<cudf::size_type>(std::min<std::int64_t>(k, sorted->num_rows()));
-  auto const top = cudf::slice(sorted->view(), {0, n}, c.stream).front();
-  return std::make_unique<cudf::table>(top, c.stream, c.mr);
+  return cudf::gather(
+    top->view(), order->view(), cudf::out_of_bounds_policy::DONT_CHECK, c.stream, c.mr);
 }
 
 }  // namespace
