@@ -21,9 +21,6 @@
 // Every query goes through the shared file-backed GpuExecutionFixture, which
 // runs it once on the GPU (asserting a real GPU execution with no fallback) and
 // once on DuckDB CPU, then compares the results (order-insensitive).
-//
-// Cases tagged [!shouldfail] document confirmed GPU/CPU divergences (see
-// NULL_TESTS_KNOWN_DIVERGENCES.md).
 
 #include <catch.hpp>
 #include <duckdb.hpp>

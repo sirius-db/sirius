@@ -23,9 +23,9 @@
 // once on DuckDB CPU, then compares the results. The comparator is order-
 // insensitive, which suits GROUP BY output.
 //
-// Cases tagged [!shouldfail] document confirmed GPU/CPU divergences (see
-// NULL_TESTS_KNOWN_DIVERGENCES.md); the tag reports them as expected failures so
-// CI stays green until the underlying bug is fixed.
+// Cases tagged [!shouldfail] document confirmed GPU/CPU divergences (tracked in
+// their own issues); the tag reports them as expected failures so CI stays green
+// until the underlying bug is fixed.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -107,8 +107,8 @@ TEST_CASE_METHOD(AggNullFixture,
 }
 
 //===----------------------------------------------------------------------===//
-// Known GPU divergences (documented, quarantined) -- see
-// NULL_TESTS_KNOWN_DIVERGENCES.md and file one issue each before removing.
+// Known GPU divergences (quarantined) -- each tracked in its own issue; remove
+// the [!shouldfail] tag when the underlying bug is fixed.
 //===----------------------------------------------------------------------===//
 
 // KNOWN GPU DIVERGENCE (issue #1095 follow-up -- please file):
