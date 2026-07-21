@@ -86,6 +86,9 @@ class SiriusContext : public ClientContextState {
   /// \param context The client context.
   void QueryBegin(ClientContext& context) final;
 
+  /// \brief Starts a query for execution paths that bypass DuckDB's active-query state.
+  void QueryBeginStandalone(ClientContext& context, std::string_view query_label);
+
   /// \brief Called at the end of a query execution.
   void QueryEnd() final;
 

@@ -136,8 +136,12 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // execution is eager (the result is materialized), so the transaction can close
   // before the Arrow stream is consumed.
   impl_->conn->BeginTransaction();
+  bool query_started = false;
   duckdb::unique_ptr<duckdb::QueryResult> result;
   try {
+    impl_->context->QueryBeginStandalone(client, "starrocks_substrait");
+    query_started = true;
+
     // 1. Substrait bytes -> DuckDB Relation. DuckDB is used only for this lowering.
     duckdb::SubstraitToDuckDB transformer(impl_->conn->context, plan, /*json=*/false);
     auto relation = transformer.TransformPlan();
@@ -172,7 +176,20 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     sirius::sirius_interface iface(client, std::optional<std::string>("starrocks_substrait"));
     result = iface.sirius_execute_query(
       client, "starrocks_substrait", gpu_prepared, duckdb::PendingQueryParameters{});
+
+    // This standalone path bypasses DuckDB's normal query entry point, so its
+    // ClientContextState callbacks are not invoked automatically. End every
+    // single-shot execution explicitly to clear repositories, scan providers,
+    // and task-creator state before the next fragment.
+    impl_->context->QueryEnd();
+    query_started = false;
   } catch (...) {
+    if (query_started) {
+      try {
+        impl_->context->QueryEnd();
+      } catch (...) {
+      }
+    }
     impl_->conn->Rollback();
     throw;
   }
