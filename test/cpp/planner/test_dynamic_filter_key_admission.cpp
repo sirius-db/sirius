@@ -98,10 +98,10 @@ dynamic_filter_publish_plan::admitted_key expected_key(
   std::size_t condition_index, dynamic_filter_condition_shape shape = kDirectDirect)
 {
   return dynamic_filter_publish_plan::admitted_key{
-    .condition_index   = condition_index,
-    .build_key_ordinal = static_cast<cudf::size_type>(condition_index),
-    .storage_type      = kInt32,
-    .key_shape         = shape};
+    .planner_condition_index = condition_index,
+    .build_key_ordinal       = static_cast<cudf::size_type>(condition_index),
+    .storage_type            = kInt32,
+    .key_shape               = shape};
 }
 
 }  // namespace
@@ -119,15 +119,16 @@ TEST_CASE("admission reads the build ordinal from the build side, not the condit
   std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
   std::vector<std::size_t> const hinted{1, 0};
   std::vector<dynamic_filter_scan_target_input> const targets{
-    {.channel_push_ordinals = {21, 8}, .probe_storage_types = {kInt32, kInt32}}};
+    {.columns = {{.channel_push_ordinal = 21, .probe_storage_type = kInt32},
+                 {.channel_push_ordinal = 8, .probe_storage_type = kInt32}}}};
 
   auto const result = admit_dynamic_filter_keys(
     conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
 
   REQUIRE(result.admitted_keys.size() == 2);
-  REQUIRE(result.admitted_keys[0].condition_index == 1);
+  REQUIRE(result.admitted_keys[0].planner_condition_index == 1);
   REQUIRE(result.admitted_keys[0].build_key_ordinal == 7);
-  REQUIRE(result.admitted_keys[1].condition_index == 0);
+  REQUIRE(result.admitted_keys[1].planner_condition_index == 0);
   REQUIRE(result.admitted_keys[1].build_key_ordinal == 4);
   REQUIRE(result.per_target_key_bindings[0] ==
           std::vector<dynamic_filter_publish_plan::key_binding>{
@@ -163,7 +164,7 @@ TEST_CASE("admission rejects a build ordinal outside the cuDF column range",
   std::vector<dynamic_filter_condition_shape> const shapes(1, kDirectDirect);
 
   REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, std::nullopt, {}, {}),
-                    std::logic_error);
+                    std::invalid_argument);
 }
 
 TEST_CASE("admission rejects a build side that is not a plain column reference",
@@ -221,7 +222,8 @@ TEST_CASE("admission binds reordered non-prefix hinted keys to their channel pus
   // DuckDB discovery names conditions {2, 0}, in that filter-ordinal order.
   std::vector<std::size_t> const hinted{2, 0};
   std::vector<dynamic_filter_scan_target_input> const targets{
-    {.channel_push_ordinals = {12, 7}, .probe_storage_types = {kInt32, kInt32}}};
+    {.columns = {{.channel_push_ordinal = 12, .probe_storage_type = kInt32},
+                 {.channel_push_ordinal = 7, .probe_storage_type = kInt32}}}};
 
   auto const result = admit_dynamic_filter_keys(
     conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
@@ -233,7 +235,6 @@ TEST_CASE("admission binds reordered non-prefix hinted keys to their channel pus
           std::vector<dynamic_filter_publish_plan::key_binding>{
             {.admitted_key_index = 0, .channel_push_ordinal = 12, .probe_storage_type = kInt32},
             {.admitted_key_index = 1, .channel_push_ordinal = 7, .probe_storage_type = kInt32}});
-  REQUIRE(result.build_key_domain_cardinalities.empty());
 }
 
 TEST_CASE("admission keeps partially eligible composites correctly bound",
@@ -248,7 +249,8 @@ TEST_CASE("admission keeps partially eligible composites correctly bound",
     kDirectDirect};
   std::vector<std::size_t> const hinted{0, 1};
   std::vector<dynamic_filter_scan_target_input> const targets{
-    {.channel_push_ordinals = {4, 9}, .probe_storage_types = {kInt32, kInt32}}};
+    {.columns = {{.channel_push_ordinal = 4, .probe_storage_type = kInt32},
+                 {.channel_push_ordinal = 9, .probe_storage_type = kInt32}}}};
 
   auto const result = admit_dynamic_filter_keys(
     conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
@@ -275,7 +277,7 @@ TEST_CASE("admission never admits an inequality condition", "[dynamic_filter][ke
   // them on the comparison itself and depends on no such ordering.
   std::vector<std::size_t> const hinted{1};
   std::vector<dynamic_filter_scan_target_input> const targets{
-    {.channel_push_ordinals = {3}, .probe_storage_types = {kInt32}}};
+    {.columns = {{.channel_push_ordinal = 3, .probe_storage_type = kInt32}}}};
 
   auto const result = admit_dynamic_filter_keys(
     conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
@@ -295,7 +297,7 @@ TEST_CASE("admission works without DuckDB discovery", "[dynamic_filter][key_admi
 
   // Admitted keys without any target build a valid but disabled plan: publication is a no-op
   // until a target exists.
-  dynamic_filter_publish_plan const plan{std::move(result.admitted_keys), {}, false, {}, {}};
+  dynamic_filter_publish_plan const plan{std::move(result.admitted_keys), {}, {}};
   REQUIRE_FALSE(plan.enabled());
 }
 
@@ -306,12 +308,15 @@ TEST_CASE("admission re-emits domain cardinalities in admitted order",
   std::vector<dynamic_filter_condition_shape> const shapes(3, kDirectDirect);
   std::vector<std::size_t> const hinted{2, 0};
   std::vector<dynamic_filter_scan_target_input> const targets{
-    {.channel_push_ordinals = {1, 0}, .probe_storage_types = {kInt32, kInt32}}};
+    {.columns = {{.channel_push_ordinal = 1, .probe_storage_type = kInt32},
+                 {.channel_push_ordinal = 0, .probe_storage_type = kInt32}}}};
   std::vector<std::size_t> const condition_domains{10, 20, 30};
 
   auto const result = admit_dynamic_filter_keys(
     conditions, shapes, std::span<std::size_t const>{hinted}, targets, condition_domains);
-  REQUIRE(result.build_key_domain_cardinalities == std::vector<std::size_t>{30, 10});
+  // Recorded on each key rather than in a parallel array, so it cannot drift out of alignment.
+  REQUIRE(result.admitted_keys[0].build_key_domain_cardinality == 30);
+  REQUIRE(result.admitted_keys[1].build_key_domain_cardinality == 10);
 }
 
 TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_admission]")
@@ -320,7 +325,7 @@ TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_a
   std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
   std::vector<std::size_t> const hinted{0};
   std::vector<dynamic_filter_scan_target_input> const targets{
-    {.channel_push_ordinals = {3}, .probe_storage_types = {kInt32}}};
+    {.columns = {{.channel_push_ordinal = 3, .probe_storage_type = kInt32}}}};
 
   SECTION("misaligned shapes")
   {
@@ -344,7 +349,8 @@ TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_a
   SECTION("target arity mismatched with the discovery")
   {
     std::vector<dynamic_filter_scan_target_input> const bad_targets{
-      {.channel_push_ordinals = {3, 4}, .probe_storage_types = {kInt32, kInt32}}};
+      {.columns = {{.channel_push_ordinal = 3, .probe_storage_type = kInt32},
+                   {.channel_push_ordinal = 4, .probe_storage_type = kInt32}}}};
     REQUIRE_THROWS_AS(admit_dynamic_filter_keys(
                         conditions, shapes, std::span<std::size_t const>{hinted}, bad_targets, {}),
                       std::invalid_argument);
@@ -427,49 +433,63 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
 {
   SECTION("duplicate condition index")
   {
-    REQUIRE_THROWS_AS(
-      dynamic_filter_publish_plan({expected_key(0), expected_key(0)}, {}, false, {}, {}),
-      std::invalid_argument);
+    REQUIRE_THROWS_AS(dynamic_filter_publish_plan({expected_key(0), expected_key(0)}, {}, {}),
+                      std::invalid_argument);
   }
   SECTION("negative build ordinal")
   {
     auto key              = expected_key(0);
     key.build_key_ordinal = -1;
-    REQUIRE_THROWS_AS(dynamic_filter_publish_plan({key}, {}, false, {}, {}), std::invalid_argument);
+    REQUIRE_THROWS_AS(dynamic_filter_publish_plan({key}, {}, {}), std::invalid_argument);
   }
   SECTION("EMPTY storage type")
   {
     auto key         = expected_key(0);
     key.storage_type = cudf::data_type{cudf::type_id::EMPTY};
-    REQUIRE_THROWS_AS(dynamic_filter_publish_plan({key}, {}, false, {}, {}), std::invalid_argument);
+    REQUIRE_THROWS_AS(dynamic_filter_publish_plan({key}, {}, {}), std::invalid_argument);
   }
-  SECTION("misaligned domain cardinalities")
+  SECTION("a transported threshold is accepted without re-validation")
   {
-    REQUIRE_THROWS_AS(dynamic_filter_publish_plan({expected_key(0)}, {}, false, {1, 2}, {}),
-                      std::invalid_argument);
+    // The threshold is validated once, where it enters the engine
+    // (config::valid_domain_coverage_threshold). A plan is built for every GPU hash join, so it
+    // must not be able to fail planning over a value it merely transports.
+    REQUIRE_NOTHROW(
+      dynamic_filter_publish_plan({expected_key(0)}, {}, {}, {.domain_coverage_threshold = 0.0}));
   }
-  SECTION("invalid domain-coverage threshold")
+  SECTION("equality is differential over every field")
   {
-    REQUIRE_THROWS_AS(dynamic_filter_publish_plan({expected_key(0)}, {}, false, {}, {}, 0.0),
-                      std::invalid_argument);
-    REQUIRE_THROWS_AS(
-      dynamic_filter_publish_plan(
-        {expected_key(0)}, {}, false, {}, {}, std::numeric_limits<double>::quiet_NaN()),
-      std::invalid_argument);
-  }
-  SECTION("defaulted equality is member-wise over every coordinate field")
-  {
+    // A structured binding fails to compile if a field is added without extending this section,
+    // so the check cannot silently fall behind the struct.
+    auto const& [planner_condition_index, build_key_ordinal, storage_type, key_shape, domain] =
+      expected_key(3);
+    (void)planner_condition_index;
+    (void)build_key_ordinal;
+    (void)storage_type;
+    (void)key_shape;
+    (void)domain;
+
     auto const base = expected_key(3);
     REQUIRE(base == expected_key(3));
-    auto other            = base;
-    other.condition_index = 4;
-    REQUIRE_FALSE(base == other);
-    other                   = base;
-    other.build_key_ordinal = 9;
-    REQUIRE_FALSE(base == other);
-    other              = base;
-    other.storage_type = kInt64;
-    REQUIRE_FALSE(base == other);
+
+    auto vary_planner_condition_index                    = base;
+    vary_planner_condition_index.planner_condition_index = 4;
+    REQUIRE_FALSE(base == vary_planner_condition_index);
+
+    auto vary_build_key_ordinal              = base;
+    vary_build_key_ordinal.build_key_ordinal = 9;
+    REQUIRE_FALSE(base == vary_build_key_ordinal);
+
+    auto vary_storage_type         = base;
+    vary_storage_type.storage_type = kInt64;
+    REQUIRE_FALSE(base == vary_storage_type);
+
+    auto vary_key_shape            = base;
+    vary_key_shape.key_shape.build = dynamic_filter_key_shape::computed;
+    REQUIRE_FALSE(base == vary_key_shape);
+
+    auto vary_domain                         = base;
+    vary_domain.build_key_domain_cardinality = 1000;
+    REQUIRE_FALSE(base == vary_domain);
   }
 }
 
@@ -541,14 +561,16 @@ TEST_CASE("condition_key_shapes[i] describes conditions[i] after equality-first 
   auto const& join = *fixture.hash_join;
 
   REQUIRE(join.conditions.size() == 3);
-  REQUIRE(join.condition_key_shapes.size() == 3);
+  REQUIRE(join.has_condition_key_shapes());
   // Reordered condition order is [eq(0), eq(1), gt(0)]; the shapes must have followed.
   REQUIRE(join.conditions[0].comparison == sirius::comparison_type::equal);
   REQUIRE(join.conditions[1].comparison == sirius::comparison_type::equal);
   REQUIRE(join.conditions[2].comparison == sirius::comparison_type::gt);
-  REQUIRE(join.condition_key_shapes[0] == shape_a);
-  REQUIRE(join.condition_key_shapes[1] == shape_c);
-  REQUIRE(join.condition_key_shapes[2] == shape_b);
+  REQUIRE(join.key_shape_of_condition(0) == shape_a);
+  REQUIRE(join.key_shape_of_condition(1) == shape_c);
+  REQUIRE(join.key_shape_of_condition(2) == shape_b);
+  // Out of range yields the default shape rather than reading past the end.
+  REQUIRE(join.key_shape_of_condition(3) == dynamic_filter_condition_shape{});
 }
 
 TEST_CASE("the physical join rejects misaligned condition_key_shapes",

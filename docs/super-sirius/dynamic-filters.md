@@ -141,10 +141,11 @@ filter construction and sparse per-target bindings for fan-out:
 class dynamic_filter_publish_plan {
  public:
   struct admitted_key {
-    std::size_t condition_index;       // original-condition provenance
-    cudf::size_type build_key_ordinal; // runtime build-table column
+    std::size_t planner_condition_index;       // provenance, in original planner order
+    cudf::size_type build_key_ordinal;         // runtime build-table column
     cudf::data_type storage_type;
     dynamic_filter_condition_shape key_shape;  // carried pre-materialization classification
+    std::size_t build_key_domain_cardinality;  // 0 = unknown, coverage gates off for this key
   };
 
   struct key_binding {
@@ -163,7 +164,7 @@ class dynamic_filter_publish_plan {
  private:
   std::vector<admitted_key> _admitted_keys;
   std::vector<probe_target> _probe_targets;
-  std::vector<std::size_t> _build_key_domain_cardinalities;  // admitted-key order
+  dynamic_filter_publication_policy _policy;  // config-transported, ingress-validated
   std::vector<dynamic_filter_replica_space> _replica_spaces;
 };
 ```

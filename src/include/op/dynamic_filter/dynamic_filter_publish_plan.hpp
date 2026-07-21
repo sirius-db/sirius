@@ -108,6 +108,20 @@ enum class dynamic_filter_route_class : std::uint8_t {
  * The nested structs are true aggregates constructed with designated initializers at every
  * construction site; member declaration order is therefore part of their API and must stay stable.
  */
+/**
+ * @brief Publication policy transported from configuration
+ *
+ * Validated once where it enters the engine (`config::valid_domain_coverage_threshold`); the plan
+ * constructor does not re-validate it. Everything outside this struct is planner-computed and
+ * constructor-validated; everything inside it is config-transported and ingress-validated.
+ */
+struct dynamic_filter_publication_policy {
+  /// Whether publication constructs zone-map filters alongside membership filters
+  bool emit_zone_map_filters = false;
+  /// Fraction of a key's domain a build may cover and still publish that key's filters
+  double domain_coverage_threshold = 0.9;
+};
+
 class dynamic_filter_publish_plan final {
  public:
   /**
@@ -122,11 +136,12 @@ class dynamic_filter_publish_plan final {
      * @brief Index into the planner's original condition vector, recorded before
      * `wrap_join_conditions` and before the physical join's equality-first condition reordering
      *
-     * Provenance and uniqueness only -- never a runtime index. The join's `key_casts`,
-     * `right_key_col_indices`, and `condition_key_shapes` all live in reordered equality-ordinal
-     * space and must not be subscripted with this value.
+     * Provenance and uniqueness only. This index is in the planner's original condition order;
+     * anything the physical join derives from its own `conditions` vector -- `key_casts`,
+     * `right_key_col_indices`, `condition_key_shapes` -- is in reordered equality-ordinal space
+     * and must never be subscripted with a value from this space.
      */
-    std::size_t condition_index = 0;
+    std::size_t planner_condition_index = 0;
     /**
      * @brief Build-child output column holding the key values; indexes the build table view the
      * publisher receives
@@ -144,6 +159,13 @@ class dynamic_filter_publish_plan final {
      * @brief Carried pre-materialization classification of this condition's sides
      */
     dynamic_filter_condition_shape key_shape{};
+    /**
+     * @brief Unfiltered cardinality of the base table this build key traces to
+     *
+     * 0 when untraceable, which disables both coverage gates for this key. Carried per key rather
+     * than in a parallel array so a cardinality cannot become misaligned with its key.
+     */
+    std::size_t build_key_domain_cardinality = 0;
 
     [[nodiscard]] bool operator==(admitted_key const&) const = default;
   };
@@ -220,9 +242,9 @@ class dynamic_filter_publish_plan final {
   dynamic_filter_publish_plan() = default;
 
   /**
-   * @brief Validate and freeze one hash join's publication metadata
+   * @brief Validate, canonicalize, and freeze one hash join's publication metadata
    *
-   * The plan persists four distinct coordinates: original condition index for provenance,
+   * The plan persists four distinct coordinates: planner condition index for provenance,
    * admitted-key index for dense filter construction, build-key ordinal for runtime build-table
    * lookup, and channel push ordinal for target-specific publication. The constructor validates
    * every relationship it can represent. One precondition is not verifiable here and is trusted
@@ -233,11 +255,14 @@ class dynamic_filter_publish_plan final {
    * key coordinates: admission consumes the former and replaces it with sparse bindings, while
    * each `probe_targets[i]` owns the bindings for target `i`.
    *
+   * @p replica_spaces is canonicalized rather than rejected: any order and any duplication of a
+   * device denote the same replica set, so the constructor sorts by device id and drops repeats.
+   * Two admitted keys naming the same condition are different -- they denote two plans, not one --
+   * and are rejected. `replica_spaces()` therefore returns the canonical form, not the input order.
+   *
    * @throw std::invalid_argument if the plan has probe targets but no replica space
    * @throw std::invalid_argument if a replica space is not a GPU space with HOST-tier staging
-   * @throw std::invalid_argument if `build_key_domain_cardinalities` is non-empty and not aligned
-   * one-to-one with `admitted_keys`
-   * @throw std::invalid_argument if two admitted keys reference the same condition index
+   * @throw std::invalid_argument if two admitted keys name the same planner condition
    * @throw std::invalid_argument if an admitted key has a negative build ordinal or an EMPTY
    * storage type (either is the signature of an upstream conversion defect)
    * @throw std::invalid_argument if a probe target has a null channel, is a membership-only
@@ -246,23 +271,14 @@ class dynamic_filter_publish_plan final {
    *
    * @param[in] admitted_keys Statically admitted build keys, in admitted order
    * @param[in] probe_targets Endpoint channels with their sparse key bindings
-   * @param[in] emit_zone_map_filters Whether publication constructs zone-map filters at all
-   * @param[in] build_key_domain_cardinalities Per admitted key, the unfiltered cardinality of the
-   * base table its build key traces to (0 disables the coverage gates for that key); empty when no
-   * domain evidence exists
    * @param[in] replica_spaces GPU/HOST placements for device-local filter replicas
-   * @param[in] domain_coverage_threshold Fraction of a key's domain a build may cover and still
-   * publish that key's filters. Transported from configuration and validated at its ingress by
-   * `config::valid_domain_coverage_threshold`; this constructor does not re-validate it, because
-   * a plan is built for every GPU hash join and must not be able to fail planning.
+   * @param[in] policy Publication policy transported from configuration and validated at its
+   * ingress; see @ref dynamic_filter_publication_policy
    */
-  dynamic_filter_publish_plan(
-    std::vector<admitted_key> admitted_keys,
-    std::vector<probe_target> probe_targets,
-    bool emit_zone_map_filters,
-    std::vector<std::size_t> build_key_domain_cardinalities,
-    std::vector<dynamic_filter_replica_space> replica_spaces,
-    double domain_coverage_threshold = k_default_domain_coverage_threshold);
+  dynamic_filter_publish_plan(std::vector<admitted_key> admitted_keys,
+                              std::vector<probe_target> probe_targets,
+                              std::vector<dynamic_filter_replica_space> replica_spaces,
+                              dynamic_filter_publication_policy policy = {});
 
   /**
    * @brief Whether this producer publishes at all
@@ -289,17 +305,9 @@ class dynamic_filter_publish_plan final {
   {
     return _probe_targets;
   }
-  [[nodiscard]] bool emit_zone_map_filters() const noexcept { return _emit_zone_map_filters; }
-  /**
-   * @brief Per-key domain evidence for the publication coverage gates
-   *
-   * @return Cardinalities aligned with `admitted_keys()`, or empty when no domain evidence exists:
-   * the unfiltered cardinality of the base table the build key traces to, or 0 when untraceable
-   * (the coverage gates are then off for that key)
-   */
-  [[nodiscard]] std::vector<std::size_t> const& build_key_domain_cardinalities() const noexcept
+  [[nodiscard]] bool emit_zone_map_filters() const noexcept
   {
-    return _build_key_domain_cardinalities;
+    return _policy.emit_zone_map_filters;
   }
   [[nodiscard]] std::vector<dynamic_filter_replica_space> const& replica_spaces() const noexcept
   {
@@ -307,15 +315,13 @@ class dynamic_filter_publish_plan final {
   }
   [[nodiscard]] double domain_coverage_threshold() const noexcept
   {
-    return _domain_coverage_threshold;
+    return _policy.domain_coverage_threshold;
   }
 
  private:
   std::vector<admitted_key> _admitted_keys;
   std::vector<probe_target> _probe_targets;
-  bool _emit_zone_map_filters = false;
-  std::vector<std::size_t> _build_key_domain_cardinalities;
-  double _domain_coverage_threshold = k_default_domain_coverage_threshold;
+  dynamic_filter_publication_policy _policy{};
   std::vector<dynamic_filter_replica_space>
     _replica_spaces;  ///< Non-owning GPU/HOST placements; see @ref dynamic_filter_replica_space for
                       ///< the lifetime contract

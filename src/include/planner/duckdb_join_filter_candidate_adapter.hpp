@@ -142,8 +142,12 @@ class duckdb_probe_target_candidate final {
  *
  * (Runtime mirrors this: one filter is built per ordinal j and pushed to every target.)
  *
- * Later planning wraps these raw adapter values in strong ordinal types and may compact admitted
- * equality keys into a third space, the Sirius key ordinal.
+ * `sirius_plan_comparison_join` consumes these values and compacts the admitted equality keys into
+ * a dense array, so the filter ordinal above is a plan-construction alignment index that admission
+ * discards. The persisted key coordinates -- planner condition index, admitted-key index, build-key
+ * ordinal, and channel push ordinal -- are documented on `dynamic_filter_publish_plan`. They are
+ * plain integers distinguished by name rather than by type: no strong-index facility exists in this
+ * tree, and introducing one for a single subsystem was judged worse than the confusion it removes.
  */
 class duckdb_join_filter_candidate final {
  public:

@@ -110,16 +110,23 @@ namespace sirius::planner {
  */
 struct dynamic_filter_scan_target_input {
   /**
-   * @brief Per filter ordinal: where that key lands in this scan's `column_ids` space
+   * @brief One key's landing site in this scan target
    */
-  std::vector<std::size_t> channel_push_ordinals;
-  /**
-   * @brief Per filter ordinal: the probe-side storage type at that coordinate
-   *
-   * `cudf::type_id::EMPTY` when the DuckDB type has no cudf representation (zone maps are then
-   * suppressed for that binding).
-   */
-  std::vector<cudf::data_type> probe_storage_types;
+  struct scan_target_column {
+    /// Where the key lands in this scan's `column_ids` space
+    std::size_t channel_push_ordinal = 0;
+    /**
+     * @brief Probe-side storage type at that coordinate
+     *
+     * `cudf::type_id::EMPTY` when the DuckDB type has no cuDF representation, which suppresses
+     * zone maps for the binding built from this column.
+     */
+    cudf::data_type probe_storage_type{cudf::type_id::EMPTY};
+  };
+
+  /// Indexed by the filter ordinal DuckDB recorded, so a push ordinal cannot become separated
+  /// from the probe type it belongs with.
+  std::vector<scan_target_column> columns;
 };
 
 /**
@@ -136,12 +143,6 @@ struct key_admission_result {
    * @brief Sparse key bindings, aligned one-to-one with the scan-target inputs
    */
   std::vector<std::vector<op::dynamic_filter_publish_plan::key_binding>> per_target_key_bindings;
-  /**
-   * @brief Domain cardinalities re-emitted in admitted-key order
-   *
-   * Empty when the input carried no domain evidence.
-   */
-  std::vector<std::size_t> build_key_domain_cardinalities;
 };
 
 /**
@@ -160,9 +161,8 @@ struct key_admission_result {
  * computed from the conditions alone.
  *
  * @throw std::invalid_argument if `condition_shapes` is not aligned with `conditions`, if
- * `scan_targets` is non-empty without `hinted_condition_indexes`, if a hinted index or target arity
- * is inconsistent with `conditions`, or if `condition_domain_cardinalities` is non-empty and not
- * aligned with `conditions`
+ * `scan_targets` is non-empty without `hinted_condition_indexes`, or if a hinted index or target
+ * arity is inconsistent with `conditions`
  *
  * @param[in] conditions The wrapped join conditions in original planner order
  * (post-materialization; wrapping preserves that order)
@@ -175,10 +175,11 @@ struct key_admission_result {
  * @param[in] scan_targets Resolved scan endpoints, in the order DuckDB recorded its probe targets;
  * this target index aligns with the returned `per_target_key_bindings` entry, while each target's
  * inner vectors align by DuckDB filter ordinal
- * @param[in] condition_domain_cardinalities Per condition index, the build key's domain cardinality
- * (0 = unknown); empty when no domain evidence exists
- * @return The admitted keys, per-target bindings, and admitted-order domain cardinalities.
- * `per_target_key_bindings` always has exactly one entry per element of `scan_targets`.
+ * @param[in] condition_domain_cardinalities Per condition index, the build key's domain
+ * cardinality (0 = unknown); empty when no domain evidence exists. Recorded onto each admitted
+ * key, so the result carries no parallel array.
+ * @return The admitted keys and their per-target bindings. `per_target_key_bindings` always has
+ * exactly one entry per element of `scan_targets`.
  */
 [[nodiscard]] key_admission_result admit_dynamic_filter_keys(
   duckdb::vector<sirius::join_condition> const& conditions,

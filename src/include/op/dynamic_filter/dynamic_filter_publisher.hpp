@@ -65,7 +65,10 @@ struct dynamic_filter_publication_outcome {
  * ordinal outside the build table is different in kind -- it proves the plan is incoherent, and
  * `cudf::table_view::column()` does not bounds-check -- so it fails the attempt.
  *
- * @throw std::logic_error if an admitted key's build ordinal lies outside `build_view`
+ * @throw std::runtime_error if the source GPU cannot be identified
+ * @throw std::logic_error if an admitted key's build ordinal lies outside `build_view`, if the
+ * source GPU is absent from the plan's replica spaces, or if a constructed filter does not
+ * implement `sirius_device_replicable`
  *
  * @param[in] plan The join's enabled publication plan (admitted keys, targets, policy, replica
  * placements)

@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "sirius_config.hpp"
 #include "yaml_reader.hpp"
 
 #include <yaml-cpp/yaml.h>
@@ -22,6 +23,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <variant>
@@ -555,4 +557,29 @@ TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")
     std::string msg = e.what();
     REQUIRE(msg.find("test.section.value") != std::string::npos);
   }
+}
+
+TEST_CASE("the domain-coverage threshold is validated where it enters the engine",
+          "[config_opt][conditional][dynamic_filter]")
+{
+  // One predicate backs both ingress surfaces (the YAML reader and the SQL SET handler) so they
+  // cannot drift. Downstream, the publication plan transports the value without re-validating it:
+  // a plan is built for every GPU hash join and must not be able to fail planning.
+  config::valid_domain_coverage_threshold const accepts;
+
+  REQUIRE(accepts(0.9));
+  REQUIRE(accepts(1.5));  // >= 1.0 disables the gate rather than being invalid
+
+  REQUIRE_FALSE(accepts(0.0));   // would suppress every filter
+  REQUIRE_FALSE(accepts(-0.5));  // likewise, and nonsensical as a coverage fraction
+  REQUIRE_FALSE(accepts(std::numeric_limits<double>::quiet_NaN()));  // would disable the gate
+  REQUIRE_FALSE(accepts(std::numeric_limits<double>::infinity()));
+
+  // The YAML surface rejects the same values the SQL surface rejects, and leaves the default.
+  auto node    = YAML::Load("dynamic_filter_domain_coverage_threshold: 0");
+  double value = 0.9;
+  yaml::reader r(node);
+  REQUIRE_THROWS_AS(r.optional("dynamic_filter_domain_coverage_threshold", value, accepts),
+                    std::runtime_error);
+  REQUIRE(value == 0.9);
 }

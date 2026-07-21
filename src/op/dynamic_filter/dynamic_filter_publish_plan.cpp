@@ -27,15 +27,11 @@ namespace sirius::op {
 dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   std::vector<admitted_key> admitted_keys,
   std::vector<probe_target> probe_targets,
-  bool emit_zone_map_filters,
-  std::vector<std::size_t> build_key_domain_cardinalities,
   std::vector<dynamic_filter_replica_space> replica_spaces,
-  double domain_coverage_threshold)
+  dynamic_filter_publication_policy policy)
   : _admitted_keys(std::move(admitted_keys)),
     _probe_targets(std::move(probe_targets)),
-    _emit_zone_map_filters(emit_zone_map_filters),
-    _build_key_domain_cardinalities(std::move(build_key_domain_cardinalities)),
-    _domain_coverage_threshold(domain_coverage_threshold),
+    _policy(policy),
     _replica_spaces(std::move(replica_spaces))
 {
   if (!_probe_targets.empty() && _replica_spaces.empty()) {
@@ -64,13 +60,6 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   _replica_spaces.erase(std::unique(_replica_spaces.begin(), _replica_spaces.end(), same_device),
                         _replica_spaces.end());
 
-  if (!_build_key_domain_cardinalities.empty() &&
-      _build_key_domain_cardinalities.size() != _admitted_keys.size()) {
-    throw std::invalid_argument(
-      "[dynamic_filter_publish_plan] Build-key domain cardinalities must be empty or aligned "
-      "one-to-one with the admitted keys");
-  }
-
   std::vector<std::size_t> condition_indexes;
   condition_indexes.reserve(_admitted_keys.size());
   for (auto const& key : _admitted_keys) {
@@ -84,13 +73,12 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
         "[dynamic_filter_publish_plan] An admitted key has an EMPTY storage type (admission must "
         "not admit a key whose type it cannot represent)");
     }
-    condition_indexes.push_back(key.condition_index);
+    condition_indexes.push_back(key.planner_condition_index);
   }
-  std::sort(condition_indexes.begin(), condition_indexes.end());
-  if (std::adjacent_find(condition_indexes.begin(), condition_indexes.end()) !=
-      condition_indexes.end()) {
+  std::ranges::sort(condition_indexes);
+  if (std::ranges::adjacent_find(condition_indexes) != condition_indexes.end()) {
     throw std::invalid_argument(
-      "[dynamic_filter_publish_plan] Admitted keys must reference distinct join conditions");
+      "[dynamic_filter_publish_plan] Admitted keys must name distinct planner conditions");
   }
 
   for (auto const& target : _probe_targets) {
@@ -117,8 +105,8 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
     // Duplicate channel_push_ordinal values stay legal -- two admitted keys may bind the same
     // probe column, and the channel conjoins same-column filters -- but one admitted key bound
     // twice on one target would push the same filter twice.
-    std::sort(bound_keys.begin(), bound_keys.end());
-    if (std::adjacent_find(bound_keys.begin(), bound_keys.end()) != bound_keys.end()) {
+    std::ranges::sort(bound_keys);
+    if (std::ranges::adjacent_find(bound_keys) != bound_keys.end()) {
       throw std::invalid_argument(
         "[dynamic_filter_publish_plan] A probe target may bind each admitted key at most once");
     }

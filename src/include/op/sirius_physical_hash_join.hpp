@@ -96,15 +96,34 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   duckdb::vector<sirius::join_condition> conditions;
   /**
-   * @brief Carried pre-materialization key-shape classification, index-aligned with
-   * `conditions`
+   * @brief Shape of the key sides of one condition, in this operator's own condition order
    *
-   * Either empty or `condition_key_shapes[i]` describes `conditions[i]`, an alignment the
-   * constructor preserves by permuting both vectors through one `reorder_join_conditions`
-   * call. Immutable after construction (like `conditions`). Consumed by the plan-time
-   * join-edge placement helper of issue #1010; runtime execution never reads it.
+   * The classification is captured before the planner materializes computed keys, then permuted
+   * with `conditions` so index `i` always describes `conditions[i]`. The argument is therefore in
+   * **reordered equality-ordinal space**, the same space as `key_casts` and
+   * `right_key_col_indices` -- never the planner condition order that
+   * `dynamic_filter_publish_plan::admitted_key::planner_condition_index` records.
+   *
+   * Consumed by the plan-time join-edge placement helper that issue #1010's next unit adds; the
+   * runtime execution path never reads it. Returns `direct` for both sides when no classification
+   * was carried, which is the shape a caller may not act on.
+   *
+   * @param[in] reordered_condition_index Index into this operator's `conditions`
+   * @return The carried classification, or a default-constructed shape when none was carried
    */
-  std::vector<dynamic_filter_condition_shape> condition_key_shapes;
+  [[nodiscard]] dynamic_filter_condition_shape key_shape_of_condition(
+    std::size_t reordered_condition_index) const noexcept
+  {
+    return reordered_condition_index < _condition_key_shapes.size()
+             ? _condition_key_shapes[reordered_condition_index]
+             : dynamic_filter_condition_shape{};
+  }
+
+  /// Whether any key-shape classification was carried onto this operator
+  [[nodiscard]] bool has_condition_key_shapes() const noexcept
+  {
+    return !_condition_key_shapes.empty();
+  }
 
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
@@ -232,6 +251,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
  protected:
   std::vector<key_cast_info> key_casts;
+
+  /// Immutable after construction; see @ref key_shape_of_condition for the coordinate space.
+  std::vector<dynamic_filter_condition_shape> _condition_key_shapes;
 
   //===----------------------------------------------------------------------===//
   // Dynamic Filters

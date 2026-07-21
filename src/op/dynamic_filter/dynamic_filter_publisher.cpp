@@ -16,13 +16,14 @@
 
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
-#include "cudf/aggregation.hpp"
-#include "cudf/reduction.hpp"
-#include "cudf/scalar/scalar.hpp"
-#include "cudf/types.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+
+#include <cudf/aggregation.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/types.hpp>
 
 #include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
@@ -94,7 +95,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   }
 
   auto const& admitted_keys = plan.admitted_keys();
-  auto const& key_domains   = plan.build_key_domain_cardinalities();
   outcome.keys_considered   = admitted_keys.size();
 
   int source_device = -1;
@@ -166,8 +166,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
 
     // Skip domain-covering keys before paying to build a membership structure; their filters keep
     // most probe rows, and the consumer-side gate remains the runtime backstop.
-    auto const key_domain =
-      admitted_key_index < key_domains.size() ? key_domains[admitted_key_index] : 0;
+    auto const key_domain = admitted_key.build_key_domain_cardinality;
     if (domain_coverage_gate_fires(build_rows, key_domain, plan.domain_coverage_threshold())) {
       SIRIUS_LOG_DEBUG(
         "[sirius_physical_hash_join] publish gate: key {}: build {} rows cover {:.2f} of key "

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -42,6 +41,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "planner/duckdb_join_filter_candidate_adapter.hpp"
 #include "planner/dynamic_filter_key_admission.hpp"
+#include "planner/dynamic_filter_scan_routes.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
@@ -554,103 +554,74 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // admitted-key publication plan before constructing the physical join. Routing and device
     // placement are plan-time decisions; runtime code only consumes the resulting
     // dynamic_filter_publish_plan value and never reads DuckDB metadata.
-    std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> filter_targets;
+    //
+    // The memory-space lookup stays here and is answered before resolve_scan_routes mints
+    // anything: a producer must not register on channels it would then abandon for want of a
+    // replica placement.
+    auto& memory_manager  = sirius_context->get_memory_manager();
+    auto const gpu_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    auto const host_spaces =
+      memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    auto routes = resolve_scan_routes(
+      filter_candidate,
+      /*device_placement_available=*/!gpu_spaces.empty() && !host_spaces.empty(),
+      [this](duckdb::DynamicTableFilterSet const* channel_identity) {
+        return get_or_create_dynamic_filter_channel(channel_identity);
+      });
+
     std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
-    std::vector<dynamic_filter_scan_target_input> scan_target_inputs;
-    switch (filter_candidate.kind()) {
-      case duckdb_candidate_kind::absent: break;
-      case duckdb_candidate_kind::malformed:
+    switch (routes.decision) {
+      // A producer whose channels all mint null (the master switch being off, for instance) wires
+      // nothing and says nothing, exactly as an absent candidate does.
+      case dynamic_filter_routing_decision::no_duckdb_metadata:
+      case dynamic_filter_routing_decision::no_live_channel: break;
+      case dynamic_filter_routing_decision::metadata_malformed:
         SIRIUS_LOG_WARN(
           "[sirius_plan_comparison_join] Not wiring dynamic filter(s): DuckDB join-filter "
           "metadata failed structural validation.");
         break;
-      case duckdb_candidate_kind::statistics_only:
+      case dynamic_filter_routing_decision::build_side_unfiltered:
         SIRIUS_LOG_INFO(
           "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is "
           "unfiltered (build est {} rows).",
           rhs_cardinality);
         break;
-      case duckdb_candidate_kind::admitted: {
-        // An unfiltered build is (for FK-shaped joins) the whole key domain -- its filter keeps
-        // every probe row by construction, so wiring a producer target for it only buys overhead.
-        // DuckDB's hint covers the delim-join case where the effective build data is children[0].
-        if (!filter_candidate.build_subtree_has_filter_hint()) {
-          SIRIUS_LOG_INFO(
-            "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is "
-            "unfiltered (build est {} rows).",
-            rhs_cardinality);
-          break;
-        }
-        auto& memory_manager = sirius_context->get_memory_manager();
-        auto const gpu_spaces =
-          memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-        auto const host_spaces =
-          memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-        if (gpu_spaces.empty() || host_spaces.empty()) {
-          SIRIUS_LOG_INFO(
-            "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
-            "memory space are required for device-local replicas.");
-          break;
-        }
-        filter_targets.reserve(filter_candidate.targets().size());
-        scan_target_inputs.reserve(filter_candidate.targets().size());
-        for (auto const& target_candidate : filter_candidate.targets()) {
-          auto channel =
-            get_or_create_dynamic_filter_channel(target_candidate.channel_identity().get());
-          if (!channel) { continue; }
-          channel->register_producer();
-          dynamic_filter_scan_target_input target_input;
-          target_input.channel_push_ordinals.reserve(target_candidate.columns().size());
-          target_input.probe_storage_types.reserve(target_candidate.columns().size());
-          for (auto const& column : target_candidate.columns()) {
-            target_input.channel_push_ordinals.push_back(column.column_index);
-            auto storage_type = cudf::data_type{cudf::type_id::EMPTY};
-            try {
-              storage_type = sirius::get_cudf_type(sirius::from_duckdb(column.storage_type));
-            } catch (std::exception const&) {
-              // EMPTY type will prevent zone-map filter construction for this binding
-            }
-            target_input.probe_storage_types.push_back(storage_type);
+      case dynamic_filter_routing_decision::no_device_placement:
+        SIRIUS_LOG_INFO(
+          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
+          "memory space are required for device-local replicas.");
+        break;
+      case dynamic_filter_routing_decision::wired: {
+        // Resolve each replica's NUMA-local Sirius HOST space once at plan time. The transfer
+        // path borrows fixed pinned blocks from that explicit space if peer DMA is unavailable.
+        auto const& topology = sirius_context->get_config().get_hw_topology();
+        for (auto const* gpu_space : gpu_spaces) {
+          auto const gpu_id = gpu_space->get_device_id();
+          auto const gpu_info =
+            std::find_if(topology.gpus.begin(), topology.gpus.end(), [gpu_id](auto const& gpu) {
+              return static_cast<int>(gpu.id) == gpu_id;
+            });
+          auto const numa_node = gpu_info == topology.gpus.end() ? -1 : gpu_info->numa_node;
+          auto const local_host =
+            std::find_if(host_spaces.begin(), host_spaces.end(), [numa_node](auto const* host) {
+              return numa_node >= 0 && host->get_device_id() == numa_node;
+            });
+          auto const* host_space =
+            local_host == host_spaces.end() ? host_spaces.front() : *local_host;
+          auto* mutable_gpu_space =
+            memory_manager.get_memory_space(cucascade::memory::Tier::GPU, gpu_id);
+          if (mutable_gpu_space == nullptr) {
+            throw std::logic_error(
+              "[sirius_plan_comparison_join] Dynamic-filter GPU space disappeared during "
+              "plan construction");
           }
-          scan_target_inputs.push_back(std::move(target_input));
-          filter_targets.push_back(sirius::op::dynamic_filter_publish_plan::probe_target{
-            .filter_set               = std::move(channel),
-            .route_class              = sirius::op::dynamic_filter_route_class::scan,
-            .accepts_zone_map_filters = true,
-            .key_bindings             = {}});
+          filter_replica_spaces.emplace_back(*mutable_gpu_space, *host_space);
         }
-        if (!filter_targets.empty()) {
-          // Resolve each replica's NUMA-local Sirius HOST space once at plan time. The transfer
-          // path borrows fixed pinned blocks from that explicit space if peer DMA is unavailable.
-          auto const& topology = sirius_context->get_config().get_hw_topology();
-          for (auto const* gpu_space : gpu_spaces) {
-            auto const gpu_id = gpu_space->get_device_id();
-            auto const gpu_info =
-              std::find_if(topology.gpus.begin(), topology.gpus.end(), [gpu_id](auto const& gpu) {
-                return static_cast<int>(gpu.id) == gpu_id;
-              });
-            auto const numa_node = gpu_info == topology.gpus.end() ? -1 : gpu_info->numa_node;
-            auto const local_host =
-              std::find_if(host_spaces.begin(), host_spaces.end(), [numa_node](auto const* host) {
-                return numa_node >= 0 && host->get_device_id() == numa_node;
-              });
-            auto const* host_space =
-              local_host == host_spaces.end() ? host_spaces.front() : *local_host;
-            auto* mutable_gpu_space =
-              memory_manager.get_memory_space(cucascade::memory::Tier::GPU, gpu_id);
-            if (mutable_gpu_space == nullptr) {
-              throw std::logic_error(
-                "[sirius_plan_comparison_join] Dynamic-filter GPU space disappeared during "
-                "plan construction");
-            }
-            filter_replica_spaces.emplace_back(*mutable_gpu_space, *host_space);
-          }
-          SIRIUS_LOG_INFO(
-            "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
-            "target(s) (build est {} rows).",
-            filter_targets.size(),
-            rhs_cardinality);
-        }
+        SIRIUS_LOG_INFO(
+          "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
+          "target(s) (build est {} rows).",
+          routes.targets.size(),
+          rhs_cardinality);
         break;
       }
     }
@@ -660,28 +631,27 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // condition set, admission is restricted to it so publication constructs exactly the filters
     // the runtime publisher constructed before admission moved to plan time.
     auto const hinted_condition_indexes =
-      filter_candidate.kind() == duckdb_candidate_kind::admitted
-        ? std::optional<std::span<std::size_t const>>{std::span<std::size_t const>{
-            filter_candidate.condition_indexes()}}
-        : std::nullopt;
+      routes.hinted_condition_indexes.empty()
+        ? std::optional<std::span<std::size_t const>>{}
+        : std::optional<std::span<std::size_t const>>{
+            std::span<std::size_t const>{routes.hinted_condition_indexes}};
     auto admission = admit_dynamic_filter_keys(conditions,
                                                condition_key_shapes,
                                                hinted_condition_indexes,
-                                               scan_target_inputs,
+                                               routes.target_inputs,
                                                condition_domains);
     // Postcondition of admit_dynamic_filter_keys: one binding list per input target.
-    assert(admission.per_target_key_bindings.size() == filter_targets.size());
-    for (std::size_t target_index = 0; target_index < filter_targets.size(); ++target_index) {
-      filter_targets[target_index].key_bindings =
+    assert(admission.per_target_key_bindings.size() == routes.targets.size());
+    for (std::size_t target_index = 0; target_index < routes.targets.size(); ++target_index) {
+      routes.targets[target_index].key_bindings =
         std::move(admission.per_target_key_bindings[target_index]);
     }
     sirius::op::dynamic_filter_publish_plan filter_plan{
       std::move(admission.admitted_keys),
-      std::move(filter_targets),
-      op_params.enable_dynamic_zone_map_filter,
-      std::move(admission.build_key_domain_cardinalities),
+      std::move(routes.targets),
       std::move(filter_replica_spaces),
-      op_params.dynamic_filter_domain_coverage_threshold};
+      {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
+       .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold}};
 
     auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,

@@ -58,7 +58,7 @@ bool side_blocks_scan_route(op::dynamic_filter_key_shape shape) noexcept
  *
  * This is the single checked conversion point between the two index spaces; they meet nowhere else.
  *
- * @throw std::logic_error if the index exceeds the cudf column ordinal range
+ * @throw std::invalid_argument if the index exceeds the cuDF column ordinal range
  *
  * @param[in] bound_reference_index The build side's AST reference column ordinal
  * @return The equivalent cudf column ordinal
@@ -68,8 +68,8 @@ cudf::size_type to_build_key_ordinal(std::uint32_t bound_reference_index)
   constexpr auto k_max_ordinal =
     static_cast<std::uint32_t>(std::numeric_limits<cudf::size_type>::max());
   if (bound_reference_index > k_max_ordinal) {
-    throw std::logic_error(
-      "[dynamic_filter_key_admission] A build-side bound-reference index exceeds the cudf column "
+    throw std::invalid_argument(
+      "[dynamic_filter_key_admission] A build-side reference ordinal exceeds the cuDF column "
       "ordinal range");
   }
   return static_cast<cudf::size_type>(bound_reference_index);
@@ -86,12 +86,14 @@ cudf::size_type to_build_key_ordinal(std::uint32_t bound_reference_index)
  * @param[in] condition The join condition to admit
  * @param[in] shape The condition's carried pre-materialization side shapes
  * @param[in] condition_index The condition's index in original planner order
+ * @param[in] domain_cardinality The build key's domain cardinality, or 0 when unknown
  * @return The admitted key, or nullopt when the condition is not scan-route legal
  */
 std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_key(
   sirius::join_condition const& condition,
   op::dynamic_filter_condition_shape shape,
-  std::size_t condition_index)
+  std::size_t condition_index,
+  std::size_t domain_cardinality)
 {
   if (condition.comparison != sirius::comparison_type::equal) { return std::nullopt; }
   if (side_blocks_scan_route(shape.probe) || side_blocks_scan_route(shape.build)) {
@@ -112,10 +114,11 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   if (!storage_type.has_value()) { return std::nullopt; }
 
   return op::dynamic_filter_publish_plan::admitted_key{
-    .condition_index   = condition_index,
-    .build_key_ordinal = to_build_key_ordinal(build_ref.column_index),
-    .storage_type      = *storage_type,
-    .key_shape         = shape};
+    .planner_condition_index      = condition_index,
+    .build_key_ordinal            = to_build_key_ordinal(build_ref.column_index),
+    .storage_type                 = *storage_type,
+    .key_shape                    = shape,
+    .build_key_domain_cardinality = domain_cardinality};
 }
 
 }  // namespace
@@ -178,14 +181,17 @@ key_admission_result admit_dynamic_filter_keys(
       }
     }
     for (auto const& target : scan_targets) {
-      if (target.channel_push_ordinals.size() != hinted_condition_indexes->size() ||
-          target.probe_storage_types.size() != hinted_condition_indexes->size()) {
+      if (target.columns.size() != hinted_condition_indexes->size()) {
         throw std::invalid_argument(
           "[dynamic_filter_key_admission] A scan target's arity must match the hinted condition "
           "indexes");
       }
     }
   }
+
+  // Hoisted once, immediately after validation: an absent hint and an empty hint drive the same
+  // binding loop, so no later code has to reason about the optional's state.
+  auto const hinted = hinted_condition_indexes.value_or(std::span<std::size_t const>{});
 
   key_admission_result result;
 
@@ -196,14 +202,19 @@ key_admission_result admit_dynamic_filter_keys(
   std::unordered_map<std::size_t, std::size_t> admitted_index_by_condition;
   auto admit_condition = [&](std::size_t condition_index) {
     if (admitted_index_by_condition.contains(condition_index)) { return; }
-    auto admitted = admit_scan_route_key(
-      conditions[condition_index], condition_shapes[condition_index], condition_index);
+    auto const domain_cardinality = condition_index < condition_domain_cardinalities.size()
+                                      ? condition_domain_cardinalities[condition_index]
+                                      : 0;
+    auto admitted                 = admit_scan_route_key(conditions[condition_index],
+                                         condition_shapes[condition_index],
+                                         condition_index,
+                                         domain_cardinality);
     if (!admitted.has_value()) { return; }
     admitted_index_by_condition.emplace(condition_index, result.admitted_keys.size());
     result.admitted_keys.push_back(*std::move(admitted));
   };
   if (hinted_condition_indexes.has_value()) {
-    for (auto const condition_index : *hinted_condition_indexes) {
+    for (auto const condition_index : hinted) {
       admit_condition(condition_index);
     }
   } else {
@@ -218,23 +229,14 @@ key_admission_result admit_dynamic_filter_keys(
   for (std::size_t target_index = 0; target_index < scan_targets.size(); ++target_index) {
     auto const& target = scan_targets[target_index];
     auto& bindings     = result.per_target_key_bindings[target_index];
-    for (std::size_t filter_ordinal = 0; filter_ordinal < hinted_condition_indexes->size();
-         ++filter_ordinal) {
-      auto const admitted_it =
-        admitted_index_by_condition.find((*hinted_condition_indexes)[filter_ordinal]);
+    for (std::size_t filter_ordinal = 0; filter_ordinal < hinted.size(); ++filter_ordinal) {
+      auto const admitted_it = admitted_index_by_condition.find(hinted[filter_ordinal]);
       if (admitted_it == admitted_index_by_condition.end()) { continue; }
+      auto const& column = target.columns[filter_ordinal];
       bindings.push_back(op::dynamic_filter_publish_plan::key_binding{
         .admitted_key_index   = admitted_it->second,
-        .channel_push_ordinal = target.channel_push_ordinals[filter_ordinal],
-        .probe_storage_type   = target.probe_storage_types[filter_ordinal]});
-    }
-  }
-
-  if (!condition_domain_cardinalities.empty()) {
-    result.build_key_domain_cardinalities.reserve(result.admitted_keys.size());
-    for (auto const& admitted : result.admitted_keys) {
-      result.build_key_domain_cardinalities.push_back(
-        condition_domain_cardinalities[admitted.condition_index]);
+        .channel_push_ordinal = column.channel_push_ordinal,
+        .probe_storage_type   = column.probe_storage_type});
     }
   }
 

@@ -71,14 +71,18 @@ std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
   return {{*gpu_space, *host_space}};
 }
 
-/// One admitted INT64 key over build column @p build_key_ordinal.
+/// One admitted INT64 key over build column @p build_key_ordinal, tracing to a key domain of @p
+/// domain_cardinality values; 0 leaves the coverage gates disabled for the key.
 dynamic_filter_publish_plan::admitted_key make_int64_key(std::size_t condition_index,
-                                                         cudf::size_type build_key_ordinal)
+                                                         cudf::size_type build_key_ordinal,
+                                                         std::size_t domain_cardinality = 0)
 {
-  return dynamic_filter_publish_plan::admitted_key{.condition_index   = condition_index,
-                                                   .build_key_ordinal = build_key_ordinal,
-                                                   .storage_type      = kInt64,
-                                                   .key_shape         = {}};
+  return dynamic_filter_publish_plan::admitted_key{
+    .planner_condition_index      = condition_index,
+    .build_key_ordinal            = build_key_ordinal,
+    .storage_type                 = kInt64,
+    .key_shape                    = {},
+    .build_key_domain_cardinality = domain_cardinality};
 }
 
 /// GPU fixture: memory manager, replica spaces, a construction stream, and INT64 key columns.
@@ -180,7 +184,7 @@ void require_published_membership(std::size_t rows)
                                                    .channel_push_ordinal = kProbeColumnIndex,
                                                    .probe_storage_type   = kInt64}}});
   dynamic_filter_publish_plan plan{
-    {make_int64_key(0, 0)}, std::move(targets), false, {0}, std::move(fixture.replica_spaces)};
+    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
 
   auto const& keys = *fixture.columns.front();
   if constexpr (std::is_same_v<ExpectedFilter, sirius::op::sirius_dynamic_small_in_list_filter>) {
@@ -207,6 +211,101 @@ void require_published_membership(std::size_t rows)
   if constexpr (std::is_same_v<ExpectedFilter, sirius::op::sirius_dynamic_in_list_filter>) {
     REQUIRE(selected->has_persistent_set());
   }
+}
+
+/// Require that @p outcome describes an attempt that walked no key, built nothing, and reached no
+/// target.
+void require_nothing_published(sirius::op::dynamic_filter_publication_outcome const& outcome)
+{
+  REQUIRE(outcome.keys_considered == 0);
+  REQUIRE(outcome.keys_skipped_domain_gate == 0);
+  REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+  REQUIRE(outcome.membership_filters_built == 0);
+  REQUIRE(outcome.zone_map_filters_built == 0);
+  REQUIRE(outcome.active_targets == 0);
+  REQUIRE(outcome.filters_pushed == 0);
+}
+
+/// A HOST memory space, as a mutable reference the plan's replica-space tier guards can be handed
+/// in either slot.
+cucascade::memory::memory_space& host_memory_space(publisher_fixture& fixture)
+{
+  auto const host_spaces =
+    fixture.memory_manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(host_spaces.empty());
+  auto* space = fixture.memory_manager->get_memory_space(cucascade::memory::Tier::HOST,
+                                                         host_spaces.front()->get_device_id());
+  REQUIRE(space != nullptr);
+  return *space;
+}
+
+/// Publish two admitted keys bound to one target and require that the domain-coverage gate skips
+/// exactly @p gated_key_index.
+///
+/// The two keys differ in every coordinate the publisher could confuse: admitted-key index, build
+/// ordinal, build column values, channel push ordinal, and domain cardinality. Only the gated key
+/// traces to a domain its build covers, so a publisher that read one key's cardinality while
+/// building another key's filter -- or that published a filter at another key's push ordinal --
+/// gates the wrong key and fails here.
+void require_domain_gate_skips_only(std::size_t gated_key_index)
+{
+  constexpr std::size_t kBuildRows = 3;
+  // Coverage 3/3 = 1.0 trips the plan's default threshold; 3/1000 = 0.003 stays far below it.
+  constexpr std::size_t kCoveredDomain   = kBuildRows;
+  constexpr std::size_t kWideDomain      = 1000;
+  constexpr std::size_t kKey0PushOrdinal = 3;
+  constexpr std::size_t kKey1PushOrdinal = 5;
+
+  publisher_fixture fixture;
+  // Disjoint value ranges per build column: admitted key 0 names build ordinal 1 ({0,1,2}) and
+  // admitted key 1 names build ordinal 0 ({100,101,102}), so the surviving filter's contents say
+  // which key it was built from.
+  fixture.add_key_column(kBuildRows, 100);
+  fixture.add_key_column(kBuildRows, 0);
+
+  auto const domain_of = [gated_key_index](std::size_t key_index) {
+    return key_index == gated_key_index ? kCoveredDomain : kWideDomain;
+  };
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kKey0PushOrdinal,
+                                                   .probe_storage_type   = kInt64},
+                                                  {.admitted_key_index   = 1,
+                                                   .channel_push_ordinal = kKey1PushOrdinal,
+                                                   .probe_storage_type   = kInt64}}});
+  dynamic_filter_publish_plan plan{
+    {make_int64_key(0, 1, domain_of(0)), make_int64_key(1, 0, domain_of(1))},
+    std::move(targets),
+    std::move(fixture.replica_spaces)};
+
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+
+  REQUIRE(outcome.keys_considered == 2);
+  REQUIRE(outcome.keys_skipped_domain_gate == 1);
+  REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.zone_map_filters_built == 0);
+  REQUIRE(outcome.active_targets == 1);
+  REQUIRE(outcome.filters_pushed == 1);
+
+  auto const gated_ordinal     = gated_key_index == 0 ? kKey0PushOrdinal : kKey1PushOrdinal;
+  auto const surviving_ordinal = gated_key_index == 0 ? kKey1PushOrdinal : kKey0PushOrdinal;
+  REQUIRE(channel->filters_for_column(gated_ordinal).empty());
+  auto const surviving = channel->filters_for_column(surviving_ordinal);
+  REQUIRE(surviving.size() == 1);
+
+  // Presence at the right ordinal is not enough: apply the filter to one value from each build
+  // column, so a filter built from the gated key's column keeps the wrong probe row here.
+  auto const probe = make_int64_values(fixture, {0, 100});
+  auto const expected =
+    gated_key_index == 0 ? std::vector<std::uint8_t>{0, 1} : std::vector<std::uint8_t>{1, 0};
+  REQUIRE(membership_mask(*surviving.front(), probe->view(), fixture) == expected);
 }
 
 }  // namespace
@@ -250,8 +349,6 @@ TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only
        {.admitted_key_index = 1, .channel_push_ordinal = 5, .probe_storage_type = kInt64}}});
   dynamic_filter_publish_plan plan{{make_int64_key(0, 1), make_int64_key(1, 0)},
                                    std::move(targets),
-                                   false,
-                                   {},
                                    std::move(fixture.replica_spaces)};
 
   auto const outcome =
@@ -279,6 +376,13 @@ TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only
           std::vector<std::uint8_t>{0, 1});
 }
 
+TEST_CASE("dynamic-filter publisher applies the domain-coverage gate to each key's own domain",
+          "[dynamic_filter][publisher]")
+{
+  SECTION("the first admitted key covers its domain") { require_domain_gate_skips_only(0); }
+  SECTION("the second admitted key covers its domain") { require_domain_gate_skips_only(1); }
+}
+
 TEST_CASE("dynamic-filter publisher fails loudly on a plan/runtime key-mapping inconsistency",
           "[dynamic_filter][publisher]")
 {
@@ -298,8 +402,7 @@ TEST_CASE("dynamic-filter publisher fails loudly on a plan/runtime key-mapping i
                                                      .channel_push_ordinal = kProbeColumnIndex,
                                                      .probe_storage_type   = kInt64}}});
     auto replica_spaces = fixture.replica_spaces;  // copy; each section builds its own plan
-    return dynamic_filter_publish_plan{
-      {key}, std::move(targets), false, {0}, std::move(replica_spaces)};
+    return dynamic_filter_publish_plan{{key}, std::move(targets), std::move(replica_spaces)};
   };
 
   SECTION("build ordinal outside the runtime build table")
@@ -348,9 +451,8 @@ TEST_CASE("dynamic-filter publisher suppresses zone maps per binding on probe-ty
                                    .probe_storage_type   = cudf::data_type{cudf::type_id::INT32}}}});
   dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
                                    std::move(targets),
-                                   true,  // emit zone maps
-                                   {0},
-                                   std::move(fixture.replica_spaces)};
+                                   std::move(fixture.replica_spaces),
+                                   {.emit_zone_map_filters = true}};
 
   auto const outcome =
     sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
@@ -392,9 +494,8 @@ TEST_CASE("dynamic-filter publisher keeps zone maps out of membership-only targe
        {.admitted_key_index = 0, .channel_push_ordinal = 2, .probe_storage_type = kInt64}}});
   dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
                                    std::move(targets),
-                                   true,  // emit zone maps
-                                   {0},
-                                   std::move(fixture.replica_spaces)};
+                                   std::move(fixture.replica_spaces),
+                                   {.emit_zone_map_filters = true}};
 
   auto const outcome =
     sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
@@ -422,14 +523,110 @@ TEST_CASE("dynamic-filter publisher completes on a plan with targets but no admi
                      .route_class              = dynamic_filter_route_class::scan,
                      .accepts_zone_map_filters = true,
                      .key_bindings             = {}});
-  dynamic_filter_publish_plan plan{
-    {}, std::move(targets), false, {}, std::move(fixture.replica_spaces)};
+  dynamic_filter_publish_plan plan{{}, std::move(targets), std::move(fixture.replica_spaces)};
   REQUIRE(plan.enabled());
 
   // A producer whose keys were all inadmissible still claims publication and publishes nothing.
   auto const outcome =
     sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
   REQUIRE_FALSE(channel->has_filters());
+}
+
+TEST_CASE("dynamic-filter publisher publishes nothing from an empty build",
+          "[dynamic_filter][publisher]")
+{
+  // An empty build carries no key values to construct from, and its join emits no rows whatever the
+  // probe side keeps, so nothing is built, replicated, or pushed. Zone maps are enabled here so the
+  // reduction path is skipped too.
+  publisher_fixture fixture;
+  fixture.add_key_column(0);
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
+                                   std::move(targets),
+                                   std::move(fixture.replica_spaces),
+                                   {.emit_zone_map_filters = true}};
+
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  require_nothing_published(outcome);
+  REQUIRE(channel->empty());
+  REQUIRE_FALSE(channel->has_filters());
+}
+
+TEST_CASE("dynamic-filter publisher publishes nothing once every target has drained",
+          "[dynamic_filter][publisher]")
+{
+  // No future consumer split can observe a filter pushed now, so the build is skipped outright.
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  channel->close_for_new_filters();
+  REQUIRE_FALSE(channel->accepting_filters());
+
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  dynamic_filter_publish_plan plan{
+    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
+
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  require_nothing_published(outcome);
+  REQUIRE(channel->empty());
+  REQUIRE_FALSE(channel->has_filters());
+}
+
+TEST_CASE("dynamic-filter publisher serves a live target beside a drained one",
+          "[dynamic_filter][publisher]")
+{
+  // The drained target comes first, so a fan-out that stopped at the first unusable target -- or
+  // that counted it as active -- fails here.
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+
+  auto drained_channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  drained_channel->close_for_new_filters();
+  auto live_channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back(
+    {.filter_set               = drained_channel,
+     .route_class              = dynamic_filter_route_class::scan,
+     .accepts_zone_map_filters = true,
+     .key_bindings             = {
+       {.admitted_key_index = 0, .channel_push_ordinal = 3, .probe_storage_type = kInt64}}});
+  targets.push_back(
+    {.filter_set               = live_channel,
+     .route_class              = dynamic_filter_route_class::scan,
+     .accepts_zone_map_filters = true,
+     .key_bindings             = {
+       {.admitted_key_index = 0, .channel_push_ordinal = 5, .probe_storage_type = kInt64}}});
+  dynamic_filter_publish_plan plan{
+    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
+
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+
+  REQUIRE(outcome.keys_considered == 1);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.active_targets == 1);
+  REQUIRE(outcome.filters_pushed == 1);
+
+  REQUIRE(live_channel->filters_for_column(5).size() == 1);
+  REQUIRE(drained_channel->empty());
 }
 
 TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
@@ -447,7 +644,7 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
                        .key_bindings             = {}});
     REQUIRE_THROWS_AS(
       dynamic_filter_publish_plan(
-        {make_int64_key(0, 0)}, std::move(targets), false, {}, std::move(fixture.replica_spaces)),
+        {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)),
       std::invalid_argument);
   }
 
@@ -460,7 +657,7 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
                        .key_bindings             = {}});
     REQUIRE_THROWS_AS(
       dynamic_filter_publish_plan(
-        {make_int64_key(0, 0)}, std::move(targets), false, {}, std::move(fixture.replica_spaces)),
+        {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)),
       std::invalid_argument);
   }
 
@@ -475,7 +672,7 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
          {.admitted_key_index = 1, .channel_push_ordinal = 0, .probe_storage_type = kInt64}}});
     REQUIRE_THROWS_AS(
       dynamic_filter_publish_plan(
-        {make_int64_key(0, 0)}, std::move(targets), false, {}, std::move(fixture.replica_spaces)),
+        {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)),
       std::invalid_argument);
   }
 
@@ -491,7 +688,7 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
          {.admitted_key_index = 0, .channel_push_ordinal = 1, .probe_storage_type = kInt64}}});
     REQUIRE_THROWS_AS(
       dynamic_filter_publish_plan(
-        {make_int64_key(0, 0)}, std::move(targets), false, {}, std::move(fixture.replica_spaces)),
+        {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)),
       std::invalid_argument);
   }
 
@@ -507,8 +704,50 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
          {.admitted_key_index = 1, .channel_push_ordinal = 4, .probe_storage_type = kInt64}}});
     REQUIRE_NOTHROW(dynamic_filter_publish_plan({make_int64_key(0, 0), make_int64_key(1, 1)},
                                                 std::move(targets),
-                                                false,
-                                                {},
                                                 std::move(fixture.replica_spaces)));
+  }
+}
+
+TEST_CASE("dynamic-filter publish plan rejects unusable replica placements",
+          "[dynamic_filter][publisher]")
+{
+  // A placement the publisher cannot allocate a replica in, or stage a transfer through, would
+  // otherwise surface as an allocation failure mid-publication rather than at plan construction.
+  publisher_fixture fixture;
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+
+  auto make_targets = [&channel] {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back({.filter_set               = channel,
+                       .route_class              = dynamic_filter_route_class::scan,
+                       .accepts_zone_map_filters = true,
+                       .key_bindings             = {{.admitted_key_index   = 0,
+                                                     .channel_push_ordinal = kProbeColumnIndex,
+                                                     .probe_storage_type   = kInt64}}});
+    return targets;
+  };
+
+  SECTION("probe targets with no replica placement at all")
+  {
+    REQUIRE_THROWS_AS(dynamic_filter_publish_plan({make_int64_key(0, 0)}, make_targets(), {}),
+                      std::invalid_argument);
+  }
+
+  SECTION("a placement whose GPU slot holds a host space")
+  {
+    auto& host_space = host_memory_space(fixture);
+    std::vector<sirius::op::dynamic_filter_replica_space> spaces{{host_space, host_space}};
+    REQUIRE_THROWS_AS(
+      dynamic_filter_publish_plan({make_int64_key(0, 0)}, make_targets(), std::move(spaces)),
+      std::invalid_argument);
+  }
+
+  SECTION("a placement whose staging slot holds a GPU space")
+  {
+    auto& gpu_space = fixture.replica_spaces.front().get_gpu_space();
+    std::vector<sirius::op::dynamic_filter_replica_space> spaces{{gpu_space, gpu_space}};
+    REQUIRE_THROWS_AS(
+      dynamic_filter_publish_plan({make_int64_key(0, 0)}, make_targets(), std::move(spaces)),
+      std::invalid_argument);
   }
 }

@@ -173,13 +173,16 @@ bool sirius_physical_hash_join::are_conditions_supported(
   return true;
 }
 
+namespace {
+
+/// Move equality conditions ahead of the rest, permuting the carried key shapes identically.
+///
+/// This call is the single point that establishes the conditions/shapes index alignment, so the
+/// two containers cannot drift apart. Precondition: `condition_key_shapes` is either empty or
+/// already aligned with `conditions`; the constructor rejects anything else before calling.
 void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions,
                              std::vector<dynamic_filter_condition_shape>& condition_key_shapes)
 {
-  // One permutation applied to both vectors: this call is the single point that establishes the
-  // conditions/shapes index alignment, so the two containers cannot drift. The caller validates
-  // that the shapes vector is empty or already aligned.
-  assert(condition_key_shapes.empty() || condition_key_shapes.size() == conditions.size());
   bool is_ordered     = true;
   bool seen_non_equal = false;
   for (auto& cond : conditions) {
@@ -220,6 +223,8 @@ void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions,
   }
 }
 
+}  // namespace
+
 sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::LogicalOperator& op,
   duckdb::unique_ptr<sirius_physical_operator> left,
@@ -237,18 +242,18 @@ sirius_physical_hash_join::sirius_physical_hash_join(
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
     conditions(std::move(cond)),
-    condition_key_shapes(std::move(condition_key_shapes_p)),
     join_type(join_type),
     delim_types(std::move(delim_types)),
     _dynamic_filter_plan(std::move(dynamic_filter_plan))
 {
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
-  if (!condition_key_shapes.empty() && condition_key_shapes.size() != conditions.size()) {
+  _condition_key_shapes       = std::move(condition_key_shapes_p);
+  if (!_condition_key_shapes.empty() && _condition_key_shapes.size() != conditions.size()) {
     throw std::invalid_argument(
       "[sirius_physical_hash_join] condition_key_shapes must be empty or aligned one-to-one with "
       "the join conditions");
   }
-  reorder_join_conditions(conditions, condition_key_shapes);
+  reorder_join_conditions(conditions, _condition_key_shapes);
 
   children.push_back(std::move(left));
   children.push_back(std::move(right));
