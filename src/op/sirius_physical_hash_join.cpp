@@ -239,7 +239,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   dynamic_filter_publish_plan dynamic_filter_plan,
   uint64_t hash_partition_bytes,
   uint64_t max_broadcast_join_size,
-  std::vector<dynamic_filter_condition_shape> condition_key_shapes_p)
+  std::vector<dynamic_filter_condition_shape> condition_key_shapes_p,
+  dynamic_filter_stats* dynamic_filter_stats_sink)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
@@ -258,6 +259,11 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       "the join conditions");
   }
   reorder_join_conditions(conditions, _condition_key_shapes);
+
+  _dynamic_filter_stats = dynamic_filter_stats_sink;
+  if (_dynamic_filter_stats != nullptr && _dynamic_filter_plan.enabled()) {
+    _dynamic_filter_stats->producers_enabled.fetch_add(1, std::memory_order_relaxed);
+  }
 
   children.push_back(std::move(left));
   children.push_back(std::move(right));
@@ -1730,6 +1736,9 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
     return;
   }
 
+  if (_dynamic_filter_stats != nullptr) {
+    _dynamic_filter_stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
+  }
   try {
     if (_dynamic_filter_plan.enabled()) {
       auto const outcome =
@@ -1746,12 +1755,32 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
         outcome.zone_map_filters_built,
         outcome.filters_pushed,
         outcome.active_targets);
+      if (_dynamic_filter_stats != nullptr) {
+        auto& stats        = *_dynamic_filter_stats;
+        auto const relaxed = std::memory_order_relaxed;
+        stats.keys_considered.fetch_add(outcome.keys_considered, relaxed);
+        stats.keys_with_known_domain.fetch_add(outcome.keys_with_known_domain, relaxed);
+        stats.keys_skipped_domain_gate.fetch_add(outcome.keys_skipped_domain_gate, relaxed);
+        stats.keys_skipped_type_mismatch.fetch_add(outcome.keys_skipped_type_mismatch, relaxed);
+        stats.keys_build_exceeded_domain.fetch_add(outcome.keys_build_exceeded_domain, relaxed);
+        stats.membership_filters_built.fetch_add(outcome.membership_filters_built, relaxed);
+        stats.zone_map_filters_built.fetch_add(outcome.zone_map_filters_built, relaxed);
+        stats.publications_skipped_targets_drained.fetch_add(outcome.skipped_targets_drained,
+                                                             relaxed);
+        stats.filters_pushed.fetch_add(outcome.filters_pushed, relaxed);
+      }
     }
     _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FINISHED,
                                             std::memory_order_release);
+    if (_dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
+    }
   } catch (...) {
     _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
                                             std::memory_order_release);
+    if (_dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
+    }
     throw;
   }
 }
@@ -1792,7 +1821,13 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   auto* ms = build_ro->get_data() ? build_ro->get_memory_space() : nullptr;
   // Non-GPU residency here means the batch was already downgraded before this delivery (it can be
   // shared with an earlier consumer, e.g. CTE fan-out). Publication is best-effort: skip it.
-  if (!ms || build_ro->get_current_tier() != ::cucascade::memory::Tier::GPU) { return; }
+  if (!ms || build_ro->get_current_tier() != ::cucascade::memory::Tier::GPU) {
+    if (_dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publications_skipped_source_not_resident.fetch_add(
+        1, std::memory_order_relaxed);
+    }
+    return;
+  }
 
   // The build batch was produced on a different stream than the publication stream. Order the
   // publication stream after the batch's writer event.

@@ -91,6 +91,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
     SIRIUS_LOG_DEBUG(
       "[sirius_physical_hash_join] Skipping dynamic filter push: all target scans drained.");
+    outcome.skipped_targets_drained = 1;
     return outcome;
   }
 
@@ -167,6 +168,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     // Skip domain-covering keys before paying to build a membership structure; their filters keep
     // most probe rows, and the consumer-side gate remains the runtime backstop.
     auto const key_domain = admitted_key.build_key_domain_cardinality;
+    if (key_domain > 0) {
+      ++outcome.keys_with_known_domain;
+      if (build_rows > key_domain) { ++outcome.keys_build_exceeded_domain; }
+    }
     if (domain_coverage_gate_fires(build_rows, key_domain, plan.domain_coverage_threshold())) {
       SIRIUS_LOG_DEBUG(
         "[sirius_physical_hash_join] publish gate: key {}: build {} rows cover {:.2f} of key "

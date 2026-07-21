@@ -29,6 +29,7 @@
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -161,7 +162,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     dynamic_filter_publish_plan dynamic_filter_plan = {},
     uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
     uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
-    std::vector<dynamic_filter_condition_shape> condition_key_shapes = {});
+    std::vector<dynamic_filter_condition_shape> condition_key_shapes = {},
+    dynamic_filter_stats* dynamic_filter_stats_sink                  = {});
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -387,6 +389,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
   dynamic_filter_publish_plan const _dynamic_filter_plan;
+  /**
+   * @brief Non-owning publication-counter sink, owned by `SiriusContext`
+   *
+   * Handed over by `sirius_plan_comparison_join` at construction; null when no counter surface
+   * exists (unit fixtures). The owner outlives every plan built during a query, the same lifetime
+   * contract as the plan's replica spaces.
+   */
+  dynamic_filter_stats* _dynamic_filter_stats = nullptr;
   /// Exactly-once arbitration between the publication hook and finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
