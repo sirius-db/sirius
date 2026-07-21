@@ -173,6 +173,17 @@ elif [ "$FORMAT" = "duckdb" ]; then
         exit 1
     fi
 
+    # TPC-H primary key declarations. Applied after tables are populated so the
+    # optimizer can use uniqueness hints (e.g. for join elimination).
+    TPCH_PK_SQL="ALTER TABLE region    ADD PRIMARY KEY (r_regionkey);
+ALTER TABLE nation    ADD PRIMARY KEY (n_nationkey);
+ALTER TABLE part      ADD PRIMARY KEY (p_partkey);
+ALTER TABLE supplier  ADD PRIMARY KEY (s_suppkey);
+ALTER TABLE partsupp  ADD PRIMARY KEY (ps_partkey, ps_suppkey);
+ALTER TABLE customer  ADD PRIMARY KEY (c_custkey);
+ALTER TABLE orders    ADD PRIMARY KEY (o_orderkey);
+ALTER TABLE lineitem  ADD PRIMARY KEY (l_orderkey, l_linenumber);"
+
     if [ "$CLUSTER" = "true" ]; then
         # Clustered build. dbgen into a staging database, then write a *fresh*,
         # COMPACT database with the requested tables physically sorted (ORDER BY at
@@ -210,7 +221,7 @@ elif [ "$FORMAT" = "duckdb" ]; then
                 BUILD_SQL+=" CREATE TABLE ${_t} AS FROM s.${_t};"
             fi
         done
-        BUILD_SQL+=" CHECKPOINT;"
+        BUILD_SQL+=" ${TPCH_PK_SQL} CHECKPOINT;"
 
         echo "Writing sorted database into $OUTPUT ..."
         "$DUCKDB" "$OUTPUT" -c "$BUILD_SQL"
@@ -223,7 +234,7 @@ elif [ "$FORMAT" = "duckdb" ]; then
         fi
 
         echo "Generating TPC-H SF${SF} data into $OUTPUT ..."
-        "$DUCKDB" "$OUTPUT" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF});"
+        "$DUCKDB" "$OUTPUT" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF}); ${TPCH_PK_SQL}"
     fi
 fi
 
