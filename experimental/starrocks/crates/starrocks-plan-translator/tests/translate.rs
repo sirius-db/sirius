@@ -683,6 +683,46 @@ fn split_broker_range_is_unsupported() {
     }
 }
 
+/// Verifies complete byte-range splits are collapsed to one whole-file local read.
+#[test]
+fn complete_split_broker_ranges_produce_one_local_file() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 512, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(1024)),
+            None,
+            None,
+            None,
+        ));
+    let translated = PlanTranslator::new().translate_fragment(&fragment).unwrap();
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+}
+
 /// Verifies a scan range delivered via the pipeline per-driver-sequence map is
 /// collected too (not just `per_node_scan_ranges`).
 #[test]
