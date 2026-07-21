@@ -21,6 +21,8 @@ pub(crate) struct ExprContext<'a> {
     registry: &'a mut ExtensionRegistry,
     /// Tuple ids that describe the input row visible to this expression.
     row_tuples: &'a [i32],
+    /// Synthetic StarRocks slots appended while evaluating common project expressions.
+    slot_overrides: Option<&'a std::collections::HashMap<(i32, i32), usize>>,
 }
 
 impl<'a> ExprContext<'a> {
@@ -34,6 +36,23 @@ impl<'a> ExprContext<'a> {
             desc,
             registry,
             row_tuples,
+            slot_overrides: None,
+        }
+    }
+
+    /// Creates an expression context that can resolve synthetic slots not present
+    /// in the descriptor table.
+    pub(crate) fn with_slot_overrides(
+        desc: &'a DescriptorTable,
+        registry: &'a mut ExtensionRegistry,
+        row_tuples: &'a [i32],
+        slot_overrides: &'a std::collections::HashMap<(i32, i32), usize>,
+    ) -> Self {
+        Self {
+            desc,
+            registry,
+            row_tuples,
+            slot_overrides: Some(slot_overrides),
         }
     }
 }
@@ -147,9 +166,18 @@ fn translate_slot_ref(
         context: "SLOT_REF",
         field: "slot_ref",
     })?;
-    let field =
-        ctx.desc
-            .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)? as i32;
+    let field = ctx
+        .slot_overrides
+        .and_then(|overrides| {
+            overrides
+                .get(&(slot_ref.tuple_id, slot_ref.slot_id))
+                .copied()
+        })
+        .map(Ok)
+        .unwrap_or_else(|| {
+            ctx.desc
+                .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)
+        })? as i32;
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(

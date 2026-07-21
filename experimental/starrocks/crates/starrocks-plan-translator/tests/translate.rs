@@ -1112,6 +1112,64 @@ fn scan_project_preserves_descriptor_output_order() {
     }
 }
 
+/// Verifies hidden project expressions are appended in key order and can be
+/// referenced by visible expressions without descriptor-table slots.
+#[test]
+fn project_common_slots_are_materialized_before_visible_expressions() {
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(5, 1, scalar_type(TPrimitiveType::BIGINT)));
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Project(visible) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected visible project");
+    };
+    let expression::RexType::Selection(selection) =
+        visible.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected common-slot selection");
+    };
+    let expression::field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected direct field reference");
+    };
+    let expression::reference_segment::ReferenceType::StructField(field) =
+        segment.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected struct field");
+    };
+    assert_eq!(field.field, 2);
+    assert!(matches!(
+        visible.input.as_ref().unwrap().rel_type.as_ref().unwrap(),
+        rel::RelType::Project(_)
+    ));
+}
+
 /// Verifies fragment output expressions add the final root projection.
 #[test]
 fn fragment_output_exprs_add_root_projection() {
