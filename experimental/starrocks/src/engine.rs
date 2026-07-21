@@ -54,6 +54,7 @@ impl SiriusEngine {
     /// failure surfaces here, before any RPC is served. `config` is the optional Sirius YAML path
     /// (built-in defaults when `None`).
     pub fn start(config: Option<PathBuf>) -> Result<Self, String> {
+        Self::configure_duckdb_extensions()?;
         let (request_tx, request_rx) = channel::<ExecuteRequest>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
@@ -68,6 +69,42 @@ impl SiriusEngine {
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
         }
+    }
+
+    /// Points the embedded DuckDB context at the locally built extensions used by Substrait.
+    fn configure_duckdb_extensions() -> Result<(), String> {
+        let build_dir = std::env::var_os("SIRIUS_BUILD_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join("build/release")
+            });
+        let extensions = [
+            (
+                "SIRIUS_DUCKDB_PARQUET_EXTENSION",
+                build_dir.join("extension/parquet/parquet.duckdb_extension"),
+            ),
+            (
+                "SIRIUS_DUCKDB_CORE_FUNCTIONS_EXTENSION",
+                build_dir.join("extension/core_functions/core_functions.duckdb_extension"),
+            ),
+        ];
+        for (variable, path) in extensions {
+            if std::env::var_os(variable).is_some() {
+                continue;
+            }
+            if !path.is_file() {
+                return Err(format!(
+                    "DuckDB extension for {variable} is missing at {}",
+                    path.display()
+                ));
+            }
+            // SAFETY: this runs before the engine thread and RPC servers start, so no concurrent
+            // code reads or writes these process environment variables.
+            unsafe { std::env::set_var(variable, &path) };
+        }
+        Ok(())
     }
 }
 

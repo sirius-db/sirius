@@ -66,22 +66,21 @@ struct Context::Impl {
     // path needs. Idempotent; the transparent path does this at extension load.
     sirius::converter_registry::initialize();
 
-    // Lowering a Substrait `local_files` read produces a `parquet_scan`, so the
-    // embedded DuckDB must have the parquet extension to bind it. Dev stopgap until
-    // parquet is linked into the engine: ONLY when SIRIUS_DUCKDB_PARQUET_EXTENSION
-    // points at a (locally-built, unsigned) parquet extension do we opt into
-    // unsigned loading and load it. Absent the env var, no unsigned loading is
-    // enabled — the default trust boundary is unchanged.
+    // The embedded DuckDB needs parquet for local_files reads and core_functions for
+    // Substrait scalar/aggregate bindings. Only explicitly configured local extensions opt into
+    // unsigned loading; absent both variables, the default trust boundary is unchanged.
     duckdb::DBConfig db_config;
     const char* parquet_ext = std::getenv("SIRIUS_DUCKDB_PARQUET_EXTENSION");
-    if (parquet_ext != nullptr) {
+    const char* core_functions_ext = std::getenv("SIRIUS_DUCKDB_CORE_FUNCTIONS_EXTENSION");
+    if (parquet_ext != nullptr || core_functions_ext != nullptr) {
       db_config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(true));
     }
     db   = duckdb::make_uniq<duckdb::DuckDB>(nullptr, &db_config);
     conn = duckdb::make_uniq<duckdb::Connection>(*db);
-    if (parquet_ext != nullptr) {
+    for (const char* extension : {core_functions_ext, parquet_ext}) {
+      if (extension == nullptr) { continue; }
       // Escape single quotes so the path can't break out of the SQL string literal.
-      std::string escaped(parquet_ext);
+      std::string escaped(extension);
       for (std::size_t pos = escaped.find('\''); pos != std::string::npos;
            pos             = escaped.find('\'', pos + 2)) {
         escaped.replace(pos, 1, "''");
