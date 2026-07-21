@@ -551,7 +551,14 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                   !is_right_family && !is_mixed && !is_full_outer;
   }
 
-  bool const broadcast = broadcast_candidate && build_probe;
+  // Multi-GPU MARK must never hash-partition its build side: build_has_null has to be globally
+  // consistent, which only holds when every GPU sees the whole build. So a multi-GPU MARK join is
+  // forced to broadcast (build replicated to every GPU) even when it is not BUILD_PROBE-eligible —
+  // otherwise a large/non-foldable/mixed build would fall through to the `natural` hash-partitioned
+  // count below and split build rows across GPUs, corrupting the per-GPU null flag. Every other
+  // join broadcasts only when it is also build-probe.
+  bool const force_mark_broadcast = is_mark && num_gpus > 1;
+  bool const broadcast            = force_mark_broadcast || (broadcast_candidate && build_probe);
   // MARK single-GPU is clamped to one partition regardless of the natural count; every other case
   // takes num_gpus when broadcasting and the natural count otherwise.
   int const num_partitions = broadcast ? num_gpus : ((is_mark && num_gpus <= 1) ? 1 : natural);
