@@ -33,7 +33,9 @@ namespace sirius::op {
 /// and pushes a lightweight handle into the exchange channel.
 ///
 /// Key design invariants:
-/// - sink() never blocks a worker: a full channel parks the handle in _pending and returns.
+/// - sink() never blocks a worker: a full channel parks the handle in _pending and returns
+///   (exchange_channel::push() is wrapper/test-side only — a blocked worker can deadlock the
+///   pool and cannot be cancelled; see the park-site comment in sink()).
 /// - _pending is flushed FIFO before any newer handle is pushed, preserving order.
 /// - EOS: on_finalize_operator() flushes what fits and closes immediately, or sets
 ///   _close_when_flushed so the last try_flush_pending() call closes the channel.
@@ -55,6 +57,9 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
     std::shared_ptr<exec::exchange_channel> output_channel,
     std::shared_ptr<cucascade::shared_data_repository> output_repository);
 
+  // Port-fed terminal operator (RESULT_COLLECTOR-style): heads the single-operator pipeline it
+  // also terminates. Head placement is what lets get_next_task_hint() gate task creation on
+  // channel capacity; a pipeline head must report is_source() (see sirius_pipeline::reset_source).
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
   bool sink_order_dependent() const override { return false; }

@@ -111,7 +111,9 @@ Key design invariants:
   `ColumnDataCollection` materialization.
 - **CONCAT shape**: `is_source() && is_sink()` are both `true`. The operator heads its own
   single-operator pipeline fed via an `"input"` port; the upstream pipeline pushes batches into
-  that port's repository via the base-class `sink()` → `push_data_batch()` path.
+  that port's repository via the base-class `sink()` → `push_data_batch()` path. Being the head,
+  it is simultaneously the *final* operator of that pipeline (`publish_output()` calls its
+  `sink()`) — the same head-and-terminal shape as `RESULT_COLLECTOR` and `MERGE_GROUP_BY`.
 - **Backpressure as admission control**: if the channel is full or `_pending` is non-empty,
   `get_next_task_hint()` and `get_next_task_input_data()` return `WAITING{nullptr}` / `nullptr`
   respectively, preventing new tasks from being created. Worker threads never block.
@@ -126,8 +128,8 @@ Key design invariants:
 - **Flush-then-close EOS**: `on_finalize_operator()` flushes what fits; if `_pending` is empty
   it closes the channel immediately; otherwise it sets `_close_when_flushed` and the close
   happens on a later `try_flush_pending()` call. Nothing polls that after finalize — the
-  consumer/session must call `try_flush_pending()` after pops (or wire `on_pop` to it, #839) or
-  deferred EOS stalls. Finalize also sets `_closing` under `_pending_lock`; a `sink()` that
+  consumer/session must call `try_flush_pending()` after pops (or have `on_pop` schedule a
+  deferred call — #839) or deferred EOS stalls. Finalize also sets `_closing` under `_pending_lock`; a `sink()` that
   observes it throws rather than stranding the handle behind the closed channel.
 - **Locking discipline**: whenever `_pending_lock` and the channel's internal mutex are both
   needed, `_pending_lock` is always acquired first (consistent ordering prevents deadlock);
@@ -143,7 +145,7 @@ Hint table:
 | port empty, upstream pipeline finished | `std::nullopt` — EOS |
 | port empty, upstream still running | `WAITING{upstream_op}` — propagate hint up the chain |
 
-**Consumer contract**: pop a handle from the channel, then call `output_repository->pop_data_batch_by_id(handle.batch_id)` to take ownership of the batch. Hint polling drives the pending drain only while the sink's pipeline is still running; after finalize the consumer/session must call `try_flush_pending()` after pops (or wire `exchange_channel::on_pop` to it) so `_pending` drains and the deferred close completes. Channel callbacks run synchronously on the calling thread — they must post/schedule work, never re-enter an operator or take pipeline locks.
+**Consumer contract**: pop a handle from the channel, then call `output_repository->pop_data_batch_by_id(handle.batch_id)` to take ownership of the batch. Hint polling drives the pending drain only while the sink's pipeline is still running; after finalize the consumer/session must call `try_flush_pending()` after pops (or have `exchange_channel::on_pop` post/schedule a deferred `try_flush_pending()` call — never invoke it directly from the callback) so `_pending` drains and the deferred close completes. Channel callbacks run synchronously on the calling thread — they must post/schedule work, never re-enter an operator or take pipeline locks.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -394,7 +396,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
-| STREAMING_SINK | Pipeline | Exchange-output sink (CONCAT shape); registers batches in `shared_data_repository`, pushes handles to `exchange_channel` with backpressure |
+| STREAMING_SINK | Result | Exchange-output sink (CONCAT shape); registers batches in `shared_data_repository`, pushes handles to `exchange_channel` with backpressure |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |

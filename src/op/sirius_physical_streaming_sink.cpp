@@ -172,8 +172,9 @@ void sirius_physical_streaming_sink::sink(const operator_data& output_data,
 
     exec::exchange_batch_handle handle{batch->get_batch_id(), size_bytes};
 
-    // Drain the backlog first, then push the new handle — or park it if anything is still
-    // queued or the channel is full. Never blocks a worker.
+    // Flush backlog first, then try_push — or park if still queued/full. Never block: sink()
+    // runs on a scheduler worker, and push() can deadlock the pool or strand on a stalled
+    // consumer (no cancellation; only pop/close wakes it). Closed channels still refuse.
     flush_pending_locked();
     if (!_pending.empty() || !_output_channel->try_push(handle)) { _pending.push_back(handle); }
   }
