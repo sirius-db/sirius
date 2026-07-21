@@ -94,5 +94,12 @@ TEST_CASE_METHOD(JoinNullFixture,
 {
   // IN produces a three-valued mark: TRUE when a key matches, NULL when the probe
   // is NULL or no match exists while the build side contains a NULL, else FALSE.
+  //
+  // The full build side contains a NULL, so an unmatched non-NULL probe (l.k=30)
+  // yields NULL, never FALSE -- this exercises TRUE and NULL.
   compare_gpu_vs_cpu("SELECT l.id, l.k IN (SELECT k FROM r) AS m FROM l");
+  // A NULL-free build side lets an unmatched non-NULL probe produce FALSE: l.k=30
+  // is absent from {10,20,40} with no NULL present, so the mark is FALSE (while
+  // l.k=NULL is still NULL and matches are TRUE) -- this exercises FALSE.
+  compare_gpu_vs_cpu("SELECT l.id, l.k IN (SELECT k FROM r WHERE k IS NOT NULL) AS m FROM l");
 }

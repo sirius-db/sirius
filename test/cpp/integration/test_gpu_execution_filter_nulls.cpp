@@ -122,25 +122,33 @@ TEST_CASE_METHOD(NullDataFixture,
                  "gpu_execution three-valued AND / NOT",
                  "[integration][gpu_execution][filter][nulls]")
 {
-  // TRUE AND NULL and FALSE AND NULL both yield a non-TRUE result, so the row is
-  // excluded either way -- AND membership never diverges from naive propagation.
-  compare_gpu_vs_cpu("SELECT id FROM nt WHERE i = 10 AND b = 100");
-  compare_gpu_vs_cpu("SELECT id FROM nt WHERE NOT (i = 10)");
-  compare_gpu_vs_cpu("SELECT id FROM nt WHERE NOT (i = 10 OR dbl > 2.0)");
+  // Project the boolean result rather than filtering on it: a WHERE clause
+  // collapses FALSE and UNKNOWN together, so it cannot tell whether TRUE AND NULL
+  // yields NULL (correct) or FALSE. These rows span TRUE / FALSE / NULL outcomes.
+  compare_gpu_vs_cpu("SELECT id, (i = 10 AND b = 100) AS r FROM nt");
+  compare_gpu_vs_cpu("SELECT id, (NOT (i = 10)) AS r FROM nt");
 }
 
 // KNOWN GPU DIVERGENCE (issue #1095 follow-up -- please file):
 // SQL three-valued logic says `TRUE OR UNKNOWN = TRUE`, but Sirius's GPU OR
 // naively propagates NULL (`TRUE OR NULL -> NULL`), so a row where one branch is
-// TRUE and the other is NULL is wrongly filtered out. Example below: row (i=10,
-// b=NULL) satisfies `i = 10` yet GPU drops it because `b = 200` is NULL.
-// Tagged [!shouldfail] so it documents the bug without failing CI; remove the
-// tag when the GPU predicate evaluator implements 3-valued OR correctly.
+// TRUE and the other is NULL is wrongly filtered out. Each divergent query is its
+// own case: Catch2 aborts a test case at the first REQUIRE failure, so bundling
+// them would leave the later queries unexercised. Tagged [!shouldfail] so they
+// document the bug without failing CI; remove the tag when the GPU predicate
+// evaluator implements 3-valued OR correctly.
 TEST_CASE_METHOD(NullDataFixture,
-                 "gpu_execution three-valued OR with NULL operand [known divergence]",
+                 "gpu_execution three-valued OR, TRUE-OR-NULL branch [known divergence]",
                  "[integration][gpu_execution][filter][nulls][!shouldfail]")
 {
+  // Row (i=10, b=NULL) satisfies `i = 10` yet GPU drops it because `b = 200` is NULL.
   compare_gpu_vs_cpu("SELECT id FROM nt WHERE i = 10 OR b = 200");
+}
+
+TEST_CASE_METHOD(NullDataFixture,
+                 "gpu_execution three-valued OR, IS-NULL-OR-match branch [known divergence]",
+                 "[integration][gpu_execution][filter][nulls][!shouldfail]")
+{
   compare_gpu_vs_cpu("SELECT id FROM nt WHERE (i IS NULL) OR (b = 100)");
 }
 

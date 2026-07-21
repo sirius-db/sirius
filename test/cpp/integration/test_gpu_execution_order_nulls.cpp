@@ -47,25 +47,37 @@ std::string case_name(const null_order_case& order_case)
   return order_case.sort_direction + " NULLS " + order_case.null_position;
 }
 
-// Sets a runtime setting for a scope and RESETs it on destruction, so the
-// setting is restored even when a REQUIRE failure unwinds out of the test.
+// Sets a runtime setting for a scope and restores its PREVIOUS value on
+// destruction (not the default), so the setting survives a REQUIRE failure that
+// unwinds out of the test without clobbering an outer override.
 class scoped_setting {
  public:
   scoped_setting(sirius::test::GpuExecutionFixture& fixture,
                  std::string name,
                  const std::string& value)
-    : fixture(fixture), name(std::move(name))
+    : fixture(fixture), name(std::move(name)), old_value(read_setting(fixture, this->name))
   {
     fixture.run_ok("SET " + this->name + " = " + value + ";");
   }
-  ~scoped_setting() { fixture.con->Query("RESET " + name + ";"); }
+  ~scoped_setting() { fixture.con->Query("SET " + name + " = " + old_value + ";"); }
 
   scoped_setting(const scoped_setting&)            = delete;
   scoped_setting& operator=(const scoped_setting&) = delete;
 
  private:
+  static std::string read_setting(sirius::test::GpuExecutionFixture& fixture,
+                                  const std::string& name)
+  {
+    auto result =
+      fixture.con->Query("SELECT value FROM duckdb_settings() WHERE name = '" + name + "'");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    return result->GetValue(0, 0).ToString();
+  }
+
   sirius::test::GpuExecutionFixture& fixture;
   std::string name;
+  std::string old_value;
 };
 
 class OrderNullsGPUExecutionFixture : public sirius::test::GpuExecutionFixture {
