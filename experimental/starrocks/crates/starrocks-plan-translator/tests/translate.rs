@@ -2851,9 +2851,9 @@ fn unsupported_join_type_is_reported_before_missing_conjuncts() {
     assert_eq!(reason, "hash join type is unsupported");
 }
 
-/// Verifies decimal-typed arithmetic is rejected (it crashes the engine's GPU projection).
+/// Verifies decimal arithmetic is lowered to FP64 casts for the GPU expression evaluator.
 #[test]
-fn decimal_arithmetic_is_rejected() {
+fn decimal_arithmetic_is_lowered_to_fp64() {
     let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4));
     let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
     arith.opcode = Some(TExprOpcode::MULTIPLY);
@@ -2861,27 +2861,48 @@ fn decimal_arithmetic_is_rejected() {
     nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
     nodes.extend(slot_ref(1, 0, decimal).nodes);
 
-    let err = translate_fragment(&params(
+    let translated = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
         Some(base_desc()),
         Some(vec![TExpr::new(nodes)]),
     ))
-    .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            TranslateError::UnsupportedExpression {
-                node_type: TExprNodeType::ARITHMETIC_EXPR,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected output project");
+    };
+    let expression::RexType::ScalarFunction(function) =
+        project.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected arithmetic function");
+    };
+    assert!(function.arguments.iter().all(|argument| matches!(
+        argument.arg_type.as_ref().unwrap(),
+        substrait::proto::function_argument::ArgType::Value(substrait::proto::Expression {
+            rex_type: Some(expression::RexType::Cast(_)),
+        })
+    )));
+    assert!(matches!(
+        function
+            .output_type
+            .as_ref()
+            .unwrap()
+            .kind
+            .as_ref()
+            .unwrap(),
+        substrait::proto::r#type::Kind::Fp64(_)
+    ));
 }
 
-/// Verifies `avg` over decimals is rejected (DuckDB computes a double for decimal inputs).
+/// Verifies decimal AVG arguments are lowered to FP64 for GPU execution.
 #[test]
-fn decimal_avg_is_rejected() {
+fn decimal_avg_is_lowered_to_fp64() {
     let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(8));
     let agg = aggregation_node(
         1,
@@ -2893,16 +2914,32 @@ fn decimal_avg_is_rejected() {
             Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
         )],
     );
-    let err = translate_fragment(&params(
+    let translated = translate_fragment(&params(
         Some(TPlan::new(vec![agg, scan_node(0, 0)])),
         Some(agg_desc()),
         None,
     ))
-    .unwrap_err();
-    assert!(
-        matches!(err, TranslateError::UnsupportedExpression { .. }),
-        "{err:?}"
-    );
+    .unwrap();
+    let rel::RelType::Aggregate(aggregate) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected aggregate");
+    };
+    let argument = aggregate.measures[0].measure.as_ref().unwrap().arguments[0]
+        .arg_type
+        .as_ref()
+        .unwrap();
+    assert!(matches!(
+        argument,
+        substrait::proto::function_argument::ArgType::Value(substrait::proto::Expression {
+            rex_type: Some(expression::RexType::Cast(_)),
+        })
+    ));
 }
 
 /// Verifies partitioned top-N sorts are rejected rather than run as a global sort.
