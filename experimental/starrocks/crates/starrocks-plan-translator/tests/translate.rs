@@ -2480,6 +2480,45 @@ fn materialized_exchange_feeds_aggregate() {
     assert_eq!(read.base_schema.as_ref().unwrap().names, vec!["id", "name"]);
 }
 
+/// Verifies a merging exchange globally sorts the materialized local sender output.
+#[test]
+fn materialized_merging_exchange_becomes_sort_over_read() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))],
+        vec![false],
+        vec![false],
+        None,
+    );
+    let mut exchange = base_plan_node(7, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![0],
+        Some(sort_info),
+        Some(0),
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(Some(TPlan::new(vec![exchange])), Some(base_desc()), None),
+            &[ExchangeInput {
+                node_id: 7,
+                paths: vec!["/tmp/materialized-exchange.parquet".to_string()],
+                names: vec!["id".to_string(), "name".to_string()],
+            }],
+        )
+        .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected merging exchange sort");
+    };
+    let rel::RelType::Read(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected materialized exchange read under sort");
+    };
+    assert_eq!(sort.sorts.len(), 1);
+}
+
 /// Returns every extension function name declared by the plan.
 fn extension_function_names(plan: &substrait::proto::Plan) -> Vec<String> {
     use substrait::proto::extensions::simple_extension_declaration::MappingType;

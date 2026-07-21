@@ -327,13 +327,6 @@ fn translate_exchange(
             context: "EXCHANGE_NODE",
             field: "exchange_node",
         })?;
-    if exchange.sort_info.is_some() {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "merging exchanges are not supported by sequential execution",
-        });
-    }
     if exchange.input_row_tuples.is_empty() {
         return Err(TranslateError::MissingField {
             context: "TExchangeNode",
@@ -362,11 +355,26 @@ fn translate_exchange(
         .as_ref()
         .map(|structure| structure.types.len())
         .unwrap_or(0);
-    let translated = TranslatedRel {
+    let mut translated = TranslatedRel {
         rel: local_files_rel(schema, &input.paths),
         row_tuples: exchange.input_row_tuples.clone(),
         output_width,
     };
+    if let Some(sort_info) = &exchange.sort_info {
+        let sorts = sort_fields(sort_info, &translated, ctx)?;
+        let row_tuples = translated.row_tuples.clone();
+        translated = TranslatedRel {
+            rel: Rel {
+                rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                    input: Some(Box::new(translated.rel)),
+                    sorts,
+                    ..Default::default()
+                }))),
+            },
+            row_tuples,
+            output_width,
+        };
+    }
     apply_conjuncts(translated, node, ctx)
 }
 
