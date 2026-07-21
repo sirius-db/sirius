@@ -87,45 +87,57 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
         "compress_get_temp_size");
   rmm::device_buffer temp(temp_bytes, stream, mr);
 
-  rmm::device_buffer d_uncomp_ptrs(num_chunks * sizeof(void*), stream, mr);
-  rmm::device_buffer d_uncomp_bytes(num_chunks * sizeof(std::size_t), stream, mr);
-  rmm::device_buffer d_comp_ptrs(num_chunks * sizeof(void*), stream, mr);
-  rmm::device_buffer d_comp_bytes(num_chunks * sizeof(std::size_t), stream, mr);
-  rmm::device_buffer d_statuses(num_chunks * sizeof(nvcompStatus_t), stream, mr);
-  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_ptrs.data(),
-                                      h_uncomp_ptrs.data(),
-                                      num_chunks * sizeof(void*),
-                                      cudaMemcpyHostToDevice,
-                                      s),
-                      "H2D uncomp ptrs");
-  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_bytes.data(),
+  // Coalesce the per-chunk metadata arrays into ONE device allocation instead of six
+  // tiny ones (uncomp ptrs/bytes, comp ptrs/bytes, dst offsets, statuses). nvcomp only
+  // needs each array base to be 8-byte aligned, which sub-regions at 8*num_chunks
+  // strides satisfy; this cuts the per-op device-allocation count from ~6 to 1.
+  std::size_t const sz_ptr           = num_chunks * sizeof(void*);
+  std::size_t const sz_size          = num_chunks * sizeof(std::size_t);
+  std::size_t const sz_stat          = num_chunks * sizeof(nvcompStatus_t);
+  std::size_t const off_uncomp_ptrs  = 0;
+  std::size_t const off_uncomp_bytes = off_uncomp_ptrs + sz_ptr;
+  std::size_t const off_comp_ptrs    = off_uncomp_bytes + sz_size;
+  std::size_t const off_comp_bytes   = off_comp_ptrs + sz_ptr;
+  std::size_t const off_dst_off      = off_comp_bytes + sz_size;
+  std::size_t const off_statuses     = off_dst_off + sz_size;
+  rmm::device_buffer meta(off_statuses + sz_stat, stream, mr);
+  auto* const meta_base      = static_cast<std::uint8_t*>(meta.data());
+  void* const d_uncomp_ptrs  = meta_base + off_uncomp_ptrs;
+  void* const d_uncomp_bytes = meta_base + off_uncomp_bytes;
+  void* const d_comp_ptrs    = meta_base + off_comp_ptrs;
+  void* const d_comp_bytes   = meta_base + off_comp_bytes;
+  void* const d_dst_off      = meta_base + off_dst_off;  // filled after the size readback
+  void* const d_statuses     = meta_base + off_statuses;
+  throw_if_cuda_error(
+    cudaMemcpyAsync(
+      d_uncomp_ptrs, h_uncomp_ptrs.data(), num_chunks * sizeof(void*), cudaMemcpyHostToDevice, s),
+    "H2D uncomp ptrs");
+  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_bytes,
                                       h_uncomp_bytes.data(),
                                       num_chunks * sizeof(std::size_t),
                                       cudaMemcpyHostToDevice,
                                       s),
                       "H2D uncomp bytes");
-  throw_if_cuda_error(cudaMemcpyAsync(d_comp_ptrs.data(),
-                                      h_comp_ptrs.data(),
-                                      num_chunks * sizeof(void*),
-                                      cudaMemcpyHostToDevice,
-                                      s),
-                      "H2D comp ptrs");
+  throw_if_cuda_error(
+    cudaMemcpyAsync(
+      d_comp_ptrs, h_comp_ptrs.data(), num_chunks * sizeof(void*), cudaMemcpyHostToDevice, s),
+    "H2D comp ptrs");
 
-  check(ops.compress_async(static_cast<void const* const*>(d_uncomp_ptrs.data()),
-                           static_cast<std::size_t const*>(d_uncomp_bytes.data()),
+  check(ops.compress_async(static_cast<void const* const*>(d_uncomp_ptrs),
+                           static_cast<std::size_t const*>(d_uncomp_bytes),
                            chunk,
                            num_chunks,
                            temp.data(),
                            temp_bytes,
-                           static_cast<void* const*>(d_comp_ptrs.data()),
-                           static_cast<std::size_t*>(d_comp_bytes.data()),
-                           static_cast<nvcompStatus_t*>(d_statuses.data()),
+                           static_cast<void* const*>(d_comp_ptrs),
+                           static_cast<std::size_t*>(d_comp_bytes),
+                           static_cast<nvcompStatus_t*>(d_statuses),
                            s),
         "compress_async");
 
   std::vector<std::size_t> h_comp_bytes(num_chunks);
   throw_if_cuda_error(cudaMemcpyAsync(h_comp_bytes.data(),
-                                      d_comp_bytes.data(),
+                                      d_comp_bytes,
                                       num_chunks * sizeof(std::size_t),
                                       cudaMemcpyDeviceToHost,
                                       s),
@@ -155,20 +167,17 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
     cudaMemcpyAsync(frame->data(), h_hdr.data(), header, cudaMemcpyHostToDevice, s),
     "H2D frame header");
 
-  rmm::device_buffer d_dst_off(num_chunks * sizeof(std::size_t), stream, mr);
-  throw_if_cuda_error(cudaMemcpyAsync(d_dst_off.data(),
-                                      h_dst_off.data(),
-                                      num_chunks * sizeof(std::size_t),
-                                      cudaMemcpyHostToDevice,
-                                      s),
-                      "H2D dst offsets");
+  throw_if_cuda_error(
+    cudaMemcpyAsync(
+      d_dst_off, h_dst_off.data(), num_chunks * sizeof(std::size_t), cudaMemcpyHostToDevice, s),
+    "H2D dst offsets");
 
   scatter_chunks_kernel<<<static_cast<unsigned>(num_chunks), 256, 0, s>>>(
     static_cast<std::uint8_t const*>(scratch.data()),
     out_stride,
     static_cast<std::uint8_t*>(frame->data()),
-    static_cast<std::size_t const*>(d_dst_off.data()),
-    static_cast<std::size_t const*>(d_comp_bytes.data()),
+    static_cast<std::size_t const*>(d_dst_off),
+    static_cast<std::size_t const*>(d_comp_bytes),
     num_chunks);
   throw_if_cuda_error(cudaGetLastError(), "scatter kernel launch");
   throw_if_cuda_error(cudaStreamSynchronize(s), "sync after scatter");
@@ -219,55 +228,65 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
     h_uncomp_ptrs[i]  = d + i * chunk;
   }
 
-  rmm::device_buffer d_comp_ptrs(num_chunks * sizeof(void*), stream, mr);
-  rmm::device_buffer d_comp_bytes(num_chunks * sizeof(std::size_t), stream, mr);
-  rmm::device_buffer d_uncomp_bytes(num_chunks * sizeof(std::size_t), stream, mr);
-  rmm::device_buffer d_uncomp_ptrs(num_chunks * sizeof(void*), stream, mr);
-  throw_if_cuda_error(cudaMemcpyAsync(d_comp_ptrs.data(),
-                                      h_comp_ptrs.data(),
-                                      num_chunks * sizeof(void*),
-                                      cudaMemcpyHostToDevice,
-                                      s),
-                      "H2D comp ptrs");
-  throw_if_cuda_error(cudaMemcpyAsync(d_comp_bytes.data(),
+  // Coalesce the per-chunk metadata arrays into ONE device allocation instead of six
+  // tiny ones (comp ptrs/bytes, uncomp bytes/ptrs, plus the actual-size and status
+  // outputs some codecs require). Sub-regions at 8*num_chunks strides are 8-byte
+  // aligned, which is all nvcomp needs.
+  std::size_t const sz_ptr           = num_chunks * sizeof(void*);
+  std::size_t const sz_size          = num_chunks * sizeof(std::size_t);
+  std::size_t const sz_stat          = num_chunks * sizeof(nvcompStatus_t);
+  std::size_t const off_comp_ptrs    = 0;
+  std::size_t const off_comp_bytes   = off_comp_ptrs + sz_ptr;
+  std::size_t const off_uncomp_bytes = off_comp_bytes + sz_size;
+  std::size_t const off_uncomp_ptrs  = off_uncomp_bytes + sz_size;
+  std::size_t const off_actual       = off_uncomp_ptrs + sz_ptr;
+  std::size_t const off_statuses     = off_actual + sz_size;
+  rmm::device_buffer meta(off_statuses + sz_stat, stream, mr);
+  auto* const meta_base      = static_cast<std::uint8_t*>(meta.data());
+  void* const d_comp_ptrs    = meta_base + off_comp_ptrs;
+  void* const d_comp_bytes   = meta_base + off_comp_bytes;
+  void* const d_uncomp_bytes = meta_base + off_uncomp_bytes;
+  void* const d_uncomp_ptrs  = meta_base + off_uncomp_ptrs;
+  // Some codecs (e.g. Cascaded) require the actual-size and status output arrays
+  // to be non-null, unlike LZ4/Snappy where they are optional. Always provide
+  // them (carved from `meta`); we do not read them back (verified upstream).
+  void* const d_actual   = meta_base + off_actual;
+  void* const d_statuses = meta_base + off_statuses;
+  throw_if_cuda_error(
+    cudaMemcpyAsync(
+      d_comp_ptrs, h_comp_ptrs.data(), num_chunks * sizeof(void*), cudaMemcpyHostToDevice, s),
+    "H2D comp ptrs");
+  throw_if_cuda_error(cudaMemcpyAsync(d_comp_bytes,
                                       h_comp_bytes.data(),
                                       num_chunks * sizeof(std::size_t),
                                       cudaMemcpyHostToDevice,
                                       s),
                       "H2D comp bytes");
-  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_bytes.data(),
+  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_bytes,
                                       h_uncomp_bytes.data(),
                                       num_chunks * sizeof(std::size_t),
                                       cudaMemcpyHostToDevice,
                                       s),
                       "H2D uncomp bytes");
-  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_ptrs.data(),
-                                      h_uncomp_ptrs.data(),
-                                      num_chunks * sizeof(void*),
-                                      cudaMemcpyHostToDevice,
-                                      s),
-                      "H2D uncomp ptrs");
+  throw_if_cuda_error(
+    cudaMemcpyAsync(
+      d_uncomp_ptrs, h_uncomp_ptrs.data(), num_chunks * sizeof(void*), cudaMemcpyHostToDevice, s),
+    "H2D uncomp ptrs");
 
   std::size_t temp_bytes = 0;
   check(ops.decompress_get_temp_size(num_chunks, chunk, &temp_bytes, out_bytes),
         "decompress_get_temp_size");
   rmm::device_buffer temp(temp_bytes, stream, mr);
 
-  // Some codecs (e.g. Cascaded) require the actual-size and status output arrays
-  // to be non-null, unlike LZ4/Snappy where they are optional. Always provide
-  // them; we do not read them back (correctness is verified upstream).
-  rmm::device_buffer d_actual(num_chunks * sizeof(std::size_t), stream, mr);
-  rmm::device_buffer d_statuses(num_chunks * sizeof(nvcompStatus_t), stream, mr);
-
-  check(ops.decompress_async(static_cast<void const* const*>(d_comp_ptrs.data()),
-                             static_cast<std::size_t const*>(d_comp_bytes.data()),
-                             static_cast<std::size_t const*>(d_uncomp_bytes.data()),
-                             static_cast<std::size_t*>(d_actual.data()),
+  check(ops.decompress_async(static_cast<void const* const*>(d_comp_ptrs),
+                             static_cast<std::size_t const*>(d_comp_bytes),
+                             static_cast<std::size_t const*>(d_uncomp_bytes),
+                             static_cast<std::size_t*>(d_actual),
                              num_chunks,
                              temp.data(),
                              temp_bytes,
-                             static_cast<void* const*>(d_uncomp_ptrs.data()),
-                             static_cast<nvcompStatus_t*>(d_statuses.data()),
+                             static_cast<void* const*>(d_uncomp_ptrs),
+                             static_cast<nvcompStatus_t*>(d_statuses),
                              s),
         "decompress_async");
   throw_if_cuda_error(cudaStreamSynchronize(s), "sync after decompress");
