@@ -319,6 +319,26 @@ TEST_CASE("admission re-emits domain cardinalities in admitted order",
   REQUIRE(result.admitted_keys[1].build_key_domain_cardinality == 10);
 }
 
+TEST_CASE("admission records zero domains from an empty domain vector",
+          "[dynamic_filter][key_admission]")
+{
+  // The empty vector is the no-domain-evidence encoding (a nonempty vector of the wrong length is
+  // a programming error and throws): every admitted key's gate stays disabled.
+  auto const conditions = make_wrapped_equalities(2);
+  std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
+  std::vector<std::size_t> const hinted{1, 0};
+  std::vector<dynamic_filter_scan_target_input> const targets{
+    {.columns = {{.channel_push_ordinal = 1, .probe_storage_type = kInt32},
+                 {.channel_push_ordinal = 0, .probe_storage_type = kInt32}}}};
+
+  auto const result = admit_dynamic_filter_keys(
+    conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
+
+  REQUIRE(result.admitted_keys.size() == 2);
+  REQUIRE(result.admitted_keys[0].build_key_domain_cardinality == 0);
+  REQUIRE(result.admitted_keys[1].build_key_domain_cardinality == 0);
+}
+
 TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_admission]")
 {
   auto const conditions = make_wrapped_equalities(2);
