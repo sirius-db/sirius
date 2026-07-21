@@ -62,7 +62,7 @@ class query {
    *
    * @return Reference to the vector of pointers to scan operators in execution order.
    */
-  [[nodiscard]] const duckdb::vector<op::sirius_physical_operator*>& get_scan_operators() const;
+  [[nodiscard]] std::span<op::sirius_physical_operator* const> get_scan_operators() const;
 
   /**
    * @brief Get the pipeline containing a specific physical operator.

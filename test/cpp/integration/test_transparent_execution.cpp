@@ -182,6 +182,18 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
 }
 
 TEST_CASE_METHOD(TransparentExecutionFixture,
+                 "transparent execution: statistics-propagated aggregates",
+                 "[transparent][integration][gpu_values]")
+{
+  con->Query("CREATE TABLE test_stats AS SELECT i AS id FROM range(1000) t(i);");
+
+  // DuckDB can fold these aggregates from table statistics into constant
+  // EXPRESSION_GET/DUMMY_SCAN sources. Transparent execution must leave
+  // STATISTICS_PROPAGATION enabled and execute the resulting GPU_VALUES plan.
+  compare_transparent_vs_cpu("SELECT count(*), min(id), max(id) FROM test_stats;");
+}
+
+TEST_CASE_METHOD(TransparentExecutionFixture,
                  "transparent execution: join",
                  "[transparent][integration]")
 {
@@ -284,7 +296,9 @@ TEST_CASE_METHOD(TransparentExecutionFixture,
   require_total(*second_result, "45");
 
   auto after_stats = sirius::test::get_transparent_execution_stats(*con);
-  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 2);
+  // 3 rebinds: one at Prepare, one per Execute (OnExecutePrepared re-decides GPU
+  // eligibility for Sirius-backed prepared statements on every execute).
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 3, 0, 2);
 }
 
 TEST_CASE_METHOD(TransparentExecutionFixture,

@@ -46,7 +46,13 @@ class sirius_physical_delim_join : public sirius_physical_operator {
     duckdb::optional_idx delim_idx);
 
   duckdb::unique_ptr<sirius_physical_operator> join;
-  duckdb::unique_ptr<sirius_physical_grouped_aggregate> distinct;
+  //! Owns the distinct subtree top: the bare DISTINCT under flag OFF, or the
+  //! `DISTINCT_MERGE -> PARTITION_DISTINCT -> DISTINCT` chain after wrap_delim_distinct
+  //! under flag ON.
+  duckdb::unique_ptr<sirius_physical_operator> distinct_root;
+  //! Non-owning borrow of the original DISTINCT (always the subtree bottom), used to identify
+  //! the DISTINCT for fan-out wiring and by grouped-aggregate-specific callers.
+  sirius_physical_grouped_aggregate* distinct = nullptr;
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans;
 
   duckdb::optional_idx delim_idx;
@@ -85,10 +91,6 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
-
-  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
-
-  std::unique_ptr<operator_data> get_next_task_input_data() override;
 };
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
@@ -111,8 +113,6 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
-
-  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

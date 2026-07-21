@@ -17,11 +17,17 @@
 #pragma once
 
 #include "io/rest/rest_reactor.hpp"
+#include "io/s3/s3_list_parser.hpp"
 #include "io/templated_ioctx.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace sirius::io::rest {
 
@@ -54,11 +60,60 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// non-zero reactor value.  Lock-free; drives the s3-bench JSON baseline.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
+  /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
+  /// per page (a page holds at most 1000 entries, so peak memory is one page
+  /// regardless of bucket population).  @p sink returns false to stop early —
+  /// no further LIST requests are issued.  @p page_size is clamped to [1,1000]
+  /// (0 and >1000 mean 1000).  Throws (never truncates) on a truncated page
+  /// without a continuation token, and once more than @p max_scanned entries
+  /// have been scanned across pages (bounds time / request count on a prefix
+  /// whose population dwarfs the caller's matches).
+  void list_objects_paged(std::string_view bucket,
+                          std::string_view prefix,
+                          std::size_t page_size,
+                          std::function<bool(s3::list_objects_v2_page const&)> const& sink,
+                          std::optional<std::size_t> max_scanned = std::nullopt);
+
+  /// Whole-listing convenience over @c list_objects_paged: every object under
+  /// @p prefix, in document order, with sizes.  Throws (never truncates) when
+  /// the accumulated entries would exceed @p max_keys — a partial key set would
+  /// resolve a glob to a silently incomplete table.
+  [[nodiscard]] std::vector<s3::list_entry> list_objects(
+    std::string_view bucket,
+    std::string_view prefix,
+    std::size_t page_size               = 1000,
+    std::optional<std::size_t> max_keys = std::nullopt);
+
+  /// The configured matched cap (@c config.list_max_matches) — exposed so the
+  /// glob layer (@c sirius_httpfs::expand_glob, one level up) can bound its
+  /// match set without a reactor handle.  Falls back to the built-in default
+  /// when the pool is empty (never in practice).
+  [[nodiscard]] std::size_t list_max_matches() const;
+
  protected:
   /// Backend hook invoked by @c sirius_ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
+
+  /// @c open_hint::parquet_footer_probe resolves the size and stashes the
+  /// parquet footer together via a single suffix-range GET, carried on the
+  /// returned io_object; every other hint falls back to the plain HEAD path above.
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint) override;
+
+  /// Known-size open: the caller already learned the object's size (e.g. from a
+  /// ListObjectsV2 response), so the io_object is built with ZERO network — no
+  /// HEAD, no probe.
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path,
+                                                     std::uint64_t known_size) override;
+
+ private:
+  /// Resolve @p path with a single suffix-range GET: it discovers the size and
+  /// stashes the object's trailing bytes on the returned io_object so cuDF's
+  /// footer reads are served locally by @c rest_reactor::host_read.  Falls back
+  /// to a HEAD when the suffix response is unusable.  The stash lives only as
+  /// long as the returned io_object — a per-open transport shortcut, not a cache.
+  std::shared_ptr<sirius_io_object> create_footer_probe_object(std::string path);
 };
 
 }  // namespace sirius::io::rest

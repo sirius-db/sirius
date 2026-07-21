@@ -1,14 +1,17 @@
 # Dynamic Filters — Multi-GPU Publication
 
-> **Status: implemented and revalidated on 2026-07-06.** Dynamic-filter
-> consumers remain nonblocking and are safe on multiple GPUs. The producer builds each
-> filter once, materializes its compact representation on every active probe GPU
-> (copying finalized membership storage or reconstructing exact zone scalars),
-> and publishes one immutable logical filter only after every successful
-> device-local replica is ready. TPC-H Q2 passes on physical GPUs 1
-> and 2. In the final pinned-host SF300 Q1-Q22 A/B, the sum of warm per-query
+> **Status: implemented.** The hash-IN-list, Bloom, and zone-map replica paths
+> were revalidated on 2026-07-06. Dynamic-filter consumers remain nonblocking
+> and safe on multiple GPUs. The producer builds each filter once and attempts
+> to materialize its compact representation on every active probe GPU (copying
+> raw needles, finalized hash-set slots, or Bloom words, or reconstructing exact zone
+> scalars), and publishes one immutable logical filter only after every
+> successful device-local replica is ready. TPC-H Q2 passed on physical GPUs 1
+> and 2. In the recorded pinned-host SF300 Q1-Q22 A/B, the sum of warm per-query
 > medians fell from **13.7013505 s to 8.2939465 s: 39.466212% faster
-> (1.651970x)**. All 22 result files were byte-identical.
+> (1.651970x)**. All 22 result files were byte-identical. That measurement and
+> the two-GPU revalidation predate the raw-needle representation; its focused
+> two-GPU regression is described in [Validation](#validation).
 > See [dynamic-filters.md](dynamic-filters.md) for the general feature.
 
 ## Summary
@@ -36,23 +39,27 @@ The publication and application contracts are distinct:
   execution begins.
 - A base scan reached transitively through an intervening join can execute
   earlier. It snapshots whatever fully ready filters are visible at its
-  reader and post-decode checkpoints; soft build-subtree task priority improves
-  the coverage of later splits without imposing a barrier.
+  reader and post-decode checkpoints under normal scheduler order.
 - A scan never waits for a dynamic filter and never assumes one was emitted.
 - An empty or policy-gated publication and an allocation-unavailable local
   replica are safe pass-through cases; the authoritative join guarantees
   correctness.
-- For IN-list/Bloom replicas, serious CUDA construction, transfer, or
-  synchronization failures propagate and fail the producing task/query. The
-  current zone-map target-clone path instead catches, logs, and omits a failed
-  target replica.
+- Every concrete filter treats a per-target reservation denial, construction
+  exception, transfer failure, or completion failure as optional replica
+  unavailability: it catches and logs the failure and omits that target. Source
+  construction failures and publisher invariants outside a target replication
+  attempt still propagate and fail the producing task/query.
 
 Probe metadata parsing and prefetch preparation are independent of publication.
 For an immediate probe, the actual `read_parquet`/decode task starts after the
 ordered build-port publication attempt has returned. A transitive target may
-start sooner: it selects zone maps immediately before `read_parquet` and selects
-membership filters in the following post-decode operator. See
-[Transitive scan targets and build-task priority](dynamic-filters.md#transitive-scan-targets-and-build-task-priority).
+start sooner, and where it snapshots the channel depends on the scan format: a
+parquet target has two checkpoints — it selects zone maps into the reader AST
+immediately before `read_parquet`, then selects membership filters in the
+following post-decode operator; a duckdb-native target has one — the post-decode
+operator, which has no reader filter to ride and therefore selects zone maps
+(evaluated row-wise as AST masks) and membership filters together. See
+[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ## Reproduction and diagnosis
 
@@ -76,6 +83,10 @@ The unsafe ownership was:
 | IN-list | `cuco::static_set` slots | `contains` on GPU B read GPU A's slots |
 | Bloom | `cuco::bloom_filter` words | `contains` on GPU B read GPU A's words |
 | Zone map | min/max `cudf::scalar`s | GPU B's AST literal referenced GPU A storage |
+
+The raw-needle IN-list was added after this original failure. Its owned
+`rmm::device_buffer` is still device-local and follows the same rule: a GPU may
+read only its own needle snapshot.
 
 The error is reported by `cudf::apply_boolean_mask`/`copy_if`, but that is only
 the next synchronizing operation. The invalid access originates in the earlier
@@ -124,18 +135,21 @@ uses must finish before filter destruction. This was already required by the
 replicas' non-owning RMM allocator references. Carrying the memory space makes
 the allocator-and-stream lifetime contract explicit in the placement type.
 
-The exact-set/Bloom choice uses the minimum L2 size across the planned devices.
-The exact IN-list is selected only when it fits the least-capable probe GPU;
-otherwise the publisher selects the much smaller Bloom, which may itself exceed
-L2 for a sufficiently large build. The decision never inherits whichever GPU
+The producer first selects the raw-needle IN-list for 1–12 null-free INT32/INT64
+build rows, counting duplicates. For remaining supported columns, the
+hash-IN-list/Bloom choice uses the minimum L2 size across the planned devices.
+The hash IN-list is selected only when it fits the least-capable probe GPU;
+otherwise the publisher selects the smaller Bloom, which may itself exceed L2
+for a sufficiently large build. The decision never inherits whichever GPU
 first queried `cudaDevAttrL2CacheSize`.
 
 ### 2. Keep publication local and exactly once
 
-`dynamic_filter_publisher` is a translation-unit-local helper in
-`sirius_physical_hash_join.cpp`. It consumes the immutable plan, the join's key
-metadata, and one materialized build view; it is not a shared scheduler service
-or a mutable routing registry.
+`dynamic_filter_publisher` is declared in
+`src/include/op/dynamic_filter_publisher.hpp` and implemented in
+`src/op/dynamic_filter_publisher.cpp`; the physical hash join owns and invokes
+it. It consumes the immutable plan, the join's key metadata, and one materialized
+build view; it is not a shared scheduler service or a mutable routing registry.
 
 The build-port hook offers that view as soon as the single concat-folded
 `BUILD_PROBE` build batch arrives, acquiring the batch's read-only accessor
@@ -156,13 +170,11 @@ is never held while reducing keys, building filters, copying replicas, or
 synchronizing CUDA work.
 
 At the early build-port site, a stream borrowed from the build memory space
-first waits on the build representation's writer event. The fallback also
-switches from the worker stream to a stream from that same durable pool after
-the hash-table build is drained. Persistent cuDF/cuCO filter storage may retain
-its allocation stream for eventual asynchronous deallocation, so it must not
-retain a worker stream whose executor can be torn down earlier. Publication
-remains independent of a probe batch and preserves the existing join task state
-machine.
+first waits on the build representation's writer event. Persistent
+cuDF/cuCO/RMM filter storage may retain that durable pooled stream for eventual
+asynchronous deallocation, so it must not retain a worker stream whose executor
+can be torn down earlier. Publication remains independent of a probe batch and
+preserves the existing join task state machine.
 
 ### 3. Expose replication as a producer-only capability
 
@@ -189,13 +201,22 @@ The producer builds the source filter normally and synchronizes its construction
 stream once. It does not retain the build-key column and does not rebuild or
 rehash keys on every GPU.
 
-- **IN-list:** create an identical target `cuco::static_set`, verify its
+- **Raw-needle IN-list:** allocate an owned target `rmm::device_buffer` and copy
+  `num_keys * sizeof(KeyT)` bytes from the source needle snapshot. There is no
+  target hash structure to rebuild.
+- **Hash IN-list:** create an identical target `cuco::static_set`, verify its
   capacity, then copy `capacity * sizeof(KeyT)` bytes from `static_set::data()`.
 - **Bloom:** create the same policy and block extent on the target, verify the
   extent, then copy `block_extent * words_per_block * sizeof(word_type)` bytes.
 - **Zone map:** read each bound as its exact host type and construct target-owned
   scalars. This preserves `INT64`, timestamp, decimal, and string semantics; it
   does not round bounds through `double`.
+
+Each byte-backed membership replica first reserves its tracked destination
+allocation through the target's reservation-aware GPU allocator. Reservation
+denial logs and omits that optional replica. When the scoped reservation
+detaches, unused capacity is returned while the completed allocation remains
+accounted until replica teardown.
 
 For every target, the planner pairs its GPU memory space with a NUMA-local HOST
 memory space (falling back to the first Sirius HOST space when topology is
@@ -207,8 +228,9 @@ same-device copy is submitted for it. Peer-DMA copies to remote targets are
 submitted before the publisher waits on any target stream, so transfers to
 three or more GPUs can overlap. The publisher retains each destination object
 through this completion pass and adds it to the ready set only after its stream
-completes. Replica destruction selects the owning CUDA device and releases
-cuCO/scalar objects while both documented memory spaces are still alive.
+completes. Replica destruction selects the owning CUDA device and releases RMM
+buffers, cuCO objects, or scalars while both documented memory spaces are still
+alive.
 
 ```mermaid
 flowchart LR
@@ -230,8 +252,8 @@ flowchart LR
 
     FILTER --> REPLICATE
     FILTER -->|"ready source replica"| COMPLETE
-    REPLICATE -->|"IN-list / Bloom<br/>verified peer route"| PEER
-    REPLICATE -->|"IN-list / Bloom<br/>peer route unavailable"| HOST
+    REPLICATE -->|"raw/hash IN-list or Bloom<br/>verified peer route"| PEER
+    REPLICATE -->|"raw/hash IN-list or Bloom<br/>peer route unavailable"| HOST
     HOST --> STAGED
     REPLICATE -->|"zone map"| ZONE
     REPLICATE -.->|"membership target failure"| SKIP
@@ -279,8 +301,10 @@ retains those replicas and synchronizes all target streams only after fan-out
 submission is complete. HOST staging completes inside the helper because its
 borrowed blocks cannot return to the pool while H2D DMA is in flight. Host-pool
 exhaustion is allocation unavailability and may omit that optional replica.
-CUDA enqueue/synchronization and invariant failures propagate; they do not
-silently change routes or allow probing against uncertain replica state.
+The copy helper propagates enqueue and synchronization errors to its concrete
+filter; the filter's per-target replication boundary catches them, logs the
+omission, and never exposes uncertain replica state. The helper does not
+silently change transfer routes.
 
 ### 6. Publish one ready immutable snapshot
 
@@ -303,9 +327,12 @@ generations. A transitive target may still race the producer's successive
 The scan paths pass their memory-space device ID into dynamic-filter lowering and
 mask computation:
 
-- parquet AST merge selects device-local zone-map scalars;
-- post-decode membership apply selects the local static set/Bloom;
-- `is_available_on_device` is checked before either path.
+- the parquet reader AST merge selects device-local zone-map scalars;
+- the post-decode AST row-mask apply (duckdb-native scans,
+  `include_ast_row_masks`) selects device-local zone-map scalars;
+- the post-decode membership apply selects the local raw needles, static set, or
+  Bloom;
+- `is_available_on_device` is checked before every path.
 
 There is no remote kernel dereference and no consumer-side synchronization with
 the producer.
@@ -321,10 +348,13 @@ disable a filter already proven useful.
 
 Publication adds `O(filter_size * (GPU_count - 1))` transfer work per join, not
 one rehash/rebuild per GPU. A verified pair uses one direct peer-DMA leg; only an
-unusable pair pays the HOST-staged D2H/H2D fallback. The steady-state probe remains
-entirely device-local: the exact set is selected to fit the smallest active L2
-where possible, and the Bloom stays the compact fallback. No key column is
-retained, no scan is pinned to the build GPU, and scan parallelism is unchanged.
+unusable pair pays the HOST-staged D2H/H2D fallback. The steady-state probe
+remains entirely device-local: the 1–12-row first tier scans raw needles, the
+hash IN-list is selected to fit the smallest active L2 where possible, and the
+Bloom remains the compact fallback. The raw tier's probe work is
+`O(probe_rows * num_keys)`; its row-count gate bounds that work, but no
+raw-versus-hash performance result is claimed here. No key column is retained,
+no scan is pinned to the build GPU, and scan parallelism is unchanged.
 
 The copy happens on the producer's publication path. Direct copies to all
 peer-capable targets are enqueued before the completion pass, allowing their DMA
@@ -332,10 +362,10 @@ legs to overlap on three or more GPUs. For an immediate probe, publication
 completion is upstream of data-scan execution, so replica latency is on the
 probe-start critical path. For a transitive target, earlier work may proceed
 unfiltered while replication is in progress; replica latency instead delays
-filter availability and reduces the number of splits it can prune. Soft
-build-subtree priority minimizes that window. The representations are compact
-and copied rather than rebuilt; for a two-GPU query this is one remote replica
-per emitted filter.
+filter availability and reduces the number of splits it can prune. The scheduler
+does not reorder work to minimize that window. Raw needles are bounded by the
+producer policy, while hash-set slots and Bloom words are copied rather than
+rebuilt; for a two-GPU query this is one remote replica per emitted filter.
 
 `memory_space::acquire_stream()` may return a pooled stream that already has
 work queued, so the publication wait can occasionally include earlier work on
@@ -349,8 +379,9 @@ includes this behavior.
 
 ### Correctness and device ownership
 
-On physical NVIDIA GB200 GPUs 1 and 2 (`CUDA_VISIBLE_DEVICES=1,2`, exposed as
-logical devices 0 and 1):
+The recorded 2026-07-06 baseline on physical NVIDIA GB200 GPUs 1 and 2
+(`CUDA_VISIBLE_DEVICES=1,2`, exposed as logical devices 0 and 1) predates the
+raw-needle representation:
 
 - Full dynamic-filter suite: **242 assertions in 67 test cases, all passed**.
   This includes IN-list, Bloom, and zone-map remote replicas, the forced
@@ -363,18 +394,29 @@ requested device returns no mask; this exercises API safety and is not a model
 of production scheduling, because production publishes only after replication.
 The tests also verify that replicas survive destruction of the borrowed
 build-key column, that Bloom replication has no false negatives, and that the
-explicit pinned-host fallback transfers the exact bytes. Their source
-and destination allocations use streams and allocators from a two-GPU Sirius
+explicit pinned-host fallback transfers the exact bytes. Their source and
+destination allocations use streams and allocators from a two-GPU Sirius
 memory manager, which is deliberately declared before—and destroyed after—the
 filters to exercise the documented pool-lifetime contract.
 
+Raw-needle coverage adds local INT32/INT64 exact-mask and reserved-sentinel
+cases, direct publisher-selection tests for the raw and adjacent hash tiers,
+and a focused two-GPU case. The latter destroys the original build-key column
+before fan-out, verifies remote unavailability before replication and exact
+masking afterward, checks reservation/allocation growth, and checks teardown.
+The reservation-denial suite also covers the raw small IN-list. These multi-GPU
+cases skip automatically when fewer than two devices are visible, so a passing
+two-device run is still required before the raw path can be called revalidated.
+
 ### Performance
 
-The final measurement used SF300 parquet, grouped mode, physical GPUs 1 and 2,
-five iterations per query, and `--pin host`. Host pinning occurs outside the
-timed region. Zone maps were disabled, so this isolates membership-filter
-publication and application. The OFF and ON configurations differ materially
-only in `enable_dynamic_filter_pushdown` and their output paths.
+The recorded measurement used SF300 parquet, grouped mode, physical GPUs 1 and
+2, five iterations per query, and `--pin host`. Host pinning occurs outside the
+timed region. Zone maps were disabled, so this isolates the then-current
+hash-IN-list/Bloom publication and application. It predates the raw-needle tier
+and is not evidence for that tier or its cutoff. The OFF and ON configurations
+differ materially only in `enable_dynamic_filter_pushdown` and their output
+paths.
 
 For each query, iteration 0 was discarded and the median of iterations 1-4 was
 taken. The global TPC-H metric is the sum of those 22 medians:
@@ -420,13 +462,16 @@ claim. Q19 regresses 1.0%, so the gain is global rather than universal per query
 
 - Filter API and device-aware ownership:
   `src/include/op/sirius_dynamic_filter.hpp`
-- IN-list/Bloom storage replication:
+- Membership storage replication:
+  `src/cuda/sirius_dynamic_small_in_list_filter.cu`,
   `src/cuda/sirius_dynamic_in_list_filter.cu`,
   `src/cuda/sirius_dynamic_bloom_filter.cu`
 - Exact typed zone-map replication:
   `src/op/sirius_dynamic_filter.cpp`
 - Producer device discovery and publication:
   `src/planner/sirius_plan_comparison_join.cpp`,
+  `src/include/op/dynamic_filter_publisher.hpp`,
+  `src/op/dynamic_filter_publisher.cpp`,
   `src/op/sirius_physical_hash_join.cpp`
 - Consumer device selection:
   `src/include/op/scan/dynamic_filter_gate.hpp`,
@@ -434,8 +479,10 @@ claim. Q19 regresses 1.0%, so the gain is global rather than universal per query
   `src/op/scan/parquet_gpu_ingestible.cpp`,
   `src/op/scan/sirius_physical_dynamic_filter.cpp`
 - Sirius-owned replica-transfer policy:
+  `src/include/op/dynamic_filter_replica_reservation.hpp`,
   `src/include/op/dynamic_filter_replica_transfer.hpp`,
   `src/cuda/dynamic_filter_replica_transfer.cu`
-- Focused regression:
+- Focused regressions:
+  `test/cpp/operator/test_dynamic_filter_publisher.cpp`,
   `test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp`,
   `test/cpp/scan/test_dynamic_filter_merge.cpp`

@@ -16,9 +16,9 @@
 
 #include "planner/query.hpp"
 
-#include "sirius_engine.hpp"
-#include "sirius_interface.hpp"
 #include "telemetry/telemetry_context.hpp"
+
+#include <cstdlib>
 
 namespace sirius::planner {
 
@@ -43,9 +43,11 @@ void query::build_indices()
       // Add to operator-to-pipeline map
       _operator_to_pipeline[source.get()] = pipeline;
 
-      // If it's a scan-like source, add to scan operators vector
+      // If it's a scan-like source, add to scan operators vector. GPU_VALUES
+      // must be included: task_scheduler::start_query() schedules the first
+      // scan operator, which is the only kickoff a VALUES-only plan gets.
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES) {
         _scan_operators.push_back(source.get());
       }
     }
@@ -60,9 +62,9 @@ void query::build_indices()
   }
 }
 
-const duckdb::vector<op::sirius_physical_operator*>& query::get_scan_operators() const
+std::span<op::sirius_physical_operator* const> query::get_scan_operators() const
 {
-  return _scan_operators;
+  return {_scan_operators.data(), _scan_operators.size()};
 }
 
 duckdb::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_physical_operator* op)

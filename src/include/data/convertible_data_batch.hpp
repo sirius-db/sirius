@@ -126,15 +126,15 @@ class convertible_data_batch : public convertible_data {
       switch (space->get_tier()) {
         case cucascade::memory::Tier::GPU:
           mut.convert_to<cucascade::gpu_table_representation>(
-            converter_registry, mem_space, stream);
+            converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::HOST:
           mut.convert_to<cucascade::host_data_representation>(
-            converter_registry, mem_space, stream);
+            converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::DISK:
           mut.convert_to<cucascade::disk_data_representation>(
-            converter_registry, mem_space, stream);
+            converter_registry, *reservation, stream);
           break;
         default: continue;
       }
@@ -230,12 +230,16 @@ class convertible_data_batch_provider : public convertible_data_provider {
    *
    * Same iteration order as get_next_convertible but collects all matching batches.
    *
-   * @param space           The memory space to filter by.
-   * @param front_to_back   Iteration direction.
+   * @param space             The memory space to filter by.
+   * @param front_to_back     Iteration direction.
+   * @param ignore_subscribed When true (default), skip batches that have been subscribed to by a
+   * task
    * @return A vector of convertible_data_batch instances (may be empty).
    */
   std::vector<std::unique_ptr<convertible_data>> get_all_convertible(
-    cucascade::memory::memory_space* space, bool front_to_back) override
+    cucascade::memory::memory_space* space,
+    bool front_to_back,
+    bool ignore_subscribed = true) override
   {
     std::vector<std::unique_ptr<convertible_data>> results;
     auto num_parts = _repo->num_partitions();
@@ -245,7 +249,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
       for (std::size_t p = 0; p < num_parts; ++p) {
         auto batch_ids = _repo->get_batch_ids(p);
         for (std::size_t i = 0; i < batch_ids.size(); ++i) {
-          auto result = try_get_batch(batch_ids[i], p, space);
+          auto result = try_get_batch(batch_ids[i], p, space, ignore_subscribed);
           if (result) { results.push_back(std::move(result)); }
         }
       }
@@ -253,7 +257,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
       for (std::size_t p = num_parts; p > 0; --p) {
         auto batch_ids = _repo->get_batch_ids(p - 1);
         for (std::size_t i = batch_ids.size(); i > 0; --i) {
-          auto result = try_get_batch(batch_ids[i - 1], p - 1, space);
+          auto result = try_get_batch(batch_ids[i - 1], p - 1, space, ignore_subscribed);
           if (result) { results.push_back(std::move(result)); }
         }
       }
@@ -298,17 +302,24 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * to_read_only() as required by the new cucascade API (get_memory_space() is
    * private on idle data_batch).
    *
-   * @param batch_id       The batch ID to retrieve.
-   * @param partition_idx  The partition containing the batch.
-   * @param space          The target memory space to match.
+   * @param batch_id          The batch ID to retrieve.
+   * @param partition_idx     The partition containing the batch.
+   * @param space             The target memory space to match.
+   * @param ignore_subscribed When true (default), skip batches that have been subscribed to by a
+   * task.
    * @return A convertible_data_batch if the batch matches, nullptr otherwise.
    */
   std::unique_ptr<convertible_data> try_get_batch(uint64_t batch_id,
                                                   std::size_t partition_idx,
-                                                  cucascade::memory::memory_space* space) const
+                                                  cucascade::memory::memory_space* space,
+                                                  bool ignore_subscribed = true) const
   {
     auto batch = _repo->get_data_batch_by_id(batch_id, partition_idx);
     if (!batch) { return nullptr; }
+
+    // A subscribed batch is being held by a task (queued or preparing); skip it so we don't
+    // downgrade data a task is about to use.
+    if (ignore_subscribed && batch->get_subscriber_count() > 0) { return nullptr; }
 
     if (batch->get_state() != cucascade::batch_state::idle) { return nullptr; }
 

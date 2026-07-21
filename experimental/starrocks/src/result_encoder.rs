@@ -100,7 +100,9 @@ impl MysqlResultEncoder {
                     .ok_or_else(|| format!("date32 value {} out of range", typed.value(row)))?;
                 Ok(Some(date.format("%Y-%m-%d").to_string().into_bytes()))
             }
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            // StarRocks DATETIME is timezone-naive wall-clock; a tz-aware timestamp would need
+            // offset handling we don't implement, so let `Some(tz)` fall through to the error arm.
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 let typed = Self::downcast::<TimestampMicrosecondArray>(array)?;
                 let value = typed.value(row);
                 let datetime = as_datetime::<TimestampMicrosecondType>(value)
@@ -224,15 +226,17 @@ mod tests {
             Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
         ]));
         let decimals: ArrayRef = Arc::new(
-            Decimal128Array::from(vec![Some(-123456), None])
+            Decimal128Array::from(vec![Some(-123456), None, None])
                 .with_precision_and_scale(15, 2)
                 .unwrap(),
         );
         // 10471 days = 1998-09-02.
-        let days: ArrayRef = Arc::new(Date32Array::from(vec![Some(10471), Some(0)]));
+        let days: ArrayRef = Arc::new(Date32Array::from(vec![Some(10471), Some(0), Some(0)]));
         let stamps: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
             Some(904_694_400_000_000),
             Some(1_500_000),
+            // Sub-millisecond fractional part exercises %.6f leading-zero padding.
+            Some(1_500),
         ]));
         let batch = RecordBatch::try_new(schema, vec![decimals, days, stamps]).unwrap();
 
@@ -261,6 +265,10 @@ mod tests {
         assert_eq!(
             cells(&result.rows[1]),
             vec!["NULL", "1970-01-01", "1970-01-01 00:00:01.500000"]
+        );
+        assert_eq!(
+            cells(&result.rows[2]),
+            vec!["NULL", "1970-01-01", "1970-01-01 00:00:00.001500"]
         );
     }
 

@@ -22,6 +22,7 @@
 #include "io/cache/types.hpp"
 #include "io/io_context.hpp"
 #include "io/types.hpp"
+#include "log/logging.hpp"
 #include "memory/topology_index.hpp"
 #include "util/error_utils.hpp"
 
@@ -30,15 +31,13 @@
 
 #include <cuda_runtime.h>
 
-#include <spdlog/fmt/fmt.h>
-#include <spdlog/spdlog.h>
-
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <exception>
+#include <format>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -329,8 +328,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
 {
   if (!_armed) { return prefetching_handle(nullptr); }
 
-  const auto& key = obj.raw_file_cache_id();
-  auto& file      = get_or_create_file_entry(obj);
+  auto& file = get_or_create_file_entry(obj);
 
   const size_t chunk_bytes = _chunk_size;
   auto coalesced_ranges    = _io_ctx->align_and_coalesce(ranges, chunk_bytes);
@@ -366,7 +364,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
     work, _eviction_queue, _prefetch_queue));
   _preparation_queue.enqueue(std::move(work));
 
-  return std::move(handle);
+  return handle;
 }
 
 bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
@@ -638,7 +636,7 @@ std::string prefetching_cache::summary() const
   uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
   uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
 
-  return fmt::format(
+  return std::format(
     "prefetching_cache: "
     "global[reads={} hits={} h2d={} miss={} evictions={}] "
     "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
@@ -675,7 +673,7 @@ void prefetching_cache::prepare_for_query(const sirius::planner::query& query) n
 void prefetching_cache::prepare_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
-    spdlog::trace("prefetching_cache: prepare_loop received stop request, unblocking queue");
+    SIRIUS_LOG_TRACE("prefetching_cache: prepare_loop received stop request, unblocking queue");
     _preparation_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
 
@@ -717,7 +715,7 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
         c->numa_node = numa_allocated;
         if (!c->state.mark_allocated()) {
           buffers.push_back(buffer);  // return the buffer to the pool
-          spdlog::error(
+          SIRIUS_LOG_ERROR(
             "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
             "allocated",
             c->offset);
@@ -745,7 +743,7 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
 void prefetching_cache::prefetch_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
-    spdlog::trace("prefetching_cache: prefetch_loop received stop request, unblocking queue");
+    SIRIUS_LOG_TRACE("prefetching_cache: prefetch_loop received stop request, unblocking queue");
     _prefetch_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
   while (!_shutting_down && !st.stop_requested()) {
@@ -777,6 +775,7 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
     if (req->is_cancelled() || st.stop_requested()) {
       std::ranges::for_each(allocated_chunks,
                             [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
+      std::ignore = req->state->mark_load_failed();
       continue;
     }
 
@@ -796,7 +795,7 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
 void prefetching_cache::evict_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
-    spdlog::trace("prefetching_cache: evict_loop received stop request, unblocking queue");
+    SIRIUS_LOG_TRACE("prefetching_cache: evict_loop received stop request, unblocking queue");
     _eviction_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
   });
 

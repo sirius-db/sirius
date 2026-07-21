@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -49,7 +50,8 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
   sirius::parallel::downgrade_executor* downgrade_executor,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
-  : sirius::parallel::itask_executor(config, std::move(telemetry_context)),
+  : sirius::parallel::itask_executor(
+      config, std::move(telemetry_context), mem_space->get_device_id()),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
@@ -70,7 +72,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
           thread_id_counter]() mutable noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
     telemetry::thread_local_executor_thread_telemtry_init(
-      *telemetry_context, fmt::format("{}-gpu_exec-{}", thread_prefix, thread_id));
+      *telemetry_context,
+      std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
+      telemetry_context->executor_thread_group_id(device_id));
 
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
@@ -80,9 +84,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
     // check instead.
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
-      spdlog::error("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
-                    device_id,
-                    cudaGetErrorString(err));
+      SIRIUS_LOG_ERROR("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
+                       device_id,
+                       cudaGetErrorString(err));
     }
     sirius::util::enable_log_on_default_stream();
   };
@@ -91,7 +95,9 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 void gpu_pipeline_executor::manager_loop()
 {
   telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
-    *_telemetry_context, fmt::format("gpu-{}-exec-manager", _memory_space->get_device_id())};
+    *_telemetry_context,
+    std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
+    _telemetry_context->manager_thread_group_id(_memory_space->get_device_id())};
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
@@ -109,11 +115,16 @@ void gpu_pipeline_executor::manager_loop()
     auto ready       = std::make_unique<task_request>();
     ready->kind      = task_request_kind::device_ready;
     ready->device_id = _memory_space->get_device_id();
-    if (!_task_request_publisher.send(std::move(ready))) {
-      SIRIUS_LOG_INFO("GPU Pipeline Executor: task_request channel closed, stopping manager loop");
-      break;
+
+    std::unique_ptr<parallel::itask> pipeline_task = nullptr;
+    {
+      if (!_task_request_publisher.send(std::move(ready))) {
+        SIRIUS_LOG_INFO(
+          "GPU Pipeline Executor: task_request channel closed, stopping manager loop");
+        break;
+      }
+      pipeline_task = _task_queue.pop();  // block till a task is available
     }
-    auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;
@@ -127,7 +138,9 @@ void gpu_pipeline_executor::manager_loop()
       }
       break;
     }
-    auto reservation_info = gpu_task->get_estimated_reservation_size_info();
+    // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
+    // another device, which prepare clones into this space) are counted in the reservation.
+    auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
     auto bytes_needs      = reservation_info.reservation_size;
     gpu_task->telemetry_handle().reserving({
       .instance_name              = "",
@@ -294,6 +307,7 @@ void gpu_pipeline_executor::manager_loop()
        pipeline]() mutable {
         try {
           task->execute(exc_stream);
+          _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (oom_reschedule_exception& oom) {
           if (_completion_handler && _completion_handler->has_error()) {
             // If the completion handler is already in an error state, then we can just return and
@@ -468,6 +482,11 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
 }
 
 bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }
+
+executor_metrics gpu_pipeline_executor::get_metrics() const noexcept
+{
+  return {_tasks_executed.load(std::memory_order_relaxed)};
+}
 
 void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
 {

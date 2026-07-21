@@ -10,7 +10,7 @@
   </a>
 </p>
 
-Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
+Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Starrocks (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
 
 <p align="center">
   <picture>
@@ -69,10 +69,34 @@ ORDER BY l_returnflag;
 SET gpu_execution = false;
 ```
 
-Two execution paths are available. See each page for build, configuration, and testing details:
+Execution is out-of-core with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling, and works with both **Parquet** and **DuckDB-native** storage. See [`gpu_execution`](gpu_execution.md) for build, configuration, and testing details.
 
-- **[`gpu_execution`](gpu_execution.md) (Recommended)** — Out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. Works with **Parquet** data format.
-- **[`gpu_processing`](gpu_processing.md)** — In-memory execution where the dataset must fit in GPU memory. Works with DuckDB's native storage format.
+## Pinning Tables for Hot Runs
+
+Sirius reads table data from storage on every query. For the best hot-run performance, pin
+frequently queried tables: `pin_table` materializes a table's columns into memory once, and
+subsequent queries over that source are served straight from the pinned copy, skipping file
+I/O and decode entirely. Queries don't change — pinned tables are matched automatically.
+
+```sql
+-- Pin a parquet file (or glob) into GPU memory; omit cols to pin all columns
+CALL pin_table('/path/to/lineitem.parquet', name = 'lineitem', tier = 'gpu',
+               cols = ['l_orderkey', 'l_quantity', 'l_extendedprice', 'l_shipdate']);
+
+-- Pin a DuckDB base table
+CALL pin_table(format = 'duckdb', name = 'my_table', tier = 'gpu');
+
+-- Served from the pinned copy — no file I/O
+SELECT sum(l_extendedprice * l_quantity)
+FROM read_parquet('/path/to/lineitem.parquet')
+WHERE l_shipdate >= DATE '1994-01-01';
+
+-- Release the pinned memory
+CALL unpin_table('lineitem');
+```
+
+`tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
+pinned host memory instead, for tables larger than GPU memory.
 
 ## Configuration
 
@@ -143,7 +167,7 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 </p>
 
 ## Future Roadmap
-Sirius is still under major development and we are working on adding more features to Sirius, such as disk spilling, multi-GPUs, multi-node, more operators, data types, accelerating more engines, and many more.
+Sirius is still under major development and we are working on adding more features to Sirius, such as multi-node, more operators, data types, accelerating more engines, and many more.
 
 Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
 

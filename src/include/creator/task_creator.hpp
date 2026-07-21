@@ -16,11 +16,12 @@
 
 #pragma once
 
+#include "config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "exec/bounded_thread_pool.hpp"
-#include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
@@ -63,6 +64,7 @@ namespace sirius::creator {
 
 struct task_creation_request {
   op::sirius_physical_operator* node;
+  request_type type = request_type::active;
 };
 
 class task_creator {
@@ -74,7 +76,7 @@ class task_creator {
    * @param mem_res_mgr Reference to the memory reservation manager.
    * @param sys_topology Optional system topology info for NUMA-aware GPU routing.
    */
-  task_creator(exec::thread_pool_config config,
+  task_creator(task_creator_config config,
                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
                const cucascade::memory::system_topology_info* sys_topology = nullptr);
 
@@ -99,9 +101,7 @@ class task_creator {
   void prepare_for_query(const sirius::planner::query& query);
 
   /// \brief clean-up query bound resources and prepare the task creator for next query
-  /// @param keep_parquet_metadata When true, parquet scan global states are kept
-  ///        so that cached file metadata (footers) can be reused on a warm re-run.
-  void reset(bool keep_parquet_metadata = false);
+  void reset();
 
   /**
    * @brief Stop the task creator and its thread pool.
@@ -133,20 +133,13 @@ class task_creator {
   void drain_pending_tasks();
 
   /**
-   * @brief Signal query completion without draining.
-   *
-   * Safe to call from inside a pool thread (unlike drain_pending_tasks). Used by
-   * notify_downstream_pipelines when a terminal RESULT_COLLECTOR pipeline finishes
-   * with zero tasks — the normal gpu_pipeline_executor path is never reached.
-   */
-  void signal_query_complete();
-
-  /**
    * @brief Schedule a task creation info for processing.
    *
    * @param info The task creation info to schedule.
    */
   virtual void schedule(op::sirius_physical_operator* request);
+
+  void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
   /**
    * @brief Get the next task id.
@@ -184,13 +177,17 @@ class task_creator {
   void manager_loop();
 
   std::atomic<bool> _running;
-  exec::thread_pool_config _config;
+  task_creator_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   std::thread _manager_thread;
   ::duckdb::ClientContext* _client_context;
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
+
+  std::mutex _lookahead_mutex;              // Protect concurrent access to the lookahead scheduling
+  std::size_t _index_of_next_lookahead{0};  // Index of the next operator to lookahead for
+  std::vector<op::sirius_physical_operator*> _lookahead_queue;
 
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task

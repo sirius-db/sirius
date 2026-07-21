@@ -199,7 +199,7 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   // worker drops the old request and we don't leak both into the cache.
   if (_prefetch_handle) {
     if (_prefetch_handle.is_active()) {
-      spdlog::warn(
+      SIRIUS_LOG_WARN(
         "sirius_datasource::fadvise: a prefetching_handle was already stored on "
         "this datasource (path={}); cancelling the stale request.  Each scan "
         "should own a unique datasource.",
@@ -229,10 +229,9 @@ void sirius_datasource::prefetch(cache::prefetching_stage site)
   }
 }
 
-bool sirius_datasource::uses_prefetching_cache()
+bool sirius_datasource::uses_prefetching_cache() const noexcept
 {
-  auto* cache = _io_ctx->cache();
-  return cache != nullptr && _io_ctx->can_use_prefetching_cache();
+  return _io_ctx->uses_prefetching_cache();
 }
 
 }  // namespace sirius::io

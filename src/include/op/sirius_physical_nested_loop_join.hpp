@@ -26,6 +26,7 @@
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "sirius_config.hpp"
 
 #include <cstdint>
 
@@ -103,21 +104,33 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
  protected:
   // CachingOperator Interface
 
-  static void build_join_pipelines(pipeline::sirius_pipeline& current,
-                                   pipeline::sirius_meta_pipeline& meta_pipeline,
-                                   sirius_physical_operator& op,
-                                   bool build_rhs = true);
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
  public:
   // Source interface
-  bool is_source() const override { return duckdb::PropagatesBuildSide(join_type); }
+  //! Always a source: every join emits output.
+  bool is_source() const override { return true; }
 
  public:
-  // Sink Interface
-  bool is_sink() const override { return true; }
+  //! True when this NLJ is the internal `delim.join` of a RIGHT_DELIM_JOIN; see the
+  //! identical field on `sirius_physical_hash_join`.
+  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
+  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
 
+  // Sink Interface
+  //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule
+  //! applies. Mirrors HJ.
+  bool is_sink() const override
+  {
+    if (_is_delim_join_inner) { return false; }
+    return sirius_physical_operator::is_sink();
+  }
+
+ protected:
+  bool _is_delim_join_inner = false;
+
+ public:
   static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,
                            duckdb::JoinType join_type);
 

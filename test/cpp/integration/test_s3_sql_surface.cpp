@@ -6,12 +6,14 @@
  */
 
 #include "catch.hpp"
+#include "io/io_context.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_object_ref.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
+#include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -30,6 +32,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -299,6 +302,10 @@ struct sirius_memory_limits {
   std::optional<bool> enable_prefetch_cache;
   std::optional<std::size_t> rest_n_reactors;
   std::optional<std::size_t> rest_max_connections;
+  std::optional<bool> use_sirius_datasource;
+  std::optional<std::string> rest_footer_probe_bytes;
+  std::optional<std::size_t> rest_list_max_matches;
+  std::optional<std::size_t> rest_list_max_scanned;
   bool rest_perf_instrumentation{false};
 };
 
@@ -373,6 +380,10 @@ class sirius_config_env_guard {
       out << "      enable_prefetch_cache: " << (*limits.enable_prefetch_cache ? "true" : "false")
           << "\n";
     }
+    if (limits.use_sirius_datasource.has_value()) {
+      out << "      use_sirius_datasource: " << (*limits.use_sirius_datasource ? "true" : "false")
+          << "\n";
+    }
     if (limits.rest_n_reactors.has_value()) {
       out << "      rest_n_reactors: " << *limits.rest_n_reactors << "\n";
     }
@@ -407,6 +418,15 @@ class sirius_config_env_guard {
         << limits.rest_max_connections.value_or(std::size_t{8})
         << "\n"
            "        request_timeout_s: 30\n";
+    if (limits.rest_footer_probe_bytes.has_value()) {
+      out << "        footer_probe_bytes: " << yaml_quote(*limits.rest_footer_probe_bytes) << "\n";
+    }
+    if (limits.rest_list_max_matches.has_value()) {
+      out << "        list_max_matches: " << *limits.rest_list_max_matches << "\n";
+    }
+    if (limits.rest_list_max_scanned.has_value()) {
+      out << "        list_max_scanned: " << *limits.rest_list_max_scanned << "\n";
+    }
     if (limits.rest_perf_instrumentation) { out << "        perf_instrumentation: true\n"; }
     out.close();
     REQUIRE(out);
@@ -480,6 +500,13 @@ std::unique_ptr<duckdb::MaterializedQueryResult> require_query_ok(duckdb::Connec
     static_cast<duckdb::MaterializedQueryResult*>(result.release()));
 }
 
+void query_or_throw_on_error(duckdb::Connection& con, std::string const& sql)
+{
+  auto result = con.Query(sql);
+  if (!result) { throw std::runtime_error("DuckDB returned a null query result"); }
+  if (result->HasError()) { result->ThrowError(); }
+}
+
 std::string gpu_execution_sql(std::string const& inner_sql)
 {
   std::string escaped;
@@ -489,6 +516,14 @@ std::string gpu_execution_sql(std::string const& inner_sql)
     escaped.push_back(c);
   }
   return "SELECT * FROM gpu_execution('" + escaped + "')";
+}
+
+void set_gpu_execution(duckdb::Connection& con, bool enabled)
+{
+  auto result = con.Query(std::string{"SET gpu_execution = "} + (enabled ? "true" : "false"));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
 }
 
 std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
@@ -593,6 +628,31 @@ void check_rows_equal_with_tolerant_columns(duckdb::MaterializedQueryResult& act
   }
 }
 
+std::string lowercase(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+void require_nested_operation_unsupported(s3_sql_fixture& fixture,
+                                          std::string const& sql,
+                                          std::string_view column_name)
+{
+  auto result = fixture.con.Query(gpu_execution_sql(sql));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+
+  auto const error       = result->GetError();
+  auto const lower_error = lowercase(error);
+  INFO(error);
+  CHECK(lower_error.find("nested column operation") != std::string::npos);
+  CHECK((lower_error.find("unsupported") != std::string::npos ||
+         lower_error.find("not supported") != std::string::npos));
+  CHECK(error.find(std::string{column_name}) != std::string::npos);
+}
+
 fs::path local_parquet_path(s3_test_env const& env, std::string_view table)
 {
   return env.local_dir / "parquet" / (std::string{table} + ".parquet");
@@ -618,10 +678,25 @@ std::string local_parquet_file_scan(fs::path const& path)
   return "read_parquet(" + sql_quote(path.string()) + ")";
 }
 
+std::string local_parquet_glob_scan(s3_test_env const& env,
+                                    std::string_view pattern,
+                                    std::string_view options = {})
+{
+  return "read_parquet(" + sql_quote((env.local_dir / std::string{pattern}).string()) +
+         std::string{options} + ")";
+}
+
 std::string s3_parquet_scan(s3_test_env const& env, std::string_view table)
 {
   auto const key = "parquet/" + std::string{table} + ".parquet";
   return "read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
+}
+
+std::string s3_parquet_glob_scan(s3_test_env const& env,
+                                 std::string_view pattern,
+                                 std::string_view options = {})
+{
+  return "read_parquet(" + sql_quote(s3_uri(env.bucket, pattern)) + std::string{options} + ")";
 }
 
 std::string s3_sirius_parquet_scan(s3_test_env const& env, std::string_view table)
@@ -668,6 +743,19 @@ sirius::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std::s
   auto* rest_ctx = dynamic_cast<sirius::io::rest::rest_ioctx*>(datasource->io_ctx().get());
   REQUIRE(rest_ctx != nullptr);
   return *rest_ctx;
+}
+
+void require_s3_keys_listed(s3_sql_fixture& fixture,
+                            s3_test_env const& env,
+                            std::vector<std::string_view> const& expected_keys)
+{
+  auto& rest  = require_rest_ioctx(fixture, s3_uri(env.bucket, "parquet/nation.parquet"));
+  auto listed = rest.list_objects(env.bucket, "glob-enc/");
+  for (auto const expected : expected_keys) {
+    INFO("expected LIST key=" << expected);
+    REQUIRE(std::any_of(
+      listed.begin(), listed.end(), [&](auto const& entry) { return entry.key == expected; }));
+  }
 }
 
 std::uint64_t rest_chunk_get_count(s3_sql_fixture& fixture, std::string const& uri)
@@ -755,6 +843,11 @@ double mean_ns_as_ms(std::uint64_t total_ns, std::uint64_t count)
   return static_cast<double>(total_ns) / static_cast<double>(count) / 1'000'000.0;
 }
 
+double bytes_per_sec_to_mib_per_sec(double bytes_per_sec)
+{
+  return bytes_per_sec / static_cast<double>(1024U * 1024U);
+}
+
 std::uint64_t sat_sub(std::uint64_t after, std::uint64_t before)
 {
   return after >= before ? after - before : 0;
@@ -781,6 +874,11 @@ sirius::io::rest::rest_perf_snapshot delta_snapshot(
     sat_sub(after.device_stream_sync_total, before.device_stream_sync_total);
   out.payload_bytes_read_total =
     sat_sub(after.payload_bytes_read_total, before.payload_bytes_read_total);
+  out.blocking_host_get_count =
+    sat_sub(after.blocking_host_get_count, before.blocking_host_get_count);
+  out.blocking_host_get_wall_ns_total =
+    sat_sub(after.blocking_host_get_wall_ns_total, before.blocking_host_get_wall_ns_total);
+  out.blocking_host_get_wall_ns_max = after.blocking_host_get_wall_ns_max;
   return out;
 }
 
@@ -792,6 +890,7 @@ struct rest_bench_measurement {
   double scan_ms{0.0};
   std::uint64_t payload_bytes_read{0};
   duckdb::idx_t rows{0};
+  sirius::io::rest::rest_perf_snapshot bind_micro;
   sirius::io::rest::rest_perf_snapshot micro;
 };
 
@@ -811,27 +910,47 @@ std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer_for_bench(
   return source.host_read(file_size - footer_tail_size - footer_size, footer_size);
 }
 
+sirius::io::rest::rest_ioctx& ensure_rest_ioctx_for_bench(
+  sirius::scan_manager::sirius_scan_manager& manager, std::string const& uri)
+{
+  auto datasource = manager.create_datasource(uri);
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  auto* rest = dynamic_cast<sirius::io::rest::rest_ioctx*>(datasource->io_ctx().get());
+  REQUIRE(rest != nullptr);
+  return *rest;
+}
+
 rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
                                              std::string const& uri,
-                                             std::vector<std::string> const& columns)
+                                             std::vector<std::string> const& columns,
+                                             bool use_footer_probe = false)
 {
   auto& manager = require_sirius_context(fixture).get_scan_manager();
+  // Snapshotting the routed REST ioctx before the measured open requires one
+  // unmeasured datasource lookup.  That may warm the backend's connection path,
+  // so the absolute open_ms is a warm-open measurement; the generic/probe A/B
+  // still uses the same pre-open and remains comparable within this benchmark.
+  auto& rest = ensure_rest_ioctx_for_bench(manager, uri);
 
   auto const wall_start = bench_clock::now();
+  auto const before     = rest.perf_snapshot();
 
   auto const open_start = bench_clock::now();
-  auto datasource       = manager.create_datasource(uri);
-  auto const open_stop  = bench_clock::now();
+  auto datasource =
+    manager.create_datasource(uri,
+                              use_footer_probe ? sirius::io::open_hint::parquet_footer_probe
+                                               : sirius::io::open_hint::generic);
+  auto const open_stop = bench_clock::now();
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
   auto io_ctx = datasource->io_ctx();
-  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
-  REQUIRE(rest != nullptr);
-  auto const before = rest->perf_snapshot();
+  REQUIRE(io_ctx.get() == &rest);
 
   auto const footer_start = bench_clock::now();
   auto footer_buffer      = read_parquet_footer_for_bench(*datasource);
   auto const footer_stop  = bench_clock::now();
+  auto const after_footer = rest.perf_snapshot();
 
   auto opts = cudf::io::parquet_reader_options::builder().column_names(columns).build();
 
@@ -848,10 +967,11 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
   auto const scan_start  = bench_clock::now();
   auto [table, metadata] = cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts);
   (void)metadata;
-  auto const scan_stop = bench_clock::now();
-  auto const wall_stop = bench_clock::now();
-  auto const after     = rest->perf_snapshot();
-  auto const micro     = delta_snapshot(after, before);
+  auto const scan_stop  = bench_clock::now();
+  auto const wall_stop  = bench_clock::now();
+  auto const after      = rest.perf_snapshot();
+  auto const bind_micro = delta_snapshot(after_footer, before);
+  auto const micro      = delta_snapshot(after, before);
 
   return rest_bench_measurement{elapsed_ms(wall_start, wall_stop),
                                 elapsed_ms(open_start, open_stop),
@@ -860,6 +980,7 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
                                 elapsed_ms(scan_start, scan_stop),
                                 micro.payload_bytes_read_total,
                                 static_cast<duckdb::idx_t>(table->num_rows()),
+                                bind_micro,
                                 micro};
 }
 
@@ -880,11 +1001,13 @@ struct bench_record {
   double wall_clock_ms{0.0};
   double open_ms{0.0};
   double footer_fetch_ms{0.0};
+  double bind_ms{0.0};
   double metadata_parse_ms{0.0};
   double scan_ms{0.0};
   std::uint64_t payload_bytes_read{0};
   duckdb::idx_t row_count{0};
-  double effective_bytes_per_sec{0.0};
+  double effective_mib_per_sec{0.0};
+  std::uint64_t bind_chunk_get_count{0};
   std::uint64_t chunk_get_ns_total{0};
   std::uint64_t chunk_get_count{0};
   std::uint64_t chunk_get_ns_max{0};
@@ -903,6 +1026,14 @@ struct bench_record {
   std::vector<metric_delta> comparisons;
 };
 
+struct tpch_bench_record {
+  std::string scenario;
+  std::string arm;
+  std::size_t query_number{0};
+  double wall_clock_ms{0.0};
+  duckdb::idx_t row_count{0};
+};
+
 bench_record make_record(std::string scenario,
                          std::string transport,
                          std::string projection,
@@ -913,9 +1044,10 @@ bench_record make_record(std::string scenario,
                          std::uint64_t dataset_bytes)
 {
   auto seconds = measurement.wall_clock_ms / 1000.0;
-  auto effective =
+  auto const raw_bytes_per_sec =
     seconds > 0.0 ? static_cast<double>(dataset_bytes) / seconds : static_cast<double>(0);
-  auto const& micro = measurement.micro;
+  auto const effective_mib_per_sec = bytes_per_sec_to_mib_per_sec(raw_bytes_per_sec);
+  auto const& micro                = measurement.micro;
   return bench_record{std::move(scenario),
                       std::move(transport),
                       std::move(projection),
@@ -925,11 +1057,13 @@ bench_record make_record(std::string scenario,
                       measurement.wall_clock_ms,
                       measurement.open_ms,
                       measurement.footer_fetch_ms,
+                      measurement.open_ms + measurement.footer_fetch_ms,
                       measurement.metadata_parse_ms,
                       measurement.scan_ms,
                       measurement.payload_bytes_read,
                       measurement.rows,
-                      effective,
+                      effective_mib_per_sec,
+                      measurement.bind_micro.chunk_get_count,
                       micro.chunk_get_ns_total,
                       micro.chunk_get_count,
                       micro.chunk_get_ns_max,
@@ -946,6 +1080,19 @@ bench_record make_record(std::string scenario,
                       micro.terminal_failures_total,
                       micro.device_stream_sync_total,
                       {}};
+}
+
+void warn_footer_probe_ab(std::string_view label,
+                          bench_record const& generic,
+                          bench_record const& probe)
+{
+  WARN("[footerbind A/B] " << label << " bind(open+footer) generic=" << generic.bind_ms << "ms"
+                           << " (bind_chunk_get=" << generic.bind_chunk_get_count
+                           << ", total_chunk_get=" << generic.chunk_get_count
+                           << ") probe=" << probe.bind_ms << "ms"
+                           << " (bind_chunk_get=" << probe.bind_chunk_get_count
+                           << ", total_chunk_get=" << probe.chunk_get_count << ") collapse="
+                           << (probe.bind_ms > 0.0 ? generic.bind_ms / probe.bind_ms : 0.0) << "x");
 }
 
 std::string json_escape(std::string_view value)
@@ -981,6 +1128,12 @@ std::string transport_signature(std::string const& endpoint)
 std::string prefetch_cache_signature(bool enable_prefetch_cache)
 {
   return enable_prefetch_cache ? "on" : "off";
+}
+
+std::string footer_probe_scenario_name(std::string scenario, bool use_footer_probe)
+{
+  if (use_footer_probe) { scenario += "_probe"; }
+  return scenario;
 }
 
 fs::path unittest_log_dir()
@@ -1201,11 +1354,13 @@ void write_perf_json(fs::path const& path,
         << "\"wall_clock_ms\": " << std::fixed << std::setprecision(3) << r.wall_clock_ms << ", "
         << "\"open_ms\": " << r.open_ms << ", "
         << "\"footer_fetch_ms\": " << r.footer_fetch_ms << ", "
+        << "\"bind_ms\": " << r.bind_ms << ", "
         << "\"metadata_parse_ms\": " << r.metadata_parse_ms << ", "
         << "\"scan_ms\": " << r.scan_ms << ", "
         << "\"payload_bytes_read\": " << r.payload_bytes_read << ", "
         << "\"row_count\": " << r.row_count << ", "
-        << "\"effective_bytes_per_sec\": " << r.effective_bytes_per_sec << ", "
+        << "\"effective_mib_per_sec\": " << r.effective_mib_per_sec << ", "
+        << "\"bind_chunk_get_count\": " << r.bind_chunk_get_count << ", "
         << "\"chunk_get_ns_total\": " << r.chunk_get_ns_total << ", "
         << "\"chunk_get_count\": " << r.chunk_get_count << ", "
         << "\"chunk_get_ns_max\": " << r.chunk_get_ns_max << ", "
@@ -1238,6 +1393,38 @@ void write_perf_json(fs::path const& path,
   out << "}\n";
 }
 
+void write_perf_json(fs::path const& path,
+                     s3_test_env const& env,
+                     std::string_view backend,
+                     std::string_view object_key,
+                     std::uint64_t dataset_bytes,
+                     std::vector<tpch_bench_record> const& records)
+{
+  fs::create_directories(path.parent_path());
+  std::ofstream out(path);
+  REQUIRE(out);
+
+  out << "{\n";
+  out << "  \"git_sha\": \"" << json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\n";
+  out << "  \"host\": \"" << json_escape(env_or("HOSTNAME", "unknown")) << "\",\n";
+  out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
+  out << "  \"dataset_bytes\": " << dataset_bytes << ",\n";
+  out << "  \"config\": {\"bucket\": \"" << json_escape(env.bucket) << "\", \"key\": \""
+      << json_escape(object_key) << "\"},\n";
+  out << "  \"results\": [\n";
+  for (std::size_t index = 0; index < records.size(); ++index) {
+    auto const& record = records[index];
+    out << "    {\"scenario\": \"" << json_escape(record.scenario) << "\", "
+        << "\"arm\": \"" << json_escape(record.arm) << "\", "
+        << "\"query_number\": " << record.query_number << ", "
+        << "\"wall_clock_ms\": " << std::fixed << std::setprecision(3) << record.wall_clock_ms
+        << ", \"row_count\": " << record.row_count << "}";
+    out << (index + 1 == records.size() ? "\n" : ",\n");
+  }
+  out << "  ]\n";
+  out << "}\n";
+}
+
 void append_perf_history_jsonl(fs::path const& path,
                                s3_test_env const& env,
                                std::string_view backend,
@@ -1265,8 +1452,9 @@ void append_perf_history_jsonl(fs::path const& path,
         << "\",\"max_connections\":" << r.max_connections
         << ",\"rest_n_reactors\":" << r.rest_n_reactors
         << ",\"payload_bytes_read\":" << r.payload_bytes_read << ",\"row_count\":" << r.row_count
+        << ",\"bind_chunk_get_count\":" << r.bind_chunk_get_count
         << ",\"wall_clock_ms\":" << std::fixed << std::setprecision(3) << r.wall_clock_ms
-        << ",\"effective_bytes_per_sec\":" << r.effective_bytes_per_sec
+        << ",\"bind_ms\":" << r.bind_ms << ",\"effective_mib_per_sec\":" << r.effective_mib_per_sec
         << ",\"retries_total\":" << r.retries_total
         << ",\"terminal_failures_total\":" << r.terminal_failures_total
         << ",\"device_stream_sync_total\":" << r.device_stream_sync_total << "}";
@@ -1291,11 +1479,13 @@ void require_perf_json_schema(fs::path const& path, std::vector<std::string> exp
                    "\"wall_clock_ms\"",
                    "\"open_ms\"",
                    "\"footer_fetch_ms\"",
+                   "\"bind_ms\"",
                    "\"metadata_parse_ms\"",
                    "\"scan_ms\"",
                    "\"payload_bytes_read\"",
                    "\"row_count\"",
-                   "\"effective_bytes_per_sec\"",
+                   "\"effective_mib_per_sec\"",
+                   "\"bind_chunk_get_count\"",
                    "\"chunk_get_ns_total\"",
                    "\"chunk_get_count\"",
                    "\"chunk_get_ns_max\"",
@@ -1394,16 +1584,25 @@ bench_record run_rest_minio_bench_scenario(
   std::vector<std::string> columns,
   std::optional<std::size_t> rest_max_connections = std::nullopt,
   std::optional<std::size_t> rest_n_reactors      = std::nullopt,
-  bool enable_prefetch_cache                      = true)
+  bool enable_prefetch_cache                      = true,
+  bool use_footer_probe                           = false)
 {
   INFO("scenario=" << scenario << " columns=" << columns.size()
                    << " max_connections=" << rest_max_connections.value_or(std::size_t{8})
                    << " rest_n_reactors=" << rest_n_reactors.value_or(std::size_t{2})
-                   << " enable_prefetch_cache=" << enable_prefetch_cache);
+                   << " enable_prefetch_cache=" << enable_prefetch_cache
+                   << " use_footer_probe=" << use_footer_probe);
   auto limits                      = large_sirius_memory_limits(enable_prefetch_cache);
   limits.rest_perf_instrumentation = perf_instrumentation;
   limits.rest_max_connections      = rest_max_connections;
   limits.rest_n_reactors           = rest_n_reactors;
+  if (use_footer_probe) {
+    // The default footer-probe window is intentionally 512 KiB.  SF10
+    // lineitem's footer is larger than that, so the benchmark's probe variant
+    // pins a 1 MiB window to keep this scenario focused on the single-suffix-GET
+    // A/B rather than the out-of-window fallback (covered by REST unit tests).
+    limits.rest_footer_probe_bytes = "1 MiB";
+  }
   if (columns.size() > 1) {
     // The compatibility run mirrors the old #982 seven-column async-S3 baseline.
     // SF10 materializes a much wider cuDF table than the single-column CI
@@ -1418,7 +1617,7 @@ bench_record run_rest_minio_bench_scenario(
     limits.host_capacity = "12 GiB";
   }
   s3_sql_fixture fixture(env, limits, std::nullopt, endpoint, std::move(ca_bundle), tls_verify);
-  auto measurement = run_rest_parquet_scan(fixture, large.uri, columns);
+  auto measurement = run_rest_parquet_scan(fixture, large.uri, columns, use_footer_probe);
   CHECK(measurement.rows == large.total_num_rows);
   CHECK(measurement.payload_bytes_read > 0);
   CHECK(measurement.open_ms > 0.0);
@@ -1427,9 +1626,12 @@ bench_record run_rest_minio_bench_scenario(
   CHECK(measurement.scan_ms > 0.0);
   CHECK(measurement.wall_clock_ms + 0.001 >=
         measurement.open_ms + measurement.footer_fetch_ms + measurement.scan_ms);
+  if (perf_instrumentation) {
+    CHECK(measurement.bind_micro.chunk_get_count == (use_footer_probe ? 1 : 2));
+  }
   CHECK(measurement.micro.device_stream_sync_total == 0);
   CHECK(measurement.micro.terminal_failures_total == 0);
-  return make_record(std::move(scenario),
+  return make_record(footer_probe_scenario_name(std::move(scenario), use_footer_probe),
                      transport_signature(endpoint),
                      projection_signature(columns),
                      rest_max_connections.value_or(std::size_t{8}),
@@ -1444,10 +1646,12 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                                          std::string scenario,
                                          std::vector<std::string> columns,
                                          std::size_t rest_max_connections,
-                                         std::optional<duckdb::idx_t> expected_rows)
+                                         std::optional<duckdb::idx_t> expected_rows,
+                                         bool use_footer_probe = false)
 {
   INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
-                   << " columns=" << columns.size() << " max_connections=" << rest_max_connections);
+                   << " columns=" << columns.size() << " max_connections=" << rest_max_connections
+                   << " use_footer_probe=" << use_footer_probe);
   auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
   limits.rest_perf_instrumentation = true;
   limits.rest_max_connections      = rest_max_connections;
@@ -1462,13 +1666,18 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                          env.endpoint,
                          std::nullopt,
                          /*tls_verify=*/true);
-  auto measurement = run_rest_parquet_scan(fixture, uri, columns);
+  auto measurement = run_rest_parquet_scan(fixture, uri, columns, use_footer_probe);
   CHECK(measurement.rows > 0);
   if (expected_rows.has_value()) { CHECK(measurement.rows == *expected_rows); }
   CHECK(measurement.payload_bytes_read > 0);
+  if (use_footer_probe) {
+    CHECK(measurement.bind_micro.chunk_get_count == 1);
+  } else {
+    CHECK(measurement.bind_micro.chunk_get_count >= 2);
+  }
   CHECK(measurement.micro.device_stream_sync_total == 0);
   CHECK(measurement.micro.terminal_failures_total == 0);
-  return make_record(std::move(scenario),
+  return make_record(footer_probe_scenario_name(std::move(scenario), use_footer_probe),
                      "https",
                      projection_signature(columns),
                      rest_max_connections,
@@ -1604,6 +1813,21 @@ void compare_s3_gpu_to_local_cpu(s3_sql_fixture& fixture,
   check_rows_equal_with_tolerant_columns(*s3_result, *local_result, tolerant_columns);
 }
 
+void compare_transparent_s3_gpu_to_local_cpu(
+  s3_sql_fixture& fixture,
+  std::string const& s3_query,
+  std::string const& local_query,
+  std::vector<duckdb::idx_t> const& tolerant_columns = {})
+{
+  auto s3_result = require_query_ok(fixture.con, s3_query);
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto local_result = require_query_ok(baseline_con, local_query);
+
+  check_rows_equal_with_tolerant_columns(*s3_result, *local_result, tolerant_columns);
+}
+
 void compare_s3_gpu_to_local_cpu_with_watchdog(std::shared_ptr<s3_sql_fixture> const& fixture,
                                                std::string_view label,
                                                std::string const& s3_query,
@@ -1621,6 +1845,56 @@ void compare_s3_gpu_to_local_cpu_with_watchdog(std::shared_ptr<s3_sql_fixture> c
   REQUIRE(s3_result.row_count == local_result->RowCount());
   REQUIRE(s3_result.column_count == local_result->ColumnCount());
   CHECK(s3_result.rows == local_rows);
+}
+
+constexpr std::array<std::string_view, 8> kBenchTpchTables = {
+  "nation", "region", "customer", "orders", "part", "partsupp", "supplier", "lineitem"};
+
+sirius_memory_limits tpch_sf1_bench_memory_limits()
+{
+  sirius_memory_limits limits;
+  limits.gpu_usage     = "2 GiB";
+  limits.host_capacity = "4 GiB";
+  limits.disk_capacity = "16 GiB";
+  return limits;
+}
+
+void create_tpch_bench_views(duckdb::Connection& connection, std::string const& root, bool s3)
+{
+  for (auto const table : kBenchTpchTables) {
+    auto const path = s3 ? root + "/" + std::string{table} + ".parquet"
+                         : (fs::path{root} / (std::string{table} + ".parquet")).string();
+    require_query_ok(connection,
+                     "CREATE OR REPLACE VIEW " + std::string{table} +
+                       " AS SELECT * FROM read_parquet(" + sql_quote(path) + ");");
+  }
+}
+
+tpch_bench_record run_tpch_bench_query(duckdb::Connection& connection,
+                                       sirius::test::tpch_query_spec const& query,
+                                       std::string arm)
+{
+  auto const start = bench_clock::now();
+  auto result      = connection.Query(std::string{query.sql});
+  auto const stop  = bench_clock::now();
+  if (!result)
+    throw std::runtime_error("TPC-H Q" + std::to_string(query.number) + " returned no result");
+  if (result->HasError()) throw std::runtime_error(result->GetError());
+
+  return tpch_bench_record{"tpch_q" + std::to_string(query.number) + "_" + arm,
+                           std::move(arm),
+                           query.number,
+                           elapsed_ms(start, stop),
+                           result->RowCount()};
+}
+
+std::uint64_t tpch_dataset_bytes(fs::path const& root)
+{
+  std::uint64_t bytes = 0;
+  for (auto const table : kBenchTpchTables) {
+    bytes += static_cast<std::uint64_t>(fs::file_size(root / (std::string{table} + ".parquet")));
+  }
+  return bytes;
 }
 
 }  // namespace
@@ -1775,7 +2049,7 @@ TEST_CASE("S3 REST bench perf instrumentation gate keeps micro counters zero", "
 
   auto record = run_rest_minio_bench_scenario(*env,
                                               *large,
-                                              "async_http_gate_off",
+                                              "rest_reactor_http_gate_off",
                                               env->endpoint,
                                               std::nullopt,
                                               false,
@@ -1816,51 +2090,80 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
   auto constexpr backend = std::string_view{"rest_minio"};
   auto baseline_json     = read_optional_text_file(perf_baseline_path(backend));
   std::vector<bench_record> records;
-  records.reserve(4);
+  records.reserve(6);
 
-  // compat_* mirrors the old async-S3 benchmark shape: seven projected columns,
-  // mc=32, and no scan-manager prefetch cache mixed into the raw S3 read path.
-  auto compat_http  = run_rest_minio_bench_scenario(*env,
-                                                   *large,
-                                                   "compat_http",
-                                                   env->endpoint,
-                                                   std::nullopt,
-                                                   false,
-                                                   /*perf_instrumentation=*/true,
-                                                   bench_compat_projection(),
-                                                   std::size_t{32},
-                                                   std::size_t{1},
-                                                   /*enable_prefetch_cache=*/false);
-  auto compat_https = run_rest_minio_bench_scenario(*env,
-                                                    *large,
-                                                    "compat_https",
-                                                    env->https_endpoint,
-                                                    env->ca_bundle_path,
-                                                    true,
-                                                    /*perf_instrumentation=*/true,
-                                                    bench_compat_projection(),
-                                                    std::size_t{32},
-                                                    std::size_t{1},
-                                                    /*enable_prefetch_cache=*/false);
-  auto http         = run_rest_minio_bench_scenario(*env,
+  // rest_reactor_compat_* mirrors the old async-S3 benchmark shape: seven
+  // projected columns, mc=32, and no scan-manager prefetch cache mixed into the
+  // raw S3 read path.
+  auto rest_reactor_compat_http  = run_rest_minio_bench_scenario(*env,
+                                                                *large,
+                                                                "rest_reactor_compat_http",
+                                                                env->endpoint,
+                                                                std::nullopt,
+                                                                false,
+                                                                /*perf_instrumentation=*/true,
+                                                                bench_compat_projection(),
+                                                                std::size_t{32},
+                                                                std::size_t{1},
+                                                                /*enable_prefetch_cache=*/false);
+  auto rest_reactor_compat_https = run_rest_minio_bench_scenario(*env,
+                                                                 *large,
+                                                                 "rest_reactor_compat_https",
+                                                                 env->https_endpoint,
+                                                                 env->ca_bundle_path,
+                                                                 true,
+                                                                 /*perf_instrumentation=*/true,
+                                                                 bench_compat_projection(),
+                                                                 std::size_t{32},
+                                                                 std::size_t{1},
+                                                                 /*enable_prefetch_cache=*/false);
+  auto http                      = run_rest_minio_bench_scenario(*env,
                                             *large,
-                                            "async_http",
+                                            "rest_reactor_http",
                                             env->endpoint,
                                             std::nullopt,
                                             false,
                                             /*perf_instrumentation=*/true,
                                             bench_single_column_projection());
-  auto https        = run_rest_minio_bench_scenario(*env,
+  auto http_probe                = run_rest_minio_bench_scenario(*env,
+                                                  *large,
+                                                  "rest_reactor_http",
+                                                  env->endpoint,
+                                                  std::nullopt,
+                                                  false,
+                                                  /*perf_instrumentation=*/true,
+                                                  bench_single_column_projection(),
+                                                  std::nullopt,
+                                                  std::nullopt,
+                                                  /*enable_prefetch_cache=*/true,
+                                                  /*use_footer_probe=*/true);
+  auto https                     = run_rest_minio_bench_scenario(*env,
                                              *large,
-                                             "async_https",
+                                             "rest_reactor_https",
                                              env->https_endpoint,
                                              env->ca_bundle_path,
                                              true,
                                              /*perf_instrumentation=*/true,
                                              bench_single_column_projection());
+  auto https_probe               = run_rest_minio_bench_scenario(*env,
+                                                   *large,
+                                                   "rest_reactor_https",
+                                                   env->https_endpoint,
+                                                   env->ca_bundle_path,
+                                                   true,
+                                                   /*perf_instrumentation=*/true,
+                                                   bench_single_column_projection(),
+                                                   std::nullopt,
+                                                   std::nullopt,
+                                                   /*enable_prefetch_cache=*/true,
+                                                   /*use_footer_probe=*/true);
 
-  for (auto const& r :
-       {std::cref(http), std::cref(https), std::cref(compat_http), std::cref(compat_https)}) {
+  for (auto const& r : {std::cref(http),
+                        std::cref(http_probe),
+                        std::cref(https),
+                        std::cref(https_probe),
+                        std::cref(rest_reactor_compat_http),
+                        std::cref(rest_reactor_compat_https)}) {
     auto const& record = r.get();
     CHECK(record.row_count == large->total_num_rows);
     CHECK(record.payload_bytes_read > 0);
@@ -1881,40 +2184,57 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
 
   CHECK(http.row_count == https.row_count);
   CHECK(http.payload_bytes_read == https.payload_bytes_read);
-  CHECK(compat_http.row_count == compat_https.row_count);
-  CHECK(compat_http.payload_bytes_read == compat_https.payload_bytes_read);
+  CHECK(http.row_count == http_probe.row_count);
+  CHECK(https.row_count == https_probe.row_count);
+  CHECK(http_probe.payload_bytes_read == https_probe.payload_bytes_read);
+  CHECK(http.bind_chunk_get_count == 2);
+  CHECK(http_probe.bind_chunk_get_count == 1);
+  CHECK(https.bind_chunk_get_count == 2);
+  CHECK(https_probe.bind_chunk_get_count == 1);
+  CHECK(rest_reactor_compat_http.row_count == rest_reactor_compat_https.row_count);
+  CHECK(rest_reactor_compat_http.payload_bytes_read ==
+        rest_reactor_compat_https.payload_bytes_read);
   if (https.footer_fetch_ms > http.footer_fetch_ms * 3.0) {
     WARN("HTTPS footer_fetch_ms is more than 3x HTTP on this MinIO run: http="
          << http.footer_fetch_ms << "ms https=" << https.footer_fetch_ms << "ms");
   }
-  if (compat_https.footer_fetch_ms > compat_http.footer_fetch_ms * 3.0) {
+  if (rest_reactor_compat_https.footer_fetch_ms > rest_reactor_compat_http.footer_fetch_ms * 3.0) {
     WARN("HTTPS compat footer_fetch_ms is more than 3x HTTP on this MinIO run: http="
-         << compat_http.footer_fetch_ms << "ms https=" << compat_https.footer_fetch_ms << "ms");
+         << rest_reactor_compat_http.footer_fetch_ms
+         << "ms https=" << rest_reactor_compat_https.footer_fetch_ms << "ms");
   }
-  WARN("S3 REST perf async_http throughput=" << http.effective_bytes_per_sec
-                                             << " B/s footer_fetch_ms=" << http.footer_fetch_ms
-                                             << " chunk_get_ms_mean=" << http.chunk_get_ms_mean);
-  WARN("S3 REST perf async_https throughput=" << https.effective_bytes_per_sec
-                                              << " B/s footer_fetch_ms=" << https.footer_fetch_ms
-                                              << " chunk_get_ms_mean=" << https.chunk_get_ms_mean);
-  WARN("S3 REST perf compat_http throughput="
-       << compat_http.effective_bytes_per_sec << " B/s footer_fetch_ms="
-       << compat_http.footer_fetch_ms << " chunk_get_ms_mean=" << compat_http.chunk_get_ms_mean
-       << " chunk_get_count=" << compat_http.chunk_get_count);
-  WARN("S3 REST perf compat_https throughput="
-       << compat_https.effective_bytes_per_sec << " B/s footer_fetch_ms="
-       << compat_https.footer_fetch_ms << " chunk_get_ms_mean=" << compat_https.chunk_get_ms_mean
-       << " chunk_get_count=" << compat_https.chunk_get_count);
+  WARN("S3 REST perf rest_reactor_http throughput="
+       << http.effective_mib_per_sec << " MiB/s footer_fetch_ms=" << http.footer_fetch_ms
+       << " chunk_get_ms_mean=" << http.chunk_get_ms_mean);
+  WARN("S3 REST perf rest_reactor_https throughput="
+       << https.effective_mib_per_sec << " MiB/s footer_fetch_ms=" << https.footer_fetch_ms
+       << " chunk_get_ms_mean=" << https.chunk_get_ms_mean);
+  warn_footer_probe_ab("rest_reactor_http", http, http_probe);
+  warn_footer_probe_ab("rest_reactor_https", https, https_probe);
+  WARN("S3 REST perf rest_reactor_compat_http throughput="
+       << rest_reactor_compat_http.effective_mib_per_sec
+       << " MiB/s footer_fetch_ms=" << rest_reactor_compat_http.footer_fetch_ms
+       << " chunk_get_ms_mean=" << rest_reactor_compat_http.chunk_get_ms_mean
+       << " chunk_get_count=" << rest_reactor_compat_http.chunk_get_count);
+  WARN("S3 REST perf rest_reactor_compat_https throughput="
+       << rest_reactor_compat_https.effective_mib_per_sec
+       << " MiB/s footer_fetch_ms=" << rest_reactor_compat_https.footer_fetch_ms
+       << " chunk_get_ms_mean=" << rest_reactor_compat_https.chunk_get_ms_mean
+       << " chunk_get_count=" << rest_reactor_compat_https.chunk_get_count);
 
   attach_baseline_comparison(http, baseline_json, backend);
+  attach_baseline_comparison(http_probe, baseline_json, backend);
   attach_baseline_comparison(https, baseline_json, backend);
-  attach_baseline_comparison(compat_http, baseline_json, backend);
-  attach_baseline_comparison(compat_https, baseline_json, backend);
+  attach_baseline_comparison(https_probe, baseline_json, backend);
+  attach_baseline_comparison(rest_reactor_compat_http, baseline_json, backend);
+  attach_baseline_comparison(rest_reactor_compat_https, baseline_json, backend);
   records.push_back(std::move(http));
+  records.push_back(std::move(http_probe));
   records.push_back(std::move(https));
-  records.push_back(std::move(compat_http));
-  records.push_back(std::move(compat_https));
-  REQUIRE(records.size() >= 4);
+  records.push_back(std::move(https_probe));
+  records.push_back(std::move(rest_reactor_compat_http));
+  records.push_back(std::move(rest_reactor_compat_https));
+  REQUIRE(records.size() >= 6);
 
   auto const path = perf_json_path();
   write_perf_json(path,
@@ -1923,8 +2243,74 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
                   sf10_lineitem_key(),
                   static_cast<std::uint64_t>(fs::file_size(large->local_path)),
                   records);
-  require_perf_json_schema(path, {"async_http", "async_https", "compat_http", "compat_https"});
+  require_perf_json_schema(path,
+                           {"rest_reactor_http",
+                            "rest_reactor_http_probe",
+                            "rest_reactor_https",
+                            "rest_reactor_https_probe",
+                            "rest_reactor_compat_http",
+                            "rest_reactor_compat_https"});
   WARN("Wrote S3 REST perf JSON baseline to " << path.string());
+}
+
+TEST_CASE("S3 TPC-H benchmark records SF1 S3 and local wall-clock arms", "[.][s3][bench][tpch]")
+{
+  if (!truthy_env("SIRIUS_BENCH_S3_TPCH")) {
+    SUCCEED("SIRIUS_BENCH_S3_TPCH is not enabled");
+    return;
+  }
+
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+
+  auto const local_dir_text = env_or("SIRIUS_TEST_S3_TPCH_LOCAL_DIR");
+  REQUIRE_FALSE(local_dir_text.empty());
+  fs::path const local_dir{local_dir_text};
+  for (auto const table : kBenchTpchTables) {
+    REQUIRE(fs::exists(local_dir / (std::string{table} + ".parquet")));
+  }
+
+  s3_sql_fixture fixture(*env, tpch_sf1_bench_memory_limits());
+  set_gpu_execution(fixture.con, true);
+  create_tpch_bench_views(fixture.con, s3_uri(env->bucket, "tpch/sf1"), true);
+
+  duckdb::DuckDB local_db(nullptr);
+  duckdb::Connection local_connection(local_db);
+  create_tpch_bench_views(local_connection, local_dir.string(), false);
+
+  std::vector<tpch_bench_record> records;
+  records.reserve(sirius::test::kTpchQueries.size() * 2);
+  for (auto const& query : sirius::test::kTpchQueries) {
+    tpch_bench_record s3_record;
+    try {
+      s3_record = run_tpch_bench_query(fixture.con, query, "s3");
+    } catch (std::exception const& first_error) {
+      if (!query.retry_once) throw;
+      WARN("TPC-H Q" << query.number << " S3 benchmark first attempt failed; retrying once: "
+                     << first_error.what());
+      s3_record = run_tpch_bench_query(fixture.con, query, "s3");
+    }
+    auto local_record = run_tpch_bench_query(local_connection, query, "local");
+
+    CHECK(s3_record.row_count == local_record.row_count);
+    WARN("TPC-H Q" << query.number << " S3=" << s3_record.wall_clock_ms << "ms local="
+                   << local_record.wall_clock_ms << "ms rows=" << s3_record.row_count);
+    records.push_back(std::move(s3_record));
+    records.push_back(std::move(local_record));
+  }
+  REQUIRE(records.size() == 44);
+
+  auto const path = perf_json_path();
+  write_perf_json(
+    path, *env, "rest_minio_tpch", "tpch/sf1", tpch_dataset_bytes(local_dir), records);
+  auto const json = read_text_file(path);
+  for (auto const& query : sirius::test::kTpchQueries) {
+    CHECK(json.find("\"scenario\": \"tpch_q" + std::to_string(query.number) + "_s3\"") !=
+          std::string::npos);
+    CHECK(json.find("\"scenario\": \"tpch_q" + std::to_string(query.number) + "_local\"") !=
+          std::string::npos);
+  }
+  WARN("Wrote S3 TPC-H perf JSON to " << path.string());
 }
 
 TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
@@ -1939,12 +2325,14 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
   auto baseline_json     = read_optional_text_file(perf_baseline_path(backend));
 
   std::vector<bench_record> records;
-  records.reserve(4);
+  records.reserve(8);
 
   std::optional<duckdb::idx_t> projected_rows;
   std::optional<duckdb::idx_t> full_rows;
   std::optional<std::uint64_t> projected_payload_bytes;
+  std::optional<std::uint64_t> projected_probe_payload_bytes;
   std::optional<std::uint64_t> full_payload_bytes;
+  std::optional<std::uint64_t> full_probe_payload_bytes;
 
   for (auto max_connections : {std::size_t{1}, std::size_t{32}}) {
     auto projected = run_rest_aws_bench_scenario(*env,
@@ -1961,13 +2349,37 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(projected.payload_bytes_read == *projected_payload_bytes);
     CHECK(projected.terminal_failures_total == 0);
     CHECK(projected.device_stream_sync_total == 0);
+    CHECK(projected.bind_chunk_get_count >= 2);
     WARN("AWS REST projected mc=" << max_connections
-                                  << " throughput=" << projected.effective_bytes_per_sec
-                                  << " B/s footer_fetch_ms=" << projected.footer_fetch_ms
+                                  << " throughput=" << projected.effective_mib_per_sec
+                                  << " MiB/s footer_fetch_ms=" << projected.footer_fetch_ms
                                   << " ttfb_ns=" << projected.ttfb_ns
                                   << " retries=" << projected.retries_total);
     attach_baseline_comparison(projected, baseline_json, backend);
     records.push_back(std::move(projected));
+
+    auto projected_probe = run_rest_aws_bench_scenario(*env,
+                                                       uri,
+                                                       "aws_https_projected",
+                                                       bench_single_column_projection(),
+                                                       max_connections,
+                                                       projected_rows,
+                                                       /*use_footer_probe=*/true);
+    if (!projected_probe_payload_bytes.has_value()) {
+      projected_probe_payload_bytes = projected_probe.payload_bytes_read;
+    }
+    CHECK(projected_probe.row_count == *projected_rows);
+    CHECK(projected_probe.payload_bytes_read == *projected_probe_payload_bytes);
+    CHECK(projected_probe.terminal_failures_total == 0);
+    CHECK(projected_probe.device_stream_sync_total == 0);
+    CHECK(projected_probe.bind_chunk_get_count == 1);
+    WARN("AWS REST projected_probe mc="
+         << max_connections << " throughput=" << projected_probe.effective_mib_per_sec
+         << " MiB/s footer_fetch_ms=" << projected_probe.footer_fetch_ms
+         << " ttfb_ns=" << projected_probe.ttfb_ns << " retries=" << projected_probe.retries_total);
+    warn_footer_probe_ab("aws_https_projected", records.back(), projected_probe);
+    attach_baseline_comparison(projected_probe, baseline_json, backend);
+    records.push_back(std::move(projected_probe));
 
     auto full = run_rest_aws_bench_scenario(
       *env, uri, "aws_https_full", bench_full_lineitem_projection(), max_connections, full_rows);
@@ -1977,13 +2389,37 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(full.payload_bytes_read == *full_payload_bytes);
     CHECK(full.terminal_failures_total == 0);
     CHECK(full.device_stream_sync_total == 0);
-    WARN("AWS REST full mc=" << max_connections << " throughput=" << full.effective_bytes_per_sec
-                             << " B/s footer_fetch_ms=" << full.footer_fetch_ms
+    CHECK(full.bind_chunk_get_count >= 2);
+    WARN("AWS REST full mc=" << max_connections << " throughput=" << full.effective_mib_per_sec
+                             << " MiB/s footer_fetch_ms=" << full.footer_fetch_ms
                              << " ttfb_ns=" << full.ttfb_ns << " retries=" << full.retries_total);
     attach_baseline_comparison(full, baseline_json, backend);
     records.push_back(std::move(full));
+
+    auto full_probe = run_rest_aws_bench_scenario(*env,
+                                                  uri,
+                                                  "aws_https_full",
+                                                  bench_full_lineitem_projection(),
+                                                  max_connections,
+                                                  full_rows,
+                                                  /*use_footer_probe=*/true);
+    if (!full_probe_payload_bytes.has_value()) {
+      full_probe_payload_bytes = full_probe.payload_bytes_read;
+    }
+    CHECK(full_probe.row_count == *full_rows);
+    CHECK(full_probe.payload_bytes_read == *full_probe_payload_bytes);
+    CHECK(full_probe.terminal_failures_total == 0);
+    CHECK(full_probe.device_stream_sync_total == 0);
+    CHECK(full_probe.bind_chunk_get_count == 1);
+    WARN("AWS REST full_probe mc="
+         << max_connections << " throughput=" << full_probe.effective_mib_per_sec
+         << " MiB/s footer_fetch_ms=" << full_probe.footer_fetch_ms
+         << " ttfb_ns=" << full_probe.ttfb_ns << " retries=" << full_probe.retries_total);
+    warn_footer_probe_ab("aws_https_full", records.back(), full_probe);
+    attach_baseline_comparison(full_probe, baseline_json, backend);
+    records.push_back(std::move(full_probe));
   }
-  REQUIRE(records.size() == 4);
+  REQUIRE(records.size() == 8);
 
   auto dataset_bytes = std::uint64_t{0};
   for (auto const& record : records) {
@@ -1993,7 +2429,9 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
 
   auto const path = perf_json_path();
   write_perf_json(path, *env, backend, object_key, dataset_bytes, records);
-  require_perf_json_schema(path, {"aws_https_projected", "aws_https_full"});
+  require_perf_json_schema(
+    path,
+    {"aws_https_projected", "aws_https_projected_probe", "aws_https_full", "aws_https_full_probe"});
   append_perf_history_jsonl(
     perf_history_path(backend), *env, backend, object_key, dataset_bytes, records);
   WARN("Wrote AWS S3 REST perf JSON to " << path.string());
@@ -2027,6 +2465,373 @@ TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
   CHECK(result->GetValue(1, 0).ToString() == "ALGERIA");
   for (auto const count : region_counts) {
     CHECK(count == 5);
+  }
+}
+
+TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
+          "[s3][integration][sql][gpu_execution][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto& rest     = require_rest_ioctx(fixture, uri);
+  CHECK(rest.type() == sirius::io::io_context_type::restful);
+
+  auto const s3_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
+                        s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
+                           local_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent read_parquet over S3 keeps REST routing when local Sirius datasource is off",
+          "[s3][integration][sql][gpu_execution][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.use_sirius_datasource = false;
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto& rest     = require_rest_ioctx(fixture, uri);
+  CHECK(rest.type() == sirius::io::io_context_type::restful);
+
+  auto result =
+    require_query_ok(fixture.con, "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")");
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const before_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto const s3_scan      = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan   = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query     = "SELECT n_nationkey, n_name, n_regionkey FROM " + s3_scan +
+                        " ORDER BY n_nationkey, n_name, n_regionkey";
+  auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " + local_scan +
+                           " ORDER BY n_nationkey, n_name, n_regionkey";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+TEST_CASE("transparent S3 glob rejects a matched percent-encoded key instead of opening its decoy",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/a%2Fb.parquet", "glob-enc/a/b.parquet"});
+
+  auto const s3_query = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/a*.parquet");
+
+  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, s3_query),
+                    Catch::Contains("percent-encoded"));
+}
+
+TEST_CASE("transparent S3 glob opens keys containing URI fragment and query delimiters",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/x#1.parquet", "glob-enc/y?v.parquet"});
+
+  for (auto const pattern :
+       {std::string_view{"glob-enc/x*.parquet"}, std::string_view{"glob-enc/y*.parquet"}}) {
+    DYNAMIC_SECTION("pattern=" << pattern)
+    {
+      auto const s3_query    = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, pattern);
+      auto const local_query = "SELECT count(*) FROM " + local_parquet_glob_scan(*env, pattern);
+      compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+    }
+  }
+}
+
+TEST_CASE("transparent S3 glob opens a key containing a literal percent byte",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/100%.parquet"});
+
+  auto const s3_query =
+    "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/100*.parquet");
+  auto const local_query =
+    "SELECT count(*) FROM " + local_parquet_glob_scan(*env, "glob-enc/100*.parquet");
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob rejects a matched Hive-style percent-encoded key",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/t/col=a%20b/p0.parquet"});
+
+  auto const s3_query =
+    "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/t/*/*.parquet");
+
+  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, s3_query),
+                    Catch::Contains("percent-encoded"));
+}
+
+TEST_CASE("transparent S3 glob ignores percent-encoded keys outside the match",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/a%2Fb.parquet", "glob-enc/y?v.parquet"});
+
+  auto const pattern     = std::string_view{"glob-enc/y*.parquet"};
+  auto const s3_query    = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, pattern);
+  auto const local_query = "SELECT count(*) FROM " + local_parquet_glob_scan(*env, pattern);
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob preserves hive partition columns",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const before_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto const options      = ", hive_partitioning=true";
+  auto const s3_scan      = s3_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
+  auto const local_scan = local_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
+  auto const s3_query   = "SELECT year, count(*), min(n_nationkey), max(n_nationkey) FROM " +
+                        s3_scan + " GROUP BY year ORDER BY year";
+  auto const local_query = "SELECT year, count(*), min(n_nationkey), max(n_nationkey) FROM " +
+                           local_scan + " GROUP BY year ORDER BY year";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+TEST_CASE("transparent S3 glob scans use parquet footer probes",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_perf_instrumentation = true;
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto& rest = require_rest_ioctx(fixture, s3_uri(env->bucket, "glob/multi/nation_a.parquet"));
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  auto const before = rest.perf_snapshot();
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const delta = delta_snapshot(rest.perf_snapshot(), before);
+
+  CHECK(delta.blocking_host_get_count == 0);
+}
+
+TEST_CASE("transparent S3 glob remains correct with a straddled footer-probe window",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_footer_probe_bytes = "512 B";
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob warm scan skips blocking host reads",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_perf_instrumentation = true;
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto& rest = require_rest_ioctx(fixture, s3_uri(env->bucket, "glob/multi/nation_a.parquet"));
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const before_warm = rest.perf_snapshot();
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const warm_delta = delta_snapshot(rest.perf_snapshot(), before_warm);
+
+  CHECK(warm_delta.blocking_host_get_count == 0);
+}
+
+TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto check_count = [&](std::string_view s3_pattern,
+                         std::string_view local_pattern,
+                         std::int64_t expected) {
+    auto const s3_query    = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, s3_pattern);
+    auto const local_query = "SELECT count(*) FROM " + local_parquet_glob_scan(*env, local_pattern);
+    compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+    auto result = require_query_ok(fixture.con, s3_query);
+    REQUIRE(result->RowCount() == 1);
+    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == expected);
+  };
+
+  check_count("glob/multi/nation_?.parquet", "glob/multi/nation_?.parquet", 50);
+  check_count("glob/multi/nation_[ab].parquet", "glob/multi/nation_[ab].parquet", 50);
+  check_count("glob/hive/**/nation.parquet", "glob/hive/**/nation.parquet", 50);
+  check_count("root_*.parquet", "root_*.parquet", 50);
+
+  auto uppercase_root_uri = s3_uri(env->bucket, "root_*.parquet");
+  uppercase_root_uri.replace(0, 2, "S3");
+  auto const uppercase_root_query =
+    "SELECT count(n_nationkey) FROM read_parquet(" + sql_quote(uppercase_root_uri) + ")";
+  auto const local_root_query =
+    "SELECT count(n_nationkey) FROM " + local_parquet_glob_scan(*env, "root_*.parquet");
+  compare_transparent_s3_gpu_to_local_cpu(fixture, uppercase_root_query, local_root_query);
+  auto uppercase_root = require_query_ok(fixture.con, uppercase_root_query);
+  REQUIRE(uppercase_root->RowCount() == 1);
+  CHECK(uppercase_root->GetValue(0, 0).GetValue<int64_t>() == 50);
+
+  auto wildcard_bucket =
+    fixture.con.Query("SELECT count(*) FROM read_parquet('s3://*/glob/multi/nation_*.parquet')");
+  REQUIRE(wildcard_bucket);
+  REQUIRE(wildcard_bucket->HasError());
+  INFO(wildcard_bucket->GetError());
+  CHECK(wildcard_bucket->GetError().find("bucket") != std::string::npos);
+}
+
+TEST_CASE("transparent S3 glob scans 1001 parquet objects across LIST pages",
+          "[.][s3][integration][sql][gpu_execution][transparent][glob][large][glob-scale]")
+{
+  if (!truthy_env("SIRIUS_TEST_S3_GLOB_SCALE")) {
+    SUCCEED("SIRIUS_TEST_S3_GLOB_SCALE is not enabled");
+    return;
+  }
+
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const query =
+    "SELECT count(n_nationkey), sum(n_nationkey), min(n_nationkey), max(n_nationkey) FROM " +
+    s3_parquet_glob_scan(*env, "glob-scale/part_*.parquet");
+  auto result = require_query_ok(fixture.con, query);
+
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25'025);
+  CHECK(result->GetValue(1, 0).GetValue<int64_t>() == 300'300);
+  CHECK(result->GetValue(2, 0).GetValue<int64_t>() == 0);
+  CHECK(result->GetValue(3, 0).GetValue<int64_t>() == 24);
+}
+
+TEST_CASE("transparent S3 glob reports no-files and GPU-only errors clearly",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  SECTION("zero-match glob reports a no-files class error")
+  {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, true);
+
+    auto result = fixture.con.Query("SELECT count(*) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/no-match-*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(
+      (error.find("No files") != std::string::npos || error.find("no files") != std::string::npos));
+    CHECK(error.find("glob/wildcard patterns are not supported") == std::string::npos);
+    CHECK(error.find("No filesystem") == std::string::npos);
+    CHECK(error.find("no filesystem") == std::string::npos);
+  }
+
+  SECTION("gpu_execution=false rejects globbed S3 at the filesystem gate")
+  {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, false);
+
+    auto result = fixture.con.Query("SELECT count(*) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("S3 is GPU-only") != std::string::npos);
+    CHECK(error.find("SET gpu_execution=true") != std::string::npos);
+  }
+
+  SECTION("configured glob match cap rejects overly broad matches")
+  {
+    sirius_memory_limits limits;
+    limits.rest_list_max_matches = 1;
+    s3_sql_fixture fixture(*env, limits);
+    set_gpu_execution(fixture.con, true);
+
+    auto result = fixture.con.Query("SELECT count(n_nationkey) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("narrow the glob prefix") != std::string::npos);
   }
 }
 
@@ -2533,16 +3338,82 @@ TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
                               {1});
 }
 
-TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
-          "[s3][integration][sql][gpu_execution][fallback]")
+TEST_CASE("gpu_execution S3 nested parquet projections match local DuckDB CPU",
+          "[.][s3][integration][sql][gpu_execution][nested]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  struct nested_projection_case {
+    std::string_view table;
+    std::string_view select_list;
+  };
+
+  constexpr std::array<nested_projection_case, 5> cases{{
+    {"nested_struct", "id, payload"},
+    {"nested_list", "id, items"},
+    {"nested_map", "id, attrs"},
+    {"nested_deep", "id, struct_of_list, list_of_struct, tail"},
+    {"nested_chunk_boundary", "id, items, payload, attrs, tail"},
+  }};
+
+  s3_sql_fixture fixture(*env);
+  for (auto const& test_case : cases) {
+    auto const s3_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
+                          s3_parquet_scan(*env, test_case.table) + " ORDER BY id";
+    auto const local_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
+                             local_parquet_scan(*env, test_case.table) + " ORDER BY id";
+
+    INFO("table=" << test_case.table);
+    compare_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  }
+}
+
+TEST_CASE("gpu_execution rejects operations on nested S3 parquet columns cleanly",
+          "[.][s3][integration][sql][gpu_execution][nested][unsupported]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
   s3_sql_fixture fixture(*env);
+
+  auto const struct_scan = s3_parquet_scan(*env, "nested_struct");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + struct_scan + " WHERE payload IS NULL", "payload");
+
+  require_nested_operation_unsupported(
+    fixture,
+    "SELECT id FROM " + struct_scan + " WHERE payload = struct_pack(a := 10, b := 'alpha')",
+    "payload");
+
+  auto const list_scan = s3_parquet_scan(*env, "nested_list");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + list_scan + " WHERE items IS NULL", "items");
+
+  require_nested_operation_unsupported(
+    fixture, "SELECT items, count(*) FROM " + list_scan + " GROUP BY items", "items");
+
+  require_nested_operation_unsupported(
+    fixture,
+    "SELECT l.id FROM " + list_scan + " l JOIN " + list_scan + " r ON l.items = r.items",
+    "items");
+
+  auto const map_scan = s3_parquet_scan(*env, "nested_map");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + map_scan + " WHERE attrs IS NULL", "attrs");
+}
+
+TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
+          "[s3][integration][sql][gpu_execution][fallback][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
   auto const s3_query = "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn FROM " +
                         s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
-  auto result = fixture.con.Query(gpu_execution_sql(s3_query));
+  auto result = fixture.con.Query(s3_query);
   REQUIRE(result);
   REQUIRE(result->HasError());
   auto const error = result->GetError();
@@ -2554,20 +3425,52 @@ TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
   CHECK(error.find("no filesystem") == std::string::npos);
 }
 
-TEST_CASE("plain DuckDB read_parquet over s3 is not the Sirius SQL surface",
-          "[s3][integration][sql][gpu_execution]")
+TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU",
+          "[s3][integration][sql][gpu_execution][fallback][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
   s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  REQUIRE_FALSE(fixture.con
+                  .Query("CREATE VIEW v_s3_nation AS "
+                         "SELECT n_nationkey FROM " +
+                         s3_parquet_scan(*env, "nation"))
+                  ->HasError());
+
+  auto result = fixture.con.Query(
+    "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
+    "FROM v_s3_nation ORDER BY n_nationkey");
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  auto const error = result->GetError();
+  INFO(error);
+  CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK((error.find("window") != std::string::npos || error.find("Window") != std::string::npos ||
+         error.find("WINDOW") != std::string::npos));
+  CHECK(error.find("No filesystem") == std::string::npos);
+  CHECK(error.find("no filesystem") == std::string::npos);
+}
+
+TEST_CASE("S3 read_parquet is rejected when transparent GPU execution is disabled",
+          "[s3][integration][sql][gpu_execution][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, false);
   auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
   auto result    = fixture.con.Query("SELECT count(*) FROM read_parquet('" + uri + "')");
   REQUIRE(result);
   REQUIRE(result->HasError());
   auto const error = result->GetError();
   INFO(error);
-  CHECK((error.find("s3") != std::string::npos || error.find("S3") != std::string::npos));
+  CHECK(error.find("S3 is GPU-only") != std::string::npos);
+  CHECK(error.find("SET gpu_execution=true") != std::string::npos);
+  CHECK(error.find("No filesystem") == std::string::npos);
+  CHECK(error.find("no filesystem") == std::string::npos);
 }
 
 TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for cardinality",
@@ -2847,9 +3750,12 @@ TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and mat
     large_lineitem_orders_join_query(local_parquet_file_scan(large->local_path),
                                      local_parquet_scan(*env, "orders")));
 
-  auto const explain_sql = large_lineitem_orders_join_query(s3_sirius_large_lineitem_scan(*env),
-                                                            s3_sirius_parquet_scan(*env, "orders"));
-  auto const plan        = explain_text(fixture.con, explain_sql);
+  // Keep this plan unfiltered. The filtered query above checks correctness;
+  // filter pushdown makes EXPLAIN report a post-filter estimate.
+  auto const explain_sql = "SELECT count(*) FROM " + s3_sirius_large_lineitem_scan(*env) +
+                           " l JOIN " + s3_sirius_parquet_scan(*env, "orders") +
+                           " o ON l.l_orderkey = o.o_orderkey";
+  auto const plan = explain_text(fixture.con, explain_sql);
   INFO(plan);
   CHECK(plan_mentions_cardinality(plan, expected_lineitem_rows));
   CHECK(plan_mentions_cardinality(plan, expected_orders_rows));

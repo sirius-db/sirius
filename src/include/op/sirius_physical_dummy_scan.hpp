@@ -37,8 +37,23 @@ class sirius_physical_dummy_scan : public sirius_physical_operator {
  public:
   bool is_source() const override { return true; }
 
-  std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+  //! The RIGHT_DELIM_JOIN build placeholder contributes no pipeline operator: the delim join
+  //! fans its input directly to PARTITION_build, so the placeholder carries no runtime data.
+  //! Real DUMMY_SCANs (constant-row subqueries) use the base source-leaf behavior.
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
+  //! RIGHT_DELIM_JOIN's internal join. Plan-gen skips `replace_with_gpu_values` for it: the
+  //! placeholder carries no runtime data (the delim join fans its input directly to
+  //! PARTITION_build). Real DUMMY_SCAN usages (constant-row subqueries) become GPU_VALUES sources.
+  [[nodiscard]] bool is_delim_join_placeholder() const noexcept
+  {
+    return _is_delim_join_placeholder;
+  }
+  void set_delim_join_placeholder(bool value) noexcept { _is_delim_join_placeholder = value; }
+
+ protected:
+  bool _is_delim_join_placeholder = false;
 };
 
 }  // namespace op

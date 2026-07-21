@@ -37,6 +37,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library
+#include <algorithm>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -117,7 +118,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
 
-  auto batch = sirius::make_data_batch(std::move(output_table), *mem_space, stream);
+  auto batch =
+    sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
@@ -125,13 +127,15 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
 std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  // Match the legacy heuristics: pinned (cached) inputs are pass-throughs in the
-  // common case, so the estimate equals the input size. Fresh reads expand the
-  // input substantially (decompression + decode), so the parquet operator used
-  // an 8× factor. duckdb-native used 4×. Pick 8× as the safe upper bound — the
-  // reservation system clamps via downstream operator estimates anyway.
-  if (stats.resident) { return stats.bytes; }
-  return stats.bytes * 8;
+  // Match the legacy 8x fresh-read heuristic for projected data, then add any
+  // filter-only columns that must also be decoded. Keeping the latter additive
+  // avoids applying the expansion factor twice to the transient working set.
+  // Resident (cached) chunks surface their mask/filter copy peaks through the
+  // split's working-set estimate; a plain chunk reports it equal to bytes.
+  if (stats.resident) { return std::max(stats.bytes, stats.working_set_bytes); }
+  auto const filter_only_bytes =
+    stats.working_set_bytes > stats.bytes ? stats.working_set_bytes - stats.bytes : 0;
+  return stats.bytes * 8 + filter_only_bytes;
 }
 
 }  // namespace sirius::op::scan

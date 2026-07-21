@@ -40,6 +40,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -78,9 +79,8 @@ TEST_CASE("physical_order - large sort distributes across two GPUs",
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("large");
-  auto log_dir = tmp / "log";
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("large");
+  auto yaml = tmp / "mgpu.yaml";
 
   // 8 files × 500k rows × 16 B ≈ 64 MiB. `k = range * 37 % 1000000` gives a
   // permuted key so the sort has real work, and the permutation still
@@ -96,25 +96,28 @@ TEST_CASE("physical_order - large sort distributes across two GPUs",
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
 
-  scoped_log_dir logs(log_dir);
-
   auto glob        = parquet_glob(tmp);
   auto inner_query = "SELECT k, v FROM read_parquet('" + glob + "') ORDER BY k DESC LIMIT 100";
 
+  std::map<int, size_t> tasks_per_gpu;
   {
     scoped_mgpu_env env(yaml);
     auto con = std::make_unique<duckdb::Connection>(env.make_connection());
     require_gpu_matches_cpu(*con, inner_query);
-    con.reset();  // flush sinks before parse_audit_log
+    auto& scheduler = env.get_task_scheduler(*con);
+    con.reset();  // flush sinks before reading metrics
+
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  auto by_gpu = parse_audit_log(log_dir);
-  INFO("gpu0 pipelines=" << by_gpu[0].pipeline_ids.size()
-                         << " gpu1 pipelines=" << by_gpu[1].pipeline_ids.size());
-  REQUIRE(by_gpu.count(0));
-  REQUIRE(by_gpu.count(1));
-  REQUIRE(by_gpu[0].pipeline_ids.size() >= 1);
-  REQUIRE(by_gpu[1].pipeline_ids.size() >= 1);
+  INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
 
   std::error_code ec;
   fs::remove_all(tmp, ec);
@@ -129,9 +132,8 @@ TEST_CASE("physical_order - small sort rangecheck regression",
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("rangecheck");
-  auto log_dir = tmp / "log";
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("rangecheck");
+  auto yaml = tmp / "mgpu.yaml";
 
   // Tiny surface (4 files x 256 rows). Combined with hash_partition_bytes=1024
   // below, this forces the partitioner into the 2-element vector shape that
@@ -147,8 +149,6 @@ TEST_CASE("physical_order - small sort rangecheck regression",
   params.hash_partition_bytes = 1024;  // force multi-partition on tiny data
   write_mgpu_yaml(yaml, params);
   REQUIRE(fs::exists(yaml));
-
-  scoped_log_dir logs(log_dir);
 
   auto glob        = parquet_glob(tmp);
   auto inner_query = "SELECT * FROM read_parquet('" + glob + "') ORDER BY k LIMIT 5";
@@ -172,9 +172,8 @@ TEST_CASE("physical_order - small sort stays single-GPU",
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("small");
-  auto log_dir = tmp / "log";
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("small");
+  auto yaml = tmp / "mgpu.yaml";
 
   // 8 files × 1k rows ≈ 128 KiB — well below the multi-partition floor at
   // hash_partition_bytes=1 MiB. A single partition should keep the sort on
@@ -188,8 +187,6 @@ TEST_CASE("physical_order - small sort stays single-GPU",
 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
-
-  scoped_log_dir logs(log_dir);
 
   auto glob        = parquet_glob(tmp);
   auto inner_query = "SELECT * FROM read_parquet('" + glob + "') ORDER BY k LIMIT 10";
@@ -210,9 +207,8 @@ TEST_CASE("physical_order - order by with limit over large input",
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("topn");
-  auto log_dir = tmp / "log";
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("topn");
+  auto yaml = tmp / "mgpu.yaml";
 
   // Same large surface as test #1 so partitioning routes across both GPUs,
   // but with a tight LIMIT 5 to exercise the top-N path — per-partition
@@ -227,25 +223,28 @@ TEST_CASE("physical_order - order by with limit over large input",
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
 
-  scoped_log_dir logs(log_dir);
-
   auto glob        = parquet_glob(tmp);
   auto inner_query = "SELECT k FROM read_parquet('" + glob + "') ORDER BY k LIMIT 5";
 
+  std::map<int, size_t> tasks_per_gpu;
   {
     scoped_mgpu_env env(yaml);
     auto con = std::make_unique<duckdb::Connection>(env.make_connection());
     require_gpu_matches_cpu(*con, inner_query);
-    con.reset();
+    auto& scheduler = env.get_task_scheduler(*con);
+    con.reset();  // flush sinks before reading metrics
+
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  auto by_gpu = parse_audit_log(log_dir);
-  INFO("gpu0 pipelines=" << by_gpu[0].pipeline_ids.size()
-                         << " gpu1 pipelines=" << by_gpu[1].pipeline_ids.size());
-  REQUIRE(by_gpu.count(0));
-  REQUIRE(by_gpu.count(1));
-  REQUIRE(by_gpu[0].pipeline_ids.size() >= 1);
-  REQUIRE(by_gpu[1].pipeline_ids.size() >= 1);
+  INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
 
   std::error_code ec;
   fs::remove_all(tmp, ec);

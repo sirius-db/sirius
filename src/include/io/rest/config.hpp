@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/s3/s3_list_parser.hpp"
+
 #include <chrono>
 #include <cstddef>
 
@@ -88,6 +90,27 @@ struct config {
   /// terminal-failure and device-stream-sync counters are always recorded,
   /// independent of this flag.
   bool perf_instrumentation{false};
+
+  /// Suffix-range window (bytes) for the parquet footer probe
+  /// (@c open_hint::parquet_footer_probe): one `Range: bytes=-N` GET resolves the
+  /// object size and stashes its last N bytes, so cuDF's trailer/footer reads are
+  /// served locally.  Tradeoff — a parquet footer is ~0.037% of the file (SF1
+  /// lineitem 207 MB -> 78 KiB, SF10 2.2 GB -> 771 KiB): N must cover the footer,
+  /// else the probe wastes the suffix and re-GETs the footer body (worse than a
+  /// plain HEAD), so err large; the over-read when N exceeds the footer is a
+  /// one-time bind transfer (~10 ms on a high-bandwidth link).  The 512 KiB
+  /// default covers files up to ~1.4 GB in one GET (the common range); raise it
+  /// for multi-GB single files, lower it for many-tiny-file / low-bandwidth
+  /// workloads.
+  std::size_t footer_probe_bytes{512UL << 10};  // 512 KiB
+
+  /// S3 LIST / glob safety caps (both throw "narrow the glob prefix", never
+  /// truncate).  @c list_max_matches bounds the files a glob keeps / a
+  /// whole-listing accumulates (result memory); @c list_max_scanned bounds the
+  /// objects a LIST sweep looks at across pages (time / LIST round-trips).  The
+  /// two axes diverge when a prefix is huge but few keys match, so both exist.
+  std::size_t list_max_matches{s3::default_max_list_objects};     // 100'000
+  std::size_t list_max_scanned{s3::default_max_scanned_objects};  // 1'000'000
 };
 
 }  // namespace sirius::io::rest

@@ -28,9 +28,7 @@ jobs:
       # CUDA-pinned platform. Assert it so the (cuda13) environment resolves.
       CONDA_OVERRIDE_CUDA: "13"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
@@ -104,13 +102,18 @@ jobs:
     timeout-minutes: ${{ case(matrix.build.environment == 'vcpkg', 240, 60) }}
     continue-on-error: ${{ matrix.build.cudf-channel == 'nightly' }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Unshallow vcpkg for version overrides
+      - name: Init build submodules
+        run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+
+      - name: Init vcpkg with full history for version overrides
         if: matrix.build.environment == 'vcpkg'
-        run: git -C vcpkg rev-parse --is-shallow-repository | grep -q true && git -C vcpkg fetch --unshallow || true
+        run: |
+          git submodule update --init vcpkg
+          if [[ "$(git -C vcpkg rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -C vcpkg fetch --unshallow
+          fi
 
       - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:

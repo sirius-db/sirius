@@ -16,6 +16,8 @@
 
 #include "config.hpp"
 
+#include "log/logging.hpp"
+
 namespace duckdb {
 
 bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
@@ -35,19 +37,17 @@ uint64_t Config::PRINT_GPU_TABLE_MAX_ROWS = 1000;
 
 bool Config::ENABLE_FALLBACK_CHECK = false;
 
-bool Config::ENABLE_DUCKDB_FALLBACK = true;
-
 bool Config::ENABLE_REGEX_JIT_IMPL = true;
 
 bool Config::MODIFIED_PIPELINE = false;
 
-uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE   = 512ULL * 1024 * 1024;  ///< 50 MB
-uint64_t Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256ULL;
+uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 512ULL * 1024 * 1024;  ///< 50 MB
 
 uint64_t Config::MAX_SORT_PARTITION_BYTES = 0;  ///< 0 = auto (33% of available GPU memory)
 
-std::string Config::LOG_LEVEL = "info";
-std::string Config::LOG_DIR   = "log";
-int Config::LOG_FLUSH_SECONDS = 3;
+std::string Config::LOG_BACKEND = "spdlog";
+std::string Config::LOG_LEVEL   = "info";
+std::string Config::LOG_DIR     = "log";
+int Config::LOG_FLUSH_SECONDS   = 3;
 
 }  // namespace duckdb
